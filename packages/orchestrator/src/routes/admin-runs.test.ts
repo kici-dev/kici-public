@@ -1,0 +1,943 @@
+/**
+ * Tests for admin run inspection routes.
+ *
+ * Verifies auth, RBAC, query parameter filtering, and response shapes
+ * for:
+ *   GET /api/v1/admin/runs                        — list + filters
+ *   GET /api/v1/admin/runs/:runId                 — run header only
+ *   GET /api/v1/admin/runs/:runId/jobs            — jobs (+ optional steps)
+ *   GET /api/v1/admin/runs/:runId/ephemeral-key   — scrub status
+ *   GET /api/v1/admin/runs/:runId/secret-outputs  — masked / reveal + audit
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { RUN_STATUSES, createAdminRunRoutes, type AdminRunRoutesDeps } from './admin-runs.js';
+import { ExecutionJobStatus, ExecutionRunStatus } from '@kici-dev/engine';
+import { RbacEnforcer } from '../secrets/rbac.js';
+import type { Role } from '../secrets/rbac.js';
+import { encrypt, deriveKey } from '@kici-dev/shared';
+
+/**
+ * Minimal mock for a Kysely query chain. Each call in the builder chain
+ * returns the same proxy, and terminal executors are swappable via the
+ * returned vi.fn() references so tests can stage per-call responses.
+ */
+function createMockDb() {
+  const mockExecute = vi.fn().mockResolvedValue([]);
+  const mockExecuteTakeFirst = vi.fn().mockResolvedValue(undefined);
+  const mockExecuteTakeFirstOrThrow = vi.fn().mockResolvedValue({ total: 0 });
+
+  const whereCalls: Array<unknown[]> = [];
+  /**
+   * The same predicates, tagged with the table the query read.
+   *
+   * `whereCalls` alone cannot say WHICH query carried a predicate, so a route
+   * that issues two queries against the same id proves nothing by its presence
+   * — dropping the predicate from one of them leaves the other's entry behind.
+   */
+  const whereCallsByTable: Array<{ table: string; args: unknown[] }> = [];
+  /** Every table name passed to `selectFrom`, in call order. */
+  const selectFromCalls: string[] = [];
+
+  const makeChain = (table: string) => {
+    const chain: any = new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          if (prop === 'execute') return mockExecute;
+          if (prop === 'executeTakeFirst') return mockExecuteTakeFirst;
+          if (prop === 'executeTakeFirstOrThrow') return mockExecuteTakeFirstOrThrow;
+          if (prop === 'where')
+            return (...args: unknown[]) => {
+              whereCalls.push(args);
+              whereCallsByTable.push({ table, args });
+              return chain;
+            };
+          return () => chain;
+        },
+      },
+    );
+    return chain;
+  };
+
+  return {
+    selectFrom: (table: string) => {
+      selectFromCalls.push(table);
+      return makeChain(table);
+    },
+    fn: { countAll: () => ({ as: () => 'count' }) },
+    mockExecute,
+    mockExecuteTakeFirst,
+    mockExecuteTakeFirstOrThrow,
+    whereCalls,
+    whereCallsByTable,
+    selectFromCalls,
+  };
+}
+
+/** Master secret key used only for test reveal round-trips. */
+const TEST_SECRET_KEY = 'a'.repeat(64);
+const TEST_OLD_SECRET_KEY = 'b'.repeat(64);
+const TEST_MASTER_KEYS = {
+  material: TEST_SECRET_KEY,
+  materialOld: undefined,
+  current: deriveKey(TEST_SECRET_KEY),
+  old: undefined,
+};
+
+interface Deps extends AdminRunRoutesDeps {
+  mockDb: ReturnType<typeof createMockDb>;
+  auditLoggerLog: ReturnType<typeof vi.fn>;
+}
+
+function createMockDeps(overrides: Partial<AdminRunRoutesDeps> = {}): Deps {
+  const mockDb = createMockDb();
+  const auditLoggerLog = vi.fn().mockResolvedValue(undefined);
+  const logStorage = {
+    append: vi.fn(),
+    read: vi.fn().mockResolvedValue({ data: 'log-a\nlog-b\n', cursor: 0, complete: true }),
+    exists: vi.fn(),
+    list: vi.fn(),
+  } as any;
+  return {
+    db: mockDb as any,
+    tokenManager: { validate: vi.fn() } as any,
+    rbac: new RbacEnforcer(),
+    auditLogger: { log: auditLoggerLog } as any,
+    masterKeys: TEST_MASTER_KEYS,
+    logStorage,
+    ...overrides,
+    mockDb,
+    auditLoggerLog,
+  };
+}
+
+async function request(
+  app: ReturnType<typeof createAdminRunRoutes>,
+  path: string,
+  opts?: { token?: string },
+) {
+  const headers: Record<string, string> = {};
+  if (opts?.token) {
+    headers['Authorization'] = `Bearer ${opts.token}`;
+  }
+  const url = `http://localhost/api/v1/admin/runs${path}`;
+  return app.request(url, { method: 'GET', headers });
+}
+
+describe('admin run routes', () => {
+  let deps: Deps;
+  let app: ReturnType<typeof createAdminRunRoutes>;
+  const validToken = 'test-token-abc123';
+
+  beforeEach(() => {
+    deps = createMockDeps();
+    app = createAdminRunRoutes(deps);
+    (deps.tokenManager.validate as any).mockResolvedValue({
+      id: 'user-1',
+      role: 'owner' as Role,
+      routingKey: null,
+      label: 'test',
+    });
+  });
+
+  // ── auth + RBAC ─────────────────────────────────────────────────
+
+  describe('auth', () => {
+    it('rejects missing Authorization header with 401', async () => {
+      const res = await request(app, '');
+      expect(res.status).toBe(401);
+      const body = await res.json();
+      expect(body.error).toBe('Missing authorization');
+    });
+
+    it('rejects invalid token with 401', async () => {
+      (deps.tokenManager.validate as any).mockResolvedValue(null);
+      const res = await request(app, '', { token: 'bad-token' });
+      expect(res.status).toBe(401);
+      const body = await res.json();
+      expect(body.error).toBe('Invalid or expired token');
+    });
+  });
+
+  describe('RBAC', () => {
+    it('allows auditor role (has run.read permission)', async () => {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'auditor' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      const res = await request(app, '', { token: validToken });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ── GET /admin/runs ─────────────────────────────────────────────
+
+  describe('GET /api/v1/admin/runs', () => {
+    it('returns empty runs list with total 0', async () => {
+      const res = await request(app, '', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.runs).toEqual([]);
+      expect(body.total).toBe(0);
+      expect(body.limit).toBe(20);
+      expect(body.offset).toBe(0);
+    });
+
+    it('returns runs with correct shape', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          run_id: 'run-1',
+          workflow_name: 'ci',
+          status: 'success',
+          provider: 'github',
+          repo_identifier: 'owner/repo',
+          ref: 'refs/heads/master',
+          sha: 'abc1234',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 5000,
+          parent_run_id: null,
+          triggered_by: null,
+          failure_reason: null,
+          environment: null,
+          trust_tier: null,
+          created_at: now,
+        },
+      ]);
+      deps.mockDb.mockExecuteTakeFirstOrThrow.mockResolvedValueOnce({ total: 1 });
+
+      const res = await request(app, '', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.runs).toHaveLength(1);
+      expect(body.runs[0].runId).toBe('run-1');
+      expect(body.runs[0].workflowName).toBe('ci');
+      expect(body.total).toBe(1);
+    });
+
+    it('rejects invalid ?since with 400', async () => {
+      const res = await request(app, '?since=not-a-date', { token: validToken });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('Invalid "since"');
+    });
+
+    it('rejects unknown ?status value with 400', async () => {
+      const res = await request(app, '?status=success,bogus', { token: validToken });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('Invalid status');
+    });
+
+    it('accepts every run status on ?status, including held and cancelling', async () => {
+      // The route-level assertion, not just the constant: `?status=held` used
+      // to be rejected with 400 even though held runs exist, and a test that
+      // only probed the exported set would still pass with the validation loop
+      // deleted.
+      for (const status of ExecutionRunStatus.options) {
+        const res = await request(app, `?status=${status}`, { token: validToken });
+        expect(res.status, `?status=${status} should be accepted`).toBe(200);
+      }
+    });
+
+    it('honours ?count=true with count-only response shape', async () => {
+      deps.mockDb.mockExecuteTakeFirstOrThrow.mockResolvedValueOnce({ total: 7 });
+      const res = await request(
+        app,
+        '?count=true&since=2026-04-18T00:00:00Z&status=success,failed',
+        {
+          token: validToken,
+        },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({
+        total: 7,
+        since: '2026-04-18T00:00:00.000Z',
+        status: ['success', 'failed'],
+        workflowName: null,
+        repo: null,
+      });
+      // The count path must NOT query the list of rows.
+      expect(deps.mockDb.mockExecute).not.toHaveBeenCalled();
+    });
+
+    it('applies a delivery_id filter when ?deliveryId= is present', async () => {
+      const res = await request(app, '?deliveryId=rk%3Amine', { token: validToken });
+      expect(res.status).toBe(200);
+      // The (url-decoded) delivery id is pushed as an exact-match where clause.
+      expect(deps.mockDb.whereCalls).toContainEqual(['delivery_id', '=', 'rk:mine']);
+    });
+
+    it('does not filter by delivery_id when the param is absent', async () => {
+      await request(app, '', { token: validToken });
+      expect(deps.mockDb.whereCalls.some((c) => c[0] === 'delivery_id')).toBe(false);
+    });
+  });
+
+  // ── GET /admin/runs/:runId (run header only) ────────────────────
+
+  describe('GET /api/v1/admin/runs/:runId', () => {
+    it('returns 404 for non-existent run', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/run-nonexistent', { token: validToken });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error).toContain('not found');
+    });
+
+    it('returns run fields only (no jobs, no steps)', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        run_id: 'run-1',
+        workflow_name: 'ci',
+        status: 'success',
+        provider: 'github',
+        repo_identifier: 'owner/repo',
+        ref: 'refs/heads/master',
+        sha: 'abc1234',
+        delivery_id: 'del-1',
+        started_at: now,
+        completed_at: now,
+        duration_ms: 5000,
+        is_test_run: false,
+        parent_run_id: null,
+        original_run_id: null,
+        triggered_by: null,
+        cancelled_by: null,
+        environment: null,
+        trust_tier: null,
+        lock_file_source: null,
+        contributor_username: null,
+        failure_reason: null,
+        created_at: now,
+      });
+      const res = await request(app, '/run-1', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.run.runId).toBe('run-1');
+      // The split endpoint must NOT return jobs or steps.
+      expect(body.jobs).toBeUndefined();
+      expect(body.steps).toBeUndefined();
+    });
+  });
+
+  // ── GET /admin/runs/:runId/jobs ────────────────────────────────
+
+  describe('GET /api/v1/admin/runs/:runId/jobs', () => {
+    it('returns 404 when the run does not exist', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined); // run existence check
+      const res = await request(app, '/run-x/jobs', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    // `runs_on_labels` and `matrix_values` are JSONB, so the driver hands back a
+    // parsed array/object. Both fixtures below use that real shape: with a JSON
+    // string instead, the route could re-parse it and still look correct while
+    // returning null against a live database for every job.
+    it('passes JSONB columns through as the driver already parsed them', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-matrix',
+          job_name: 'build[node-18]',
+          status: 'success',
+          matrix_values: { node: '18' },
+          agent_id: 'agent-1',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 1000,
+          error_message: null,
+          runs_on_labels: ['kici:scaler:github-actions', 'kici:os:linux'],
+          created_at: now,
+        },
+      ]);
+      deps.mockDb.mockExecute.mockResolvedValueOnce([]); // execution_job_needs
+      const res = await request(app, '/run-1/jobs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobs[0].runsOnLabels).toEqual(['kici:scaler:github-actions', 'kici:os:linux']);
+      expect(body.jobs[0].matrixValues).toEqual({ node: '18' });
+    });
+
+    it('returns jobs for a run without steps by default', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-test',
+          job_name: 'test',
+          status: 'success',
+          matrix_values: null,
+          agent_id: 'agent-1',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 4000,
+          error_message: null,
+          runs_on_labels: ['kici:os:linux'],
+          created_at: now,
+        },
+      ]);
+      // execution_job_needs query (no edges for this run).
+      deps.mockDb.mockExecute.mockResolvedValueOnce([]);
+      const res = await request(app, '/run-1/jobs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobs).toHaveLength(1);
+      expect(body.jobs[0].jobId).toBe('job-test');
+      expect(body.jobs[0].runsOnLabels).toEqual(['kici:os:linux']);
+      expect(body.jobs[0].needs).toBeNull();
+      expect(body.jobs[0].steps).toBeUndefined();
+    });
+
+    it('attaches resolved dependency edges (needs) grouped by downstream job', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-build',
+          job_name: 'build',
+          status: 'success',
+          matrix_values: null,
+          agent_id: 'agent-1',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 4000,
+          error_message: null,
+          runs_on_labels: null,
+          created_at: now,
+        },
+        {
+          job_id: 'job-deploy',
+          job_name: 'deploy',
+          status: 'success',
+          matrix_values: null,
+          agent_id: 'agent-1',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 4000,
+          error_message: null,
+          runs_on_labels: null,
+          created_at: now,
+        },
+      ]);
+      // execution_job_needs query: deploy depends on build (run-anyway policy).
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_name: 'deploy',
+          upstream_name: 'build',
+          run_on: JSON.stringify(['failed', 'timed_out_stale']),
+        },
+      ]);
+      const res = await request(app, '/run-1/jobs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const build = body.jobs.find((j: { jobName: string }) => j.jobName === 'build');
+      const deploy = body.jobs.find((j: { jobName: string }) => j.jobName === 'deploy');
+      expect(build.needs).toBeNull();
+      expect(deploy.needs).toEqual([
+        { upstreamName: 'build', runOn: ['failed', 'timed_out_stale'] },
+      ]);
+    });
+
+    it('embeds steps when ?includeSteps=true', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-test',
+          job_name: 'test',
+          status: 'success',
+          matrix_values: null,
+          agent_id: 'agent-1',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 4000,
+          error_message: null,
+          runs_on_labels: null,
+          created_at: now,
+        },
+      ]);
+      // execution_job_needs query (no edges) runs between the jobs and steps queries.
+      deps.mockDb.mockExecute.mockResolvedValueOnce([]);
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-test',
+          step_index: 0,
+          step_name: 'checkout',
+          status: 'success',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 1000,
+          exit_code: 0,
+          error_message: null,
+          step_type: 'step',
+        },
+      ]);
+      const res = await request(app, '/run-1/jobs?includeSteps=true', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobs[0].steps).toHaveLength(1);
+      expect(body.jobs[0].steps[0].stepName).toBe('checkout');
+    });
+  });
+
+  // ── GET /admin/runs/:runId/ephemeral-key ───────────────────────
+
+  describe('GET /api/v1/admin/runs/:runId/ephemeral-key', () => {
+    it('returns 404 when the run does not exist', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/run-x/ephemeral-key', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    it('returns {exists: true, createdAt} when the row is present', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1' })
+        .mockResolvedValueOnce({ run_id: 'run-1', created_at: now });
+      const res = await request(app, '/run-1/ephemeral-key', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ exists: true, createdAt: now.toISOString() });
+    });
+
+    it('returns {exists: false, createdAt: null} when the row has been scrubbed', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1' })
+        .mockResolvedValueOnce(undefined);
+      const res = await request(app, '/run-1/ephemeral-key', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ exists: false, createdAt: null });
+    });
+
+    it('never leaks the public_key or encrypted_private_key', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1' })
+        .mockResolvedValueOnce({
+          run_id: 'run-1',
+          created_at: now,
+          public_key: 'must-not-appear',
+          encrypted_private_key: 'must-not-appear',
+        });
+      const res = await request(app, '/run-1/ephemeral-key', { token: validToken });
+      const body = await res.json();
+      expect(JSON.stringify(body)).not.toContain('must-not-appear');
+    });
+  });
+
+  // ── GET /admin/runs/:runId/secret-outputs ──────────────────────
+
+  describe('GET /api/v1/admin/runs/:runId/secret-outputs', () => {
+    it('returns 404 when the run does not exist', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/run-x/secret-outputs', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    it('returns masked rows by default (no value field)', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          id: 'out-1',
+          job_id: 'job-a',
+          output_key: 'API_KEY',
+          encrypted_value: 'base64-ciphertext',
+          created_at: now,
+        },
+      ]);
+      const res = await request(app, '/run-1/secret-outputs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.outputs).toHaveLength(1);
+      expect(body.outputs[0].value).toBeNull();
+      expect(body.outputs[0].masked).toBe(true);
+      // Ciphertext must NOT appear in the masked response.
+      expect(JSON.stringify(body)).not.toContain('base64-ciphertext');
+      // No audit row for a non-reveal read.
+      expect(deps.auditLoggerLog).not.toHaveBeenCalled();
+    });
+
+    it('rejects ?reveal=true with 403 when role lacks secret.reveal', async () => {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'auditor' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      const res = await request(app, '/run-1/secret-outputs?reveal=true', { token: validToken });
+      expect(res.status).toBe(403);
+    });
+
+    it('503s on ?reveal=true when the master key or auditLogger is missing', async () => {
+      const depsNoKey = createMockDeps({ masterKeys: null, auditLogger: undefined });
+      (depsNoKey.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      const appNoKey = createAdminRunRoutes(depsNoKey);
+      const res = await request(appNoKey, '/run-1/secret-outputs?reveal=true', {
+        token: validToken,
+      });
+      expect(res.status).toBe(503);
+    });
+
+    it('decrypts values on ?reveal=true and writes a single audit row', async () => {
+      const runId = 'run-1';
+      const plaintext = 'super-secret';
+      const keyBuf = deriveKey(TEST_SECRET_KEY);
+      const { data: ciphertext } = encrypt(plaintext, keyBuf, 1, `secret-output:${runId}`);
+
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: runId });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          id: 'out-1',
+          job_id: 'job-a',
+          output_key: 'API_KEY',
+          encrypted_value: ciphertext,
+          created_at: now,
+        },
+      ]);
+
+      const res = await request(app, `/${runId}/secret-outputs?reveal=true`, { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.outputs).toHaveLength(1);
+      expect(body.outputs[0].value).toBe(plaintext);
+      expect(body.outputs[0].masked).toBe(false);
+
+      expect(deps.auditLoggerLog).toHaveBeenCalledTimes(1);
+      const entry = deps.auditLoggerLog.mock.calls[0][0];
+      expect(entry.action).toBe('secret-outputs.reveal');
+      expect(entry.runId).toBe(runId);
+      expect(entry.secretKeys).toEqual(['API_KEY']);
+      expect(entry.outcome).toBe('allowed');
+      expect(entry.userId).toBe('user-1');
+    });
+
+    it('reveals a row still sealed under the OLD master key', async () => {
+      const runId = 'run-1';
+      const { data: ciphertext } = encrypt(
+        'sealed-before-rotation',
+        deriveKey(TEST_OLD_SECRET_KEY),
+        1,
+        `secret-output:${runId}`,
+      );
+      const row = {
+        id: 'out-1',
+        job_id: 'job-a',
+        output_key: 'API_KEY',
+        encrypted_value: ciphertext,
+        created_at: new Date(),
+      };
+
+      // Positive control: with the current key alone the reveal fails, so the
+      // dual-key deps below are what make it succeed.
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: runId });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([row]);
+      const currentOnly = await request(app, `/${runId}/secret-outputs?reveal=true`, {
+        token: validToken,
+      });
+      expect((await currentOnly.json()).outputs[0].revealError).toBeTruthy();
+
+      const dualDeps = createMockDeps({
+        masterKeys: {
+          material: TEST_SECRET_KEY,
+          materialOld: TEST_OLD_SECRET_KEY,
+          current: deriveKey(TEST_SECRET_KEY),
+          old: deriveKey(TEST_OLD_SECRET_KEY),
+        },
+      });
+      dualDeps.tokenManager.validate = deps.tokenManager.validate;
+      const dualApp = createAdminRunRoutes(dualDeps as never);
+      dualDeps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: runId });
+      dualDeps.mockDb.mockExecute.mockResolvedValueOnce([row]);
+      const res = await request(dualApp, `/${runId}/secret-outputs?reveal=true`, {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.outputs[0].value).toBe('sealed-before-rotation');
+      expect(body.outputs[0].masked).toBe(false);
+    });
+
+    it('records a revealError row when the ciphertext cannot be decrypted', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          id: 'out-1',
+          job_id: 'job-a',
+          output_key: 'API_KEY',
+          encrypted_value: 'not-valid-ciphertext',
+          created_at: new Date(),
+        },
+      ]);
+      const res = await request(app, '/run-1/secret-outputs?reveal=true', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.outputs[0].masked).toBe(true);
+      expect(body.outputs[0].value).toBeNull();
+      expect(body.outputs[0].revealError).toBeTruthy();
+
+      // The audit row should still fire, with failedCount: 1.
+      expect(deps.auditLoggerLog).toHaveBeenCalledTimes(1);
+      const entry = deps.auditLoggerLog.mock.calls[0][0];
+      expect(entry.metadata.failedCount).toBe(1);
+      expect(entry.metadata.revealedCount).toBe(0);
+    });
+  });
+
+  // ── GET /runs/:runId/structured (agent run result) ──────────────
+
+  describe('GET /api/v1/admin/runs/:runId/structured', () => {
+    const headerRow = {
+      run_id: 'run-1',
+      workflow_name: 'ci',
+      status: 'failed',
+      provider: 'github',
+      repo_identifier: 'owner/repo',
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      started_at: new Date(),
+      completed_at: null,
+      duration_ms: null,
+      trust_tier: 'trusted',
+      contributor_username: 'alice',
+      triggered_by: null,
+      failure_reason: 'boom',
+      init_failure: null,
+      provider_context: '{}',
+      routing_key: null,
+    };
+
+    it('returns a provenance-tagged result with untrusted-wrapped names', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(headerRow);
+      const res = await request(app, '/run-1/structured', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.runId).toBe('run-1');
+      expect(body.workflowName).toEqual({ untrusted: true, value: 'ci' });
+      expect(body.sha).toBe('abc123');
+      expect(body.jobs).toEqual([]);
+    });
+
+    it('404s for an unknown run', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/nope/structured', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    it('403s for a routing-key-scoped token reading a foreign run', async () => {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: 'scope-a',
+        label: 'test',
+      });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        ...headerRow,
+        routing_key: 'scope-b',
+      });
+      const res = await request(app, '/run-1/structured', { token: validToken });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  // ── GET /runs/:runId/jobs/:jobId/steps/:stepIndex/logs ──────────
+
+  describe('GET /api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs', () => {
+    it('returns untrusted-wrapped log lines', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
+        .mockResolvedValueOnce({ log_path: 'executions/run-1/job-a/step-0.log' }); // step lookup
+      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.lines.every((l: any) => l.untrusted === true)).toBe(true);
+      expect(body.lines).toEqual([
+        { untrusted: true, value: 'log-a' },
+        { untrusted: true, value: 'log-b' },
+      ]);
+      expect(body.totalLines).toBe(2);
+    });
+
+    it('400s on a non-numeric stepIndex', async () => {
+      const res = await request(app, '/run-1/jobs/job-a/steps/abc/logs', { token: validToken });
+      expect(res.status).toBe(400);
+    });
+
+    it('404s for an unknown run', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/nope/jobs/job-a/steps/0/logs', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    it('503s when log storage is not configured', async () => {
+      const depsNoLog = createMockDeps({ logStorage: undefined });
+      (depsNoLog.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      const appNoLog = createAdminRunRoutes(depsNoLog);
+      const res = await request(appNoLog, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      expect(res.status).toBe(503);
+    });
+  });
+
+  // ── step logs: the dispatch-queue fallback for eval rounds ──────
+  //
+  // A global eval round writes NO `execution_runs` row when it admits its
+  // candidates (the round is what decides whether a run exists at all), yet
+  // its `global-eval` step log is durably stored. `dispatch_queue` carries
+  // the same `run_id` plus the `routing_key` the scope guard needs, so the
+  // route resolves such ids there. The mock db ignores the table name, so
+  // each staged `executeTakeFirst` value is consumed in query order:
+  // execution_runs, then dispatch_queue, then the `execution_steps` lookup
+  // inside `readStepLogLines`. `selectFromCalls` records which tables were
+  // actually read.
+
+  describe('GET /runs/:runId/jobs/:jobId/steps/:stepIndex/logs — eval-round fallback', () => {
+    /** Point `tokenManager.validate` at a routing-key-scoped token. */
+    function useScopedToken(routingKey: string) {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey,
+        label: 'test',
+      });
+    }
+
+    it('serves logs for a runId known only to dispatch_queue', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_runs: no row for an eval round
+        .mockResolvedValueOnce({ run_id: 'run-eval-1', routing_key: 'github:42' }) // dispatch_queue
+        .mockResolvedValueOnce({ log_path: 'executions/run-eval-1/job-eval-1/step-0.log' });
+      (deps.logStorage!.read as any).mockResolvedValueOnce({
+        data: '[global-filter] verdict=true\n',
+        cursor: 0,
+        complete: true,
+      });
+
+      const res = await request(app, '/run-eval-1/jobs/job-eval-1/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.lines).toEqual([{ untrusted: true, value: '[global-filter] verdict=true' }]);
+      expect(deps.mockDb.selectFromCalls).toContain('dispatch_queue');
+      // The fallback must be keyed on THIS run. Without the predicate the
+      // query returns an ARBITRARY queued row, whose routing key would then
+      // authorize the request — and every other assertion in this describe
+      // still passes, because the mock returns the staged row either way.
+      //
+      // Asserted against `whereCallsByTable`, not `whereCalls`: the
+      // `execution_runs` lookup and the `execution_steps` lookup inside
+      // `readStepLogLines` both carry the same `run_id` predicate, so a
+      // table-blind assertion would be satisfied by either of them and prove
+      // nothing about the fallback.
+      expect(
+        deps.mockDb.whereCallsByTable
+          .filter((w) => w.table === 'dispatch_queue')
+          .map((w) => w.args),
+      ).toContainEqual(['run_id', '=', 'run-eval-1']);
+    });
+
+    it('still 404s a runId in neither table', async () => {
+      // Both lookups miss (the mock's default resolves to undefined).
+      const res = await request(app, '/run-nope/jobs/job-nope/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error).toBe('Run run-nope not found');
+      expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs', 'dispatch_queue']);
+    });
+
+    it('enforces routing-key scope using the dispatch_queue routing key', async () => {
+      useScopedToken('github:99');
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_runs: no row
+        .mockResolvedValueOnce({ run_id: 'run-eval-2', routing_key: 'github:42' }); // dispatch_queue
+
+      const res = await request(app, '/run-eval-2/jobs/job-eval-2/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(403);
+      // The step lookup must never run for a denied request.
+      expect(deps.mockDb.selectFromCalls).not.toContain('execution_steps');
+    });
+
+    it('admits a matching scope resolved through dispatch_queue', async () => {
+      useScopedToken('github:42');
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_runs: no row
+        .mockResolvedValueOnce({ run_id: 'run-eval-3', routing_key: 'github:42' }) // dispatch_queue
+        .mockResolvedValueOnce({ log_path: 'executions/run-eval-3/job-eval-3/step-0.log' });
+
+      const res = await request(app, '/run-eval-3/jobs/job-eval-3/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('does not query dispatch_queue when execution_runs already has the row', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // execution_runs hit
+        .mockResolvedValueOnce({ log_path: 'executions/run-1/job-a/step-0.log' });
+
+      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+
+      expect(res.status).toBe(200);
+      expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs', 'execution_steps']);
+    });
+
+    it('403s a scoped token on an ordinary run whose routing_key is null', async () => {
+      // A found run with a null routing key must stay a scope denial, never a
+      // 404 and never a fallthrough to dispatch_queue.
+      useScopedToken('github:42');
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        run_id: 'run-1',
+        routing_key: null,
+      });
+
+      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+
+      expect(res.status).toBe(403);
+      expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs']);
+    });
+  });
+});
+
+describe('admin runs status filter', () => {
+  it('accepts every run status, including held and cancelling', () => {
+    for (const status of ExecutionRunStatus.options) {
+      expect(RUN_STATUSES.has(status)).toBe(true);
+    }
+  });
+
+  it('still accepts the job-only statuses it accepted before', () => {
+    expect(RUN_STATUSES.has(ExecutionJobStatus.enum.timed_out_stale)).toBe(true);
+    expect(RUN_STATUSES.has(ExecutionJobStatus.enum.skipped)).toBe(true);
+  });
+
+  it('rejects an unknown status', () => {
+    expect(RUN_STATUSES.has('brand_new_status')).toBe(false);
+  });
+});

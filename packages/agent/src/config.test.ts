@@ -1,0 +1,646 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  loadConfig,
+  agentClientConnectionOptions,
+  scrubCredentialEnv,
+  describeExposedPosture,
+  type AppConfig,
+} from './config.js';
+
+describe('loadConfig', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    // Clear all KICI_ env vars
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('KICI_')) {
+        delete process.env[key];
+      }
+    }
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('parses valid config with all required env vars', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_AGENT_ID = 'test-agent-01';
+    process.env.KICI_LABELS = 'linux,docker';
+    const config = loadConfig();
+
+    expect(config.orchestratorUrl).toBe('ws://localhost:4000');
+    expect(config.agentId).toBe('test-agent-01');
+    expect(config.labels).toEqual(['linux', 'docker']);
+  });
+
+  it('parses KICI_PROPERTIES into a typed host-vars bag', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_PROPERTIES = 'region=eu,cores=8,gpu=true';
+    const config = loadConfig();
+    expect(config.properties).toEqual({ region: 'eu', cores: 8, gpu: true });
+    expect(agentClientConnectionOptions(config).properties).toEqual({
+      region: 'eu',
+      cores: 8,
+      gpu: true,
+    });
+  });
+
+  it('produces empty properties when KICI_PROPERTIES not set', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    const config = loadConfig();
+    expect(config.properties).toEqual({});
+  });
+
+  it('parses KICI_AGENT_PAYLOAD_DIR into agentPayloadDir', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_AGENT_PAYLOAD_DIR = '/var/lib/kici/agent-packages';
+    expect(loadConfig().agentPayloadDir).toBe('/var/lib/kici/agent-packages');
+  });
+
+  it('leaves agentPayloadDir undefined when KICI_AGENT_PAYLOAD_DIR is unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    expect(loadConfig().agentPayloadDir).toBeUndefined();
+  });
+
+  it('parses KICI_AGENT_COMMAND into agentCommand (golden-image escape hatch)', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_AGENT_COMMAND = '/opt/golden/kici-agent';
+    expect(loadConfig().agentCommand).toBe('/opt/golden/kici-agent');
+  });
+
+  it('throws with clear error when KICI_ORCHESTRATOR_URL is missing', () => {
+    expect(() => loadConfig()).toThrow('Configuration validation failed');
+    expect(() => loadConfig()).toThrow('orchestratorUrl');
+  });
+
+  describe('container-sandbox hardening config', () => {
+    it('defaults to a secure hardened posture', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.sandboxHardened).toBe(true);
+      expect(config.sandboxReadonlyRootfs).toBe(false);
+      expect(config.sandboxUser).toBeUndefined();
+      expect(config.sandboxPidsLimit).toBe(512);
+      expect(config.sandboxMemoryBytes).toBe(2 * 1024 * 1024 * 1024);
+      expect(config.sandboxNanoCpus).toBe(2 * 1_000_000_000);
+    });
+
+    it('honors the KICI_SANDBOX_HARDENED rollback flag', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SANDBOX_HARDENED = 'false';
+      expect(loadConfig().sandboxHardened).toBe(false);
+    });
+
+    it('parses the read-only rootfs / user / cgroup-cap overrides', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SANDBOX_READONLY_ROOTFS = 'true';
+      process.env.KICI_SANDBOX_USER = '1000:1000';
+      process.env.KICI_SANDBOX_PIDS_LIMIT = '256';
+      process.env.KICI_SANDBOX_MEMORY_BYTES = '1073741824';
+      process.env.KICI_SANDBOX_NANO_CPUS = '500000000';
+      const config = loadConfig();
+      expect(config.sandboxReadonlyRootfs).toBe(true);
+      expect(config.sandboxUser).toBe('1000:1000');
+      expect(config.sandboxPidsLimit).toBe(256);
+      expect(config.sandboxMemoryBytes).toBe(1_073_741_824);
+      expect(config.sandboxNanoCpus).toBe(500_000_000);
+    });
+  });
+
+  it('splits KICI_LABELS comma-separated string into array', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_LABELS = 'linux,docker,gpu';
+
+    const config = loadConfig();
+
+    expect(config.labels).toEqual(['linux', 'docker', 'gpu']);
+  });
+
+  it('produces empty array for empty KICI_LABELS', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_LABELS = '';
+
+    const config = loadConfig();
+
+    expect(config.labels).toEqual([]);
+  });
+
+  it('produces empty array when KICI_LABELS not set', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+
+    const config = loadConfig();
+
+    expect(config.labels).toEqual([]);
+  });
+
+  it('applies default values', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+
+    const config = loadConfig();
+
+    expect(config.port).toBe(8080);
+    expect(config.maxLogSizeBytes).toBe(10 * 1024 * 1024); // 10MB = 10485760
+    expect(config.defaultStepTimeoutMs).toBe(30 * 60 * 1000); // 30min = 1800000
+    expect(config.logLevel).toBe('info');
+    expect(config.dockerKeepFailed).toBe(false);
+  });
+
+  it('auto-generates agentId when KICI_AGENT_ID not provided', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+
+    const config = loadConfig();
+
+    // Should be hostname-uuid8 format
+    expect(config.agentId).toBeTruthy();
+    expect(config.agentId).toMatch(/.+-[a-f0-9]{8}/);
+  });
+
+  it('uses KICI_AGENT_ID when provided', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_AGENT_ID = 'custom-agent';
+
+    const config = loadConfig();
+
+    expect(config.agentId).toBe('custom-agent');
+  });
+
+  it('coerces numeric env vars', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_PORT = '9090';
+    process.env.KICI_MAX_LOG_SIZE_BYTES = '5242880';
+    process.env.KICI_DEFAULT_STEP_TIMEOUT_MS = '60000';
+
+    const config = loadConfig();
+
+    expect(config.port).toBe(9090);
+    expect(config.maxLogSizeBytes).toBe(5242880);
+    expect(config.defaultStepTimeoutMs).toBe(60000);
+  });
+
+  it('parses KICI_DOCKER_KEEP_FAILED as boolean', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_DOCKER_KEEP_FAILED = 'true';
+
+    const config = loadConfig();
+
+    expect(config.dockerKeepFailed).toBe(true);
+  });
+
+  it('defaults KICI_SANDBOX to false when unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+
+    const config = loadConfig();
+
+    expect(config.sandbox).toBe(false);
+  });
+
+  it('parses KICI_SANDBOX=true as boolean true', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_SANDBOX = 'true';
+
+    const config = loadConfig();
+
+    expect(config.sandbox).toBe(true);
+  });
+
+  it('parses KICI_SANDBOX=false as boolean false', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_SANDBOX = 'false';
+
+    const config = loadConfig();
+
+    expect(config.sandbox).toBe(false);
+  });
+
+  it('defaults KICI_TRUSTED_ENV to false when unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    const config = loadConfig();
+    expect(config.trustedEnv).toBe(false);
+  });
+
+  it('parses KICI_TRUSTED_ENV=true as boolean true (accepted known var)', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_TRUSTED_ENV = 'true';
+    const config = loadConfig();
+    expect(config.trustedEnv).toBe(true);
+  });
+
+  it('defaults KICI_IN_PLACE to false when unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    const config = loadConfig();
+    expect(config.inPlace).toBe(false);
+  });
+
+  it('parses KICI_IN_PLACE=true as boolean true (accepted known var)', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_IN_PLACE = 'true';
+    const config = loadConfig();
+    expect(config.inPlace).toBe(true);
+  });
+
+  it('defaults KICI_SANDBOX_NETWORK to "isolated" when unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+
+    const config = loadConfig();
+
+    expect(config.sandboxNetwork).toBe('isolated');
+  });
+
+  it('parses KICI_SANDBOX_NETWORK=host', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_SANDBOX_NETWORK = 'host';
+
+    const config = loadConfig();
+
+    expect(config.sandboxNetwork).toBe('host');
+  });
+
+  it('rejects invalid KICI_SANDBOX_NETWORK values with a clear error', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_SANDBOX_NETWORK = 'maybe';
+
+    expect(() => loadConfig()).toThrow(/sandboxNetwork/);
+  });
+
+  it('parses KICI_LOG_LEVEL enum values', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_LOG_LEVEL = 'debug';
+
+    const config = loadConfig();
+
+    expect(config.logLevel).toBe('debug');
+  });
+
+  describe('KICI_ROLES parsing', () => {
+    it('returns undefined when KICI_ROLES is unset (all roles, )', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.roles).toBeUndefined();
+    });
+
+    it('returns [] when KICI_ROLES is empty string (execution only, )', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = '';
+      const config = loadConfig();
+      expect(config.roles).toEqual([]);
+    });
+
+    it('parses KICI_ROLES=builder to ["builder"]', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'builder';
+      const config = loadConfig();
+      expect(config.roles).toEqual(['builder']);
+    });
+
+    it('parses KICI_ROLES=init-runner to ["init-runner"]', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'init-runner';
+      const config = loadConfig();
+      expect(config.roles).toEqual(['init-runner']);
+    });
+
+    it('parses KICI_ROLES=builder,init-runner to ["builder", "init-runner"]', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'builder,init-runner';
+      const config = loadConfig();
+      expect(config.roles).toEqual(['builder', 'init-runner']);
+    });
+
+    it('normalizes KICI_ROLES=all to undefined', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'all';
+      const config = loadConfig();
+      expect(config.roles).toBeUndefined();
+    });
+
+    it('normalizes KICI_ROLES=builder,all to undefined', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'builder,all';
+      const config = loadConfig();
+      expect(config.roles).toBeUndefined();
+    });
+
+    it('rejects KICI_ROLES=unknown with clear error', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'unknown';
+      expect(() => loadConfig()).toThrow('KICI_ROLES must contain only');
+    });
+
+    it('rejects KICI_ROLES=builder,invalid with clear error', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_ROLES = 'builder,invalid';
+      expect(() => loadConfig()).toThrow('KICI_ROLES must contain only');
+    });
+  });
+
+  describe('KICI_LABELS reserved prefix rejection', () => {
+    it('rejects KICI_LABELS with kici: prefix', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_LABELS = 'kici:role:builder';
+      expect(() => loadConfig()).toThrow(/kici:/);
+    });
+
+    it('accepts KICI_LABELS without kici: prefix', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_LABELS = 'linux,docker';
+      const config = loadConfig();
+      expect(config.labels).toEqual(['linux', 'docker']);
+    });
+
+    it('accepts reserved capability labels when a token is present (ops agent)', () => {
+      // A token-authenticated ssh-transport ops agent advertises
+      // kici:capability:ssh-transport; the orchestrator gates it against the
+      // token's authorized set at register, so the client-side guardrail must
+      // not block it.
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_AGENT_TOKEN = 'kat_ops_secret';
+      process.env.KICI_LABELS = 'kici:capability:ssh-transport,default';
+      const config = loadConfig();
+      expect(config.labels).toEqual(['kici:capability:ssh-transport', 'default']);
+    });
+
+    it('accepts reserved init-runner labels when a token is present', () => {
+      // The init-runner boots with a bootstrap token that authorizes
+      // kici:init / kici:privileged:root / kici:host:*; buildLauncher passes
+      // them via KICI_LABELS, so a token-bearing agent must accept them.
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_AGENT_TOKEN = 'kat_bootstrap';
+      process.env.KICI_LABELS = 'kici:init,kici:privileged:root,kici:host:box-00007';
+      const config = loadConfig();
+      expect(config.labels).toEqual(['kici:init', 'kici:privileged:root', 'kici:host:box-00007']);
+    });
+  });
+
+  describe('scaler / execution mode fields', () => {
+    it('parses KICI_SCALER_MANAGED=1 as boolean true', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SCALER_MANAGED = '1';
+      const config = loadConfig();
+      expect(config.scalerManaged).toBe(true);
+    });
+
+    it('defaults scalerManaged to false when KICI_SCALER_MANAGED unset', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.scalerManaged).toBe(false);
+    });
+
+    it('coerces KICI_SCALER_IDLE_TIMEOUT', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SCALER_IDLE_TIMEOUT = '12000';
+      const config = loadConfig();
+      expect(config.scalerIdleTimeoutMs).toBe(12000);
+    });
+
+    it('defaults KICI_SCALER_IDLE_TIMEOUT to 5000', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.scalerIdleTimeoutMs).toBe(5000);
+    });
+
+    it('coerces KICI_SCALER_PENDING_DISPATCH_TIMEOUT', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SCALER_PENDING_DISPATCH_TIMEOUT = '90000';
+      const config = loadConfig();
+      expect(config.scalerPendingDispatchTimeoutMs).toBe(90000);
+    });
+
+    it('defaults KICI_SCALER_PENDING_DISPATCH_TIMEOUT to 60000', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.scalerPendingDispatchTimeoutMs).toBe(60000);
+    });
+
+    it('parses KICI_SCALER_CLAIM_CODE into scalerClaimCode', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SCALER_CLAIM_CODE = 'claim-abc';
+      const config = loadConfig();
+      expect(config.scalerClaimCode).toBe('claim-abc');
+    });
+
+    it('leaves scalerClaimCode undefined when KICI_SCALER_CLAIM_CODE unset', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.scalerClaimCode).toBeUndefined();
+    });
+
+    it('parses KICI_EXECUTION_MODE=container', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_EXECUTION_MODE = 'container';
+      const config = loadConfig();
+      expect(config.executionMode).toBe('container');
+    });
+
+    it('rejects KICI_EXECUTION_MODE with unsupported value', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_EXECUTION_MODE = 'wasm';
+      expect(() => loadConfig()).toThrow(/executionMode/);
+    });
+
+    it('leaves executionMode undefined when env var unset', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.executionMode).toBeUndefined();
+    });
+  });
+
+  describe('unknown-KICI-var rejection', () => {
+    it('throws on a typo in a KICI_ env var (drift catcher)', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SECERT_KEY = 'oops';
+      expect(() => loadConfig()).toThrow(/Unknown KICI_/);
+    });
+
+    it('downgrades unknown KICI_ vars to a warning when KICI_DEV=true', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SECERT_KEY = 'oops';
+      process.env.KICI_DEV = 'true';
+      // Should not throw — KICI_DEV downgrades to warn
+      expect(() => loadConfig()).not.toThrow();
+    });
+
+    it('reads KICI_JOB_HEARTBEAT_INTERVAL_MS into jobHeartbeatIntervalMs', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_JOB_HEARTBEAT_INTERVAL_MS = '7777';
+      const config = loadConfig();
+      expect(config.jobHeartbeatIntervalMs).toBe(7777);
+    });
+
+    it('ignores non-KICI_ env vars (PATH, HOME, etc.)', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.SOME_OTHER_ENV = 'whatever';
+      expect(() => loadConfig()).not.toThrow();
+    });
+  });
+});
+
+describe('agentClientConnectionOptions', () => {
+  function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+    return {
+      orchestratorUrl: 'ws://localhost:4000/ws',
+      agentId: 'agent-1',
+      labels: ['linux', 'container'],
+      scalerManaged: true,
+      ...overrides,
+    } as AppConfig;
+  }
+
+  it('threads the agent token through so token-mode auth.request is sent', () => {
+    const opts = agentClientConnectionOptions(makeConfig({ agentToken: 'kat_secret' }));
+    expect(opts.token).toBe('kat_secret');
+  });
+
+  it('leaves token undefined when no token is configured (unauthenticated mode)', () => {
+    const opts = agentClientConnectionOptions(makeConfig({ agentToken: undefined }));
+    expect(opts.token).toBeUndefined();
+  });
+
+  it('carries the core connection identity fields', () => {
+    const opts = agentClientConnectionOptions(
+      makeConfig({ agentToken: 'kat_x', scalerManaged: true }),
+    );
+    expect(opts.url).toBe('ws://localhost:4000/ws');
+    expect(opts.agentId).toBe('agent-1');
+    expect(opts.labels).toEqual(['linux', 'container']);
+    expect(opts.scalerManaged).toBe(true);
+  });
+});
+
+describe('between-jobs config', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('KICI_')) delete process.env[key];
+    }
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('defaults orphanCleanup on, drainOnResetFailure off, reset disabled', () => {
+    const c = loadConfig();
+    expect(c.orphanCleanup).toBe(true);
+    expect(c.drainOnResetFailure).toBe(false);
+    expect(c.betweenJobsResetCommand).toBeUndefined();
+    expect(c.betweenJobsResetTimeoutMs).toBe(60_000);
+    expect(c.betweenJobsResetRunOn).toBe('always');
+  });
+
+  it('parses configured reset command, timeout, run-on, and switches', () => {
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND = 'docker system prune -f';
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS = '90000';
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON = 'on-failure';
+    process.env.KICI_AGENT_ORPHAN_CLEANUP = 'false';
+    process.env.KICI_AGENT_DRAIN_ON_RESET_FAILURE = 'true';
+    const c = loadConfig();
+    expect(c.betweenJobsResetCommand).toBe('docker system prune -f');
+    expect(c.betweenJobsResetTimeoutMs).toBe(90_000);
+    expect(c.betweenJobsResetRunOn).toBe('on-failure');
+    expect(c.orphanCleanup).toBe(false);
+    expect(c.drainOnResetFailure).toBe(true);
+  });
+
+  it('does not trip validateUnknownKiciVars for the new vars', () => {
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND = 'true';
+    expect(() => loadConfig()).not.toThrow();
+  });
+});
+
+describe('scrubCredentialEnv', () => {
+  it('removes the agent credentials from process.env while the config keeps them', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:3000';
+    process.env.KICI_AGENT_TOKEN = 'kat_secret-token';
+    process.env.KICI_SCALER_CLAIM_CODE = 'claim-code';
+    process.env.KICI_GITHUB_TOKEN = 'ghp_secret';
+
+    const config = loadConfig();
+    const removed = scrubCredentialEnv();
+
+    // The agent still authenticates: the value lives on the config object.
+    expect(config.agentToken).toBe('kat_secret-token');
+    expect(agentClientConnectionOptions(config).token).toBe('kat_secret-token');
+
+    expect(removed.sort()).toEqual([
+      'KICI_AGENT_TOKEN',
+      'KICI_GITHUB_TOKEN',
+      'KICI_SCALER_CLAIM_CODE',
+    ]);
+    expect(process.env.KICI_AGENT_TOKEN).toBeUndefined();
+    expect(process.env.KICI_SCALER_CLAIM_CODE).toBeUndefined();
+    expect(process.env.KICI_GITHUB_TOKEN).toBeUndefined();
+
+    // KICI_ORCHESTRATOR_URL is a URL, not a credential, and has a live reader.
+    expect(process.env.KICI_ORCHESTRATOR_URL).toBe('ws://localhost:3000');
+  });
+
+  it('is a no-op when no credential is set', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:3000';
+    delete process.env.KICI_AGENT_TOKEN;
+    delete process.env.KICI_SCALER_CLAIM_CODE;
+    delete process.env.KICI_GITHUB_TOKEN;
+
+    expect(scrubCredentialEnv()).toEqual([]);
+  });
+});
+
+describe('describeExposedPosture', () => {
+  const base = {
+    sandbox: false,
+    runnerUser: undefined,
+    executionMode: undefined,
+    jobImageAgent: false,
+  } as const;
+
+  it('warns on the default bare-metal posture', () => {
+    const warning = describeExposedPosture(base);
+    expect(warning).toContain('KICI_RUNNER_USER');
+    expect(warning).toContain('KICI_SANDBOX=true');
+  });
+
+  it('is silent with a dedicated runner user', () => {
+    expect(describeExposedPosture({ ...base, runnerUser: 'kici-runner' })).toBeUndefined();
+  });
+
+  it('is silent with bwrap', () => {
+    expect(describeExposedPosture({ ...base, sandbox: true })).toBeUndefined();
+  });
+
+  it('is silent under the container backend', () => {
+    expect(describeExposedPosture({ ...base, executionMode: 'container' })).toBeUndefined();
+  });
+
+  it('still warns when the agent IS the job image (steps run bare-metal)', () => {
+    expect(
+      describeExposedPosture({ ...base, executionMode: 'container', jobImageAgent: true }),
+    ).toBeDefined();
+  });
+});
+
+describe('KICI_RUNNER_DEBUG_STDIO is a declared config var', () => {
+  it('does not trip the unknown-KICI_*-var guard', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:3000';
+    process.env.KICI_RUNNER_DEBUG_STDIO = 'true';
+
+    // An undeclared KICI_* name makes loadConfig throw "Unknown KICI_* env
+    // var(s) detected — refusing to start", so the agent would not boot at all
+    // for an operator who turned the documented debug flag on.
+    try {
+      const config = loadConfig();
+      expect(config.runnerDebugStdio).toBe(true);
+    } finally {
+      delete process.env.KICI_RUNNER_DEBUG_STDIO;
+    }
+  });
+
+  it('defaults to false', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:3000';
+    delete process.env.KICI_RUNNER_DEBUG_STDIO;
+    expect(loadConfig().runnerDebugStdio).toBe(false);
+  });
+});

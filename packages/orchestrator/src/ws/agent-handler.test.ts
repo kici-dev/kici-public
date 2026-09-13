@@ -1,0 +1,3596 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Capture every module logger so the artifact tests can assert that the raw
+// exception a failed commit must NOT put on the wire is still recorded
+// server-side. Stripping the disclosure without keeping the log line would
+// trade a leak for an observability regression, so both halves are asserted.
+const mockLogError = vi.hoisted(() => vi.fn());
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: mockLogError, debug: vi.fn() }),
+  };
+});
+
+import { LogStream, agentLogChunkSchema } from '@kici-dev/engine';
+import {
+  createAgentWsHandler,
+  isValidLogChunk,
+  truncateCloseReason,
+  type AgentWsHandlerDeps,
+} from './agent-handler.js';
+import { AgentRegistry } from '../agent/registry.js';
+import type { Dispatcher } from '../agent/dispatcher.js';
+import type { AgentTokenStore } from '../agent/token-store.js';
+import { OwnershipTracker, type OwnershipDbResult } from '../agent/ownership-tracker.js';
+import { OWNERSHIP_REFUSED } from '../agent/ownership-refusal.js';
+import {
+  WS_CLOSE_AUTH_TIMEOUT,
+  WS_CLOSE_INVALID_MESSAGE,
+  WS_CLOSE_AGENT_AUTH_FAILED,
+  PRIVILEGED_ROOT_LABEL,
+  ArtifactCompleteAckOutcome,
+  ORCH_AGENT_CAPABILITIES,
+} from '@kici-dev/engine';
+import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
+import type { UserCache } from '../cache/user-cache.js';
+import {
+  ArtifactInvalidNameError,
+  ArtifactObjectMissingError,
+  type ArtifactStore,
+} from '../artifacts/artifact-store.js';
+import {
+  ARTIFACT_INVALID_NAME_PREFIX,
+  ArtifactInternalFailure,
+  artifactInvalidNameError,
+} from '../artifacts/failure-messages.js';
+import {
+  AgentApiRegistry,
+  ApiRoleDeniedError,
+  UnknownApiMethodError,
+} from './agent-api-registry.js';
+import { AgentWsInternalFailure } from './failure-messages.js';
+import { CacheRefScope } from '@kici-dev/engine';
+import { FleetAgentCollector } from './fleet-agent-collector.js';
+
+/** Create a mock Dispatcher with controllable methods. */
+function mockDispatcher(): Dispatcher {
+  return {
+    dispatch: vi.fn().mockResolvedValue({ status: 'queued', jobId: 'test' }),
+    onAgentAvailable: vi.fn().mockResolvedValue(undefined),
+    onAgentDisconnect: vi.fn().mockResolvedValue(undefined),
+    onJobComplete: vi.fn(),
+    markJobStarted: vi.fn(),
+    onJobRejected: vi.fn().mockResolvedValue(undefined),
+    releaseRebootPending: vi.fn().mockResolvedValue(undefined),
+  } as unknown as Dispatcher;
+}
+
+/** Create a mock AgentTokenStore. */
+function mockTokenStore(
+  overrides: Partial<{
+    validate: ReturnType<typeof vi.fn>;
+    createEphemeral: ReturnType<typeof vi.fn>;
+    cleanupExpired: ReturnType<typeof vi.fn>;
+  }> = {},
+): AgentTokenStore {
+  return {
+    validate:
+      overrides.validate ??
+      vi.fn().mockResolvedValue({
+        id: 'tok-1',
+        token_prefix: 'kat_abcd1234',
+        labels: null,
+        mandatory_labels: null,
+        agent_type: 'static',
+        created_at: new Date(),
+        last_seen_at: null,
+        created_by: null,
+        revoked_at: null,
+        expires_at: null,
+      }),
+    createEphemeral: overrides.createEphemeral ?? vi.fn(),
+    createStatic: vi.fn(),
+    revoke: vi.fn(),
+    list: vi.fn(),
+    cleanupExpired: overrides.cleanupExpired ?? vi.fn(),
+  } as unknown as AgentTokenStore;
+}
+
+/** Create a MessageEvent-like object for testing. */
+function makeMessageEvent(data: unknown): MessageEvent {
+  return { data: JSON.stringify(data) } as MessageEvent;
+}
+
+/** Create a well-formed agent.register message. */
+function registerMsg(overrides: Partial<{ agentId: string; labels: string[] }> = {}) {
+  return {
+    type: 'agent.register' as const,
+    messageId: 'msg-1',
+    agentId: overrides.agentId ?? 'agent-1',
+    labels: overrides.labels ?? ['linux', 'docker'],
+  };
+}
+
+/** Create an auth.request message. */
+function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
+  return {
+    type: 'auth.request' as const,
+    token,
+    protocolVersion: 1,
+  };
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+describe('createAgentWsHandler', () => {
+  let registry: AgentRegistry;
+  let dispatcher: Dispatcher;
+  let onJobStatus: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // Per-test isolation for the shared module-logger stub, so a
+    // `toHaveBeenCalledWith` on it can only be satisfied by its own test.
+    mockLogError.mockClear();
+    registry = new AgentRegistry();
+    dispatcher = mockDispatcher();
+    onJobStatus = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // ── Fleet bundle chunks vs the per-connection rate limiter ────
+
+  describe('fleet.bundle.chunk against the rate limiter', () => {
+    // A limiter small enough that a handful of chunks exhausts it: the real
+    // defaults are 2 MiB / 200 messages, and the agent's mini-bundle can
+    // legitimately be 25× the byte burst. Two chunks fit, the third does not.
+    const chunkBytes = 1000;
+    const rateLimiterConfig = {
+      messageCapacity: 100,
+      messageRefillRate: 1,
+      // Two chunk frames plus the registration frame fit; a third chunk does not.
+      bytesCapacity: chunkBytes * 2 + 600,
+      bytesRefillRate: 1,
+      maxMessageSize: 1024 * 1024,
+    };
+
+    function chunk(requestId: string, seq: number, isLast: boolean) {
+      return {
+        type: 'fleet.bundle.chunk' as const,
+        requestId,
+        seq,
+        isLast,
+        dataB64: 'A'.repeat(chunkBytes),
+      };
+    }
+
+    async function registeredHandler(collector: FleetAgentCollector) {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        rateLimiterConfig,
+        fleetAgentCollector: collector,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      expect(registry.get('agent-1')).toBeDefined();
+      return { handler, ws };
+    }
+
+    function rateLimitWarnings(ws: ReturnType<typeof mockWs>): number {
+      return (ws.send as ReturnType<typeof vi.fn>).mock.calls.filter((call) =>
+        String(call[0]).includes('"rate.limit.warning"'),
+      ).length;
+    }
+
+    it('lets a solicited bundle stream past the byte burst and assembles it whole', async () => {
+      const collector = new FleetAgentCollector({ timeoutMs: 10_000 });
+      const { handler, ws } = await registeredHandler(collector);
+
+      // The orchestrator asks; the collector now holds the request for agent-1.
+      const requestId = 'req-solicited';
+      const bundle = collector.request(requestId, 'agent-1', () => {});
+
+      // Six chunks in one burst — three times what the byte bucket admits.
+      for (let seq = 0; seq < 6; seq++) {
+        await handler.onMessage!(makeMessageEvent(chunk(requestId, seq, seq === 5)), ws as any);
+      }
+
+      // fails-when: the chunk is rate-limited like any other frame — the third
+      // frame is dropped with a warning, the fourth arrives out of order, and
+      // the collection rejects instead of resolving.
+      const assembled = await bundle;
+      expect(assembled.length).toBe(6 * Buffer.from('A'.repeat(chunkBytes), 'base64').length);
+      expect(rateLimitWarnings(ws)).toBe(0);
+    });
+
+    it('still throttles a chunk for a collection nobody asked this agent for', async () => {
+      // breaks-if-wrong: the exemption must be keyed on a pending request for
+      // THIS agent, or the frame type alone becomes a limiter bypass.
+      const collector = new FleetAgentCollector({ timeoutMs: 10_000 });
+      const { handler, ws } = await registeredHandler(collector);
+
+      // A request that exists, but was sent to a different agent.
+      collector.request('req-for-agent-2', 'agent-2', () => {}).catch(() => {});
+
+      for (let seq = 0; seq < 6; seq++) {
+        await handler.onMessage!(makeMessageEvent(chunk('req-for-agent-2', seq, false)), ws as any);
+      }
+      for (let seq = 0; seq < 6; seq++) {
+        await handler.onMessage!(makeMessageEvent(chunk('req-unknown', seq, false)), ws as any);
+      }
+
+      // Two frames per request fit the burst; the rest were warned and dropped.
+      expect(rateLimitWarnings(ws)).toBe(10);
+    });
+  });
+
+  // ── Unauthenticated mode (agentAuthMode='none') ──────────────
+
+  describe('unauthenticated mode (agentAuthMode=none)', () => {
+    function createHandler(extraDeps: Partial<AgentWsHandlerDeps> = {}) {
+      return createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ...extraDeps,
+      });
+    }
+
+    it('registers agent in registry and calls onAgentAvailable', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const entry = registry.get('agent-1');
+      expect(entry).toBeDefined();
+      expect(entry!.agentId).toBe('agent-1');
+      expect(entry!.labels).toEqual(new Set(['linux', 'docker']));
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('folds the wire labels before the scaler correlates them', async () => {
+      // The scaler matches an agent against its own label sets, which the
+      // scaler config load already folded. An agent advertising `Docker` must
+      // therefore arrive as `docker` or it correlates against no pool at all.
+      const onScalerAgentRegistered = vi.fn().mockResolvedValue({ mandatoryLabels: [] });
+      const handler = createHandler({ onScalerAgentRegistered });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ labels: ['Linux', 'Docker'] })),
+        ws as any,
+      );
+
+      expect(onScalerAgentRegistered).toHaveBeenCalledWith('agent-1', ['linux', 'docker']);
+    });
+
+    it('a scaler-supplied gate reaches the entry folded and gates on a lowercase runsOn', async () => {
+      // End to end for the taint: the scaler config folds `mandatoryLabels` at
+      // load, but an ADOPTED spawn record returns whatever was persisted, so
+      // the fold is asserted where the gate is actually read — the AgentEntry.
+      const onScalerAgentRegistered = vi.fn().mockResolvedValue({ mandatoryLabels: ['GPU'] });
+      const handler = createHandler({ onScalerAgentRegistered });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ labels: ['linux', 'GPU'] })),
+        ws as any,
+      );
+
+      const entry = registry.get('agent-1');
+      expect([...entry!.mandatoryLabels]).toEqual(['gpu']);
+      // The gate is satisfied by a lowercase runsOn…
+      expect(registry.findAvailable(['linux', 'gpu']).map((e) => e.agentId)).toEqual(['agent-1']);
+      // …and still blocks a job that omits it, so the fold did not defeat it.
+      expect(registry.findAvailable(['linux'])).toHaveLength(0);
+    });
+
+    it('passes runningAsUser and runningAsUid to registry on initial registration', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({
+          ...registerMsg({ agentId: 'agent-uid' }),
+          runningAsUser: 'ci-runner',
+          runningAsUid: 1001,
+        }),
+        ws as any,
+      );
+
+      const entry = registry.get('agent-uid');
+      expect(entry).toBeDefined();
+      expect(entry!.runningAsUser).toBe('ci-runner');
+      expect(entry!.runningAsUid).toBe(1001);
+    });
+
+    it('stores agentId on WS context for disconnect handling', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      handler.onClose!(new CloseEvent('close'), ws as any);
+      expect(dispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('closes connection if no register within 10s', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      vi.advanceTimersByTime(10_000);
+
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AUTH_TIMEOUT, 'Registration timeout');
+    });
+
+    it('does not close if register arrives within timeout', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      vi.advanceTimersByTime(10_000);
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+
+    it('rejects non-register first message', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({ type: 'heartbeat', timestamp: Date.now() }),
+        ws as any,
+      );
+
+      expect(ws.close).toHaveBeenCalledWith(
+        WS_CLOSE_INVALID_MESSAGE,
+        'First message must be agent.register',
+      );
+    });
+
+    // An agent cannot tell which auth mode the orchestrator runs, so one that
+    // carries a token — a static `KICI_AGENT_TOKEN`, or the ephemeral one a
+    // claim-code self-bootstrap just minted — opens with `auth.request` and
+    // waits for `auth.success` before it registers. Refusing that frame strands
+    // every such agent in a permanent reconnect loop it can never escape.
+    it('answers a pre-registration auth.request with auth.success, then registers', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      expect(ws.close).not.toHaveBeenCalled();
+      const authSuccess = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.success');
+      expect(authSuccess).toBeDefined();
+      expect(authSuccess.connectionId).toEqual(expect.any(String));
+
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ agentId: 'agent-selfboot' })),
+        ws as any,
+      );
+      expect(registry.get('agent-selfboot')).toBeDefined();
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledWith('agent-selfboot');
+    });
+
+    // Auth is disabled, so the frame is tolerated and the token ignored. Reading
+    // it would refuse an agent whose token is expired in a mode that accepts a
+    // tokenless one — a regression dressed as a hardening.
+    it('ignores the token on a pre-registration auth.request', async () => {
+      const tokenStore = mockTokenStore();
+      const handler = createHandler({ tokenStore });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      expect(tokenStore.validate).not.toHaveBeenCalled();
+    });
+
+    // The registration timer is deliberately left running across the tolerated
+    // auth.request, so an agent that authenticates and then goes quiet is still
+    // bounded rather than holding the connection open forever.
+    it('keeps the registration timeout running across the tolerated auth.request', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      vi.advanceTimersByTime(10_000);
+
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AUTH_TIMEOUT, 'Registration timeout');
+    });
+
+    it('sends register.ack after registration', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ agentId: 'agent-ack', labels: ['linux'] })),
+        ws as any,
+      );
+
+      const sentCalls = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const ackMsg = sentCalls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'register.ack');
+
+      expect(ackMsg).toEqual({
+        type: 'register.ack',
+        agentId: 'agent-ack',
+        labels: ['linux'],
+        scalerManaged: false,
+        capabilities: ORCH_AGENT_CAPABILITIES,
+      });
+    });
+  });
+
+  // ── Authenticated mode (agentAuthMode='token') ────────────────
+
+  describe('authenticated mode (agentAuthMode=token)', () => {
+    function createHandler(extraDeps: Partial<AgentWsHandlerDeps> = {}) {
+      return createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'token',
+        tokenStore: mockTokenStore(),
+        onJobStatus,
+        ...extraDeps,
+      });
+    }
+
+    it('happy path: auth.request -> auth.success -> agent.register -> register.ack', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+
+      // Send auth.request
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      // Check auth.success was sent
+      const sentAfterAuth = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const authSuccess = sentAfterAuth
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.success');
+      expect(authSuccess).toBeDefined();
+      expect(authSuccess!.connectionId).toBeDefined();
+
+      // Send agent.register
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      // Check agent is registered
+      const entry = registry.get('agent-1');
+      expect(entry).toBeDefined();
+
+      // Check register.ack was sent
+      const sentAfterReg = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const registerAck = sentAfterReg
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'register.ack');
+      expect(registerAck).toBeDefined();
+      expect(registerAck!.agentId).toBe('agent-1');
+    });
+
+    it('self-bootstrap: token-mode connection claims BEFORE auth, then auth.request proceeds', async () => {
+      // A scaler-managed agent runs against a token-mode orchestrator, so a
+      // fresh connection is in pendingAuth (Phase 1). It redeems its claim code
+      // FIRST, then authenticates with the minted token. The claim must be
+      // admitted in pendingAuth without breaking the follow-up auth.request.
+      const credentials = {
+        agentToken: 'kat_' + 'b'.repeat(64),
+        agentId: 'fresh-1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['github-actions'],
+      };
+      const onClaimCredentials = vi.fn().mockResolvedValue({ credentials });
+      const handler = createHandler({ onClaimCredentials });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+
+      // Claim before any auth.request.
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+      expect(onClaimCredentials).toHaveBeenCalledWith('', 'code-abc');
+      const claimResp = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'scaler.claim-credentials.response');
+      expect(claimResp).toMatchObject({ requestId: 'r1', credentials });
+
+      // The connection stayed in pendingAuth: auth.request now proceeds to auth.success.
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      const authSuccess = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.success');
+      expect(authSuccess).toBeDefined();
+    });
+
+    // ── Privileged-root taint (token mandatory_labels) ──────────
+
+    /** A validated token row carrying authorized labels + a taint set. */
+    function privilegedRootTokenRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'tok-root',
+        token_prefix: 'kat_root0000',
+        labels: JSON.stringify(['linux', PRIVILEGED_ROOT_LABEL]),
+        mandatory_labels: JSON.stringify([PRIVILEGED_ROOT_LABEL]),
+        agent_type: 'static',
+        created_at: new Date(),
+        last_seen_at: null,
+        created_by: 'cli:admin',
+        revoked_at: null,
+        expires_at: null,
+        ...overrides,
+      };
+    }
+
+    /** Drive auth.request -> agent.register with a custom register payload. */
+    async function authAndRegister(
+      tokenRow: Record<string, unknown>,
+      register: { agentId: string; labels: string[]; runningAsUid?: number },
+    ) {
+      const ts = mockTokenStore({ validate: vi.fn().mockResolvedValue(tokenRow) });
+      const handler = createHandler({ tokenStore: ts });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'agent.register',
+          messageId: 'reg-1',
+          agentId: register.agentId,
+          labels: register.labels,
+          ...(register.runningAsUid !== undefined ? { runningAsUid: register.runningAsUid } : {}),
+        }),
+        ws as any,
+      );
+      return ws;
+    }
+
+    it('static agent inherits token mandatory_labels and is confined by the taint', async () => {
+      await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 0,
+      });
+
+      const entry = registry.get('agent-root');
+      expect(entry).toBeDefined();
+      expect([...entry!.mandatoryLabels]).toEqual([PRIVILEGED_ROOT_LABEL]);
+
+      // A plain job (no privileged:root) must NOT match the tainted agent.
+      expect(registry.findAvailable(['linux']).map((e) => e.agentId)).not.toContain('agent-root');
+      // A root-demanding job MUST match it.
+      expect(
+        registry.findAvailable(['linux', PRIVILEGED_ROOT_LABEL]).map((e) => e.agentId),
+      ).toContain('agent-root');
+    });
+
+    it('accepts a privileged-root agent running as root (uid 0)', async () => {
+      await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 0,
+      });
+      expect(registry.get('agent-root')).toBeDefined();
+    });
+
+    it('rejects a privileged-root token presented by a non-root agent (uid != 0)', async () => {
+      const ws = await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 1000,
+      });
+      expect(registry.get('agent-root')).toBeUndefined();
+      const close = (ws.close as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      expect(close?.[0]).toBe(WS_CLOSE_AGENT_AUTH_FAILED);
+      expect(String(close?.[1])).toMatch(/privileged-root.*non-root|uid/i);
+    });
+
+    it('rejects a privileged-root claim when uid is absent (cannot verify)', async () => {
+      const ws = await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        // no runningAsUid
+      });
+      expect(registry.get('agent-root')).toBeUndefined();
+      const close = (ws.close as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      expect(close?.[0]).toBe(WS_CLOSE_AGENT_AUTH_FAILED);
+    });
+
+    it('rejects a privileged-root advertised label by a non-root agent even without a taint', async () => {
+      // The honesty gate keys off the advertised label too: an agent that
+      // advertises kici:privileged:root (authorized by a token that lists it as
+      // a label but mints no taint) must still be uid 0.
+      const ws = await authAndRegister(privilegedRootTokenRow({ mandatory_labels: null }), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 1000,
+      });
+      expect(registry.get('agent-root')).toBeUndefined();
+      const close = (ws.close as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      expect(close?.[0]).toBe(WS_CLOSE_AGENT_AUTH_FAILED);
+    });
+
+    it('rejects invalid token -> auth.failure + WS close 4010', async () => {
+      const ts = mockTokenStore({ validate: vi.fn().mockResolvedValue(null) });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'token',
+        tokenStore: ts,
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg('kat_bad_token')), ws as any);
+
+      const sentCalls = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const authFailure = sentCalls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.failure');
+      expect(authFailure).toBeDefined();
+      expect(authFailure!.reason).toContain('Invalid or expired token');
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AGENT_AUTH_FAILED, 'Authentication failed');
+    });
+
+    it('auth timeout (no auth.request within 5s) -> WS close 4002', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      vi.advanceTimersByTime(5_000);
+
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AUTH_TIMEOUT, 'Auth timeout');
+    });
+
+    it('agent.register without prior auth.request (when auth enabled) -> rejected', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+
+      // Send agent.register directly (should fail because auth.request is expected)
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      // Should be rejected because auth.request was not received first
+      const sentCalls = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const authFailure = sentCalls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.failure');
+      expect(authFailure).toBeDefined();
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AGENT_AUTH_FAILED, 'Invalid auth message');
+    });
+
+    it('agentId collision (different token) -> rejected', async () => {
+      const ts = mockTokenStore();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'token',
+        tokenStore: ts,
+        onJobStatus,
+      });
+
+      // First agent registers successfully
+      const ws1 = mockWs();
+      handler.onOpen!(new Event('open'), ws1 as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws1 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg({ agentId: 'agent-1' })), ws1 as any);
+      expect(registry.get('agent-1')).toBeDefined();
+
+      // Second agent tries to register with same agentId but different tokenId
+      (ts.validate as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'tok-2', // Different token ID
+        token_prefix: 'kat_bbbb2222',
+        labels: null,
+        agent_type: 'static',
+        created_at: new Date(),
+        last_seen_at: null,
+        created_by: null,
+        revoked_at: null,
+        expires_at: null,
+      });
+
+      const ws2 = mockWs();
+      handler.onOpen!(new Event('open'), ws2 as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg('kat_different')), ws2 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg({ agentId: 'agent-1' })), ws2 as any);
+
+      expect(ws2.close).toHaveBeenCalledWith(
+        WS_CLOSE_INVALID_MESSAGE,
+        'AgentId already registered with a different token',
+      );
+    });
+
+    it('agentId reconnection (same token) -> WS reference replaced', async () => {
+      const ts = mockTokenStore();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'token',
+        tokenStore: ts,
+        onJobStatus,
+      });
+
+      // First connection
+      const ws1 = mockWs();
+      handler.onOpen!(new Event('open'), ws1 as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws1 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg({ agentId: 'agent-1' })), ws1 as any);
+      expect(registry.get('agent-1')).toBeDefined();
+
+      // Same agent reconnects with same token (same tokenId 'tok-1')
+      const ws2 = mockWs();
+      handler.onOpen!(new Event('open'), ws2 as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws2 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg({ agentId: 'agent-1' })), ws2 as any);
+
+      // Should succeed -- WS reference replaced
+      expect(ws2.close).not.toHaveBeenCalled();
+      expect(registry.get('agent-1')).toBeDefined();
+    });
+
+    it('disconnect during pendingAuth cleans up', () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      handler.onClose!(new CloseEvent('close'), ws as any);
+
+      // Should not call dispatcher
+      expect(dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+    });
+
+    it('disconnect during pendingRegistration cleans up', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      handler.onClose!(new CloseEvent('close'), ws as any);
+
+      // Should not call dispatcher
+      expect(dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+    });
+
+    it('a concurrent second agent.register on one socket adopts at most once', async () => {
+      // Awaiting the adoption lookup opens a yield point between
+      // `pendingRegistration.delete(ws)` and `registry.register(...)`. WS
+      // message handlers are not serialized, so prove a second frame cannot
+      // slip through it.
+      //
+      // The gate is a manually-released deferred rather than a timer: this
+      // suite runs on fake timers, so a `setTimeout` inside the callback would
+      // never fire and both frames would hang.
+      let releaseAdoption!: () => void;
+      const adoptionGate = new Promise<void>((resolve) => {
+        releaseAdoption = resolve;
+      });
+      const onScalerAgentRegistered = vi.fn().mockImplementation(async () => {
+        await adoptionGate;
+        return { mandatoryLabels: [] };
+      });
+      const handler = createHandler({ onScalerAgentRegistered });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      const first = handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      // The first frame is parked inside the adoption lookup; the second one
+      // runs against exactly that window.
+      await vi.waitFor(() => expect(onScalerAgentRegistered).toHaveBeenCalledTimes(1));
+      const second = handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      releaseAdoption();
+      await Promise.all([first, second]);
+
+      expect(onScalerAgentRegistered).toHaveBeenCalledTimes(1);
+      expect(registry.get('agent-1')).toBeDefined();
+      // The second frame is dropped, not closed: the socket is mid-registration,
+      // and closing it would kill the connection frame 1 is about to register.
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+
+    it('a close arriving mid-registration leaves no entry for the dead socket', async () => {
+      // The socket has left `pendingRegistration` and has not reached
+      // `wsToAgentId`, so `onClose` matches none of its usual branches.
+      // Registering anyway would put a dead WS in the registry with no close
+      // event left to remove it — its jobs would never fail over and, for a
+      // scaler agent, its provisioned instance would never be torn down.
+      let releaseAdoption!: () => void;
+      const adoptionGate = new Promise<void>((resolve) => {
+        releaseAdoption = resolve;
+      });
+      const onScalerAgentRegistered = vi.fn().mockImplementation(async () => {
+        await adoptionGate;
+        return { mandatoryLabels: [] };
+      });
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createHandler({ onScalerAgentRegistered, onScalerAgentDisconnected });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      const register = handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await vi.waitFor(() => expect(onScalerAgentRegistered).toHaveBeenCalledTimes(1));
+
+      // Close lands while the registration is parked in the scaler lookup.
+      handler.onClose!(new CloseEvent('close'), ws as any);
+      releaseAdoption();
+      await register;
+
+      expect(registry.get('agent-1')).toBeUndefined();
+      // The lookup already correlated the agent to a scaler, so its teardown
+      // has to run from here — no later close event will ever arrive.
+      expect(onScalerAgentDisconnected).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('refuses the registration when the scaler lookup throws', async () => {
+      // The scaler could not read this agent's spawn record. Registering it
+      // anyway makes it static for its whole life, with no `mandatoryLabels`
+      // gate, so a queued job whose `runsOn` omits the platform taint can land
+      // on it. Refusing costs the agent a reconnect.
+      const onScalerAgentRegistered = vi
+        .fn()
+        .mockRejectedValue(new Error('scaler adoption lookup failed for agent agent-1'));
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createHandler({ onScalerAgentRegistered, onScalerAgentDisconnected });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      expect(registry.get('agent-1')).toBeUndefined();
+      expect(ws.close).toHaveBeenCalledWith(4006, 'Scaler state unavailable');
+      // Nothing was correlated, so there is no teardown to run.
+      expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('keeps registering when the close lands after registration completed', async () => {
+      // The complement of the test above: without it, a fix that never
+      // registered would pass that one.
+      const onScalerAgentRegistered = vi.fn().mockResolvedValue({ mandatoryLabels: [] });
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createHandler({ onScalerAgentRegistered, onScalerAgentDisconnected });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      expect(registry.get('agent-1')).toBeDefined();
+      expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Common behavior tests (shared across both modes) ──────────
+
+  describe('agent.status', () => {
+    it('does not clobber the authoritative registry count from the self-report', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const entry = registry.get('agent-1')!;
+      // Registry says the agent is busy (a dispatch is in flight). A stale
+      // self-report of 0 must NOT re-open the slot.
+      entry.activeJobs = 1;
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'agent.status',
+          messageId: 'msg-2',
+          agentId: 'agent-1',
+          activeJobs: 0,
+        }),
+        ws as any,
+      );
+
+      // Registry count is authoritative — unchanged by the self-report.
+      expect(entry.activeJobs).toBe(1);
+      // No spare capacity (1/1), so no drain beyond the register-time one.
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledTimes(1);
+    });
+
+    it('triggers a queue drain whenever the registry shows spare capacity', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const entry = registry.get('agent-1')!;
+      entry.activeJobs = 0;
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'agent.status',
+          messageId: 'msg-2',
+          agentId: 'agent-1',
+          activeJobs: 1,
+        }),
+        ws as any,
+      );
+
+      // Registry shows capacity (0/1), so the drain fires again (idempotent).
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('job.status with success', () => {
+    it('decrements activeJobs and triggers queue drain', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-3',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-1');
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('job.status with failed', () => {
+    it('decrements activeJobs and forwards to Platform', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const timestamp = Date.now();
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-4',
+          runId: 'run-2',
+          jobId: 'job-2',
+          state: 'failed',
+          timestamp,
+          data: { error: 'Build failed' },
+        }),
+        ws as any,
+      );
+
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-2');
+      expect(onJobStatus).toHaveBeenCalledWith('agent-1', {
+        runId: 'run-2',
+        jobId: 'job-2',
+        state: 'failed',
+        timestamp,
+        data: { error: 'Build failed' },
+      });
+    });
+  });
+
+  describe('heartbeat', () => {
+    it('updates registry timestamp', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const beforeHeartbeat = registry.get('agent-1')!.lastHeartbeatAt;
+      vi.advanceTimersByTime(5000);
+
+      await handler.onMessage!(
+        makeMessageEvent({ type: 'heartbeat', timestamp: Date.now() }),
+        ws as any,
+      );
+
+      const afterHeartbeat = registry.get('agent-1')!.lastHeartbeatAt;
+      expect(afterHeartbeat).toBeGreaterThanOrEqual(beforeHeartbeat);
+    });
+  });
+
+  describe('provenance.upload.complete', () => {
+    it('initializes the bundle metadata sidecar before recording the attestation', async () => {
+      // The agent uploads the bundle via a presigned PUT (data object only).
+      // CacheStorage.get is metadata-gated, so the handler MUST write the
+      // metadata sidecar via initMeta(key) before the dashboard read can inline
+      // the bundle — otherwise the P1.7 attestations API reads it back as
+      // missing and returns an empty list despite a recorded DB row.
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
+
+      const initMeta = vi.fn().mockResolvedValue(undefined);
+      const provenanceStorage = { initMeta } as unknown as AgentWsHandlerDeps['provenanceStorage'];
+
+      const recordedKeys: string[] = [];
+      const onProvenanceUpload = vi.fn(async (record: { storageKey: string }) => {
+        // initMeta must already have run by the time the DB row is recorded.
+        expect(initMeta).toHaveBeenCalledTimes(1);
+        recordedKeys.push(record.storageKey);
+      });
+
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs,
+        provenanceStorage,
+        onProvenanceUpload,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'provenance.upload.complete',
+          messageId: 'msg-prov',
+          jobId: 'job-prov',
+          subjectName: 'artifact.bin',
+          subjectDigest: 'a'.repeat(64),
+          mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+        }),
+        ws as any,
+      );
+
+      const expectedKey = `provenance/run-prov/job-prov/${'a'.repeat(64)}.kici.json`;
+      expect(initMeta).toHaveBeenCalledWith(expectedKey);
+      expect(onProvenanceUpload).toHaveBeenCalledTimes(1);
+      expect(recordedKeys).toEqual([expectedKey]);
+    });
+  });
+
+  describe('provenance.upload.defer', () => {
+    const deferMsg = {
+      type: 'provenance.upload.defer' as const,
+      messageId: 'msg-defer',
+      jobId: 'job-prov',
+      subjectName: 'artifact.bin',
+      subjectDigest: 'a'.repeat(64),
+      audience: 'kici-provenance',
+      mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+      statementHash: 'b'.repeat(64),
+      dsseEnvelope: {
+        payloadType: 'application/vnd.in-toto+json',
+        payload: 'eyJ4Ijoxf',
+        signatures: [{ keyid: 'k', sig: 's' }],
+      },
+      publicKey: { kty: 'EC', crv: 'P-256', x: 'a', y: 'b' },
+    };
+
+    it('captures the frozen envelope with runId resolved from the dispatch ref', async () => {
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
+
+      const captured: unknown[] = [];
+      const onProvenanceDefer = vi.fn(async (record: unknown) => {
+        captured.push(record);
+      });
+
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs,
+        onProvenanceDefer,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(deferMsg), ws as any);
+
+      expect(onProvenanceDefer).toHaveBeenCalledTimes(1);
+      expect(captured[0]).toMatchObject({
+        runId: 'run-prov',
+        jobId: 'job-prov',
+        subjectDigest: 'a'.repeat(64),
+        statementHash: 'b'.repeat(64),
+        originKind: 'deferred',
+      });
+    });
+
+    it('honours classifyDeferOrigin (offline-backfill)', async () => {
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
+
+      const onProvenanceDefer = vi.fn(async () => {});
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs,
+        onProvenanceDefer,
+        classifyDeferOrigin: async () => 'offline-backfill',
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(deferMsg), ws as any);
+
+      expect(onProvenanceDefer).toHaveBeenCalledWith(
+        expect.objectContaining({ originKind: 'offline-backfill' }),
+      );
+    });
+
+    it('drops a defer for an unresolvable job', async () => {
+      const onProvenanceDefer = vi.fn(async () => {});
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs: new DispatchCacheRefTracker(),
+        onProvenanceDefer,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(deferMsg), ws as any);
+
+      expect(onProvenanceDefer).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('invalid message', () => {
+    it('logs warning and closes connection for malformed JSON', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!({ data: 'not json {{{' } as MessageEvent, ws as any);
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_INVALID_MESSAGE, 'Malformed JSON');
+    });
+
+    it('closes connection for invalid message format after registration', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(makeMessageEvent({ type: 'unknown.type', foo: 'bar' }), ws as any);
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_INVALID_MESSAGE, 'Invalid message');
+    });
+  });
+
+  describe('disconnect', () => {
+    it('calls onAgentDisconnect and unregisters', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      expect(registry.get('agent-1')).toBeDefined();
+      handler.onClose!(new CloseEvent('close'), ws as any);
+      expect(dispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('handles disconnect before registration (pending state)', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      handler.onClose!(new CloseEvent('close'), ws as any);
+
+      expect(dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+    });
+
+    it('cleans up pendingBuilds, pendingInits, and pendingDynamics on disconnect', async () => {
+      const failedJobIds = ['job-1', 'job-2', 'job-3'];
+      const disconnectDispatcher = {
+        ...dispatcher,
+        onAgentDisconnect: vi.fn().mockResolvedValue(failedJobIds),
+      } as unknown as Dispatcher;
+
+      const pendingBuilds = { cleanup: vi.fn() };
+      const pendingInits = { cleanup: vi.fn() };
+      const pendingDynamics = { cleanup: vi.fn() };
+
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher: disconnectDispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        pendingBuilds: pendingBuilds as any,
+        pendingInits: pendingInits as any,
+        pendingDynamics: pendingDynamics as any,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      handler.onClose!(new CloseEvent('close'), ws as any);
+
+      // Wait for the async onAgentDisconnect to resolve
+      await vi.waitFor(() => {
+        expect(disconnectDispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
+      });
+
+      // All three trackers should be cleaned up for each failed job
+      for (const jobId of failedJobIds) {
+        expect(pendingBuilds.cleanup).toHaveBeenCalledWith(jobId);
+        expect(pendingInits.cleanup).toHaveBeenCalledWith(jobId);
+        expect(pendingDynamics.cleanup).toHaveBeenCalledWith(jobId);
+      }
+    });
+
+    it('a stale socket closing does not tear down the registration that replaced it', async () => {
+      // A half-open connection can outlive the reconnect that replaced it. Its
+      // close carries the same agent id, so without the socket-identity guard
+      // the teardown runs against the live registration: the agent is
+      // unregistered, its running jobs are failed, and a scaler-managed agent
+      // is destroyed while it is still streaming on the new socket.
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+      });
+      const s1 = mockWs();
+      const s2 = mockWs();
+
+      handler.onOpen!(new Event('open'), s1 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), s1 as any);
+      handler.onOpen!(new Event('open'), s2 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), s2 as any);
+
+      expect(registry.get('agent-1')!.ws).toBe(s2);
+      // The reconnect retires the ghost rather than leaving it to the OS.
+      expect(s1.close).toHaveBeenCalledWith(4032, 'Superseded by reconnect');
+
+      handler.onClose!(new CloseEvent('close'), s1 as any);
+
+      expect(dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+      expect(registry.get('agent-1')).toBeDefined();
+      expect(registry.get('agent-1')!.ws).toBe(s2);
+    });
+
+    it('closing the live socket still runs the full teardown exactly once', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+      });
+      const s1 = mockWs();
+      const s2 = mockWs();
+
+      handler.onOpen!(new Event('open'), s1 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), s1 as any);
+      handler.onOpen!(new Event('open'), s2 as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), s2 as any);
+
+      handler.onClose!(new CloseEvent('close'), s1 as any);
+      handler.onClose!(new CloseEvent('close'), s2 as any);
+
+      expect(dispatcher.onAgentDisconnect).toHaveBeenCalledTimes(1);
+      expect(dispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
+    });
+  });
+
+  describe('scaler lifecycle callbacks', () => {
+    it('calls onScalerAgentRegistered on registration', async () => {
+      const onScalerAgentRegistered = vi.fn();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onScalerAgentRegistered,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ agentId: 'scaler-agent-1', labels: ['linux', 'docker'] })),
+        ws as any,
+      );
+
+      expect(onScalerAgentRegistered).toHaveBeenCalledWith('scaler-agent-1', ['linux', 'docker']);
+    });
+
+    it('calls onScalerAgentDisconnected on disconnect', async () => {
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onScalerAgentDisconnected,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      handler.onClose!(new CloseEvent('close'), ws as any);
+      expect(onScalerAgentDisconnected).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('calls onScalerJobComplete on job completion', async () => {
+      const onScalerJobComplete = vi.fn();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onScalerJobComplete,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-7',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(onScalerJobComplete).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('does not crash when scaler callbacks are not provided', async () => {
+      const handler = createAgentWsHandler({ registry, dispatcher, agentAuthMode: 'none' });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-8',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      handler.onClose!(new CloseEvent('close'), ws as any);
+      expect(dispatcher.onJobComplete).toHaveBeenCalled();
+      expect(dispatcher.onAgentDisconnect).toHaveBeenCalled();
+    });
+
+    /**
+     * Register one agent and return the register.ack the handler sent.
+     * `scalerInfo` is what `onScalerAgentRegistered` resolves with: `null` for a
+     * static agent, no `boundJobId` for a warm (pre-spawned) one.
+     */
+    async function registerAndCaptureAck(
+      scalerInfo: { boundJobId?: string; mandatoryLabels: string[] } | null,
+    ): Promise<Record<string, unknown>> {
+      const boundDispatcher = {
+        ...mockDispatcher(),
+        dispatchBoundJob: vi.fn().mockResolvedValue(true),
+      } as unknown as Dispatcher;
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher: boundDispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onScalerAgentRegistered: vi.fn().mockResolvedValue(scalerInfo),
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const ack = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'register.ack');
+      expect(ack).toBeDefined();
+      return ack as Record<string, unknown>;
+    }
+
+    it('marks a scaler-managed agent with no bound job as warm', async () => {
+      const ack = await registerAndCaptureAck({ mandatoryLabels: [] });
+      expect(ack.warmPool).toBe(true);
+      expect(ack.pendingDispatch).toBeUndefined();
+    });
+
+    it('does not mark a job-bound spawn as warm', async () => {
+      const ack = await registerAndCaptureAck({ boundJobId: 'job-1', mandatoryLabels: [] });
+      expect(ack.warmPool).toBeUndefined();
+      expect(ack.pendingDispatch).toBe(true);
+    });
+
+    it('does not mark a static agent as warm', async () => {
+      const ack = await registerAndCaptureAck(null);
+      expect(ack.warmPool).toBeUndefined();
+      expect(ack.scalerManaged).toBe(false);
+    });
+  });
+
+  describe('job.status with cancelled state', () => {
+    it('decrements activeJobs and forwards to Platform', async () => {
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const timestamp = Date.now();
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-6',
+          runId: 'run-3',
+          jobId: 'job-3',
+          state: 'cancelled',
+          timestamp,
+        }),
+        ws as any,
+      );
+
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-3');
+      expect(onJobStatus).toHaveBeenCalledWith('agent-1', {
+        runId: 'run-3',
+        jobId: 'job-3',
+        state: 'cancelled',
+        timestamp,
+        data: undefined,
+      });
+    });
+  });
+
+  describe('config.ack', () => {
+    it('calls onConfigAck callback when config.ack is received', async () => {
+      const onConfigAck = vi.fn();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onConfigAck,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'config.ack',
+          messageId: 'config-ack-1',
+          agentId: 'agent-1',
+        }),
+        ws as any,
+      );
+
+      expect(onConfigAck).toHaveBeenCalledWith('agent-1');
+    });
+  });
+
+  describe('cache.upload.request', () => {
+    it('returns upload URL for source cache type', async () => {
+      const mockSourceCache = {
+        getUploadUrl: vi.fn().mockResolvedValue('https://s3.example.com/upload-bundle'),
+      };
+      // The org comes from the server-side dispatch ref, never the wire body.
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-1', { runId: 'run-1', orgId: 'org-a' });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        sourceCache: mockSourceCache as any,
+        dispatchCacheRefs,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      (ws.send as ReturnType<typeof vi.fn>).mockClear();
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.upload.request',
+          messageId: 'upload-req-1',
+          jobId: 'job-1',
+          cacheType: 'source',
+          contentHash: 'abc123hash',
+          sourceTarDigest: 'tar-digest',
+          platform: 'linux',
+          arch: 'x64',
+        }),
+        ws as any,
+      );
+
+      // Signed for the tarball's OWN digest, under the org the dispatch names.
+      expect(mockSourceCache.getUploadUrl).toHaveBeenCalledWith('org-a', 'tar-digest');
+      const sentCalls = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const response = JSON.parse(sentCalls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.upload.response',
+        requestId: 'upload-req-1',
+        uploadUrl: 'https://s3.example.com/upload-bundle',
+      });
+    });
+  });
+
+  // ── User-cache WS handlers (Task 7) ─────────────────────────────
+
+  describe('user-cache WS handlers', () => {
+    /** A UserCache-shaped stub recording the refs it was called with. */
+    function mockUserCache(
+      overrides: Partial<{
+        restore: ReturnType<typeof vi.fn>;
+        beginSave: ReturnType<typeof vi.fn>;
+        commitSave: ReturnType<typeof vi.fn>;
+      }> = {},
+    ): UserCache {
+      return {
+        restore: overrides.restore ?? vi.fn().mockResolvedValue({ hit: false }),
+        beginSave: overrides.beginSave ?? vi.fn().mockResolvedValue({ skip: false }),
+        commitSave: overrides.commitSave ?? vi.fn().mockResolvedValue(undefined),
+      } as unknown as UserCache;
+    }
+
+    /** Build a handler with an owning ownership-tracker + a populated dispatch-cache-ref tracker. */
+    function setup(
+      opts: {
+        owned?: boolean;
+        userCache?: UserCache;
+        artifactStore?: ArtifactStore;
+        dispatchCacheRefs?: DispatchCacheRefTracker;
+        recordRef?: boolean;
+        /**
+         * Verdict the database-backed fallback returns. Present ⇒ the tracker is
+         * built with a fallback, which is what a coordinator that never saw the
+         * dispatch looks like: the synchronous check cannot decide, so the
+         * database has to.
+         */
+        ownershipDb?: OwnershipDbResult;
+      } = {},
+    ) {
+      const isJobOwnedByAgent = vi.fn().mockReturnValue(opts.owned ?? true);
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent,
+        onDisconnect: vi.fn(),
+        ...(opts.ownershipDb
+          ? { isJobOwnedByAgentInDb: async () => opts.ownershipDb as OwnershipDbResult }
+          : {}),
+      });
+      const dispatchCacheRefs = opts.dispatchCacheRefs ?? new DispatchCacheRefTracker();
+      if (opts.recordRef !== false) {
+        dispatchCacheRefs.record('job-1', {
+          orgId: 'org-1',
+          repoId: 'owner/repo',
+          cacheRefScope: CacheRefScope.enum.shared,
+          runId: 'run-1',
+        });
+      }
+      const userCache = opts.userCache ?? mockUserCache();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ownershipTracker: tracker,
+        userCache,
+        artifactStore: opts.artifactStore,
+        dispatchCacheRefs,
+      });
+      return { handler, userCache, dispatchCacheRefs };
+    }
+
+    /** Minimal ArtifactStore stub exposing only the methods the handler drives. */
+    function mockArtifactStore(
+      opts: {
+        beginUpload?: ReturnType<typeof vi.fn>;
+        completeUpload?: ReturnType<typeof vi.fn>;
+        download?: ReturnType<typeof vi.fn>;
+      } = {},
+    ): ArtifactStore {
+      return {
+        beginUpload: opts.beginUpload ?? vi.fn().mockResolvedValue({ outcome: 'granted' }),
+        completeUpload: opts.completeUpload ?? vi.fn().mockResolvedValue(undefined),
+        download: opts.download ?? vi.fn().mockResolvedValue({ outcome: 'not_found' }),
+      } as unknown as ArtifactStore;
+    }
+
+    async function register(
+      handler: ReturnType<typeof createAgentWsHandler>,
+      ws: ReturnType<typeof mockWs>,
+    ) {
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      (ws.send as ReturnType<typeof vi.fn>).mockClear();
+    }
+
+    /** The canonical owned+resolvable `artifacts.upload.complete` frame. */
+    function completeMsg() {
+      return {
+        type: 'artifacts.upload.complete',
+        messageId: 'm1',
+        jobId: 'job-1',
+        name: 'bundle',
+        sizeBytes: 100,
+        sha256: 'abc',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      };
+    }
+
+    /** The `artifacts.upload.complete.ack` the handler sent, if any. */
+    function sentAck(ws: ReturnType<typeof mockWs>): Record<string, unknown> | undefined {
+      return (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => JSON.parse(c[0]))
+        .find((m) => m.type === 'artifacts.upload.complete.ack');
+    }
+
+    it('cache.user.restore.request resolves the ref server-side and replies with the stub result', async () => {
+      const restore = vi.fn().mockResolvedValue({
+        hit: true,
+        matchedKey: 'k1',
+        downloadUrl: 'mem://k1',
+        tarHash: 'deadbeef',
+      });
+      const { handler, userCache } = setup({ userCache: mockUserCache({ restore }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.restore.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+          restoreKeys: ['k-'],
+        }),
+        ws as any,
+      );
+
+      // The handler resolves org/repo/scope/runId from the tracker, NOT the wire.
+      expect(userCache.restore).toHaveBeenCalledWith({
+        org: 'org-1',
+        repo: 'owner/repo',
+        scope: 'shared',
+        runId: 'run-1',
+        key: 'k1',
+        restoreKeys: ['k-'],
+      });
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.restore.response',
+        requestId: 'm1',
+        hit: true,
+        matchedKey: 'k1',
+        downloadUrl: 'mem://k1',
+        tarHash: 'deadbeef',
+      });
+    });
+
+    it('SECURITY: a wire-supplied org/repo/scope cannot influence the resolved ref', async () => {
+      const restore = vi.fn().mockResolvedValue({ hit: false });
+      const { handler, userCache } = setup({ userCache: mockUserCache({ restore }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Attacker stuffs forged namespacing onto the wire message.
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.restore.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+          // forged fields — must be ignored entirely
+          org: 'victim-org',
+          repo: 'victim/repo',
+          scope: 'shared',
+          orgId: 'victim-org',
+          repoId: 'victim/repo',
+          cacheRefScope: 'shared',
+          runId: 'victim-run',
+        }),
+        ws as any,
+      );
+
+      const callArg = (userCache.restore as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArg.org).toBe('org-1');
+      expect(callArg.repo).toBe('owner/repo');
+      expect(callArg.scope).toBe('shared');
+      expect(callArg.runId).toBe('run-1');
+    });
+
+    it('cache.user.restore.request for an unowned job replies a miss, never silence', async () => {
+      const { handler, userCache } = setup({ owned: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.restore.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+        }),
+        ws as any,
+      );
+
+      expect(userCache.restore).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.restore.response',
+        requestId: 'm1',
+        hit: false,
+      });
+    });
+
+    it('cache.user.restore.request for an unknown jobId fails closed (miss reply, no restore)', async () => {
+      const { handler, userCache } = setup({ recordRef: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.restore.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+        }),
+        ws as any,
+      );
+
+      expect(userCache.restore).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.restore.response',
+        requestId: 'm1',
+        hit: false,
+      });
+    });
+
+    it('cache.user.save.request replies skip:true when the key already exists', async () => {
+      const beginSave = vi.fn().mockResolvedValue({ skip: true });
+      const { handler, userCache } = setup({ userCache: mockUserCache({ beginSave }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.save.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+        }),
+        ws as any,
+      );
+
+      expect(userCache.beginSave).toHaveBeenCalledWith({
+        org: 'org-1',
+        repo: 'owner/repo',
+        scope: 'shared',
+        runId: 'run-1',
+        key: 'k1',
+      });
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.save.response',
+        requestId: 'm1',
+        skip: true,
+      });
+    });
+
+    it('cache.user.save.request replies with uploadUrl and threads the tempKey to commit', async () => {
+      const beginSave = vi.fn().mockResolvedValue({
+        skip: false,
+        uploadUrl: 'put://tmp',
+        tempKey: 'cache/org-1/.tmp-x.tar.gz',
+      });
+      const commitSave = vi.fn().mockResolvedValue(undefined);
+      const { handler, userCache } = setup({
+        userCache: mockUserCache({ beginSave, commitSave }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.save.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+        }),
+        ws as any,
+      );
+      const saveResp = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(saveResp).toEqual({
+        type: 'cache.user.save.response',
+        requestId: 'm1',
+        skip: false,
+        uploadUrl: 'put://tmp',
+      });
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.save.complete',
+          messageId: 'm2',
+          jobId: 'job-1',
+          key: 'k1',
+          tarHash: 'deadbeef',
+          sizeBytes: 1234,
+        }),
+        ws as any,
+      );
+
+      expect(userCache.commitSave).toHaveBeenCalledWith({
+        org: 'org-1',
+        repo: 'owner/repo',
+        scope: 'shared',
+        runId: 'run-1',
+        key: 'k1',
+        tarHash: 'deadbeef',
+        sizeBytes: 1234,
+        tempKey: 'cache/org-1/.tmp-x.tar.gz',
+      });
+    });
+
+    it('cache.user.save.complete for an unowned job does not commit', async () => {
+      const { handler, userCache } = setup({ owned: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.save.complete',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+          tarHash: 'deadbeef',
+          sizeBytes: 10,
+        }),
+        ws as any,
+      );
+
+      expect(userCache.commitSave).not.toHaveBeenCalled();
+    });
+
+    it('drops the dispatch-cache ref when the job completes', async () => {
+      const owned = new OwnershipTracker({
+        isJobOwnedByAgent: vi.fn().mockReturnValue(true),
+        onDisconnect: vi.fn(),
+      });
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-1', { runId: 'run-1' });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ownershipTracker: owned,
+        userCache: mockUserCache(),
+        dispatchCacheRefs,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      expect(dispatchCacheRefs.get('job-1')).toBeDefined();
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'm1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(dispatchCacheRefs.get('job-1')).toBeUndefined();
+    });
+
+    it('artifacts.upload.request resolves the ref server-side and replies with the grant', async () => {
+      const beginUpload = vi.fn().mockResolvedValue({
+        outcome: 'granted',
+        uploadUrl: 'mem://put',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      });
+      const { handler } = setup({ artifactStore: mockArtifactStore({ beginUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+          // forged fields — must be ignored (org/run resolved server-side)
+          orgId: 'victim',
+          runId: 'victim-run',
+        }),
+        ws as any,
+      );
+
+      expect(beginUpload).toHaveBeenCalledWith({
+        customerId: 'org-1',
+        runId: 'run-1',
+        name: 'bundle',
+        declaredSizeBytes: 100,
+      });
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.upload.response',
+        requestId: 'm1',
+        outcome: 'granted',
+        uploadUrl: 'mem://put',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      });
+    });
+
+    it('artifacts.upload.request relays a rejection reason verbatim', async () => {
+      const beginUpload = vi
+        .fn()
+        .mockResolvedValue({ outcome: 'rejected', reason: 'duplicate_name' });
+      const { handler } = setup({ artifactStore: mockArtifactStore({ beginUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+        }),
+        ws as any,
+      );
+
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toMatchObject({ outcome: 'rejected', reason: 'duplicate_name' });
+      expect(response.error).toBeUndefined();
+    });
+
+    /** Drive one `artifacts.upload.request` and return the response the handler sent. */
+    async function uploadRequest(
+      setupOpts: Parameters<typeof setup>[0],
+    ): Promise<Record<string, unknown>> {
+      const { handler } = setup(setupOpts);
+      const ws = mockWs();
+      await register(handler, ws);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+        }),
+        ws as any,
+      );
+      return JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    }
+
+    it('artifacts.upload.request relays a non-conforming-name rejection from the store', async () => {
+      // The store refuses the name before any gate; the handler must forward its
+      // free-text detail so the author is told the name is the problem, rather
+      // than falling back to the generic "upload was rejected".
+      const beginUpload = vi.fn().mockResolvedValue({
+        outcome: 'rejected',
+        error: artifactInvalidNameError('artifact name may only contain letters'),
+      });
+      const response = await uploadRequest({ artifactStore: mockArtifactStore({ beginUpload }) });
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: expect.stringContaining(ARTIFACT_INVALID_NAME_PREFIX),
+      });
+      expect(response.reason).toBeUndefined();
+    });
+
+    it('artifacts.upload.request rejects with a config error (not org_quota) when artifacts are unconfigured', async () => {
+      // No artifactStore -> the store is unset.
+      const response = await uploadRequest({});
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: ArtifactInternalFailure.uploadNotConfigured,
+      });
+      expect(response.reason).toBeUndefined();
+    });
+
+    it('artifacts.upload.request rejects with an unresolvable-run error when the ref has no runId', async () => {
+      const response = await uploadRequest({
+        artifactStore: mockArtifactStore(),
+        recordRef: false,
+      });
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: ArtifactInternalFailure.unresolvableRun,
+      });
+      expect(response.reason).toBeUndefined();
+    });
+
+    it('artifacts.upload.request rejects with an internal error when beginUpload throws', async () => {
+      const beginUpload = vi.fn().mockRejectedValue(new Error('s3 endpoint unreachable'));
+      const response = await uploadRequest({ artifactStore: mockArtifactStore({ beginUpload }) });
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: ArtifactInternalFailure.uploadFailed,
+      });
+      expect(response.reason).toBeUndefined();
+      // The raw exception text must never reach the wire.
+      expect(JSON.stringify(response)).not.toContain('s3 endpoint unreachable');
+    });
+
+    it('artifacts.upload.complete writes the row via the store', async () => {
+      const completeUpload = vi.fn().mockResolvedValue(undefined);
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.complete',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          sizeBytes: 100,
+          sha256: 'abc',
+          storageKey: 'artifacts/run-1/bundle.tar.gz',
+        }),
+        ws as any,
+      );
+
+      expect(completeUpload).toHaveBeenCalledWith({
+        customerId: 'org-1',
+        runId: 'run-1',
+        jobId: 'job-1',
+        name: 'bundle',
+        sizeBytes: 100,
+        sha256: 'abc',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      });
+      expect(sentAck(ws)).toEqual({
+        type: 'artifacts.upload.complete.ack',
+        requestId: 'm1',
+        outcome: ArtifactCompleteAckOutcome.enum.committed,
+      });
+    });
+
+    it('artifacts.upload.complete acks failed after the retries exhaust', async () => {
+      // Infrastructure-shaped text: the assertions below are that NONE of this
+      // reaches the agent, which runs untrusted workflow code. Asserting only
+      // the safe literal would still pass if the send site went back to
+      // forwarding the raw exception and its text happened to match.
+      const raw = 'connect ECONNREFUSED 10.1.2.3:5432 relation "artifacts" violates constraint';
+      const completeUpload = vi.fn().mockRejectedValue(new Error(raw));
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Fake timers are active suite-wide, so the retry backoff has to be
+      // advanced explicitly for the handler promise to settle.
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      // Bounded retry: the commit is idempotent, so a transient blip is retried
+      // before the agent's step is failed.
+      expect(completeUpload).toHaveBeenCalledTimes(3);
+      const ack = sentAck(ws);
+      expect(ack).toMatchObject({
+        type: 'artifacts.upload.complete.ack',
+        requestId: 'm1',
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: ArtifactInternalFailure.commitFailed,
+      });
+      expect(JSON.stringify(ack)).not.toContain('ECONNREFUSED');
+      expect(JSON.stringify(ack)).not.toContain('10.1.2.3');
+      expect(JSON.stringify(ack)).not.toContain('constraint');
+      // The other half of the invariant: the operator can still debug the real
+      // failure, because the raw exception went to the orchestrator's own log.
+      expect(mockLogError).toHaveBeenCalledWith(
+        'artifact upload-complete failed',
+        expect.objectContaining({ error: raw }),
+      );
+    });
+
+    it('artifacts.upload.complete acks committed when a transient failure recovers', async () => {
+      const completeUpload = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('transient'))
+        .mockResolvedValue(undefined);
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      expect(completeUpload).toHaveBeenCalledTimes(2);
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.committed,
+      });
+    });
+
+    it('artifacts.upload.complete does not retry a missing object, and does not leak its key', async () => {
+      const storageKey = 'artifacts/run-1/bundle-0123456789abcdef.tar.gz';
+      const completeUpload = vi.fn().mockRejectedValue(new ArtifactObjectMissingError(storageKey));
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Advance the retry backoff even though a terminal failure should never
+      // arm it: if the terminal classification regressed, the retries run and
+      // the call-count assertion fails instead of the promise hanging.
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      // The presigned PUT never landed an object — retrying cannot help.
+      expect(completeUpload).toHaveBeenCalledTimes(1);
+      const ack = sentAck(ws);
+      expect(ack).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        // Still its own actionable category, but the error's message embeds the
+        // storage key and that must not travel to the workflow author.
+        reason: ArtifactInternalFailure.commitObjectMissing,
+      });
+      expect(JSON.stringify(ack)).not.toContain(storageKey);
+    });
+
+    it('artifacts.upload.complete does not retry a non-conforming name', async () => {
+      const completeUpload = vi
+        .fn()
+        .mockRejectedValue(new ArtifactInvalidNameError('artifact name may only contain letters'));
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Same timer advance as the missing-object case: a regressed terminal
+      // classification fails the call-count assertion rather than hanging.
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      // The name is fixed for the life of the request — retrying cannot help.
+      expect(completeUpload).toHaveBeenCalledTimes(1);
+      // Safe by construction: the detail is one of the schema's own fixed
+      // messages, so it passes through and the author still learns what was
+      // wrong with the name.
+      const reason = sentAck(ws)!.reason as string;
+      expect(reason).toContain(ARTIFACT_INVALID_NAME_PREFIX);
+      expect(reason).toContain('artifact name may only contain letters');
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+      });
+    });
+
+    it('artifacts.upload.complete acks failed for an unresolvable job', async () => {
+      const completeUpload = vi.fn();
+      const { handler } = setup({
+        artifactStore: mockArtifactStore({ completeUpload }),
+        recordRef: false,
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      // No commit is possible, but the agent must not hang waiting for an ack.
+      expect(completeUpload).not.toHaveBeenCalled();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: ArtifactInternalFailure.unresolvableRun,
+      });
+    });
+
+    it('artifacts.upload.complete acks not-configured when there is no artifact store', async () => {
+      // The guard covers two distinct operator problems and keeps them apart:
+      // storage that was never configured (here), and a run the orchestrator
+      // could not resolve (the test above).
+      const { handler } = setup({});
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: ArtifactInternalFailure.uploadNotConfigured,
+      });
+    });
+
+    it('artifacts.upload.complete for an unowned job is refused with an ack, never dropped', async () => {
+      const completeUpload = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        artifactStore: mockArtifactStore({ completeUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      // The commit must not run — but the agent is awaiting an ack, so a
+      // refusal is an explicit `failed`, not silence.
+      expect(completeUpload).not.toHaveBeenCalled();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('artifacts.upload.complete on a cold coordinator commits once the database confirms ownership', async () => {
+      // The failover shape: the in-memory map is empty on the newly-elected
+      // leader, so only the database can answer. The frame must be handled,
+      // not dropped for want of a synchronous hit.
+      const completeUpload = vi.fn().mockResolvedValue(undefined);
+      const { handler } = setup({
+        owned: false,
+        ownershipDb: 'owned',
+        artifactStore: mockArtifactStore({ completeUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      expect(completeUpload).toHaveBeenCalledOnce();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.committed,
+      });
+    });
+
+    it('artifacts.upload.complete is refused with the shared wording when the database cannot decide', async () => {
+      // An undecided lookup and a decided refusal are indistinguishable on the
+      // wire: a caller that could tell them apart would hold an oracle for job
+      // existence and orchestrator database health.
+      const completeUpload = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        ownershipDb: 'unknown',
+        artifactStore: mockArtifactStore({ completeUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      expect(completeUpload).not.toHaveBeenCalled();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('register.ack advertises the artifactCompleteAck capability', async () => {
+      const { handler } = setup({});
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const ack = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => JSON.parse(c[0]))
+        .find((m) => m.type === 'register.ack');
+      expect(ack?.capabilities?.artifactCompleteAck).toBe(true);
+    });
+
+    it('artifacts.download.request replies found with the presigned GET', async () => {
+      const download = vi.fn().mockResolvedValue({
+        outcome: 'found',
+        downloadUrl: 'mem://get',
+        sizeBytes: 100,
+        sha256: 'abc',
+      });
+      const { handler } = setup({ artifactStore: mockArtifactStore({ download }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.download.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+        }),
+        ws as any,
+      );
+
+      expect(download).toHaveBeenCalledWith({
+        customerId: 'org-1',
+        runId: 'run-1',
+        name: 'bundle',
+      });
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.download.response',
+        requestId: 'm1',
+        outcome: 'found',
+        downloadUrl: 'mem://get',
+        sizeBytes: 100,
+        sha256: 'abc',
+      });
+    });
+
+    /** Drive one `artifacts.download.request` and return the response the handler sent. */
+    async function downloadRequest(
+      setupOpts: Parameters<typeof setup>[0],
+    ): Promise<Record<string, unknown>> {
+      const { handler } = setup(setupOpts);
+      const ws = mockWs();
+      await register(handler, ws);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.download.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+        }),
+        ws as any,
+      );
+      return JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    }
+
+    it('artifacts.download.request replies not_found with no error on a genuine miss', async () => {
+      const download = vi.fn().mockResolvedValue({ outcome: 'not_found' });
+      const response = await downloadRequest({ artifactStore: mockArtifactStore({ download }) });
+      expect(response).toMatchObject({ outcome: 'not_found' });
+      expect(response.error).toBeUndefined();
+    });
+
+    it('artifacts.download.request carries a config error when artifacts are unconfigured', async () => {
+      const response = await downloadRequest({});
+      expect(response).toMatchObject({
+        outcome: 'not_found',
+        error: ArtifactInternalFailure.downloadNotConfigured,
+      });
+    });
+
+    it('artifacts.download.request carries an unresolvable-run error when the ref has no runId', async () => {
+      const response = await downloadRequest({
+        artifactStore: mockArtifactStore(),
+        recordRef: false,
+      });
+      expect(response).toMatchObject({
+        outcome: 'not_found',
+        error: ArtifactInternalFailure.unresolvableRun,
+      });
+    });
+
+    it('artifacts.download.request carries an internal error when download throws', async () => {
+      const download = vi.fn().mockRejectedValue(new Error('s3 endpoint unreachable'));
+      const response = await downloadRequest({ artifactStore: mockArtifactStore({ download }) });
+      expect(response).toMatchObject({
+        outcome: 'not_found',
+        error: ArtifactInternalFailure.downloadFailed,
+      });
+      // The raw exception text must never reach the wire.
+      expect(JSON.stringify(response)).not.toContain('s3 endpoint unreachable');
+    });
+
+    it('artifacts.upload.request for an unowned job is refused with a reply, no grant', async () => {
+      const beginUpload = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        artifactStore: mockArtifactStore({ beginUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+        }),
+        ws as any,
+      );
+
+      expect(beginUpload).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.upload.response',
+        requestId: 'm1',
+        outcome: 'rejected',
+        error: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('artifacts.download.request for an unowned job replies not_found, no lookup', async () => {
+      const download = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        artifactStore: mockArtifactStore({ download }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.download.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+        }),
+        ws as any,
+      );
+
+      expect(download).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.download.response',
+        requestId: 'm1',
+        outcome: 'not_found',
+        error: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('cache.upload.request for an unowned job replies an empty upload URL', async () => {
+      const { handler } = setup({ owned: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          cacheType: 'source',
+          contentHash: 'abc',
+          platform: 'linux',
+          arch: 'x64',
+        }),
+        ws as any,
+      );
+
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.upload.response',
+        requestId: 'm1',
+        uploadUrl: '',
+      });
+    });
+
+    it('cache.user.save.request for an unowned job replies skip, no beginSave', async () => {
+      const beginSave = vi.fn();
+      const { handler, userCache } = setup({
+        owned: false,
+        userCache: mockUserCache({ beginSave }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.save.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+        }),
+        ws as any,
+      );
+
+      expect(userCache.beginSave).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.save.response',
+        requestId: 'm1',
+        skip: true,
+      });
+    });
+
+    it('provenance.upload.request for an unowned job replies an empty upload URL', async () => {
+      const { handler } = setup({ owned: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'provenance.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          subjectDigest: 'sha256:abc',
+          sizeBytes: 10,
+        }),
+        ws as any,
+      );
+
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'provenance.upload.response',
+        requestId: 'm1',
+        uploadUrl: '',
+      });
+    });
+  });
+
+  // ── Ownership validation tests ──────────────────────────────────
+
+  describe('ownership validation', () => {
+    function createHandlerWithOwnership(
+      ownershipOpts: { owned?: boolean; threshold?: number } = {},
+      extraDeps: Partial<AgentWsHandlerDeps> = {},
+    ) {
+      const isJobOwnedByAgent = vi.fn().mockReturnValue(ownershipOpts.owned ?? false);
+      const onDisconnect = vi.fn();
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent,
+        onDisconnect,
+        violationThreshold: ownershipOpts.threshold ?? 5,
+      });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ownershipTracker: tracker,
+        ...extraDeps,
+      });
+      return { handler, tracker, isJobOwnedByAgent, onDisconnect };
+    }
+
+    it('job.status from owning agent is processed normally', async () => {
+      const { handler } = createHandlerWithOwnership({ owned: true });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-own-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-1');
+      expect(onJobStatus).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ jobId: 'job-1', state: 'success' }),
+      );
+    });
+
+    it('job.status from non-owning agent is silently dropped', async () => {
+      const { handler } = createHandlerWithOwnership({ owned: false });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-noown-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(dispatcher.onJobComplete).not.toHaveBeenCalled();
+      expect(onJobStatus).not.toHaveBeenCalled();
+    });
+
+    it('log.chunk from non-owning agent is silently dropped', async () => {
+      const onLogChunk = vi.fn();
+      const { handler } = createHandlerWithOwnership({ owned: false }, { onLogChunk });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'log.chunk',
+          messageId: 'msg-log-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          stepIndex: 0,
+          lines: ['hello world'],
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(onLogChunk).not.toHaveBeenCalled();
+    });
+
+    it('step.status from non-owning agent is silently dropped', async () => {
+      const onStepStatus = vi.fn();
+      const { handler } = createHandlerWithOwnership({ owned: false }, { onStepStatus });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'step.status',
+          messageId: 'msg-step-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          stepIndex: 0,
+          stepName: 'build',
+          state: 'running',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(onStepStatus).not.toHaveBeenCalled();
+    });
+
+    it('job.heartbeat from non-owning agent is silently dropped', async () => {
+      const onJobHeartbeat = vi.fn();
+      const { handler } = createHandlerWithOwnership({ owned: false }, { onJobHeartbeat });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.heartbeat',
+          messageId: 'msg-hb-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(onJobHeartbeat).not.toHaveBeenCalled();
+    });
+
+    it('escalation disconnects agent after threshold violations', async () => {
+      const { handler, onDisconnect } = createHandlerWithOwnership({
+        owned: false,
+        threshold: 3,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      for (let i = 0; i < 3; i++) {
+        await handler.onMessage!(
+          makeMessageEvent({
+            type: 'job.status',
+            messageId: `msg-esc-${i}`,
+            runId: 'run-1',
+            jobId: `job-${i}`,
+            state: 'running',
+            timestamp: Date.now(),
+          }),
+          ws as any,
+        );
+      }
+
+      expect(onDisconnect).toHaveBeenCalledWith('agent-1', 'Too many ownership violations');
+    });
+
+    it('grace window: message accepted during grace period', async () => {
+      // Use a dynamic ownership check that starts false then becomes true
+      const isJobOwnedByAgent = vi.fn().mockReturnValue(true);
+      const onDisconnect = vi.fn();
+      const tracker = new OwnershipTracker({ isJobOwnedByAgent, onDisconnect });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ownershipTracker: tracker,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      // Send job.status for a job that passes ownership check (simulating grace window)
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-grace-1',
+          runId: 'run-1',
+          jobId: 'job-grace-1',
+          state: 'running',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(onJobStatus).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ jobId: 'job-grace-1' }),
+      );
+    });
+
+    it('cleanup on disconnect removes violation tracking', async () => {
+      const isJobOwnedByAgent = vi.fn().mockReturnValue(false);
+      const onDisconnect = vi.fn();
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent,
+        onDisconnect,
+        violationThreshold: 3,
+      });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        ownershipTracker: tracker,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      // Two violations
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-v1',
+          runId: 'run-1',
+          jobId: 'job-v1',
+          state: 'running',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-v2',
+          runId: 'run-1',
+          jobId: 'job-v2',
+          state: 'running',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      // Disconnect (should cleanup violations)
+      handler.onClose!(new CloseEvent('close'), ws as any);
+
+      // Verify cleanup was called (dispatcher.onAgentDisconnect is called)
+      expect(dispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('calls onSecretOutputs when job succeeds with secretOutputs', async () => {
+      const onSecretOutputs = vi.fn().mockResolvedValue(undefined);
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onSecretOutputs,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-secret-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+          secretOutputs: {
+            API_KEY: {
+              agentPublicKey: 'dGVzdC1wdWJsaWMta2V5',
+              encrypted: 'dGVzdC1lbmNyeXB0ZWQ=',
+            },
+          },
+        }),
+        ws as any,
+      );
+
+      // onSecretOutputs should have been called with the right args
+      // (fire-and-forget, so we need to wait a tick for the promise)
+      await vi.waitFor(() => {
+        expect(onSecretOutputs).toHaveBeenCalledTimes(1);
+      });
+      expect(onSecretOutputs).toHaveBeenCalledWith('run-1', 'job-1', {
+        API_KEY: {
+          agentPublicKey: 'dGVzdC1wdWJsaWMta2V5',
+          encrypted: 'dGVzdC1lbmNyeXB0ZWQ=',
+        },
+      });
+    });
+
+    it('does not call onSecretOutputs when state is not success', async () => {
+      const onSecretOutputs = vi.fn().mockResolvedValue(undefined);
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onSecretOutputs,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-secret-2',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'failed',
+          timestamp: Date.now(),
+          secretOutputs: {
+            API_KEY: {
+              agentPublicKey: 'dGVzdC1wdWJsaWMta2V5',
+              encrypted: 'dGVzdC1lbmNyeXB0ZWQ=',
+            },
+          },
+        }),
+        ws as any,
+      );
+
+      // onSecretOutputs is only called for state === 'success', so it should not be called
+      expect(onSecretOutputs).not.toHaveBeenCalled();
+    });
+
+    it('does not call onSecretOutputs when no secretOutputs in message', async () => {
+      const onSecretOutputs = vi.fn().mockResolvedValue(undefined);
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onSecretOutputs,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-secret-3',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      // No secretOutputs in message, so callback should not be called
+      expect(onSecretOutputs).not.toHaveBeenCalled();
+    });
+
+    it('handles onSecretOutputs rejection gracefully (does not crash handler)', async () => {
+      const onSecretOutputs = vi.fn().mockRejectedValue(new Error('Decryption failed'));
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onSecretOutputs,
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      // Should not throw even though onSecretOutputs rejects
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-secret-4',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+          secretOutputs: {
+            TOKEN: {
+              agentPublicKey: 'dGVzdC1wdWJsaWMta2V5',
+              encrypted: 'dGVzdC1lbmNyeXB0ZWQ=',
+            },
+          },
+        }),
+        ws as any,
+      );
+
+      // Job should still complete normally
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-1');
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalled();
+    });
+
+    it('no ownership tracker: messages pass through unchanged', async () => {
+      // Without ownershipTracker, handler should work normally (backward compat)
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        // No ownershipTracker
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-notrack-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-1');
+    });
+  });
+
+  // ── Agent run.event and job.context forwarding ──────────────
+
+  describe('run.event and job.context forwarding', () => {
+    function createHandler(extraDeps: Partial<AgentWsHandlerDeps> = {}) {
+      return createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ...extraDeps,
+      });
+    }
+
+    async function registerAgent(handler: ReturnType<typeof createAgentWsHandler>) {
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      return ws;
+    }
+
+    it('forwards run.event from agent to onRunEvent callback', async () => {
+      const onRunEvent = vi.fn();
+      const handler = createHandler({ onRunEvent });
+      const ws = await registerAgent(handler);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'run.event',
+          runId: 'run-1',
+          eventType: 'agent.execution.start',
+          timestampMs: 1234567890,
+          sourceService: 'agent',
+          jobId: 'job-1',
+          metadata: { foo: 'bar' },
+          durationMs: null,
+        }),
+        ws as any,
+      );
+
+      expect(onRunEvent).toHaveBeenCalledOnce();
+      expect(onRunEvent).toHaveBeenCalledWith('agent-1', {
+        runId: 'run-1',
+        eventType: 'agent.execution.start',
+        timestampMs: 1234567890,
+        sourceService: 'agent',
+        jobId: 'job-1',
+        metadata: { foo: 'bar' },
+        durationMs: undefined,
+      });
+    });
+
+    it('forwards job.context from agent to onJobContext callback', async () => {
+      const onJobContext = vi.fn();
+      const handler = createHandler({ onJobContext });
+      const ws = await registerAgent(handler);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.context',
+          runId: 'run-1',
+          jobId: 'job-1',
+          context: {
+            runtime: { nodeVersion: 'v24.0.0', os: 'linux', arch: 'x64' },
+            sandboxType: 'bare-metal',
+          },
+        }),
+        ws as any,
+      );
+
+      expect(onJobContext).toHaveBeenCalledOnce();
+      expect(onJobContext).toHaveBeenCalledWith('agent-1', {
+        runId: 'run-1',
+        jobId: 'job-1',
+        context: {
+          runtime: { nodeVersion: 'v24.0.0', os: 'linux', arch: 'x64' },
+          sandboxType: 'bare-metal',
+        },
+      });
+    });
+
+    it('silently drops run.event when no onRunEvent callback configured', async () => {
+      const handler = createHandler(); // no onRunEvent
+      const ws = await registerAgent(handler);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'run.event',
+          runId: 'run-1',
+          eventType: 'agent.execution.start',
+          timestampMs: 1234567890,
+          sourceService: 'agent',
+          jobId: null,
+        }),
+        ws as any,
+      );
+
+      // Connection should NOT be closed (message silently dropped, not rejected by Zod)
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('agent-bound error disclosure', () => {
+    // Infrastructure-shaped text. The assertions are that NONE of it reaches the
+    // agent, which runs untrusted customer workflow code and persists whatever
+    // it receives into the author's step logs.
+    const SECRET_TEXT = 'connect ECONNREFUSED 10.0.0.7:5432 relation "held_runs"';
+
+    /** Build a handler that owns every job the tests drive through it. */
+    function setup(extraDeps: Partial<AgentWsHandlerDeps> = {}) {
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent: vi.fn().mockReturnValue(true),
+        onDisconnect: vi.fn(),
+      });
+      return createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ownershipTracker: tracker,
+        ...extraDeps,
+      });
+    }
+
+    async function register(
+      handler: ReturnType<typeof createAgentWsHandler>,
+      ws: ReturnType<typeof mockWs>,
+    ) {
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      (ws.send as ReturnType<typeof vi.fn>).mockClear();
+    }
+
+    /** The frame of the given type the handler sent, if any. */
+    function sent(
+      ws: ReturnType<typeof mockWs>,
+      type: string,
+    ): Record<string, unknown> | undefined {
+      return (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => JSON.parse(c[0]))
+        .find((m) => m.type === type);
+    }
+
+    function approvalRequestMsg() {
+      return {
+        type: 'step.approval-request',
+        messageId: 'm1',
+        runId: 'run-1',
+        jobId: 'job-1',
+        stepIndex: 2,
+        stepName: 'deploy',
+        clauses: [],
+        reason: 'production deploy',
+      };
+    }
+
+    it('step.approval-resolved replaces a bridge rejection with a safe fixed reason', async () => {
+      const onStepApproval = vi.fn().mockRejectedValue(new Error(SECRET_TEXT));
+      const handler = setup({ onStepApproval });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(approvalRequestMsg()), ws as any);
+
+      // The bridge is awaited off the message-handling path, so the reply lands
+      // on a later microtask.
+      await vi.waitFor(() => expect(sent(ws, 'step.approval-resolved')).toBeDefined());
+      const frame = sent(ws, 'step.approval-resolved')!;
+      expect(frame).toMatchObject({
+        outcome: 'rejected',
+        reason: AgentWsInternalFailure.approvalFailed,
+      });
+      expect(JSON.stringify(frame)).not.toContain(SECRET_TEXT);
+      expect(JSON.stringify(frame)).not.toContain('ECONNREFUSED');
+      // The other half of the invariant: the operator can still debug the real
+      // failure, because the raw exception went to the orchestrator's own log.
+      expect(mockLogError).toHaveBeenCalledWith(
+        'Step approval bridge rejected',
+        expect.objectContaining({ error: expect.stringContaining('ECONNREFUSED') }),
+      );
+    });
+
+    it('event.emit.response replaces a thrown callback with a safe fixed error', async () => {
+      const onEventEmit = vi.fn().mockRejectedValue(new Error(SECRET_TEXT));
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'deploy.done',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      const frame = sent(ws, 'event.emit.response')!;
+      expect(frame).toMatchObject({ error: AgentWsInternalFailure.eventEmitFailed });
+      expect(JSON.stringify(frame)).not.toContain(SECRET_TEXT);
+      expect(mockLogError).toHaveBeenCalledWith(
+        'Failed to process event.emit',
+        expect.objectContaining({ error: expect.stringContaining('ECONNREFUSED') }),
+      );
+    });
+
+    it('event.emit.response forwards an author-actionable error from the callback verbatim', async () => {
+      // The callback's own return value carries safe wording that stays specific
+      // enough for the author to fix their workflow.
+      const onEventEmit = vi.fn().mockResolvedValue({ error: 'Unknown job context' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'deploy.done',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      expect(sent(ws, 'event.emit.response')).toMatchObject({ error: 'Unknown job context' });
+    });
+
+    it('rejects a reserved kici. event-name prefix without invoking onEventEmit', async () => {
+      const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'kici.scaler.scale-up',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      expect(onEventEmit).not.toHaveBeenCalled();
+      expect(sent(ws, 'event.emit.response')).toMatchObject({
+        requestId: 'r1',
+        error: expect.stringContaining('reserved'),
+      });
+    });
+
+    /**
+     * The authoritative half of the `__` reservation. The SDK refuses it first,
+     * but the SDK runs inside the job — an attacker controls that side entirely,
+     * so this handler is what actually holds the boundary.
+     *
+     * Why it is a boundary and not a namespace: every name under the prefix is
+     * exempt from the event-storm rate limiter, and `__schedule_fire` is
+     * additionally dispatched as a TRUSTED ref (shared user-cache writes, the
+     * Dockerfile build gate) because no run causes it. An untrusted fork-PR job
+     * that could emit `__schedule_fire` would hand itself both. The lifecycle
+     * names inherit the tier of the run behind them, so forging one buys the
+     * rate-limiter exemption rather than the trusted ref — still a boundary.
+     */
+    it.each([
+      ['__schedule_fire'],
+      ['__workflow_complete'],
+      ['__job_complete'],
+      ['__workflows_failed_batch'],
+      ['__anything_else'],
+    ])('rejects the reserved internal event name %s without invoking onEventEmit', async (name) => {
+      const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: name,
+          payload: { cronExpression: '* * * * *', commitSha: 'a'.repeat(40) },
+        }),
+        ws as any,
+      );
+
+      // Not merely answered with an error: the emit never reaches the router,
+      // so no row is written and nothing is dispatched.
+      expect(onEventEmit).not.toHaveBeenCalled();
+      expect(sent(ws, 'event.emit.response')).toMatchObject({
+        requestId: 'r1',
+        error: 'event name prefix "__" is reserved for KiCI internal events',
+      });
+    });
+
+    it('still admits an ordinary custom event name', async () => {
+      // The control for the two rejection suites above: the same handler, the
+      // same message shape, an unreserved name — and the emit goes through. A
+      // guard that refused everything would pass both suites.
+      const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'deploy__done',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      expect(onEventEmit).toHaveBeenCalledTimes(1);
+      expect(sent(ws, 'event.emit.response')).toMatchObject({ deliveryId: 'd1' });
+    });
+
+    it('scaler.claim-credentials returns minted credentials from the callback', async () => {
+      const credentials = {
+        agentToken: 'kat_secret',
+        agentId: 'a1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['cloud=hetzner'],
+      };
+      const onClaimCredentials = vi.fn().mockResolvedValue({ credentials });
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+
+      expect(onClaimCredentials).toHaveBeenCalledWith(expect.any(String), 'code-abc');
+      expect(sent(ws, 'scaler.claim-credentials.response')).toMatchObject({
+        requestId: 'r1',
+        credentials,
+      });
+    });
+
+    it('scaler.claim-credentials forwards an author-actionable error verbatim', async () => {
+      const onClaimCredentials = vi.fn().mockResolvedValue({ error: 'invalid claim code' });
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'bad',
+        }),
+        ws as any,
+      );
+
+      const frame = sent(ws, 'scaler.claim-credentials.response')!;
+      expect(frame).toMatchObject({ requestId: 'r1', error: 'invalid claim code' });
+      expect(frame.credentials).toBeUndefined();
+    });
+
+    it('scaler.claim-credentials replaces a thrown callback with a safe fixed error', async () => {
+      const onClaimCredentials = vi.fn().mockRejectedValue(new Error(SECRET_TEXT));
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+
+      const frame = sent(ws, 'scaler.claim-credentials.response')!;
+      expect(frame).toMatchObject({ error: AgentWsInternalFailure.scalerClaimFailed });
+      expect(JSON.stringify(frame)).not.toContain(SECRET_TEXT);
+    });
+
+    it('scaler.claim-credentials succeeds BEFORE the connection registers (self-bootstrap)', async () => {
+      const credentials = {
+        agentToken: 'kat_bootstrap',
+        agentId: 'fresh-1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['cloud=hetzner'],
+      };
+      const onClaimCredentials = vi.fn().mockResolvedValue({ credentials });
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+
+      // Open the connection but do NOT register: a fresh, not-yet-registered
+      // agent redeems its single-use claim code to self-bootstrap. The claim
+      // code is the authorization, so minting ignores the caller's agent id
+      // (empty here).
+      handler.onOpen!(new Event('open'), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+
+      expect(onClaimCredentials).toHaveBeenCalledWith('', 'code-abc');
+      expect(sent(ws, 'scaler.claim-credentials.response')).toMatchObject({
+        requestId: 'r1',
+        credentials,
+      });
+    });
+
+    /** Drive one `agent.api.request` and return the response the handler sent. */
+    async function apiRequest(
+      agentApiRegistry: AgentApiRegistry,
+      method: string,
+    ): Promise<Record<string, unknown>> {
+      const handler = setup({ agentApiRegistry });
+      const ws = mockWs();
+      await register(handler, ws);
+      await handler.onMessage!(
+        makeMessageEvent({ type: 'agent.api.request', requestId: 'r1', method, params: {} }),
+        ws as any,
+      );
+      return sent(ws, 'agent.api.response')!;
+    }
+
+    it('agent.api.response forwards an unknown-method rejection verbatim', async () => {
+      const response = await apiRequest(new AgentApiRegistry(), 'nope.missing');
+      expect(response).toMatchObject({ error: "Unknown API method 'nope.missing'" });
+    });
+
+    it('agent.api.response forwards a role-denied rejection verbatim', async () => {
+      const registry = new AgentApiRegistry();
+      registry.register('admin.destroy', 'read', async () => {
+        throw new ApiRoleDeniedError('admin.destroy', 'write', ['read']);
+      });
+      const response = await apiRequest(registry, 'admin.destroy');
+      expect(response).toMatchObject({
+        error: "Method 'admin.destroy' requires 'write' role, caller only has [read]",
+      });
+    });
+
+    it('agent.api.response replaces any other handler exception with a safe fixed error', async () => {
+      const registry = new AgentApiRegistry();
+      registry.register('infra.list', 'read', async () => {
+        throw new Error(SECRET_TEXT);
+      });
+      const response = await apiRequest(registry, 'infra.list');
+      expect(response).toMatchObject({ error: AgentWsInternalFailure.agentApiFailed });
+      expect(JSON.stringify(response)).not.toContain(SECRET_TEXT);
+      expect(JSON.stringify(response)).not.toContain('ECONNREFUSED');
+    });
+
+    it('agent.api.response gates on the error type, not on its text', async () => {
+      // A plain Error carrying the same wording as a deliberate rejection is
+      // still replaced: only the registry's own typed rejections are trusted.
+      const registry = new AgentApiRegistry();
+      registry.register('infra.list', 'read', async () => {
+        throw new Error("Unknown API method 'infra.list'");
+      });
+      const response = await apiRequest(registry, 'infra.list');
+      expect(response).toMatchObject({ error: AgentWsInternalFailure.agentApiFailed });
+    });
+
+    it('both registry rejection classes construct as Errors', () => {
+      expect(new UnknownApiMethodError('a.b')).toBeInstanceOf(Error);
+      expect(new ApiRoleDeniedError('a.b', 'write', ['read'])).toBeInstanceOf(Error);
+    });
+  });
+});
+
+describe('truncateCloseReason', () => {
+  it('passes short reasons through unchanged', () => {
+    expect(truncateCloseReason('short reason')).toBe('short reason');
+  });
+
+  it('caps a long reason at 123 UTF-8 bytes (RFC 6455 close-reason limit)', () => {
+    const long = 'Agent labels exceed token-bound scope: ' + 'kici:role:builder,'.repeat(20);
+    const out = truncateCloseReason(long);
+    expect(Buffer.from(out, 'utf-8').length).toBeLessThanOrEqual(123);
+  });
+
+  it('does not leave a trailing partial multi-byte char when truncating', () => {
+    const out = truncateCloseReason('é'.repeat(200)); // 2 bytes each
+    expect(Buffer.from(out, 'utf-8').length).toBeLessThanOrEqual(123);
+    expect(out).not.toContain('�');
+  });
+});
+
+// The `log.chunk` fast path bypasses Zod, so the hand-written validator has to
+// track the schema itself — including the optional `stream` discriminator.
+describe('isValidLogChunk', () => {
+  const base = {
+    type: 'log.chunk',
+    messageId: 'm1',
+    runId: 'r1',
+    jobId: 'j1',
+    stepIndex: 0,
+    lines: ['x'],
+    timestamp: 1,
+  };
+
+  it('accepts a chunk with no stream (the field is optional)', () => {
+    expect(isValidLogChunk(base)).toBe(true);
+  });
+
+  it('accepts a chunk carrying either known stream', () => {
+    expect(isValidLogChunk({ ...base, stream: LogStream.enum.stdout })).toBe(true);
+    expect(isValidLogChunk({ ...base, stream: LogStream.enum.stderr })).toBe(true);
+  });
+
+  it('rejects a chunk whose stream is not a known value', () => {
+    expect(isValidLogChunk({ ...base, stream: 'syslog' })).toBe(false);
+    expect(isValidLogChunk({ ...base, stream: 3 })).toBe(false);
+  });
+
+  it('stays in step with the Zod schema it fast-paths', () => {
+    for (const candidate of [
+      base,
+      { ...base, stream: LogStream.enum.stderr },
+      { ...base, stream: 'syslog' },
+    ]) {
+      expect(isValidLogChunk(candidate)).toBe(agentLogChunkSchema.safeParse(candidate).success);
+    }
+  });
+});

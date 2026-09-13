@@ -1,0 +1,69 @@
+# KiCI bare-metal quickstart — backing-services compose.
+#
+# The bare-metal orchestrator runs as a native systemd service (see
+# docs/user/quickstart/bare-metal.md); this compose runs only the two backing
+# services it can't easily run natively: PostgreSQL 18 and a SeaweedFS object
+# store. Postgres is published on loopback (not reachable off-box); SeaweedFS is
+# published on all interfaces so spawned agent containers can fetch overlays for
+# `kici run remote` (see the seaweedfs ports note below). Bring them up with:
+#
+#   docker compose -f docker-compose.postgres.yaml up -d --wait
+#
+# The DB password defaults to the loopback-only stub `kici-local`; override it
+# by exporting POSTGRES_PASSWORD (or setting it in a sibling .env that compose
+# auto-reads).
+# seaweedfs-s3.json must sit next to this file (download it from the same
+# directory) — it carries the static S3 identity for the kici-cache bucket.
+services:
+  postgres:
+    image: docker.io/library/postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: kici
+      POSTGRES_USER: kici
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-kici-local}'
+    # Publish only on loopback so the database isn't reachable off-box.
+    ports:
+      - '127.0.0.1:5432:5432'
+    # Postgres 18+ images expect the bind at /var/lib/postgresql (not
+    # /var/lib/postgresql/data). The image stores data in a major-version
+    # subdirectory beneath it, which lets pg_upgrade --link work across a
+    # major bump without mount-point gymnastics.
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U kici -d kici']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  seaweedfs:
+    image: docker.io/chrislusf/seaweedfs:4.46
+    # S3 gateway on :8333; the static identity lives in seaweedfs-s3.json and
+    # the kici-cache bucket is created on first write. Required for
+    # `kici run remote` against the native orchestrator on this host.
+    command: 'server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json'
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweedfs-data:/data
+    # Published on all interfaces (not loopback-only) so that container-scaler
+    # AGENTS — which run in their own network namespace and reach the host via
+    # `host.docker.internal` / the bridge gateway — can fetch the overlay for
+    # `kici run remote`. A loopback-only publish is reachable by the host CLI
+    # and the native orchestrator but NOT by a spawned agent container, which
+    # fails the overlay download with ECONNREFUSED. See the KICI_STORAGE_*
+    # endpoint notes in .env.example.
+    ports:
+      - '8333:8333'
+    healthcheck:
+      # /status is the unauthenticated liveness endpoint (the S3 root needs
+      # auth → 403). 127.0.0.1 (not localhost): SeaweedFS binds IPv4 only.
+      test: ['CMD-SHELL', 'wget -q -O - http://127.0.0.1:8333/status >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  seaweedfs-data:

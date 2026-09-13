@@ -1,0 +1,43 @@
+# CI for the public mirror (github.com/kici-dev/kici-public).
+#
+# The mirror is a projection of a private monorepo, so this is the only
+# automated check that ever runs against the tree a reader actually clones.
+# It runs exactly the three commands the repo's own README documents, in the
+# order that works on a tree that has never been built: install, build, then
+# typecheck and test.
+#
+# Nothing here may depend on private infrastructure — a contributor's fork must
+# be able to run it unchanged.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # The orchestrator suite starts a throwaway PostgreSQL container when its
+      # real-database specs are selected. Skipping keeps CI free of a
+      # container-runtime dependency; every other spec still runs.
+      KICI_SKIP_DB_TESTS: '1'
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r run build
+      - run: pnpm typecheck
+      - run: pnpm -r run test
+      - run: pnpm lint

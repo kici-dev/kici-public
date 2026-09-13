@@ -1,0 +1,91 @@
+{
+  "name": "@kici-dev/agent",
+  "version": "0.8.1",
+  "description": "Customer-deployable agent for the KiCI CI/CD stack. Connects to an orchestrator, clones the workflow repo, executes steps, and streams logs back.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "agent",
+    "runner"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/agent"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./server": "./dist/server.js"
+  },
+  "build": {
+    "entries": {
+      "server.js": "src/server.ts",
+      "workflow-runner.js": "src/execution/sandbox/workflow-runner.ts",
+      "workflow-runner-bundle.js": "src/execution/sandbox/workflow-runner.ts",
+      "eval-runner.js": "src/execution/sandbox/eval-runner.ts",
+      "container-ts-loader-hook.js": "src/execution/sandbox/container-ts-loader-hook.ts",
+      "index.js": "src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-service.mjs && tsgo --emitDeclarationOnly",
+    "typecheck": "tsgo --noEmit",
+    "test": "vitest run",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/agent --name @kici-dev/agent"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "@kici-dev/core": "workspace:*",
+    "@kici-dev/engine": "workspace:*",
+    "@kici-dev/sdk": "workspace:*",
+    "@kici-dev/shared": "workspace:*",
+    "archiver": "^8.0.0",
+    "dockerode": "^5.0.1",
+    "hono": "^4.13.2",
+    "jose": "^6.2.10",
+    "tar": "^7.5.22",
+    "winston": "^3.19.0",
+    "ws": "^8.21.3",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3",
+    "zx": "^8.8.5"
+  },
+  "kici": {
+    "metrics": {
+      "mode": "push",
+      "jobName": "kici-agent"
+    }
+  },
+  "devDependencies": {
+    "@types/archiver": "^8.0.0",
+    "@types/dockerode": "^4.0.1"
+  }
+}

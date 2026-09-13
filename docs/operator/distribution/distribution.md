@@ -1,0 +1,355 @@
+---
+title: Distribution
+description: How KiCI packages are distributed and deployed
+---
+
+KiCI distributes via three channels: **npm packages**, **OCI container images**, and **Firecracker rootfs**. This guide covers what each channel provides, when to use it, and how to obtain artifacts.
+
+> **Note:** The Platform relay tier is internal-only -- it is not distributed to customers. Customers connect to the hosted Platform or use independent orchestrator mode.
+
+> **Note:** KiCI also offers standalone packages with an embedded Node.js binary for deployments where npm is not available. See the [Packaging guide](sea-binaries.md) for details on full and light package types.
+
+---
+
+## npm packages
+
+All KiCI packages are published to the public npm registry (`npmjs.com`).
+
+### Scoped packages
+
+| Package                  | Purpose                                                                                               |
+| ------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `@kici-dev/sdk`          | Workflow definition API (triggers, jobs, steps, rules, matrices)                                      |
+| `@kici-dev/compiler`     | CLI tooling (compile, test, init, run, fixture, hook)                                                 |
+| `@kici-dev/core`         | Light shared utilities (logging, errors, formatting, crypto, TS loader hook) — no server dependencies |
+| `@kici-dev/shared`       | Shared utilities (logger, database, crypto, telemetry); re-exports `@kici-dev/core`                   |
+| `@kici-dev/engine`       | Business logic (protocol, triggers, execution status vocabulary, providers)                           |
+| `@kici-dev/orchestrator` | Customer-deployable orchestrator with provider abstraction                                            |
+| `@kici-dev/agent`        | Customer-deployable job execution agent                                                               |
+
+### Wrapper CLIs
+
+| Package      | Command      | Wraps                        |
+| ------------ | ------------ | ---------------------------- |
+| `kici`       | `kici`       | `@kici-dev/compiler/cli`     |
+| `kici-admin` | `kici-admin` | `@kici-dev/orchestrator/cli` |
+
+### User installation (workflow authors)
+
+Install the SDK and compiler as dev dependencies in your project:
+
+```bash
+npm install -D @kici-dev/sdk @kici-dev/compiler
+```
+
+Or use the interactive setup:
+
+```bash
+npx kici init
+```
+
+This creates a `.kici/` directory with workflow templates, installs dependencies, and optionally sets up a pre-commit compile hook.
+
+### Operator installation (orchestrator setup)
+
+Install and configure the orchestrator using the admin CLI:
+
+```bash
+npx kici-admin orchestrator install --wizard --instance-dir ~/kici-deploy
+```
+
+This pulls `@kici-dev/orchestrator` and runs the interactive setup wizard, which configures the database, Platform connection, scaler backends, and service installation. The `--instance-dir` flag chooses the deploy folder where the instance manifest (`.kici-orchestrator.json`) is written; lifecycle commands later resolve their target through that manifest. See the [Instance directory and manifest](service-installation.md#instance-directory-and-manifest) section for the full model.
+
+### Agent bare-metal installation
+
+For the bare-metal scaler backend, install the agent globally. The `kici-admin`
+wrapper carries the agent and exposes the `kici-agent` binary the bare-metal
+scaler spawns:
+
+```bash
+npm install -g kici-admin
+```
+
+The agent requires `git`, a shell (`bash` on Linux/macOS, `pwsh` on Windows), `node`, and `npm` to be available on the host. See [Agent runtime dependencies](#agent-runtime-dependencies) below.
+
+### Publishing
+
+Releases are published by KiCI. See [Release artifacts](./release-artifacts.md) for what each release ships and how to verify it.
+
+---
+
+## Container images
+
+OCI-compliant container images are built for the orchestrator and agent.
+
+### Available images
+
+| Image                         | Contents                                                                                |
+| ----------------------------- | --------------------------------------------------------------------------------------- |
+| `kici-orchestrator:<version>` | Orchestrator with all dependencies, ready for Docker/Podman/Kubernetes                  |
+| `kici-agent:<version>`        | Agent with git, bash, node, npm, and the native TypeScript loader binding pre-installed |
+
+The agent container image is self-contained -- it includes all required runtime dependencies and can execute workflows without any additional host-level tools.
+
+### Multi-architecture support
+
+Images are built natively for **amd64** and **arm64** platforms. No QEMU emulation is used -- each architecture is built on its native hardware.
+
+```bash
+# Build on the current architecture
+scripts/build-multi-arch.sh agent <tag>
+
+# Create a multi-arch manifest after building on both architectures
+scripts/build-multi-arch.sh agent <tag> --manifest-only
+```
+
+See [Multi-architecture builds](multi-arch-builds.md) for the full workflow including cross-machine image transfer and manifest creation.
+
+### Building images
+
+Build from the monorepo root:
+
+```bash
+# Agent image
+podman build -t kici-agent:<version> -f packages/agent/Dockerfile .
+
+# Orchestrator image
+podman build -t kici-orchestrator:<version> -f packages/orchestrator/Dockerfile .
+```
+
+Both Dockerfiles use multi-stage builds: a builder stage with full dev dependencies produces the compiled output, and a slim runtime stage contains only production dependencies.
+
+### Container registry
+
+The container registry is configurable -- images are built locally and can be pushed to any OCI-compliant registry (Docker Hub, GitHub Container Registry, Quay.io, a self-hosted registry, etc.). The build pipeline is registry-agnostic by design.
+
+```bash
+# Tag and push to your registry
+podman tag kici-agent:latest registry.example.com/kici-agent:latest
+podman push registry.example.com/kici-agent:latest
+```
+
+---
+
+## Which versions are distributed
+
+Published versions stay available. A release adds a version; it does not remove
+earlier ones. Before 1.0, KiCI made one exception: the 0.8.0 release retired every
+earlier version, because those versions predate security fixes. Any future removal
+is a separate, announced decision, never a side effect of a release. The 0.8.0
+retirement did this:
+
+- **npm** — earlier versions carry a deprecation notice. They still install, and
+  `npm` prints the notice with the version to upgrade to.
+- **`quay.io`** — earlier image tags are removed. A pin to an earlier tag fails to
+  pull. Move the pin to the current release, by tag or by the digest listed in
+  [Release artifacts](release-artifacts.md). A digest pin is for the current release
+  only: a retired version's digest does not pull.
+- **GitHub** — earlier releases and tags on `kici-dev/kici-public` are removed.
+
+The [deprecations page](../../user/deprecations.md) records the retirement.
+
+---
+
+## Firecracker rootfs
+
+Firecracker microVM execution requires a root filesystem image containing the agent and all its dependencies. Due to image size (~500MB+), the rootfs is **not distributed as a pre-built artifact**. Instead, operators build it once and cache it locally.
+
+See the dedicated [Firecracker rootfs build guide](../orchestrator/firecracker/rootfs.md) for full instructions.
+
+---
+
+## Orchestrator deployment modes
+
+The orchestrator supports four deployment modes, all officially supported.
+
+### Container image (Docker/Podman/Kubernetes)
+
+Deploy the orchestrator as a container. This is the simplest approach for production.
+
+```yaml
+# docker-compose.yml
+services:
+  orchestrator:
+    image: kici-orchestrator:latest
+    ports:
+      - '10143:10143'
+    environment:
+      MODE: platform
+      KICI_PLATFORM_URL: wss://api.kici.dev/ws
+      KICI_PLATFORM_TOKEN: ${KICI_PLATFORM_TOKEN}
+      KICI_DATABASE_URL: ${KICI_DATABASE_URL}
+    depends_on:
+      - postgres
+```
+
+For Kubernetes, deploy as a `Deployment` or `StatefulSet` (StatefulSet is recommended for clustered setups with stable instance IDs).
+
+### npm + systemd (Linux)
+
+Install the orchestrator via npm and configure a systemd service:
+
+```bash
+npx kici-admin orchestrator install --wizard --instance-dir ~/kici-deploy
+cd ~/kici-deploy && npx kici-admin orchestrator start
+```
+
+The `kici-admin orchestrator install` command writes an instance manifest to the deploy folder, generates a systemd unit file, enables the service, and registers the instance in the host's index. The unit is configured with automatic restart, journald logging, and environment file support. Per-instance config, log, and install directories are name-scoped (`/etc/kici/<name>/`, `/var/log/kici/<name>/`, `/opt/kici/<name>/`), so two instances with different `--name` values are fully isolated.
+
+See [Service installation](service-installation.md) for the full reference.
+
+### npm + launchd (macOS)
+
+Install the orchestrator via npm and configure a launchd agent:
+
+```bash
+npx kici-admin orchestrator install --wizard --instance-dir ~/kici-deploy
+cd ~/kici-deploy && npx kici-admin orchestrator start
+```
+
+The command writes an instance manifest to the deploy folder, generates a launchd plist, loads the agent, and starts the service. Logs go to `~/Library/Logs/kici/<name>/`.
+
+See [Service installation](service-installation.md) for the full reference.
+
+### npm + Windows service
+
+Install the orchestrator via npm and configure a Windows service:
+
+```bash
+npx kici-admin orchestrator install --wizard --instance-dir C:\kici-deploy
+cd C:\kici-deploy
+npx kici-admin orchestrator start
+```
+
+The command writes an instance manifest to the deploy folder and registers the orchestrator as a Windows service with automatic start. Logs go to the Windows Event Log and a local per-instance log directory (`C:\ProgramData\kici\<name>\logs\`).
+
+See [Service installation](service-installation.md) for the full reference.
+
+---
+
+## Agent deployment formats
+
+The agent supports three deployment formats, each suited to a different scaler backend.
+
+### Container image
+
+Used by the **container scaler**. The orchestrator pulls and runs the agent container image for each job.
+
+The image name and tag are configured in the scaler YAML:
+
+```yaml
+# scalers.yaml
+scalers:
+  - type: container
+    image: kici-agent:latest
+    labels: [linux, x64]
+```
+
+The container image includes git, bash, node, npm, and the native TypeScript loader binding -- no additional dependencies are needed.
+
+### npm package (bare-metal)
+
+Used by the **bare-metal scaler**. The agent is installed on the host machine and spawned as a process for each job. The `kici-admin` wrapper carries the agent and exposes the `kici-agent` binary the scaler spawns.
+
+```bash
+npm install -g kici-admin
+```
+
+The host must have git, a shell (bash on Linux/macOS, pwsh on Windows), node, and npm available. The bare-metal scaler starts agent processes directly, passing job configuration via environment variables.
+
+### Firecracker rootfs
+
+Used by the **Firecracker scaler**. The operator builds a rootfs image containing the agent, and the scaler launches Firecracker microVMs with that image.
+
+```yaml
+# scalers.yaml
+scalers:
+  - type: firecracker
+    rootfsPath: /var/lib/kici/agent-rootfs.ext4
+    kernelPath: /var/lib/kici/vmlinux-5.10
+    labels: [linux, x64, isolated]
+```
+
+See [Firecracker rootfs build guide](../orchestrator/firecracker/rootfs.md) for building the image.
+
+### Self-contained payload (fresh-box bootstrap)
+
+To provision an agent onto a machine that has **no Node.js installed**, use `kici-admin agent package`. It produces a self-contained tarball: the published agent, its full runtime dependency closure (including the native TypeScript loader binding), and a vendored, integrity-verified Node binary. The tarball also carries a `kici-agent` launcher that runs the agent on the vendored Node exclusively — no system Node on `PATH` is required.
+
+```bash
+# Produce a version-keyed payload for the glibc-Linux bootstrap set.
+kici-admin agent package --platform linux-x64,linux-arm64 --out ./agent-packages
+#   → ./agent-packages/<version>/kici-agent-<platform>.tar.gz (+ .sha256)
+
+# Optionally presign-upload each payload to the orchestrator cache bucket.
+kici-admin agent package --platform linux-x64 --upload
+```
+
+The payload version equals the orchestrator's own version, so a given version is always the same agent. Extract the tarball on the target host and run its `kici-agent` launcher — the launcher boots on the vendored `bin/node`. See the [`agent package` CLI reference](../orchestrator/kici-admin/agents-peers-hosts.md) for every flag (`--node-mirror` and `--npm-registry` cover air-gapped mirrors).
+
+Payloads are built on your own orchestrator from the sources you already trust — nodejs.org (checksum-verified) and npm (lockfile-verified) — and stored in your own object-storage cache bucket. `KICI_AGENT_BINARY_SOURCE` overrides the source to another bucket or mirror on the same endpoint (for an air-gapped replica). It defaults to the orchestrator's own cache bucket and rejects any non-`s3://` value, so there is no vendor CDN in the path.
+
+**Set a routable connect-back URL for boxes on other machines.** A bootstrapped agent dials the orchestrator at the URL the bring-up hands it, which defaults to `ws://127.0.0.1:<port>/ws` — correct only for a box that shares the orchestrator's host. Whenever the fresh box is a different machine, set `KICI_ORCHESTRATOR_URL` on the orchestrator to an address that box can reach (for example `ws://10.0.0.5:4000/ws`); otherwise the payload stages and boots but the agent never connects. The same variable sets the connect-back URL for scaler-spawned agents that a per-scaler `orchestratorUrl` does not already cover.
+
+#### Auto-package on orchestrator upgrade
+
+`kici-admin orchestrator upgrade` refreshes the fleet's payloads automatically: after the orchestrator advances to a new version, it produces and uploads `agent-packages/<version>/kici-agent-<platform>.tar.gz(.sha256)` for the platforms the fleet already runs (discovered from the cache bucket; the glibc-Linux bootstrap set on a fresh cache). It is idempotent — a version whose payloads already exist is skipped — so re-running an upgrade re-uploads nothing. Pass `--no-agent-packages` to skip this and publish payloads out of band, or `--agent-package-platforms <list>` to override the platform set. An orchestrator with no object-storage cache configured skips the step entirely (payloads are served from the cache bucket).
+
+#### Fleet auto-upgrade convergence
+
+Once bare boxes bootstrap themselves into the fleet, the orchestrator's version is the single source of truth for the whole fleet's agent version. The `agentVersionConverge(targetAgentId)` workflow check-step rolls a permanent fleet agent up to the orchestrator's version:
+
+```ts
+// A job on an ops agent (one holding kici:capability:ssh-transport) converges a host.
+job({ runsOn: ['kici:capability:ssh-transport'], steps: [agentVersionConverge('box-00007')] });
+```
+
+The check compares the host's staged version against the orchestrator target and reports drift; the apply re-stages the target payload onto the host and restarts its agent. Two properties make the roll safe:
+
+- **Availability-gated.** The convergence never rolls a host onto a version whose payload objects don't exist for the host's platform — it holds the host at its current version and reports the block instead. A missing payload can never produce a version skew.
+- **External-actor re-stage.** The re-stage is driven by the ops agent over SSH — it swaps the install and restarts the target's agent, which reconnects on its own persistent credential. The host's agent never updates its own running binary.
+
+Declare how a host restarts its agent so the convergence can drive it, via host properties on `kici-admin host declare`: either a systemd unit name (`kici:agent-service`) or explicit `kici:agent-restart-stop` / `kici:agent-restart-start` commands, plus an optional `kici:agent-install-dir` (default `/opt/kici-agent`). Combine `agentVersionConverge()` with a run-level check mode and drift approval for a controlled, health-gated rolling upgrade across the fleet.
+
+---
+
+## Agent runtime dependencies
+
+Every agent deployment requires the following runtime dependencies, regardless of deployment format:
+
+### Required
+
+| Dependency                                   | Purpose                                                                                          | Notes                                                                                                                      |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| **git** (CLI)                                | Repository cloning                                                                               | Any recent version                                                                                                         |
+| **bash** (Linux/macOS) or **pwsh** (Windows) | Step execution via zx                                                                            | Shell for workflow steps. On Windows, PowerShell 7 (`pwsh`) is required — the agent auto-installs it via winget if missing |
+| **node**                                     | Runtime + child process spawning                                                                 | Must match the version used to build the agent                                                                             |
+| **npm**                                      | `.kici/` dependency installation                                                                 | Ships with Node.js                                                                                                         |
+| **TypeScript loader binding**                | TS transform on `import()` (native NAPI bindings, consumed by `@kici-dev/shared/ts-loader-hook`) | Must be in `node_modules`, not lazy-downloaded                                                                             |
+
+The container image and Firecracker rootfs include all required dependencies. For bare-metal deployment, the operator must ensure these are available on the host.
+
+npm is the only package manager used -- pnpm is not bundled. npm ships with Node.js and the agent resolves `npm-cli.js` from the Node installation directory.
+
+### Optional host-level tools
+
+| Tool                    | Purpose                         | When needed                         |
+| ----------------------- | ------------------------------- | ----------------------------------- |
+| **bwrap** (bubblewrap)  | Sandbox isolation on bare-metal | Bare-metal scaler with sandbox mode |
+| **docker** / **podman** | Container sandbox mode          | Container-based step isolation      |
+
+These are not bundled in any deployment format -- they are host-level tools the operator installs if the feature is needed.
+
+---
+
+## Choosing a deployment model
+
+| Scenario                         | Orchestrator               | Agent                      |
+| -------------------------------- | -------------------------- | -------------------------- |
+| **Quick start (single machine)** | Container image            | Container image            |
+| **Production Linux server**      | npm + systemd              | Container or bare-metal    |
+| **macOS CI runner**              | npm + launchd              | Bare-metal (npm)           |
+| **Windows CI runner**            | npm + Windows service      | Bare-metal (npm)           |
+| **Kubernetes cluster**           | Container image            | Container image            |
+| **High-security isolation**      | Container or systemd       | Firecracker rootfs         |
+| **Multi-architecture**           | Container image (per-arch) | Container image (per-arch) |

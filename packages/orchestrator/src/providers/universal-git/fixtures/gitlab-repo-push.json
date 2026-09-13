@@ -1,0 +1,23 @@
+{
+  "object_kind": "push",
+  "event_name": "push",
+  "before": "1111111111111111111111111111111111111111",
+  "after": "2222222222222222222222222222222222222222",
+  "ref": "refs/heads/main",
+  "user_username": "gitlab-user",
+  "project": {
+    "id": 99,
+    "name": "svc",
+    "path_with_namespace": "group/subgroup/svc",
+    "default_branch": "main"
+  },
+  "commits": [
+    {
+      "id": "2222222222222222222222222222222222222222",
+      "message": "refactor",
+      "added": ["docs/readme.md"],
+      "modified": ["src/x.ts"],
+      "removed": []
+    }
+  ]
+}

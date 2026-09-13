@@ -1,0 +1,51 @@
+/**
+ * Secrets management module.
+ *
+ * Re-exports the PG secret store, audit logger, crypto utilities,
+ * and configuration helpers.
+ */
+export { PgSecretStore } from './pg-secret-store.js';
+export { AuditLogger } from './audit-logger.js';
+export {
+  loadMasterKey,
+  loadMasterKeyMaterial,
+  loadOldMasterKey,
+  loadOldMasterKeyMaterial,
+  loadSecretStoreConfig,
+  resolveMasterKeys,
+  type ResolvedMasterKeys,
+  type SecretStoreConfig,
+} from './config.js';
+export { secretOutputAad, sealSecretOutput, unsealSecretOutput } from './secret-output-crypto.js';
+export {
+  rotateMasterKeyWrappedTables,
+  selfHealStrandedDashboardKey,
+  selfHealStrandedSigningKey,
+  strandedKeyError,
+  type MasterKeyRotationResult,
+  type SweepResult,
+} from './master-key-rotation.js';
+export {
+  encrypt,
+  decrypt,
+  deriveKey,
+  generateMasterKey,
+  type EncryptedValue,
+} from '@kici-dev/shared';
+export { VaultSecretStore, type VaultConfig } from './vault-secret-store.js';
+export {
+  SecretResolver,
+  type SecretResolverDeps,
+  type ResolvedSecretMeta,
+  type ContextStoreLike,
+  type BindingStoreLike,
+  type SecretStoreLike,
+} from './secret-resolver.js';
+export { BackendSyncManager } from './backend-sync.js';
+export { RbacEnforcer, PermissionDeniedError, type Role, type Permission } from './rbac.js';
+export { TokenManager } from './token-manager.js';
+export {
+  cleanupOrphanedSecrets,
+  createOrphanSecretCleanupHandler,
+  type SecretCleanupDeps,
+} from './cleanup.js';

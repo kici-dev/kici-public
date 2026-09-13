@@ -1,0 +1,553 @@
+/**
+ * Registry of dashboard write operations governed by the per-orch
+ * dashboard-write policy.
+ *
+ * Subpath export: consumers import from
+ * `@kici-dev/engine/protocol/dashboard-write-operations`. The file is pure
+ * Zod + plain TypeScript with no node built-ins, so it remains
+ * browser-safe and is also imported directly by the dashboard SPA for
+ * capability rendering.
+ *
+ * Three audiences read this registry:
+ *   - Orchestrator: enforces the policy per operation in dashboard.* handlers.
+ *   - Platform: gates HTTP routes that proxy to the orch.
+ *   - Dashboard: renders per-control state (enabled / disabled / loading).
+ *
+ * Adding a new operation: append an entry to `DashboardWriteOperation`
+ * (the Zod enum) and `DASHBOARD_WRITE_OPERATIONS` (the descriptor array).
+ * The runtime build-time tests on the orchestrator and Platform sides
+ * fail until at least one gate handler references the new operation.
+ */
+import { z } from 'zod';
+
+export const DashboardWriteOperation = z.enum([
+  // Secrets — plaintext values traverse Platform memory when policy is enabled.
+  'secrets.set',
+  'secrets.delete',
+  'secrets.scope.create',
+  'secrets.scope.rename',
+  'secrets.scope.delete',
+  // Variables — plaintext values traverse Platform memory when policy is enabled.
+  'variables.set',
+  'variables.delete',
+  // Contexts — definition CRUD; no plaintext.
+  'contexts.create',
+  'contexts.update',
+  'contexts.test_access.set',
+  'contexts.delete',
+  // Bindings and per-source overrides — reshape the resolution tree; no plaintext.
+  'contexts.bindings.set',
+  'contexts.source_overrides.set',
+  'contexts.source_overrides.delete',
+  // Held runs — release execution.
+  'held_runs.approve',
+  'held_runs.reject',
+  // DLQ — replay or drop failed webhooks.
+  'event_dlq.retry',
+  'event_dlq.discard',
+  // Attestations — drain the deferred-attestation outbox (mints deferred tokens).
+  'attestations.retry',
+  // Registrations — DoS-shaped or destructive.
+  'registration.disable',
+  'registration.delete',
+  // Orch topology — config that affects scaler / dispatch.
+  'global_workflows.update',
+  'backends.sync',
+  'backends.sync_one',
+  'backends.test',
+  // Fleet — host inventory writes (declare / remove); config that affects the fleet.
+  'fleet.host.declare',
+  'fleet.host.remove',
+]);
+
+export type DashboardWriteOperation = z.infer<typeof DashboardWriteOperation>;
+
+/** Stable list of every operation in enum-declaration order. */
+export const DASHBOARD_WRITE_OPERATION_VALUES: readonly DashboardWriteOperation[] = Object.freeze([
+  'secrets.set',
+  'secrets.delete',
+  'secrets.scope.create',
+  'secrets.scope.rename',
+  'secrets.scope.delete',
+  'variables.set',
+  'variables.delete',
+  'contexts.create',
+  'contexts.update',
+  'contexts.test_access.set',
+  'contexts.delete',
+  'contexts.bindings.set',
+  'contexts.source_overrides.set',
+  'contexts.source_overrides.delete',
+  'held_runs.approve',
+  'held_runs.reject',
+  'event_dlq.retry',
+  'event_dlq.discard',
+  'attestations.retry',
+  'registration.disable',
+  'registration.delete',
+  'global_workflows.update',
+  'backends.sync',
+  'backends.sync_one',
+  'backends.test',
+  'fleet.host.declare',
+  'fleet.host.remove',
+]);
+
+export const DashboardWriteCategory = z.enum([
+  'Secrets',
+  'Variables',
+  'Contexts',
+  'Bindings',
+  'Held runs',
+  'DLQ',
+  'Attestations',
+  'Registrations',
+  'Topology',
+  'Fleet',
+]);
+export type DashboardWriteCategory = z.infer<typeof DashboardWriteCategory>;
+
+export const DashboardWriteSensitivity = z.enum(['plaintext', 'authority', 'dispatch']);
+export type DashboardWriteSensitivity = z.infer<typeof DashboardWriteSensitivity>;
+
+/**
+ * Descriptor for one dashboard write operation. The fields that don't
+ * affect enforcement (label, cliEquivalent) are read by the dashboard
+ * SPA to render policy-aware UI and by the docs generator.
+ */
+export interface DashboardWriteOperationDescriptor {
+  /** The operation enum value used by enforcement helpers. */
+  readonly name: DashboardWriteOperation;
+  /** The wire message type the operation maps to (dashboard.* on Platform→Orch). */
+  readonly wireMessageType: string;
+  /** Grouping for UI rendering. */
+  readonly category: DashboardWriteCategory;
+  /** Human-facing label for tooltips and the Security policy page. */
+  readonly label: string;
+  /** Threat-model bucket — used by docs + the --sensitivity CLI sugar. */
+  readonly sensitivity: DashboardWriteSensitivity;
+  /** kici-admin invocation hint shown in the CLI snippet copied from the UI. */
+  readonly cliEquivalent: string;
+}
+
+export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescriptor[] =
+  Object.freeze([
+    {
+      name: 'secrets.set',
+      wireMessageType: 'dashboard.contexts.secrets.set',
+      category: 'Secrets',
+      label: 'Set secret value',
+      sensitivity: 'plaintext',
+      cliEquivalent: 'kici-admin secret set',
+    },
+    {
+      name: 'secrets.delete',
+      wireMessageType: 'dashboard.contexts.secrets.delete',
+      category: 'Secrets',
+      label: 'Delete secret',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin secret delete',
+    },
+    {
+      name: 'secrets.scope.create',
+      wireMessageType: 'dashboard.contexts.secrets.scope.create',
+      category: 'Secrets',
+      label: 'Create secret scope',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin secret scope create',
+    },
+    {
+      name: 'secrets.scope.rename',
+      wireMessageType: 'dashboard.contexts.secrets.scope.rename',
+      category: 'Secrets',
+      label: 'Rename secret scope',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin secret scope rename',
+    },
+    {
+      name: 'secrets.scope.delete',
+      wireMessageType: 'dashboard.contexts.secrets.scope.delete',
+      category: 'Secrets',
+      label: 'Delete secret scope',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin secret scope delete',
+    },
+    {
+      name: 'variables.set',
+      wireMessageType: 'dashboard.contexts.variables.set',
+      category: 'Variables',
+      label: 'Set variable value',
+      sensitivity: 'plaintext',
+      cliEquivalent: 'kici-admin variable set',
+    },
+    {
+      name: 'variables.delete',
+      wireMessageType: 'dashboard.contexts.variables.delete',
+      category: 'Variables',
+      label: 'Delete variable',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin variable delete',
+    },
+    {
+      name: 'contexts.create',
+      wireMessageType: 'dashboard.contexts.create',
+      category: 'Contexts',
+      label: 'Create context',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context create',
+    },
+    {
+      name: 'contexts.update',
+      wireMessageType: 'dashboard.contexts.update',
+      category: 'Contexts',
+      label: 'Update context',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context set-policy',
+    },
+    {
+      name: 'contexts.test_access.set',
+      wireMessageType: 'dashboard.contexts.test_access.set',
+      category: 'Contexts',
+      label: 'Set context test access',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context set-policy --allow-local-execution',
+    },
+    {
+      name: 'contexts.delete',
+      wireMessageType: 'dashboard.contexts.delete',
+      category: 'Contexts',
+      label: 'Delete context',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context delete',
+    },
+    {
+      name: 'contexts.bindings.set',
+      wireMessageType: 'dashboard.contexts.bindings.set',
+      category: 'Bindings',
+      label: 'Set context binding',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context bind',
+    },
+    {
+      name: 'contexts.source_overrides.set',
+      wireMessageType: 'dashboard.contexts.source-overrides.set',
+      category: 'Bindings',
+      label: 'Set source override',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context source-override set',
+    },
+    {
+      name: 'contexts.source_overrides.delete',
+      wireMessageType: 'dashboard.contexts.source-overrides.delete',
+      category: 'Bindings',
+      label: 'Delete source override',
+      sensitivity: 'authority',
+      cliEquivalent: 'kici-admin context source-override delete',
+    },
+    {
+      name: 'held_runs.approve',
+      wireMessageType: 'dashboard.held-runs.approve',
+      category: 'Held runs',
+      label: 'Approve held run',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin held-run approve',
+    },
+    {
+      name: 'held_runs.reject',
+      wireMessageType: 'dashboard.held-runs.reject',
+      category: 'Held runs',
+      label: 'Reject held run',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin held-run reject',
+    },
+    {
+      name: 'event_dlq.retry',
+      wireMessageType: 'dashboard.event-dlq.retry',
+      category: 'DLQ',
+      label: 'Retry dead-lettered webhook',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin event-dlq retry',
+    },
+    {
+      name: 'event_dlq.discard',
+      wireMessageType: 'dashboard.event-dlq.discard',
+      category: 'DLQ',
+      label: 'Discard dead-lettered webhook',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin event-dlq discard',
+    },
+    {
+      name: 'attestations.retry',
+      wireMessageType: 'dashboard.attestation.retry',
+      category: 'Attestations',
+      label: 'Retry deferred attestations',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin attestations retry',
+    },
+    {
+      name: 'registration.disable',
+      wireMessageType: 'dashboard.registration.disable',
+      category: 'Registrations',
+      label: 'Disable workflow registration',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin registration disable',
+    },
+    {
+      name: 'registration.delete',
+      wireMessageType: 'dashboard.registration.delete',
+      category: 'Registrations',
+      label: 'Delete workflow registration',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin registration delete',
+    },
+    {
+      name: 'global_workflows.update',
+      wireMessageType: 'dashboard.global-workflows.update',
+      category: 'Topology',
+      label: 'Update global workflow policy',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin org-settings global-workflows set',
+    },
+    {
+      name: 'backends.sync',
+      wireMessageType: 'dashboard.backends.sync',
+      category: 'Topology',
+      label: 'Sync all scaler backends',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin backend sync',
+    },
+    {
+      name: 'backends.sync_one',
+      wireMessageType: 'dashboard.backends.sync.one',
+      category: 'Topology',
+      label: 'Sync one scaler backend',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin backend sync --one',
+    },
+    {
+      name: 'backends.test',
+      wireMessageType: 'dashboard.backends.test',
+      category: 'Topology',
+      label: 'Test scaler backend',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin backend test',
+    },
+    {
+      name: 'fleet.host.declare',
+      wireMessageType: 'dashboard.fleet.host.declare',
+      category: 'Fleet',
+      label: 'Declare a static host',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin host declare',
+    },
+    {
+      name: 'fleet.host.remove',
+      wireMessageType: 'dashboard.fleet.host.remove',
+      category: 'Fleet',
+      label: 'Remove a host from the roster',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin host remove',
+    },
+  ]);
+
+/**
+ * The operations whose `cliEquivalent` answers only on an **independent**
+ * orchestrator.
+ *
+ * `kici-admin held-run approve` and `reject` refuse with a 409 wherever a
+ * Platform is attached, because the Platform's own held-run trust gate is the
+ * authority on who may answer a hold there. Every other operation's CLI
+ * equivalent works in any mode.
+ *
+ * That makes these two the only operations a Platform-attached orchestrator
+ * cannot move to the CLI layer: disabling one leaves no surface that can answer
+ * a context or reviewer hold, so the orchestrator refuses the write. This list
+ * is what the orchestrator's policy module and the `dashboard-writes` CLI
+ * render both read, so the refusal and the warning can never name different
+ * operations.
+ */
+export const CLI_INDEPENDENT_ONLY_OPERATIONS: readonly DashboardWriteOperation[] = Object.freeze([
+  'held_runs.approve',
+  'held_runs.reject',
+]);
+
+/** O(1) lookup of a descriptor by operation name. */
+export const DASHBOARD_WRITE_OPERATIONS_BY_NAME: ReadonlyMap<
+  DashboardWriteOperation,
+  DashboardWriteOperationDescriptor
+> = new Map(DASHBOARD_WRITE_OPERATIONS.map((d) => [d.name, d]));
+
+/** O(1) lookup of a descriptor by wire-message type. */
+export const DASHBOARD_WRITE_OPERATIONS_BY_WIRE_TYPE: ReadonlyMap<
+  string,
+  DashboardWriteOperationDescriptor
+> = new Map(DASHBOARD_WRITE_OPERATIONS.map((d) => [d.wireMessageType, d]));
+
+export function getDashboardWriteOperationDescriptor(
+  op: DashboardWriteOperation,
+): DashboardWriteOperationDescriptor {
+  const descriptor = DASHBOARD_WRITE_OPERATIONS_BY_NAME.get(op);
+  if (!descriptor) {
+    throw new Error(`No descriptor registered for dashboard write operation: ${op}`);
+  }
+  return descriptor;
+}
+
+export function getDashboardWriteOperationsByCategory(
+  category: DashboardWriteCategory,
+): readonly DashboardWriteOperationDescriptor[] {
+  return DASHBOARD_WRITE_OPERATIONS.filter((d) => d.category === category);
+}
+
+export function getDashboardWriteOperationsBySensitivity(
+  sensitivity: DashboardWriteSensitivity,
+): readonly DashboardWriteOperationDescriptor[] {
+  return DASHBOARD_WRITE_OPERATIONS.filter((d) => d.sensitivity === sensitivity);
+}
+
+/**
+ * Per-operation dashboard-write posture.
+ *
+ *   - `permissive` — the write is accepted and its plaintext value transits
+ *     the hosted Platform process (today's default; the absent-key default).
+ *   - `encrypted` — the write is accepted but the value is sealed in the
+ *     browser to the orchestrator's published X25519 key, so the Platform
+ *     relays only opaque ciphertext. Valid ONLY for `plaintext`-sensitivity
+ *     operations (`secrets.set`, `variables.set`) — an operation with no
+ *     plaintext payload has nothing to seal.
+ *   - `disabled` — the write is refused; the operator must use the CLI.
+ *
+ * Absent from the sparse map ⇒ `permissive`.
+ */
+export const DashboardWritePolicyState = z.enum(['permissive', 'encrypted', 'disabled']);
+export type DashboardWritePolicyState = z.infer<typeof DashboardWritePolicyState>;
+
+/**
+ * Coerce a single stored / on-the-wire policy value to a
+ * {@link DashboardWritePolicyState}. Older orchestrators (and pre-migration
+ * JSONB rows) carry the legacy boolean shape: `true` (enabled/permissive) and
+ * `false` (disabled). New peers carry the enum string directly. This keeps the
+ * protected wire + storage surfaces backward-compatible during the deprecation
+ * window — a boolean is never rejected, it is translated.
+ */
+export function coerceDashboardWritePolicyValue(value: unknown): DashboardWritePolicyState {
+  if (value === true) return 'permissive';
+  if (value === false) return 'disabled';
+  const parsed = DashboardWritePolicyState.safeParse(value);
+  return parsed.success ? parsed.data : 'permissive';
+}
+
+/**
+ * Map of operation → posture. Omitted operations default to `permissive`.
+ * The orch persists this shape verbatim as JSONB; the Platform mirrors it in
+ * its per-org cache.
+ */
+export type DashboardWritePolicyMap = Partial<
+  Record<DashboardWriteOperation, DashboardWritePolicyState>
+>;
+
+/**
+ * Validates a sparse policy map. Accepts BOTH the enum-string shape and the
+ * legacy boolean shape (coerced), so an older orchestrator's boolean map and a
+ * pre-migration JSONB row both parse. `encrypted` is rejected for any operation
+ * whose sensitivity is not `plaintext` (nothing to seal without a plaintext
+ * payload; the signing half that would cover authority/dispatch ops is a
+ * separate feature). Use this where the value is required but may be empty
+ * (e.g. the JSONB column on the orch). For optional fields on outer schemas,
+ * embed `dashboardWritePolicyMap` directly with `.optional()` so omission stays
+ * as `undefined` rather than being coerced to `{}`.
+ */
+export const dashboardWritePolicyMap = z
+  .partialRecord(DashboardWriteOperation, z.union([z.boolean(), DashboardWritePolicyState]))
+  .transform((map) => {
+    const out: DashboardWritePolicyMap = {};
+    for (const [op, value] of Object.entries(map)) {
+      out[op as DashboardWriteOperation] = coerceDashboardWritePolicyValue(value);
+    }
+    return out;
+  })
+  .superRefine((map, ctx) => {
+    for (const [op, state] of Object.entries(map)) {
+      if (state !== 'encrypted') continue;
+      const descriptor = DASHBOARD_WRITE_OPERATIONS_BY_NAME.get(op as DashboardWriteOperation);
+      if (descriptor?.sensitivity !== 'plaintext') {
+        ctx.addIssue({
+          code: 'custom',
+          message: `"encrypted" is only valid for plaintext operations, not "${op}"`,
+          path: [op],
+        });
+      }
+    }
+  });
+
+export const dashboardWritePolicyMapSchema = dashboardWritePolicyMap.default({});
+
+/**
+ * Resolve the effective posture of an operation given a (possibly sparse)
+ * policy map. Treats `undefined` as the permissive default.
+ */
+export function resolvePolicyState(
+  policy: DashboardWritePolicyMap | null | undefined,
+  op: DashboardWriteOperation,
+): DashboardWritePolicyState {
+  const raw = policy?.[op];
+  if (raw === undefined) return 'permissive';
+  // Coerce defensively: a policy map that reached this resolver without going
+  // through the schema (e.g. a raw legacy-boolean map cached from an older
+  // orchestrator) must still resolve `false` → disabled, never fail-open.
+  return coerceDashboardWritePolicyValue(raw);
+}
+
+/**
+ * Resolve the effective enabled state of an operation. `true` unless the
+ * posture is `disabled`. Convenience for the many read-only "may this write
+ * proceed at all?" call sites.
+ */
+export function isDashboardWriteOperationEnabled(
+  policy: DashboardWritePolicyMap | null | undefined,
+  op: DashboardWriteOperation,
+): boolean {
+  return resolvePolicyState(policy, op) !== 'disabled';
+}
+
+/** True only when the operation's posture is `encrypted`. */
+export function isEncryptedState(
+  policy: DashboardWritePolicyMap | null | undefined,
+  op: DashboardWriteOperation,
+): boolean {
+  return resolvePolicyState(policy, op) === 'encrypted';
+}
+
+/**
+ * Expand a (possibly sparse) policy map into the full effective enabled
+ * boolean for all 27 operations. Operations the policy doesn't mention come
+ * back as `true` (permissive). Retained for existing consumers that only need
+ * the enabled/disabled bit; {@link resolveFullPolicyStateView} exposes the
+ * richer tri-state.
+ */
+export function resolveFullPolicyView(
+  policy: DashboardWritePolicyMap | null | undefined,
+): Record<DashboardWriteOperation, boolean> {
+  const out = {} as Record<DashboardWriteOperation, boolean>;
+  for (const descriptor of DASHBOARD_WRITE_OPERATIONS) {
+    out[descriptor.name] = isDashboardWriteOperationEnabled(policy, descriptor.name);
+  }
+  return out;
+}
+
+/**
+ * Expand a (possibly sparse) policy map into the full tri-state posture for
+ * all 27 operations. Used by the orch HTTP admin response, the WS
+ * `orch.capabilities` broadcast, and the dashboard's policy page so consumers
+ * see the full picture (including which plaintext ops are `encrypted`), not the
+ * sparse storage shape.
+ */
+export function resolveFullPolicyStateView(
+  policy: DashboardWritePolicyMap | null | undefined,
+): Record<DashboardWriteOperation, DashboardWritePolicyState> {
+  const out = {} as Record<DashboardWriteOperation, DashboardWritePolicyState>;
+  for (const descriptor of DASHBOARD_WRITE_OPERATIONS) {
+    out[descriptor.name] = resolvePolicyState(policy, descriptor.name);
+  }
+  return out;
+}

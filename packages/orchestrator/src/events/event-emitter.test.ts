@@ -1,0 +1,316 @@
+/**
+ * Tests for EventEmitter -- system event emission on workflow/job completion.
+ *
+ * Mocks EventRouter to verify:
+ * - emitWorkflowComplete produces correct event name and payload
+ * - emitJobComplete produces correct event name and payload
+ * - chainDepth is always 0 for system events
+ * - source fields are set correctly
+ */
+import { describe, it, expect, vi } from 'vitest';
+
+import {
+  EventEmitter,
+  type WorkflowCompleteData,
+  type WorkflowsFailedBatchData,
+  type JobCompleteData,
+} from './event-emitter.js';
+import type { EventRouter } from './event-router.js';
+
+// ── Mock helpers ────────────────────────────────────────────────
+
+function createMockRouter() {
+  return {
+    emit: vi.fn().mockResolvedValue('evt-sys-001'),
+    start: vi.fn(),
+    stop: vi.fn(),
+  } as unknown as EventRouter;
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+describe('EventEmitter', () => {
+  describe('emitWorkflowsFailedBatch', () => {
+    it('should emit __workflows_failed_batch targeting the registration with the run list', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      const data: WorkflowsFailedBatchData = {
+        routingKey: 'github:42',
+        repo: 'owner/repo',
+        registrationId: 'reg-notifier',
+        total: 3,
+        runs: [
+          { runId: 'run-1', repo: 'owner/repo', workflowName: 'CI', failureClass: 'step_failure' },
+          { runId: 'run-2', repo: 'owner/repo', workflowName: 'CI' },
+          { runId: 'run-3', repo: 'owner/repo', workflowName: 'Deploy' },
+        ],
+      };
+
+      const eventId = await emitter.emitWorkflowsFailedBatch(data);
+
+      expect(eventId).toBe('evt-sys-001');
+      expect(router.emit).toHaveBeenCalledWith({
+        eventName: '__workflows_failed_batch',
+        payload: {
+          registrationId: 'reg-notifier',
+          total: 3,
+          runs: data.runs,
+          sourceRepo: 'owner/repo',
+          sourceRoutingKey: 'github:42',
+        },
+        sourceRepo: 'owner/repo',
+        sourceRoutingKey: 'github:42',
+        chainDepth: 0,
+      });
+    });
+  });
+
+  describe('emitWorkflowComplete', () => {
+    it('should emit __workflow_complete with correct event name and payload', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      const data: WorkflowCompleteData = {
+        routingKey: 'github:42',
+        repo: 'owner/repo',
+        workflowName: 'CI',
+        runId: 'run-123',
+        status: 'success',
+        conclusion: 'All jobs passed',
+        duration: 30000,
+        jobResults: [
+          { name: 'build', status: 'success' },
+          { name: 'test', status: 'success' },
+        ],
+      };
+
+      const eventId = await emitter.emitWorkflowComplete(data);
+
+      expect(eventId).toBe('evt-sys-001');
+      expect(router.emit).toHaveBeenCalledWith({
+        eventName: '__workflow_complete',
+        payload: {
+          workflowName: 'CI',
+          runId: 'run-123',
+          status: 'success',
+          conclusion: 'All jobs passed',
+          duration: 30000,
+          jobResults: [
+            { name: 'build', status: 'success' },
+            { name: 'test', status: 'success' },
+          ],
+          sourceRepo: 'owner/repo',
+          sourceRoutingKey: 'github:42',
+        },
+        sourceRepo: 'owner/repo',
+        sourceRoutingKey: 'github:42',
+        sourceRunId: 'run-123',
+        chainDepth: 0,
+      });
+    });
+
+    it('should always set chainDepth to 0 for workflow complete events', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      await emitter.emitWorkflowComplete({
+        routingKey: 'github:42',
+        repo: 'owner/repo',
+        workflowName: 'Deploy',
+        runId: 'run-456',
+        status: 'failed',
+        conclusion: 'Job "deploy" failed',
+        duration: 5000,
+        jobResults: [{ name: 'deploy', status: 'failed' }],
+      });
+
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.chainDepth).toBe(0);
+    });
+
+    it('should set source fields correctly', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      await emitter.emitWorkflowComplete({
+        routingKey: 'github:99',
+        repo: 'org/monorepo',
+        workflowName: 'Release',
+        runId: 'run-789',
+        status: 'success',
+        conclusion: 'Released v1.0.0',
+        duration: 120000,
+        jobResults: [],
+      });
+
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.sourceRepo).toBe('org/monorepo');
+      expect(emitCall.sourceRoutingKey).toBe('github:99');
+      expect(emitCall.sourceRunId).toBe('run-789');
+    });
+  });
+
+  describe('emitJobComplete', () => {
+    it('should emit __job_complete with correct event name and payload', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      const data: JobCompleteData = {
+        routingKey: 'github:42',
+        repo: 'owner/repo',
+        workflowName: 'CI',
+        jobName: 'build',
+        runId: 'run-123',
+        jobId: 'job-456',
+        status: 'success',
+        duration: 15000,
+        stepResults: [
+          { name: 'checkout', status: 'success' },
+          { name: 'compile', status: 'success' },
+          { name: 'test', status: 'success' },
+        ],
+      };
+
+      const eventId = await emitter.emitJobComplete(data);
+
+      expect(eventId).toBe('evt-sys-001');
+      expect(router.emit).toHaveBeenCalledWith({
+        eventName: '__job_complete',
+        payload: {
+          workflowName: 'CI',
+          jobName: 'build',
+          runId: 'run-123',
+          jobId: 'job-456',
+          status: 'success',
+          duration: 15000,
+          stepResults: [
+            { name: 'checkout', status: 'success' },
+            { name: 'compile', status: 'success' },
+            { name: 'test', status: 'success' },
+          ],
+          sourceRepo: 'owner/repo',
+          sourceRoutingKey: 'github:42',
+        },
+        sourceRepo: 'owner/repo',
+        sourceRoutingKey: 'github:42',
+        sourceRunId: 'run-123',
+        sourceJobId: 'job-456',
+        chainDepth: 0,
+      });
+    });
+
+    it('should always set chainDepth to 0 for job complete events', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      await emitter.emitJobComplete({
+        routingKey: 'github:42',
+        repo: 'owner/repo',
+        workflowName: 'CI',
+        jobName: 'test',
+        runId: 'run-123',
+        jobId: 'job-789',
+        status: 'failed',
+        duration: 5000,
+        stepResults: [{ name: 'run-tests', status: 'failed' }],
+      });
+
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.chainDepth).toBe(0);
+    });
+
+    it('should set source fields including jobId correctly', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      await emitter.emitJobComplete({
+        routingKey: 'github:99',
+        repo: 'org/service',
+        workflowName: 'Deploy',
+        jobName: 'deploy-prod',
+        runId: 'run-100',
+        jobId: 'job-200',
+        status: 'success',
+        duration: 60000,
+        stepResults: [],
+      });
+
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.sourceRepo).toBe('org/service');
+      expect(emitCall.sourceRoutingKey).toBe('github:99');
+      expect(emitCall.sourceRunId).toBe('run-100');
+      expect(emitCall.sourceJobId).toBe('job-200');
+    });
+  });
+
+  describe('emitScalerScaleUp', () => {
+    it('emits kici.scaler.scale-up at chainDepth 0 targeting the provisioning targets', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      const eventId = await emitter.emitScalerScaleUp(
+        {
+          scalerName: 'hetzner',
+          agentId: 'a1',
+          labels: ['cloud=hetzner'],
+          mandatoryLabels: [],
+          resources: {},
+          orchestratorUrl: 'wss://h/ws',
+          claimCode: 'claim-abc',
+          jobId: 'job-9',
+          requestId: 'r1',
+        },
+        ['org/infra'],
+      );
+
+      expect(eventId).toBe('evt-sys-001');
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.eventName).toBe('kici.scaler.scale-up');
+      expect(emitCall.chainDepth).toBe(0);
+      expect(emitCall.target).toEqual({ repos: ['org/infra'] });
+      expect(emitCall.payload.agentId).toBe('a1');
+      expect(emitCall.payload.claimCode).toBe('claim-abc');
+    });
+
+    it('rejects a malformed scale-up payload before routing', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+      await expect(
+        // Missing required fields (claimCode, orchestratorUrl, ...).
+        emitter.emitScalerScaleUp({ scalerName: 'hetzner' } as never, ['org/infra']),
+      ).rejects.toThrow();
+      expect(router.emit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('emitScalerScaleDown', () => {
+    it('emits kici.scaler.scale-down at chainDepth 0 with the reason', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      await emitter.emitScalerScaleDown(
+        { scalerName: 'hetzner', agentId: 'a1', reason: 'job-complete', requestId: 'r1' },
+        ['org/infra'],
+      );
+
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.eventName).toBe('kici.scaler.scale-down');
+      expect(emitCall.chainDepth).toBe(0);
+      expect(emitCall.target).toEqual({ repos: ['org/infra'] });
+      expect(emitCall.payload.reason).toBe('job-complete');
+    });
+
+    it('rejects an unknown scale-down reason before routing', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+      await expect(
+        emitter.emitScalerScaleDown(
+          { scalerName: 'hetzner', agentId: 'a1', reason: 'exploded' as never, requestId: 'r1' },
+          ['org/infra'],
+        ),
+      ).rejects.toThrow();
+      expect(router.emit).not.toHaveBeenCalled();
+    });
+  });
+});

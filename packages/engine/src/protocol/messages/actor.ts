@@ -1,0 +1,221 @@
+import { z } from 'zod';
+
+/**
+ * Typed actor principal for attributable reads, writes, and admin operations
+ * across the Platform → orchestrator and orchestrator → agent boundaries.
+ *
+ * Every dashboard.* / run.* proxy message carries an `actor` field so the
+ * orchestrator can write an `access_log` row attributable to a specific
+ * principal. The discriminated union prevents string-shape drift between
+ * tiers and encodes the reason for break-glass operator access at the
+ * protocol level rather than in free-text metadata.
+ */
+
+export const ActorType = z.enum([
+  'user',
+  'api_key',
+  'service_account',
+  'platform_operator',
+  'system',
+]);
+export type ActorType = z.infer<typeof ActorType>;
+
+export const userActorSchema = z.object({
+  type: z.literal(ActorType.enum.user),
+  /** Keycloak subject (idp_sub). */
+  sub: z.string().min(1),
+  /**
+   * Present when the user is acting through an agent-kind PAT (e.g. a coding
+   * agent driving KiCI via the developer MCP server). The PAT still inherits
+   * the user's permissions — this is provenance only, not an authority change.
+   * `patId` is the opaque PAT identifier; `label` is the human-set agent name
+   * recorded on every audit / access-log row.
+   */
+  agent: z
+    .object({
+      patId: z.string().min(1),
+      label: z.string().min(1),
+    })
+    .optional(),
+});
+export type UserActor = z.infer<typeof userActorSchema>;
+
+export const apiKeyActorSchema = z.object({
+  type: z.literal(ActorType.enum.api_key),
+  /** Opaque key identifier (not the secret). */
+  keyId: z.string().min(1),
+  /** Keycloak sub of the human who owns this key. */
+  ownerSub: z.string().min(1),
+  /**
+   * Present when the org API key is agent-kind (e.g. a service account driving
+   * KiCI via the developer MCP server). Unlike the user actor's agent, no
+   * separate id is needed — `keyId` already identifies the credential. The key
+   * still inherits the org's permissions; the label is provenance only.
+   */
+  agent: z
+    .object({
+      label: z.string().min(1),
+    })
+    .optional(),
+});
+export type ApiKeyActor = z.infer<typeof apiKeyActorSchema>;
+
+export const serviceAccountActorSchema = z.object({
+  type: z.literal(ActorType.enum.service_account),
+  /** Service-account identifier (orchestrator admin tokens, CI bot tokens, etc.). */
+  id: z.string().min(1),
+});
+export type ServiceAccountActor = z.infer<typeof serviceAccountActorSchema>;
+
+export const platformOperatorActorSchema = z.object({
+  type: z.literal(ActorType.enum.platform_operator),
+  /** Keycloak sub of the SaaS operator performing break-glass access. */
+  sub: z.string().min(1),
+  /**
+   * Free-text justification recorded in `access_log.actor_meta.reason`.
+   * Length bounds reject empty / obviously-bad-faith values; not a ticket
+   * pattern (we support multiple incident systems).
+   */
+  reason: z.string().min(4).max(200),
+  /**
+   * Support-session id, when the operator is reading through a dashboard
+   * support session (not the kici-platform-admin CLI break-glass path).
+   * Recorded in `access_log.actor_meta.sessionId` so the customer's activity
+   * page can tie each operator read back to the session that authorised it.
+   */
+  sessionId: z.string().min(1).optional(),
+});
+export type PlatformOperatorActor = z.infer<typeof platformOperatorActorSchema>;
+
+export const systemActorSchema = z.object({
+  type: z.literal(ActorType.enum.system),
+  /** Subsystem initiating the action (e.g. 'scheduler', 'retry', 'cleanup'). */
+  component: z.string().min(1),
+});
+export type SystemActor = z.infer<typeof systemActorSchema>;
+
+export const actorPrincipalSchema = z.discriminatedUnion('type', [
+  userActorSchema,
+  apiKeyActorSchema,
+  serviceAccountActorSchema,
+  platformOperatorActorSchema,
+  systemActorSchema,
+]);
+export type ActorPrincipal = z.infer<typeof actorPrincipalSchema>;
+
+/**
+ * Separator {@link stringifyActor} appends when a `user` / `api_key` actor acted
+ * through an agent, as `${type}:${id}${ACTOR_AGENT_SUFFIX}${label}`.
+ *
+ * Exported because a reader that splits the persisted string on its first colon
+ * gets `${id}${ACTOR_AGENT_SUFFIX}${label}` rather than the id — so any consumer
+ * comparing a stored subject against a live one has to strip this suffix, and
+ * must strip the same string this function writes.
+ */
+export const ACTOR_AGENT_SUFFIX = ' via agent:';
+
+/**
+ * Convert an ActorPrincipal to a colon-prefixed string suitable for DB
+ * persistence in columns like `execution_runs.triggered_by` / `.cancelled_by`.
+ * The inverse of parseActor().
+ *
+ * Format: `${type}:${id}` where id is the variant's natural identifier, plus
+ * {@link ACTOR_AGENT_SUFFIX} and the label when the actor acted through an
+ * agent. Extra metadata (api_key.ownerSub, platform_operator.reason) is NOT
+ * round-tripped through the string form — callers that need full fidelity
+ * must persist the actor object separately (e.g. in `access_log.actor_meta`).
+ */
+export function stringifyActor(actor: ActorPrincipal): string {
+  switch (actor.type) {
+    case 'user':
+      return actor.agent
+        ? `user:${actor.sub}${ACTOR_AGENT_SUFFIX}${actor.agent.label}`
+        : `user:${actor.sub}`;
+    case 'api_key':
+      return actor.agent
+        ? `api_key:${actor.keyId}${ACTOR_AGENT_SUFFIX}${actor.agent.label}`
+        : `api_key:${actor.keyId}`;
+    case 'service_account':
+      return `service_account:${actor.id}`;
+    case 'platform_operator':
+      return `platform_operator:${actor.sub}`;
+    case 'system':
+      return `system:${actor.component}`;
+  }
+}
+
+/**
+ * Parse a `${type}:${id}` string back into a partial ActorPrincipal.
+ * Because the string form drops metadata, api_key.ownerSub and
+ * platform_operator.reason are null when the source is a string.
+ *
+ * Returns null for unrecognized inputs; callers that need strict parsing
+ * should throw on null.
+ */
+export function parseActor(
+  value: string | null | undefined,
+): { type: ActorType; id: string } | null {
+  if (value == null || value === '') return null;
+  const idx = value.indexOf(':');
+  if (idx < 1 || idx === value.length - 1) return null;
+  const prefix = value.slice(0, idx);
+  const id = value.slice(idx + 1);
+  const parsed = ActorType.safeParse(prefix);
+  if (!parsed.success) return null;
+  return { type: parsed.data, id };
+}
+
+/**
+ * Flatten an ActorPrincipal into the three columns the orchestrator
+ * `access_log` table uses: (actor_type, actor_id, actor_meta).
+ * actor_meta preserves the variant-specific extras that are lost in
+ * stringifyActor().
+ */
+export function flattenActor(actor: ActorPrincipal): {
+  actorType: ActorType;
+  actorId: string;
+  actorMeta: Record<string, unknown> | null;
+} {
+  switch (actor.type) {
+    case 'user':
+      return {
+        actorType: 'user',
+        actorId: actor.sub,
+        actorMeta: actor.agent
+          ? { agentPatId: actor.agent.patId, agentLabel: actor.agent.label }
+          : null,
+      };
+    case 'api_key':
+      return {
+        actorType: 'api_key',
+        actorId: actor.keyId,
+        actorMeta: actor.agent
+          ? { ownerSub: actor.ownerSub, agentLabel: actor.agent.label }
+          : { ownerSub: actor.ownerSub },
+      };
+    case 'service_account':
+      return { actorType: 'service_account', actorId: actor.id, actorMeta: null };
+    case 'platform_operator':
+      return {
+        actorType: 'platform_operator',
+        actorId: actor.sub,
+        actorMeta: {
+          reason: actor.reason,
+          ...(actor.sessionId ? { sessionId: actor.sessionId } : {}),
+        },
+      };
+    case 'system':
+      return { actorType: 'system', actorId: actor.component, actorMeta: null };
+  }
+}
+
+/**
+ * Extract the agent provenance label from an actor, when present. Returns the
+ * label for agent-kind `user` (PAT) and `api_key` (org key) actors, else null.
+ * The single label extractor reused by run capture and the access-log writer so
+ * both credential families surface agent provenance identically.
+ */
+export function agentLabelOf(actor: ActorPrincipal): string | null {
+  if (actor.type === 'user' || actor.type === 'api_key') return actor.agent?.label ?? null;
+  return null;
+}

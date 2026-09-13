@@ -1,0 +1,410 @@
+/**
+ * `kici-admin orchestrator install` command.
+ *
+ * Registers the orchestrator as a native system service on the current platform.
+ * Auto-detects platform and privilege level, creates config directories,
+ * writes env file, and registers the service with the init system.
+ */
+
+import type { Command } from 'commander';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import {
+  createServiceManager,
+  detectPlatform,
+  getConfigDir,
+  getLogDir,
+  kiciConfigRoot,
+  listInstances,
+  writeManifest,
+  appendIndexEntry,
+  resolveUserLevel,
+  DEFAULT_RESTART_POLICY,
+  readKiciVersion,
+} from '../../service/index.js';
+import { selectServerEntry, resolveServiceExecutable } from '../../service/entrypoint.js';
+import { buildDeployEnvLines, upsertDeployEnvLines } from '../../service/deploy-env.js';
+import { detectRuntime } from '../../service/compose.js';
+import type { InstanceManifest, ServiceConfig, ServicePlatform } from '../../service/index.js';
+import { getInstallBase } from '../shared/versioned-upgrade.js';
+import { resolveWizardMode, writeInstallEnvFile, DEFAULT_INSTALL_MODE } from './install-env.js';
+import { OrchestratorMode } from '@kici-dev/engine';
+import { formatSourceAddHint } from '../../wizard/orchestrator-wizard.js';
+import { toErrorMessage, kiciMkdtemp } from '@kici-dev/shared';
+import { isCiEnvironment } from '@kici-dev/shared/ci-env';
+
+interface InstallOptions {
+  platform?: ServicePlatform;
+  mode?: string;
+  envFile?: string;
+  binary?: string;
+  dev?: boolean;
+  wizard?: boolean;
+  name: string;
+  system?: boolean;
+  userLevel?: boolean;
+  user?: string;
+  instanceDir?: string;
+  force?: boolean;
+}
+
+/**
+ * Spin up a dev PostgreSQL container using Docker or Podman.
+ * Returns the DATABASE_URL for the container.
+ */
+function startDevPostgres(containerName: string): string {
+  const password = crypto.randomBytes(16).toString('hex');
+  const port = 15432;
+
+  // Detect container runtime
+  let runtime = 'podman';
+  try {
+    execSync('podman --version', { stdio: 'ignore' });
+  } catch {
+    runtime = 'docker';
+    try {
+      execSync('docker --version', { stdio: 'ignore' });
+    } catch {
+      throw new Error('Neither podman nor docker found. Install one to use --dev mode.');
+    }
+  }
+
+  // Check if container already exists
+  try {
+    const existing = execSync(
+      `${runtime} ps -a --filter name=${containerName} --format "{{.Names}}"`,
+      {
+        encoding: 'utf-8',
+      },
+    ).trim();
+    if (existing) {
+      console.log(`Dev PostgreSQL container "${containerName}" already exists.`);
+      console.log(`Remove it with: ${runtime} rm -f ${containerName}`);
+      throw new Error(`Container "${containerName}" already exists`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already exists')) throw err;
+    // Container doesn't exist, continue
+  }
+
+  console.log(`Starting dev PostgreSQL container "${containerName}" on port ${port}...`);
+  // Pass POSTGRES_PASSWORD via --env-file rather than -e KEY=value argv so
+  // the password never lands in the operator's `ps aux` output or shell
+  // history. Tempfile is created with 0600 and removed in a finally — the
+  // plaintext window is the few microseconds podman takes to read the
+  // file before forking the container. POSTGRES_DB stays on the argv since
+  // it isn't sensitive.
+  const tmpEnvFile = path.join(kiciMkdtemp('kici-dev-pg-'), 'postgres.env');
+  try {
+    fs.writeFileSync(tmpEnvFile, `POSTGRES_PASSWORD=${password}\n`, { mode: 0o600 });
+    execSync(
+      `${runtime} run -d --name ${containerName} -p ${port}:5432 --env-file ${tmpEnvFile} -e POSTGRES_DB=kici postgres:18-trixie`,
+      { stdio: 'inherit' },
+    );
+  } finally {
+    try {
+      fs.rmSync(path.dirname(tmpEnvFile), { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup; don't mask the underlying error
+    }
+  }
+
+  return `postgresql://postgres:${password}@localhost:${port}/kici`;
+}
+
+export function registerOrchestratorInstall(orchestrator: Command): void {
+  orchestrator
+    .command('install')
+    .description('Install the orchestrator as a system service')
+    .addHelpText(
+      'after',
+      `
+Token vocabulary:
+  KICI_PLATFORM_TOKEN is an orchestrator REGISTRATION token (kici_ok_...), minted
+  in the dashboard (Settings -> Orchestrators -> New orchestrator). It authorises a
+  single orchestrator to connect to the Platform relay.
+
+  It is NOT a cluster JOIN token (kici_join_v1....). Join tokens are used only by
+  \`kici-admin join\` to add another orchestrator as a peer to an existing cluster.
+`,
+    )
+    .option(
+      '--platform <type>',
+      'Force the service platform (systemd, launchd, windows, compose). Default: detected from the host',
+    )
+    .option(
+      '--mode <mode>',
+      `Operating mode written to the env file (${OrchestratorMode.options.join(', ')}). Naming it with --env-file overwrites the copied file's own KICI_MODE; omitting it leaves that value alone`,
+      DEFAULT_INSTALL_MODE,
+    )
+    .option('--env-file <path>', 'Path to existing env/config file to use')
+    .option('--binary <path>', 'Path to orchestrator binary (default: current executable)')
+    .option('--dev', 'Dev mode: spin up PostgreSQL container on port 15432')
+    .option('--wizard', 'Run the interactive setup wizard (default on an interactive terminal)')
+    .option('--no-wizard', 'Skip the wizard and write a stub env file to edit by hand')
+    .option('--name <name>', 'Service name', 'kici-orchestrator')
+    .option('--system', 'Install as system-level service (requires root)')
+    .option('--user-level', 'Install as user-level service (no root required)')
+    .option(
+      '--user <name>',
+      'Run the service as the named user (system-level launchd only; sets UserName in plist so the daemon drops privileges)',
+    )
+    .option(
+      '--instance-dir <path>',
+      'Deploy folder; the instance manifest is written here (default: current working directory)',
+    )
+    .option('--force', 'Overwrite an existing same-named foreign instance')
+    .action(async (opts: InstallOptions, command: Command) => {
+      try {
+        if (opts.wizard === true && opts.envFile) {
+          console.error('Error: Cannot use --wizard with --env-file');
+          process.exit(1);
+        }
+        if (opts.wizard === true && opts.dev) {
+          console.error(
+            'Error: Cannot use --wizard with --dev (the wizard prompts for the database URL)',
+          );
+          process.exit(1);
+        }
+        const parsedMode = OrchestratorMode.safeParse(opts.mode);
+        if (!parsedMode.success) {
+          console.error(
+            `Error: --mode must be one of: ${OrchestratorMode.options.join(', ')} (got "${opts.mode}")`,
+          );
+          process.exit(1);
+        }
+        const orchestratorMode = parsedMode.data;
+        // --mode carries a Commander default, so opts.mode is always set. Only
+        // the source tells an operator who typed `--mode independent` from one
+        // who typed nothing, and the env-file path needs that distinction.
+        const modeExplicit = command.getOptionValueSource('mode') !== 'default';
+
+        const platform = detectPlatform(opts.platform as ServicePlatform | undefined);
+        const userLevel = resolveUserLevel(opts);
+        const serviceName = opts.name;
+        const instanceDir = path.resolve(opts.instanceDir ?? process.cwd());
+        const kiciRoot = kiciConfigRoot(userLevel);
+
+        console.log(`Platform: ${platform}`);
+        console.log(`Privilege: ${userLevel ? 'user' : 'system'}`);
+        console.log(`Service name: ${serviceName}`);
+        console.log(`Instance dir: ${instanceDir}`);
+
+        // Create service manager early so the create-path guard can reconcile
+        // the index against the driver's native scan.
+        const manager = await createServiceManager(platform);
+
+        // Create-path guard: refuse to clobber a same-named foreign instance
+        // (one already installed at a different path, or one discovered in the
+        // init system with no manifest yet). --force overrides.
+        //
+        // The scan names no driver, so it covers every candidate one: a compose
+        // orchestrator of this name on a systemd host is a clobber the
+        // single-driver scan could not see.
+        const existingInstances = await listInstances({
+          component: 'orchestrator',
+          isUserLevel: userLevel,
+          kiciRoot,
+        });
+        const existing = existingInstances.find((c) => c.name === serviceName);
+        if (existing && existing.instanceDir !== instanceDir && !opts.force) {
+          const at = existing.instanceDir ?? '(no manifest)';
+          console.error(
+            `Error: an orchestrator instance "${serviceName}" is already installed at ${at}.\n` +
+              `\n` +
+              `Upgrading this service? Don't re-run install — installing again is for first-time\n` +
+              `setup, not upgrades. For an npm-global install run \`npm install -g kici-admin@latest\`\n` +
+              `then \`kici-admin orchestrator restart\`; for a versioned-directory install run\n` +
+              `\`kici-admin orchestrator upgrade\`.\n` +
+              `\n` +
+              `Installing a second, separate instance? Pass a different --name or --instance-dir,\n` +
+              `or --force to take over this one.`,
+          );
+          process.exit(1);
+        }
+
+        // Resolve directories
+        const configDir = getConfigDir(serviceName, userLevel);
+        const logDir = getLogDir(serviceName, userLevel);
+
+        // Ensure directories exist
+        fs.mkdirSync(configDir, { recursive: true });
+        fs.mkdirSync(logDir, { recursive: true });
+
+        const envFilePath = path.join(configDir, `${serviceName}.env`);
+
+        // Handle --dev mode: spin up Postgres container
+        let devDbUrl: string | undefined;
+        if (opts.dev) {
+          const containerName = `${serviceName}-dev-pg`;
+          devDbUrl = startDevPostgres(containerName);
+          console.log(`Dev PostgreSQL URL: ${devDbUrl}`);
+        }
+
+        // Resolve which config source materialises the env file (wizard on a
+        // bare interactive TTY, an explicit --env-file copy, or an enumerated
+        // stub for every non-interactive/scripted install), then delegate.
+        const envMode = resolveWizardMode({
+          wizard: opts.wizard,
+          envFile: opts.envFile,
+          dev: opts.dev,
+          isTTY: Boolean(process.stdout.isTTY),
+          isCI: isCiEnvironment(),
+        });
+        const envResult = await writeInstallEnvFile({
+          mode: envMode,
+          envFilePath,
+          envFileSource: opts.envFile,
+          devDbUrl,
+          orchestratorMode,
+          modeExplicit,
+        });
+
+        // Inject the deployment-identity env vars so the running orchestrator
+        // can report its own deployment shape in source.register (drives the
+        // dashboard's per-orchestrator kici-admin command helper). For compose,
+        // resolve the container runtime; a probe failure yields no runtime line
+        // rather than aborting the install. Idempotent: re-install replaces any
+        // existing KICI_DEPLOY_* lines.
+        let composeRuntime: 'podman' | 'docker' | undefined;
+        if (platform === 'compose') {
+          try {
+            composeRuntime = detectRuntime();
+          } catch {
+            composeRuntime = undefined;
+          }
+        }
+        const deployLines = buildDeployEnvLines({
+          platform,
+          serviceName,
+          containerRuntime: composeRuntime,
+          envFilePath,
+        });
+        fs.writeFileSync(
+          envFilePath,
+          upsertDeployEnvLines(fs.readFileSync(envFilePath, 'utf-8'), deployLines),
+          'utf-8',
+        );
+
+        // Resolve the run command. With an explicit --binary we run it
+        // directly (assumed self-launching). Otherwise we run Node against the
+        // installed orchestrator server entry — server.js for platform/hybrid,
+        // standalone.js for independent — because `npm install -g kici-admin`
+        // exposes only the CLI bin, not a self-launching server binary.
+        const entryScript = opts.binary
+          ? undefined
+          : fileURLToPath(
+              import.meta.resolve(
+                `@kici-dev/orchestrator/${selectServerEntry(fs.readFileSync(envFilePath, 'utf-8'))}`,
+              ),
+            );
+        const { executablePath, args } = resolveServiceExecutable({
+          binary: opts.binary ? path.resolve(opts.binary) : undefined,
+          nodePath: process.execPath,
+          entryScript,
+        });
+
+        // Check for Firecracker scaler in env file and warn if non-root
+        if (userLevel) {
+          try {
+            const envContent = fs.readFileSync(envFilePath, 'utf-8');
+            if (envContent.includes('firecracker') || envContent.includes('FIRECRACKER')) {
+              console.warn('\nWARNING: Firecracker scaler requires root privileges.');
+              console.warn(
+                'The service is being installed at user level. Firecracker will not work.',
+              );
+              console.warn('Re-run as root (sudo) to install a system-level service.\n');
+            }
+          } catch {
+            // Ignore read errors
+          }
+        }
+
+        // Build ServiceConfig
+        const config: ServiceConfig = {
+          name: serviceName,
+          displayName: 'KiCI Orchestrator',
+          description: 'KiCI CI/CD workflow orchestrator service',
+          executablePath,
+          args,
+          // The node running this install command is the node the spawned
+          // agents use; bake its bin dir onto the service PATH so the
+          // required-tools check passes even when --binary wraps node.
+          nodeBinDir: path.dirname(process.execPath),
+          envFilePath,
+          workingDirectory: configDir,
+          isUserLevel: userLevel,
+          user: opts.user,
+          component: 'orchestrator',
+          instanceDir,
+          restartPolicy: DEFAULT_RESTART_POLICY,
+        };
+
+        await manager.install(config);
+
+        // Write the instance manifest into the deploy folder. This is the
+        // single source of truth every lifecycle command reads to reconstruct
+        // the ServiceConfig without re-deriving paths.
+        const manifest: InstanceManifest = {
+          component: 'orchestrator',
+          name: serviceName,
+          platform,
+          isUserLevel: userLevel,
+          envFilePath,
+          configDir,
+          logDir,
+          installBase: getInstallBase(platform, serviceName),
+          createdAt: new Date().toISOString(),
+          kiciVersion: readKiciVersion(),
+        };
+        const manifestFile = writeManifest(instanceDir, manifest);
+
+        // Register the instance in the host-wide index cache.
+        try {
+          appendIndexEntry(kiciRoot, {
+            component: 'orchestrator',
+            name: serviceName,
+            platform,
+            isUserLevel: userLevel,
+            instanceDir,
+          });
+        } catch (err) {
+          // appendIndexEntry throws on a same-name-different-dir collision; at
+          // this point the unit is already installed, so warn loudly rather
+          // than tear down the install.
+          console.warn(`Warning: instance index append failed: ${(err as Error).message}`);
+        }
+
+        console.log(`\nOrchestrator service "${serviceName}" installed successfully.`);
+        console.log(`  Config:   ${envFilePath}`);
+        console.log(`  Logs:     ${logDir}`);
+        console.log(`  Manifest: ${manifestFile}`);
+        console.log(`\nNext steps:`);
+        if (envMode === 'stub') {
+          console.log(
+            `  1. Edit ${envFilePath} — it lists the required keys with generation commands.`,
+          );
+          console.log(`  2. Run \`kici-admin orchestrator start\` to start the service`);
+        } else {
+          console.log(`  1. Run \`kici-admin orchestrator start\` to start the service`);
+        }
+        console.log(`  Schedule daily database backups: \`kici-admin db backup --install-timer\``);
+        if (envResult.sourceHint) {
+          // A sourceHint is only ever produced by the wizard (non-stub) path,
+          // which prints a single "1. start" step above, so this is step 2.
+          console.log(
+            `  2. Add the GitHub App source you configured (run after the orchestrator is up):`,
+          );
+          for (const line of formatSourceAddHint(envResult.sourceHint)) {
+            console.log(line);
+          }
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}

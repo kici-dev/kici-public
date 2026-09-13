@@ -1,0 +1,18 @@
+# Example: an event scaler that provisions ephemeral agents as GitHub Actions runs.
+# The provisioning workflow dispatches a kici-agent.yml GitHub Actions run; the run
+# boots a one-shot agent that self-claims its credentials and executes one job.
+# #region scaler
+version: 1
+scalers:
+  - name: github-actions
+    type: event
+    maxAgents: 20
+    # Repo identifiers, NOT workflow names: the reserved events are delivered
+    # with `target.repos = provisioningTargets`, and the router filters
+    # registrations by repo. A workflow name here matches no registration and
+    # the scale-up reaches no subscriber at all.
+    provisioningTargets:
+      - myorg/infra
+    labelSets:
+      - labels: [github-actions]
+# #endregion

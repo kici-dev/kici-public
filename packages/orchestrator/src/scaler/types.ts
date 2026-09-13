@@ -1,0 +1,656 @@
+/**
+ * Core type definitions for the agent auto-scaler module.
+ *
+ * Provides the foundational types that all scaler backends, the ScalerManager,
+ * and the configuration layer depend on.
+ */
+
+import { ImagePullPolicy } from '@kici-dev/shared/container-runtime';
+import { z } from 'zod';
+import { ScalerEventType } from '@kici-dev/engine';
+import type { ScaleDownReason } from './scaler-events.js';
+import type {
+  ResourceRequest,
+  ResourceSpec,
+  ScalerBackendType,
+  ScalerPlatform,
+} from '@kici-dev/engine';
+
+export type { ResourceRequest, ResourceSpec } from '@kici-dev/engine';
+export { ScalerEventType } from '@kici-dev/engine';
+
+/**
+ * Resource limits for spawned agents.
+ *
+ * Alias of `ResourceSpec` from `@kici-dev/engine`. Single source of truth for
+ * the (cpus, memory) pair used by both scaler config and per-job resource
+ * declarations. Memory uses container-style suffixes (e.g., "2g", "512m").
+ * CPUs use fractional cores (e.g., 1.5 = 1.5 cores).
+ */
+export type ResourceLimits = ResourceSpec;
+
+/**
+ * Aggregate cap on summed `requests` for a group of agents (per-scaler,
+ * per-orchestrator, or per-machine pool). Memory is pre-parsed to bytes at
+ * config-load so the scaler doesn't re-parse on every spawn check.
+ */
+export interface ResourceCap {
+  /** Maximum total CPU (sum of `requests.cpus`) across all active agents in the group. */
+  maxCpu?: number;
+  /** Maximum total memory in bytes (sum of `requests.memory`) across all active agents in the group. */
+  maxMemoryBytes?: number;
+}
+
+/**
+ * Definition of a named machine pool. Multiple orchestrators on the same host
+ * can share a pool by referencing it by name; the file-backed ledger
+ * (`machine-ledger.ts`) coordinates reservation accounting across processes.
+ */
+export interface MachinePoolConfig {
+  name: string;
+  cap: ResourceCap;
+}
+
+/**
+ * Pre-resolved kernel-side limits passed to `ScalerBackend.spawn()`.
+ *
+ * Memory is in bytes (already parsed) so the backend doesn't re-run the
+ * memory-string parser on every spawn. Either field may be zero or omitted
+ * to mean "no limit on this dimension"; the backend falls back to its
+ * label-set or default limits when both are zero.
+ */
+export interface EffectiveLimits {
+  cpus?: number;
+  memBytes?: number;
+}
+
+/**
+ * Identity of the work a spawn was provisioned for, passed to
+ * `ScalerBackend.spawn()`. Backends surface it on the provisioned resource
+ * (container labels today) so an operator inspecting the backend — e.g.
+ * `podman ps` — can tell which job/run each agent serves, and so tests can
+ * select the exact container a trigger produced instead of guessing among
+ * concurrent kici-managed containers. Absent for unbound spawns (warm pool).
+ */
+/**
+ * A job's container spec with its registry credentials already resolved.
+ *
+ * The lock carries credential REFERENCES; this is what a runtime can actually
+ * pull with. Produced by `resolveContainerSpawn`, consumed by the container
+ * sandbox and by both spawning backends.
+ */
+export interface ResolvedContainerSpawn {
+  image: string;
+  authconfig?: { username: string; password: string; serveraddress: string };
+  env?: Record<string, string>;
+}
+
+export interface SpawnContext {
+  /** Execution job id the spawn is bound to. */
+  boundJobId?: string;
+  /** Execution run id the bound job belongs to. */
+  runId?: string;
+  /**
+   * The job's own container image plus resolved registry credentials, when the
+   * job declared one. Present means "spawn THIS image with the KiCI runtime
+   * injected" rather than the pool's fixed agent image.
+   */
+  container?: ResolvedContainerSpawn;
+  /**
+   * Plain platform-taint tokens (`windows`, `macos`, `arm64`) for the pool this
+   * spawn belongs to, derived by `ScalerManager` from the same resolved
+   * platform its taint gate uses. A backend forwards them to
+   * `scalerAgentLabels()` so the agent registers carrying the very tokens the
+   * gate demands — without them a tainted pool spawns agents no job can be
+   * dispatched to. A backend must never derive them itself: the manager is the
+   * single source, and computing them twice is the defect this field closes.
+   */
+  platformTaints?: readonly string[];
+  /**
+   * The full taint gate the spawned agent is registered under: the pool's
+   * configured `mandatoryLabels` plus every derived platform taint, resolved
+   * by `ScalerManager` for the label set this spawn belongs to — the same set
+   * the durable spawn row carries. A backend publishes it (an event scaler puts
+   * it on the scale-up payload) so a provisioning workflow sees the gate the
+   * agent will actually be held to. A backend must never derive it itself: the
+   * manager is the single source, exactly as for `platformTaints`.
+   */
+  mandatoryLabels?: readonly string[];
+}
+
+/**
+ * Network policy controlling RFC1918 and internet access for agents in this
+ * label set. Defined in `@kici-dev/shared/net` alongside the nftables rule builder
+ * that consumes it, and re-exported here so scaler call sites are unchanged.
+ */
+import type { NetworkPolicy } from '@kici-dev/shared/net';
+export type { NetworkPolicy };
+
+/**
+ * Image pull policy for container-backend agent images.
+ *
+ * - `IfNotPresent` (default): pull only when the image is not already local.
+ *   KiCI agent images are pinned + immutable, so re-pulling on every spawn only
+ *   storms the registry/socket.
+ * - `Always`: re-pull on every spawn. Set this on a label set that tracks a
+ *   moving tag (e.g. `:latest`) or otherwise needs a fresh image each spawn.
+ * - `Never`: never pull; fail if the image is absent.
+ *
+ * Defined alongside `pullImageIfMissing` in `@kici-dev/shared` — the agent
+ * pulls job images through the same helper — and re-exported here so the scaler
+ * config schema and every operator-facing value stay exactly where they were.
+ */
+export { ImagePullPolicy };
+
+/**
+ * Configuration for a single label-set mapping within a scaler backend.
+ * Maps an exact set of labels to the agent provisioning details.
+ */
+export interface LabelSetConfig {
+  /** Exact label set (sorted for deterministic comparison) */
+  labels: string[];
+  /** Container image (Docker backend) */
+  image?: string;
+  /** Image pull policy: IfNotPresent (default), Always, or Never */
+  imagePullPolicy?: ImagePullPolicy;
+  /** Path to agent binary (bare-metal backend) */
+  binaryPath?: string;
+  /**
+   * Per-label-set resource request and limit (override scaler defaults).
+   * After config-load normalization the internal representation is always nested:
+   * `{ requests?: { cpus, memory }, limits?: { cpus, memory } }`.
+   * The legacy flat shorthand (`{ cpus, memory }`) is accepted at config-load
+   * and treated as `limits` (with `requests` auto-mirrored).
+   */
+  resources?: ResourceRequest;
+  /**
+   * Mount container runtime socket into container.
+   * WARNING: Enabling gives CI jobs FULL ROOT ACCESS to the host container runtime.
+   * Only enable for fully trusted workloads on isolated infrastructure.
+   * @default false
+   */
+  containerSocket?: boolean;
+  /** Additional bind-mount volumes for spawned containers (e.g. ["/host/path:/container/path:ro"]) */
+  volumes?: string[];
+  /** Additional environment variables passed to spawned agents */
+  env?: Record<string, string>;
+  /** Network isolation policy for agents in this label set */
+  networkPolicy?: NetworkPolicy;
+  /** Backpressure mode for agent log streaming: 'pause' (default) or 'drop'.
+   * When set, injected as KICI_BACKPRESSURE_MODE into spawned agent environment. */
+  backpressureMode?: 'pause' | 'drop';
+
+  // ── Firecracker-specific fields ──────────────────────────────
+
+  /** Path to ext4 rootfs image (Firecracker backend, required per label-set) */
+  rootfsPath?: string;
+  /** Override scaler-level kernel path for this label set */
+  kernelPath?: string;
+  /** Override scaler-level vCPU count for this label set */
+  vcpuCount?: number;
+  /** Override scaler-level memory in MiB for this label set */
+  memSizeMib?: number;
+  /** Size in MiB for the per-VM overlay drive (Firecracker CoW mode) @default 2048 */
+  overlayDriveSizeMib?: number;
+}
+
+/**
+ * Represents a single spawned agent instance tracked by the scaler.
+ * Separate from the AgentRegistry which only knows about registered (WS-connected) agents.
+ */
+export interface ManagedAgent {
+  /** Unique ID for this managed agent instance (scaler-internal tracking) */
+  id: string;
+  /** The label set this agent was spawned for */
+  labelSet: string[];
+  /** Backend-specific identifier (container ID or PID) */
+  backendRef: string;
+  /** When this agent was spawned (epoch ms) */
+  spawnedAt: number;
+  /** Current lifecycle state */
+  state: 'spawning' | 'running' | 'destroying';
+  /** The agentId the spawned agent registered with via WS (set after registration) */
+  registeredAgentId?: string;
+}
+
+/**
+ * Result of a scaling decision.
+ * Discriminated union on 'action' for exhaustive pattern matching.
+ */
+export type ScaleResult =
+  | { action: 'spawning'; backendType: string }
+  | { action: 'at-capacity' }
+  | { action: 'no-backend'; labels: string[] }
+  | { action: 'failed'; error: string }
+  /** Scale-up declined without attempting a spawn (e.g. coordinator draining). */
+  | { action: 'skipped'; reason: string };
+
+/**
+ * What triggered a pending-scale re-drive (`Dispatcher.retryPendingScaleRequests`):
+ * the near-zero-latency capacity-freed `hook` fired from `ScalerManager`, or the
+ * leader-gated periodic `sweep` backstop. Used as the `trigger` label on the
+ * `kici_orch_scaler_redispatch_total` counter.
+ */
+export const ScalerRedispatchTrigger = z.enum(['hook', 'sweep']);
+export type ScalerRedispatchTrigger = z.infer<typeof ScalerRedispatchTrigger>;
+
+/**
+ * Result of a configuration validation or reload operation.
+ */
+export type ValidationResult = { valid: true } | { valid: false; errors: string[] };
+
+/**
+ * Optional context passed to `ScalerBackend.destroy`. The event backend surfaces
+ * `reason` on its scale-down event; local backends ignore it.
+ */
+export interface ScalerDestroyContext {
+  /** Why the teardown was requested (idle, job-complete, drain, …). */
+  reason?: ScaleDownReason;
+  /**
+   * Where an event backend must deliver the teardown, overriding its live
+   * config. Set from the spawn record when the agent was adopted from another
+   * coordinator, so a teardown addresses the targets the provision was spawned
+   * with even if `provisioningTargets` has been edited since. Ignored by the
+   * local backends, which deliver nothing.
+   */
+  targets?: string[];
+}
+
+/**
+ * Common interface for all scaler backends.
+ * Each backend manages a specific pool of agents for specific label sets.
+ * Designed to be pluggable -- Docker, bare-metal, and future K8s/VM backends
+ * all implement this interface.
+ */
+export interface ScalerBackend {
+  /** Backend type identifier */
+  readonly type: ScalerBackendType;
+
+  /** Log source identifier for ELK app.logsSource field. Set by each backend. */
+  readonly logsSource?: string;
+
+  /** Label sets this backend can provision */
+  readonly labelSets: LabelSetConfig[];
+
+  /**
+   * Per-backend maximum agents. Updated by `reload` so a config change to
+   * `maxAgents` applies without an orchestrator restart.
+   */
+  maxAgents: number;
+
+  /**
+   * Whether this backend spawns its agents on the orchestrator's own host.
+   * True for bare-metal and Firecracker (local processes / local VMs) and for
+   * container backends using a local runtime socket; false when the backend
+   * provisions elsewhere (remote container runtime, future cloud backends).
+   * Drives the static spawning-host display on the dashboard Infrastructure
+   * page.
+   */
+  readonly spawnsOnLocalHost: boolean;
+
+  /** Current count of agents managed by this backend (including spawning) */
+  getActiveCount(): number;
+
+  /**
+   * Spawn an agent for the given label set.
+   * @param labelSet - The exact label set to spawn for
+   * @param agentId - Pre-generated agent ID for WS registration correlation
+   * @param orchestratorUrl - URL for the agent to connect back to
+   * @param onEvent - Lifecycle event callback
+   * @param effectiveLimits - Resolved kernel-side limits (`{ cpus, memBytes }`)
+   *   for this spawn. Computed by ScalerManager from the job/label-set/scaler
+   *   default chain. When omitted (or both fields zero), the backend falls
+   *   back to its label-set / default limits the same way it always has.
+   * @param spawnContext - Identity of the bound job/run this spawn serves
+   *   (omitted for unbound spawns, e.g. warm pool). Backends surface it on
+   *   the provisioned resource for operator inspection.
+   * @returns The managed agent tracking object
+   * @throws If the label set is not supported by this backend
+   */
+  spawn(
+    labelSet: string[],
+    agentId: string,
+    orchestratorUrl: string,
+    onEvent?: ScalerEventCallback,
+    effectiveLimits?: EffectiveLimits,
+    spawnContext?: SpawnContext,
+    /**
+     * Optional abort signal from the ScalerManager spawn-timeout wrapper. When
+     * aborted, backends thread it into any long-running provisioning I/O
+     * (container-runtime requests, HTTP calls) so a hung provision cancels
+     * instead of pinning the per-backend spawn-semaphore slot.
+     */
+    signal?: AbortSignal,
+  ): Promise<ManagedAgent>;
+
+  /**
+   * Destroy a specific managed agent.
+   * Docker: docker rm -f; Bare-metal: SIGTERM -> SIGKILL.
+   *
+   * @param context - Optional teardown context. The event backend carries
+   *   `reason` onto its `kici.scaler.scale-down` event so a teardown workflow
+   *   (and the timeline) can distinguish an idle reap from a job-complete
+   *   teardown or a spawn timeout. Local backends accept and ignore it.
+   */
+  destroy(managedId: string, context?: ScalerDestroyContext): Promise<void>;
+
+  /**
+   * Reclaim the HOST-LOCAL compute of a managed agent this backend no longer
+   * tracks in memory, from whatever durable host state survived the loss.
+   *
+   * `destroy` is keyed off the in-memory agent map, so an orchestrator restart
+   * makes it a silent no-op while the VM or host process keeps running. This
+   * hook is the restart-surviving half: it reads the backend's own on-host
+   * artifacts for `managedId` and reclaims them.
+   *
+   * Two properties every implementation MUST hold:
+   *
+   * - **Host-local evidence only.** Reclaim nothing unless an artifact for
+   *   exactly this `managedId` exists on THIS host — that artifact is the proof
+   *   this backend spawned it. A coordinator must never be able to reach across
+   *   and reap a peer's compute.
+   * - **Caller supplies the orphan verdict.** The hook force-reclaims a *live*
+   *   instance, which is precisely what the liveness-driven orphan sweeps
+   *   refuse to do on their own. Only call it where the agent is known to be
+   *   unowned.
+   *
+   * Optional: a backend whose compute is not host-local — the event backend's
+   * customer cloud instance — cannot implement it at all. An implementation may
+   * also cover only part of its own backend, when the rest keeps nothing durable
+   * to read. Bare metal is that case: a container-mode agent carries
+   * `kici-agent-id` / `kici-scaler-name` labels on the host and is reclaimed,
+   * while a plain-process agent records its PID in the in-memory entry alone, so
+   * a restart loses it and the hook reports nothing to reclaim.
+   *
+   * @returns `true` when host-local state for `managedId` was found and
+   *   reclaimed, `false` when there was nothing here to reclaim.
+   */
+  reapUnowned?(managedId: string): Promise<boolean>;
+
+  /**
+   * Get the LogCapture for a managed agent (optional -- container and bare-metal backends
+   * support stdout capture. Firecracker handles log forwarding internally via file tailing
+   * (serial console + VMM logs) and does not return a LogCapture here).
+   */
+  getLogCapture?(managedId: string): LogCapture | undefined;
+
+  /** Shutdown all agents managed by this backend (called during graceful shutdown) */
+  shutdownAll(): Promise<void>;
+
+  /**
+   * Return scaler-specific configuration metadata for a managed agent.
+   * Used by the orchestrator to enrich job.context before forwarding to Platform.
+   */
+  getScalerContext?(agentId: string): Record<string, unknown> | undefined;
+
+  /**
+   * Provision or heal this backend's host prerequisites before it spawns.
+   * Called once by ScalerManager during startup. Optional — only backends with
+   * host-side setup (Firecracker's bridge) implement it; container/bare-metal
+   * omit it. May throw; the manager catches per-backend and degrades that
+   * scaler rather than aborting orchestrator startup.
+   */
+  ensureHostReady?(): Promise<void>;
+
+  /**
+   * Reload configuration (called on config reload / SIGHUP).
+   *
+   * `opts.maxAgents`, when present, replaces the population cap. `opts.entry`
+   * is the whole new config entry, for a backend that reads more than its
+   * label sets off it. On an invalid result NOTHING is applied.
+   */
+  reload(
+    labelSets: LabelSetConfig[],
+    opts?: { maxAgents?: number; entry?: ScalerEntry },
+  ): ValidationResult;
+
+  /**
+   * The config entry this backend is currently serving, for backends that hold
+   * one. Read by the reload rollback so a rejected reload can restore it
+   * alongside `labelSets` and `maxAgents`. Undefined for backends that keep no
+   * entry (container, bare-metal, Firecracker all read only their label sets).
+   */
+  readonly currentEntry?: ScalerEntry;
+}
+
+/**
+ * Parsed and validated scaler configuration from YAML.
+ * Loaded at startup and reloaded on SIGHUP.
+ */
+/**
+ * Firecracker network configuration.
+ * Defines the CIDR pool, bridge name, and gateway for VM networking.
+ * Global across all Firecracker scalers on the orchestrator.
+ */
+export interface FirecrackerNetworkConfig {
+  /** CIDR range for VM IP allocation @default '10.0.0.0/24' */
+  cidr?: string;
+  /** Host bridge interface name @default 'kici-br0' */
+  bridgeName?: string;
+  /** Gateway IP address (assigned to bridge) @default '10.0.0.1' */
+  gateway?: string;
+  /** Subnet mask for guest networking @default '255.255.255.0' */
+  netmask?: string;
+  /** nft table name for this coordinator's host bridge @default 'kici' */
+  table?: string;
+  /**
+   * When true (default), the orchestrator verifies and provisions this host
+   * bridge on startup (self-heal), so a fresh Firecracker host needs no manual
+   * `kici-admin firecracker provision`. @default true
+   */
+  autoProvisionHost?: boolean;
+}
+
+/**
+ * Parsed and validated scaler configuration from YAML.
+ * Loaded at startup and reloaded on SIGHUP.
+ */
+export interface ScalerConfig {
+  /** Config format version (currently always 1) */
+  version: 1;
+  /** Global maximum agents across all backends */
+  globalMaxAgents: number;
+  /** Global defaults applied to all label sets */
+  defaults?: {
+    /**
+     * Default resource request and limit applied when neither the job nor the
+     * label-set declares resources. Internal representation is always nested.
+     */
+    resources?: ResourceRequest;
+  };
+  /**
+   * Cap on the total summed `requests` across every agent this orchestrator
+   * has active (across all scalers). Counterpart to `globalMaxAgents` for
+   * resource-based pressure.
+   */
+  globalResourceCap?: ResourceCap;
+  /**
+   * Optional named machine pools shared by scaler entries on the same host.
+   * Each entry's cap is enforced via the file-backed ledger so multiple
+   * orchestrator processes on one machine cannot collectively oversubscribe.
+   */
+  machinePools?: MachinePoolConfig[];
+  /** Individual scaler backend configurations */
+  scalers: ScalerEntry[];
+  /** Global Firecracker network configuration (shared across all Firecracker scalers) */
+  firecracker?: FirecrackerNetworkConfig;
+}
+
+/**
+ * Configuration for a single scaler backend entry.
+ */
+export interface ScalerEntry {
+  /** Human-readable name for this scaler */
+  name: string;
+  /** Backend type */
+  type: Exclude<ScalerBackendType, 'kubernetes'>;
+  /** Maximum concurrent agents for this scaler (population cap) */
+  maxAgents: number;
+  /**
+   * Maximum concurrent `backend.spawn` operations for this scaler
+   * (provisioning-rate throttle). Orthogonal to `maxAgents`: excess in-cap
+   * spawns queue and drain at this rate rather than storming the socket.
+   * Defaults to `DEFAULT_MAX_CONCURRENT_SPAWNS` at config-load.
+   */
+  maxConcurrentSpawns: number;
+  /** Label-set to image/binary mappings */
+  labelSets: LabelSetConfig[];
+  /** Container runtime host (e.g. 'tcp://192.168.1.10:2376'). Works for both Docker and Podman remote. */
+  host?: string;
+  /** Explicit container runtime socket path. Overrides auto-detection. Use for non-standard socket locations. */
+  socketPath?: string;
+  /** Container runtime type. 'auto' probes known socket paths. Default: 'auto' */
+  runtime?: 'docker' | 'podman' | 'auto';
+  /** Orchestrator URL for spawned agents to connect back to */
+  orchestratorUrl?: string;
+  /** Extra host:IP mappings injected into spawned containers (e.g. ["verdaccio.local:host-gateway"]) */
+  extraHosts?: string[];
+  /** Disable nftables-based network isolation for container backend (default: true). Set to false when nft is unavailable. */
+  networkIsolation?: boolean;
+  /** Warm pool configuration */
+  warmPool?: WarmPoolConfig;
+
+  /**
+   * Labels a job MUST declare in `runsOn` to be allowed on this scaler.
+   * Mirrors the Kubernetes "taints" concept: a generic job that does not
+   * include every mandatory label is blocked from this scaler entirely,
+   * even when its other labels are a subset of one of the scaler's
+   * `labelSets`. Default: `[]` (no gating).
+   */
+  mandatoryLabels?: string[];
+
+  /**
+   * Structured platform of this pool's agents. When set, the auto-injected
+   * `kici:os:*` / `kici:arch:*` labels AND the mandatory platform taint both
+   * derive from this single field. Optional: when omitted, bare-metal pools
+   * derive the platform from the host OS/arch, and container / firecracker
+   * pools default to linux.
+   */
+  readonly platform?: ScalerPlatform;
+
+  /**
+   * Agent roles this scaler handles. scaler-entry level, not per-label-set.
+   * - undefined (not set): handles all job types including build and init (backward compat,)
+   * - []: execution jobs only, no build/init
+   * - ['builder']: handles build jobs + execution
+   * - ['init-runner']: handles init jobs + execution
+   * - ['builder', 'init-runner']: handles both internal job types + execution
+   * - ['all']: same as undefined
+   */
+  roles?: string[];
+
+  /**
+   * Cap on summed `requests` (cpus + memory) across active agents in this
+   * scaler. Stacks with `maxAgents`; both must allow the spawn.
+   */
+  resourceCap?: ResourceCap;
+  /**
+   * Reference to a named machine pool defined at top level. Scalers that
+   * reference the same pool name on the same host share a file-backed ledger
+   * so multiple orchestrators can't collectively exceed the pool cap.
+   */
+  machinePool?: string;
+  /**
+   * Bare-metal opt-in: when true, wrap the spawned binary in a transient
+   * `systemd-run --user --scope` with `MemoryMax` and `CPUQuota` derived from
+   * the resolved `limits`. Requires user-mode systemd with cgroup-v2 delegate.
+   */
+  enforceCgroups?: boolean;
+
+  // ── Firecracker-specific fields (scaler-level defaults) ──────
+
+  /** Path to the Firecracker binary (Firecracker backend, required) */
+  firecrackerPath?: string;
+  /** Path to the jailer binary (Firecracker backend, required) */
+  jailerPath?: string;
+  /** Default kernel path for all label sets (Firecracker backend, required) */
+  kernelPath?: string;
+  /** Jailer chroot base directory @default '/srv/jailer' */
+  chrootBaseDir?: string;
+  /** Jailer uid (Firecracker backend, required) */
+  uid?: number;
+  /** Jailer gid (Firecracker backend, required) */
+  gid?: number;
+  /** Default vCPU count for VMs @default 2 */
+  vcpuCount?: number;
+  /** Default memory in MiB for VMs @default 512 */
+  memSizeMib?: number;
+  /**
+   * Wrap privileged commands (`ip`, `chown`) with `sudo -n` when the
+   * orchestrator runs as a non-root user (e.g. user-mode systemd on edge
+   * worker nodes). Operators must have NOPASSWD sudoers entries for those
+   * binaries. Default false.
+   */
+  requireSudo?: boolean;
+
+  // ── Event-backend fields (meaningful only when `type: 'event'`) ──
+
+  /**
+   * Workflow refs (e.g. `org/infra`) the reserved scale-up / scale-down events
+   * are delivered to. The customer's provisioning / teardown workflows
+   * subscribe with `kiciEvent()`. Required for a `type: event` scaler.
+   */
+  provisioningTargets?: string[];
+  /**
+   * Seconds a pending provisioning claim code stays valid before it expires.
+   * @default 300
+   */
+  claimTtlSeconds?: number;
+  /**
+   * Seconds the ephemeral agent token minted for a claimed provision stays
+   * valid. @default 600
+   */
+  agentTokenTtlSeconds?: number;
+}
+
+/**
+ * Warm pool configuration for pre-provisioned idle agents.
+ */
+export interface WarmPoolConfig {
+  /** Whether the warm pool is enabled */
+  enabled: boolean;
+  /** Number of idle agents to maintain */
+  size: number;
+  /** Seconds before an idle warm-pool agent is destroyed
+   * @default 300
+   */
+  idleTimeoutSeconds: number;
+}
+
+// ── Scaler lifecycle events ──────────────────────────────────────
+
+/**
+ * A single scaler lifecycle event.
+ * Each backend emits these at key provisioning milestones.
+ */
+export interface ScalerEvent {
+  agentId: string;
+  eventType: z.infer<typeof ScalerEventType>;
+  /** Backend-specific detail text (e.g. "pulling image nginx:latest", "booting microVM") */
+  detail: string;
+  timestampMs: number;
+}
+
+/**
+ * Callback type for scaler event emission.
+ * Passed from ScalerManager to each backend during spawn().
+ */
+export type ScalerEventCallback = (event: ScalerEvent) => void;
+
+/**
+ * Interface for capturing agent log output from scaler backends.
+ * Each backend implements this to expose the spawned agent's stdout/stderr
+ * as an async iterable of individual log lines.
+ */
+export interface LogCapture {
+  /** Async iterable yielding individual log lines from the agent process. */
+  lines(): AsyncIterable<string>;
+  /**
+   * Return the most recent buffered output lines (bounded ring buffer),
+   * joined oldest→newest. Used to enrich a `scaler.failed` event when a
+   * spawn dies before WS registration. Empty string when nothing captured.
+   */
+  tail(): string;
+  /** Stop capturing and destroy underlying streams. Safe to call multiple times. */
+  close(): void;
+}

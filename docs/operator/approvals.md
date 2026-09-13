@@ -1,0 +1,121 @@
+---
+title: Approval gates
+description: Configure approvers, expiry, and self-approval; manage the dashboard approval queue and the approve/reject flow
+---
+
+An approval gate holds a workflow element — a step, a job, or a whole run — until an authorized person approves it. This guide covers the operator side: defining the approvers (teams), the org-level expiry and self-approval settings, the dashboard approval queue, the approve/reject flow, and the agent-occupancy consideration for step-level holds.
+
+Workflow authors declare gates with `approval` (see [Approval gates (user guide)](../user/approvals.md)). The same held-element mechanism also backs the **required reviewers** protection rule on an environment, so everything below applies to both the explicit (author-declared) and mandatory (environment-policy) gates.
+
+## Approvers: teams and users
+
+An approval clause names either a **team** or a **user**:
+
+- `{ team: 'leads' }` is released when any member of the `leads` team approves.
+- `{ user: 'cto' }` is released when that specific user approves.
+
+Workflow code may _name_ a team but can never define its membership — teams are operator-defined data. That boundary is what makes a `{team}` clause a real control: a malicious change can name `{team: 'leads'}`, but it cannot add itself to `leads`.
+
+### Defining teams
+
+Teams are managed two ways:
+
+- **Dashboard Teams tab** — on the org settings page, gated by the `teams` permission (`teams:read` to view, `teams:admin` to edit). Create, rename, and delete teams; add and remove members from a picker over your org members; attach roles to a team so the whole team inherits the role's permissions.
+- **Break-glass CLI** — the platform admin CLI's `team` subcommands (`create`, `list`, `show`, `add-member`, `remove-member`, `assign-role`, `revoke-role`, `delete`) write directly to the control-plane database, are idempotent and transactional, and record an audit entry per change.
+
+A team member must also be a member of the org. Membership changes propagate to the orchestrator automatically, so a clause is always evaluated against the current team roster.
+
+### Who may approve
+
+Releasing a held element requires the permission that matches its hold type — `ci_trust:write` for a **security** hold, `contexts:admin` for a **wait-timer** hold, `contexts:write` for every other hold — **and** eligibility for at least one unsatisfied clause (membership in a named team, or being a named user). The permission is the gate to act on approvals at all; the per-clause eligibility is the fine-grained check on top. Naming a team in a workflow does not grant anyone approval rights — it only restricts which already-permitted users can release that specific gate.
+
+`ci_trust:write` is deliberately narrower than `contexts:write`: it is the grant that says a person may vouch for untrusted code. Granting broad context write access does not confer it. Skipping a wait timer takes `contexts:admin` because it cuts short a delay somebody configured on purpose.
+
+The check runs on the server, so one policy covers every surface: the dashboard, the `kici` CLI, any direct caller of the held-run approve and reject routes, and the developer MCP's `approve_run` / `reject_run` tools. The MCP tools require their own `runs:write` **in addition to** the hold's permission, never instead of it — so an agent credential cannot release a hold that a person with the same grants could not.
+
+The `/kici approve` PR-comment channel acts only on **security** holds, and releasing one that way requires the same `ci_trust:write`. A reviewer, wait-timer, or concurrency hold is not resolvable by comment — use the dashboard or `kici approve`.
+
+A per-member CI trust override (Members tab) sets the trust level a member's security-hold decisions are judged at, on every surface including the dashboard — which reads the same override-resolved level the server decides with, so an override that lowers a member hides the controls rather than offering ones the API refuses.
+
+An override adjusts an existing approver's level; it does not create an approver. A member still has to hold `contexts:write` or `ci_trust:write` from a role to reach the approve and reject routes at all, because that check reads role-derived permissions and the override is deliberately kept out of them — folding it in would let an `admin` override confer the power to edit trust policy and set other members' overrides. So raise a member with an override only on top of a role that already grants one of those two; to make someone an approver from nothing, grant the permission.
+
+An org API key is its own principal with its own permission matrix and does not inherit its owner's override.
+
+## Org settings
+
+Two org-scoped settings govern approval behavior. Manage them with the orchestrator admin CLI:
+
+```bash
+# Show the current approval settings for an org
+kici-admin org-settings approval show --customer-id <id>
+
+# Set the default hold expiry (seconds)
+kici-admin org-settings approval set-expiry <seconds> --customer-id <id>
+
+# Allow or forbid self-approval
+kici-admin org-settings approval set-self-approval true|false --customer-id <id>
+```
+
+| Setting                   | Default | Effect                                                                                                      |
+| ------------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
+| `approval_expiry_seconds` | `86400` | Default time a held element waits before it expires (and the run fails). A per-gate `timeout` overrides it. |
+| `allow_self_approval`     | `true`  | Whether the person who triggered the run may approve their own gate.                                        |
+
+### Expiry
+
+A held element waits up to its expiry. An **explicit** gate (an `approval` block in workflow code) uses the per-gate `timeout` if the workflow set one, otherwise `approval_expiry_seconds`. A **mandatory** gate attached to an environment's required-reviewer policy instead uses that environment's own `hold_expiry_seconds` (default one hour), so tighten the environment rather than the org setting when you want a shorter reviewer window on one environment. When the deadline passes without all clauses satisfied, the element is rejected and the run fails. The stale run detector sweeps overdue holds on each scan cycle; a step-level hold that expires also signals the waiting agent to fail the job. Set `approval_expiry_seconds` to a value that matches how long your reviewers realistically take — long enough to avoid spurious failures, short enough that a forgotten gate does not tie up resources indefinitely (see [agent occupancy](#agent-occupancy-during-step-level-holds)).
+
+`approval_expiry_seconds` governs this queue only. The **security** approval queue is a separate queue with its own deadline: a hold raised by the org trust policy uses that policy's own approval expiry (default 72 hours), configured under **Settings > CI trust**. See [CI security](security/security.md#expiry).
+
+### Self-approval
+
+With `allow_self_approval` set to `false`, the user who triggered a run cannot approve a gate on that run; another eligible approver must. This is the control for environments where author sign-off must be independent. It defaults to `true` because an author's _voluntary_ gate is usually a reminder for themselves; the mandatory environment-reviewer layer remains the real control for untrusted contributors.
+
+The rule applies to the **principal** that triggered the run, not only to a person signed in to the dashboard. A run triggered by a user through an agent, by a service account, or by an internal system component is subject to the same refusal when that same principal tries to approve it.
+
+One case stays outside the rule: a run triggered by an API key is recorded under the key's own identity, while an approve from that key's owner arrives under the owner's user identity. The two are not matched, so the owner can approve a run their key triggered. Use a team or an `approvers:` clause that excludes the key owner when you need that separation.
+
+## The dashboard approval queue
+
+The approval queue page lists held elements pending approval. It shows held runs at all three scopes (step, job, workflow) — the `Scope` column carries a badge for each — and, for each, the **per-clause progress** — which clauses are satisfied and by whom, and how many remain (for example, `leads ✓ · cto ✗ — 1/2`). Each decision is attributed to the real approver. Approve and reject actions are available to users with the required permission; the run detail page shows who approved each clause.
+
+A `workflow`-scoped row covers a whole workflow dispatch. One source of these is the **private-registry install gate**: when a workflow's `registries:` / `installEnv:` names a reviewer-gated environment, the install gate pauses the whole dispatch as a `held` run (job id `__install__<workflow>`) until an approver releases it. Approving resumes the dispatch and lets its jobs run; rejecting cancels the run before any job starts. See [Private registries](../user/private-registries.md#reviewer-gated-installs).
+
+A held-for-approval status check is also posted back to the source provider for job- and workflow-level holds, naming the unsatisfied clauses. Step-level holds run inside the agent mid-job, so the provider check stays at job granularity.
+
+## Approving and rejecting
+
+A held element is released the same way regardless of whether it was held by an explicit `approval` gate or a mandatory environment reviewer policy:
+
+- **Dashboard** — approve or reject from the approval queue.
+- **`kici approve` / `kici reject`** — the developer CLI, acting as the authenticated user. See [`kici approve`](../user/approvals.md#approving-from-the-cli).
+- **`kici-admin held-run approve` / `reject`** — the operator CLI, on an **independent** orchestrator only. The two paths above relay through the KiCI Platform, which an independent orchestrator does not have, so this is the only surface there. It refuses with a 409 wherever a Platform is attached, because the Platform's own held-run trust gate is the authority on who may answer a hold. Add `--as <user-id>` to answer as a member of the [approval directory](security/security.md#answering-a-hold-on-an-independent-orchestrator), which is what satisfies a hold whose clauses name a user or a team.
+
+Every path runs through the same eligibility check and the same resume logic. On full satisfaction the held element is re-dispatched (for a job or workflow) or unblocked (for a step). Any single rejection fails the element and the run.
+
+### What a successful answer means
+
+An approve or a reject answers as soon as the decision is **recorded**, not when its consequence finishes. The decision is durable at that point. The hold has left the pending queue, a second answer on the same hold is refused as already resolved, and the resume (or the cancellation) is under way.
+
+The consequence itself can take a few more seconds. Releasing a workflow-scoped hold replays the whole dispatch — re-evaluating triggers, re-reading the lock file, routing the jobs — and rejecting one cancels the run and completes every status check the held dispatch had queued. So after a successful answer, expect the approval queue to clear at once and the run to leave `held` shortly after, rather than both at the same instant.
+
+A consequence that fails is recorded, not lost. It appears as a `held_run.approve` or `held_run.reject` entry in the access log with the outcome `error` and the failure message — readable in the dashboard activity view and with `kici-admin access-log`. A resume that cannot rebuild its dispatch also fails the run itself and completes the status checks it was blocking, so the pull request never sits behind a check that can no longer clear.
+
+A job can also be held by a [security hold](security/security.md#security-approval-queue) at the same time — that one takes `ci_trust:write`, not `contexts:write`. Both holds must be released before the job runs, and each carries its own expiry, so the first deadline to arrive cancels the run. From the CLI, `--job` names both, so pass `--hold-type reviewer` or `--hold-type security` to pick one.
+
+## Agent occupancy during step-level holds
+
+A **step-level** hold pauses a job mid-execution. To preserve the workspace and all prior-step state across the wait, the agent and its workspace stay live and occupied for the entire human wait — the agent keeps sending heartbeats so it is not reaped, but it cannot be reused for other work until the gate resolves.
+
+Plan capacity accordingly:
+
+- Set a sane `approval_expiry_seconds` (or per-gate `timeout`) so an unanswered step gate cannot occupy an agent indefinitely.
+- Prefer job- or workflow-level gates when the approval does not need to land mid-job with prior-step state intact — those hold a `held_runs` row, not a live agent.
+- If many concurrent runs use step-level gates, size your agent pool to absorb the holds without starving normal dispatch.
+
+## See also
+
+- [Approval gates (user guide)](../user/approvals.md) — authoring `approval`.
+- [Contexts](contexts.md) — required reviewers and the held-run lifecycle.
+- [Approval gates (architecture)](../architecture/approvals.md) — the unified hold model and the step-level round-trip.
+- [kici-admin CLI](orchestrator/kici-admin-cli.md) — the `org-settings approval` subcommand.

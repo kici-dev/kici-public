@@ -1,0 +1,989 @@
+import { describe, it, expect, vi } from 'vitest';
+import { job } from './job.js';
+import { step } from './step.js';
+import { invokeSource } from './invoke.js';
+import { rule } from './rules/index.js';
+import type { HookInput } from './hooks/types.js';
+import type { GenericInitConfig } from './types.js';
+import type { EventPayload } from './events/event-payloads.js';
+import { dynamicJob, getDynamicJobGitCredentials, getDynamicJobNeeds } from './types.js';
+
+describe('dynamic function event fields', () => {
+  it('stores context/env/concurrencyGroup dynamic functions on the job', () => {
+    // Runtime contract: dynamic context / env / concurrencyGroup functions
+    // are stored verbatim on the job. The compile-time guarantee that these
+    // functions receive the narrowable EventPayload union lives in
+    // events/event-payloads.test-d.ts (run through Vitest's typecheck runner).
+    const j = job('typed-dynamic', {
+      runsOn: 'default',
+      context: (event: EventPayload) =>
+        event.type === 'pull_request'
+          ? `preview-${event.payload.pull_request.number}`
+          : 'production',
+      env: (event: EventPayload) => ({
+        BRANCH: event.targetBranch ?? 'unknown',
+      }),
+      concurrencyGroup: (event: EventPayload) => `cg-${event.targetBranch ?? 'none'}`,
+      steps: [step('noop', async () => {})],
+    });
+    expect(j.name).toBe('typed-dynamic');
+    expect(typeof j.context).toBe('function');
+    expect(typeof j.env).toBe('function');
+    expect(typeof j.concurrencyGroup).toBe('function');
+  });
+});
+
+describe('job()', () => {
+  const checkoutStep = step('checkout', async () => {});
+  const buildStep = step('build', async () => {});
+
+  describe('basic functionality (backward compatible)', () => {
+    it('creates a job with explicit name', () => {
+      const build = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep, buildStep],
+      });
+
+      expect(build._tag).toBe('Job');
+      expect(build.name).toBe('build');
+      expect(build.runsOn).toBe('linux');
+      expect(build.steps).toHaveLength(2);
+      expect(build.needs).toBeUndefined();
+    });
+
+    it('creates a job with auto-generated ID', () => {
+      const build = job({
+        runsOn: 'linux',
+        steps: [checkoutStep],
+      });
+
+      expect(build._tag).toBe('Job');
+      expect(build.name).toMatch(/^[0-9a-f-]{36}$/); // UUID format
+      expect(build.runsOn).toBe('linux');
+    });
+
+    it('accepts needs as Job references', () => {
+      const buildJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+      });
+
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        needs: [buildJob],
+      });
+
+      expect(testJob.needs).toHaveLength(1);
+      expect(testJob.needs?.[0]).toBe(buildJob);
+    });
+
+    it('accepts needs as string IDs', () => {
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        needs: ['build', 'lint'],
+      });
+
+      expect(testJob.needs).toEqual(['build', 'lint']);
+    });
+
+    it('accepts mixed needs (Job refs and strings)', () => {
+      const buildJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+      });
+
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        needs: [buildJob, 'lint'],
+      });
+
+      expect(testJob.needs).toHaveLength(2);
+    });
+
+    it('creates a job without rules or description (undefined)', () => {
+      const build = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+      });
+
+      expect(build.rules).toBeUndefined();
+      expect(build.description).toBeUndefined();
+    });
+  });
+
+  describe('runsOnAll host fan-out', () => {
+    it('creates a job with runsOnAll and no runsOn', () => {
+      const patch = job('patch', {
+        runsOnAll: 'role:web',
+        steps: [checkoutStep],
+      });
+      expect(patch.runsOnAll).toBe('role:web');
+      expect(patch.runsOn).toBeUndefined();
+    });
+
+    it('threads onUnreachable alongside runsOnAll', () => {
+      const patch = job('patch', {
+        runsOnAll: ['role:web', '!kici:host:web-01'],
+        onUnreachable: 'fail',
+        steps: [checkoutStep],
+      });
+      expect(patch.runsOnAll).toEqual(['role:web', '!kici:host:web-01']);
+      expect(patch.onUnreachable).toBe('fail');
+    });
+
+    it('threads includeUninitialized alongside runsOnAll', () => {
+      const converge = job('converge', {
+        runsOnAll: 'kici:role:test',
+        includeUninitialized: true,
+        steps: [checkoutStep],
+      });
+      expect(converge.runsOnAll).toBe('kici:role:test');
+      expect(converge.includeUninitialized).toBe(true);
+    });
+
+    it('leaves includeUninitialized undefined when omitted', () => {
+      const patch = job('patch', { runsOnAll: 'role:web', steps: [checkoutStep] });
+      expect(patch.includeUninitialized).toBeUndefined();
+    });
+
+    it('warns when includeUninitialized is set without runsOnAll', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      job('bad', { runsOn: 'linux', includeUninitialized: true, steps: [checkoutStep] });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('includeUninitialized is ignored without runsOnAll'),
+      );
+      warn.mockRestore();
+    });
+
+    it('throws when both runsOn and runsOnAll are set', () => {
+      expect(() =>
+        job('bad', { runsOn: 'linux', runsOnAll: 'role:web', steps: [checkoutStep] }),
+      ).toThrow(/mutually exclusive/i);
+    });
+
+    it('throws when neither runsOn nor runsOnAll is set', () => {
+      expect(() => job('bad', { steps: [checkoutStep] } as never)).toThrow(
+        /one of runsOn or runsOnAll is required/i,
+      );
+    });
+  });
+
+  describe('rule integration', () => {
+    it('accepts rules array', () => {
+      const envRule = rule('env: CI');
+      const build = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        rules: [envRule],
+      });
+
+      expect(build.rules).toHaveLength(1);
+      expect(build.rules![0].label).toBe('env: CI');
+    });
+
+    it('stores rules as-is (not transformed)', () => {
+      const myRule = rule('my rule', async () => true);
+      const build = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        rules: [myRule],
+      });
+
+      expect(build.rules![0]).toBe(myRule);
+      expect(build.rules![0]._tag).toBe('Rule');
+    });
+
+    it('accepts multiple rules', () => {
+      const rule1 = rule('rule 1');
+      const rule2 = rule('rule 2', () => false);
+      const build = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        rules: [rule1, rule2],
+      });
+
+      expect(build.rules).toHaveLength(2);
+    });
+  });
+
+  describe('description support', () => {
+    it('accepts optional description', () => {
+      const build = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        description: 'Build the project',
+      });
+
+      expect(build.description).toBe('Build the project');
+    });
+  });
+
+  describe('full job with all options', () => {
+    it('combines needs, rules, and description', () => {
+      const setupJob = job('setup', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+      });
+
+      const envRule = rule('env: CI');
+      const buildJob = job('build', {
+        runsOn: 'linux',
+        steps: [checkoutStep, buildStep],
+        needs: [setupJob],
+        rules: [envRule],
+        description: 'Build all packages',
+      });
+
+      expect(buildJob.name).toBe('build');
+      expect(buildJob.needs).toHaveLength(1);
+      expect(buildJob.rules).toHaveLength(1);
+      expect(buildJob.description).toBe('Build all packages');
+    });
+
+    it('works with anonymous job and all options', () => {
+      const envRule = rule('env: CI');
+      const anonJob = job({
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        rules: [envRule],
+        description: 'Anonymous job',
+      });
+
+      expect(anonJob.name).toMatch(/^[0-9a-f-]{36}$/);
+      expect(anonJob.rules).toHaveLength(1);
+      expect(anonJob.description).toBe('Anonymous job');
+    });
+  });
+
+  describe('cache field', () => {
+    it('round-trips a declarative cache spec onto the job', () => {
+      const cachedJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+        cache: { key: 'k', paths: ['dist'] },
+      });
+
+      expect(cachedJob.cache).toEqual({ key: 'k', paths: ['dist'] });
+    });
+
+    it('leaves cache undefined when not provided', () => {
+      const plainJob = job('build', { runsOn: 'linux', steps: [buildStep] });
+      expect(plainJob.cache).toBeUndefined();
+    });
+  });
+
+  describe('agent execution options', () => {
+    it('creates a job with checkout: false', () => {
+      const deployJob = job('deploy', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+        checkout: false,
+      });
+
+      expect(deployJob.checkout).toBe(false);
+    });
+
+    it('creates a job with container string', () => {
+      const containerJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+        container: 'node:20',
+      });
+
+      expect(containerJob.container).toBe('node:20');
+    });
+
+    it('creates a job with container config object', () => {
+      const containerJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+        container: {
+          image: 'node:20-alpine',
+          env: { NODE_ENV: 'test' },
+        },
+      });
+
+      expect(containerJob.container).toEqual({
+        image: 'node:20-alpine',
+        env: { NODE_ENV: 'test' },
+      });
+    });
+
+    it('checkout and container are undefined when not provided', () => {
+      const basicJob = job('basic', {
+        runsOn: 'linux',
+        steps: [checkoutStep],
+      });
+
+      expect(basicJob.checkout).toBeUndefined();
+      expect(basicJob.container).toBeUndefined();
+    });
+
+    it('rejects a container that names neither an image nor a dockerfile', () => {
+      expect(() =>
+        job('build', { runsOn: 'linux', steps: [buildStep], container: {} as never }),
+      ).toThrow(/exactly one of container.image or container.dockerfile/);
+    });
+
+    it('rejects a container that names both an image and a dockerfile', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { image: 'python:3.12', dockerfile: 'Dockerfile' },
+        }),
+      ).toThrow(/exactly one of container.image or container.dockerfile/);
+    });
+
+    it('rejects a dockerfile path that escapes the repository', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: '../evil' },
+        }),
+      ).toThrow(/container.dockerfile must stay inside the repository/);
+    });
+
+    it('rejects an absolute dockerfile path', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: '/etc/shadow' },
+        }),
+      ).toThrow(/container.dockerfile must stay inside the repository/);
+    });
+
+    it('rejects a context path that escapes the repository', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: 'Dockerfile', context: '../..' },
+        }),
+      ).toThrow(/container.context must stay inside the repository/);
+    });
+
+    it('rejects a build-only field on a job that names a finalized image', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { image: 'python:3.12', target: 'ci' },
+        }),
+      ).toThrow(/container.target applies only to container.dockerfile/);
+    });
+
+    it('requires auth.registry when building from a dockerfile', () => {
+      // The base image lives inside the Dockerfile, so there is no image
+      // reference to derive the registry host from.
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: 'Dockerfile', auth: { tokenSecret: 'prod:TOKEN' } },
+        }),
+      ).toThrow(/container.auth.registry is required/);
+    });
+
+    it('creates a job that builds its image from a dockerfile', () => {
+      const containerJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+        container: {
+          dockerfile: '.kici/ci.Dockerfile',
+          context: '.',
+          target: 'ci',
+          args: { NODE_VERSION: '24' },
+        },
+      });
+
+      expect(containerJob.container).toEqual({
+        dockerfile: '.kici/ci.Dockerfile',
+        context: '.',
+        target: 'ci',
+        args: { NODE_VERSION: '24' },
+      });
+    });
+  });
+
+  describe('run shorthand', () => {
+    it('creates a named job with run shorthand', () => {
+      const deploy = job('deploy', {
+        runsOn: 'default',
+        run: async (ctx) => {},
+      });
+
+      expect(deploy._tag).toBe('Job');
+      expect(deploy.name).toBe('deploy');
+      expect(deploy.steps).toHaveLength(1);
+      // The run function is stored as a bare function in the steps array
+      expect(typeof deploy.steps[0]).toBe('function');
+    });
+
+    it('creates an unnamed job with run shorthand', () => {
+      const j = job({
+        runsOn: 'default',
+        run: async (ctx) => {},
+      });
+
+      expect(j._tag).toBe('Job');
+      expect(j.name).toMatch(/^[0-9a-f-]{36}$/); // UUID
+      expect(j.steps).toHaveLength(1);
+    });
+
+    it('throws when both run and steps are provided', () => {
+      expect(() =>
+        job('x', {
+          runsOn: 'default',
+          run: async () => {},
+          steps: [step('s', async () => {})],
+        }),
+      ).toThrow('job() cannot have both "run" and "steps"');
+    });
+
+    it('allows run with empty steps array (treated as run-only)', () => {
+      // Empty steps array is falsy for .length > 0 check
+      const j = job('x', {
+        runsOn: 'default',
+        run: async () => {},
+        steps: [],
+      });
+
+      expect(j.steps).toHaveLength(1);
+      expect(typeof j.steps[0]).toBe('function');
+    });
+  });
+
+  describe('bare functions in steps array', () => {
+    it('accepts bare async functions in steps array', () => {
+      const bareFn = async (ctx: any) => {};
+      const j = job('x', {
+        runsOn: 'default',
+        steps: [bareFn],
+      });
+
+      expect(j.steps).toHaveLength(1);
+      expect(typeof j.steps[0]).toBe('function');
+    });
+
+    it('accepts mixed Step objects and bare functions in steps', () => {
+      const bareFn = async (ctx: any) => {};
+      const namedStep = step('named', async () => {});
+      const j = job('x', {
+        runsOn: 'default',
+        steps: [namedStep, bareFn, step(async () => {})],
+      });
+
+      expect(j.steps).toHaveLength(3);
+      // First is a Step object
+      expect((j.steps[0] as any)._tag).toBe('Step');
+      // Second is a bare function
+      expect(typeof j.steps[1]).toBe('function');
+      // Third is a Step object (id-less step)
+      expect((j.steps[2] as any)._tag).toBe('Step');
+    });
+  });
+
+  describe('matrix support', () => {
+    it('creates job with static array matrix', () => {
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [],
+        matrix: ['18', '20', '22'],
+      });
+
+      expect(testJob.matrix).toEqual(['18', '20', '22']);
+    });
+
+    it('creates job with static object matrix', () => {
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [],
+        matrix: { os: ['linux', 'mac'], node: ['18', '20'] },
+      });
+
+      expect(testJob.matrix).toEqual({ os: ['linux', 'mac'], node: ['18', '20'] });
+    });
+
+    it('creates job with dynamic matrix function', () => {
+      const dynamicMatrix = async () => ['a', 'b', 'c'];
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [],
+        matrix: dynamicMatrix,
+      });
+
+      expect(typeof testJob.matrix).toBe('function');
+    });
+
+    it('creates job with include and exclude', () => {
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [],
+        matrix: { os: ['linux', 'mac'], node: ['18', '20'] },
+        exclude: [{ os: 'mac', node: '18' }],
+        include: [{ os: 'windows', node: '22' }],
+      });
+
+      expect(testJob.exclude).toEqual([{ os: 'mac', node: '18' }]);
+      expect(testJob.include).toEqual([{ os: 'windows', node: '22' }]);
+    });
+
+    it('matrix/include/exclude are undefined when not provided', () => {
+      const testJob = job('test', {
+        runsOn: 'linux',
+        steps: [],
+      });
+
+      expect(testJob.matrix).toBeUndefined();
+      expect(testJob.include).toBeUndefined();
+      expect(testJob.exclude).toBeUndefined();
+    });
+  });
+
+  describe('resources field', () => {
+    it('passes through requests-only resources', () => {
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [],
+        resources: { requests: { cpus: 1, memory: '512m' } },
+      });
+
+      expect(j.resources).toEqual({ requests: { cpus: 1, memory: '512m' } });
+    });
+
+    it('passes through limits-only resources', () => {
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [],
+        resources: { limits: { cpus: 2, memory: '2g' } },
+      });
+
+      expect(j.resources).toEqual({ limits: { cpus: 2, memory: '2g' } });
+    });
+
+    it('passes through both requests and limits', () => {
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [],
+        resources: {
+          requests: { cpus: 1, memory: '1g' },
+          limits: { cpus: 2, memory: '4g' },
+        },
+      });
+
+      expect(j.resources).toEqual({
+        requests: { cpus: 1, memory: '1g' },
+        limits: { cpus: 2, memory: '4g' },
+      });
+    });
+
+    it('resources is undefined when not provided', () => {
+      const j = job('build', { runsOn: 'linux', steps: [] });
+      expect(j.resources).toBeUndefined();
+    });
+  });
+
+  describe('hook fields', () => {
+    it('accepts onCancel hook', () => {
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [],
+        onCancel: async () => {},
+      });
+
+      expect(j.onCancel).toBeDefined();
+      expect(typeof j.onCancel).toBe('function');
+    });
+
+    it('accepts cleanup and gracePeriod', () => {
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [],
+        cleanup: async () => {},
+        gracePeriod: 60,
+      });
+
+      expect(j.cleanup).toBeDefined();
+      expect(j.gracePeriod).toBe(60);
+    });
+
+    it('threads timeout from JobOptions onto the Job', () => {
+      const j = job('build', { runsOn: 'linux', steps: [], timeout: 600_000 });
+      expect(j.timeout).toBe(600_000);
+    });
+
+    it('leaves timeout undefined when not set', () => {
+      const j = job('build', { runsOn: 'linux', steps: [] });
+      expect(j.timeout).toBeUndefined();
+    });
+
+    it('accepts all 6 hook types', () => {
+      const hookFn: HookInput = async () => {};
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [],
+        onCancel: hookFn,
+        cleanup: hookFn,
+        onSuccess: hookFn,
+        onFailure: hookFn,
+        beforeStep: hookFn,
+        afterStep: hookFn,
+      });
+
+      expect(j.onCancel).toBe(hookFn);
+      expect(j.cleanup).toBe(hookFn);
+      expect(j.onSuccess).toBe(hookFn);
+      expect(j.onFailure).toBe(hookFn);
+      expect(j.beforeStep).toBe(hookFn);
+      expect(j.afterStep).toBe(hookFn);
+    });
+
+    it('accepts hook with timeout config', () => {
+      const hookConfig = { run: async () => {}, timeout: 30000 };
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [],
+        onCancel: hookConfig,
+      });
+
+      expect(j.onCancel).toBe(hookConfig);
+    });
+
+    it('hook fields are undefined when not provided', () => {
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [],
+      });
+
+      expect(j.onCancel).toBeUndefined();
+      expect(j.cleanup).toBeUndefined();
+      expect(j.onSuccess).toBeUndefined();
+      expect(j.onFailure).toBeUndefined();
+      expect(j.beforeStep).toBeUndefined();
+      expect(j.afterStep).toBeUndefined();
+      expect(j.gracePeriod).toBeUndefined();
+    });
+  });
+
+  describe('init field', () => {
+    it('threads a single GenericInitConfig through the factory', () => {
+      const init: GenericInitConfig = { run: 'echo hi' };
+      const j = job('build', { runsOn: 'linux', steps: [], init });
+      expect(j.init).toEqual(init);
+    });
+
+    it('threads an array of init configs in order', () => {
+      const init: GenericInitConfig[] = [{ run: 'a' }, { run: 'b' }];
+      const j = job('build', { runsOn: 'linux', steps: [], init });
+      expect(j.init).toEqual(init);
+    });
+
+    it('threads init: false (explicit opt-out)', () => {
+      const j = job('build', { runsOn: 'linux', steps: [], init: false });
+      expect(j.init).toBe(false);
+    });
+
+    it('leaves init undefined when not provided', () => {
+      const j = job('build', { runsOn: 'linux', steps: [] });
+      expect(j.init).toBeUndefined();
+    });
+
+    it('accepts a full init config (shell, cache, timeout, env)', () => {
+      const init: GenericInitConfig = {
+        run: 'mise install',
+        shell: 'bash',
+        cache: { key: 'mise-x', paths: ['~/.local/share/mise'] },
+        timeout: 600_000,
+        env: { MISE_QUIET: '1' },
+      };
+      const j = job('build', { runsOn: 'linux', steps: [], init });
+      expect(j.init).toEqual(init);
+    });
+
+    it('rejects an init config with an empty run command', () => {
+      expect(() => job('build', { runsOn: 'linux', steps: [], init: { run: '' } })).toThrow(
+        /init\[0\]\.run must be a non-empty command/,
+      );
+    });
+
+    it('rejects a whitespace-only run command', () => {
+      expect(() => job('build', { runsOn: 'linux', steps: [], init: { run: '   \n' } })).toThrow(
+        /init\[0\]\.run must be a non-empty command/,
+      );
+    });
+
+    it('reports the offending index for an array init', () => {
+      expect(() =>
+        job('build', { runsOn: 'linux', steps: [], init: [{ run: 'ok' }, { run: '' }] }),
+      ).toThrow(/init\[1\]\.run must be a non-empty command/);
+    });
+
+    it('does not validate when init is false', () => {
+      expect(() => job('build', { runsOn: 'linux', steps: [], init: false })).not.toThrow();
+    });
+  });
+
+  describe('multiple contexts', () => {
+    it('accepts an contexts array', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        contexts: ['staging', 'my-testing'],
+      });
+      expect(j.contexts).toEqual(['staging', 'my-testing']);
+      expect(j.context).toBeUndefined();
+    });
+
+    it('throws when both context and contexts are set', () => {
+      expect(() =>
+        job('deploy', {
+          runsOn: 'role:web',
+          run: async () => {},
+          context: 'staging',
+          contexts: ['my-testing'],
+        }),
+      ).toThrow(/mutually exclusive/);
+    });
+
+    it('accepts dynamic function elements in contexts', () => {
+      const fn = (event: EventPayload) => event.targetBranch ?? 'fallback';
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        contexts: ['staging', fn],
+      });
+      expect(j.contexts?.[0]).toBe('staging');
+      expect(typeof j.contexts?.[1]).toBe('function');
+    });
+
+    it('defaults concurrencyGroup to the first bound context', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        contexts: ['staging', 'my-testing'],
+      });
+      expect(j.concurrencyGroup).toBe('staging');
+    });
+
+    it('keeps an explicit concurrencyGroup over the env default', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        contexts: ['staging'],
+        concurrencyGroup: 'custom',
+      });
+      expect(j.concurrencyGroup).toBe('custom');
+    });
+
+    it('leaves concurrencyGroup undefined when the first context is dynamic', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        contexts: [(event: EventPayload) => event.targetBranch ?? 'x'],
+      });
+      expect(j.concurrencyGroup).toBeUndefined();
+    });
+
+    describe('gitCredentials', () => {
+      it('stores a named map on the job', () => {
+        const j = job('release', {
+          runsOn: 'linux',
+          gitCredentials: {
+            default: {
+              kind: 'app',
+              appIdSecret: 'ci:A_ID',
+              installationIdSecret: 'ci:I_ID',
+              privateKeySecret: 'ci:A_KEY',
+            },
+            forge: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+          },
+          steps: [checkoutStep],
+        });
+        expect(Object.keys(j.gitCredentials ?? {})).toEqual(['default', 'forge']);
+      });
+
+      it('omits the field entirely when no credentials are declared', () => {
+        const j = job('build', { runsOn: 'linux', steps: [checkoutStep] });
+        expect(j.gitCredentials).toBeUndefined();
+      });
+
+      it('carries secret NAMES, never material', () => {
+        const j = job('release', {
+          runsOn: 'linux',
+          gitCredentials: { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } },
+          steps: [checkoutStep],
+        });
+        // The lock file is generated from this object, so material here would be
+        // committed to a git repository.
+        expect(JSON.stringify(j.gitCredentials)).not.toMatch(/BEGIN |gh[pousr]_/);
+      });
+
+      it('rejects a pasted private key, naming the field', () => {
+        expect(() =>
+          job('release', {
+            runsOn: 'linux',
+            gitCredentials: {
+              default: {
+                kind: 'ssh',
+                privateKeySecret: '-----BEGIN RSA PRIVATE KEY-----\nMII',
+              },
+            },
+            steps: [checkoutStep],
+          }),
+        ).toThrow(/default\.privateKeySecret/);
+      });
+
+      it('rejects an unqualified secret reference', () => {
+        expect(() =>
+          job('release', {
+            runsOn: 'linux',
+            gitCredentials: { default: { kind: 'token', tokenSecret: 'FORGE_PAT' } },
+            steps: [checkoutStep],
+          }),
+        ).toThrow(/qualified <context>:<secret-name>/);
+      });
+
+      it('does not reject a *Value field, which is material by declaration', () => {
+        expect(() =>
+          job('release', {
+            runsOn: 'linux',
+            gitCredentials: { default: { kind: 'token', tokenValue: 'ghp_runtime_material_0001' } },
+            steps: [checkoutStep],
+          }),
+        ).not.toThrow();
+      });
+    });
+  });
+});
+
+describe('runsOn accepts RegExp and glob strings', () => {
+  it('accepts a RegExp and a glob string in runsOn (type + runtime passthrough)', () => {
+    const j = job('build', { runsOn: /kici:host:box-0[1-3]/, run: async () => {} });
+    expect(j.runsOn).toBeInstanceOf(RegExp);
+    const j2 = job('build2', { runsOn: 'kici:host:box-*', run: async () => {} });
+    expect(j2.runsOn).toBe('kici:host:box-*');
+  });
+});
+
+describe('job() sandbox escape hatch', () => {
+  it('stores a two-lever sandbox request on the job', () => {
+    const j = job('build', {
+      runsOn: 'linux',
+      container: 'node:20',
+      sandbox: { capabilities: ['NET_ADMIN'], network: 'host' },
+      run: async () => {},
+    });
+    expect(j.sandbox).toEqual({ capabilities: ['NET_ADMIN'], network: 'host' });
+  });
+
+  it('accepts a capability in either CAP_-prefixed or bare form', () => {
+    const j = job('build', {
+      runsOn: 'linux',
+      sandbox: { capabilities: ['CAP_NET_ADMIN'] },
+      run: async () => {},
+    });
+    expect(j.sandbox?.capabilities).toEqual(['CAP_NET_ADMIN']);
+  });
+
+  it('rejects an unknown capability at author time', () => {
+    expect(() =>
+      job('build', {
+        runsOn: 'linux',
+        sandbox: { capabilities: ['NOT_A_CAP'] },
+        run: async () => {},
+      }),
+    ).toThrow(/unknown Linux capability/i);
+  });
+
+  it('omits the sandbox key entirely when not requested', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    expect('sandbox' in j).toBe(false);
+  });
+});
+
+describe('job() invoke gate', () => {
+  it('accepts an invoke gate with no steps and no runsOn', () => {
+    const j = job('repo-tests', { invoke: invokeSource('myorg.repo-tests') });
+    expect(j.invoke?.event).toBe('myorg.repo-tests');
+    expect(j.steps ?? []).toEqual([]);
+    expect(j.runsOn).toBeUndefined();
+  });
+
+  it('rejects invoke together with steps', () => {
+    expect(() =>
+      job('bad', { invoke: invokeSource('e'), steps: [step('s', async () => {})] } as any),
+    ).toThrow(/mutually exclusive/i);
+  });
+
+  it('rejects invoke together with run', () => {
+    expect(() => job('bad', { invoke: invokeSource('e'), run: async () => {} } as any)).toThrow(
+      /mutually exclusive/i,
+    );
+  });
+});
+
+describe('dynamicJob gitCredentials', () => {
+  // A fresh generator per case: `dynamicJob` tags the function object it is
+  // handed, so one shared function cannot be tagged twice.
+  const newGenerate = () => async () => [job('shard', { runsOn: 'linux', run: async () => {} })];
+
+  it('stores the generator-declared map, readable by the compiler', () => {
+    const gen = dynamicJob('shards', {
+      generate: newGenerate(),
+      gitCredentials: { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } },
+    });
+    expect(getDynamicJobGitCredentials(gen)).toEqual({
+      default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+    });
+  });
+
+  it('accepts the options form with no needs — an event-only generator', () => {
+    // The wish's case is a sharding generator, which has no upstreams. Requiring
+    // `needs` here would leave it unable to declare credentials at all.
+    const gen = dynamicJob('shards', {
+      generate: newGenerate(),
+      gitCredentials: { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } },
+    });
+    expect(getDynamicJobNeeds(gen)).toBeUndefined();
+  });
+
+  it('leaves the bare function form undeclared', () => {
+    const gen = dynamicJob('shards', newGenerate());
+    expect(getDynamicJobGitCredentials(gen)).toBeUndefined();
+  });
+
+  it('rejects an unqualified secret reference, naming the generator', () => {
+    expect(() =>
+      dynamicJob('shards', {
+        generate: newGenerate(),
+        gitCredentials: { default: { kind: 'token', tokenSecret: 'FORGE_PAT' } },
+      }),
+    ).toThrow(/dynamicJob\('shards'\): gitCredentials\.default\.tokenSecret/);
+  });
+
+  it('rejects a pasted private key, naming the field', () => {
+    expect(() =>
+      dynamicJob('shards', {
+        generate: newGenerate(),
+        gitCredentials: {
+          default: { kind: 'ssh', privateKeySecret: '-----BEGIN RSA PRIVATE KEY-----\nMII' },
+        },
+      }),
+    ).toThrow(/default\.privateKeySecret/);
+  });
+
+  it('does not reject a *Value field, which is material by declaration', () => {
+    expect(() =>
+      dynamicJob('shards', {
+        generate: newGenerate(),
+        gitCredentials: { default: { kind: 'token', tokenValue: 'ghp_runtime_material_0001' } },
+      }),
+    ).not.toThrow();
+  });
+});

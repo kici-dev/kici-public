@@ -1,0 +1,3209 @@
+/**
+ * WebSocket handler for agent connections.
+ *
+ * Agents connect to the orchestrator via WebSocket to:
+ * - Authenticate with a kat_ token (when agentAuthMode === 'token')
+ * - Register their capabilities (labels, concurrency)
+ * - Receive job dispatches
+ * - Report job execution status
+ * - Send periodic heartbeats
+ *
+ * Two-phase auth flow (when agentAuthMode === 'token'):
+ * 1. pendingAuth (5s): Agent must send auth.request with a valid kat_ token.
+ * 2. pendingRegistration (10s): After auth.success, agent must send agent.register.
+ * 3. registered: Agent is fully connected and can exchange messages.
+ *
+ * When agentAuthMode === 'none', the auth phase is skipped and the connection
+ * starts in pendingRegistration. An agent that happens to carry a token still
+ * opens with auth.request — nothing on the wire tells it the mode — so that
+ * frame is accepted there and answered with auth.success without reading the
+ * token, and the agent then registers as normal.
+ */
+
+import type { WSContext, WSEvents, WSMessageReceive } from 'hono/ws';
+import { randomUUID } from 'node:crypto';
+import { createLogger, toErrorMessage, computeBackoffDelay } from '@kici-dev/shared';
+import {
+  agentToOrchestratorMessageSchema,
+  agentAuthRequestSchema,
+  MIN_PROTOCOL_VERSION,
+  WS_CLOSE_AUTH_TIMEOUT,
+  WS_CLOSE_INVALID_MESSAGE,
+  WS_CLOSE_INTERNAL_ERROR,
+  WS_CLOSE_AGENT_AUTH_FAILED,
+  WS_CLOSE_PROTOCOL_ERROR,
+  WS_CLOSE_SUPERSEDED_BY_RECONNECT,
+  WsRateLimiter,
+  ExecutionJobStatus,
+  isSelfReportedLabel,
+  canonicalizeLabel,
+  canonicalizeLabels,
+  PRIVILEGED_ROOT_LABEL,
+  ORCH_AGENT_CAPABILITIES,
+  ArtifactCompleteAckOutcome,
+  ArtifactDownloadOutcome,
+  ArtifactUploadOutcome,
+  LogStream,
+  reservedEventNamePrefix,
+} from '@kici-dev/engine';
+import type { RateLimiterConfig, AttestationVerifyStatus } from '@kici-dev/engine';
+import { provenanceStorageKey } from '@kici-dev/engine/provenance/bundle';
+import type { ProvenanceTrustRoot } from '../provenance/trust-root.js';
+import { computeAttestationVerdict } from '../provenance/verify-at-ingest.js';
+import type { AgentRegistry, WsLike } from '../agent/registry.js';
+import type { Dispatcher } from '../agent/dispatcher.js';
+import {
+  boundAgentIdFromCreatedBy,
+  BOOTSTRAP_CREATED_BY_PREFIX,
+  type AgentTokenStore,
+} from '../agent/token-store.js';
+import type { OwnershipTracker } from '../agent/ownership-tracker.js';
+import { OWNERSHIP_REFUSED } from '../agent/ownership-refusal.js';
+import { gateOwnership } from './ownership-gate.js';
+import type { SourceCache } from '../cache/source-cache.js';
+import { depTarballKey } from '../cache/dep-cache.js';
+import { sourceTarballKey } from '../cache/source-cache.js';
+import type { DepCache } from '../cache/dep-cache.js';
+import type { UserCache, UserCacheRef } from '../cache/user-cache.js';
+import {
+  ArtifactInvalidNameError,
+  ArtifactObjectMissingError,
+  classifyArtifactCommitFailure,
+  type ArtifactStore,
+} from '../artifacts/artifact-store.js';
+import { ArtifactInternalFailure } from '../artifacts/failure-messages.js';
+import { AgentWsInternalFailure } from './failure-messages.js';
+import type { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
+import type { PendingBuildTracker } from '../cache/pending-builds.js';
+import type { PendingInitTracker } from '../cache/pending-inits.js';
+import type { PendingDynamicTracker } from '../cache/pending-dynamics.js';
+import type { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
+import type { CacheStorage } from '../storage/types.js';
+import { setAgentsActive } from '../metrics/prometheus.js';
+import type { AgentMetricsAggregator } from '../metrics/agent-metrics-aggregator.js';
+import {
+  ApiRoleDeniedError,
+  UnknownApiMethodError,
+  type AgentApiRegistry,
+} from './agent-api-registry.js';
+import type { FleetAgentCollector } from './fleet-agent-collector.js';
+
+const logger = createLogger({ prefix: 'agent-ws-handler' });
+
+/** Timeout for auth phase (must send auth.request within this window). */
+const AUTH_TIMEOUT_MS = 5_000;
+
+/** Timeout for registration phase (must send agent.register after auth). */
+const REGISTER_TIMEOUT_MS = 10_000;
+
+/**
+ * Bounded retry for the artifact commit. The commit is idempotent (the storage
+ * key is server-derived and the DB insert is onConflict-do-nothing), so a
+ * momentary storage/DB blip is retried rather than failing the agent's step.
+ * Kept well inside the agent's 25s ack timeout.
+ */
+const ARTIFACT_COMMIT_RETRY = {
+  maxAttempts: 3,
+  delayMs: 100,
+  backoff: 'exponential',
+  maxDelayMs: 1_000,
+} as const;
+
+/**
+ * Commit an artifact upload, retrying transient failures. Two failures are
+ * terminal and rethrown immediately: a missing object (the presigned PUT never
+ * landed, so no amount of retrying will find it) and a name that violates the
+ * artifact-name contract (the name is fixed for the life of the request).
+ */
+async function completeUploadWithRetry(
+  artifactStore: ArtifactStore,
+  args: Parameters<ArtifactStore['completeUpload']>[0],
+): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await artifactStore.completeUpload(args);
+      return;
+    } catch (err) {
+      if (
+        err instanceof ArtifactObjectMissingError ||
+        err instanceof ArtifactInvalidNameError ||
+        attempt >= ARTIFACT_COMMIT_RETRY.maxAttempts
+      ) {
+        throw err;
+      }
+      logger.warn('artifact upload-complete attempt failed, retrying', {
+        runId: args.runId,
+        name: args.name,
+        attempt,
+        error: toErrorMessage(err),
+      });
+      await new Promise((r) => setTimeout(r, computeBackoffDelay(attempt, ARTIFACT_COMMIT_RETRY)));
+    }
+  }
+}
+
+/**
+ * Token-bound authorization context captured at auth time and consulted
+ * on every `agent.register` that mutates the registry's `agentId → entry`
+ * mapping for an authenticated WS — both the first register (Phase 2) and
+ * any subsequent re-register on the same connection.
+ *
+ * `undefined` fields mean the deployment opted out of agent auth
+ * (`agentAuthMode === 'none'`); the gates are skipped in that case.
+ *
+ * `tokenLabels === null` is the back-compat carve-out for tokens issued
+ * before `agent_tokens.labels` became an enforced authorization signal.
+ */
+type AuthState = {
+  tokenId?: string;
+  tokenLabels?: string[] | null;
+  /**
+   * Token-authorized taint set (`agent_tokens.mandatory_labels`). Becomes the
+   * static agent's registry-entry `mandatoryLabels` at register time, confining
+   * it to jobs whose `runsOn` demands every label here. `null`/`undefined` = no
+   * taint. When it (or the advertised labels) includes `PRIVILEGED_ROOT_LABEL`,
+   * the uid-0 honesty gate verifies the agent is actually running as root.
+   */
+  tokenMandatoryLabels?: string[] | null;
+  tokenAgentType?: string;
+  tokenCreatedBy?: string | null;
+};
+
+/**
+ * Narrow the token's `agent_type` column (a free string at the DB layer) to
+ * the host-roster lifecycle class. Anything other than the two known values
+ * (including `undefined` under `agentAuth: 'none'`) maps to `null` so the
+ * roster's reconcile hook treats it as the GC-able default class.
+ */
+function toLifecycleClass(agentType: string | undefined): 'static' | 'ephemeral' | null {
+  return agentType === 'static' || agentType === 'ephemeral' ? agentType : null;
+}
+
+/**
+ * Run the three token-bound authorization gates against a wire-supplied
+ * `agent.register` payload. The gates are identical at first register
+ * (Phase 2 / `pendingRegistration`) and on every subsequent re-register
+ * arriving on the same registered WS — every code path that mutates the
+ * registry's `agentId → entry` mapping for an authenticated WS MUST run
+ * them, otherwise the token-scope and identity-binding invariants only
+ * hold for the very first register and a re-register can silently
+ * overwrite the authority.
+ *
+ * Gates:
+ *  1. Token-scope subset — wire labels MUST be a subset of
+ *     `agent_tokens.labels` when that set is non-null. Closes the WS with
+ *     `WS_CLOSE_AGENT_AUTH_FAILED` listing the elevated labels.
+ *  2. Ephemeral identity-binding — for `agent_type === 'ephemeral'`,
+ *     wire `agentId` MUST equal `tokenCreatedBy` (the scaler-spawned
+ *     agentId the token was issued for). Closes the WS with
+ *     `WS_CLOSE_AGENT_AUTH_FAILED`.
+ *  3. Static-token agentId-collision — a different `tokenId` must not
+ *     already claim the wire `agentId`. Closes the WS with
+ *     `WS_CLOSE_INVALID_MESSAGE`.
+ *
+ * Returns `true` when every gate passed and the caller may proceed;
+ * returns `false` after closing the WS on the first violation, in which
+ * case the caller MUST stop processing.
+ */
+/**
+ * WebSocket close reasons are capped at 123 UTF-8 bytes (RFC 6455, section 5.5.1).
+ * A reason longer than that makes `ws.close()` throw a RangeError, which —
+ * thrown from an async message handler — surfaces as an unhandled rejection
+ * and skips the close entirely. Truncate on a byte boundary and drop any
+ * trailing partial multi-byte char.
+ */
+export function truncateCloseReason(reason: string): string {
+  const bytes = Buffer.from(reason, 'utf-8');
+  if (bytes.length <= 123) return reason;
+  return bytes.subarray(0, 123).toString('utf-8').replace(/�+$/, '');
+}
+
+function enforceRegisterAuthGates(
+  authState: AuthState | undefined,
+  payload: { agentId: string; labels: string[]; runningAsUid?: number },
+  ws: { close(code: number, reason: string): void },
+  agentIdToTokenId: Map<unknown, string>,
+): boolean {
+  const { agentId, runningAsUid } = payload;
+  // Fold the wire labels once, here at the ingress. Every gate below compares
+  // them against a token-bound or reserved label, and label matching folds
+  // case. Gate 0 is the load-bearing one: the registry stores the canonical
+  // form, so an agent advertising `KICI:PRIVILEGED:ROOT` would otherwise slip
+  // past the honesty check and still match the privileged-root selector at
+  // dispatch time.
+  const labels = canonicalizeLabels(payload.labels);
+
+  // Gate 0 — privileged-root honesty (independent of auth mode). The
+  // kici:privileged:root SELECTOR must be true: a root-demanding job must never
+  // land on a non-root agent. Fail closed when the agent claims the label
+  // (advertised on the wire, or authorized by its token as a label or a taint)
+  // but is not verifiably uid 0 (including absent uid — we cannot verify, so we
+  // refuse). uid is self-reported, so this catches honest misconfig, not a
+  // malicious agent: such an agent already holds an operator-minted privileged
+  // token and is inside the trust boundary by construction.
+  const claimsPrivilegedRoot =
+    labels.includes(canonicalizeLabel(PRIVILEGED_ROOT_LABEL)) ||
+    (authState?.tokenLabels?.includes(PRIVILEGED_ROOT_LABEL) ?? false) ||
+    (authState?.tokenMandatoryLabels?.includes(PRIVILEGED_ROOT_LABEL) ?? false);
+  if (claimsPrivilegedRoot && runningAsUid !== 0) {
+    logger.warn('Agent register rejected: privileged-root claim by non-root agent', {
+      agentId,
+      runningAsUid: runningAsUid ?? null,
+    });
+    ws.close(
+      WS_CLOSE_AGENT_AUTH_FAILED,
+      truncateCloseReason(
+        `privileged-root token presented by non-root agent (uid=${runningAsUid ?? 'absent'})`,
+      ),
+    );
+    return false;
+  }
+
+  if (authState === undefined) return true;
+  const { tokenId, tokenLabels, tokenAgentType, tokenCreatedBy } = authState;
+
+  // Gate 1 — token-scope subset. Self-reported platform facts (kici:os:,
+  // kici:arch:, kici:host:) are exempt: the agent derives them from its own
+  // host at registration, the scaler can't predict them at token-mint time,
+  // and they grant no privilege. Authorization-bearing labels (base + the
+  // scaler-assigned kici:agent:/kici:scaler:/kici:role:) must be bound by the
+  // token, which the scaler now does via scalerAgentLabels().
+  if (tokenLabels !== undefined && tokenLabels !== null) {
+    // Fold both sides. The token scope is stored as the operator typed it and
+    // the agent reports what its own config says, so a case-only difference is
+    // not a privilege escalation. Closing the socket over one reads to the
+    // operator as an auth failure with no hint that case was the cause.
+    const allowedSet = new Set(canonicalizeLabels(tokenLabels));
+    const elevated = labels.filter((l) => !allowedSet.has(l) && !isSelfReportedLabel(l));
+    if (elevated.length > 0) {
+      logger.warn('Agent register-time label-scope violation: wire labels exceed token-bound set', {
+        agentId,
+        tokenLabels,
+        wireLabels: payload.labels,
+        elevated,
+      });
+      ws.close(
+        WS_CLOSE_AGENT_AUTH_FAILED,
+        truncateCloseReason(`Agent labels exceed token-bound scope: ${elevated.join(',')}`),
+      );
+      return false;
+    }
+  }
+
+  // Gate 2 — ephemeral identity-binding. Scaler tokens store the bound id
+  // verbatim in `created_by`; a single-use bootstrap (init-runner) token stores
+  // it behind `bootstrap:` (mintBootstrapToken). Resolve the bare bound id so
+  // the init-runner can register as its target agent id.
+  if (tokenAgentType === 'ephemeral' && tokenCreatedBy !== undefined && tokenCreatedBy !== null) {
+    const boundAgentId = boundAgentIdFromCreatedBy(tokenCreatedBy);
+    if (boundAgentId !== agentId) {
+      logger.warn(
+        'Agent register-time identity-binding violation: ephemeral token bound to a different agentId',
+        { wireAgentId: agentId, tokenCreatedBy, boundAgentId, tokenId },
+      );
+      ws.close(
+        WS_CLOSE_AGENT_AUTH_FAILED,
+        truncateCloseReason(
+          `Ephemeral token bound to a different agentId: expected ${boundAgentId}, got ${agentId}`,
+        ),
+      );
+      return false;
+    }
+  }
+
+  // Gate 3 — agentId collision.
+  if (tokenId !== undefined) {
+    const existingTokenId = agentIdToTokenId.get(agentId);
+    if (existingTokenId !== undefined && existingTokenId !== tokenId) {
+      logger.warn('AgentId collision: different token', { agentId });
+      ws.close(WS_CLOSE_INVALID_MESSAGE, 'AgentId already registered with a different token');
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export interface AgentWsHandlerDeps {
+  registry: AgentRegistry;
+  dispatcher: Dispatcher;
+  /** Token store for validating agent auth tokens. Undefined when auth disabled. */
+  tokenStore?: AgentTokenStore;
+  /** Agent authentication mode. 'token' requires auth.request before register. */
+  agentAuthMode: 'token' | 'none';
+  /** Optional callback to forward job status to the Platform client. */
+  onJobStatus?: (
+    agentId: string,
+    msg: {
+      runId: string;
+      jobId: string;
+      state: string;
+      timestamp: number;
+      data?: Record<string, unknown>;
+    },
+  ) => void;
+  /** Optional callback when agent sends log chunks. */
+  onLogChunk?: (
+    agentId: string,
+    msg: {
+      runId: string;
+      jobId: string;
+      stepIndex: number;
+      lines: string[];
+      timestamp: number;
+      /** Absent when the agent does not report a stream; read as `stdout`. */
+      stream?: LogStream;
+    },
+  ) => void;
+  /** Optional callback when agent sends step status updates. */
+  onStepStatus?: (
+    agentId: string,
+    msg: {
+      runId: string;
+      jobId: string;
+      stepIndex: number;
+      stepName: string;
+      state: string;
+      timestamp: number;
+      data?: Record<string, unknown>;
+      secretsAccessed?: string[];
+      /** Parallel step-group concurrency role (`sequential` | `parallel-child` | `parallel-group`). */
+      concurrencyKind?: string;
+      /** Parallel-group correlation id shared by a group's children. */
+      groupId?: string;
+      /** Raw log bytes accumulated by this step's LogStreamer at terminal time. */
+      logBytesStreamed?: number;
+    },
+  ) => void;
+  /**
+   * Optional callback when a scaler-managed agent registers.
+   *
+   * Returns:
+   * - `boundJobId` (optional): set when the scaler bound a specific queued
+   *   job to this agent at spawn time. The orchestrator eagerly dispatches
+   *   that job before the agent's idle timer fires.
+   * - `mandatoryLabels` (always populated for scaler-managed agents): the
+   *   spawning scaler's Kubernetes-taint-style gate. Threaded into the
+   *   AgentRegistry so subsequent label matches (queue drain + eager
+   *   dispatch) apply the same gate the scaler-side selector applied.
+   *
+   * Resolves to `null` for static agents not managed by any scaler.
+   *
+   * Asynchronous because the agent may reach an instance that did not spawn
+   * it: that instance adopts the agent from the shared spawn record, which is
+   * a database round trip.
+   */
+  onScalerAgentRegistered?: (
+    agentId: string,
+    labels: string[],
+  ) => Promise<{ boundJobId?: string; mandatoryLabels: string[] } | null>;
+  /** Optional callback when an agent disconnects (for scaler lifecycle). */
+  onScalerAgentDisconnected?: (agentId: string) => void;
+  /** Optional callback when an agent completes a job (for scaler lifecycle). */
+  onScalerJobComplete?: (agentId: string) => void;
+  /** Optional callback when agent sends per-job heartbeats. */
+  onJobHeartbeat?: (
+    agentId: string,
+    msg: { runId: string; jobId: string; timestamp: number },
+  ) => void;
+  /** Optional callback when agent sends operational log lines (stateful/external agents via WS). */
+  onAgentLog?: (agentId: string, msg: { lines: string[]; timestamp: number }) => void;
+  /** Optional callback when agent acknowledges config (for MMDS clearing in Firecracker). */
+  onConfigAck?: (agentId: string) => void;
+  /**
+   * Optional callback when agent emits a custom event via ctx.emit().
+   *
+   * A returned `error` is relayed to the agent verbatim, and the agent runs
+   * untrusted workflow code that persists it into the author's step logs — so
+   * an implementation may only return author-facing wording (an unknown job
+   * context). Raw exception text belongs in the implementation's own
+   * `logger.*`, with {@link AgentWsInternalFailure.eventEmitFailed} returned in
+   * its place; a thrown exception is already replaced with the same string
+   * here.
+   */
+  onEventEmit?: (
+    agentId: string,
+    msg: {
+      jobId: string;
+      requestId: string;
+      eventName: string;
+      payload: Record<string, unknown>;
+      target?: { repos?: string[] };
+    },
+  ) => Promise<{ deliveryId?: string; error?: string }>;
+  /**
+   * Optional callback: a provisioning workflow's agent exchanges a single-use
+   * claim code (from a `kici.scaler.scale-up` event) for freshly minted
+   * ephemeral agent credentials. Delegates to the event scaler backend's claim
+   * store. Returns the credentials or an author-actionable error; the token is
+   * carried only in the response, never logged.
+   */
+  onClaimCredentials?: (
+    agentId: string,
+    claimCode: string,
+  ) => Promise<{
+    credentials?: {
+      agentToken: string;
+      agentId: string;
+      orchestratorUrl: string;
+      labels: string[];
+    };
+    error?: string;
+  }>;
+  /** Optional callback when agent sends a run.event for infrastructure lifecycle tracking. */
+  onRunEvent?: (
+    agentId: string,
+    msg: {
+      runId: string;
+      eventType: string;
+      timestampMs: number;
+      sourceService: string;
+      jobId?: string | null;
+      metadata?: Record<string, unknown>;
+      durationMs?: number | null;
+    },
+  ) => void;
+  /** Optional callback when agent sends a job.context with execution environment details. */
+  onJobContext?: (
+    agentId: string,
+    msg: {
+      runId: string;
+      jobId: string;
+      context: Record<string, unknown>;
+    },
+  ) => void;
+  /** Bundle cache for generating pre-signed upload URLs. */
+  sourceCache?: SourceCache;
+  /** Dep cache for generating pre-signed upload URLs. */
+  depCache?: DepCache;
+  /** User-facing cache for serving restore/save requests from the sandbox. */
+  userCache?: UserCache;
+  /**
+   * Server-side jobId -> user-cache-namespace store. The orchestrator records
+   * `{orgId, repoId, cacheRefScope, runId}` per job at dispatch time; the
+   * `cache.user.*` handlers resolve the ref from HERE (keyed by the wire jobId),
+   * NEVER from the wire message body — a `cache.user.*` message carries only a
+   * `jobId` + `key`, so an agent can name a job it owns but can never influence
+   * which org/repo/scope that job resolves to.
+   */
+  dispatchCacheRefs?: DispatchCacheRefTracker;
+  /**
+   * User-facing artifact store for serving `artifacts.*` upload/download
+   * requests from the sandbox. The org (`customer_id`) + runId are resolved
+   * server-side from the job's dispatch ref, NEVER from the wire body.
+   */
+  artifactStore?: ArtifactStore;
+  /** Cache storage for setting metadata after upload completion. */
+  cacheStorage?: CacheStorage;
+  /**
+   * Storage used to mint presigned PUT URLs for provenance bundles. Distinct
+   * dep so a deployment can decide whether attestations share the cache bucket.
+   */
+  provenanceStorage?: CacheStorage;
+  /**
+   * Provenance trust root used to verify each bundle at ingest. When absent (or
+   * its issuer is null) the verdict is recorded as `unverifiable`.
+   */
+  provenanceTrustRoot?: ProvenanceTrustRoot;
+  /**
+   * Record a completed provenance-bundle upload (writes an attestations row).
+   * `runId` is resolved server-side from the job's dispatch ref, never the wire.
+   * The verdict fields are computed at ingest (verify-at-ingest).
+   */
+  onProvenanceUpload?: (record: {
+    runId: string;
+    jobId: string;
+    subjectName: string;
+    subjectDigest: string;
+    storageKey: string;
+    mediaType: string;
+    verifyStatus: AttestationVerifyStatus;
+    verifyReason: string | null;
+    verifiedAt: Date | null;
+  }) => Promise<void>;
+  /**
+   * Optional callback when an agent reports a deferred attestation (transient
+   * mint failure). Persists the frozen envelope into the deferred-attestation
+   * outbox; the job stays green and the token is minted later.
+   */
+  onProvenanceDefer?: (record: {
+    runId: string;
+    jobId: string;
+    subjectName: string;
+    subjectDigest: string;
+    audience: string;
+    mediaType: string;
+    statementHash: string;
+    dsseEnvelope: unknown;
+    publicKey: unknown;
+    originKind: 'deferred' | 'offline-backfill';
+  }) => Promise<void>;
+  /**
+   * Classify a deferred attestation's origin from the local run row: a run
+   * ingested while the Platform was down is `offline-backfill`, otherwise a
+   * transient blip is `deferred`. Defaults to always-`deferred` when unset.
+   */
+  classifyDeferOrigin?: (runId: string) => Promise<'deferred' | 'offline-backfill'>;
+  /** Optional rate limiter configuration. */
+  rateLimiterConfig?: RateLimiterConfig;
+  /** Optional ownership tracker for validating job-related messages. */
+  ownershipTracker?: OwnershipTracker;
+  /** Optional pending build tracker for cleanup on agent disconnect. */
+  pendingBuilds?: PendingBuildTracker;
+  /** Optional pending init tracker for cleanup on agent disconnect. */
+  pendingInits?: PendingInitTracker;
+  /** Optional pending dynamic tracker for cleanup on agent disconnect. */
+  pendingDynamics?: PendingDynamicTracker;
+  /** Optional pending global-eval-round tracker for cleanup on agent disconnect. */
+  pendingGlobalEvals?: PendingGlobalEvalTracker;
+  /** Optional callback when agent sends encrypted secret outputs on job success. */
+  onSecretOutputs?: (
+    runId: string,
+    jobId: string,
+    secretOutputs: Record<string, { agentPublicKey: string; encrypted: string }>,
+  ) => Promise<void>;
+  /** Agent metrics aggregator for receiving pushed metrics. */
+  agentMetricsAggregator?: AgentMetricsAggregator;
+  /**
+   * Optional callback when agent reports a job belongs to a concurrency group.
+   *
+   * A returned `reason` is relayed to the agent verbatim as the
+   * `job.concurrency.ack` reason, and the agent runs untrusted workflow code
+   * that persists it into the author's step logs — so an implementation may
+   * only return author-facing wording (the group the job queued behind). Raw
+   * exception text belongs in the implementation's own `logger.*`.
+   */
+  onConcurrencyReport?: (
+    agentId: string,
+    msg: { runId: string; jobId: string; group: string; messageId: string },
+  ) => Promise<{ action: 'proceed' | 'wait' | 'cancel'; reason?: string }>;
+  /**
+   * Optional callback when an agent blocks an `approval` step. The server
+   * creates a step-scoped hold from the carried clauses (and the drift
+   * `payload` for a `when: 'drift'` gate) and returns a promise that resolves
+   * when the hold is approved, rejected, or expired. The handler relays the
+   * resolution back to the originating agent as a `step.approval-resolved`
+   * message. The `agentId` lets the server drop the pending resolver when the
+   * agent disconnects.
+   *
+   * The resolved `reason` is relayed to the agent verbatim, and the agent runs
+   * untrusted workflow code that persists it into the author's step logs — so
+   * an implementation may only resolve with author-facing wording (an
+   * approver's decline note, an invalid per-gate timeout). Raw exception text
+   * belongs in the implementation's own `logger.*`; a rejected promise is
+   * already replaced with {@link AgentWsInternalFailure.approvalFailed} here.
+   */
+  onStepApproval?: (
+    agentId: string,
+    msg: {
+      runId: string;
+      jobId: string;
+      stepIndex: number;
+      stepName: string;
+      clauses: Array<{ team: string } | { user: string }>;
+      reason: string;
+      timeoutSeconds?: number;
+      payload?: { summaryMarkdown: string; drift: unknown };
+    },
+  ) => Promise<{ outcome: 'approved' | 'rejected' | 'expired'; reason?: string }>;
+  /**
+   * Optional callback fired when an agent's WS connection closes, after the
+   * dispatcher's own cleanup has run. Used by the long-poll concurrency
+   * pipeline to drop the agent's queued waiters and `cancelQueued` the
+   * matching DB rows so the run is marked failed instead of dangling.
+   */
+  onConcurrencyAgentDisconnect?: (agentId: string) => void | Promise<void>;
+  /** Agent private API registry for handling agent.api.request messages. */
+  agentApiRegistry?: AgentApiRegistry;
+  /**
+   * Orchestrator-scoped collector that correlates fleet.logs.request with the
+   * agent's chunked fleet.bundle.chunk / fleet.bundle.error response. Routed to
+   * from the incoming-message switch; pending requests for a given agent are
+   * rejected when that agent's WS closes.
+   */
+  fleetAgentCollector?: FleetAgentCollector;
+}
+
+/**
+ * Create a Hono WS event handler for agent connections.
+ *
+ * Flow:
+ * 1. onOpen: start 10-second register timer
+ * 2. First onMessage: must be agent.register with labels and capacity
+ * 3. Subsequent onMessage: validated against protocol schemas, routed by type
+ * 4. onClose: cleanup from pending registration or dispatcher
+ */
+/**
+ * Reconcile in-flight jobs reported by a reconnecting agent.
+ *
+ * For each job the agent claims is still running, attempt to reclaim the
+ * dispatcher's recovery timer, restore DB and in-memory tracking, and emit
+ * structured recovery log events.
+ */
+async function reconcileInFlightJobs(
+  agentId: string,
+  inFlightJobs: Array<{ jobId: string; runId: string }>,
+  dispatcher: Dispatcher,
+  registry: AgentRegistry,
+  onJobStatus?: AgentWsHandlerDeps['onJobStatus'],
+): Promise<void> {
+  logger.info('Agent reporting in-flight jobs on reconnect', {
+    agentId,
+    jobCount: inFlightJobs.length,
+    jobIds: inFlightJobs.map((j) => j.jobId),
+  });
+
+  let recoveredCount = 0;
+  for (const { jobId, runId } of inFlightJobs) {
+    const reconciled = await dispatcher.reconcileRecovery(jobId, agentId);
+    if (reconciled) {
+      // Increment active jobs in registry
+      registry.incrementActiveJobs(agentId);
+      recoveredCount++;
+
+      const recoveryInfo = dispatcher.getRecoveryInfo(jobId);
+      const recoveryDuration = recoveryInfo ? Date.now() - recoveryInfo.disconnectedAt : 0;
+
+      // Structured recovery log event
+      logger.info('Job recovered from agent reconnection', {
+        recovery_duration: recoveryDuration,
+        agent_id: agentId,
+        job_id: jobId,
+        run_id: runId,
+        buffered_messages_count: 0,
+      });
+
+      // Update execution_jobs status back to 'running'
+      onJobStatus?.(agentId, {
+        runId,
+        jobId,
+        state: ExecutionJobStatus.enum.running,
+        timestamp: Date.now(),
+      });
+    } else {
+      // Agent claims a job we don't know about or that's not in recovery
+      logger.warn('Agent reported unknown in-flight job', {
+        agentId,
+        jobId,
+        runId,
+      });
+    }
+  }
+
+  logger.info('Reconnection reconciliation complete', {
+    agentId,
+    reported: inFlightJobs.length,
+    recovered: recoveredCount,
+    orphaned: inFlightJobs.length - recoveredCount,
+  });
+}
+
+/**
+ * FAST PATH: Manual type guard for log.chunk messages.
+ *
+ * Skips Zod safeParse() on authenticated connections for this high-frequency message type.
+ *
+ * SYNC INVARIANT: This manual validator MUST match the Zod schema
+ * `agentLogChunkSchema` in packages/engine/src/protocol/messages/orchestrator-agent.ts.
+ * If you change the schema, update this validator in the same commit.
+ * See CLAUDE.md rule: "Zod fast-path sync invariant".
+ */
+export function isValidLogChunk(raw: unknown): raw is {
+  type: 'log.chunk';
+  messageId: string;
+  runId: string;
+  jobId: string;
+  stepIndex: number;
+  lines: string[];
+  timestamp: number;
+  stream?: LogStream;
+} {
+  if (typeof raw !== 'object' || raw === null) return false;
+  const msg = raw as Record<string, unknown>;
+  return (
+    msg.type === 'log.chunk' &&
+    typeof msg.messageId === 'string' &&
+    typeof msg.runId === 'string' &&
+    typeof msg.jobId === 'string' &&
+    typeof msg.stepIndex === 'number' &&
+    Array.isArray(msg.lines) &&
+    typeof msg.timestamp === 'number' &&
+    // Optional for backward compatibility with agents that omit it; when
+    // present it must be one of the two known streams.
+    (msg.stream === undefined || LogStream.safeParse(msg.stream).success)
+  );
+}
+
+/**
+ * FAST PATH: Manual type guard for heartbeat messages.
+ *
+ * SYNC INVARIANT: This manual validator MUST match the Zod schema
+ * `heartbeatSchema` in packages/engine/src/protocol/messages/common.ts.
+ * If you change the schema, update this validator in the same commit.
+ * See CLAUDE.md rule: "Zod fast-path sync invariant".
+ */
+function isValidHeartbeat(raw: unknown): raw is { type: 'heartbeat'; timestamp: number } {
+  if (typeof raw !== 'object' || raw === null) return false;
+  const msg = raw as Record<string, unknown>;
+  return msg.type === 'heartbeat' && typeof msg.timestamp === 'number';
+}
+
+export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
+  const {
+    registry,
+    dispatcher,
+    tokenStore,
+    agentAuthMode,
+    onJobStatus,
+    onLogChunk,
+    onStepStatus,
+    onScalerAgentRegistered,
+    onScalerAgentDisconnected,
+    onScalerJobComplete,
+    onJobHeartbeat,
+    onAgentLog,
+    onConfigAck,
+    onEventEmit,
+    onClaimCredentials,
+    onRunEvent,
+    onJobContext,
+    sourceCache,
+    depCache,
+    userCache,
+    artifactStore,
+    dispatchCacheRefs,
+    cacheStorage,
+    provenanceTrustRoot,
+    provenanceStorage,
+    onProvenanceUpload,
+    onProvenanceDefer,
+    classifyDeferOrigin,
+    rateLimiterConfig,
+    ownershipTracker,
+    pendingBuilds,
+    pendingInits,
+    pendingDynamics,
+    pendingGlobalEvals,
+    onSecretOutputs,
+    onConcurrencyReport,
+    onStepApproval,
+    onConcurrencyAgentDisconnect,
+    agentMetricsAggregator,
+  } = deps;
+
+  /** Per-connection rate limiters. Created on connect, cleaned up on disconnect. */
+  const rateLimiters = new Map<WSContext, WsRateLimiter>();
+
+  /** Connections waiting for auth.request (token mode only). */
+  const pendingAuth = new Map<WSContext, { timer: ReturnType<typeof setTimeout> }>();
+
+  /** Connections waiting for agent.register (after auth, or directly in 'none' mode). */
+  const pendingRegistration = new Map<
+    WSContext,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      tokenId?: string;
+      /**
+       * Token-bound label authorization scope, captured from `agent_tokens.labels`
+       * at auth time. `null` means the token has no label constraint (back-compat
+       * carve-out for tokens issued before the column became an enforced
+       * authorization signal). `undefined` only when auth mode is `none` (in
+       * which case label scoping is not applicable — the deployment opted out
+       * of agent authentication entirely).
+       *
+       * The agent's wire-supplied labels on `agent.register` are checked against
+       * this set; any label outside it is treated as a token-authorization
+       * failure and the WS is closed with `WS_CLOSE_AGENT_AUTH_FAILED`. See
+       * and the regression test at `agent-handler.label-elevation.test.ts`.
+       */
+      tokenLabels?: string[] | null;
+      /**
+       * Token's `mandatory_labels` column, captured at auth time. Becomes the
+       * static agent's registry-entry `mandatoryLabels` taint at register time
+       * (so the dispatch gate confines it to jobs demanding every label here).
+       * `null` = no taint; `undefined` only when auth mode is `none`.
+       */
+      tokenMandatoryLabels?: string[] | null;
+      /**
+       * Token's `agent_type` column (`'static'` | `'ephemeral'`). Captured at
+       * auth time; consumed at register time to enforce the
+       * single-use binding for ephemeral tokens. Static tokens are
+       * intentionally N-use (operator-issued shared PSK), so the binding
+       * check is skipped when `agent_type === 'static'`. `undefined` when
+       * auth mode is `none`. See `agent-handler.token-single-use.test.ts`.
+       */
+      tokenAgentType?: string;
+      /**
+       * Token's `created_by` column. For `agent_type === 'ephemeral'`,
+       * this is the scaler-spawned agentId the token was issued for, and
+       * the wire-supplied `agentId` MUST equal this value at register
+       * time. For `agent_type === 'static'`,
+       * this is a free-form creator label (e.g. `'cli:admin'`) and is
+       * not consulted for authorization.
+       */
+      tokenCreatedBy?: string | null;
+      /**
+       * Token's `expires_at` column. Non-null only for ephemeral tokens
+       * (static tokens have no TTL by design). At register-time, used
+       * to schedule a per-token kick timer via
+       * `AgentRegistry.scheduleExpiryKick(tokenId, expiresAt)` so that
+       * in-flight WS connections close when the token's TTL elapses
+       * naturally — sister to the revoke kick path. See
+       */
+      tokenExpiresAt?: Date | null;
+    }
+  >();
+
+  /**
+   * Sockets parked inside the initial-registration await window — past
+   * `pendingRegistration.delete(ws)` but not yet in `wsToAgentId`.
+   *
+   * The scaler notification is awaited before the registry write (a database
+   * round trip when the agent registers on an instance that did not spawn it),
+   * so that interval is no longer synchronous and the WS belongs to none of the
+   * three maps `onClose` inspects. This map is the fourth state: `onClose`
+   * marks the entry `closed` instead of falling through having done nothing,
+   * and the in-flight registration reads that flag before writing to the
+   * registry — otherwise it registers a dead socket that can never emit another
+   * close, so the disconnect path (and, for a scaler agent, the teardown that
+   * frees the provisioned instance) never runs.
+   */
+  const registering = new Map<WSContext, { closed: boolean }>();
+
+  /**
+   * Map from WSContext to agentId for registered connections.
+   * Separate from the registry's WS map because we use WSContext here
+   * (Hono type) vs WsLike in the registry.
+   */
+  const wsToAgentId = new Map<WSContext, string>();
+
+  /**
+   * Map from agentId to the tokenId used for authentication.
+   * Used for agentId collision detection (different token = reject).
+   */
+  const agentIdToTokenId = new Map<string, string>();
+
+  /**
+   * Map from WSContext to the token authority context captured at auth
+   * time. Populated when Phase 2's auth gates pass and consulted on every
+   * subsequent `agent.register` (re-register branch) so the gates re-run
+   * with the same authority the first register was checked against. Empty
+   * when `agentAuthMode === 'none'`.
+   */
+  const wsToAuthState = new Map<WSContext, AuthState>();
+
+  /**
+   * Retire the socket a reconnect just replaced.
+   *
+   * `AgentRegistry.register` rebinds the agent to the new socket but leaves the
+   * old one open, and this handler's per-socket maps are keyed by socket, so
+   * without this the map holds two sockets for one agent id. A half-open
+   * connection sits in CLOSE_WAIT until the OS or the WS ping reaps it; when it
+   * finally closes, `onClose` resolves it to the same agent id and runs the full
+   * teardown against the *live* registration — unregistering the agent, failing
+   * its running jobs and destroying it if it is scaler-managed. Dropping the
+   * ghost's per-socket state and closing it here means it can never be mistaken
+   * for the live one.
+   */
+  function retireSupersededSocket(agentId: string, supersededWs: WsLike | undefined): void {
+    if (!supersededWs) return;
+    const ghost = supersededWs as unknown as WSContext;
+    wsToAgentId.delete(ghost);
+    wsToAuthState.delete(ghost);
+    rateLimiters.delete(ghost);
+    logger.info('Closing socket superseded by an agent reconnect', { agentId });
+    try {
+      ghost.close(WS_CLOSE_SUPERSEDED_BY_RECONNECT, 'Superseded by reconnect');
+    } catch (err) {
+      // An already-dead socket throws on close; the maps are cleared either way.
+      logger.debug('Superseded socket close failed', { agentId, error: toErrorMessage(err) });
+    }
+  }
+
+  /** Track whether the unauthenticated mode warning has been logged. */
+  let noAuthWarningLogged = false;
+
+  /**
+   * Per-connection `${jobId}:${key} -> tempKey` map. `cache.user.save.request`
+   * mints a presigned PUT to a `.tmp-<uuid>` key and stashes that temp key here;
+   * the matching `cache.user.save.complete` reads it back so the commit copies
+   * the right temp object to its final key. Cleared on disconnect with the rest
+   * of this connection's per-job state.
+   */
+  const pendingUserCacheTempKeys = new Map<string, string>();
+
+  function sendJson(ws: WSContext, data: unknown): void {
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify(data));
+    }
+  }
+
+  /**
+   * Redeem a single-use scaler claim code for freshly minted ephemeral
+   * credentials and reply on `ws`. Shared by the registered-agent message loop
+   * and the pre-register self-bootstrap admission, so a fresh agent can claim
+   * before it registers. Minting routes by the claim code and ignores the
+   * caller's agent id, so the pre-register caller passes an empty id. The claim
+   * code is a single-use secret and is never logged.
+   */
+  async function handleClaimCredentials(
+    ws: WSContext,
+    requestId: string,
+    claimCode: string,
+    agentId: string,
+    onClaimCredentials: AgentWsHandlerDeps['onClaimCredentials'],
+  ): Promise<void> {
+    if (!onClaimCredentials) {
+      logger.warn('scaler.claim-credentials received but event scaler not configured', {
+        agentId,
+      });
+      sendJson(ws, {
+        type: 'scaler.claim-credentials.response',
+        requestId,
+        error: 'Scaler credential claim not available',
+      });
+      return;
+    }
+
+    try {
+      const result = await onClaimCredentials(agentId, claimCode);
+      sendJson(ws, {
+        type: 'scaler.claim-credentials.response',
+        requestId,
+        ...(result.credentials && { credentials: result.credentials }),
+        ...(result.error && { error: result.error }),
+      });
+    } catch (err) {
+      logger.error('Failed to process scaler.claim-credentials', {
+        agentId,
+        // The claim code is a single-use secret — never log it.
+        error: toErrorMessage(err),
+      });
+      sendJson(ws, {
+        type: 'scaler.claim-credentials.response',
+        requestId,
+        error: AgentWsInternalFailure.scalerClaimFailed,
+      });
+    }
+  }
+
+  /**
+   * Resolve the trusted user-cache namespace for a job from the server-side
+   * dispatch-cache-ref tracker (NEVER from the wire message). Returns `null`
+   * when the job was never dispatched / already cleaned up, or when the dispatch
+   * carried no org/repo (e.g. a sourceless deploy) — in which case the cache
+   * fails closed and the caller no-ops rather than ever crossing tenants.
+   */
+  function resolveUserCacheRef(jobId: string): UserCacheRef | null {
+    const ref = dispatchCacheRefs?.get(jobId);
+    if (!ref || ref.orgId === undefined || ref.repoId === undefined) return null;
+    return {
+      org: ref.orgId,
+      repo: ref.repoId,
+      // Absent scope fails closed to `isolated` (per-run write scope), matching
+      // the agent-side default for a dispatch that carried no cacheRefScope.
+      scope: ref.cacheRefScope ?? 'isolated',
+      runId: ref.runId,
+    };
+  }
+
+  return {
+    onOpen(_evt: Event, ws: WSContext) {
+      // Create per-connection rate limiter
+      rateLimiters.set(ws, new WsRateLimiter(rateLimiterConfig));
+
+      if (agentAuthMode === 'token') {
+        // Start auth timeout -- agent must send auth.request within AUTH_TIMEOUT_MS
+        const timer = setTimeout(() => {
+          logger.warn('Agent auth timeout, closing connection');
+          pendingAuth.delete(ws);
+          ws.close(WS_CLOSE_AUTH_TIMEOUT, 'Auth timeout');
+        }, AUTH_TIMEOUT_MS);
+
+        pendingAuth.set(ws, { timer });
+        logger.info('Agent WebSocket connection opened, awaiting auth.request');
+      } else {
+        // Unauthenticated mode: skip auth phase, go directly to pendingRegistration
+        if (!noAuthWarningLogged) {
+          logger.warn(
+            'Agent authentication is DISABLED (KICI_AGENT_AUTH=none). Any client can register as an agent.',
+          );
+          noAuthWarningLogged = true;
+        }
+
+        const timer = setTimeout(() => {
+          logger.warn('Agent registration timeout, closing connection');
+          pendingRegistration.delete(ws);
+          ws.close(WS_CLOSE_AUTH_TIMEOUT, 'Registration timeout');
+        }, REGISTER_TIMEOUT_MS);
+
+        pendingRegistration.set(ws, { timer });
+        logger.info('Agent WebSocket connection opened, awaiting registration (auth disabled)');
+      }
+    },
+
+    async onMessage(evt: MessageEvent<WSMessageReceive>, ws: WSContext) {
+      // Parse raw JSON
+      let raw: unknown;
+      try {
+        const data = typeof evt.data === 'string' ? evt.data : String(evt.data);
+        raw = JSON.parse(data);
+      } catch {
+        logger.warn('Malformed JSON received from agent, closing');
+        ws.close(WS_CLOSE_INVALID_MESSAGE, 'Malformed JSON');
+        return;
+      }
+
+      // Rate limiting check (after parse, before schema validation)
+      const rateLimiter = rateLimiters.get(ws);
+      if (rateLimiter) {
+        const messageSize = typeof evt.data === 'string' ? evt.data.length : 0;
+        const isHeartbeat =
+          raw !== null &&
+          typeof raw === 'object' &&
+          'type' in raw &&
+          (raw as { type: unknown }).type === 'heartbeat';
+        // A fleet bundle chunk this orchestrator asked for is exempt, like a
+        // heartbeat. The agent streams its mini-bundle as one burst of ~113 KB
+        // frames, and `FLEET_MAX_LOG_BYTES` lets that bundle run to 50 MiB —
+        // 25× the limiter's byte burst, and past its message burst too. A
+        // throttled frame is dropped, the next frame through arrives
+        // out-of-order, and the collection fails on any agent whose logs
+        // compress to more than 2 MiB. The exemption is bounded by what it
+        // protects against: only a chunk carrying the id of a collection still
+        // pending for THIS agent passes, so an unsolicited burst — a guessed or
+        // stale request id, or a chunk for a peer's collection — is throttled,
+        // and the assembler caps what a solicited one may deliver.
+        const isSolicitedFleetChunk =
+          raw !== null &&
+          typeof raw === 'object' &&
+          (raw as { type?: unknown }).type === 'fleet.bundle.chunk' &&
+          typeof (raw as { requestId?: unknown }).requestId === 'string' &&
+          deps.fleetAgentCollector !== undefined &&
+          wsToAgentId.has(ws) &&
+          deps.fleetAgentCollector.isPendingFor(
+            (raw as { requestId: string }).requestId,
+            wsToAgentId.get(ws)!,
+          );
+        const rlResult = rateLimiter.check(messageSize, isHeartbeat || isSolicitedFleetChunk);
+        if (!rlResult.allowed) {
+          if (rlResult.action === 'disconnect') {
+            logger.warn('Rate limit disconnect', { reason: rlResult.reason });
+            ws.close(WS_CLOSE_INVALID_MESSAGE, rlResult.reason ?? 'Rate limit exceeded');
+            return;
+          }
+          // Warn: send rate.limit.warning message and drop this message
+          sendJson(ws, { type: 'rate.limit.warning', retryAfterMs: rlResult.retryAfterMs });
+          return;
+        }
+      }
+
+      // -- Phase 1: Pending auth (token mode) --
+      const authEntry = pendingAuth.get(ws);
+      if (authEntry !== undefined) {
+        // Self-bootstrap: a fresh agent may redeem a single-use claim code for
+        // its ephemeral credentials BEFORE it authenticates. The claim code is
+        // the authorization, so this one frame is admitted ahead of auth.request
+        // and routed through the same helper the registered case uses (empty
+        // agent id — minting routes by the code). The connection stays in
+        // pendingAuth with its timer running, so the agent then authenticates
+        // with the minted token via the normal auth.request path below.
+        const preAuth = agentToOrchestratorMessageSchema.safeParse(raw);
+        if (preAuth.success && preAuth.data.type === 'scaler.claim-credentials') {
+          await handleClaimCredentials(
+            ws,
+            preAuth.data.requestId,
+            preAuth.data.claimCode,
+            '',
+            onClaimCredentials,
+          );
+          return;
+        }
+
+        clearTimeout(authEntry.timer);
+        pendingAuth.delete(ws);
+
+        // First message must be auth.request
+        const parsed = agentAuthRequestSchema.safeParse(raw);
+        if (!parsed.success) {
+          logger.warn('First message must be auth.request (token mode)', {
+            errors: parsed.error.issues,
+          });
+          sendJson(ws, { type: 'auth.failure', reason: 'First message must be auth.request' });
+          ws.close(WS_CLOSE_AGENT_AUTH_FAILED, 'Invalid auth message');
+          return;
+        }
+
+        // Protocol version check (consistent with Platform handler)
+        if (parsed.data.protocolVersion < MIN_PROTOCOL_VERSION) {
+          logger.warn('Agent protocol version below minimum', {
+            received: parsed.data.protocolVersion,
+            minimum: MIN_PROTOCOL_VERSION,
+          });
+          sendJson(ws, { type: 'auth.failure', reason: 'Unsupported protocol version' });
+          ws.close(WS_CLOSE_PROTOCOL_ERROR, 'Unsupported protocol version');
+          return;
+        }
+
+        // Validate token via tokenStore
+        if (!tokenStore) {
+          logger.error('Token store not configured but auth mode is token');
+          sendJson(ws, { type: 'auth.failure', reason: 'Server misconfiguration' });
+          ws.close(WS_CLOSE_AGENT_AUTH_FAILED, 'Server misconfiguration');
+          return;
+        }
+
+        const tokenRow = await tokenStore.validate(parsed.data.token);
+        if (!tokenRow) {
+          logger.warn('Agent auth failed: invalid or expired token');
+          sendJson(ws, { type: 'auth.failure', reason: 'Invalid or expired token' });
+          ws.close(WS_CLOSE_AGENT_AUTH_FAILED, 'Authentication failed');
+          return;
+        }
+
+        // Parse the token's authorized-labels scope. `agent_tokens.labels` is
+        // stored as JSON-encoded `string[]` (or `null` for unscoped tokens).
+        // Malformed JSON in the column is a server-side state error — refuse
+        // auth rather than fall through to "unscoped" (which would be a silent
+        // privilege escalation back to the baseline).
+        let tokenLabels: string[] | null = null;
+        if (tokenRow.labels !== null) {
+          try {
+            const parsedLabels: unknown = JSON.parse(tokenRow.labels);
+            if (!Array.isArray(parsedLabels) || !parsedLabels.every((l) => typeof l === 'string')) {
+              throw new Error('not a string[]');
+            }
+            // Fold the scope here so both Gate 0 and Gate 1 compare canonical
+            // labels against a canonical wire set.
+            tokenLabels = canonicalizeLabels(parsedLabels);
+          } catch (err) {
+            logger.error('Token row has malformed labels JSON, refusing auth', {
+              tokenId: tokenRow.id,
+              tokenPrefix: tokenRow.token_prefix,
+              error: toErrorMessage(err),
+            });
+            sendJson(ws, { type: 'auth.failure', reason: 'Server token state error' });
+            ws.close(WS_CLOSE_AGENT_AUTH_FAILED, 'Token state error');
+            return;
+          }
+        }
+
+        // Parse the token's authorized taint set (`agent_tokens.mandatory_labels`),
+        // symmetric with `labels` above. Malformed JSON is treated as "no taint"
+        // (null) rather than a hard auth failure: an absent taint is the safe
+        // default — it never grants privilege, it only widens which jobs the
+        // agent will accept, and the privileged-root selector is still gated by
+        // the uid-0 honesty check and the dispatch authorization chain.
+        let tokenMandatoryLabels: string[] | null = null;
+        if (tokenRow.mandatory_labels !== null) {
+          try {
+            const parsed: unknown = JSON.parse(tokenRow.mandatory_labels);
+            if (Array.isArray(parsed) && parsed.every((l) => typeof l === 'string')) {
+              tokenMandatoryLabels = canonicalizeLabels(parsed as string[]);
+            }
+          } catch {
+            tokenMandatoryLabels = null;
+          }
+        }
+
+        // Auth successful -- send auth.success and move to pendingRegistration
+        const connectionId = randomUUID();
+        sendJson(ws, { type: 'auth.success', connectionId });
+
+        const regTimer = setTimeout(() => {
+          logger.warn('Agent registration timeout after auth, closing connection');
+          pendingRegistration.delete(ws);
+          ws.close(WS_CLOSE_AUTH_TIMEOUT, 'Registration timeout');
+        }, REGISTER_TIMEOUT_MS);
+
+        pendingRegistration.set(ws, {
+          timer: regTimer,
+          tokenId: tokenRow.id,
+          tokenLabels,
+          tokenMandatoryLabels,
+          tokenAgentType: tokenRow.agent_type,
+          tokenCreatedBy: tokenRow.created_by,
+          tokenExpiresAt: tokenRow.expires_at,
+        });
+        logger.info('Agent authenticated, awaiting registration', {
+          tokenPrefix: tokenRow.token_prefix,
+        });
+        return;
+      }
+
+      // -- Phase 2: Pending registration --
+      const regEntry = pendingRegistration.get(ws);
+      if (regEntry !== undefined) {
+        const parsed = agentToOrchestratorMessageSchema.safeParse(raw);
+
+        // Self-bootstrap: a fresh, not-yet-registered agent may redeem a
+        // single-use claim code for its ephemeral credentials before it
+        // registers. The claim code is the authorization, so this one frame is
+        // admitted here and routed through the same helper the registered case
+        // uses (with an empty agent id — minting routes by the code and ignores
+        // it). The registration timer keeps running, so the connection is still
+        // bounded: the agent registers, or times out, as normal afterwards.
+        if (parsed.success && parsed.data.type === 'scaler.claim-credentials') {
+          await handleClaimCredentials(
+            ws,
+            parsed.data.requestId,
+            parsed.data.claimCode,
+            '',
+            onClaimCredentials,
+          );
+          return;
+        }
+
+        // Auth disabled, but the agent HAS a token: either a static
+        // `KICI_AGENT_TOKEN`, or an ephemeral one this orchestrator just minted
+        // for the claim-code self-bootstrap immediately above. Nothing on the
+        // wire tells an agent which auth mode the orchestrator runs, so it
+        // opens with `auth.request` and waits for `auth.success` before it
+        // registers — and refusing the frame strands it in a permanent
+        // reconnect loop it can never escape.
+        //
+        // Answering `auth.success` grants nothing. No `AuthState` is built, no
+        // token is read, and the register gates below are skipped in this mode
+        // exactly as they already are for a tokenless agent — this mode accepts
+        // any agent by definition (see the startup warning in `onOpen`). It
+        // only lets the agent proceed to `agent.register`. The registration
+        // timer keeps running, so the connection stays bounded.
+        if (agentAuthMode === 'none' && parsed.success && parsed.data.type === 'auth.request') {
+          sendJson(ws, { type: 'auth.success', connectionId: randomUUID() });
+          return;
+        }
+
+        clearTimeout(regEntry.timer);
+        pendingRegistration.delete(ws);
+
+        if (!parsed.success || parsed.data.type !== 'agent.register') {
+          logger.warn('First message after auth must be agent.register', {
+            errors: parsed.success ? undefined : parsed.error.issues,
+          });
+          ws.close(WS_CLOSE_INVALID_MESSAGE, 'First message must be agent.register');
+          return;
+        }
+
+        const { agentId, labels, platform, arch, version, maxConcurrency } = parsed.data;
+
+        // Three token-bound authorization gates run together: label-scope
+        // subset, ephemeral identity-binding, and static-token agentId
+        // collision. Identical gates re-run on every subsequent re-register
+        // on this WS (see `case 'agent.register'` in the post-register
+        // switch) — `agent_tokens.labels` / `agent_type` / `created_by`
+        // bound the connection's authority for its entire lifetime, not
+        // just the first message after auth.
+        const authStateForRegister: AuthState = {
+          tokenId: regEntry.tokenId,
+          tokenLabels: regEntry.tokenLabels,
+          tokenMandatoryLabels: regEntry.tokenMandatoryLabels,
+          tokenAgentType: regEntry.tokenAgentType,
+          tokenCreatedBy: regEntry.tokenCreatedBy,
+        };
+        if (
+          !enforceRegisterAuthGates(
+            authStateForRegister,
+            { agentId, labels, runningAsUid: parsed.data.runningAsUid },
+            ws,
+            agentIdToTokenId,
+          )
+        ) {
+          return;
+        }
+        if (regEntry.tokenId !== undefined) {
+          // Bind the agentId to its tokenId so the collision gate fires
+          // on a future first-register from a different token claiming
+          // the same agentId.
+          agentIdToTokenId.set(agentId, regEntry.tokenId);
+        }
+        // Cache the token authority context on the WS so the re-register
+        // branch in the post-register switch can re-run the same gates
+        // without a second token-store round-trip.
+        wsToAuthState.set(ws, authStateForRegister);
+
+        // Notify the scaler of agent registration FIRST so we can thread the
+        // spawning scaler's `mandatoryLabels` into the registry entry. The
+        // gate must be present on the AgentEntry before any subsequent
+        // queue-drain or label-match call observes it; registering the agent
+        // with an empty gate and back-filling it later would leave a window
+        // where `dequeueForLabels` could pull an off-gate queued job.
+        //
+        // The await is a DB round trip on the adoption path (the agent reached
+        // an instance that did not spawn it). `pendingRegistration.delete(ws)`
+        // above is what keeps a concurrent second register on this socket from
+        // racing through the same window, and `registering` carries the socket
+        // through it so a close landing mid-lookup is still seen.
+        const registerState = { closed: false };
+        registering.set(ws, registerState);
+        let scalerInfo: { boundJobId?: string; mandatoryLabels: string[] } | null = null;
+        let scalerLookupFailed = false;
+        try {
+          // Folded like every other label crossing this ingress: the scaler
+          // matches these against its own label sets, which its config load
+          // already folded, so an agent advertising `Docker` must arrive as
+          // `docker` or it correlates against no pool.
+          scalerInfo =
+            (await onScalerAgentRegistered?.(agentId, canonicalizeLabels(labels))) ?? null;
+        } catch (err) {
+          // The scaler could not read the spawn record for an agent id it
+          // recognises as its own. Registering anyway would drop that agent's
+          // `mandatoryLabels` gate for its whole life, so a queued job whose
+          // `runsOn` omits the platform taint could land on it. Refuse instead:
+          // the agent reconnects, and a transient store fault costs one retry.
+          scalerLookupFailed = true;
+          logger.error('Scaler lookup failed during agent registration', {
+            agentId,
+            error: toErrorMessage(err),
+          });
+        } finally {
+          registering.delete(ws);
+        }
+
+        if (scalerLookupFailed) {
+          wsToAuthState.delete(ws);
+          agentIdToTokenId.delete(agentId);
+          ws.close(WS_CLOSE_INTERNAL_ERROR, 'Scaler state unavailable');
+          return;
+        }
+
+        if (registerState.closed) {
+          // The socket died while the scaler lookup was in flight. Registering
+          // it now would put a dead WS in the registry with no close event left
+          // to remove it. Unwind the pre-await bindings instead, and hand the
+          // agent straight to the scaler's disconnect path: the lookup may have
+          // already adopted (or locally correlated) it, and that bookkeeping is
+          // what tears the provisioned instance down.
+          logger.info('Agent connection closed during registration', { agentId });
+          wsToAuthState.delete(ws);
+          agentIdToTokenId.delete(agentId);
+          if (scalerInfo !== null) {
+            onScalerAgentDisconnected?.(agentId);
+          }
+          return;
+        }
+
+        const pendingDispatch = scalerInfo?.boundJobId != null;
+        // A scaler-managed agent with no bound job was pre-spawned to wait for
+        // work. It must not arm the short idle timer — see registerAckSchema.
+        const warmPool = scalerInfo !== null && scalerInfo.boundJobId == null;
+
+        // Register in the registry (platform/arch default to linux/x64 if not provided)
+        const supersededWs = registry.register(
+          agentId,
+          ws as unknown as WsLike,
+          canonicalizeLabels(labels),
+          platform ?? 'linux',
+          arch ?? 'x64',
+          version,
+          maxConcurrency ?? 1,
+          {
+            hostname: parsed.data.hostname,
+            osRelease: parsed.data.osRelease,
+            osVersion: parsed.data.osVersion,
+            totalMemoryMb: parsed.data.totalMemoryMb,
+            cpuCount: parsed.data.cpuCount,
+            nodeVersion: parsed.data.nodeVersion,
+            runningAsUser: parsed.data.runningAsUser,
+            runningAsUid: parsed.data.runningAsUid,
+            // Threaded through so AgentRegistry.disconnectByTokenId(...)
+            // can enumerate every in-flight WS for a revoked token. Null
+            // when auth mode is `none` (no token-bound authority).
+            tokenId: regEntry.tokenId ?? null,
+            // Scaler-spawned agents inherit the spawning scaler's
+            // Kubernetes-taint-style gate; static agents inherit the
+            // token-authorized taint (`agent_tokens.mandatory_labels`). The two
+            // are mutually exclusive in practice (scaler-spawned vs static-token),
+            // and an un-tainted static token leaves this undefined — so
+            // `findAvailable` and the queue-drain path behave exactly as before.
+            mandatoryLabels:
+              scalerInfo?.mandatoryLabels ?? authStateForRegister.tokenMandatoryLabels ?? undefined,
+            // Scaler-spawned agents are single-use (destroyed on disconnect).
+            // The dispatcher's disconnect triage keys off this flag.
+            scalerManaged: scalerInfo !== null,
+            // Snapshot the token's lifecycle class for the host roster's
+            // `lifecycle_class`. Null when auth mode is `none`.
+            tokenAgentType: toLifecycleClass(regEntry.tokenAgentType),
+            // Agent-reported typed host-vars, shallow-merged into the roster's
+            // host_properties (agent keys win over operator-declared keys).
+            properties: parsed.data.properties,
+          },
+        );
+        retireSupersededSocket(agentId, supersededWs);
+        wsToAgentId.set(ws, agentId);
+
+        // schedule a per-token TTL kick when the
+        // token has a non-null `expires_at`. Static tokens have no
+        // TTL by design (`expires_at = null`) so this is effectively
+        // ephemeral-only. The scheduler is idempotent per tokenId, so
+        // an agent reconnect under the same token is a no-op (the
+        // token's `expires_at` doesn't shift across reconnects). See
+        if (
+          regEntry.tokenId !== undefined &&
+          regEntry.tokenExpiresAt !== undefined &&
+          regEntry.tokenExpiresAt !== null
+        ) {
+          registry.scheduleExpiryKick(regEntry.tokenId, regEntry.tokenExpiresAt);
+        }
+
+        // Send register.ack with confirmed config. When pendingDispatch is set,
+        // the agent suppresses its short KICI_SCALER_IDLE_TIMEOUT timer because
+        // the orchestrator is about to send dispatch.job (preparing it can take
+        // seconds for jobs with provider lookups, secret merging, or upstream
+        // output resolution — which previously raced the timer and killed the
+        // agent before the dispatch arrived).
+        sendJson(ws, {
+          type: 'register.ack',
+          agentId,
+          labels,
+          scalerManaged: scalerInfo !== null,
+          capabilities: ORCH_AGENT_CAPABILITIES,
+          ...(pendingDispatch ? { pendingDispatch: true } : {}),
+          ...(warmPool ? { warmPool: true } : {}),
+        });
+
+        // Update metrics
+        setAgentsActive(registry.getActiveCount());
+
+        logger.info('Agent registered', { agentId, labels });
+
+        // Single-use bootstrap (init-runner) tokens are consumed on their first
+        // successful register, so a leaked token is inert afterward. A bootstrap
+        // token is tagged `created_by: 'bootstrap:<targetAgentId>'` at mint time.
+        if (
+          tokenStore &&
+          regEntry.tokenId !== undefined &&
+          regEntry.tokenCreatedBy?.startsWith(BOOTSTRAP_CREATED_BY_PREFIX)
+        ) {
+          await tokenStore.consumeBootstrapToken(regEntry.tokenId);
+        }
+
+        // Reconcile in-flight jobs if agent reports them on reconnect
+        if (parsed.data.inFlightJobs && parsed.data.inFlightJobs.length > 0) {
+          await reconcileInFlightJobs(
+            agentId,
+            parsed.data.inFlightJobs,
+            dispatcher,
+            registry,
+            onJobStatus,
+          );
+        }
+
+        // Eager dispatch path: the scaler spawned this agent for a specific
+        // queued job. Claim and dispatch that exact job atomically before the
+        // generic queue drain runs, eliminating the dispatch-vs-idle-timer
+        // race that caused scaler-managed agents (notably Firecracker, with
+        // ~2s VM boot) to disconnect mid-spawn under concurrent run load.
+        if (scalerInfo?.boundJobId) {
+          const dispatched = await dispatcher.dispatchBoundJob(agentId, scalerInfo.boundJobId);
+          if (!dispatched) {
+            logger.warn('Bound job no longer dispatchable, falling back to queue drain', {
+              agentId,
+              boundJobId: scalerInfo.boundJobId,
+            });
+          }
+        }
+
+        // Down-then-up release: a static reboot host comes back as a fresh
+        // connection (new WS ⇒ first-register path). Clear any reboot-pending
+        // flag before draining so the held post-restart job is dispatched.
+        await dispatcher.releaseRebootPending(agentId);
+
+        // Drain any queued jobs for this agent (no-op if eager dispatch already
+        // filled this agent's single slot).
+        await dispatcher.onAgentAvailable(agentId);
+        return;
+      }
+
+      // -- Registered: validate and route --
+      const agentId = wsToAgentId.get(ws);
+      if (!agentId) {
+        if (registering.has(ws)) {
+          // A second frame arrived while this socket's registration is parked
+          // in the scaler lookup. Drop it rather than close: the connection is
+          // mid-registration, not unregistered, and closing it here would kill
+          // the socket the in-flight registration is about to complete.
+          logger.warn('Message arrived while registration is in flight, dropping');
+          return;
+        }
+        logger.warn('Message from unregistered connection, closing');
+        ws.close(WS_CLOSE_INVALID_MESSAGE, 'Not registered');
+        return;
+      }
+
+      // -- FAST PATH for high-frequency messages on authenticated connections --
+      // Skip full Zod safeParse for log.chunk and heartbeat (most frequent message types).
+      // These manual validators are kept in sync with their Zod schemas per CLAUDE.md rule.
+
+      if (isValidHeartbeat(raw)) {
+        registry.updateHeartbeat(agentId);
+        logger.debug('Agent heartbeat received', { agentId });
+        return;
+      }
+
+      if (isValidLogChunk(raw)) {
+        // Ownership resolution with DB fallback. The synchronous check hits the
+        // in-memory dispatcher Map; a miss in HA failover falls through to the
+        // database before the chunk is accepted or refused. That makes the log
+        // writer tolerant of post-failover and post-complete chunks as benign
+        // duplicates rather than dropping them.
+        if ((await gateOwnership(ownershipTracker, agentId, raw.jobId, 'log.chunk')) === 'reject') {
+          return;
+        }
+
+        logger.debug('Log chunk received', {
+          agentId,
+          runId: raw.runId,
+          jobId: raw.jobId,
+          stepIndex: raw.stepIndex,
+          lineCount: raw.lines.length,
+        });
+        onLogChunk?.(agentId, {
+          runId: raw.runId,
+          jobId: raw.jobId,
+          stepIndex: raw.stepIndex,
+          lines: raw.lines,
+          timestamp: raw.timestamp,
+          ...(raw.stream !== undefined && { stream: raw.stream }),
+        });
+        return;
+      }
+
+      // RAW PATH: Handle agent-sent run.event and job.context messages.
+      // These are not in agentToOrchestratorMessageSchema — the agent sends them
+      // as raw typed casts, and the orchestrator enriches with orgId before forwarding.
+      // Always intercept (even without callbacks) to prevent Zod rejection.
+      const rawMsg = raw as { type?: string; [key: string]: unknown };
+      if (rawMsg.type === 'run.event') {
+        onRunEvent?.(agentId, {
+          runId: rawMsg.runId as string,
+          eventType: rawMsg.eventType as string,
+          timestampMs: rawMsg.timestampMs as number,
+          sourceService: rawMsg.sourceService as string,
+          jobId: (rawMsg.jobId as string | null) ?? undefined,
+          metadata: rawMsg.metadata as Record<string, unknown> | undefined,
+          durationMs: (rawMsg.durationMs as number | null) ?? undefined,
+        });
+        return;
+      }
+
+      if (rawMsg.type === 'job.context') {
+        onJobContext?.(agentId, {
+          runId: rawMsg.runId as string,
+          jobId: rawMsg.jobId as string,
+          context: rawMsg.context as Record<string, unknown>,
+        });
+        return;
+      }
+
+      // SLOW PATH: Full Zod validation for all other message types
+      const msgParse = agentToOrchestratorMessageSchema.safeParse(raw);
+      if (!msgParse.success) {
+        logger.warn('Invalid message from agent', {
+          agentId,
+          errors: msgParse.error.issues,
+        });
+        sendJson(ws, {
+          type: 'error',
+          code: 'INVALID_MESSAGE',
+          message: 'Invalid message format',
+        });
+        ws.close(WS_CLOSE_INVALID_MESSAGE, 'Invalid message');
+        return;
+      }
+
+      const msg = msgParse.data;
+
+      switch (msg.type) {
+        case 'agent.register': {
+          // Re-registration: update the registry entry. Preserve the
+          // existing mandatoryLabels gate — re-registration is a label /
+          // metadata refresh, not a scaler relationship change. The scaler
+          // hook only fires from the initial-registration phase above; if
+          // we let the re-register path drop the gate, a gated agent could
+          // start accepting off-gate jobs the first time it sends an
+          // `agent.register` after its initial registration.
+          //
+          // Re-run the same three token-bound authorization gates the
+          // first register ran. The `pendingRegistration` map was deleted
+          // when the WS transitioned to "registered", so the authority
+          // context comes from `wsToAuthState` (cached when the first
+          // register's gates passed). Without this, a wire-supplied
+          // `msg.labels` / `msg.agentId` would silently overwrite the
+          // registry entry — collapsing the token-scope and
+          // identity-binding invariants for every re-register after
+          // Phase 2.
+          const reregisterAuthState = wsToAuthState.get(ws);
+          if (
+            !enforceRegisterAuthGates(
+              reregisterAuthState,
+              { agentId: msg.agentId, labels: msg.labels, runningAsUid: msg.runningAsUid },
+              ws,
+              agentIdToTokenId,
+            )
+          ) {
+            return;
+          }
+          if (reregisterAuthState?.tokenId !== undefined) {
+            // Update the agentId-to-tokenId mapping if the wire agentId
+            // changed across the re-register (covers a static-token PSK
+            // legitimately rebinding to a fresh agentId; the collision
+            // gate above already rejected re-registers under an agentId
+            // owned by a different token).
+            agentIdToTokenId.set(msg.agentId, reregisterAuthState.tokenId);
+          }
+
+          const existingEntry = registry.get(msg.agentId);
+          const supersededWs = registry.register(
+            msg.agentId,
+            ws as unknown as WsLike,
+            canonicalizeLabels(msg.labels),
+            msg.platform ?? 'linux',
+            msg.arch ?? 'x64',
+            msg.version,
+            msg.maxConcurrency ?? 1,
+            {
+              hostname: msg.hostname,
+              osRelease: msg.osRelease,
+              osVersion: msg.osVersion,
+              totalMemoryMb: msg.totalMemoryMb,
+              cpuCount: msg.cpuCount,
+              nodeVersion: msg.nodeVersion,
+              runningAsUser: msg.runningAsUser,
+              runningAsUid: msg.runningAsUid,
+              mandatoryLabels: existingEntry ? [...existingEntry.mandatoryLabels] : undefined,
+              // Preserve single-use status across a re-register so disconnect
+              // triage stays correct for a scaler-managed agent that reconnects.
+              scalerManaged: existingEntry?.scalerManaged ?? false,
+              // Preserve the lifecycle class across a re-register (cached on the
+              // WS auth state at first register; falls back to the prior entry).
+              tokenAgentType:
+                toLifecycleClass(reregisterAuthState?.tokenAgentType) ??
+                existingEntry?.tokenAgentType ??
+                null,
+            },
+          );
+          retireSupersededSocket(msg.agentId, supersededWs);
+          wsToAgentId.set(ws, msg.agentId);
+          setAgentsActive(registry.getActiveCount());
+
+          // Send register.ack for re-registration. Capabilities are re-advertised
+          // so a reconnecting agent does not fall back to the pre-capability
+          // behavior of any optional feature it negotiated on first register.
+          sendJson(ws, {
+            type: 'register.ack',
+            agentId: msg.agentId,
+            labels: msg.labels,
+            scalerManaged: false,
+            capabilities: ORCH_AGENT_CAPABILITIES,
+          });
+
+          logger.info('Agent re-registered', {
+            agentId: msg.agentId,
+            labels: msg.labels,
+          });
+
+          // Reconcile in-flight jobs if agent reports them on reconnect
+          if (msg.inFlightJobs && msg.inFlightJobs.length > 0) {
+            await reconcileInFlightJobs(
+              msg.agentId,
+              msg.inFlightJobs,
+              dispatcher,
+              registry,
+              onJobStatus,
+            );
+          }
+
+          // Down-then-up release: this re-register is a fresh connection after a
+          // reboot cycle, so clear any reboot-pending flag BEFORE draining. The
+          // drain then dispatches the held post-restart job.
+          await dispatcher.releaseRebootPending(msg.agentId);
+          await dispatcher.onAgentAvailable(msg.agentId);
+          break;
+        }
+
+        case 'config.ack': {
+          logger.info('Agent config acknowledged', { agentId });
+          onConfigAck?.(agentId);
+          break;
+        }
+
+        case 'agent.status': {
+          const entry = registry.get(agentId);
+          if (entry) {
+            // The registry's activeJobs count is authoritative: incremented
+            // at dispatch, decremented on completion / rejection. The agent's
+            // self-report lags dispatches in flight; assigning it here would
+            // re-open an occupied slot and invite a double dispatch. Surface
+            // disagreement as a warn — persistent drift is a bug signal.
+            if (msg.activeJobs !== entry.activeJobs) {
+              logger.warn('Agent self-reported activeJobs disagrees with registry count', {
+                agentId,
+                reported: msg.activeJobs,
+                tracked: entry.activeJobs,
+              });
+            }
+
+            // Update dynamic OS metadata if present
+            if (msg.memoryUsedMb !== undefined) entry.memoryUsedMb = msg.memoryUsedMb;
+            if (msg.memoryAvailableMb !== undefined)
+              entry.memoryAvailableMb = msg.memoryAvailableMb;
+            if (msg.uptimeSeconds !== undefined) entry.uptimeSeconds = msg.uptimeSeconds;
+
+            logger.debug('Agent status update', {
+              agentId,
+              activeJobs: msg.activeJobs,
+            });
+
+            // Drain trigger: if the registry shows capacity, try the queue.
+            if (entry.activeJobs < entry.maxConcurrency) {
+              await dispatcher.onAgentAvailable(agentId);
+            }
+          }
+          break;
+        }
+
+        case 'job.status': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.status')) === 'reject'
+          ) {
+            break;
+          }
+
+          const { runId, jobId, state, timestamp, data } = msg;
+
+          const errorMsg =
+            data && typeof data === 'object' && 'error' in data
+              ? (data as { error: unknown }).error
+              : undefined;
+          logger.info('Job status update', {
+            agentId,
+            runId,
+            jobId,
+            state,
+            ...(errorMsg ? { error: errorMsg } : {}),
+            ...(state === ExecutionJobStatus.enum.failed && data
+              ? { failureData: JSON.stringify(data) }
+              : {}),
+          });
+
+          switch (state) {
+            case ExecutionJobStatus.enum.running: {
+              // Job started -- disconnect triage now treats it as
+              // non-redispatchable (steps may have side effects).
+              dispatcher.markJobStarted(jobId);
+              // Forward to onJobStatus for ExecutionTracker
+              onJobStatus?.(agentId, { runId, jobId, state, timestamp, data });
+              break;
+            }
+            case ExecutionJobStatus.enum.success:
+            case ExecutionJobStatus.enum.failed:
+            case ExecutionJobStatus.enum.cancelled: {
+              // Process encrypted secret outputs on job success (fire-and-forget)
+              if (
+                state === ExecutionJobStatus.enum.success &&
+                msg.secretOutputs &&
+                onSecretOutputs
+              ) {
+                onSecretOutputs(runId, jobId, msg.secretOutputs).catch((err) => {
+                  logger.warn('Failed to process secret outputs', {
+                    agentId,
+                    runId,
+                    jobId,
+                    error: toErrorMessage(err),
+                  });
+                });
+              }
+
+              // Job completed -- decrement active jobs and drain queue
+              dispatcher.onJobComplete(agentId, jobId);
+              // Drop the server-side user-cache namespace ref so the tracker
+              // can't leak (mirrors the dispatcher's own per-job cleanup).
+              dispatchCacheRefs?.delete(jobId);
+              setAgentsActive(registry.getActiveCount());
+              await dispatcher.onAgentAvailable(agentId);
+
+              // Notify scaler of job completion
+              onScalerJobComplete?.(agentId);
+
+              // Forward to Platform client and ExecutionTracker
+              onJobStatus?.(agentId, { runId, jobId, state, timestamp, data });
+              break;
+            }
+            case ExecutionJobStatus.enum.cancelling: {
+              // Agent is running cancel hooks -- forward to execution tracker
+              onJobStatus?.(agentId, { runId, jobId, state, timestamp, data });
+              break;
+            }
+            case ExecutionJobStatus.enum.pending:
+            case ExecutionJobStatus.enum.queued:
+            case ExecutionJobStatus.enum.skipped: {
+              // Informational states
+              logger.debug('Job informational status', { agentId, runId, jobId, state });
+              break;
+            }
+          }
+          break;
+        }
+
+        case 'job.reject': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.reject')) === 'reject'
+          ) {
+            break;
+          }
+
+          logger.warn('Agent rejected job dispatch', {
+            agentId,
+            runId: msg.runId,
+            jobId: msg.jobId,
+            reason: msg.reason,
+          });
+          await dispatcher.onJobRejected(agentId, msg.jobId, msg.reason);
+          break;
+        }
+
+        case 'job.ack': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if ((await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.ack')) === 'reject') {
+            break;
+          }
+          logger.debug('Job dispatch acknowledged', {
+            agentId,
+            runId: msg.runId,
+            jobId: msg.jobId,
+          });
+          dispatcher.onJobAcked(agentId, msg.jobId);
+          break;
+        }
+
+        case 'log.chunk': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'log.chunk')) === 'reject'
+          ) {
+            break;
+          }
+
+          const { runId, jobId, stepIndex, lines, timestamp, stream } = msg;
+          logger.debug('Log chunk received', {
+            agentId,
+            runId,
+            jobId,
+            stepIndex,
+            lineCount: lines.length,
+          });
+          onLogChunk?.(agentId, {
+            runId,
+            jobId,
+            stepIndex,
+            lines,
+            timestamp,
+            ...(stream !== undefined && { stream }),
+          });
+          break;
+        }
+
+        case 'step.status': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'step.status')) === 'reject'
+          ) {
+            break;
+          }
+
+          const {
+            runId,
+            jobId,
+            stepIndex,
+            stepName,
+            state,
+            timestamp,
+            data,
+            secretsAccessed,
+            concurrencyKind,
+            groupId,
+            logBytesStreamed,
+          } = msg;
+          logger.info('Step status update', {
+            agentId,
+            runId,
+            jobId,
+            stepIndex,
+            stepName,
+            state,
+          });
+          onStepStatus?.(agentId, {
+            runId,
+            jobId,
+            stepIndex,
+            stepName,
+            state,
+            timestamp,
+            data,
+            secretsAccessed,
+            concurrencyKind,
+            groupId,
+            logBytesStreamed,
+          });
+          break;
+        }
+
+        case 'step.approval-request': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'step.approval-request')) ===
+            'reject'
+          ) {
+            break;
+          }
+
+          const {
+            messageId,
+            runId,
+            jobId,
+            stepIndex,
+            stepName,
+            clauses,
+            reason,
+            timeoutSeconds,
+            payload,
+          } = msg;
+          logger.info('Step approval requested', { agentId, runId, jobId, stepIndex, stepName });
+
+          if (!onStepApproval) {
+            // No approval bridge wired — fail closed so the step doesn't hang.
+            sendJson(ws, {
+              type: 'step.approval-resolved',
+              requestId: messageId,
+              runId,
+              jobId,
+              stepIndex,
+              outcome: 'rejected',
+              reason: 'Approvals not available on this orchestrator',
+            });
+            break;
+          }
+
+          // The bridge creates a step-scoped hold and resolves when the hold is
+          // approved/rejected/expired. The await may last as long as the
+          // approval window; the agent keeps heartbeating during the wait.
+          onStepApproval(agentId, {
+            runId,
+            jobId,
+            stepIndex,
+            stepName,
+            clauses,
+            reason,
+            ...(timeoutSeconds !== undefined && { timeoutSeconds }),
+            ...(payload !== undefined && { payload }),
+          }).then(
+            (resolution) => {
+              sendJson(ws, {
+                type: 'step.approval-resolved',
+                requestId: messageId,
+                runId,
+                jobId,
+                stepIndex,
+                outcome: resolution.outcome,
+                ...(resolution.reason !== undefined && { reason: resolution.reason }),
+              });
+            },
+            (err) => {
+              // The raw exception stays in the log line below — the author gets
+              // a safe fixed reason, because the agent runs untrusted workflow
+              // code and persists whatever it receives into the step's logs.
+              logger.error('Step approval bridge rejected', {
+                agentId,
+                runId,
+                jobId,
+                stepIndex,
+                error: toErrorMessage(err),
+              });
+              sendJson(ws, {
+                type: 'step.approval-resolved',
+                requestId: messageId,
+                runId,
+                jobId,
+                stepIndex,
+                outcome: 'rejected',
+                reason: AgentWsInternalFailure.approvalFailed,
+              });
+            },
+          );
+          break;
+        }
+
+        case 'job.heartbeat': {
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.heartbeat')) ===
+            'reject'
+          ) {
+            break;
+          }
+
+          const { runId, jobId, timestamp } = msg;
+          logger.debug('Job heartbeat received', { agentId, runId, jobId });
+          onJobHeartbeat?.(agentId, { runId, jobId, timestamp });
+          break;
+        }
+
+        case 'agent.log': {
+          const { lines, timestamp } = msg;
+          logger.debug('Agent log received', { agentId, lineCount: lines.length });
+          onAgentLog?.(agentId, { lines, timestamp });
+          break;
+        }
+
+        case 'agent.metrics': {
+          if (agentMetricsAggregator) {
+            agentMetricsAggregator.update(agentId, msg.metrics);
+            logger.debug('Agent metrics received', {
+              agentId,
+              metricCount: msg.metrics.length,
+            });
+          }
+          break;
+        }
+
+        case 'cache.upload.request': {
+          // A refused request still gets its reply — an empty upload URL, the
+          // same degraded value an unconfigured cache produces — so the agent
+          // skips the upload instead of waiting out its own deadline.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'cache.upload.request')) ===
+            'reject'
+          ) {
+            sendJson(ws, {
+              type: 'cache.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
+            break;
+          }
+
+          try {
+            let uploadUrl: string;
+            if (msg.cacheType === 'source') {
+              if (!sourceCache) {
+                logger.warn('cache.upload.request for source but sourceCache not configured', {
+                  agentId,
+                });
+                sendJson(ws, {
+                  type: 'cache.upload.response',
+                  requestId: msg.messageId,
+                  uploadUrl: '',
+                });
+                break;
+              }
+              // The org comes from the server-side dispatch ref, keyed by the
+              // wire jobId — NEVER from the message body. An agent can name a
+              // job it owns; it can never name the storage prefix it writes to.
+              const orgId = dispatchCacheRefs?.get(msg.jobId)?.orgId;
+              if (!orgId) {
+                logger.warn('cache.upload.request for source with no dispatch org', {
+                  agentId,
+                  jobId: msg.jobId,
+                });
+                sendJson(ws, {
+                  type: 'cache.upload.response',
+                  requestId: msg.messageId,
+                  uploadUrl: '',
+                });
+                break;
+              }
+              // Content-addressed, exactly like deps below: the tarball is
+              // stored under its own digest. An older agent omits
+              // `sourceTarDigest` — fall back to the contentHash-derived name so
+              // a mixed-version rollout still uploads somewhere rather than
+              // failing the build. Such an entry gets no pointer, so nothing
+              // will ever resolve to it and it ages out on TTL; the next build
+              // with a current agent repopulates.
+              uploadUrl = await sourceCache.getUploadUrl(
+                orgId,
+                msg.sourceTarDigest ?? msg.contentHash!,
+              );
+            } else {
+              if (!depCache) {
+                logger.warn('cache.upload.request for deps but depCache not configured', {
+                  agentId,
+                });
+                sendJson(ws, {
+                  type: 'cache.upload.response',
+                  requestId: msg.messageId,
+                  uploadUrl: '',
+                });
+                break;
+              }
+              // Content-addressed: the tarball is stored under its own hash, so
+              // sign for that. An older agent omits `depsHash` — fall back to
+              // the lockfile-derived name so a mixed-version rollout still
+              // uploads somewhere rather than failing the build. Such an entry
+              // gets no pointer, so nothing will ever resolve to it and it ages
+              // out on TTL; the next build with a current agent repopulates.
+              uploadUrl = await depCache.getUploadUrl(
+                msg.depsHash ?? msg.lockfileHash!,
+                msg.platform,
+                msg.arch,
+              );
+            }
+            sendJson(ws, {
+              type: 'cache.upload.response',
+              requestId: msg.messageId,
+              uploadUrl,
+            });
+            logger.info('Cache upload URL generated', {
+              agentId,
+              cacheType: msg.cacheType,
+              platform: msg.platform,
+              arch: msg.arch,
+            });
+          } catch (err) {
+            logger.error('Failed to generate cache upload URL', {
+              agentId,
+              cacheType: msg.cacheType,
+              error: toErrorMessage(err),
+            });
+            sendJson(ws, {
+              type: 'cache.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
+          }
+          break;
+        }
+
+        case 'cache.upload.complete': {
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'cache.upload.complete')) ===
+            'reject'
+          ) {
+            break;
+          }
+
+          // Compute the storage key from the message fields. A dep tarball is
+          // addressed by its own content hash; only fall back to the lockfile
+          // name for an older agent that sent no `depsHash` (see the upload-URL
+          // branch above — the two must agree on the key or initMeta stamps TTL
+          // bookkeeping onto an object that does not exist).
+          const uploadOrgId = dispatchCacheRefs?.get(msg.jobId)?.orgId;
+          let storageKey: string;
+          if (msg.cacheType === 'source') {
+            storageKey = sourceTarballKey(
+              uploadOrgId ?? '',
+              msg.sourceTarDigest ?? msg.contentHash!,
+            );
+          } else {
+            storageKey = depTarballKey(msg.depsHash ?? msg.lockfileHash!, msg.platform, msg.arch);
+          }
+
+          if (cacheStorage) {
+            try {
+              await cacheStorage.initMeta(storageKey);
+              // Publish the pointer only now, after the agent confirmed the
+              // upload landed. Publishing earlier would let a reader resolve a
+              // lockfile to bytes that are not there yet.
+              if (msg.cacheType === 'deps' && msg.depsHash && msg.lockfileHash && depCache) {
+                await depCache.publishPointer(
+                  msg.lockfileHash,
+                  msg.platform,
+                  msg.arch,
+                  msg.depsHash,
+                  msg.siblingsDigest,
+                );
+              }
+              if (
+                msg.cacheType === 'source' &&
+                msg.sourceTarDigest &&
+                msg.contentHash &&
+                uploadOrgId &&
+                sourceCache
+              ) {
+                await sourceCache.publishPointer(uploadOrgId, msg.contentHash, msg.sourceTarDigest);
+              }
+              logger.info('Cache upload metadata initialized', {
+                agentId,
+                cacheType: msg.cacheType,
+                storageKey,
+              });
+            } catch (err) {
+              logger.error('Failed to initialize cache metadata', {
+                agentId,
+                storageKey,
+                error: toErrorMessage(err),
+              });
+            }
+          } else {
+            logger.warn('cache.upload.complete received but cacheStorage not configured', {
+              agentId,
+              storageKey,
+            });
+          }
+          break;
+        }
+
+        case 'cache.user.restore.request': {
+          // A refused restore replies with a miss — the same degraded value an
+          // unresolvable job produces — so the agent proceeds without a cache
+          // rather than waiting for a reply that never comes.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'cache.user.restore.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'cache.user.restore.response',
+              requestId: msg.messageId,
+              hit: false,
+            });
+            break;
+          }
+          // Resolve the namespace server-side. Missing userCache or an
+          // unresolvable jobId both fail closed to a miss — never a cross-tenant
+          // read and never a trust of the wire-supplied identity.
+          const ref = userCache ? resolveUserCacheRef(msg.jobId) : null;
+          if (!userCache || !ref) {
+            if (userCache && !ref) {
+              logger.warn('user-cache restore for unresolvable job, replying miss', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendJson(ws, {
+              type: 'cache.user.restore.response',
+              requestId: msg.messageId,
+              hit: false,
+            });
+            break;
+          }
+          try {
+            const r = await userCache.restore({
+              ...ref,
+              key: msg.key,
+              restoreKeys: msg.restoreKeys,
+            });
+            sendJson(ws, {
+              type: 'cache.user.restore.response',
+              requestId: msg.messageId,
+              hit: r.hit,
+              ...(r.matchedKey && { matchedKey: r.matchedKey }),
+              ...(r.downloadUrl && { downloadUrl: r.downloadUrl }),
+              ...(r.tarHash && { tarHash: r.tarHash }),
+            });
+          } catch (err) {
+            logger.error('user-cache restore failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            sendJson(ws, {
+              type: 'cache.user.restore.response',
+              requestId: msg.messageId,
+              hit: false,
+            });
+          }
+          break;
+        }
+
+        case 'cache.user.save.request': {
+          // A refused save replies skip — the same degraded value an
+          // unresolvable job produces — so the agent abandons the upload
+          // instead of hanging on a reply that never comes.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'cache.user.save.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'cache.user.save.response',
+              requestId: msg.messageId,
+              skip: true,
+            });
+            break;
+          }
+          const ref = userCache ? resolveUserCacheRef(msg.jobId) : null;
+          if (!userCache || !ref) {
+            if (userCache && !ref) {
+              logger.warn('user-cache save for unresolvable job, replying skip', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            // Fail closed: tell the agent to skip the upload (no presigned URL).
+            sendJson(ws, {
+              type: 'cache.user.save.response',
+              requestId: msg.messageId,
+              skip: true,
+            });
+            break;
+          }
+          try {
+            const begin = await userCache.beginSave({ ...ref, key: msg.key });
+            // Stash the temp key so the matching save.complete can commit it.
+            if (begin.tempKey) {
+              pendingUserCacheTempKeys.set(`${msg.jobId}:${msg.key}`, begin.tempKey);
+            }
+            sendJson(ws, {
+              type: 'cache.user.save.response',
+              requestId: msg.messageId,
+              skip: begin.skip,
+              ...(begin.uploadUrl && { uploadUrl: begin.uploadUrl }),
+            });
+          } catch (err) {
+            logger.error('user-cache save begin failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            sendJson(ws, {
+              type: 'cache.user.save.response',
+              requestId: msg.messageId,
+              skip: true,
+            });
+          }
+          break;
+        }
+
+        case 'cache.user.save.complete': {
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'cache.user.save.complete',
+            )) === 'reject'
+          ) {
+            break;
+          }
+          const stashKey = `${msg.jobId}:${msg.key}`;
+          const tempKey = pendingUserCacheTempKeys.get(stashKey);
+          pendingUserCacheTempKeys.delete(stashKey);
+          const ref = userCache ? resolveUserCacheRef(msg.jobId) : null;
+          if (!userCache || !ref) {
+            if (userCache && !ref) {
+              logger.warn('user-cache save.complete for unresolvable job, dropping', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            break;
+          }
+          try {
+            await userCache.commitSave({
+              ...ref,
+              key: msg.key,
+              tarHash: msg.tarHash,
+              sizeBytes: msg.sizeBytes,
+              ...(tempKey && { tempKey }),
+            });
+          } catch (err) {
+            logger.error('user-cache save commit failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+          }
+          break;
+        }
+
+        case 'artifacts.upload.request': {
+          // A refused request is answered, never dropped: the agent awaits this
+          // reply and would otherwise burn its whole retry budget on silence.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'artifacts.upload.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: ArtifactUploadOutcome.enum.rejected,
+              error: OWNERSHIP_REFUSED,
+            });
+            break;
+          }
+          const ref = artifactStore ? resolveUserCacheRef(msg.jobId) : null;
+          if (!artifactStore || !ref || !ref.runId) {
+            // An internal failure carries a free-text `error` and NO enforcement
+            // `reason`: telling the author "you are over quota" for a
+            // misconfigured orchestrator sends them to delete artifacts that
+            // were never the problem.
+            const error = !artifactStore
+              ? ArtifactInternalFailure.uploadNotConfigured
+              : ArtifactInternalFailure.unresolvableRun;
+            if (artifactStore && (!ref || !ref.runId)) {
+              logger.warn('artifact upload for unresolvable job, rejecting', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: ArtifactUploadOutcome.enum.rejected,
+              error,
+            });
+            break;
+          }
+          try {
+            const result = await artifactStore.beginUpload({
+              customerId: ref.org,
+              runId: ref.runId,
+              name: msg.name,
+              declaredSizeBytes: msg.declaredSizeBytes,
+            });
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: result.outcome,
+              ...(result.uploadUrl && { uploadUrl: result.uploadUrl }),
+              ...(result.storageKey && { storageKey: result.storageKey }),
+              ...(result.reason && { reason: result.reason }),
+              // A store-level rejection with no enforcement reason (a name that
+              // violates the contract) travels as free text, same as the
+              // handler's own internal-failure paths.
+              ...(result.error && { error: result.error }),
+            });
+          } catch (err) {
+            logger.error('artifact begin-upload failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets
+            // only the safe literal.
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: ArtifactUploadOutcome.enum.rejected,
+              error: ArtifactInternalFailure.uploadFailed,
+            });
+          }
+          break;
+        }
+
+        case 'artifacts.upload.complete': {
+          // Every path below that belongs to this agent's job sends exactly one
+          // ack: an agent that advertised-capability-awaits the ack must never
+          // hang on a silent drop, and a commit that failed must fail the step
+          // rather than leave a green run with no artifact.
+          const sendCompleteAck = (outcome: ArtifactCompleteAckOutcome, reason?: string): void => {
+            sendJson(ws, {
+              type: 'artifacts.upload.complete.ack',
+              requestId: msg.messageId,
+              outcome,
+              ...(reason ? { reason } : {}),
+            });
+          };
+
+          // Ownership is fully resolved before the frame is refused, and a
+          // refusal is acknowledged rather than dropped. A silent drop here
+          // hangs an agent that awaits the ack — which is exactly what happens
+          // on a coordinator failover, when the synchronous check cannot yet
+          // decide and the database can.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'artifacts.upload.complete',
+            )) === 'reject'
+          ) {
+            sendCompleteAck(ArtifactCompleteAckOutcome.enum.failed, OWNERSHIP_REFUSED);
+            break;
+          }
+          const ref = artifactStore ? resolveUserCacheRef(msg.jobId) : null;
+          if (!artifactStore || !ref || !ref.runId) {
+            if (artifactStore && (!ref || !ref.runId)) {
+              logger.warn('artifact upload.complete for unresolvable job, dropping', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendCompleteAck(
+              ArtifactCompleteAckOutcome.enum.failed,
+              !artifactStore
+                ? ArtifactInternalFailure.uploadNotConfigured
+                : ArtifactInternalFailure.unresolvableRun,
+            );
+            break;
+          }
+          try {
+            await completeUploadWithRetry(artifactStore, {
+              customerId: ref.org,
+              runId: ref.runId,
+              jobId: msg.jobId,
+              name: msg.name,
+              sizeBytes: msg.sizeBytes,
+              sha256: msg.sha256,
+              storageKey: msg.storageKey,
+            });
+            sendCompleteAck(ArtifactCompleteAckOutcome.enum.committed);
+          } catch (err) {
+            logger.error('artifact upload-complete failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets
+            // only the classified safe literal, same as the sibling upload and
+            // download responses.
+            sendCompleteAck(
+              ArtifactCompleteAckOutcome.enum.failed,
+              classifyArtifactCommitFailure(err),
+            );
+          }
+          break;
+        }
+
+        case 'artifacts.download.request': {
+          // A refused download is answered, never dropped: `not_found` is the
+          // only outcome this reply allows, and the free-text error says why.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'artifacts.download.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: ArtifactDownloadOutcome.enum.not_found,
+              error: OWNERSHIP_REFUSED,
+            });
+            break;
+          }
+          const ref = artifactStore ? resolveUserCacheRef(msg.jobId) : null;
+          if (!artifactStore || !ref || !ref.runId) {
+            // `not_found` is the only outcome the schema allows here, so the
+            // free-text `error` is what separates "the artifact does not exist"
+            // from "this orchestrator could not look it up" — otherwise the
+            // author goes hunting for a missing upload that was never missing.
+            const error = !artifactStore
+              ? ArtifactInternalFailure.downloadNotConfigured
+              : ArtifactInternalFailure.unresolvableRun;
+            if (artifactStore && (!ref || !ref.runId)) {
+              logger.warn('artifact download for unresolvable job, replying not_found', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: ArtifactDownloadOutcome.enum.not_found,
+              error,
+            });
+            break;
+          }
+          try {
+            const result = await artifactStore.download({
+              customerId: ref.org,
+              runId: ref.runId,
+              name: msg.name,
+            });
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: result.outcome,
+              ...(result.downloadUrl && { downloadUrl: result.downloadUrl }),
+              ...(result.sizeBytes !== undefined && { sizeBytes: result.sizeBytes }),
+              ...(result.sha256 && { sha256: result.sha256 }),
+            });
+          } catch (err) {
+            logger.error('artifact download failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets
+            // only the safe literal.
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: ArtifactDownloadOutcome.enum.not_found,
+              error: ArtifactInternalFailure.downloadFailed,
+            });
+          }
+          break;
+        }
+
+        case 'provenance.upload.request': {
+          // A refused request still gets its reply — an empty upload URL, the
+          // same degraded value an unconfigured store produces.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'provenance.upload.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'provenance.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
+            break;
+          }
+
+          const ref = dispatchCacheRefs?.get(msg.jobId);
+          if (!provenanceStorage || !ref) {
+            if (provenanceStorage && !ref) {
+              logger.warn('provenance upload for unresolvable job, replying with no URL', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendJson(ws, {
+              type: 'provenance.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
+            break;
+          }
+          try {
+            // runId comes from the server-side dispatch ref, never the wire.
+            const key = provenanceStorageKey(ref.runId, msg.jobId, msg.subjectDigest);
+            const uploadUrl = await provenanceStorage.getUploadUrl(key);
+            sendJson(ws, {
+              type: 'provenance.upload.response',
+              requestId: msg.messageId,
+              uploadUrl,
+            });
+            logger.info('Provenance upload URL generated', { agentId, jobId: msg.jobId, key });
+          } catch (err) {
+            logger.error('Failed to generate provenance upload URL', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            sendJson(ws, {
+              type: 'provenance.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
+          }
+          break;
+        }
+
+        case 'provenance.upload.complete': {
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'provenance.upload.complete',
+            )) === 'reject'
+          ) {
+            break;
+          }
+
+          const ref = dispatchCacheRefs?.get(msg.jobId);
+          if (!onProvenanceUpload || !ref) {
+            if (onProvenanceUpload && !ref) {
+              logger.warn('provenance upload.complete for unresolvable job, dropping', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            break;
+          }
+          try {
+            const storageKey = provenanceStorageKey(ref.runId, msg.jobId, msg.subjectDigest);
+            // The agent uploaded the bundle via a presigned PUT, which writes
+            // only the data object — not the metadata sidecar `CacheStorage.get`
+            // requires (a metadata-less object reads back as missing). Write the
+            // companion metadata here, mirroring the `cache.upload.complete`
+            // two-phase finalize, so the P1.7 dashboard read can inline the
+            // bundle.
+            if (provenanceStorage) {
+              await provenanceStorage.initMeta(storageKey);
+            }
+            // Verify-at-ingest: compute and store the verdict over the just-
+            // uploaded bundle (fail-closed to `unverifiable`, never blocks).
+            const verdict = await computeAttestationVerdict({
+              trustRoot: provenanceTrustRoot,
+              storage: provenanceStorage,
+              storageKey,
+              logWarn: (reason) =>
+                logger.warn('Attestation verify-at-ingest failed', { jobId: msg.jobId, reason }),
+            });
+            await onProvenanceUpload({
+              runId: ref.runId,
+              jobId: msg.jobId,
+              subjectName: msg.subjectName,
+              subjectDigest: msg.subjectDigest,
+              storageKey,
+              mediaType: msg.mediaType,
+              verifyStatus: verdict.verifyStatus,
+              verifyReason: verdict.verifyReason,
+              verifiedAt: verdict.verifiedAt,
+            });
+            logger.info('Provenance attestation recorded', {
+              agentId,
+              jobId: msg.jobId,
+              storageKey,
+            });
+          } catch (err) {
+            logger.error('Failed to record provenance attestation', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+          }
+          break;
+        }
+
+        case 'provenance.upload.defer': {
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'provenance.upload.defer',
+            )) === 'reject'
+          ) {
+            break;
+          }
+
+          const ref = dispatchCacheRefs?.get(msg.jobId);
+          if (!onProvenanceDefer || !ref) {
+            if (onProvenanceDefer && !ref) {
+              logger.warn('provenance defer for unresolvable job, dropping', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            break;
+          }
+          try {
+            // Default a live run whose mint blipped to `deferred`; a run ingested
+            // while the Platform was down classifies as `offline-backfill`.
+            const originKind = classifyDeferOrigin
+              ? await classifyDeferOrigin(ref.runId)
+              : 'deferred';
+            await onProvenanceDefer({
+              runId: ref.runId,
+              jobId: msg.jobId,
+              subjectName: msg.subjectName,
+              subjectDigest: msg.subjectDigest,
+              audience: msg.audience,
+              mediaType: msg.mediaType,
+              statementHash: msg.statementHash,
+              dsseEnvelope: msg.dsseEnvelope,
+              publicKey: msg.publicKey,
+              originKind,
+            });
+            logger.info('Deferred attestation captured', {
+              agentId,
+              jobId: msg.jobId,
+              originKind,
+            });
+          } catch (err) {
+            logger.error('Failed to capture deferred attestation', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+          }
+          break;
+        }
+
+        case 'job.concurrency.report': {
+          // A refused report is answered with `cancel`: the agent must not
+          // proceed on a job it does not own, and it must not park forever
+          // waiting for an ack that was never going to come.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'job.concurrency.report',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'job.concurrency.ack',
+              requestId: msg.messageId,
+              action: 'cancel',
+              reason: OWNERSHIP_REFUSED,
+            });
+            break;
+          }
+
+          const { runId, jobId, group, messageId } = msg;
+          logger.info('Concurrency report received', { agentId, runId, jobId, group });
+
+          if (onConcurrencyReport) {
+            const result = await onConcurrencyReport(agentId, { runId, jobId, group, messageId });
+            sendJson(ws, {
+              type: 'job.concurrency.ack',
+              requestId: messageId,
+              action: result.action,
+              ...(result.reason && { reason: result.reason }),
+            });
+
+            // On `wait`, the agent stays connected and long-polls for an
+            // unsolicited follow-up `concurrency.ack`. Do NOT release the
+            // dispatcher slot here — the workflow-runner is still parked on
+            // the second `waitForConcurrencyAck` call, holding the agent's
+            // capacity until a slot frees (orchestrator -> tryDispatchNextQueued)
+            // or the connection drops (tracker drops the waiter and cancels
+            // the queued row).
+          } else {
+            // No concurrency handler -- default to proceed (concurrency disabled)
+            sendJson(ws, {
+              type: 'job.concurrency.ack',
+              requestId: messageId,
+              action: 'proceed',
+            });
+          }
+          break;
+        }
+
+        case 'event.emit': {
+          // A refused emit is answered: the agent awaits this response and a
+          // drop would stall the step until its own deadline expired.
+          if (
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'event.emit')) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              error: OWNERSHIP_REFUSED,
+            });
+            break;
+          }
+
+          // Authoritative forgery guard: `kici.` is reserved for KiCI-internal
+          // system events (the event scaler's scale-up / scale-down) and `__`
+          // for the events the orchestrator mints for itself. A user step must
+          // never emit either — the SDK rejects it client-side, and this is the
+          // server-side backstop.
+          //
+          // The `__` half is a privilege boundary, not just a namespace: every
+          // name under it is exempt from the event-storm rate limiter, and
+          // `__schedule_fire` is additionally dispatched as a TRUSTED ref
+          // (no run causes it). So a job that could emit `__schedule_fire`
+          // would hand itself both. The lifecycle names inherit the tier of
+          // the run behind them, so emitting one forges the exemption alone —
+          // still a boundary worth holding.
+          const reservedPrefix = reservedEventNamePrefix(msg.eventName);
+          if (reservedPrefix) {
+            logger.warn('event.emit rejected: reserved event-name prefix', {
+              agentId,
+              eventName: msg.eventName,
+              reservedPrefix,
+            });
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              error: `event name prefix "${reservedPrefix}" is reserved for KiCI internal events`,
+            });
+            break;
+          }
+
+          if (!onEventEmit) {
+            logger.warn('event.emit received but event routing not configured', { agentId });
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              error: 'Event routing not available',
+            });
+            break;
+          }
+
+          try {
+            const result = await onEventEmit(agentId, {
+              jobId: msg.jobId,
+              requestId: msg.requestId,
+              eventName: msg.eventName,
+              payload: msg.payload,
+              target: msg.target,
+            });
+
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              ...(result.deliveryId && { deliveryId: result.deliveryId }),
+              ...(result.error && { error: result.error }),
+            });
+          } catch (err) {
+            logger.error('Failed to process event.emit', {
+              agentId,
+              jobId: msg.jobId,
+              eventName: msg.eventName,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets a
+            // safe fixed error. An author-actionable failure rides the
+            // callback's own return value instead, with its own safe wording.
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              error: AgentWsInternalFailure.eventEmitFailed,
+            });
+          }
+          break;
+        }
+
+        case 'scaler.claim-credentials': {
+          // A provisioning workflow's already-registered agent exchanges its
+          // single-use claim code for freshly minted ephemeral credentials. A
+          // fresh, not-yet-registered agent takes the same path pre-register via
+          // handleClaimCredentials; the token rides the response only and is
+          // never logged.
+          await handleClaimCredentials(
+            ws,
+            msg.requestId,
+            msg.claimCode,
+            agentId,
+            onClaimCredentials,
+          );
+          break;
+        }
+
+        case 'agent.api.request': {
+          const { agentApiRegistry } = deps;
+          if (!agentApiRegistry) {
+            sendJson(ws, {
+              type: 'agent.api.response',
+              requestId: msg.requestId,
+              error: 'Agent API not available',
+            });
+            break;
+          }
+
+          try {
+            // Every agent may call read AND write methods on its own behalf.
+            // Write methods only ever affect the calling agent's own host
+            // (e.g. host.requestReboot reboots the box the agent runs on), so
+            // there is no cross-agent escalation surface to gate further here.
+            const allowedRoles: Array<'read' | 'write'> = ['read', 'write'];
+            const result = await agentApiRegistry.handle(
+              agentId,
+              msg.method,
+              msg.params as Record<string, unknown>,
+              allowedRoles,
+            );
+            sendJson(ws, {
+              type: 'agent.api.response',
+              requestId: msg.requestId,
+              result,
+            });
+          } catch (err) {
+            logger.warn('Agent API request failed', {
+              agentId,
+              method: msg.method,
+              error: toErrorMessage(err),
+            });
+            // The registry's two rejections are structured and bounded: they name
+            // only the caller's own method and roles, so the author sees why the
+            // call was refused. Anything else is an exception whose text can carry
+            // orchestrator infrastructure detail, so it stays in the log above and
+            // the author gets a safe fixed error. The gate is the error's type,
+            // never its wording.
+            const deliberate =
+              err instanceof UnknownApiMethodError || err instanceof ApiRoleDeniedError;
+            sendJson(ws, {
+              type: 'agent.api.response',
+              requestId: msg.requestId,
+              error: deliberate ? err.message : AgentWsInternalFailure.agentApiFailed,
+            });
+          }
+          break;
+        }
+
+        case 'fleet.bundle.chunk': {
+          deps.fleetAgentCollector?.onChunk(msg.requestId, msg.seq, msg.dataB64, msg.isLast);
+          break;
+        }
+
+        case 'fleet.bundle.error': {
+          logger.warn('Agent reported fleet bundle error', {
+            agentId,
+            requestId: msg.requestId,
+            error: msg.message,
+          });
+          deps.fleetAgentCollector?.onError(msg.requestId, msg.message);
+          break;
+        }
+      }
+    },
+
+    onClose(_evt: CloseEvent, ws: WSContext) {
+      // Clean up rate limiter
+      rateLimiters.delete(ws);
+
+      // Clean up pending auth
+      const authEntry = pendingAuth.get(ws);
+      if (authEntry !== undefined) {
+        clearTimeout(authEntry.timer);
+        pendingAuth.delete(ws);
+        logger.info('Agent connection closed before auth');
+        return;
+      }
+
+      // Clean up pending registration
+      const regEntry = pendingRegistration.get(ws);
+      if (regEntry !== undefined) {
+        clearTimeout(regEntry.timer);
+        pendingRegistration.delete(ws);
+        logger.info('Agent connection closed before registration');
+        return;
+      }
+
+      // Closed inside the initial-registration await window: the WS has left
+      // `pendingRegistration` and has not reached `wsToAgentId`, so neither
+      // branch above matches it. Flag the in-flight registration instead of
+      // returning having done nothing — it reads this before writing to the
+      // registry and unwinds itself, which is the only cleanup available while
+      // the agent has no registry entry to tear down.
+      const registeringState = registering.get(ws);
+      if (registeringState !== undefined) {
+        registeringState.closed = true;
+        logger.info('Agent connection closed during registration');
+        return;
+      }
+
+      // Clean up registered agent
+      const agentId = wsToAgentId.get(ws);
+      if (agentId) {
+        // Act only when this socket is the one the registry currently holds.
+        // A reconnect that races the old socket's close rebinds the agent to
+        // the new socket while the old one lingers in CLOSE_WAIT; when it does
+        // close it resolves to the same agent id, and the teardown below would
+        // unregister a healthy agent, fail the jobs it is running and destroy
+        // it if it is scaler-managed. A stale socket's close drops only its own
+        // per-socket state. `retireSupersededSocket` normally removes the ghost
+        // at register time; this is the guard for a close that beats it.
+        if (registry.get(agentId)?.ws !== (ws as unknown as WsLike)) {
+          wsToAgentId.delete(ws);
+          wsToAuthState.delete(ws);
+          logger.info('Stale agent socket closed, live registration untouched', { agentId });
+          return;
+        }
+        wsToAgentId.delete(ws);
+        // Cleanup the agentId->tokenId map too, otherwise an agent that
+        // disconnects and never reconnects leaves a stale entry behind
+        // (slow leak that grows with every churned agent).
+        agentIdToTokenId.delete(agentId);
+        // Same cleanup logic for the per-WS authority cache — the WS is
+        // gone, so the captured token context is dead state.
+        wsToAuthState.delete(ws);
+
+        // Clean up ownership violation tracking
+        ownershipTracker?.cleanup(agentId);
+
+        // Reject any in-flight fleet-bundle requests this agent was answering —
+        // the chunked response can never complete now that its WS is gone.
+        deps.fleetAgentCollector?.rejectAgent(agentId, 'agent disconnected');
+
+        // Drop any in-memory concurrency waiters owned by this agent and
+        // cancel the matching `concurrency_groups.status='queued'` rows so the
+        // run is marked failed instead of sitting forever.
+        if (onConcurrencyAgentDisconnect) {
+          Promise.resolve(onConcurrencyAgentDisconnect(agentId)).catch((err) => {
+            logger.warn('Concurrency waiter cleanup failed on agent disconnect', {
+              agentId,
+              error: toErrorMessage(err),
+            });
+          });
+        }
+
+        // Dispatcher handles: mark dispatched jobs as failed, unregister from registry
+        dispatcher
+          .onAgentDisconnect(agentId)
+          .then((failedJobIds) => {
+            // Clean up pending build entries so processor doesn't hang forever
+            if (pendingBuilds) {
+              for (const jobId of failedJobIds) {
+                pendingBuilds.cleanup(jobId);
+              }
+            }
+
+            // Clean up pending init entries so init dispatch doesn't hang forever
+            if (pendingInits) {
+              for (const jobId of failedJobIds) {
+                pendingInits.cleanup(jobId);
+              }
+            }
+
+            // Clean up pending dynamic eval entries so processor doesn't hang forever
+            if (pendingDynamics) {
+              for (const jobId of failedJobIds) {
+                pendingDynamics.cleanup(jobId);
+              }
+            }
+
+            // Clean up pending global eval rounds so the webhook pipeline doesn't hang forever.
+            //
+            // This covers SCALER-MANAGED agents only, and deliberately so: for a
+            // static agent with in-flight jobs `Dispatcher.onAgentDisconnect`
+            // routes to `startRecoveryForDisconnect`, which always returns an
+            // empty list (it keeps tracking the jobs for reconnect
+            // reconciliation instead of failing them), so this loop iterates
+            // nothing. A round left pending by a static agent's disconnect is
+            // settled by that agent's own terminal `job.status` on reconnect,
+            // or — when it never reconnects — by the orchestrator-side wait
+            // ceiling the round applies around its own await
+            // (`global_eval_wait_timeout_ms`), not from here.
+            if (pendingGlobalEvals) {
+              for (const jobId of failedJobIds) {
+                pendingGlobalEvals.cleanup(jobId);
+              }
+            }
+
+            // Drop the server-side user-cache namespace refs for the agent's
+            // now-failed jobs so the tracker can't leak across a disconnect.
+            if (dispatchCacheRefs) {
+              for (const jobId of failedJobIds) {
+                dispatchCacheRefs.delete(jobId);
+              }
+            }
+          })
+          .catch((err) => {
+            logger.error('Error handling agent disconnect', {
+              agentId,
+              error: toErrorMessage(err),
+            });
+          });
+
+        // Mark agent metrics for retention-based cleanup
+        agentMetricsAggregator?.markDisconnected(agentId);
+
+        // Notify scaler of agent disconnect
+        onScalerAgentDisconnected?.(agentId);
+
+        setAgentsActive(Math.max(0, registry.getActiveCount() - 1));
+
+        logger.info('Agent disconnected', { agentId });
+      }
+    },
+
+    onError(_evt: Event, _ws: WSContext) {
+      logger.error('Agent WebSocket error');
+    },
+  };
+}

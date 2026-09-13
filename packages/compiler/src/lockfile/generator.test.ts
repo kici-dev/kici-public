@@ -1,0 +1,3031 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { compileSafeRegex } from '@kici-dev/engine';
+import {
+  step,
+  job,
+  workflow,
+  pr,
+  push,
+  tag,
+  comment,
+  review,
+  reviewComment,
+  release,
+  dispatch,
+  create,
+  status,
+  workflowRun,
+  fork,
+  star,
+  watch,
+  webhook,
+  kiciEvent,
+  workflowComplete,
+  workflowsFailedBatch,
+  jobComplete,
+  genericWebhook,
+  schedule,
+  rule,
+  z,
+} from '@kici-dev/sdk';
+import * as sdk from '@kici-dev/sdk';
+
+// delete is a reserved word -- access via namespace
+const del = sdk['delete'];
+import { parallel } from '@kici-dev/sdk';
+import type { Job } from '@kici-dev/sdk';
+import { generateLockFile, schemaWindowWarning, transformTriggers } from './generator.js';
+import { isCompilerError, type CompilerError } from '../errors/index.js';
+import type {
+  LockDispatchTrigger,
+  LockPushTrigger,
+  LockPrTrigger,
+  LockTagTrigger,
+} from '@kici-dev/engine';
+import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
+import { SCHEMA_VERSION, BREAKING_FLOOR, type WorkflowWithSource } from '../types.js';
+
+// Mock child_process to avoid git dependency in tests
+vi.mock('node:child_process', () => ({
+  execSync: vi.fn(() => '/mock/git/root'),
+}));
+
+const MOCK_ASSET_DIGEST = 'mock/file.txt\nmock content';
+const MOCK_RESOLVED_PATHS = ['mock/file.txt'];
+
+vi.mock('./hash-files.js', () => ({
+  resolveHashFiles: vi.fn((_gitRoot: string, patterns: string[]) =>
+    patterns.length ? { assetDigest: MOCK_ASSET_DIGEST, resolvedPaths: MOCK_RESOLVED_PATHS } : null,
+  ),
+}));
+
+function makeWorkflowWithSource(
+  w: ReturnType<typeof workflow>,
+  bundleSource?: string,
+): WorkflowWithSource {
+  return {
+    workflow: w,
+    source: {
+      file: '/mock/git/root/.kici/workflows/ci.ts',
+      exportName: 'default',
+    },
+    bundleSource,
+  };
+}
+
+describe('generator - schema compatibility window', () => {
+  it('stamps minReaderVersion = BREAKING_FLOOR into the emitted lock', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    expect(lockFile.minReaderVersion).toBe(BREAKING_FLOOR);
+    expect(lockFile.schemaVersion).toBe(SCHEMA_VERSION);
+  });
+});
+
+describe('schemaWindowWarning', () => {
+  it('returns null when the floor is below the current version (additive era)', () => {
+    expect(schemaWindowWarning(30, 31)).toBeNull();
+  });
+
+  it('warns and names the required version when the current version is itself breaking', () => {
+    const warning = schemaWindowWarning(31, 31);
+    expect(warning).not.toBeNull();
+    expect(warning).toContain('v31');
+  });
+});
+
+describe('generator - approval config', () => {
+  it('maps step approval into LockStep.approval (when defaults to always)', () => {
+    const s = step('deploy', { run: async () => {}, approval: [{ team: 'leads' }] });
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0].approval).toEqual({ clauses: [{ team: 'leads' }], when: 'always' });
+    }
+  });
+
+  it('maps job approval into LockJob.approval', () => {
+    const j = job('deploy', { runsOn: 'linux', run: async () => {}, approval: true });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.approval).toEqual({ clauses: [], when: 'always' });
+    }
+  });
+
+  it('maps workflow approval (object form) into LockWorkflow.approval', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('ci', {
+      jobs: [j],
+      approval: { approvers: [{ user: 'cto' }], reason: 'prod', timeout: 7200 },
+    });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    expect(lockFile.workflows[0].approval).toEqual({
+      clauses: [{ user: 'cto' }],
+      reason: 'prod',
+      timeoutSeconds: 7200,
+      when: 'always',
+    });
+  });
+
+  it('maps a when:drift check step into LockStep.approval.when === drift', () => {
+    const s = step('deploy', {
+      check: async () => ({ want: 1 }),
+      summarize: () => 'drift',
+      run: async () => {},
+      approval: { when: 'drift', approvers: [{ team: 'ops' }] },
+    });
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0].approval).toEqual({
+        clauses: [{ team: 'ops' }],
+        when: 'drift',
+      });
+    }
+  });
+
+  it('rejects a when:drift step with no check facet at compile time', () => {
+    // The SDK step() factory guards this, so build the step object directly to
+    // prove the compiler is also an authoritative guard.
+    const bareStep = {
+      _tag: 'Step' as const,
+      name: 'deploy',
+      run: async () => {},
+      approval: { when: 'drift' as const },
+      result: undefined as never,
+    };
+    const j = job('build', { runsOn: 'linux', steps: [bareStep as never] });
+    const w = workflow('ci', { jobs: [j] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+      /approval.when "drift" requires a check facet/,
+    );
+  });
+
+  it('rejects a when:drift gate at job scope at compile time', () => {
+    const j = {
+      _tag: 'Job' as const,
+      name: 'deploy',
+      runsOn: 'linux',
+      steps: [step('s', async () => {})],
+      approval: { when: 'drift' as const },
+      result: undefined as never,
+    };
+    const w = workflow('ci', { jobs: [j as never] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+      /approval.when "drift" is only valid on steps/,
+    );
+  });
+});
+
+describe('generator - agent execution fields', () => {
+  describe('step-level fields', () => {
+    it('serializes continueOnError to LockStep', () => {
+      const s = step('risky', {
+        run: async () => {},
+        continueOnError: true,
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      expect(lockJob._type).toBe('static');
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].continueOnError).toBe(true);
+      }
+    });
+
+    it('serializes timeout to LockStep', () => {
+      const s = step('slow', {
+        run: async () => {},
+        timeout: 60000,
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].timeout).toBe(60000);
+      }
+    });
+
+    it('serializes both continueOnError and timeout', () => {
+      const s = step('configured', {
+        run: async () => {},
+        continueOnError: true,
+        timeout: 120000,
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].continueOnError).toBe(true);
+        expect(lockJob.steps[0].timeout).toBe(120000);
+      }
+    });
+
+    it('serializes the retry data subset to LockStep without retryIf', () => {
+      const s = step('flaky', {
+        run: async () => {},
+        retry: { maxAttempts: 4, retryIf: () => true },
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].retry).toEqual({
+          maxAttempts: 4,
+          delayMs: 1000,
+          backoff: 'exponential',
+          maxDelayMs: 30000,
+        });
+        expect(lockJob.steps[0].retry).not.toHaveProperty('retryIf');
+      }
+    });
+
+    it('omits continueOnError and timeout when not set', () => {
+      const s = step('simple', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0]).not.toHaveProperty('continueOnError');
+        expect(lockJob.steps[0]).not.toHaveProperty('timeout');
+      }
+    });
+  });
+
+  describe('job-level fields', () => {
+    it('serializes checkout: false to LockJob', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', { runsOn: 'linux', steps: [s], checkout: false });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.checkout).toBe(false);
+      }
+    });
+
+    it('serializes container string to LockJob', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: 'node:20-alpine',
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.container).toBe('node:20-alpine');
+      }
+    });
+
+    it('serializes container config object to LockJob', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: { image: 'node:20', env: { NODE_ENV: 'ci' } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.container).toEqual({ image: 'node:20', env: { NODE_ENV: 'ci' } });
+      }
+    });
+
+    it('serializes container registry auth (secret key-names) to LockJob', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: {
+          image: 'reg:5000/acme/ci:1.2',
+          auth: { usernameSecret: 'prod:u', tokenSecret: 'prod:t' },
+        },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      // Asserted unconditionally: an `if (_type === 'static')` guard would make
+      // this pass silently if the job ever stopped being static.
+      expect(lockJob._type).toBe('static');
+      expect((lockJob as { container?: unknown }).container).toEqual({
+        image: 'reg:5000/acme/ci:1.2',
+        auth: { usernameSecret: 'prod:u', tokenSecret: 'prod:t' },
+      });
+    });
+
+    it('serializes the *Value half of a container auth pair', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: { image: 'ghcr.io/acme/ci:1', auth: { tokenValue: 'runtime-token' } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockJob = generateLockFile([makeWorkflowWithSource(w)]).workflows[0].jobs[0];
+      expect(lockJob._type).toBe('static');
+      expect((lockJob as { container?: { auth?: unknown } }).container?.auth).toEqual({
+        tokenValue: 'runtime-token',
+      });
+    });
+
+    it('serializes the sandbox escape-hatch request to LockJob', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: 'node:20',
+        sandbox: { capabilities: ['NET_ADMIN'], network: 'host' },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.sandbox).toEqual({ capabilities: ['NET_ADMIN'], network: 'host' });
+      }
+    });
+
+    it('omits the sandbox key when not requested (additive — no floor bump)', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], container: 'node:20' });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('sandbox');
+      }
+      // Additive field: the breaking floor must stay strictly below the version.
+      expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
+    });
+
+    it('omits checkout and container when not set', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('checkout');
+        expect(lockJob).not.toHaveProperty('container');
+      }
+    });
+  });
+
+  describe('cache fields', () => {
+    it('emits cache specs onto LockJob and LockStep', () => {
+      const s = step('build', {
+        run: async () => {},
+        cache: [{ key: 's-k', paths: ['~/.cache'], restoreKeys: ['s-'] }],
+      });
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        cache: { key: 'job-k', paths: ['dist'] },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      expect(lockJob._type).toBe('static');
+      if (lockJob._type === 'static') {
+        expect(lockJob.cache).toEqual([{ key: 'job-k', paths: ['dist'] }]);
+        expect(lockJob.steps[0].cache).toEqual([
+          { key: 's-k', paths: ['~/.cache'], restoreKeys: ['s-'] },
+        ]);
+      }
+    });
+
+    it('omits cache when not set on job or step', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('cache');
+        expect(lockJob.steps[0]).not.toHaveProperty('cache');
+      }
+    });
+  });
+
+  describe('init field', () => {
+    it('emits a single init config into the lock job', () => {
+      const s = step('s', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        init: { run: 'mise install', cache: { key: 'm', paths: ['~/.local/share/mise'] } },
+      });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      expect(lockJob._type).toBe('static');
+      if (lockJob._type === 'static') {
+        expect(lockJob.init).toEqual({
+          run: 'mise install',
+          cache: { key: 'm', paths: ['~/.local/share/mise'] },
+        });
+      }
+    });
+
+    it('emits an array of init configs preserving order', () => {
+      const s = step('s', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        init: [{ run: 'a' }, { run: 'b' }],
+      });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.init).toEqual([{ run: 'a' }, { run: 'b' }]);
+      }
+    });
+
+    it('emits init: false', () => {
+      const s = step('s', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], init: false });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.init).toBe(false);
+      }
+    });
+
+    it('serializes a string preset into the lock job', () => {
+      const s = step('s', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], init: 'mise' });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.init).toBe('mise');
+      }
+    });
+
+    it('serializes an object preset into the lock job', () => {
+      const s = step('s', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        init: { mise: { timeout: 300_000, cache: false } },
+      });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.init).toEqual({ mise: { timeout: 300_000, cache: false } });
+      }
+    });
+
+    it('serializes auto into the lock job', () => {
+      const s = step('s', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], init: 'auto' });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.init).toBe('auto');
+      }
+    });
+
+    it('omits init when not set', () => {
+      const s = step('s', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('w', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('init');
+      }
+    });
+  });
+});
+
+describe('generator - content hash fields', () => {
+  it('includes contentHash and compileSchemaVersion when bundleSource is provided', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow.contentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(lockWorkflow.compileSchemaVersion).toBe(COMPILE_SCHEMA_VERSION);
+  });
+
+  it('uses empty contentHash and 0 compileSchemaVersion when bundleSource is absent', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow.contentHash).toBe('');
+    expect(lockWorkflow.compileSchemaVersion).toBe(0);
+  });
+
+  it('produces deterministic hashes for the same bundleSource', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile1 = generateLockFile([makeWorkflowWithSource(w, 'const x = 42;')]);
+    const lockFile2 = generateLockFile([makeWorkflowWithSource(w, 'const x = 42;')]);
+
+    expect(lockFile1.workflows[0].contentHash).toBe(lockFile2.workflows[0].contentHash);
+  });
+
+  it('produces different hashes for different bundleSources', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile1 = generateLockFile([makeWorkflowWithSource(w, 'const a = 1;')]);
+    const lockFile2 = generateLockFile([makeWorkflowWithSource(w, 'const b = 2;')]);
+
+    expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
+  });
+
+  it('emits the current schemaVersion into the lock', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    // What matters here is that the generator stamps the engine's version, not
+    // what that number happens to be — the number itself is pinned once, in
+    // engine's own types.test.ts, so a bump does not churn every mirror.
+    expect(lockFile.schemaVersion).toBe(SCHEMA_VERSION);
+  });
+
+  it('emits an invoke gate lock job (optional set, steps empty)', () => {
+    const gate = job('repo-tests', {
+      invoke: sdk.invokeSource('myorg.repo-tests', { optional: true }),
+    });
+    const w = workflow('ci', { jobs: [gate] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0] as any;
+    expect(lockJob.invoke.event).toBe('myorg.repo-tests');
+    expect(lockJob.invoke.scope).toBe('source');
+    expect(lockJob.invoke.optional).toBe(true);
+    expect(lockJob.steps).toEqual([]);
+  });
+
+  it('omits invoke.optional for a require-by-default gate', () => {
+    const gate = job('repo-tests', { invoke: sdk.invokeSource('myorg.repo-tests') });
+    const w = workflow('ci', { jobs: [gate] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0] as any;
+    expect(lockJob.invoke.event).toBe('myorg.repo-tests');
+    expect('optional' in lockJob.invoke).toBe(false);
+  });
+
+  it('serializes runsOnPick: deterministic by default and any when set', () => {
+    const def = job('a', { runsOn: 'linux', steps: [step('s', async () => {})] });
+    const opt = job('b', {
+      runsOn: { labels: ['role:db'], pick: 'any' },
+      steps: [step('s', async () => {})],
+    });
+    const w = workflow('ci', { jobs: [def, opt] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const byName = Object.fromEntries(
+      lockFile.workflows[0].jobs
+        .filter((jj): jj is Extract<typeof jj, { _type: 'static' }> => jj._type === 'static')
+        .map((jj) => [jj.name, jj]),
+    );
+    expect(byName.a.runsOnPick).toBe('deterministic');
+    expect(byName.b.runsOnPick).toBe('any');
+  });
+});
+
+describe('generator - workflow filter predicate', () => {
+  it('emits hasFilter: true when the workflow declares a filter', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('org-ci', { jobs: [j], filter: async () => true });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+
+    expect(lockFile.workflows[0].hasFilter).toBe(true);
+  });
+
+  it('omits hasFilter entirely when no filter is declared', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('org-ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+
+    expect('hasFilter' in lockFile.workflows[0]).toBe(false);
+  });
+});
+
+describe('generator - dispatch inputs descriptors', () => {
+  it('serializes dispatch inputs to descriptors', () => {
+    const [t] = transformTriggers([
+      dispatch({ types: ['deploy'], inputs: { skipCveScan: z.boolean().default(false) } }),
+    ]);
+    expect((t as LockDispatchTrigger).inputs).toEqual({
+      skipCveScan: { type: 'boolean', optional: false, nullable: false, default: false },
+    });
+  });
+
+  it('omits inputs when none declared', () => {
+    const [t] = transformTriggers([dispatch({ types: ['deploy'] })]);
+    expect((t as LockDispatchTrigger).inputs).toBeUndefined();
+  });
+
+  it('rejects a non-subset input schema at compile', () => {
+    expect(() =>
+      transformTriggers([dispatch({ types: ['x'], inputs: { bad: z.object({ a: z.string() }) } })]),
+    ).toThrow(/bad/);
+  });
+});
+
+describe('generator - requires content filter', () => {
+  it('serializes requires onto the push lock trigger with format resolved by extension', () => {
+    const [t] = transformTriggers([
+      push({ repos: ['o/*'], requires: [{ file: 'package.json', exists: ['$.scripts.ci'] }] }),
+    ]);
+    expect((t as LockPushTrigger).requires).toEqual([
+      { file: 'package.json', format: 'json', exists: ['$.scripts.ci'] },
+    ]);
+  });
+
+  it('resolves .yaml/.yml to yaml and an unknown extension to text', () => {
+    const [y] = transformTriggers([
+      push({ requires: [{ file: 'c.yml', exists: ['$.services'] }] }),
+    ]);
+    expect((y as LockPushTrigger).requires?.[0].format).toBe('yaml');
+    const [txt] = transformTriggers([
+      push({ requires: [{ file: 'Dockerfile', matches: '/^FROM/m' }] }),
+    ]);
+    expect((txt as LockPushTrigger).requires?.[0].format).toBe('text');
+  });
+
+  it('serializes requires onto the pr lock trigger', () => {
+    const [t] = transformTriggers([
+      pr({ requires: [{ file: 'config.yaml', match: { '$.enabled': true } }] }),
+    ]);
+    expect((t as LockPrTrigger).requires).toEqual([
+      { file: 'config.yaml', format: 'yaml', match: { '$.enabled': true } },
+    ]);
+  });
+
+  it('serializes requires onto the tag lock trigger', () => {
+    const [t] = transformTriggers([tag({ patterns: ['v*'], requires: [{ file: 'VERSION' }] })]);
+    expect((t as LockTagTrigger).requires).toEqual([{ file: 'VERSION' }]);
+  });
+
+  it('applies a push requires to both the push and the derived tag lock trigger', () => {
+    const triggers = transformTriggers([
+      push({ tags: ['v*'], requires: [{ file: 'x', absent: true }] }),
+    ]);
+    const push0 = triggers.find((t) => t._type === 'push') as LockPushTrigger;
+    const tag0 = triggers.find((t) => t._type === 'tag') as LockTagTrigger;
+    expect(push0.requires).toEqual([{ file: 'x', absent: true }]);
+    expect(tag0.requires).toEqual([{ file: 'x', absent: true }]);
+  });
+
+  it('keeps a bare { file } existence check format-less (valid)', () => {
+    const [t] = transformTriggers([push({ requires: [{ file: 'LICENSE' }] })]);
+    expect((t as LockPushTrigger).requires).toEqual([{ file: 'LICENSE' }]);
+  });
+
+  it('omits requires when none declared', () => {
+    const [t] = transformTriggers([push({ branches: ['main'] })]);
+    expect((t as LockPushTrigger).requires).toBeUndefined();
+  });
+
+  it('rejects absent combined with a query key at compile time', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x', absent: true, exists: ['$.a'] }] })]),
+    ).toThrow(/absent.*exclusive|mutually/i);
+  });
+
+  it('rejects a text-format entry carrying a json/yaml query key', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'notes.txt', exists: ['$.a'] }] })]),
+    ).toThrow(/text format cannot carry/i);
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x', format: 'text', match: { '$.a': 1 } }] })]),
+    ).toThrow(/text format cannot carry/i);
+  });
+
+  it('rejects a json/yaml entry carrying matches', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'data.json', matches: '/x/' }] })]),
+    ).toThrow(/cannot carry a raw-text key/i);
+  });
+
+  it('rejects a degenerate format-only entry with no query', () => {
+    expect(() => transformTriggers([push({ requires: [{ file: 'x', format: 'text' }] })])).toThrow(
+      /nothing to check/i,
+    );
+  });
+
+  it('rejects a catastrophic (ReDoS-prone) matches regex at compile time', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x.txt', matches: '/(a+)+$/' }] })]),
+    ).toThrow(/ReDoS|matches/i);
+  });
+
+  it('rejects a syntactically invalid matches regex at compile time', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x.txt', matches: '/(unterminated/' }] })]),
+    ).toThrow(/invalid regex/i);
+  });
+});
+
+describe('generator - top-level contentHash', () => {
+  it('includes a 64-char hex contentHash instead of generatedAt', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    expect(lockFile.contentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(lockFile).not.toHaveProperty('generatedAt');
+  });
+
+  it('is deterministic: same input produces same hash', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile1 = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockFile2 = generateLockFile([makeWorkflowWithSource(w)]);
+    expect(lockFile1.contentHash).toBe(lockFile2.contentHash);
+  });
+
+  it('changes when workflow structure changes', () => {
+    const s1 = step('build', async () => {});
+    const j1 = job('build', { runsOn: 'linux', steps: [s1] });
+    const w1 = workflow('ci', { jobs: [j1] });
+
+    const s2 = step('test', async () => {});
+    const j2 = job('test', { runsOn: 'linux', steps: [s2] });
+    const w2 = workflow('ci', { jobs: [j2] });
+
+    const hash1 = generateLockFile([makeWorkflowWithSource(w1)]).contentHash;
+    const hash2 = generateLockFile([makeWorkflowWithSource(w2)]).contentHash;
+    expect(hash1).not.toBe(hash2);
+  });
+
+  it('changes when bundle hash changes', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const hash1 = generateLockFile([makeWorkflowWithSource(w, 'const a = 1;')]).contentHash;
+    const hash2 = generateLockFile([makeWorkflowWithSource(w, 'const b = 2;')]).contentHash;
+    expect(hash1).not.toBe(hash2);
+  });
+
+  it('does not change across invocations with same content', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const hash1 = generateLockFile([makeWorkflowWithSource(w, 'const x = 42;')]).contentHash;
+    const hash2 = generateLockFile([makeWorkflowWithSource(w, 'const x = 42;')]).contentHash;
+    expect(hash1).toBe(hash2);
+  });
+});
+
+describe('generator - contexts removal', () => {
+  it('omits contexts from lock file workflows (contexts removed in v6)', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow).not.toHaveProperty('contexts');
+  });
+});
+
+describe('generator - registries and installEnv', () => {
+  const makeBasicJob = () => job('build', { runsOn: 'linux', steps: [step('s', async () => {})] });
+
+  it('emits registries: into the lock file when the workflow declares them', () => {
+    const w = workflow('ci', {
+      jobs: [makeBasicJob()],
+      registries: [
+        {
+          url: 'https://npm.pkg.github.com',
+          scope: '@my-org',
+          tokenSecret: 'production:GITHUB_PACKAGES_TOKEN',
+        },
+      ],
+    });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow.registries).toEqual([
+      {
+        url: 'https://npm.pkg.github.com',
+        scope: '@my-org',
+        tokenSecret: 'production:GITHUB_PACKAGES_TOKEN',
+      },
+    ]);
+  });
+
+  it('emits installEnv: as a plain string array', () => {
+    const w = workflow('ci', {
+      jobs: [makeBasicJob()],
+      installEnv: ['production:NPM_TOKEN', 'shared:CA_BUNDLE'],
+    });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow.installEnv).toEqual(['production:NPM_TOKEN', 'shared:CA_BUNDLE']);
+  });
+
+  it('omits both fields entirely when undeclared', () => {
+    const w = workflow('ci', { jobs: [makeBasicJob()] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow).not.toHaveProperty('registries');
+    expect(lockWorkflow).not.toHaveProperty('installEnv');
+  });
+
+  it('emits workflow-level timeout into the lock file', () => {
+    const w = workflow('ci', { jobs: [makeBasicJob()], timeout: 1_800_000 });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+
+    expect(lockFile.workflows[0].timeout).toBe(1_800_000);
+  });
+
+  it('omits workflow-level timeout when not set', () => {
+    const w = workflow('ci', { jobs: [makeBasicJob()] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+
+    expect(lockFile.workflows[0]).not.toHaveProperty('timeout');
+  });
+
+  it('preserves the alwaysAuth flag when set', () => {
+    const w = workflow('ci', {
+      jobs: [makeBasicJob()],
+      registries: [
+        {
+          url: 'https://npm.pkg.github.com',
+          scope: '@my-org',
+          tokenSecret: 'production:T',
+          alwaysAuth: false,
+        },
+      ],
+    });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+    expect(lockFile.workflows[0].registries![0].alwaysAuth).toBe(false);
+  });
+
+  it('changes the lockfile contentHash when registries change', () => {
+    const baseline = workflow('ci', { jobs: [makeBasicJob()] });
+    const withRegistry = workflow('ci', {
+      jobs: [makeBasicJob()],
+      registries: [{ url: 'https://npm.pkg.github.com', tokenSecret: 'production:T' }],
+    });
+
+    const a = generateLockFile([makeWorkflowWithSource(baseline, 'const x = 1;')]).contentHash;
+    const b = generateLockFile([makeWorkflowWithSource(withRegistry, 'const x = 1;')]).contentHash;
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('generator - hashFiles', () => {
+  it('includes hashFiles and resolvedHashFiles when workflow has hashFiles', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j], hashFiles: ['mock/file.txt'] });
+    const bundleSource = 'const x = 1;';
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, bundleSource)]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow.hashFiles).toEqual(['mock/file.txt']);
+    expect(lockWorkflow.resolvedHashFiles).toEqual(MOCK_RESOLVED_PATHS);
+    expect(lockWorkflow.contentHash).toBe(
+      computeContentHash(bundleSource, COMPILE_SCHEMA_VERSION, MOCK_ASSET_DIGEST),
+    );
+  });
+
+  it('backward compat: no hashFiles on workflow omits hashFiles and resolvedHashFiles from lock', () => {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w, 'const x = 1;')]);
+    const lockWorkflow = lockFile.workflows[0];
+
+    expect(lockWorkflow).not.toHaveProperty('hashFiles');
+    expect(lockWorkflow).not.toHaveProperty('resolvedHashFiles');
+    expect(lockWorkflow.contentHash).toBe(
+      computeContentHash('const x = 1;', COMPILE_SCHEMA_VERSION),
+    );
+  });
+});
+
+describe('generator - source locations', () => {
+  it('propagates _sourceLocation to sourceLocation when present', () => {
+    const s = step('build', async () => {});
+    // Inject a mock _sourceLocation (step() captures real ones, but we want deterministic tests)
+    const sWithLoc = {
+      ...s,
+      _sourceLocation: {
+        file: '/mock/git/root/src/ci.ts',
+        line: 42,
+        column: 5,
+      },
+    };
+    const j = job('build', { runsOn: 'linux', steps: [sWithLoc] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0].sourceLocation).toEqual({
+        file: 'src/ci.ts',
+        line: 42,
+        column: 5,
+      });
+    }
+  });
+
+  it('omits sourceLocation when _sourceLocation is undefined (backward compat)', () => {
+    const s = step('build', async () => {});
+    // Override _sourceLocation to undefined to ensure backward compat
+    const sNoLoc = { ...s, _sourceLocation: undefined };
+    const j = job('build', { runsOn: 'linux', steps: [sNoLoc] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0]).not.toHaveProperty('sourceLocation');
+    }
+  });
+
+  it('makes file path relative to git root', () => {
+    const s = step('test', async () => {});
+    const sWithAbsLoc = {
+      ...s,
+      _sourceLocation: {
+        file: '/mock/git/root/.kici/workflows/ci.ts',
+        line: 10,
+        column: 3,
+      },
+    };
+    const j = job('test', { runsOn: 'linux', steps: [sWithAbsLoc] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0].sourceLocation?.file).toBe('.kici/workflows/ci.ts');
+    }
+  });
+
+  it('strips .compiled.mjs?t=... suffix from sourceLocation file paths', () => {
+    const s = step('build', async () => {});
+    const sWithCompiledLoc = {
+      ...s,
+      _sourceLocation: {
+        file: '/mock/git/root/.kici/workflows/ci.ts.compiled.mjs?t=1772248448578',
+        line: 10,
+        column: 3,
+      },
+    };
+    const j = job('build', { runsOn: 'linux', steps: [sWithCompiledLoc] });
+    const w = workflow('ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0].sourceLocation?.file).toBe('.kici/workflows/ci.ts');
+    }
+  });
+
+  it('produces deterministic contentHash regardless of cache-buster timestamp', () => {
+    const s = step('build', async () => {});
+    const sWithLoc1 = {
+      ...s,
+      _sourceLocation: {
+        file: '/mock/git/root/.kici/workflows/ci.ts.compiled.mjs?t=1111111111111',
+        line: 10,
+        column: 3,
+      },
+    };
+    const sWithLoc2 = {
+      ...s,
+      _sourceLocation: {
+        file: '/mock/git/root/.kici/workflows/ci.ts.compiled.mjs?t=9999999999999',
+        line: 10,
+        column: 3,
+      },
+    };
+
+    const j1 = job('build', { runsOn: 'linux', steps: [sWithLoc1] });
+    const w1 = workflow('ci', { jobs: [j1] });
+    const j2 = job('build', { runsOn: 'linux', steps: [sWithLoc2] });
+    const w2 = workflow('ci', { jobs: [j2] });
+
+    const hash1 = generateLockFile([makeWorkflowWithSource(w1)]).contentHash;
+    const hash2 = generateLockFile([makeWorkflowWithSource(w2)]).contentHash;
+    expect(hash1).toBe(hash2);
+  });
+
+  it('step() factory captures real _sourceLocation with file, line, column', () => {
+    const s = step('real', async () => {});
+    expect(s._sourceLocation).toBeDefined();
+    expect(s._sourceLocation!.file).toContain('generator.test');
+    expect(typeof s._sourceLocation!.line).toBe('number');
+    expect(typeof s._sourceLocation!.column).toBe('number');
+    expect(s._sourceLocation!.line).toBeGreaterThan(0);
+    expect(s._sourceLocation!.column).toBeGreaterThan(0);
+  });
+});
+
+describe('generator - new trigger types', () => {
+  function makeTriggerWorkflow(triggers: any[]): WorkflowWithSource {
+    const s = step('build', async () => {});
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { on: triggers, jobs: [j] });
+    return makeWorkflowWithSource(w);
+  }
+
+  it('transforms TagTrigger to LockTagTrigger', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([tag({ patterns: 'v*' })])]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('tag');
+    if (t._type === 'tag') {
+      expect(t.patterns).toEqual([{ type: 'glob', pattern: 'v*' }]);
+    }
+  });
+
+  it('transforms CommentTrigger to LockCommentTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([comment({ actions: ['created'], source: 'pr', bodyMatch: '/deploy' })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('comment');
+    if (t._type === 'comment') {
+      expect(t.actions).toEqual(['created']);
+      expect(t.source).toBe('pr');
+      expect(t.bodyMatch).toEqual({ type: 'glob', pattern: '/deploy' });
+    }
+  });
+
+  it('transforms ReviewTrigger to LockReviewTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([review({ actions: ['submitted'], states: ['approved'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('review');
+    if (t._type === 'review') {
+      expect(t.actions).toEqual(['submitted']);
+      expect(t.states).toEqual(['approved']);
+    }
+  });
+
+  it('transforms ReviewCommentTrigger to LockReviewCommentTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([reviewComment({ actions: ['created'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('review_comment');
+    if (t._type === 'review_comment') {
+      expect(t.actions).toEqual(['created']);
+    }
+  });
+
+  it('transforms ReleaseTrigger to LockReleaseTrigger', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([release({ actions: ['published'] })])]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('release');
+    if (t._type === 'release') {
+      expect(t.actions).toEqual(['published']);
+    }
+  });
+
+  it('transforms DispatchTrigger to LockDispatchTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([dispatch({ types: ['deploy', 'rollback'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('dispatch');
+    if (t._type === 'dispatch') {
+      expect(t.types).toEqual(['deploy', 'rollback']);
+    }
+  });
+
+  it('transforms CreateTrigger to LockCreateTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([create({ refTypes: ['branch'], patterns: 'feature/*' })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('create');
+    if (t._type === 'create') {
+      expect(t.refTypes).toEqual(['branch']);
+      expect(t.patterns).toEqual([{ type: 'glob', pattern: 'feature/*' }]);
+    }
+  });
+
+  it('transforms DeleteTrigger to LockDeleteTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([del({ refTypes: ['branch'], patterns: 'feature/*' })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('delete');
+    if (t._type === 'delete') {
+      expect(t.refTypes).toEqual(['branch']);
+      expect(t.patterns).toEqual([{ type: 'glob', pattern: 'feature/*' }]);
+    }
+  });
+
+  it('transforms StatusTrigger to LockStatusTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([status({ contexts: ['ci/test'], states: ['success'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('status');
+    if (t._type === 'status') {
+      expect(t.contexts).toEqual(['ci/test']);
+      expect(t.states).toEqual(['success']);
+    }
+  });
+
+  it('transforms WorkflowRunTrigger to LockWorkflowRunTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([
+        workflowRun({
+          actions: ['completed'],
+          workflows: ['CI'],
+          conclusions: ['success'],
+        }),
+      ]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('workflow_run');
+    if (t._type === 'workflow_run') {
+      expect(t.actions).toEqual(['completed']);
+      expect(t.workflows).toEqual(['CI']);
+      expect(t.conclusions).toEqual(['success']);
+    }
+  });
+
+  it('transforms ForkTrigger to LockForkTrigger', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([fork()])]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('fork');
+  });
+
+  it('transforms StarTrigger to LockStarTrigger', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([star({ actions: ['created'] })])]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('star');
+    if (t._type === 'star') {
+      expect(t.actions).toEqual(['created']);
+    }
+  });
+
+  it('transforms WatchTrigger to LockWatchTrigger', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([watch({ actions: ['started'] })])]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('watch');
+    if (t._type === 'watch') {
+      expect(t.actions).toEqual(['started']);
+    }
+  });
+
+  it('transforms WebhookTrigger to LockWebhookTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([webhook({ events: ['deployment'], actions: ['created'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('webhook');
+    if (t._type === 'webhook') {
+      expect(t.events).toEqual(['deployment']);
+      expect(t.actions).toEqual(['created']);
+    }
+  });
+
+  it('push with tags generates both LockPushTrigger and LockTagTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([push({ branches: 'main', tags: 'v*' })]),
+    ]);
+    const triggers = lockFile.workflows[0].triggers;
+    expect(triggers).toHaveLength(2);
+    expect(triggers[0]._type).toBe('push');
+    expect(triggers[1]._type).toBe('tag');
+    if (triggers[1]._type === 'tag') {
+      expect(triggers[1].patterns).toEqual([{ type: 'glob', pattern: 'v*' }]);
+    }
+  });
+
+  it('push without tags generates only LockPushTrigger', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([push({ branches: 'main' })])]);
+    const triggers = lockFile.workflows[0].triggers;
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0]._type).toBe('push');
+  });
+
+  it('comment with regex bodyMatch serializes correctly', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([comment({ bodyMatch: /^\/deploy/i })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'comment') {
+      expect(t.bodyMatch).toEqual({ type: 'regex', pattern: '^\\/deploy', flags: 'i' });
+    }
+  });
+
+  it('transforms KiciEventTrigger to LockKiciEventTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([kiciEvent({ name: 'deploy-complete', match: { '$.env': 'prod' } })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('kici_event');
+    if (t._type === 'kici_event') {
+      expect(t.eventName).toBe('deploy-complete');
+      expect(t.match).toEqual({ '$.env': 'prod' });
+    }
+  });
+
+  it('transforms KiciEventTrigger with all optional fields', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([
+        kiciEvent({
+          name: 'deploy-complete',
+          match: { '$.env': 'prod' },
+          not: { '$.dry_run': true },
+          source: 'org/infra-repo',
+        }),
+      ]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'kici_event') {
+      expect(t.eventName).toBe('deploy-complete');
+      expect(t.match).toEqual({ '$.env': 'prod' });
+      expect(t.not).toEqual({ '$.dry_run': true });
+      expect(t.source).toBe('org/infra-repo');
+    }
+  });
+
+  it('transforms KiciEventTrigger omitting undefined optional fields', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([kiciEvent({ name: 'test-event' })])]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'kici_event') {
+      expect(t.eventName).toBe('test-event');
+      expect(t).not.toHaveProperty('match');
+      expect(t).not.toHaveProperty('not');
+      expect(t).not.toHaveProperty('source');
+    }
+  });
+
+  it('transforms WorkflowCompleteTrigger to LockWorkflowCompleteTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([workflowComplete({ name: 'CI', status: ['success'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('workflow_complete');
+    if (t._type === 'workflow_complete') {
+      expect(t.name).toBe('CI');
+      expect(t.status).toEqual(['success']);
+    }
+  });
+
+  it('transforms WorkflowCompleteTrigger omitting undefined optional fields', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([workflowComplete()])]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'workflow_complete') {
+      expect(t).not.toHaveProperty('name');
+      expect(t).not.toHaveProperty('status');
+      expect(t).not.toHaveProperty('source');
+    }
+  });
+
+  it('transforms WorkflowsFailedBatchTrigger to its lock trigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([
+        workflowsFailedBatch({ accumulateFor: 5000, name: 'CI', source: 'org/repo' }),
+      ]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('workflows_failed_batch');
+    if (t._type === 'workflows_failed_batch') {
+      expect(t.accumulateFor).toBe(5000);
+      expect(t.name).toBe('CI');
+      expect(t.source).toBe('org/repo');
+    }
+  });
+
+  it('transforms WorkflowsFailedBatchTrigger omitting undefined optional fields', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([workflowsFailedBatch({ accumulateFor: 3000 })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('workflows_failed_batch');
+    if (t._type === 'workflows_failed_batch') {
+      expect(t.accumulateFor).toBe(3000);
+      expect(t).not.toHaveProperty('name');
+      expect(t).not.toHaveProperty('source');
+    }
+  });
+
+  it('transforms JobCompleteTrigger to LockJobCompleteTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([jobComplete({ workflow: 'CI', job: 'build' })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('job_complete');
+    if (t._type === 'job_complete') {
+      expect(t.workflow).toBe('CI');
+      expect(t.job).toBe('build');
+    }
+  });
+
+  it('transforms JobCompleteTrigger with status and source', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([
+        jobComplete({
+          workflow: 'CI',
+          job: 'build',
+          status: ['success', 'failed'],
+          source: 'org/repo',
+        }),
+      ]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'job_complete') {
+      expect(t.workflow).toBe('CI');
+      expect(t.job).toBe('build');
+      expect(t.status).toEqual(['success', 'failed']);
+      expect(t.source).toBe('org/repo');
+    }
+  });
+
+  it('transforms JobCompleteTrigger omitting undefined optional fields', () => {
+    const lockFile = generateLockFile([makeTriggerWorkflow([jobComplete()])]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'job_complete') {
+      expect(t).not.toHaveProperty('workflow');
+      expect(t).not.toHaveProperty('job');
+      expect(t).not.toHaveProperty('status');
+      expect(t).not.toHaveProperty('source');
+    }
+  });
+
+  it('transforms GenericWebhookTrigger to LockGenericWebhookTrigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([genericWebhook({ source: 'my-service', events: ['deploy'] })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('generic_webhook');
+    if (t._type === 'generic_webhook') {
+      expect(t.source).toBe('my-service');
+      expect(t.events).toEqual(['deploy']);
+    }
+  });
+
+  it('transforms GenericWebhookTrigger with match/not filters', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([
+        genericWebhook({
+          source: 'my-service',
+          events: ['deploy'],
+          match: { '$.env': 'prod' },
+          not: { '$.dry_run': true },
+        }),
+      ]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'generic_webhook') {
+      expect(t.source).toBe('my-service');
+      expect(t.events).toEqual(['deploy']);
+      expect(t.match).toEqual({ '$.env': 'prod' });
+      expect(t.not).toEqual({ '$.dry_run': true });
+    }
+  });
+
+  it('transforms GenericWebhookTrigger omitting undefined optional fields', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([genericWebhook({ source: 'my-service' })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    if (t._type === 'generic_webhook') {
+      expect(t.source).toBe('my-service');
+      expect(t).not.toHaveProperty('events');
+      expect(t).not.toHaveProperty('match');
+      expect(t).not.toHaveProperty('not');
+    }
+  });
+});
+
+describe('generator - auto-IDs and bare function normalization', () => {
+  describe('step auto-IDs', () => {
+    it('assigns step-N names to bare function steps', () => {
+      const bareFn1 = async () => {};
+      const bareFn2 = async () => {};
+      const j = job('build', { runsOn: 'linux', steps: [bareFn1, bareFn2] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].name).toBe('step-1');
+        expect(lockJob.steps[1].name).toBe('step-2');
+        expect(lockJob.steps[0].hasOutputs).toBe(false);
+        expect(lockJob.steps[1].hasOutputs).toBe(false);
+      }
+    });
+
+    it('assigns step-N names to id-less steps (empty name)', () => {
+      const s1 = step(async () => {});
+      const s2 = step(async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s1, s2] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].name).toBe('step-1');
+        expect(lockJob.steps[1].name).toBe('step-2');
+      }
+    });
+
+    it('handles mixed named/unnamed steps correctly (counter only increments for unnamed)', () => {
+      const named1 = step('build', async () => {});
+      const bareFn = async () => {};
+      const named2 = step('deploy', async () => {});
+      const j = job('ci', { runsOn: 'linux', steps: [named1, bareFn, named2] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].name).toBe('build');
+        expect(lockJob.steps[1].name).toBe('step-1');
+        expect(lockJob.steps[2].name).toBe('deploy');
+      }
+    });
+
+    it('resets step counter per job (counter scoped to job)', () => {
+      const bareFn = async () => {};
+      const j1 = job('job1', { runsOn: 'linux', steps: [bareFn, bareFn] });
+      const j2 = job('job2', { runsOn: 'linux', steps: [bareFn] });
+      const w = workflow('ci', { jobs: [j1, j2] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob1 = lockFile.workflows[0].jobs[0];
+      const lockJob2 = lockFile.workflows[0].jobs[1];
+      if (lockJob1._type === 'static' && lockJob2._type === 'static') {
+        expect(lockJob1.steps[0].name).toBe('step-1');
+        expect(lockJob1.steps[1].name).toBe('step-2');
+        expect(lockJob2.steps[0].name).toBe('step-1');
+      }
+    });
+  });
+
+  describe('job auto-IDs', () => {
+    it('assigns job-N names to UUID-named jobs', () => {
+      const j1 = job({ runsOn: 'linux', steps: [step('build', async () => {})] });
+      const j2 = job({ runsOn: 'linux', steps: [step('test', async () => {})] });
+      const w = workflow('ci', { jobs: [j1, j2] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob1 = lockFile.workflows[0].jobs[0];
+      const lockJob2 = lockFile.workflows[0].jobs[1];
+      if (lockJob1._type === 'static' && lockJob2._type === 'static') {
+        expect(lockJob1.name).toBe('job-1');
+        expect(lockJob2.name).toBe('job-2');
+      }
+    });
+
+    it('resolves needs references to renamed job-N names for UUID-named jobs', () => {
+      const build = job({ runsOn: 'linux', steps: [step('build', async () => {})] });
+      const test = job({ runsOn: 'linux', needs: [build], steps: [step('test', async () => {})] });
+      const w = workflow('ci', { jobs: [build, test] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockBuild = lockFile.workflows[0].jobs[0];
+      const lockTest = lockFile.workflows[0].jobs[1];
+      if (lockBuild._type === 'static' && lockTest._type === 'static') {
+        expect(lockBuild.name).toBe('job-1');
+        expect(lockTest.name).toBe('job-2');
+        // needs must reference the renamed name, not the original UUID
+        expect(lockTest.needs).toEqual(['job-1']);
+      }
+    });
+
+    it('resolves needs with mixed named and UUID-named jobs', () => {
+      const build = job('build', { runsOn: 'linux', steps: [step('s1', async () => {})] });
+      const lint = job({ runsOn: 'linux', steps: [step('s2', async () => {})] });
+      const test = job({
+        runsOn: 'linux',
+        needs: [build, lint],
+        steps: [step('s3', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [build, lint, test] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockBuild = lockFile.workflows[0].jobs[0];
+      const lockLint = lockFile.workflows[0].jobs[1];
+      const lockTest = lockFile.workflows[0].jobs[2];
+      if (
+        lockBuild._type === 'static' &&
+        lockLint._type === 'static' &&
+        lockTest._type === 'static'
+      ) {
+        expect(lockBuild.name).toBe('build');
+        expect(lockLint.name).toBe('job-1');
+        expect(lockTest.name).toBe('job-2');
+        // needs must resolve named job as-is and UUID job to its renamed name
+        expect(lockTest.needs).toEqual(['build', 'job-1']);
+      }
+    });
+
+    it('handles mixed named/unnamed jobs correctly (counter only increments for unnamed)', () => {
+      const j1 = job('ci', { runsOn: 'linux', steps: [step('build', async () => {})] });
+      const j2 = job({ runsOn: 'linux', steps: [step('test', async () => {})] });
+      const j3 = job('deploy', { runsOn: 'linux', steps: [step('deploy', async () => {})] });
+      const w = workflow('ci', { jobs: [j1, j2, j3] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob1 = lockFile.workflows[0].jobs[0];
+      const lockJob2 = lockFile.workflows[0].jobs[1];
+      const lockJob3 = lockFile.workflows[0].jobs[2];
+      if (
+        lockJob1._type === 'static' &&
+        lockJob2._type === 'static' &&
+        lockJob3._type === 'static'
+      ) {
+        expect(lockJob1.name).toBe('ci');
+        expect(lockJob2.name).toBe('job-1');
+        expect(lockJob3.name).toBe('deploy');
+      }
+    });
+  });
+
+  describe('run shorthand', () => {
+    it('produces a single step in lock file for run shorthand job', () => {
+      const j = job('deploy', {
+        runsOn: 'linux',
+        run: async () => {
+          return { url: 'https://example.com' };
+        },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps).toHaveLength(1);
+        // run shorthand creates a bare function, so it gets a counter name
+        expect(lockJob.steps[0].name).toBe('step-1');
+      }
+    });
+  });
+});
+
+describe('generator - context/env/concurrencyGroup', () => {
+  describe('context extraction', () => {
+    it('normalizes a static singular context to contexts[]', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        context: 'production',
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
+        expect(lockJob).not.toHaveProperty('context');
+        expect(lockJob).not.toHaveProperty('dynamicContext');
+      }
+    });
+
+    it('emits contexts[] in order, marking function elements as dynamic markers', () => {
+      const s = step('deploy', async () => {});
+      const envFn = (event: { ref: string }) => event.ref.split('/').pop();
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        contexts: ['staging', envFn as unknown as () => Promise<string>],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.contexts?.[0]).toEqual({ value: 'staging', dynamic: false });
+        // A function element carries only the dynamic marker — never an inline
+        // expression. The agent init round resolves it.
+        expect(lockJob.contexts?.[1]).toEqual({ value: '', dynamic: true });
+      }
+    });
+
+    it('marks an async function element dynamic with no inline value', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        contexts: [async () => 'staging'],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
+      }
+    });
+
+    it('emits the dynamic marker for a function context without console.warn', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        context: async () => 'staging',
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
+      }
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it('omits context fields when not set', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('contexts');
+        expect(lockJob).not.toHaveProperty('context');
+      }
+    });
+  });
+
+  describe('env extraction', () => {
+    it('extracts static env object', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        env: { NODE_ENV: 'production', CI: 'true' },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.env).toEqual({ NODE_ENV: 'production', CI: 'true' });
+        expect(lockJob).not.toHaveProperty('dynamicEnv');
+      }
+    });
+
+    it('sets dynamicEnv flag for impure (async) function env', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        env: async () => ({ NODE_ENV: 'test' }),
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.dynamicEnv).toBe(true);
+        expect(lockJob).not.toHaveProperty('env');
+      }
+    });
+
+    it('emits a dynamic marker (no inline expression) for a pure env function', () => {
+      const s = step('build', async () => {});
+      const envFn = (event: { env: string }) => ({ NODE_ENV: event.env });
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        env: envFn as unknown as () => Promise<Record<string, string>>,
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.dynamicEnv).toBe(true);
+        // No `{ _type: 'inline', expression }` value is serialized — the agent
+        // init round resolves the function.
+        expect(lockJob.env).toBeUndefined();
+      }
+    });
+
+    it('omits env fields when not set', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('env');
+        expect(lockJob).not.toHaveProperty('dynamicEnv');
+      }
+    });
+  });
+
+  describe('concurrencyGroup extraction', () => {
+    it('extracts static concurrencyGroup string', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        concurrencyGroup: 'deploy-prod',
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.concurrencyGroup).toBe('deploy-prod');
+        expect(lockJob).not.toHaveProperty('dynamicConcurrencyGroup');
+      }
+    });
+
+    it('sets dynamicConcurrencyGroup flag for function concurrencyGroup', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        concurrencyGroup: async () => 'deploy-staging',
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.dynamicConcurrencyGroup).toBe(true);
+        expect(lockJob).not.toHaveProperty('concurrencyGroup');
+      }
+    });
+
+    it('emits a dynamic marker (no inline expression) for a pure concurrencyGroup function', () => {
+      const s = step('deploy', async () => {});
+      const groupFn = (event: { ref: string }) => `deploy-${event.ref}`;
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        concurrencyGroup: groupFn as unknown as () => Promise<string>,
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.dynamicConcurrencyGroup).toBe(true);
+        // No `{ _type: 'inline', expression }` value serialized.
+        expect(lockJob).not.toHaveProperty('concurrencyGroup');
+      }
+    });
+
+    it('omits concurrencyGroup fields when not set', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('concurrencyGroup');
+        expect(lockJob).not.toHaveProperty('dynamicConcurrencyGroup');
+      }
+    });
+  });
+
+  describe('contexts removal', () => {
+    it('does not include contexts in lock job output', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('contexts');
+        expect(lockJob).not.toHaveProperty('dynamicContexts');
+      }
+    });
+  });
+
+  describe('combined fields', () => {
+    it('extracts all three fields together', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        context: 'production',
+        env: { DEPLOY_TARGET: 'aws' },
+        concurrencyGroup: 'deploy-prod',
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
+        expect(lockJob.env).toEqual({ DEPLOY_TARGET: 'aws' });
+        expect(lockJob.concurrencyGroup).toBe('deploy-prod');
+      }
+    });
+  });
+});
+
+describe('generator - hook flags', () => {
+  describe('step-level hooks', () => {
+    it('sets hasOnCancel for step with onCancel hook', () => {
+      const s = step('deploy', {
+        run: async () => {},
+        onCancel: async () => {},
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].hasOnCancel).toBe(true);
+      }
+    });
+
+    it('sets hasCleanup for step with cleanup hook', () => {
+      const s = step('deploy', {
+        run: async () => {},
+        cleanup: async () => {},
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].hasCleanup).toBe(true);
+      }
+    });
+
+    it('omits hook flags when hooks are not present', () => {
+      const s = step('simple', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0]).not.toHaveProperty('hasOnCancel');
+        expect(lockJob.steps[0]).not.toHaveProperty('hasCleanup');
+      }
+    });
+  });
+
+  describe('step-level rules', () => {
+    it('sets hasRules and rules for step with rules', () => {
+      const s = step('deploy', {
+        run: async () => {},
+        rules: [rule('only main', () => true)],
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].hasRules).toBe(true);
+        expect(lockJob.steps[0].rules).toHaveLength(1);
+        expect(lockJob.steps[0].rules![0]._type).toBe('dynamic');
+        expect(lockJob.steps[0].rules![0].label).toBe('only main');
+      }
+    });
+
+    it('omits rules when step has no rules', () => {
+      const s = step('simple', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0]).not.toHaveProperty('hasRules');
+        expect(lockJob.steps[0]).not.toHaveProperty('rules');
+      }
+    });
+  });
+
+  describe('step-level check facet flags', () => {
+    it('sets hasCheck and hasWhenInSync for a checked step', () => {
+      const s = step('cfg', {
+        drift: sdk.z.object({ want: sdk.z.string() }),
+        check: async () => ({ want: 'x' }),
+        summarize: (d) => `would write ${d.want}`,
+        run: async (_ctx, drift) => {
+          void drift;
+        },
+        whenInSync: async () => {},
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].hasCheck).toBe(true);
+        expect(lockJob.steps[0].hasWhenInSync).toBe(true);
+      }
+    });
+
+    it('omits check flags for a plain step', () => {
+      const s = step('simple', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0]).not.toHaveProperty('hasCheck');
+        expect(lockJob.steps[0]).not.toHaveProperty('hasWhenInSync');
+      }
+    });
+  });
+
+  describe('job-level hooks', () => {
+    it('sets hasOnCancel for job with onCancel hook', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        onCancel: async () => {},
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.hasOnCancel).toBe(true);
+      }
+    });
+
+    it('sets all 6 hook flags for job with all hooks', () => {
+      const hookFn = async () => {};
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        onCancel: hookFn,
+        cleanup: hookFn,
+        onSuccess: hookFn,
+        onFailure: hookFn,
+        beforeStep: hookFn,
+        afterStep: hookFn,
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.hasOnCancel).toBe(true);
+        expect(lockJob.hasCleanup).toBe(true);
+        expect(lockJob.hasOnSuccess).toBe(true);
+        expect(lockJob.hasOnFailure).toBe(true);
+        expect(lockJob.hasBeforeStep).toBe(true);
+        expect(lockJob.hasAfterStep).toBe(true);
+      }
+    });
+
+    it('sets gracePeriod on job', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        gracePeriod: 60,
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.gracePeriod).toBe(60);
+      }
+    });
+
+    it('sets timeout on job', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], timeout: 600_000 });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.timeout).toBe(600_000);
+      }
+    });
+
+    it('omits timeout when not set on job', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      expect(lockFile.workflows[0].jobs[0]).not.toHaveProperty('timeout');
+    });
+
+    it('omits hook flags when hooks are not present on job', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('hasOnCancel');
+        expect(lockJob).not.toHaveProperty('hasCleanup');
+        expect(lockJob).not.toHaveProperty('hasOnSuccess');
+        expect(lockJob).not.toHaveProperty('hasOnFailure');
+        expect(lockJob).not.toHaveProperty('hasBeforeStep');
+        expect(lockJob).not.toHaveProperty('hasAfterStep');
+        expect(lockJob).not.toHaveProperty('gracePeriod');
+        expect(lockJob).not.toHaveProperty('resources');
+      }
+    });
+
+    it('emits resources requests-only on job', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        resources: { requests: { cpus: 1, memory: '512m' } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.resources).toEqual({ requests: { cpus: 1, memory: '512m' } });
+      }
+    });
+
+    it('emits resources limits-only on job', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        resources: { limits: { cpus: 2, memory: '2g' } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.resources).toEqual({ limits: { cpus: 2, memory: '2g' } });
+      }
+    });
+
+    it('emits resources with both requests and limits', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        resources: {
+          requests: { cpus: 1, memory: '1g' },
+          limits: { cpus: 2, memory: '2g' },
+        },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.resources).toEqual({
+          requests: { cpus: 1, memory: '1g' },
+          limits: { cpus: 2, memory: '2g' },
+        });
+      }
+    });
+
+    it('rejects invalid memory format at compile time', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        resources: { requests: { memory: '512' } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(/invalid resources/);
+    });
+
+    it('rejects requests greater than limits at compile time', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        resources: {
+          requests: { cpus: 4, memory: '4g' },
+          limits: { cpus: 2, memory: '2g' },
+        },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(/must not exceed/);
+    });
+
+    it('rejects cpus > 256', () => {
+      const s = step('build', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        resources: { requests: { cpus: 1000 } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(/invalid resources/);
+    });
+  });
+
+  describe('workflow-level hooks and concurrency', () => {
+    it('sets hook flags for workflow with hooks', () => {
+      const hookFn = async () => {};
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', {
+        jobs: [j],
+        onCancel: hookFn,
+        cleanup: hookFn,
+        onSuccess: hookFn,
+        onFailure: hookFn,
+      });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockWorkflow = lockFile.workflows[0];
+      expect(lockWorkflow.hasOnCancel).toBe(true);
+      expect(lockWorkflow.hasCleanup).toBe(true);
+      expect(lockWorkflow.hasOnSuccess).toBe(true);
+      expect(lockWorkflow.hasOnFailure).toBe(true);
+    });
+
+    it('omits hook flags when workflow has no hooks', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockWorkflow = lockFile.workflows[0];
+      expect(lockWorkflow).not.toHaveProperty('hasOnCancel');
+      expect(lockWorkflow).not.toHaveProperty('hasCleanup');
+      expect(lockWorkflow).not.toHaveProperty('hasOnSuccess');
+      expect(lockWorkflow).not.toHaveProperty('hasOnFailure');
+    });
+
+    it('produces concurrency config for workflow with concurrency', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', {
+        jobs: [j],
+        concurrency: {
+          group: () => 'main',
+          cancelInProgress: true,
+        },
+      });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockWorkflow = lockFile.workflows[0];
+      expect(lockWorkflow.concurrency).toBeDefined();
+      expect(lockWorkflow.concurrency!.hasGroup).toBe(true);
+      expect(lockWorkflow.concurrency!.cancelInProgress).toBe(true);
+    });
+
+    it('produces concurrency config with max', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', {
+        jobs: [j],
+        concurrency: {
+          group: () => 'deploy',
+          max: 3,
+        },
+      });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockWorkflow = lockFile.workflows[0];
+      expect(lockWorkflow.concurrency).toBeDefined();
+      expect(lockWorkflow.concurrency!.hasGroup).toBe(true);
+      expect(lockWorkflow.concurrency!.max).toBe(3);
+      expect(lockWorkflow.concurrency).not.toHaveProperty('cancelInProgress');
+    });
+
+    it('omits concurrency when not set', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockWorkflow = lockFile.workflows[0];
+      expect(lockWorkflow).not.toHaveProperty('concurrency');
+    });
+  });
+});
+
+describe('generator - runsOn normalization and validation', () => {
+  describe('lock file normalization', () => {
+    it('passes through string runsOn as-is', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
+        expect(lockJob).not.toHaveProperty('excludeLabels');
+      }
+    });
+
+    it('passes through array runsOn as-is', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: ['linux', 'docker'], steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.runsOn).toEqual([
+          { kind: 'exact', value: 'linux' },
+          { kind: 'exact', value: 'docker' },
+        ]);
+        expect(lockJob).not.toHaveProperty('excludeLabels');
+      }
+    });
+
+    it('normalizes object runsOn with single label to matchers', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: { labels: 'linux', exclude: 'gpu' }, steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
+        expect(lockJob.excludeLabels).toEqual([{ kind: 'exact', value: 'gpu' }]);
+      }
+    });
+
+    it('normalizes object runsOn with array labels and array exclude', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: { labels: ['linux', 'docker'], exclude: ['gpu'] },
+        steps: [s],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.runsOn).toEqual([
+          { kind: 'exact', value: 'linux' },
+          { kind: 'exact', value: 'docker' },
+        ]);
+        expect(lockJob.excludeLabels).toEqual([{ kind: 'exact', value: 'gpu' }]);
+      }
+    });
+
+    it('omits excludeLabels when object runsOn has no exclude', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: { labels: 'linux' }, steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
+        expect(lockJob).not.toHaveProperty('excludeLabels');
+      }
+    });
+  });
+
+  describe('runsOnAll host fan-out', () => {
+    it('lowers runsOnAll to LockJob.runsOnAll and omits runsOn', () => {
+      const j = job('patch', {
+        runsOnAll: ['role:web', '!kici:host:web-01'],
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.runsOnAll).toEqual({
+          include: [[{ kind: 'exact', value: 'role:web' }]],
+          exclude: [{ kind: 'exact', value: 'kici:host:web-01' }],
+        });
+        expect(lockJob).not.toHaveProperty('runsOn');
+      }
+    });
+
+    it('lowers onUnreachable alongside runsOnAll', () => {
+      const j = job('patch', {
+        runsOnAll: 'role:web',
+        onUnreachable: 'fail',
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.onUnreachable).toBe('fail');
+      }
+    });
+
+    it('lowers includeUninitialized alongside runsOnAll', () => {
+      const j = job('converge', {
+        runsOnAll: 'kici:role:test',
+        includeUninitialized: true,
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.includeUninitialized).toBe(true);
+      }
+    });
+
+    it('omits includeUninitialized when not set', () => {
+      const j = job('patch', { runsOnAll: 'role:web', steps: [step('s', async () => {})] });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.includeUninitialized).toBeUndefined();
+      }
+    });
+
+    it('rejects a job that sets both runsOn and runsOnAll', () => {
+      // job() factory enforces mutual exclusion before the generator runs.
+      expect(() => job('bad', { runsOn: 'linux', runsOnAll: 'role:web', steps: [] })).toThrow(
+        /runsOn and runsOnAll are mutually exclusive/i,
+      );
+    });
+
+    it('lowers maxParallel and failFast onto the LockJob', () => {
+      const j = job('patch', {
+        runsOnAll: 'role:web',
+        maxParallel: 2,
+        failFast: true,
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.maxParallel).toBe(2);
+        expect(lockJob.failFast).toBe(true);
+      }
+    });
+
+    it('lowers maxParallel onto a matrix fan-out (fan-out-generic)', () => {
+      const j = job('build', {
+        runsOn: 'linux',
+        matrix: { os: ['a', 'b', 'c'] },
+        maxParallel: 1,
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.maxParallel).toBe(1);
+      }
+    });
+
+    it('rejects maxParallel < 1', () => {
+      const j = job('bad', {
+        runsOnAll: 'role:web',
+        maxParallel: 0,
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+        /maxParallel must be >= 1/i,
+      );
+    });
+
+    it('omits maxParallel/failFast when unset', () => {
+      const j = job('patch', { runsOnAll: 'role:web', steps: [step('s', async () => {})] });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('maxParallel');
+        expect(lockJob).not.toHaveProperty('failFast');
+      }
+    });
+  });
+
+  describe('overlap validation', () => {
+    it('throws on overlapping labels and exclude', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: { labels: ['linux'], exclude: ['linux'] },
+        steps: [s],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+        'labels and exclude overlap',
+      );
+    });
+
+    it('throws on single overlapping label (string exclude)', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: { labels: 'gpu', exclude: ['gpu', 'arm64'] },
+        steps: [s],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+        'labels and exclude overlap on [gpu]',
+      );
+    });
+
+    it('does not throw for non-overlapping labels and exclude', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: { labels: ['linux'], exclude: ['gpu'] },
+        steps: [s],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).not.toThrow();
+    });
+
+    it('does not throw for string runsOn (no validation needed)', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).not.toThrow();
+    });
+
+    it('does not throw for array runsOn (no validation needed)', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: ['linux', 'docker'], steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      expect(() => generateLockFile([makeWorkflowWithSource(w)])).not.toThrow();
+    });
+  });
+});
+
+describe('repos serialization (unified, no notRepos)', () => {
+  it('push trigger with repos including !-prefixed exclusion generates lock trigger', () => {
+    const pushTrigger = push({
+      branches: ['main'],
+      repos: ['myorg/*', '!myorg/secret-*'],
+    });
+
+    const result = transformTriggers([pushTrigger]);
+    const lockPush = result.find((t) => t._type === 'push');
+    expect(lockPush).toBeDefined();
+    expect((lockPush as any).repos).toEqual([
+      { type: 'glob', pattern: 'myorg/*' },
+      { type: 'glob', pattern: '!myorg/secret-*' },
+    ]);
+  });
+
+  it('push trigger without repos generates lock trigger WITHOUT repos field', () => {
+    const pushTrigger = push({ branches: ['main'] });
+    const result = transformTriggers([pushTrigger]);
+    const lockPush = result.find((t) => t._type === 'push');
+    expect(lockPush).toBeDefined();
+    expect('repos' in lockPush!).toBe(false);
+  });
+
+  it('push trigger with empty repos array omits repos field', () => {
+    const pushTrigger = push({ branches: ['main'] });
+    const triggerWithEmptyRepos = {
+      ...pushTrigger,
+      repos: [],
+    };
+    const result = transformTriggers([triggerWithEmptyRepos]);
+    const lockPush = result.find((t) => t._type === 'push');
+    expect(lockPush).toBeDefined();
+    expect('repos' in lockPush!).toBe(false);
+  });
+
+  it('PR trigger with repos serializes correctly', () => {
+    const prTrigger = pr({ events: ['opened'], repos: ['myorg/*'] });
+    const result = transformTriggers([prTrigger]);
+    const lockPr = result.find((t) => t._type === 'pr');
+    expect(lockPr).toBeDefined();
+    expect((lockPr as any).repos).toEqual([{ type: 'glob', pattern: 'myorg/*' }]);
+  });
+
+  it('push trigger with mixed glob + regex repos serializes correctly', () => {
+    const pushTrigger = push({
+      branches: ['main'],
+      repos: ['myorg/*', /^otherorg\/api-v\d+$/i],
+    });
+    const result = transformTriggers([pushTrigger]);
+    const lockPush = result.find((t) => t._type === 'push');
+    expect((lockPush as any).repos).toEqual([
+      { type: 'glob', pattern: 'myorg/*' },
+      { type: 'regex', pattern: '^otherorg\\/api-v\\d+$', flags: 'i' },
+    ]);
+  });
+});
+
+describe('generator - runsOn kici: selectors', () => {
+  it('accepts a kici:os: platform-fact label in runsOn', () => {
+    const j = job('build', { runsOn: 'kici:os:linux', run: async () => {} });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    expect(lockJob._type).toBe('static');
+    if (lockJob._type === 'static') {
+      expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'kici:os:linux' }]);
+    }
+  });
+
+  it('accepts an array of kici: labels in runsOn', () => {
+    const j = job('build', {
+      runsOn: ['kici:os:linux', 'kici:arch:arm64'],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    expect(lockJob._type).toBe('static');
+    if (lockJob._type === 'static') {
+      expect(lockJob.runsOn).toEqual([
+        { kind: 'exact', value: 'kici:os:linux' },
+        { kind: 'exact', value: 'kici:arch:arm64' },
+      ]);
+    }
+  });
+
+  it('accepts a scaler-assigned kici: label in runsOn (targeting is not granting)', () => {
+    const j = job('build', { runsOn: 'kici:role:builder', run: async () => {} });
+    const w = workflow('ci', { jobs: [j] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).not.toThrow();
+  });
+
+  it('still rejects labels/exclude overlap in selector form', () => {
+    const j = job('build', {
+      runsOn: { labels: ['kici:os:linux'], exclude: ['kici:os:linux'] },
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [j] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(/overlap/);
+  });
+});
+
+describe('generator - result-aware dynamicJob', () => {
+  it('serializes a result-aware dynamicJob with needs + resultAware', () => {
+    const discover = job('discover', { runsOn: 'linux', run: async () => ({ targets: ['x'] }) });
+    const reports = sdk.dynamicJob('reports', {
+      needs: ['discover', sdk.dynamicGroup('scan')],
+      generate: async () => [],
+    });
+    const w = workflow('ci', { jobs: [discover, reports] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j._type === 'dynamic');
+    expect(entry).toBeDefined();
+    if (entry?._type !== 'dynamic') throw new Error('expected dynamic entry');
+    expect(entry.resultAware).toBe(true);
+    expect(entry.group).toBe('reports');
+    // Bare string need stays a bare string; dynamicGroup normalizes to { group, runOn }.
+    expect(entry.needs).toEqual(['discover', { group: 'scan', runOn: ['success'] }]);
+  });
+
+  it('normalizes a when keyword on a needs edge to a runOn status-set', () => {
+    const build = job('build', { runsOn: 'linux', run: async () => {} });
+    const report = job('report', {
+      runsOn: 'linux',
+      needs: [{ name: 'build', when: 'on-failure' }],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [build, report] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
+    if (!entry || entry._type !== 'static') throw new Error('expected static report job');
+    // `'on-failure'` expands to every terminal status classified as a failure,
+    // which includes a job dropped by determinism drift and a job whose
+    // `runsOn` matched no agent.
+    expect(entry.needs).toEqual([
+      { name: 'build', runOn: ['failed', 'timed_out_stale', 'drift_dropped', 'unroutable'] },
+    ]);
+  });
+
+  it('normalizes a raw status-set when to a runOn set', () => {
+    const build = job('build', { runsOn: 'linux', run: async () => {} });
+    const report = job('report', {
+      runsOn: 'linux',
+      needs: [{ name: 'build', when: ['skipped', 'failed'] }],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [build, report] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
+    if (!entry || entry._type !== 'static') throw new Error('expected static report job');
+    expect(entry.needs).toEqual([{ name: 'build', runOn: ['skipped', 'failed'] }]);
+  });
+
+  it('keeps a bare-string need as a bare string', () => {
+    const build = job('build', { runsOn: 'linux', run: async () => {} });
+    const report = job('report', {
+      runsOn: 'linux',
+      needs: ['build'],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [build, report] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
+    if (!entry || entry._type !== 'static') throw new Error('expected static report job');
+    expect(entry.needs).toContain('build');
+  });
+
+  it('event-only dynamicJob has no needs and no resultAware flag', () => {
+    const shards = sdk.dynamicJob('shards', async () => []);
+    const w = workflow('ci', { jobs: [shards] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j._type === 'dynamic');
+    if (entry?._type !== 'dynamic') throw new Error('expected dynamic entry');
+    expect(entry.group).toBe('shards');
+    expect(entry.needs).toBeUndefined();
+    expect(entry.resultAware).toBeUndefined();
+  });
+
+  it("emits the generator's declared git credentials verbatim", () => {
+    const shards = sdk.dynamicJob('shards', {
+      generate: async () => [],
+      gitCredentials: {
+        default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+        forge: { kind: 'ssh', privateKeySecret: 'ci:DEPLOY_KEY' },
+      },
+    });
+    const w = workflow('ci', { jobs: [shards] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j._type === 'dynamic');
+    if (entry?._type !== 'dynamic') throw new Error('expected dynamic entry');
+    // Verbatim: the credential relay compares a request against this map field
+    // by field, so any normalization here would refuse a legitimate request.
+    expect(entry.gitCredentials).toEqual({
+      default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+      forge: { kind: 'ssh', privateKeySecret: 'ci:DEPLOY_KEY' },
+    });
+  });
+
+  it('leaves the key absent — not undefined — for a generator that declares none', () => {
+    // The emitted object shape is what the lock is hashed and diffed from, so
+    // an always-present `gitCredentials: undefined` would move every workflow's
+    // serialized entry. Assert on the serialized key set, which is what a hash
+    // and a diff actually see.
+    const entryOf = (jobs: sdk.JobOrFactory[]) => {
+      const lock = generateLockFile([makeWorkflowWithSource(workflow('ci', { jobs }))]);
+      const found = lock.workflows[0].jobs.find((j) => j._type === 'dynamic');
+      if (found?._type !== 'dynamic') throw new Error('expected dynamic entry');
+      return found;
+    };
+
+    const undeclared = entryOf([sdk.dynamicJob('shards', async () => [])]);
+    expect(Object.keys(JSON.parse(JSON.stringify(undeclared)))).toEqual([
+      '_type',
+      'source',
+      'group',
+    ]);
+
+    // Positive control: the declaring variant DOES serialize the extra key, so
+    // the assertion above distinguishes absent from present.
+    const declared = entryOf([
+      sdk.dynamicJob('shards', {
+        generate: async () => [],
+        gitCredentials: { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } },
+      }),
+    ]);
+    expect(Object.keys(JSON.parse(JSON.stringify(declared)))).toContain('gitCredentials');
+  });
+});
+
+describe('runsOn glob/regex compilation', () => {
+  it('compiles a glob runsOn to a regex LabelMatcher', () => {
+    const j = job('build', { runsOn: 'kici:host:box-*', run: async () => {} });
+    const w = workflow('w', { triggers: [push()], jobs: [j] });
+    const lock = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lock.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.runsOn?.[0].kind).toBe('regex');
+    } else {
+      throw new Error('expected static job');
+    }
+  });
+
+  it('rejects a ReDoS-prone runsOn regex at compile time', () => {
+    const j = job('build', { runsOn: /(a+)+$/, run: async () => {} });
+    const w = workflow('w', { triggers: [push()], jobs: [j] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(/ReDoS-prone/);
+  });
+
+  it('keeps a plain string runsOn as an exact matcher', () => {
+    const j = job('build', { runsOn: 'kici:os:linux', run: async () => {} });
+    const w = workflow('w', { triggers: [push()], jobs: [j] });
+    const lock = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lock.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.runsOn?.[0]).toEqual({ kind: 'exact', value: 'kici:os:linux' });
+    } else {
+      throw new Error('expected static job');
+    }
+  });
+});
+
+describe('schedule inputs in lock file', () => {
+  function findScheduleTrigger(w: ReturnType<typeof workflow>) {
+    const lock = generateLockFile([makeWorkflowWithSource(w)]);
+    return lock.workflows[0].triggers.find((t) => t._type === 'schedule');
+  }
+
+  it('extracts a defaulted schedule input descriptor into the lock', () => {
+    const w = workflow('sched-inputs', {
+      on: [
+        schedule({
+          cron: '0 0 * * *',
+          inputs: { mode: z.enum(['full', 'quick']).default('full') },
+        }),
+      ],
+      jobs: [job('j', { runsOn: ['default'], run: async () => {} })],
+    });
+    const trig = findScheduleTrigger(w);
+    expect(trig?._type).toBe('schedule');
+    if (trig?._type === 'schedule') {
+      expect(trig.inputs?.mode).toMatchObject({ type: 'enum', default: 'full' });
+    }
+  });
+
+  it('compiles an optional-no-default schedule input', () => {
+    const w = workflow('sched-opt', {
+      on: [schedule({ cron: '0 0 * * *', inputs: { note: z.string().optional() } })],
+      jobs: [job('j', { runsOn: ['default'], run: async () => {} })],
+    });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).not.toThrow();
+  });
+
+  it('rejects a required-no-default schedule input at compile time', () => {
+    const w = workflow('sched-bad', {
+      on: [schedule({ cron: '0 0 * * *', inputs: { name: z.string() } })],
+      jobs: [job('j', { runsOn: ['default'], run: async () => {} })],
+    });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+      /schedule input "name" must declare a \.default\(\) or be \.optional\(\)/,
+    );
+  });
+});
+
+describe('generator invariant throws are coded, located CompilerErrors', () => {
+  function catchThrown(fn: () => unknown): unknown {
+    try {
+      fn();
+    } catch (e) {
+      return e;
+    }
+    return undefined;
+  }
+
+  it('E110: maxParallel < 1 throws a located CompilerError anchored to the job step', () => {
+    const w = workflow('ci', {
+      jobs: [
+        job('bad', { runsOn: 'kici:os:linux', maxParallel: 0, steps: [step('x', async () => {})] }),
+      ],
+    });
+    const thrown = catchThrown(() => generateLockFile([makeWorkflowWithSource(w)]));
+    expect(isCompilerError(thrown)).toBe(true);
+    const err = thrown as CompilerError;
+    expect(err.code).toBe('E110');
+    // Anchored to the first step's real captured location (this test file), not line 1.
+    expect(err.location?.file).toContain('generator.test.ts');
+    expect(err.location?.line).toBeGreaterThan(1);
+  });
+
+  it('E115: empty parallel group throws a located CompilerError', () => {
+    const w = workflow('ci', {
+      jobs: [
+        job('bad', {
+          runsOn: 'kici:os:linux',
+          steps: [step('real', async () => {}), parallel([])],
+        }),
+      ],
+    });
+    const thrown = catchThrown(() => generateLockFile([makeWorkflowWithSource(w)]));
+    expect(isCompilerError(thrown)).toBe(true);
+    const err = thrown as CompilerError;
+    expect(err.code).toBe('E115');
+    // Falls back to the enclosing job's first step location (the "real" step).
+    expect(err.location?.file).toContain('generator.test.ts');
+    expect(err.location?.line).toBeGreaterThan(1);
+  });
+
+  it('E108: a manually-constructed job with both runsOn and runsOnAll is a located CompilerError', () => {
+    // The SDK job() factory guards this, so build the invalid job by hand to
+    // exercise the generator's defense-in-depth invariant.
+    const base = job('bad', { runsOn: 'kici:os:linux', steps: [step('x', async () => {})] });
+    const both = { ...base, runsOnAll: 'kici:os:linux' } as Job;
+    const w = workflow('ci', { jobs: [both] });
+    const thrown = catchThrown(() => generateLockFile([makeWorkflowWithSource(w)]));
+    expect(isCompilerError(thrown)).toBe(true);
+    const err = thrown as CompilerError;
+    expect(err.code).toBe('E108');
+    expect(err.location?.line).toBeGreaterThan(1);
+  });
+});
+
+describe('TextMatch serialization', () => {
+  it('normalizes scalars to arrays and RegExp to /pattern/flags', () => {
+    const [trigger] = transformTriggers([
+      push({ branches: 'main', commitMessage: { contains: 'release:', matches: /^feat/i } }),
+    ]);
+    expect(trigger).toMatchObject({
+      _type: 'push',
+      commitMessage: { contains: ['release:'], matches: ['/^feat/i'] },
+    });
+  });
+
+  it('keeps a /pattern/flags string verbatim', () => {
+    const [trigger] = transformTriggers([
+      push({ commitMessage: { notMatches: '/^chore\\(deps\\):/' } }),
+    ]);
+    expect(trigger).toMatchObject({ commitMessage: { notMatches: ['/^chore\\(deps\\):/'] } });
+  });
+
+  it('omits commitMessage entirely when not declared', () => {
+    const [trigger] = transformTriggers([push({ branches: 'main' })]);
+    expect(trigger).not.toHaveProperty('commitMessage');
+  });
+
+  describe('regex flags round-trip through the lock', () => {
+    /** Serialize a `matches` entry and read it back the way the engine does. */
+    function roundTrip(entry: RegExp | string): { stored: string; matched: boolean } {
+      const [trigger] = transformTriggers([push({ commitMessage: { matches: entry } })]);
+      const stored = (trigger as unknown as { commitMessage: { matches: string[] } }).commitMessage
+        .matches[0];
+      const re = compileSafeRegex(stored);
+      return { stored, matched: re?.test('release-12') ?? false };
+    }
+
+    // `d` (ES2022 hasIndices) and `v` (ES2024 unicodeSets) are legal in a repo
+    // targeting ES2024. When the unwrapper's flag class stopped at `[gimsuy]`
+    // they failed to unwrap, the whole `/release-\d+/v` string became the
+    // pattern, and the lock stored a regex matching literal slashes — green at
+    // compile time, never matching at run time.
+    it.each([
+      ['d', /release-\d+/d],
+      ['i', /release-\d+/i],
+      ['m', /release-\d+/m],
+      ['s', /release-\d+/s],
+      ['u', /release-\d+/u],
+      ['v', /release-\d+/v],
+    ])('preserves the %s flag and still matches', (flag, entry) => {
+      const { stored, matched } = roundTrip(entry);
+      expect(stored).toBe(`/release-\\d+/${flag}`);
+      expect(matched).toBe(true);
+    });
+
+    it.each([
+      ['g', /release-\d+/g],
+      ['y', /release-\d+/y],
+      ['gy', /release-\d+/gy],
+    ])('drops the stateful %s flag', (_flag, entry) => {
+      const { stored, matched } = roundTrip(entry);
+      expect(stored).toBe('/release-\\d+/');
+      expect(matched).toBe(true);
+    });
+
+    it('drops g from a /pattern/flags string while keeping the rest', () => {
+      expect(roundTrip('/release-\\d+/gi').stored).toBe('/release-\\d+/i');
+    });
+  });
+
+  it('copies commitMessage onto the tag trigger a push({ tags }) config emits', () => {
+    const triggers = transformTriggers([
+      push({ tags: ['v*'], commitMessage: { contains: 'release:' } }),
+    ]);
+    expect(triggers).toHaveLength(2);
+    expect(triggers[1]).toMatchObject({ _type: 'tag', commitMessage: { contains: ['release:'] } });
+  });
+
+  it('rejects a matcher with no query key', () => {
+    expect(() => transformTriggers([push({ commitMessage: {} })])).toThrow(/nothing to check/);
+  });
+
+  it('rejects ignoreCase with only regex keys', () => {
+    expect(() =>
+      transformTriggers([push({ commitMessage: { matches: /x/, ignoreCase: true } })]),
+    ).toThrow(/ignoreCase/);
+  });
+
+  it('rejects an empty needle list and an empty-string needle', () => {
+    expect(() => transformTriggers([push({ commitMessage: { contains: [] } })])).toThrow(
+      /nothing to check/,
+    );
+    expect(() => transformTriggers([push({ commitMessage: { contains: [''] } })])).toThrow(/empty/);
+  });
+
+  it('rejects a ReDoS-prone regex', () => {
+    expect(() => transformTriggers([push({ commitMessage: { matches: '/(a+)+$/' } })])).toThrow(
+      /ReDoS/,
+    );
+  });
+});
+
+describe('content requirement text keys', () => {
+  it('normalizes the new keys and keeps them as raw-text queries', () => {
+    const [trigger] = transformTriggers([
+      push({ requires: [{ file: 'Dockerfile', contains: 'FROM node:', notMatches: [/-rc\d+$/] }] }),
+    ]);
+    expect(trigger).toMatchObject({
+      requires: [
+        {
+          file: 'Dockerfile',
+          format: 'text',
+          contains: ['FROM node:'],
+          notMatches: ['/-rc\\d+$/'],
+        },
+      ],
+    });
+  });
+
+  it('rejects a raw-text key on a json file', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'a.json', contains: 'x' }] })]),
+    ).toThrow(/cannot carry a raw-text key/);
+  });
+
+  it('rejects a raw-text key on a json file even when a json query coexists', () => {
+    expect(() =>
+      transformTriggers([
+        push({ requires: [{ file: 'a.json', match: { '$.version': 1 }, contains: 'x' }] }),
+      ]),
+    ).toThrow(/cannot carry a raw-text key/);
+  });
+
+  it('rejects a raw-text key combined with absent', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'a.txt', absent: true, contains: 'x' }] })]),
+    ).toThrow(/mutually exclusive/);
+  });
+});

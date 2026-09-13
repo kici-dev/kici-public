@@ -1,0 +1,22 @@
+{
+  "ref": "refs/heads/main",
+  "before": "dddddddddddddddddddddddddddddddddddddddd",
+  "after": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "repository": {
+    "id": 8,
+    "owner": { "login": "team" },
+    "name": "project",
+    "full_name": "team/project",
+    "default_branch": "main"
+  },
+  "commits": [
+    {
+      "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "message": "fix: bug",
+      "added": [],
+      "modified": ["src/a.go", "src/b.go"],
+      "removed": ["src/old.go"]
+    }
+  ],
+  "sender": { "login": "bob" }
+}

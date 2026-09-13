@@ -1,0 +1,1473 @@
+/**
+ * Shared versioned directory upgrade logic for kici-admin upgrade commands.
+ *
+ * Implements the versioned directory layout:
+ * - Extract new version alongside old versions
+ * - Update symlink (Unix) or service registration (Windows) atomically
+ * - Preserve old versions for rollback
+ * - Optional cleanup of old versions
+ */
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { execSync, spawnSync } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { select } from '@inquirer/prompts';
+import {
+  DEFAULT_RESTART_POLICY,
+  isRoot,
+  kiciConfigRoot,
+  readKiciVersion,
+  resolveInstanceTarget,
+  resolveNpmInstallTarget,
+  resolveVersionFromLaunchSpec,
+  writeManifest,
+  type NpmInstallTarget,
+  type ResolvedInstance,
+  type ServiceManager,
+  type ServicePlatform,
+} from '../../service/index.js';
+import type { LaunchSpec, ServiceConfig } from '../../service/types.js';
+import { toErrorMessage } from '@kici-dev/shared';
+import {
+  appliedHead,
+  backupRefusalMessage,
+  drainTimeoutMessage,
+  mergeMigrationHead,
+  readLiveMigrationRows,
+  schemaGuardVerdict,
+  type MigrationStatusRow,
+} from './upgrade-safety.js';
+import { makeTempDir } from '@kici-dev/shared/tmp';
+
+/** Component types that can be upgraded. */
+type UpgradeComponent = 'orchestrator' | 'agent';
+
+/** Options for the versioned upgrade command. */
+interface VersionedUpgradeOptions {
+  platform?: ServicePlatform;
+  /**
+   * Service name. No default — targeting flows through {@link resolveInstanceTarget}
+   * which consumes `name`, `instanceDir`, or the CWD manifest in priority order.
+   */
+  name?: string;
+  /** Deploy folder of the instance to upgrade. */
+  instanceDir?: string;
+  from?: string;
+  url?: string;
+  version?: string;
+  yes?: boolean;
+  cleanup?: boolean;
+  rollback?: boolean;
+  pick?: boolean;
+  force?: boolean;
+  /**
+   * Opt-in escape hatch: restart the already-installed package without
+   * self-driving the npm install (the pre-staged / air-gapped path).
+   */
+  restartOnly?: boolean;
+  /** Skip the pre-upgrade dump. Loud: printed as a banner and echoed at the end. */
+  skipBackup?: boolean;
+  /** Where the pre-upgrade dump goes. Defaults to `<instanceDir>/backups`. */
+  backupDir?: string;
+  /** Skip quiescing the coordinator before the restart. */
+  noDrain?: boolean;
+  /** Seconds to wait for in-flight jobs to finish. Default 300. */
+  drainTimeout?: string;
+  /**
+   * On a rollback whose database is ahead of the target, revert the schema to
+   * the target's recorded head first, through the still-running newer service.
+   */
+  migrateDown?: boolean;
+}
+
+/**
+ * The orchestrator-only pre-stop steps, injected so the agent upgrade can pass
+ * none and stay unchanged, and so each is testable without a live service.
+ */
+export interface UpgradeHooks {
+  /** Read the live migration ledger from the running service. */
+  migrationStatus?: () => Promise<{ migrations: MigrationStatusRow[] }>;
+  /** Put the coordinator into drain and poll until quiesced. */
+  drain?: (timeoutSeconds: number) => Promise<{ quiesced: boolean; jobsRunning: number }>;
+  /** Revert the schema to `head` through the running service. */
+  migrateDown?: (head: string) => Promise<void>;
+  /**
+   * Take the pre-upgrade dump, returning where it landed.
+   *
+   * `envFilePath` comes from the instance manifest, so the dump is taken
+   * against exactly the database the running service uses rather than whatever
+   * the operator's shell exports.
+   */
+  backup?: (args: {
+    outputPath: string;
+    envFilePath: string;
+  }) => Promise<{ outputPath: string; byteSize: number }>;
+}
+
+/**
+ * Resolved upgrade target: the manifest-backed ServiceConfig the upgrade
+ * flow operates on, the manifest's installBase (NOT re-derived from name),
+ * and the underlying resolved instance for downstream writes.
+ */
+export interface UpgradeTarget {
+  config: ServiceConfig;
+  installBase: string;
+  resolvedInstance: ResolvedInstance;
+  /** The driver that manages this install — built for {@link UpgradeTarget.platform}. */
+  manager: ServiceManager;
+  /**
+   * The install's own platform: `platformOverride ?? manifest.platform`. Every
+   * downstream question the upgrade asks — the root check, the launcher name,
+   * whether the current version reads a symlink or a version file — is about
+   * the layout on disk, so it is answered from the install, not the host.
+   */
+  platform: ServicePlatform;
+}
+
+/**
+ * Resolve the upgrade target via the folder-anchored model and build the
+ * ServiceConfig + installBase the rest of the upgrade flow needs.
+ *
+ * Priority chain (delegated to {@link resolveInstanceTarget}):
+ *   1. `opts.instanceDir` — read manifest at that path.
+ *   2. `opts.name`        — match against listInstances() output.
+ *   3. CWD manifest       — read `./.kici-<component>.json`.
+ *   4. otherwise          — refuse with a candidate-list error.
+ *
+ * The returned `installBase` comes from the manifest, NEVER re-derived from
+ * the service name. Instances installed with a non-default base must
+ * continue to resolve to that base on upgrade.
+ */
+export async function resolveUpgradeTarget(args: {
+  component: UpgradeComponent;
+  opts: { instanceDir?: string; name?: string };
+  /** The `--platform` flag. When set it forces the driver, as it always has. */
+  platformOverride?: ServicePlatform;
+  isUserLevel: boolean;
+  kiciRoot: string;
+  /** Driver factory. Defaults to the service barrel's createServiceManager. */
+  createManager?: (platform: ServicePlatform) => Promise<ServiceManager>;
+}): Promise<UpgradeTarget> {
+  const { component, opts, isUserLevel, kiciRoot } = args;
+  const { resolved, manager, platform } = await resolveInstanceTarget({
+    component,
+    opts: { instanceDir: opts.instanceDir, name: opts.name },
+    cwd: process.cwd(),
+    kiciRoot,
+    platformOverride: args.platformOverride,
+    isUserLevel,
+    createManager: args.createManager,
+  });
+  const config: ServiceConfig = {
+    name: resolved.manifest.name,
+    displayName: `KiCI ${component}`,
+    description: `KiCI ${component} service`,
+    executablePath: '',
+    envFilePath: resolved.manifest.envFilePath,
+    workingDirectory: resolved.manifest.configDir,
+    isUserLevel: resolved.manifest.isUserLevel,
+    // Share the one restart-policy constant every other lifecycle command uses.
+    // A re-spelled copy here would drift the moment the policy changes, and on
+    // Windows this config is what `upgrade` re-registers the service from.
+    restartPolicy: DEFAULT_RESTART_POLICY,
+    component,
+    // Re-embed the deploy-folder marker so an upgraded unit keeps recovery
+    // working even if the instance index is later lost.
+    instanceDir: resolved.instanceDir,
+  };
+  return {
+    config,
+    installBase: resolved.manifest.installBase,
+    resolvedInstance: resolved,
+    manager,
+    platform,
+  };
+}
+
+/** Prompt the user for confirmation (returns true if yes). */
+async function confirm(message: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${message} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
+    });
+  });
+}
+
+/** Download a file from a URL to a local path. */
+async function downloadArchive(url: string, destPath: string): Promise<void> {
+  console.log(`Downloading from ${url}...`);
+  const res = await fetch(url);
+  if (!res.ok || !res.body) {
+    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  }
+  const fileStream = createWriteStream(destPath);
+  await pipeline(res.body, fileStream);
+  console.log(`Downloaded to ${destPath}`);
+}
+
+/**
+ * Install base for a KiCI component instance.
+ *
+ * Name-scoped so that two instances of the same component (e.g. an org's
+ * dogfood orchestrator and an E2E test orchestrator) own independent
+ * versioned trees and symlinks. Per-platform bases:
+ *   - systemd / compose: /opt/kici/<name>/
+ *   - launchd:           /usr/local/kici/<name>/
+ *   - windows:           C:\Program Files\KiCI\<name>\
+ */
+export function getInstallBase(platform: ServicePlatform, name: string): string {
+  const sep = platform === 'windows' ? '\\' : '/';
+  switch (platform) {
+    case 'systemd':
+    case 'compose':
+      return `/opt/kici/${name}${sep}`;
+    case 'launchd':
+      return `/usr/local/kici/${name}${sep}`;
+    case 'windows':
+      return `C:\\Program Files\\KiCI\\${name}${sep}`;
+  }
+}
+
+/** A choice row for the `--pick` interactive select. */
+export interface PickChoice {
+  value: string;
+  name: string;
+  /** `false` when selectable; a reason string when disabled (inquirer renders it). */
+  disabled: boolean | string;
+}
+
+/**
+ * Build the interactive `--pick` choices, newest-first (lexicographic, matching
+ * the rest of the versioned-directory handling). The currently-active version is
+ * labeled `(current)` and disabled so it cannot be selected — picking it would be
+ * a no-op restart.
+ */
+export function buildPickChoices(versions: string[], current: string | null): PickChoice[] {
+  return [...versions]
+    .sort()
+    .reverse()
+    .map((v) => ({
+      value: v,
+      name: v === current ? `${v} (current)` : v,
+      disabled: v === current ? 'current version' : false,
+    }));
+}
+
+/**
+ * The versions a `--pick` switch may target: every installed version except the
+ * currently-active one. Empty when only the current version (or nothing) is
+ * installed — the caller turns that into a "nothing to pick" error.
+ */
+export function selectablePickTargets(versions: string[], current: string | null): string[] {
+  return versions.filter((v) => v !== current);
+}
+
+/**
+ * Validate that `--pick` is not combined with a source/mode flag it conflicts
+ * with. `--pick` activates an already-installed version, so it never downloads
+ * (`--from`/`--url`), never takes an explicit `--version`, and is its own mode
+ * (not `--rollback`/`--cleanup`). Returns an error message, or null when OK.
+ */
+export function checkPickFlagConflicts(opts: {
+  pick?: boolean;
+  from?: string;
+  url?: string;
+  version?: string;
+  rollback?: boolean;
+  cleanup?: boolean;
+}): string | null {
+  if (!opts.pick) return null;
+  const conflicts: string[] = [];
+  if (opts.from) conflicts.push('--from');
+  if (opts.url) conflicts.push('--url');
+  if (opts.version) conflicts.push('--version');
+  if (opts.rollback) conflicts.push('--rollback');
+  if (opts.cleanup) conflicts.push('--cleanup');
+  if (conflicts.length === 0) return null;
+  return (
+    `--pick cannot be combined with ${conflicts.join(', ')}. ` +
+    `--pick activates an already-installed version; it never downloads or takes an explicit version.`
+  );
+}
+
+/** Check if the platform is Windows. */
+function isWindows(platform: ServicePlatform): boolean {
+  return platform === 'windows';
+}
+
+/** Get the launcher script name for a component. */
+function getLauncherName(component: UpgradeComponent, platform: ServicePlatform): string {
+  const baseName = component === 'orchestrator' ? 'kici-orchestrator-standalone' : 'kici-agent';
+  return isWindows(platform) ? `${baseName}.cmd` : baseName;
+}
+
+/**
+ * Extract an archive (.tar.gz or .zip) to a destination directory.
+ * Returns the name of the top-level directory inside the archive.
+ */
+function extractArchive(archivePath: string, destDir: string): string {
+  fs.mkdirSync(destDir, { recursive: true });
+
+  if (archivePath.endsWith('.zip')) {
+    // Windows-style zip extraction
+    if (os.platform() === 'win32') {
+      execSync(
+        `powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force"`,
+        { stdio: 'inherit' },
+      );
+    } else {
+      execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'inherit' });
+    }
+  } else {
+    // tar.gz extraction
+    execSync(`tar -xzf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
+  }
+
+  // Find the top-level directory in the extracted content
+  const entries = fs.readdirSync(destDir);
+  const dirs = entries.filter((e) => fs.statSync(path.join(destDir, e)).isDirectory());
+  if (dirs.length === 0) {
+    throw new Error('Archive does not contain a directory');
+  }
+  return dirs[0]!;
+}
+
+/**
+ * List installed versions for a component by scanning the install base directory
+ * for directories matching `{component}-{version}/`.
+ */
+function listInstalledVersions(installBase: string, component: UpgradeComponent): string[] {
+  if (!fs.existsSync(installBase)) return [];
+  const prefix = `${component}-`;
+  return fs
+    .readdirSync(installBase)
+    .filter((entry) => {
+      if (!entry.startsWith(prefix)) return false;
+      const fullPath = path.join(installBase, entry);
+      return fs.statSync(fullPath).isDirectory();
+    })
+    .map((entry) => entry.slice(prefix.length))
+    .sort();
+}
+
+/**
+ * Read the current symlink target to determine the active version.
+ * Returns null if no symlink exists or on Windows.
+ */
+function getCurrentVersion(
+  installBase: string,
+  component: UpgradeComponent,
+  platform: ServicePlatform,
+): string | null {
+  if (isWindows(platform)) {
+    // On Windows, there's no symlink — track current version in a text file
+    const versionFile = path.join(installBase, `${component}-current-version.txt`);
+    try {
+      return fs.readFileSync(versionFile, 'utf-8').trim();
+    } catch {
+      return null;
+    }
+  }
+
+  const symlinkPath = path.join(installBase, component);
+  try {
+    const target = fs.readlinkSync(symlinkPath);
+    const prefix = `${component}-`;
+    if (target.startsWith(prefix)) {
+      return target.slice(prefix.length);
+    }
+    // Handle absolute paths
+    const basename = path.basename(target);
+    if (basename.startsWith(prefix)) {
+      return basename.slice(prefix.length);
+    }
+  } catch {
+    // Symlink doesn't exist or isn't a symlink
+  }
+  return null;
+}
+
+/** Write the current version to a tracking file (used on Windows). */
+function writeCurrentVersion(
+  installBase: string,
+  component: UpgradeComponent,
+  version: string,
+): void {
+  const versionFile = path.join(installBase, `${component}-current-version.txt`);
+  fs.writeFileSync(versionFile, version, 'utf-8');
+}
+
+/**
+ * Update the symlink atomically on Unix.
+ * Creates a temporary symlink then renames it over the existing one.
+ */
+function updateSymlinkAtomic(
+  installBase: string,
+  component: UpgradeComponent,
+  version: string,
+): void {
+  const symlinkPath = path.join(installBase, component);
+  const tmpLink = `${symlinkPath}.tmp.${Date.now()}`;
+  const target = `${component}-${version}`;
+
+  try {
+    // Create temp symlink pointing at the new versioned directory (relative path)
+    fs.symlinkSync(target, tmpLink);
+    // Atomic rename over existing symlink
+    fs.renameSync(tmpLink, symlinkPath);
+  } catch (err) {
+    // Clean up temp link if rename failed
+    try {
+      fs.unlinkSync(tmpLink);
+    } catch {
+      // Ignore cleanup errors
+    }
+    throw err;
+  }
+}
+
+/**
+ * Perform a versioned directory upgrade for a KiCI component.
+ *
+ * Flow:
+ * 1. Parse upgrade source (--from archive or --url)
+ * 2. Determine install base by platform
+ * 3. Extract new versioned directory
+ * 4. Stop service
+ * 5. Update symlink (Unix) or service registration (Windows)
+ * 6. Start service
+ */
+/**
+ * Resolve the target version for an npm-source upgrade (no --from/--url).
+ *
+ * The npm-source flow assumes the operator already ran
+ * `npm install -g @kici-dev/<pkg>@<version>`, which overwrites the global
+ * package in place. The running `kici-admin` binary is therefore the new
+ * version, and `running` is its self-reported version. We default the target
+ * to it, or validate an explicitly-passed --version matches — a mismatch means
+ * the npm install did not actually update the global binary.
+ */
+export function resolveNpmSourceVersion(opts: {
+  requested: string | undefined;
+  running: string;
+}): string {
+  if (opts.running === 'unknown' || opts.running.trim() === '') {
+    throw new Error(
+      'npm-source upgrade: could not determine the running package version. ' +
+        'Pass --from <archive> / --url <url> + --version for an archive-based upgrade instead.',
+    );
+  }
+  if (opts.requested && opts.requested !== opts.running) {
+    throw new Error(
+      `npm-source upgrade: requested --version ${opts.requested} does not match the installed ` +
+        `package version ${opts.running}. Run \`npm install -g @kici-dev/<pkg>@${opts.requested}\` first, ` +
+        `then re-run the upgrade.`,
+    );
+  }
+  return opts.running;
+}
+
+/** Verdict from {@link verifyNpmSourceLaunch}. */
+export type NpmSourceLaunchVerdict =
+  { ok: true; version: string; manifestVersion: string | null } | { ok: false; reason: string };
+
+/**
+ * Decide whether an npm-source upgrade may proceed, given the version the
+ * invoking CLI is (`invoked`) and the version the installed unit will actually
+ * launch (`launched`, or null when unresolvable — e.g. an opaque --binary
+ * install). On success `manifestVersion` is the value to persist (null = leave
+ * the manifest's kiciVersion unchanged because we couldn't verify it).
+ */
+export function verifyNpmSourceLaunch(opts: {
+  component: UpgradeComponent;
+  invoked: string;
+  launched: string | null;
+  launchedPath: string | null;
+  force: boolean;
+}): NpmSourceLaunchVerdict {
+  const { component, invoked, launched, launchedPath, force } = opts;
+  if (launched === null) {
+    if (force) return { ok: true, version: invoked, manifestVersion: null };
+    return {
+      ok: false,
+      reason:
+        'npm-source upgrade aborted: could not determine the version the installed unit ' +
+        'will launch (custom --binary install or unparseable launch target). Pass --force ' +
+        'to restart without version verification (the manifest version is left unchanged).',
+    };
+  }
+  if (launched !== invoked) {
+    const via = launchedPath ? ` (via ${launchedPath})` : '';
+    return {
+      ok: false,
+      reason:
+        `npm-source upgrade aborted: this kici-admin is version ${invoked}, but the ` +
+        `installed unit will launch version ${launched}${via}. Your \`npm install -g\` ` +
+        `updated a different install than the service is pinned to. Install ${invoked} ` +
+        `under the unit's runtime (the node its ExecStart points at), or re-run ` +
+        `\`kici-admin ${component} install\` to repoint the unit, then retry.`,
+    };
+  }
+  return { ok: true, version: launched, manifestVersion: launched };
+}
+
+/**
+ * An npm-source upgrade proceeds one of three ways: restart the already-installed
+ * package (`restart-only`, carrying a {@link NpmSourceLaunchVerdict}), self-drive
+ * the install of a resolved target under the unit's own runtime (`self-drive`),
+ * or refuse with an operator-facing message (`error`).
+ */
+export type NpmSourceUpgradeAction =
+  | { kind: 'restart-only'; verdict: NpmSourceLaunchVerdict }
+  | { kind: 'self-drive'; target: NpmInstallTarget; version: string }
+  | { kind: 'error'; reason: string };
+
+/**
+ * Decide how an npm-source upgrade proceeds. `restart-only` re-verifies and
+ * restarts the already-installed package (the pre-staged / air-gapped path).
+ * The default self-drives: it resolves the global package + pinned node from
+ * the unit's launch spec so the CLI can install the target itself. Returns an
+ * `error` action (not a throw) for the two operator-facing refusals.
+ */
+export function planNpmSourceUpgrade(opts: {
+  component: UpgradeComponent;
+  spec: LaunchSpec | null;
+  invoked: string;
+  requestedVersion: string | undefined;
+  restartOnly: boolean;
+  force: boolean;
+  windows: boolean;
+}): NpmSourceUpgradeAction {
+  const { component, spec, invoked, requestedVersion, restartOnly, force, windows } = opts;
+
+  if (restartOnly) {
+    const launched = spec ? resolveVersionFromLaunchSpec(spec, component) : null;
+    const verdict = verifyNpmSourceLaunch({
+      component,
+      invoked,
+      launched,
+      launchedPath: spec?.execPath ?? null,
+      force,
+    });
+    return { kind: 'restart-only', verdict };
+  }
+
+  if (!requestedVersion) {
+    return {
+      kind: 'error',
+      reason:
+        'self-driving upgrade requires --version <target> (the version to install). ' +
+        'Pass --restart-only to restart the already-installed package without installing.',
+    };
+  }
+
+  const target = spec ? resolveNpmInstallTarget(spec, component, { windows }) : null;
+  if (!target) {
+    return {
+      kind: 'error',
+      reason:
+        "npm-source upgrade cannot self-install: the unit's launch target is a custom " +
+        '--binary install or a non-node_modules path, so there is no global package to update. ' +
+        'Use an archive upgrade (--from <archive> / --url <url> + --version), or pre-install the ' +
+        'package and re-run with --restart-only.',
+    };
+  }
+  return { kind: 'self-drive', target, version: requestedVersion };
+}
+
+/** Injected process runner seam for {@link installGlobalPackage}. */
+type SpawnRunner = (
+  cmd: string,
+  args: string[],
+  opts?: { env?: NodeJS.ProcessEnv },
+) => { status: number | null; stderr: string };
+
+const defaultSpawnRunner: SpawnRunner = (cmd, args, opts) => {
+  const r = spawnSync(cmd, args, {
+    encoding: 'utf-8',
+    shell: process.platform === 'win32',
+    env: opts?.env ?? process.env,
+  });
+  return { status: r.status, stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
+};
+
+/**
+ * Install `<owningPackage>@<version>` globally under the unit's own pinned node,
+ * so it lands in exactly the global prefix the unit's ExecStart resolves from.
+ *
+ * npm derives its global prefix from the node that *runs* npm-cli.js, not from
+ * the location of the npm script — and the unit's `<pinned>/bin/npm` is a
+ * `#!/usr/bin/env node` shebang (or a version-manager bash wrapper invoking a
+ * bare `node`), both of which resolve `node` off PATH. So invoking that npm
+ * bare would inherit whatever node the shell has active — exactly the
+ * version-manager (mise/nvm/asdf) drift this upgrade exists to fix. We prepend
+ * the pinned node's bin dir to PATH so npm always runs under the unit's node
+ * and computes the unit's prefix, regardless of the caller's active node. The
+ * `run` seam is injected in tests.
+ */
+export function installGlobalPackage(
+  target: NpmInstallTarget,
+  version: string,
+  run: SpawnRunner = defaultSpawnRunner,
+): { ok: boolean; stderr: string } {
+  const pinnedBinDir = path.dirname(target.nodeExecPath);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${pinnedBinDir}${path.delimiter}${process.env.PATH ?? ''}`,
+  };
+  const res = run(target.npmPath, ['install', '-g', `${target.owningPackage}@${version}`], { env });
+  return { ok: res.status === 0, stderr: res.stderr };
+}
+
+/**
+ * Take the pre-upgrade dump and quiesce the coordinator, then report the head
+ * the CURRENT version was running at so the manifest can record it.
+ *
+ * Everything here runs while the service is still up, which is the point: the
+ * dump needs a live database, the drain needs a live admin API, and the head
+ * has to be read from the version that is about to be replaced.
+ */
+async function runPreStopSafety(args: {
+  component: UpgradeComponent;
+  opts: VersionedUpgradeOptions;
+  hooks: UpgradeHooks;
+  resolvedInstance: ResolvedInstance;
+}): Promise<{ map: Record<string, string> | undefined }> {
+  const { component, opts, hooks, resolvedInstance } = args;
+  const manifest = resolvedInstance.manifest;
+
+  // An agent has no database and no drain. Nothing below applies to it.
+  if (component !== 'orchestrator') return { map: manifest.migrationHeads };
+
+  // Record the head the version being replaced was running at, so a later
+  // rollback to it can be checked.
+  const rows = hooks.migrationStatus ? await readLiveMigrationRows(hooks.migrationStatus) : null;
+  const map = rows
+    ? mergeMigrationHead(manifest.migrationHeads, manifest.kiciVersion, appliedHead(rows))
+    : manifest.migrationHeads;
+
+  // Pre-upgrade backup — unconditional, with a loud opt-out. The conditional
+  // form would need a recorded head, which is absent on exactly the
+  // pre-existing installs most at risk, so it would evaluate to "skip" for
+  // every customer upgrading for the first time under this change.
+  if (opts.skipBackup) {
+    console.log('');
+    console.log('  !!  --skip-backup: no pre-upgrade dump will be taken.');
+    console.log('      If this upgrade goes wrong there is nothing to restore from.');
+    console.log('');
+  } else if (hooks.backup) {
+    const dir = opts.backupDir ?? path.join(resolvedInstance.instanceDir, 'backups');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const target = opts.version ?? 'next';
+    const outputPath = path.join(
+      dir,
+      `pre-upgrade-${manifest.kiciVersion}-${target}-${stamp}.dump`,
+    );
+    console.log('Taking a pre-upgrade backup...');
+    try {
+      const res = await hooks.backup({ outputPath, envFilePath: manifest.envFilePath });
+      console.log(`Backup written: ${res.outputPath} (${res.byteSize} bytes)`);
+    } catch (err) {
+      console.error(backupRefusalMessage(toErrorMessage(err)));
+      process.exit(1);
+    }
+  }
+
+  // Drain — default on. Every mechanism already existed and was already
+  // documented as the pre-upgrade step; the only missing piece was the call.
+  if (!opts.noDrain && hooks.drain) {
+    const timeoutSeconds = Number.parseInt(opts.drainTimeout ?? '300', 10);
+    console.log(`Draining (waiting up to ${timeoutSeconds}s for in-flight jobs)...`);
+    try {
+      const result = await hooks.drain(timeoutSeconds);
+      if (!result.quiesced) {
+        console.error(drainTimeoutMessage(result.jobsRunning, timeoutSeconds));
+        process.exit(1);
+      }
+      console.log('Coordinator quiesced.');
+    } catch (err) {
+      // Unreachable is not the same as "jobs are still running". An install
+      // whose CLI has no admin URL or token cannot reach the drain route at
+      // all, and refusing there would break the documented upgrade for every
+      // one of them — a hard break of a path that never drained before. Warn
+      // and continue; a drain that WAS requested and timed out still refuses,
+      // because that one is real evidence of in-flight work.
+      console.log('');
+      console.log(`  !!  The coordinator could not be drained: ${toErrorMessage(err)}`);
+      console.log('      Any in-flight jobs will fail when the service restarts.');
+      console.log('      Configure the admin API (--url / --token) to drain first.');
+      console.log('');
+    }
+  }
+
+  // The restarted process comes back accepting: the drain flag is in-memory,
+  // so no resume step is needed.
+  return { map };
+}
+
+export async function performVersionedUpgrade(
+  component: UpgradeComponent,
+  opts: VersionedUpgradeOptions,
+  hooks: UpgradeHooks = {},
+): Promise<void> {
+  try {
+    const userLevel = !isRoot();
+    const kiciRoot = kiciConfigRoot(userLevel);
+
+    const { config, installBase, resolvedInstance, manager, platform } = await resolveUpgradeTarget(
+      {
+        component,
+        opts: { instanceDir: opts.instanceDir, name: opts.name },
+        platformOverride: opts.platform,
+        isUserLevel: userLevel,
+        kiciRoot,
+      },
+    );
+
+    // Check root on Unix (required for /opt/kici/ and /usr/local/kici/)
+    if (!isWindows(platform) && !userLevel && !isRoot()) {
+      console.error('Error: root privileges required to upgrade system-level services');
+      process.exit(1);
+    }
+
+    // Validate --pick flag combination up front.
+    const pickConflict = checkPickFlagConflicts(opts);
+    if (pickConflict) {
+      console.error(`Error: ${pickConflict}`);
+      process.exit(1);
+    }
+
+    // Handle --pick (interactive switch to an installed version)
+    if (opts.pick) {
+      await handlePick(
+        component,
+        platform,
+        installBase,
+        config,
+        manager,
+        resolvedInstance,
+        opts,
+        hooks,
+      );
+      return;
+    }
+
+    // Handle --rollback
+    if (opts.rollback) {
+      await handleRollback(
+        component,
+        platform,
+        installBase,
+        config,
+        manager,
+        resolvedInstance,
+        opts,
+        hooks,
+      );
+      return;
+    }
+
+    // Handle --cleanup
+    if (opts.cleanup) {
+      await handleCleanup(component, platform, installBase);
+      return;
+    }
+
+    // No archive source: npm-source upgrade (self-driving by default).
+    if (!opts.from && !opts.url) {
+      await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform);
+      return;
+    }
+
+    // Archive-based upgrade requires an explicit target version.
+    if (!opts.version) {
+      console.error('Error: --version is required to specify the target version');
+      process.exit(1);
+    }
+
+    const version = opts.version;
+    const versionedDirName = `${component}-${version}`;
+    const versionedDirPath = path.join(installBase, versionedDirName);
+
+    // Check if versioned directory already exists
+    if (fs.existsSync(versionedDirPath)) {
+      if (opts.force) {
+        console.log(`Removing existing directory ${versionedDirPath} (--force)`);
+        fs.rmSync(versionedDirPath, { recursive: true, force: true });
+      } else {
+        console.error(`Error: version directory already exists: ${versionedDirPath}`);
+        console.error('Use --force to overwrite.');
+        process.exit(1);
+      }
+    }
+
+    // Check service is installed
+    const installed = await manager.isInstalled(config);
+    if (!installed) {
+      console.error(`Error: service "${config.name}" is not installed`);
+      process.exit(1);
+    }
+
+    // Resolve archive path
+    let archivePath: string;
+    const { path: tmpDir, cleanup: cleanupTmpDir } = await makeTempDir('upgrade');
+
+    if (opts.from) {
+      archivePath = path.resolve(opts.from);
+      if (!fs.existsSync(archivePath)) {
+        console.error(`Error: archive not found at ${archivePath}`);
+        process.exit(1);
+      }
+    } else {
+      // Download from URL
+      const ext = opts.url!.endsWith('.zip') ? '.zip' : '.tar.gz';
+      archivePath = path.join(tmpDir, `${component}-${version}${ext}`);
+      await downloadArchive(opts.url!, archivePath);
+    }
+
+    // Get current version info
+    const currentVersion = getCurrentVersion(installBase, component, platform);
+
+    // Confirmation
+    if (!opts.yes) {
+      console.log(`This will upgrade "${config.name}" to version ${version}:`);
+      if (currentVersion) {
+        console.log(`  Current version: ${currentVersion}`);
+      }
+      console.log(`  New version: ${version}`);
+      console.log(`  Install path: ${versionedDirPath}`);
+      console.log('  The service will be stopped during upgrade.');
+      console.log('');
+      const ok = await confirm('Proceed with upgrade?');
+      if (!ok) {
+        console.log('Upgrade cancelled.');
+        return;
+      }
+    }
+
+    // Extract archive to temp directory
+    console.log('Extracting archive...');
+    const extractDir = path.join(tmpDir, 'extract');
+    const extractedDirName = extractArchive(archivePath, extractDir);
+
+    // Move extracted directory to versioned location.
+    // Use platform-appropriate copy to handle cross-device moves
+    // (e.g., /tmp on tmpfs → /opt/kici on disk).
+    fs.mkdirSync(installBase, { recursive: true });
+    const srcDir = path.join(extractDir, extractedDirName);
+    if (isWindows(platform)) {
+      execSync(`xcopy "${srcDir}" "${versionedDirPath}" /E /I /Q /Y`, { stdio: 'inherit' });
+    } else {
+      execSync(`cp -r "${srcDir}" "${versionedDirPath}"`, { stdio: 'inherit' });
+    }
+    console.log(`Extracted to ${versionedDirPath}`);
+
+    // Take a dump and quiesce the coordinator BEFORE anything stops. Both are
+    // orchestrator-only: an agent has no database and no drain.
+    const preStopHeads = await runPreStopSafety({ component, opts, hooks, resolvedInstance });
+
+    // Stop service
+    console.log('Stopping service...');
+    const status = await manager.status(config);
+    if (status.state === 'running') {
+      await manager.stop(config);
+      console.log('Service stopped.');
+    }
+
+    // Update version pointer
+    if (isWindows(platform)) {
+      // Windows: uninstall and re-install with the new executable path.
+      // sc.exe has no "update binary path" — must delete+create the service.
+      const launcherPath = path.join(versionedDirPath, getLauncherName(component, platform));
+      config.executablePath = launcherPath;
+      await manager.uninstall(config);
+      // Brief pause after deletion to let Windows fully release the service kernel object.
+      await new Promise((r) => setTimeout(r, 2_000));
+      await manager.install(config);
+      // Track current version in a file (Windows has no symlinks)
+      writeCurrentVersion(installBase, component, version);
+      console.log(`Service registration updated to ${launcherPath}`);
+    } else {
+      // Unix: atomic symlink update
+      updateSymlinkAtomic(installBase, component, version);
+      const symlinkPath = path.join(installBase, component);
+      console.log(`Symlink updated: ${symlinkPath} -> ${versionedDirName}`);
+
+      // Ensure the launcher script in the symlinked directory is executable
+      const launcherPath = path.join(symlinkPath, getLauncherName(component, platform));
+      if (fs.existsSync(launcherPath)) {
+        fs.chmodSync(launcherPath, 0o755);
+      }
+
+      // executablePath points through the symlink
+      config.executablePath = path.join(
+        installBase,
+        component,
+        getLauncherName(component, platform),
+      );
+    }
+
+    // Start service
+    console.log('Starting service...');
+    await manager.start(config);
+    console.log('Service started.');
+
+    // Persist the new version into the manifest so subsequent lifecycle
+    // commands and the next upgrade see the current kiciVersion. Writes the
+    // entire manifest in place — every other field is preserved.
+    writeManifest(resolvedInstance.instanceDir, {
+      ...resolvedInstance.manifest,
+      kiciVersion: version,
+      migrationHeads: preStopHeads.map,
+    });
+
+    // Clean up temp directory
+    await cleanupTmpDir();
+
+    console.log('');
+    if (currentVersion) {
+      console.log(`Upgrade complete: ${currentVersion} -> ${version}`);
+      console.log(
+        `Previous version preserved at: ${path.join(installBase, `${component}-${currentVersion}`)}`,
+      );
+    } else {
+      console.log(`Upgrade to ${version} complete.`);
+    }
+  } catch (err) {
+    console.error(`Error: ${toErrorMessage(err)}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * npm-source upgrade (no --from/--url). By default the CLI self-drives: it reads
+ * the unit's launch spec to recover the pinned node runtime and the global
+ * package its ExecStart resolves (kici-admin when the component is loaded through
+ * kici-admin's nested node_modules, or the standalone `@kici-dev/<component>`),
+ * installs `<pkg>@<version>` under that runtime with the co-located npm, restarts,
+ * and verifies the launched version. `--restart-only` skips the install and just
+ * restarts an already-installed package (the pre-staged / air-gapped path). No
+ * archive, no versioned dir, no symlink.
+ */
+async function performNpmSourceUpgrade(
+  component: UpgradeComponent,
+  config: ServiceConfig,
+  resolvedInstance: ResolvedInstance,
+  manager: ServiceManager,
+  opts: VersionedUpgradeOptions,
+  platform: ServicePlatform,
+): Promise<void> {
+  const installed = await manager.isInstalled(config);
+  if (!installed) {
+    console.error(`Error: service "${config.name}" is not installed`);
+    process.exit(1);
+  }
+
+  const invoked = readKiciVersion();
+  const spec = await manager.readLaunchSpec(config);
+
+  // In restart-only mode, keep the existing invoking-CLI-vs-requested guard.
+  if (opts.restartOnly) {
+    resolveNpmSourceVersion({ requested: opts.version, running: invoked });
+  }
+
+  const action = planNpmSourceUpgrade({
+    component,
+    spec,
+    invoked,
+    requestedVersion: opts.version,
+    restartOnly: opts.restartOnly ?? false,
+    force: opts.force ?? false,
+    windows: isWindows(platform),
+  });
+
+  if (action.kind === 'error') {
+    console.error(`Error: ${action.reason}`);
+    process.exit(1);
+  }
+
+  if (action.kind === 'restart-only') {
+    await restartOnlyUpgrade(component, config, resolvedInstance, manager, action.verdict, opts);
+    return;
+  }
+
+  await performSelfDrivingInstall(component, config, resolvedInstance, manager, action, opts);
+}
+
+/**
+ * Restart-only path: the operator pre-installed `@kici-dev/<pkg>@<version>` (or
+ * kici-admin) themselves. Verify the unit will launch the invoking CLI's version,
+ * restart onto it, and persist the manifest version.
+ */
+async function restartOnlyUpgrade(
+  component: UpgradeComponent,
+  config: ServiceConfig,
+  resolvedInstance: ResolvedInstance,
+  manager: ServiceManager,
+  verdict: NpmSourceLaunchVerdict,
+  opts: VersionedUpgradeOptions,
+): Promise<void> {
+  if (!verdict.ok) {
+    console.error(`Error: ${verdict.reason}`);
+    process.exit(1);
+  }
+
+  if (!opts.yes) {
+    console.log(
+      `This will restart "${config.name}" onto the npm-installed version ${verdict.version}.`,
+    );
+    console.log('  The service will be stopped briefly during the restart.');
+    console.log('');
+    const ok = await confirm('Proceed with upgrade?');
+    if (!ok) {
+      console.log('Upgrade cancelled.');
+      return;
+    }
+  }
+
+  console.log('Restarting service onto the npm-installed package...');
+  const status = await manager.status(config);
+  if (status.state === 'running') {
+    await manager.stop(config);
+  }
+  await manager.start(config);
+
+  if (verdict.manifestVersion !== null) {
+    writeManifest(resolvedInstance.instanceDir, {
+      ...resolvedInstance.manifest,
+      kiciVersion: verdict.manifestVersion,
+    });
+  } else {
+    console.log('Note: manifest version left unchanged (verification was skipped via --force).');
+  }
+
+  console.log(
+    `Upgrade complete: service "${config.name}" is now running version ${verdict.version}.`,
+  );
+}
+
+/**
+ * Self-driving path: install the resolved global package under the unit's own
+ * pinned node/npm, restart, and verify the unit now launches the requested
+ * version.
+ */
+async function performSelfDrivingInstall(
+  component: UpgradeComponent,
+  config: ServiceConfig,
+  resolvedInstance: ResolvedInstance,
+  manager: ServiceManager,
+  action: { target: NpmInstallTarget; version: string },
+  opts: VersionedUpgradeOptions,
+): Promise<void> {
+  const { target, version } = action;
+
+  if (!opts.yes) {
+    console.log(`This will install ${target.owningPackage}@${version} using ${target.npmPath}`);
+    console.log(`  (node runtime: ${target.nodeExecPath}), then restart "${config.name}".`);
+    console.log('');
+    const ok = await confirm('Proceed with upgrade?');
+    if (!ok) {
+      console.log('Upgrade cancelled.');
+      return;
+    }
+  }
+
+  console.log(`Installing ${target.owningPackage}@${version} under the unit's runtime...`);
+  const result = installGlobalPackage(target, version);
+  if (!result.ok) {
+    const hint = /EACCES|permission denied|EPERM/i.test(result.stderr)
+      ? " The unit's global prefix is not writable — re-run with privileges matching the unit's runtime."
+      : '';
+    console.error(`Error: npm install failed for ${target.owningPackage}@${version}.${hint}`);
+    if (result.stderr.trim()) console.error(result.stderr.trim());
+    process.exit(1);
+  }
+
+  console.log('Restarting service onto the freshly-installed package...');
+  const status = await manager.status(config);
+  if (status.state === 'running') await manager.stop(config);
+  await manager.start(config);
+
+  // Verify the unit now launches the requested version.
+  const newSpec = await manager.readLaunchSpec(config);
+  const launched = newSpec ? resolveVersionFromLaunchSpec(newSpec, component) : null;
+  if (launched !== version) {
+    console.error(
+      `Error: install + restart completed but the unit launches ` +
+        `${launched ?? 'an unresolvable version'}, expected ${version}. The pinned runtime may ` +
+        `resolve a different install than the one just updated.`,
+    );
+    process.exit(1);
+  }
+
+  writeManifest(resolvedInstance.instanceDir, {
+    ...resolvedInstance.manifest,
+    kiciVersion: version,
+  });
+  console.log(`Upgrade complete: service "${config.name}" is now running version ${version}.`);
+}
+
+/**
+ * Handle `--pick`: interactively choose an already-installed version and switch
+ * the active version pointer to it. Lists every installed version (the active
+ * one shown disabled), confirms the change, then delegates to
+ * {@link switchToInstalledVersion}.
+ */
+async function handlePick(
+  component: UpgradeComponent,
+  platform: ServicePlatform,
+  installBase: string,
+  config: ServiceConfig,
+  manager: ServiceManager,
+  resolvedInstance: ResolvedInstance,
+  opts: VersionedUpgradeOptions,
+  hooks: UpgradeHooks,
+): Promise<void> {
+  if (!process.stdin.isTTY) {
+    console.error(
+      'Error: --pick requires an interactive terminal; pass an explicit archive ' +
+        '(--from/--url) or use --rollback for non-interactive switching.',
+    );
+    process.exit(1);
+  }
+
+  const versions = listInstalledVersions(installBase, component);
+  const current = getCurrentVersion(installBase, component, platform);
+  const targets = selectablePickTargets(versions, current);
+  if (targets.length === 0) {
+    const only = current ?? versions[0];
+    console.error(
+      only
+        ? `Error: only one version installed (${only}), nothing to pick.`
+        : `Error: no installed versions found for ${component}.`,
+    );
+    process.exit(1);
+  }
+
+  const target = await select({
+    message: `Select a ${component} version to activate:`,
+    choices: buildPickChoices(versions, current),
+  });
+
+  if (!opts.yes) {
+    console.log(`This will switch "${config.name}":`);
+    if (current) console.log(`  Current version: ${current}`);
+    console.log(`  Pick target: ${target}`);
+    console.log(`  Install path: ${path.join(installBase, `${component}-${target}`)}`);
+    console.log('  The service will be stopped during the switch.');
+    console.log('');
+    const ok = await confirm('Proceed with switch?');
+    if (!ok) {
+      console.log('Pick cancelled.');
+      return;
+    }
+  }
+
+  await switchToInstalledVersion({
+    component,
+    platform,
+    installBase,
+    config,
+    manager,
+    resolvedInstance,
+    targetVersion: target,
+    hooks,
+    migrateDown: opts.migrateDown === true,
+    yes: opts.yes === true,
+  });
+
+  console.log('');
+  console.log(`Switched: ${current ?? '(unknown)'} -> ${target}`);
+}
+
+/**
+ * Stop the service, switch the active version pointer to an already-installed
+ * versioned directory (atomic symlink on Unix; uninstall→install + version file
+ * on Windows), restart, and persist the new `kiciVersion` into the manifest.
+ *
+ * Shared by `--rollback` (switch to the previous version) and `--pick` (switch
+ * to any chosen installed version).
+ */
+/**
+ * Refuse a version switch whose target cannot boot against the current schema.
+ *
+ * `--rollback` and `--pick` both flip a version pointer, and the previous
+ * release's static migration provider does not carry the newer migrations'
+ * names — so Kysely throws `corrupted migrations` on boot and systemd restarts
+ * it forever. The operator ends up with neither version running, produced by
+ * the documented recovery.
+ *
+ * Returns true when the switch may proceed.
+ */
+async function assertSchemaAllowsSwitch(args: {
+  component: UpgradeComponent;
+  targetVersion: string;
+  resolvedInstance: ResolvedInstance;
+  hooks: UpgradeHooks;
+  migrateDown: boolean;
+  yes: boolean;
+}): Promise<boolean> {
+  const { component, targetVersion, resolvedInstance, hooks, migrateDown, yes } = args;
+
+  // An agent has no database, so there is nothing for a schema to be ahead of.
+  if (component !== 'orchestrator') return true;
+  if (!hooks.migrationStatus) return true;
+
+  const rows = await readLiveMigrationRows(hooks.migrationStatus);
+  // A service that cannot be reached is not evidence about the schema. Say so
+  // and let the existing confirmation decide, rather than refusing a rollback
+  // because the thing being rolled back is already down.
+  if (rows === null) {
+    console.log('');
+    console.log('  !!  The running service could not be reached, so the schema was not checked.');
+    console.log('');
+    return yes ? true : confirm('Proceed with the switch anyway?');
+  }
+
+  const recordedHead = resolvedInstance.manifest.migrationHeads?.[targetVersion];
+  const verdict = schemaGuardVerdict({ targetVersion, recordedHead, liveRows: rows });
+
+  if (verdict.kind === 'ok') return true;
+
+  if (verdict.kind === 'unknown-head') {
+    console.log('');
+    console.log(verdict.message);
+    console.log('');
+    return yes ? true : confirm('Proceed with the switch anyway?');
+  }
+
+  // The database is ahead. Refusing is the default: down() is largely untested
+  // and frequently lossy, so running it automatically would make an
+  // untested, data-destroying path the thing that fires while an operator is
+  // already in an incident.
+  if (!migrateDown) {
+    console.error('');
+    console.error(verdict.message);
+    console.error('');
+    process.exit(1);
+  }
+
+  if (!recordedHead) {
+    console.error(
+      'Error: --migrate-down has no recorded head to target for ' + targetVersion + '.',
+    );
+    process.exit(1);
+  }
+  if (!hooks.migrateDown) {
+    console.error('Error: --migrate-down is not available for this component.');
+    process.exit(1);
+  }
+
+  console.log(`Reverting the schema to ${recordedHead} before switching...`);
+  try {
+    // Runs through the STILL-RUNNING newer service, which is the only binary
+    // whose provider carries those migrations' down() functions.
+    await hooks.migrateDown(recordedHead);
+    console.log(`Schema reverted to ${recordedHead}.`);
+  } catch (err) {
+    console.error(`Error: the schema could not be reverted: ${toErrorMessage(err)}`);
+    console.error('  The version pointer has NOT been moved; the current version is still live.');
+    process.exit(1);
+  }
+  return true;
+}
+
+export async function switchToInstalledVersion(args: {
+  component: UpgradeComponent;
+  platform: ServicePlatform;
+  installBase: string;
+  config: ServiceConfig;
+  manager: ServiceManager;
+  resolvedInstance: ResolvedInstance;
+  targetVersion: string;
+  /** Orchestrator-only pre-stop capabilities. Omitted by the agent upgrade. */
+  hooks?: UpgradeHooks;
+  /** Revert the schema to the target's recorded head before switching. */
+  migrateDown?: boolean;
+  /** Skip the confirmation the unknown-head warning falls through to. */
+  yes?: boolean;
+}): Promise<void> {
+  const { component, platform, installBase, config, manager, resolvedInstance, targetVersion } =
+    args;
+
+  // The guard lives here rather than in handleRollback so `--pick` inherits it
+  // for free — `--pick` can select ANY installed version, which is a strictly
+  // wider hazard than rolling back one step.
+  const proceed = await assertSchemaAllowsSwitch({
+    component,
+    targetVersion,
+    resolvedInstance,
+    hooks: args.hooks ?? {},
+    migrateDown: args.migrateDown === true,
+    yes: args.yes === true,
+  });
+  if (!proceed) {
+    console.log('Switch cancelled.');
+    return;
+  }
+
+  console.log('Stopping service...');
+  const status = await manager.status(config);
+  if (status.state === 'running') {
+    await manager.stop(config);
+    console.log('Service stopped.');
+  }
+
+  if (isWindows(platform)) {
+    const launcherPath = path.join(
+      installBase,
+      `${component}-${targetVersion}`,
+      getLauncherName(component, platform),
+    );
+    config.executablePath = launcherPath;
+    await manager.uninstall(config);
+    await manager.install(config);
+    writeCurrentVersion(installBase, component, targetVersion);
+    console.log(`Service registration updated to ${launcherPath}`);
+  } else {
+    updateSymlinkAtomic(installBase, component, targetVersion);
+    console.log(
+      `Symlink updated: ${path.join(installBase, component)} -> ${component}-${targetVersion}`,
+    );
+  }
+
+  console.log('Starting service...');
+  await manager.start(config);
+  console.log('Service started.');
+
+  // Persist the new version into the manifest so subsequent lifecycle commands
+  // and the next upgrade see the current kiciVersion.
+  writeManifest(resolvedInstance.instanceDir, {
+    ...resolvedInstance.manifest,
+    kiciVersion: targetVersion,
+  });
+}
+
+/**
+ * Handle --rollback: switch symlink to the previous version and restart.
+ */
+async function handleRollback(
+  component: UpgradeComponent,
+  platform: ServicePlatform,
+  installBase: string,
+  config: ServiceConfig,
+  manager: ServiceManager,
+  resolvedInstance: ResolvedInstance,
+  opts: VersionedUpgradeOptions,
+  hooks: UpgradeHooks,
+): Promise<void> {
+  const versions = listInstalledVersions(installBase, component);
+  if (versions.length < 2) {
+    console.error('Error: no previous version available for rollback');
+    if (versions.length === 1) {
+      console.error(`Only version installed: ${versions[0]}`);
+    }
+    process.exit(1);
+  }
+
+  const currentVersion = getCurrentVersion(installBase, component, platform);
+  if (!currentVersion) {
+    console.error('Error: cannot determine current version (no symlink found)');
+    console.log('Available versions:');
+    for (const v of versions) {
+      console.log(`  ${component}-${v}/`);
+    }
+    process.exit(1);
+  }
+
+  // Find the previous version (the one before current in sorted order)
+  const currentIdx = versions.indexOf(currentVersion);
+  let previousVersion: string;
+  if (currentIdx > 0) {
+    previousVersion = versions[currentIdx - 1]!;
+  } else if (versions.length >= 2) {
+    // Current is the oldest, pick the next one
+    previousVersion = versions[1]!;
+  } else {
+    console.error('Error: no alternative version available for rollback');
+    process.exit(1);
+    return; // unreachable, for TS
+  }
+
+  // Confirmation
+  if (!opts.yes) {
+    console.log(`Rolling back "${config.name}":`);
+    console.log(`  Current version: ${currentVersion}`);
+    console.log(`  Rollback to: ${previousVersion}`);
+    console.log('');
+    const ok = await confirm('Proceed with rollback?');
+    if (!ok) {
+      console.log('Rollback cancelled.');
+      return;
+    }
+  }
+
+  await switchToInstalledVersion({
+    component,
+    platform,
+    installBase,
+    config,
+    manager,
+    resolvedInstance,
+    targetVersion: previousVersion,
+    hooks,
+    migrateDown: opts.migrateDown === true,
+    yes: opts.yes === true,
+  });
+
+  console.log('');
+  console.log(`Rollback complete: ${currentVersion} -> ${previousVersion}`);
+}
+
+/**
+ * Handle --cleanup: remove all versioned directories except the current
+ * and previous versions.
+ */
+async function handleCleanup(
+  component: UpgradeComponent,
+  platform: ServicePlatform,
+  installBase: string,
+): Promise<void> {
+  const versions = listInstalledVersions(installBase, component);
+  if (versions.length <= 2) {
+    console.log('Nothing to clean up (2 or fewer versions installed).');
+    return;
+  }
+
+  const currentVersion = getCurrentVersion(installBase, component, platform);
+  const currentIdx = currentVersion ? versions.indexOf(currentVersion) : versions.length - 1;
+  const previousIdx = currentIdx > 0 ? currentIdx - 1 : -1;
+
+  const toRemove = versions.filter((_, i) => i !== currentIdx && i !== previousIdx);
+
+  if (toRemove.length === 0) {
+    console.log('Nothing to clean up.');
+    return;
+  }
+
+  console.log('The following versions will be removed:');
+  for (const v of toRemove) {
+    console.log(`  ${component}-${v}/`);
+  }
+  if (currentVersion) {
+    console.log(`\nKeeping: ${component}-${currentVersion}/ (current)`);
+  }
+  if (previousIdx >= 0) {
+    console.log(`Keeping: ${component}-${versions[previousIdx]!}/ (previous)`);
+  }
+
+  for (const v of toRemove) {
+    const dirPath = path.join(installBase, `${component}-${v}`);
+    fs.rmSync(dirPath, { recursive: true, force: true });
+    console.log(`Removed ${dirPath}`);
+  }
+
+  console.log(`\nCleanup complete. Removed ${toRemove.length} old version(s).`);
+}

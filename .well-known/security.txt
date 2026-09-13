@@ -1,0 +1,5 @@
+# RFC 9116 - machine-readable security contact policy for KiCI.
+Contact: mailto:security@kici.dev
+Expires: 2027-05-16T00:00:00Z
+Preferred-Languages: en
+Canonical: https://kici.dev/.well-known/security.txt

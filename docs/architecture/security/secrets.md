@@ -1,0 +1,405 @@
+---
+title: Secrets architecture
+description: Encryption model, multi-backend architecture, access rule evaluation, and data flow for secrets management
+---
+
+KiCI's secrets management provides encrypted storage, context-scoped access, and multi-backend support. This document describes the internal architecture, encryption model, and data flow from secret creation to workflow step execution.
+
+## Data flow
+
+The secrets lifecycle spans all three tiers:
+
+```mermaid
+sequenceDiagram
+    participant Operator as Operator (Dashboard/API)
+    participant Orchestrator
+    participant Agent
+
+    Operator->>Orchestrator: PUT /secrets/:scope/:key
+    Note over Orchestrator: Encrypt (AES-256-GCM)<br/>Store in scoped_secrets table
+
+    Note over Orchestrator: Webhook arrives
+    Note over Orchestrator: 1. Load lock file<br/>2. Match context for job<br/>3. Resolve scope bindings<br/>4. Fetch + decrypt secrets<br/>5. Produce secrets (flat) + namespacedSecrets (per-scope)<br/>6. Include both in job.dispatch
+
+    Orchestrator->>Agent: WS job.dispatch { secrets, namespacedSecrets }
+    Note over Agent: Workflow-runner IPC:<br/>buildMergedFlatSecrets()<br/>createStepSecrets() → ctx.secrets (flat)<br/>LogMasker registers all secret values
+```
+
+**Key design principle:** The Platform tier never sees secrets. Secrets flow only from the orchestrator to the agent via the authenticated WebSocket channel.
+
+## Encryption model
+
+### Algorithm
+
+- **Cipher:** AES-256-GCM (authenticated encryption with associated data)
+- **Key size:** 256 bits (32 bytes)
+- **IV:** 12 random bytes per encryption operation
+- **Auth tag:** 16 bytes (128-bit GCM tag)
+
+### Wire format
+
+Each encrypted value is stored as a single base64-encoded string:
+
+```
+base64( IV [12 bytes] || AuthTag [16 bytes] || Ciphertext [variable] )
+```
+
+This format allows single-field storage in PostgreSQL while keeping all cryptographic material together.
+
+### Additional authenticated data (AAD)
+
+Every encryption operation binds the ciphertext to its storage location using AAD:
+
+```
+AAD = "orgId:scope:key"
+```
+
+This prevents cross-scope secret swaps -- a ciphertext encrypted for scope A with key "TOKEN" cannot be decrypted under scope B or key "PASSWORD", even with the same master key.
+
+The AAD is a plain concatenation, so it identifies exactly one `(orgId, scope, key)` triple only while neither the scope nor the key can contain the `:` separator. Both are validated against `[A-Za-z0-9._-]` on every write path for that reason: without it, a key of `c:d` in scope `b` renders the same AAD as a key of `d` in scope `b:c`, and a ciphertext written at one location authenticates at the other. Validation is write-side only -- reads, listings and deletes accept any name, so a key stored before the rule existed stays readable and deletable. See [Secrets management > Key naming](../../operator/security/secrets.md#key-naming).
+
+### Key derivation
+
+The master key (`KICI_SECRET_KEY`) supports two input formats:
+
+1. **64-character hex string** -- decoded to 32 bytes directly
+2. **Base64-encoded string** -- decoded to 32 bytes
+
+The `deriveKey()` function normalizes either format to a 32-byte Buffer.
+
+### Key versioning
+
+Each encrypted value stores a `keyVersion` integer. The `rotateKey()` method re-encrypts all values at an incremented version. When an old key is configured, `rotateKey()` decrypts with the old key and re-encrypts with the new (current) key. Without an old key, it performs same-key re-encryption.
+
+### Key rotation design
+
+The secrets subsystem supports zero-downtime master key rotation through a dual-key decrypt fallback pattern -- the same approach used for per-run ephemeral key encryption in `ephemeral-keys.ts`.
+
+**Dual-key decrypt fallback:**
+
+All read paths (`getSecrets`, `decryptValue`) use a `decryptWithFallback()` method that:
+
+1. Tries decrypting with the current master key
+2. If decryption fails and an old master key is configured, retries with the old key
+3. If both fail, throws an error
+
+This ensures zero-downtime during rolling restarts: instances with the new key can read secrets encrypted with the old key, while instances still running with the old key can read secrets they encrypted previously.
+
+**`rotateKey()` behavior:**
+
+- **With `oldMasterKey` set:** Decrypts each secret with the old key and re-encrypts with the current (new) key. This is true key rotation.
+- **Without `oldMasterKey`:** Decrypts and re-encrypts with the same key at an incremented version. This is periodic re-encryption (same-key version bump).
+
+**Three rotation sweeps:** a single `rotate-key` invocation runs three separately-committed sweeps — `scoped_secrets`, then `config_versions`, then the external secret-backend configs in `secret_backends`. Each uses the same dual-key fallback for decrypt and re-encrypts under the current key at `max(keyVersion) + 1`. The `secret_backends` sweep is transactionally isolated so a backend problem cannot roll back a successful secrets rotation, and an undecryptable backend row is counted and skipped rather than aborting the sweep.
+
+**Backend-config self-heal:** secret-backend connection configs also decrypt with dual-key fallback on the load path. When a backend row decrypts only under the old key at boot (a config stranded by an earlier rotation), it is transparently re-sealed under the current key while `oldMasterKey` is configured. A row decryptable under neither key fails startup loud rather than being silently dropped.
+
+**Configuration:**
+
+The old key is loaded from `KICI_SECRET_KEY_OLD` (env var) or `KICI_SECRET_KEY_FILE_OLD` (file path). The `loadOldMasterKey()` function returns `undefined` when neither is set, making the old key entirely optional.
+
+## Multi-backend architecture
+
+### SecretStore interface
+
+The `SecretStore` interface (in `@kici-dev/engine`) defines the contract for secret storage backends:
+
+```typescript
+interface SecretStore {
+  getSecrets(orgId: string, scope: string): Promise<Record<string, string>>;
+  setSecret(orgId: string, scope: string, key: string, value: string): Promise<void>;
+  deleteSecret(orgId: string, scope: string, key: string): Promise<void>;
+  listKeys(orgId: string, scope: string): Promise<string[]>;
+  listScopes(orgId: string): Promise<string[]>;
+  createScope?(orgId: string, scope: string): Promise<void>;
+  renameScope?(orgId: string, oldScope: string, newScope: string): Promise<void>;
+  deleteScope?(orgId: string, scope: string): Promise<void>;
+  getAllSecrets(
+    orgId: string,
+  ): Promise<Array<{ scope: string; key: string; encryptedValue: string; keyVersion: number }>>;
+}
+```
+
+### PG backend
+
+The default backend stores secrets in the `scoped_secrets` PostgreSQL table. Each value is AES-256-GCM encrypted with the master key. Secrets are organized by org ID and scope (e.g., context name, repo pattern).
+
+Tables:
+
+- `scoped_secrets` -- encrypted key-value pairs (org ID, scope, key name, encrypted data, backend type, key version)
+- `admin_tokens` -- RBAC tokens (hash, role, label, routing key scope)
+- `secret_audit_log` -- audit entries (action, context, user, outcome, timestamp)
+
+### Vault backend
+
+The Vault backend delegates secret storage to HashiCorp Vault's KV v2 engine. Each context maps to a Vault path:
+
+```
+{mountPath}/data/{basePath}/{contextId}
+```
+
+Vault-backed secrets use the `backend_type` field on `scoped_secrets` rows to route operations to the Vault backend.
+
+### Backend routing
+
+Secret operations are routed to the correct backend based on the `backend_type` field on each `scoped_secrets` row:
+
+```
+backend_type === 'pg'    --> PgSecretStore
+backend_type === 'vault' --> VaultSecretStore
+```
+
+The orchestrator initializes available backends at startup and registers them in a `Map<string, SecretStore>`.
+
+## Access control
+
+Secret access control is handled by the context protection gates, not by the secrets subsystem directly. Contexts define branch restrictions, trigger type filters, and repository patterns (the `branch_restrictions`, `trigger_type_filters` and `repo_patterns` columns on the `contexts` table). When a job targets a context, those gates are evaluated before the job is dispatched. If they pass, the `SecretResolver` resolves secrets for that context using scope bindings.
+
+This separation means the secrets subsystem focuses on storage and encryption, while the context system handles access policy.
+
+## Secret resolution at dispatch time
+
+The `SecretResolver` orchestrates the full resolution flow. It resolves secrets for a job by matching context bindings against scoped secrets:
+
+```typescript
+resolveForJob(
+  orgId: string,
+  contextName: string,
+  hostCtx?: HostFacts,
+): Promise<Record<string, string>>
+```
+
+Resolution steps:
+
+1. Look up the context by name in the org
+2. Get secret scope bindings for that context
+3. Load all scoped secrets for the org (across every registered backend, each scope prefixed with its backend name)
+4. Match and merge by the precedence tuple `(host specificity, scope depth)` -- a per-host binding beats a fleet-wide one, then longest scope path wins (via the engine's `resolveSecretsForContext`, which delegates precedence to `resolveSecretsWithProvenance`)
+5. Return a flat `Record<string, string>` of decrypted secrets
+
+The optional `hostCtx` carries a fan-out child's identity. When supplied, each binding is gated by its `host_pattern` and its `scope_pattern` is templated per-child (`${agentId}` / `${host}` / `${label:NAME}`); when omitted, only fleet-wide (`'**'`) non-templated bindings contribute. `resolveForJobWithMeta` returns the same resolution with per-key provenance instead of bare values.
+
+`hostCtx` carries the hostname and the labels in canonical (lowercase) form, and the agent ID verbatim. `host_pattern` matching follows that split: the agent ID compares exactly, so a binding written for `prod-01` cannot reach an agent named `PROD-01`, while the hostname and the labels compare case-insensitively.
+
+The same fold reaches `scope_pattern` templating: `${host}` and `${label:NAME}` render lowercase, and the `NAME` lookup matches folded labels. A secret subtree keyed on a mixed-case hostname or label value must be renamed to lowercase, or the templated binding selects a path that holds nothing and the host resolves no secret from it. `${agentId}` renders the identifier unchanged. Operator-facing detail: [per-host secret scoping](../../operator/security/secrets.md#per-host-secret-scoping).
+
+## Job-originated qualified references
+
+`resolveForJob` covers a job's **bound** contexts — the ones its `contexts:`
+list names. Two features let a workflow name a secret directly instead, in
+qualified `<context>:<secret-name>` form: a job's `gitCredentials` map and a
+container job's registry `auth`. The reference names its own context, which by
+design need not be one the job binds — the published examples for both features
+declare a qualified reference on a job with no `contexts:` list at all.
+
+Every such reference resolves through one function,
+`resolveJobQualifiedSecret` (`packages/orchestrator/src/secrets/job-secret-gate.ts`).
+It runs four checks before reading anything:
+
+1. **Reserved namespace.** The org and the context must not be reserved (below).
+2. **Trust tier.** A run whose contributor tier resolved to anything other than
+   `trusted` gets nothing, mirroring the install-secrets strip.
+3. **The named context's protection rules.** `evaluateProtectionRules` runs the
+   same branch / trust / concurrency / reviewer / wait-timer pipeline the
+   dispatch gate runs, against the same dispatch facts. A `prod:` reference from
+   a branch `prod` restricts is refused, with the rule named.
+4. **The lock declaration**, checked by the caller rather than the gate. Git
+   credentials are pinned to the declaration the orchestrator itself wrote from
+   the lock when it dispatched the job — `execution_jobs.git_credentials`, or
+   the job's dispatch record for a request that arrives before the tracked row
+   lands. Container-registry references come from the lock by construction, and
+   for an untrusted pull request from the **base** branch's lock.
+
+The direct lookup that applies none of these is
+`SecretResolverApi.resolveNamedInternal`. Its name says so: it is for
+system-scoped callers resolving the orchestrator's own credentials, and a
+job-originated reference never reaches it except through the gate above.
+
+### Reserved namespaces
+
+The orchestrator stores its own credentials — forge App private keys, webhook
+signing secrets, universal-git PATs — under a reserved organisation and reserved
+scopes:
+
+| Reserved value                 | Holds                                                         |
+| ------------------------------ | ------------------------------------------------------------- |
+| org `__system__`               | every credential the orchestrator owns rather than a customer |
+| scope `__source__/<sourceId>`  | a source's own credentials (App key, PAT, SSH key)            |
+| scope `__webhook__/<sourceId>` | a source's inbound webhook signing secret                     |
+
+A job's org is its `customer_id`, so a job cannot name the reserved
+organisation, and any context beginning with `__` is refused outright. Both
+refusals are explicit checks. The two namespaces also happen not to collide, but
+relying on that alone is fragile: an org literally named `__system__`, or a
+source-scoped secret copied into a customer org, would remove the boundary
+silently.
+
+## Test-run secret resolution
+
+`kici run remote` dispatches a test run rather than a webhook-driven run, and the orchestrator resolves secrets for it through a dedicated test-scoped branch. The result combines two sources:
+
+1. **CLI-uploaded local secrets.** The developer's local secret values (from `.kici/.secrets`, `.kici/.env.local`, `.kici/secrets.yaml`, and `--env` flags) are uploaded as an **encrypted** blob with the run. The orchestrator decrypts it only to inject the values into the agent for that run.
+2. **Test-context secrets.** The orchestrator resolves secrets from the `scoped_secrets` store for the job's own declared `context` (flat; static strings and pure inline `context` expressions evaluated against the fixture event — impure dynamic contexts are not evaluated for test runs) and for each fixture `secrets: { ctx: contextName }` mapping (namespaced under context `ctx`).
+
+The two sources are merged so that **CLI-uploaded values win** on key collision, giving the developer a per-run override.
+
+**`allowLocalExecution` resolution filter.** Test-context resolution is gated by the context's `allow_local_execution` flag (default `false`):
+
+- A context with the flag off is never resolvable for a test run — its secrets are not loaded.
+- The gate applies to **all** remote test runs: a run whose matched workflow targets a context with the flag off is rejected before dispatch.
+- A fixture mapping that points at a missing context, or at one whose flag is off, **rejects the run** (fail-closed).
+
+This keeps production secrets unreachable from test runs: only contexts an operator has explicitly opted into test access (`allow_local_execution = true`) can contribute secrets, and the developer's own uploaded values stay encrypted end to end.
+
+## RBAC model
+
+### Roles and permissions
+
+The orchestrator secrets admin API uses a fixed three-role model (defined in `packages/orchestrator/src/secrets/rbac.ts`): `owner`, `admin`, and `auditor`.
+
+| Permission             | Owner | Admin | Auditor |
+| ---------------------- | ----- | ----- | ------- |
+| context.create         | Y     | Y     | -       |
+| context.read           | Y     | Y     | Y       |
+| context.update         | Y     | Y     | -       |
+| context.delete         | Y     | Y     | -       |
+| secret.read            | Y     | Y     | -       |
+| secret.write           | Y     | Y     | -       |
+| secret.delete          | Y     | Y     | -       |
+| secret.reveal          | Y     | Y     | -       |
+| audit.read             | Y     | Y     | Y       |
+| token.manage           | Y     | -     | -       |
+| key.rotate             | Y     | -     | -       |
+| run.read               | Y     | Y     | Y       |
+| run.cancel             | Y     | Y     | -       |
+| event_log.read         | Y     | Y     | Y       |
+| event_log.read_payload | Y     | Y     | -       |
+| access_log.read        | Y     | Y     | Y       |
+| scheduled_job.trigger  | Y     | Y     | -       |
+| attestation.retry      | Y     | Y     | -       |
+| event_dlq.read         | Y     | Y     | Y       |
+| event_dlq.manage       | Y     | Y     | -       |
+| orchestrator.drain     | Y     | Y     | -       |
+| ci_trust.read          | Y     | Y     | -       |
+| ci_trust.admin         | Y     | Y     | -       |
+
+### Token authentication
+
+Admin API tokens are stored as SHA-256 hashes in the `admin_tokens` table. Token validation:
+
+1. Hash the incoming token with SHA-256
+2. Look up the hash in the database
+3. Check that the token is not revoked
+4. Return the associated role and routing key scope
+
+### Bootstrap token
+
+On first startup with `KICI_SECRET_KEY`, the orchestrator generates a bootstrap token with `owner` role. This token is:
+
+- Printed to the logs for operator retrieval
+- Upserted on the `label='bootstrap'` column for idempotent restarts
+- Overridable via `KICI_BOOTSTRAP_ADMIN_TOKEN` for automation
+
+## Audit logging
+
+All admin operations and dispatch-time access checks are logged to `secret_audit_log`:
+
+| Field               | Description                                                     |
+| ------------------- | --------------------------------------------------------------- |
+| `action`            | Operation type (createContext, setSecret, resolveSecrets, etc.) |
+| `context_name`      | Context involved                                                |
+| `routing_key`       | Routing key scope                                               |
+| `secret_keys`       | Array of key names involved (no values)                         |
+| `outcome`           | `allowed` or `denied`                                           |
+| `user_id`           | Token ID that performed the operation                           |
+| `role`              | Role of the token                                               |
+| `run_id` / `job_id` | Associated execution (for dispatch-time entries)                |
+| `metadata`          | Additional context (JSONB)                                      |
+
+## Security considerations
+
+### Platform never sees secrets
+
+Secrets flow from the orchestrator directly to the agent via the authenticated WebSocket channel. The Platform tier only routes webhooks and never handles secret material.
+
+### Transit encryption
+
+The WebSocket connection between orchestrator and agent should use TLS (WSS) in production to protect secrets in transit.
+
+### No environment variable injection
+
+Secrets are NOT automatically injected as environment variables. They are available via `ctx.secrets.get()` and `ctx.secrets.expose()` in step code. To pass a secret to a subprocess, the workflow author must explicitly use `expose()` to inject it into the environment or inline it:
+
+```typescript
+step('deploy', async ({ $, secrets }) => {
+  await secrets.expose('DEPLOY_TOKEN');
+  await $`deploy.sh`;
+});
+```
+
+### Log masking
+
+The agent's `LogMasker` replaces all known secret values in log output with `***`. This uses a single combined regex per line for performance. Secret values are registered with the masker before step execution begins.
+
+### AAD prevents swaps
+
+The additional authenticated data (AAD) binding prevents an attacker with database access from swapping encrypted values between scopes or keys. Each ciphertext is cryptographically bound to its `orgId:scope:key` location.
+
+## StepContext secret construction
+
+### StepSecrets interface
+
+The SDK provides an async accessor interface for step secrets (`packages/sdk/src/secrets.ts`):
+
+```typescript
+interface StepSecrets {
+  get(key: string): Promise<string>;
+  expose(key: string): Promise<void>;
+  has(key: string): boolean;
+  getMeta(key: string): SecretMeta | undefined;
+  list(): string[];
+  mountFile(opts: SecretFileOptions): Promise<MountedFile>;
+  exposeFile(envVar: string, opts: SecretFileOptions): Promise<MountedFile>;
+}
+```
+
+- **`get(key)`** -- retrieves a secret value by key. Throws `SecretNotFoundError` if the key does not exist, listing all available keys in the error message for fail-fast debugging.
+- **`expose(key)`** -- injects a secret into the step's environment variables. Throws `SecretNotFoundError` if the key does not exist.
+- **`has(key)`** -- synchronous existence check. Returns `boolean`, never throws. Use this for conditional patterns where a secret may or may not be present.
+- **`getMeta(key)`** -- retrieves metadata about a resolved secret (backend name and scope). Returns `SecretMeta | undefined` -- `undefined` if the key does not exist. Use this to inspect which backend and scope provided a specific secret.
+- **`list()`** -- returns every secret key available to the step, sorted alphabetically. Synchronous, never throws, and returns names only -- pair it with `getMeta(key)` to inspect a specific key.
+- **`mountFile(opts)`** -- concatenates one or more existing secrets (in `opts.sources` order, optionally separated by `opts.divider`) into a tmpfile inside a per-step tmpdir, chmodded to `opts.mode` (default `0o600`), and returns its absolute path. The tmpdir is allocated lazily on the first call and removed when the step completes -- success, failure, or timeout. Throws `SecretNotFoundError` naming every missing source key.
+- **`exposeFile(envVar, opts)`** -- `mountFile(opts)` plus setting `process.env[envVar]` to the resulting path. The env var is unset and the file removed on step completion.
+
+The SDK itself imports no `node:fs`, so the two file methods are backed by a host adapter the agent wires in (local preview/run mode plugs the same adapter shape against `os.tmpdir()`); without a host they throw. Mounted file contents are registered with the log masker, which covers the case where a concatenation produces bytes neither source value would mask on its own. See [Secrets > mountFile](../../user/secrets.md#mountfileopts).
+
+### Flat merge logic
+
+The `buildMergedFlatSecrets()` function (in `packages/agent/src/execution/sandbox/secret-merge.ts`) merges secrets for `ctx.secrets`:
+
+1. Start with orchestrator-level secrets as the base
+2. Iterate over namespaced secrets in declaration order
+3. For each namespace, merge all its keys into the flat map (overwriting any existing keys)
+
+**Precedence:** orchestrator-level < namespaced keys. Among namespaces, later entries win for key collisions.
+
+### Wire format
+
+The WS `job.dispatch` message carries two fields:
+
+- `secrets` -- flat `Record<string, string>` (orchestrator-level secrets)
+- `namespacedSecrets` -- `Record<string, Record<string, string>>` keyed by scope name (optional)
+
+The workflow-runner receives both fields and uses `buildMergedFlatSecrets()` to produce the final merged flat map, which backs the `StepSecrets` instance exposed as `ctx.secrets`.
+
+### Fail-fast on missing keys
+
+The `get()` and `expose()` methods throw `SecretNotFoundError` for missing keys, listing all available keys in the error message. This fail-fast pattern prevents typos like `ctx.secrets.get('DEPLO_TOKEN')` from silently returning `undefined` and causing cryptic failures downstream.
+
+The `has()` method provides safe existence checking for conditional patterns where a secret may or may not be present:
+
+```typescript
+if (ctx.secrets.has('OPTIONAL_KEY')) {
+  const val = await ctx.secrets.get('OPTIONAL_KEY');
+}
+```

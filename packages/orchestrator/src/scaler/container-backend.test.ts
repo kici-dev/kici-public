@@ -1,0 +1,1395 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { LabelSetConfig } from './types.js';
+
+// Mock node:fs/promises for socket detection tests
+const mockAccess = vi.fn();
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    access: (...args: unknown[]) => mockAccess(...args),
+  };
+});
+
+// Mock nftables module
+const mockValidateNftablesAvailability = vi.fn().mockResolvedValue(undefined);
+const mockEnsureKiciTable = vi.fn().mockResolvedValue(undefined);
+const mockAddHostIsolationRules = vi.fn().mockResolvedValue(undefined);
+const mockAddIsolationRules = vi.fn().mockResolvedValue(undefined);
+const mockRemoveIsolationRules = vi.fn().mockResolvedValue(undefined);
+const mockListIsolationRules = vi.fn().mockResolvedValue(new Map<string, number[]>());
+const mockDeleteForwardRules = vi.fn().mockResolvedValue(1);
+vi.mock('@kici-dev/shared/net', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@kici-dev/shared/net')>()),
+  validateNftablesAvailability: (...args: unknown[]) => mockValidateNftablesAvailability(...args),
+  ensureKiciTable: (...args: unknown[]) => mockEnsureKiciTable(...args),
+  addIsolationRules: (...args: unknown[]) => mockAddIsolationRules(...args),
+  addHostIsolationRules: (...args: unknown[]) => mockAddHostIsolationRules(...args),
+  removeIsolationRules: (...args: unknown[]) => mockRemoveIsolationRules(...args),
+  listIsolationRules: (...args: unknown[]) => mockListIsolationRules(...args),
+  deleteForwardRules: (...args: unknown[]) => mockDeleteForwardRules(...args),
+}));
+
+// Mock dockerode
+const mockStart = vi.fn().mockResolvedValue(undefined);
+const mockStop = vi.fn().mockResolvedValue(undefined);
+const mockRemove = vi.fn().mockResolvedValue(undefined);
+
+const mockContainerInspect = vi.fn().mockResolvedValue({
+  NetworkSettings: {
+    Networks: {
+      'kici-agent-net': { IPAddress: '172.30.0.5' },
+    },
+  },
+});
+
+// `ensureRuntimeVolume` probes the runtime volume's completion marker with a
+// short-lived container, so the fake has to be waitable. Exit 0 = the marker is
+// there = the volume is reused rather than repopulated.
+const mockWait = vi.fn().mockResolvedValue({ StatusCode: 0 });
+
+const mockContainer = {
+  id: 'container-abc123',
+  start: mockStart,
+  stop: mockStop,
+  remove: mockRemove,
+  inspect: mockContainerInspect,
+  wait: mockWait,
+};
+
+const mockCreateContainer = vi.fn().mockResolvedValue(mockContainer);
+const mockListContainers = vi.fn().mockResolvedValue([]);
+const mockGetContainer = vi.fn().mockReturnValue({
+  ...mockContainer,
+  inspect: mockContainerInspect,
+});
+const mockPull = vi.fn().mockResolvedValue('mock-stream');
+const mockFollowProgress = vi.fn((_stream: unknown, onFinished: (err: Error | null) => void) => {
+  onFinished(null);
+});
+
+// Image inspect drives the IfNotPresent branch: resolve = image already local
+// (no pull), reject = image absent (pull once).
+const mockImageInspect = vi.fn().mockResolvedValue({ Id: 'sha256:mock' });
+const mockGetImage = vi.fn().mockReturnValue({ inspect: mockImageInspect });
+
+// Network-related mocks
+const mockListNetworks = vi.fn().mockResolvedValue([]);
+const mockCreateNetwork = vi.fn().mockResolvedValue({ id: 'net-abc123456789' });
+const mockNetworkInspect = vi.fn().mockResolvedValue({
+  Id: 'net-abc123456789',
+  Options: { 'com.docker.network.bridge.name': 'br-abc123456789' },
+});
+const mockGetNetwork = vi.fn().mockReturnValue({ inspect: mockNetworkInspect });
+// The runtime volume a per-job image mounts. Default to "already present" so
+// the existing fixed-image cases never touch the populator path.
+const mockVolumeInspect = vi.fn().mockResolvedValue({});
+const mockVolumeRemove = vi.fn().mockResolvedValue(undefined);
+const mockGetVolume = vi
+  .fn()
+  .mockReturnValue({ inspect: mockVolumeInspect, remove: mockVolumeRemove });
+const mockCreateVolume = vi.fn().mockResolvedValue({});
+
+vi.mock('dockerode', () => {
+  return {
+    default: vi.fn().mockImplementation(function () {
+      return {
+        createContainer: mockCreateContainer,
+        listContainers: mockListContainers,
+        getContainer: mockGetContainer,
+        listNetworks: mockListNetworks,
+        createNetwork: mockCreateNetwork,
+        getNetwork: mockGetNetwork,
+        getImage: mockGetImage,
+        getVolume: mockGetVolume,
+        createVolume: mockCreateVolume,
+        pull: mockPull,
+        modem: {
+          followProgress: mockFollowProgress,
+        },
+      };
+    }),
+  };
+});
+
+// Import after mocking
+const { ContainerScalerBackend, detectRuntime } = await import('./container-backend.js');
+
+const defaultLabelSets: LabelSetConfig[] = [
+  {
+    labels: ['linux', 'docker'],
+    image: 'ghcr.io/org/kici-agent:latest',
+    resources: { limits: { memory: '2g', cpus: 2 } },
+  },
+  {
+    labels: ['linux', 'node20'],
+    image: 'ghcr.io/org/kici-agent-node20:latest',
+    containerSocket: true,
+    env: { NODE_VERSION: '20' },
+  },
+];
+
+async function createBackend(
+  overrides?: Partial<Parameters<typeof ContainerScalerBackend.create>[0]>,
+) {
+  return ContainerScalerBackend.create({
+    name: 'test-container',
+    labelSets: defaultLabelSets,
+    maxAgents: 5,
+    socketPath: '/var/run/docker.sock',
+    ...overrides,
+  });
+}
+
+describe('ContainerScalerBackend', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockContainer.id = 'container-abc123';
+    mockContainerInspect.mockResolvedValue({
+      NetworkSettings: {
+        Networks: {
+          'kici-agent-net': { IPAddress: '172.30.0.5' },
+        },
+      },
+    });
+    mockCreateContainer.mockResolvedValue(mockContainer);
+    mockGetContainer.mockReturnValue({
+      ...mockContainer,
+      inspect: mockContainerInspect,
+    });
+    mockListContainers.mockResolvedValue([]);
+    mockListIsolationRules.mockResolvedValue(new Map<string, number[]>());
+    mockDeleteForwardRules.mockResolvedValue(1);
+    // Reset network mocks for isolated network creation
+    mockListNetworks.mockResolvedValue([]);
+    mockCreateNetwork.mockResolvedValue({ id: 'net-abc123456789' });
+    mockNetworkInspect.mockResolvedValue({
+      Id: 'net-abc123456789',
+      Options: { 'com.docker.network.bridge.name': 'br-abc123456789' },
+    });
+    mockGetNetwork.mockReturnValue({ inspect: mockNetworkInspect });
+    // Default: image already present locally (IfNotPresent → no pull).
+    mockImageInspect.mockResolvedValue({ Id: 'sha256:mock' });
+    mockGetImage.mockReturnValue({ inspect: mockImageInspect });
+    mockValidateNftablesAvailability.mockResolvedValue(undefined);
+    mockEnsureKiciTable.mockResolvedValue(undefined);
+    mockAddIsolationRules.mockResolvedValue(undefined);
+    mockRemoveIsolationRules.mockResolvedValue(undefined);
+  });
+
+  describe('spawn()', () => {
+    it('creates container with correct env vars', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockCreateContainer).toHaveBeenCalledOnce();
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.Env).toContain('KICI_ORCHESTRATOR_URL=http://localhost:4000');
+      expect(args.Env).toContain('KICI_AGENT_ID=agent-1');
+      expect(args.Env).toContain(
+        'KICI_LABELS=linux,docker,kici:agent:container,kici:scaler:test-container,kici:role:builder,kici:role:init-runner',
+      );
+      expect(args.Env).toContain('KICI_SCALER_MANAGED=1');
+    });
+
+    it('passes additional env from label set config', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.Env).toContain('NODE_VERSION=20');
+    });
+
+    it('bounds the agent container without restricting the build it runs', async () => {
+      // `KICI_EXECUTION_MODE=bare-metal` means the workflow's steps run as host
+      // processes INSIDE this container unless the job declares its own image.
+      // A pid ceiling costs a build nothing; dropping capabilities or setting
+      // no-new-privileges would break `apt-get`, `chown` and `sudo` in every
+      // customer step, with no opt-out. The confinement the docs promise is
+      // applied one boundary in, to the nested JOB container, by
+      // packages/agent/src/execution/sandbox/container-hardening.ts.
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.PidsLimit).toBe(4096);
+      expect(args.HostConfig.AutoRemove).toBe(false);
+      expect(args.HostConfig.CapDrop).toBeUndefined();
+      expect(args.HostConfig.SecurityOpt).toBeUndefined();
+    });
+
+    it('applies resource limits (Memory and NanoCpus)', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.Memory).toBe(2 * 1024 * 1024 * 1024); // 2g in bytes
+      expect(args.HostConfig.NanoCpus).toBe(2 * 1e9);
+    });
+
+    it('applies default resources when label set has none', async () => {
+      const backend = await createBackend({
+        labelSets: [{ labels: ['linux', 'basic'], image: 'basic:latest' }],
+        defaultResources: { limits: { memory: '1g', cpus: 1 } },
+      });
+      await backend.spawn(['linux', 'basic'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.Memory).toBe(1024 * 1024 * 1024); // 1g
+      expect(args.HostConfig.NanoCpus).toBe(1e9);
+    });
+
+    it('uses effectiveLimits when provided (overrides label-set / default)', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000', undefined, {
+        cpus: 0.5,
+        memBytes: 1024 * 1024 * 1024,
+      });
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      // effectiveLimits beat the label-set's 2g/2cpus.
+      expect(args.HostConfig.Memory).toBe(1024 * 1024 * 1024);
+      expect(args.HostConfig.NanoCpus).toBe(0.5 * 1e9);
+    });
+
+    it('adds container labels (kici-managed, kici-scaler-name, kici-agent-id)', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.Labels['kici-managed']).toBe('true');
+      expect(args.Labels['kici-scaler-name']).toBe('test-container');
+      expect(args.Labels['kici-agent-id']).toBe('agent-1');
+      expect(args.Labels['kici-labels']).toBe('docker,linux');
+      // No spawn context — bound-work labels absent.
+      expect(args.Labels['kici-bound-job-id']).toBeUndefined();
+      expect(args.Labels['kici-run-id']).toBeUndefined();
+    });
+
+    it('adds bound-work labels (kici-bound-job-id, kici-run-id) when spawn context is provided', async () => {
+      const backend = await createBackend();
+      await backend.spawn(
+        ['linux', 'docker'],
+        'agent-1',
+        'http://localhost:4000',
+        undefined,
+        undefined,
+        {
+          boundJobId: 'job-123',
+          runId: 'run-456',
+        },
+      );
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.Labels['kici-bound-job-id']).toBe('job-123');
+      expect(args.Labels['kici-run-id']).toBe('run-456');
+    });
+
+    it('mounts socket at native path when containerSocket is true', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.Binds).toContain('/var/run/docker.sock:/var/run/docker.sock');
+    });
+
+    it('mounts podman socket at native path when detected', async () => {
+      const backend = await createBackend({
+        socketPath: '/run/podman/podman.sock',
+      });
+      await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.Binds).toContain('/run/podman/podman.sock:/run/podman/podman.sock');
+    });
+
+    it('does NOT mount socket when containerSocket is false (default)', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.Binds).toBeUndefined();
+    });
+
+    it('throws when label set not found', async () => {
+      const backend = await createBackend();
+      await expect(
+        backend.spawn(['windows', 'gpu'], 'agent-1', 'http://localhost:4000'),
+      ).rejects.toThrow(
+        'Label set [windows, gpu] not supported by container backend "test-container"',
+      );
+    });
+
+    it('throws when at maxAgents capacity', async () => {
+      const backend = await createBackend({ maxAgents: 1 });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      await expect(
+        backend.spawn(['linux', 'docker'], 'agent-2', 'http://localhost:4000'),
+      ).rejects.toThrow('Container backend "test-container" at capacity (1/1)');
+    });
+
+    it('tracks agent in internal map', async () => {
+      const backend = await createBackend();
+      expect(backend.getActiveCount()).toBe(0);
+
+      const managed = await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+      expect(backend.getActiveCount()).toBe(1);
+      expect(managed.id).toBe('agent-1');
+      expect(managed.state).toBe('running');
+      expect(managed.backendRef).toBe('container-abc123');
+      expect(managed.labelSet).toEqual(['linux', 'docker']);
+    });
+
+    it('pulls image before creating container when it is absent', async () => {
+      // Default policy is IfNotPresent: the image must be missing locally for a
+      // pull to happen. Make the inspect reject to simulate an absent image.
+      mockImageInspect.mockRejectedValue(new Error('no such image'));
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest', {
+        abortSignal: undefined,
+      });
+      expect(mockFollowProgress).toHaveBeenCalledOnce();
+    });
+
+    describe('abort signal', () => {
+      it('forwards the abort signal into pull, createContainer and start opts', async () => {
+        // Force a pull so the pull call site is exercised too.
+        mockImageInspect.mockRejectedValue(new Error('no such image'));
+        const controller = new AbortController();
+        const backend = await createBackend();
+        await backend.spawn(
+          ['linux', 'docker'],
+          'agent-abrt',
+          'http://localhost:4000',
+          undefined,
+          undefined,
+          undefined,
+          controller.signal,
+        );
+
+        expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest', {
+          abortSignal: controller.signal,
+        });
+        expect(mockCreateContainer.mock.calls[0][0].abortSignal).toBe(controller.signal);
+        expect(mockStart).toHaveBeenCalledWith({ abortSignal: controller.signal });
+      });
+
+      it('best-effort removes a created container and clears tracking when start fails after abort', async () => {
+        const controller = new AbortController();
+        // The container is created, then start rejects (as a cancelled request
+        // would once the signal aborts).
+        mockStart.mockRejectedValueOnce(new Error('start aborted'));
+        const backend = await createBackend();
+
+        const p = backend.spawn(
+          ['linux', 'docker'],
+          'agent-hung',
+          'http://localhost:4000',
+          undefined,
+          undefined,
+          undefined,
+          controller.signal,
+        );
+        controller.abort(new Error('scaler spawn timed out'));
+        await expect(p).rejects.toThrow();
+
+        // The created container was removed best-effort and tracking was pruned,
+        // so the semaphore/cap accounting sees the backend as idle again.
+        expect(mockRemove).toHaveBeenCalledWith({ force: true });
+        expect(backend.getActiveCount()).toBe(0);
+      });
+    });
+
+    describe('imagePullPolicy', () => {
+      it('with no imagePullPolicy set, does not pull when the image is already present', async () => {
+        mockImageInspect.mockResolvedValue({ Id: 'sha256:present' });
+        const backend = await createBackend();
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockGetImage).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest');
+        expect(mockPull).not.toHaveBeenCalled();
+        expect(mockCreateContainer).toHaveBeenCalledOnce();
+      });
+
+      it('with no imagePullPolicy set, pulls once when the image is absent', async () => {
+        mockImageInspect.mockRejectedValue(new Error('no such image'));
+        const backend = await createBackend();
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockPull).toHaveBeenCalledTimes(1);
+        expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest', {
+          abortSignal: undefined,
+        });
+      });
+
+      it('explicit imagePullPolicy Always pulls even when the image is present', async () => {
+        mockImageInspect.mockResolvedValue({ Id: 'sha256:present' });
+        const backend = await createBackend({
+          labelSets: [
+            { labels: ['linux', 'docker'], image: 'moving:latest', imagePullPolicy: 'Always' },
+          ],
+        });
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockPull).toHaveBeenCalledTimes(1);
+        expect(mockPull).toHaveBeenCalledWith('moving:latest', { abortSignal: undefined });
+      });
+
+      it('imagePullPolicy Never does not pull even when the image is absent', async () => {
+        mockImageInspect.mockRejectedValue(new Error('no such image'));
+        const backend = await createBackend({
+          labelSets: [
+            { labels: ['linux', 'docker'], image: 'pinned:1.0', imagePullPolicy: 'Never' },
+          ],
+        });
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockPull).not.toHaveBeenCalled();
+      });
+    });
+
+    it('starts container after creation', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockStart).toHaveBeenCalledOnce();
+    });
+
+    it('sets AutoRemove to false', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.AutoRemove).toBe(false);
+    });
+
+    it('passes extraHosts to HostConfig.ExtraHosts', async () => {
+      const backend = await createBackend({
+        extraHosts: ['verdaccio.local:host-gateway'],
+      });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.ExtraHosts).toEqual(['verdaccio.local:host-gateway']);
+    });
+
+    it('does NOT set ExtraHosts when extraHosts is not configured', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.HostConfig.ExtraHosts).toBeUndefined();
+    });
+
+    it('forwards KICI_AGENT_ENV_ prefixed vars with prefix stripped', async () => {
+      const originalEnv = { ...process.env };
+      try {
+        process.env.KICI_AGENT_ENV_HTTP_PROXY = 'http://proxy:3128';
+        process.env.KICI_AGENT_ENV_NO_PROXY = 'localhost,.internal';
+
+        const backend = await createBackend();
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        const args = mockCreateContainer.mock.calls[0][0];
+        expect(args.Env).toContain('HTTP_PROXY=http://proxy:3128');
+        expect(args.Env).toContain('NO_PROXY=localhost,.internal');
+
+        // Should NOT include the original KICI_AGENT_ENV_ prefixed entries
+        for (const entry of args.Env) {
+          expect(entry).not.toMatch(/^KICI_AGENT_ENV_/);
+        }
+      } finally {
+        process.env = originalEnv;
+      }
+    });
+
+    it('scalers.yaml env overrides KICI_AGENT_ENV_ forwarded vars', async () => {
+      const originalEnv = { ...process.env };
+      try {
+        process.env.KICI_AGENT_ENV_NODE_VERSION = 'forwarded-value';
+
+        const backend = await createBackend();
+        // linux,node20 label set has env: { NODE_VERSION: '20' }
+        await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
+
+        const args = mockCreateContainer.mock.calls[0][0];
+        // scalers.yaml env comes after KICI_AGENT_ENV_ in the array, so it has higher precedence
+        // Both entries may be present, but the last one wins for Docker env
+        const nodeVersionEntries = args.Env.filter((e: string) => e.startsWith('NODE_VERSION='));
+        // The last entry should be the scalers.yaml value
+        expect(nodeVersionEntries[nodeVersionEntries.length - 1]).toBe('NODE_VERSION=20');
+      } finally {
+        process.env = originalEnv;
+      }
+    });
+
+    it('cleans up tracking if spawn fails', async () => {
+      mockCreateContainer.mockRejectedValueOnce(new Error('Container error'));
+      const backend = await createBackend();
+
+      await expect(
+        backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000'),
+      ).rejects.toThrow('Container error');
+
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('applies per-container nftables rules with saddr match after spawn', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockAddIsolationRules).toHaveBeenCalledWith(
+        '172.30.0.5',
+        '172.30.0.1',
+        undefined,
+        'saddr',
+      );
+    });
+
+    it('passes networkPolicy from label set to addIsolationRules', async () => {
+      const backend = await createBackend({
+        labelSets: [
+          {
+            labels: ['linux', 'docker'],
+            image: 'test:latest',
+            networkPolicy: { allowlist: ['8.8.8.0/24'], denyAll: true },
+          },
+        ],
+      });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockAddIsolationRules).toHaveBeenCalledWith(
+        '172.30.0.5',
+        '172.30.0.1',
+        { allowlist: ['8.8.8.0/24'], denyAll: true },
+        'saddr',
+      );
+    });
+
+    it('narrows host reachability to the orchestrator port and DNS by default', async () => {
+      // Before the input chain existed, an agent container reached every port
+      // on every one of the host's addresses.
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockAddHostIsolationRules).toHaveBeenCalledWith(
+        '172.30.0.5',
+        ['172.30.0.1:53', '*:4000'],
+        'saddr',
+      );
+    });
+
+    it('applies a label set hostAccess verbatim', async () => {
+      const backend = await createBackend({
+        labelSets: [
+          {
+            labels: ['linux', 'docker'],
+            image: 'test:latest',
+            networkPolicy: { hostAccess: ['192.168.1.85:5000'] },
+          },
+        ],
+      });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockAddHostIsolationRules).toHaveBeenCalledWith(
+        '172.30.0.5',
+        ['192.168.1.85:5000'],
+        'saddr',
+      );
+    });
+
+    it('folds the orchestrator host services into the default', async () => {
+      const backend = await createBackend({ hostServices: ['192.168.1.85:9000'] });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockAddHostIsolationRules).toHaveBeenCalledWith(
+        '172.30.0.5',
+        ['172.30.0.1:53', '*:4000', '192.168.1.85:9000'],
+        'saddr',
+      );
+    });
+
+    it('skips nftables rules when network isolation is disabled', async () => {
+      const backend = await createBackend({ networkIsolation: false });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      expect(mockAddIsolationRules).not.toHaveBeenCalled();
+      expect(mockAddHostIsolationRules).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('destroy()', () => {
+    it('stops and removes container', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      await backend.destroy('agent-1');
+
+      expect(mockGetContainer).toHaveBeenCalledWith('container-abc123');
+      expect(mockStop).toHaveBeenCalledWith({ t: 10 });
+      expect(mockRemove).toHaveBeenCalledWith({ force: true });
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('handles already-removed container gracefully', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      mockStop.mockRejectedValueOnce(new Error('container already stopped'));
+      mockRemove.mockRejectedValueOnce(new Error('container already removed'));
+
+      // Should not throw
+      await backend.destroy('agent-1');
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('handles non-existent managed ID gracefully', async () => {
+      const backend = await createBackend();
+      // Should not throw
+      await backend.destroy('non-existent');
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('removes per-container nftables rules on destroy', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      await backend.destroy('agent-1');
+
+      expect(mockRemoveIsolationRules).toHaveBeenCalledWith('172.30.0.5');
+    });
+
+    // The agent inside a container registers, runs its job and disconnects
+    // while spawn() is still awaiting the runtime under load; that disconnect
+    // destroys the agent mid-spawn. Before the fix the tracking entry still
+    // carried the empty backendRef it was created with, so destroy handed
+    // dockerode '' — `POST /containers//stop`, which podman answers with a
+    // redirect docker-modem follows to a host named `containers`, and the
+    // resulting DNS failure was an uncaught exception that killed the process.
+    describe('destroy during spawn', () => {
+      it('stops the real container and never hands the runtime an empty id', async () => {
+        const backend = await createBackend();
+        let releaseStart!: () => void;
+        mockStart.mockReturnValueOnce(new Promise<void>((resolve) => (releaseStart = resolve)));
+
+        const spawning = backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+        await vi.waitFor(() => expect(mockCreateContainer).toHaveBeenCalledOnce());
+
+        // The disconnect lands while `start` is still pending.
+        await backend.destroy('agent-1');
+
+        // fails-when: destroy reads the entry's initial backendRef ('') — the
+        // exact input that produced the podman redirect.
+        expect(mockGetContainer).not.toHaveBeenCalledWith('');
+        expect(mockGetContainer).toHaveBeenCalledWith('container-abc123');
+        expect(mockStop).toHaveBeenCalledWith({ t: 10 });
+        expect(mockRemove).toHaveBeenCalledWith({ force: true });
+        expect(backend.getActiveCount()).toBe(0);
+
+        // The spawn unwinds instead of resolving an agent that no longer
+        // exists, and leaves no tracking behind.
+        releaseStart();
+        await expect(spawning).rejects.toThrow(/torn down/);
+        expect(backend.getActiveCount()).toBe(0);
+        expect(backend.getLogCapture('agent-1')).toBeUndefined();
+      });
+
+      it('skips the runtime entirely when the container does not exist yet', async () => {
+        const backend = await createBackend();
+        let releaseCreate!: (c: typeof mockContainer) => void;
+        mockCreateContainer.mockReturnValueOnce(
+          new Promise<typeof mockContainer>((resolve) => (releaseCreate = resolve)),
+        );
+
+        const spawning = backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+        await vi.waitFor(() => expect(mockCreateContainer).toHaveBeenCalledOnce());
+
+        await backend.destroy('agent-1');
+        // breaks-if-wrong: with no container, the runtime must not be asked to
+        // stop or remove anything.
+        expect(mockGetContainer).not.toHaveBeenCalled();
+        expect(mockStop).not.toHaveBeenCalled();
+
+        // The spawn's own unwind removes the container that arrives late.
+        releaseCreate(mockContainer);
+        await expect(spawning).rejects.toThrow(/torn down/);
+        expect(mockRemove).toHaveBeenCalledWith({ force: true });
+        expect(backend.getActiveCount()).toBe(0);
+      });
+    });
+  });
+
+  describe('shutdownAll()', () => {
+    it('destroys all tracked agents', async () => {
+      const backend = await createBackend();
+
+      // Spawn two different containers
+      mockContainer.id = 'container-1';
+      mockCreateContainer.mockResolvedValueOnce({
+        id: 'container-1',
+        start: mockStart,
+        stop: mockStop,
+        remove: mockRemove,
+      });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      mockCreateContainer.mockResolvedValueOnce({
+        id: 'container-2',
+        start: mockStart,
+        stop: mockStop,
+        remove: mockRemove,
+      });
+      await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
+
+      expect(backend.getActiveCount()).toBe(2);
+
+      await backend.shutdownAll();
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('includes all role labels when roles is undefined (default)', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      const labelsEnv = args.Env.find((e: string) => e.startsWith('KICI_LABELS='));
+      expect(labelsEnv).toContain('kici:role:builder');
+      expect(labelsEnv).toContain('kici:role:init-runner');
+    });
+
+    it('includes only kici:role:builder when roles is ["builder"]', async () => {
+      const backend = await createBackend({ roles: ['builder'] });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      const labelsEnv = args.Env.find((e: string) => e.startsWith('KICI_LABELS='));
+      expect(labelsEnv).toContain('kici:role:builder');
+      expect(labelsEnv).not.toContain('kici:role:init-runner');
+    });
+
+    it('includes no role labels when roles is [] (execution only)', async () => {
+      const backend = await createBackend({ roles: [] });
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      const labelsEnv = args.Env.find((e: string) => e.startsWith('KICI_LABELS='));
+      expect(labelsEnv).not.toContain('kici:role:');
+    });
+  });
+
+  describe('cleanupOrphans()', () => {
+    it('removes exited containers this scaler stamped', async () => {
+      const mockContainerInfo = [
+        { Id: 'orphan-1', Names: ['/kici-orphan-1'], State: 'exited' },
+        { Id: 'orphan-2', Names: ['/kici-orphan-2'], State: 'exited' },
+      ];
+      mockListContainers.mockResolvedValueOnce(mockContainerInfo);
+
+      const backend = await createBackend();
+      const cleaned = await backend.cleanupOrphans();
+
+      // Scoped to this scaler's own name: two orchestrators (or a coordinator
+      // and a worker peer) sharing one docker host used to kill each other's
+      // running agents on every boot.
+      expect(mockListContainers).toHaveBeenCalledWith({
+        all: true,
+        filters: { label: ['kici-managed=true', 'kici-scaler-name=test-container'] },
+      });
+      expect(cleaned).toBe(2);
+      expect(mockGetContainer).toHaveBeenCalledWith('orphan-1');
+      expect(mockGetContainer).toHaveBeenCalledWith('orphan-2');
+    });
+
+    it('spares a running container whose agent is registered', async () => {
+      // The live-agent case. An operator adding a second container scaler
+      // triggers this sweep, and removing a running, registered agent fails
+      // every job on it as "agent disconnected" on a healthy system.
+      mockListContainers.mockResolvedValueOnce([
+        {
+          Id: 'busy-1',
+          State: 'running',
+          Labels: { 'kici-managed': 'true', 'kici-agent-id': 'scaler-container-aaaa' },
+        },
+      ]);
+
+      const backend = await createBackend({ isRegistered: () => true });
+      const cleaned = await backend.cleanupOrphans();
+
+      expect(cleaned).toBe(0);
+      expect(mockGetContainer).not.toHaveBeenCalledWith('busy-1');
+    });
+
+    it('removes a running container whose agent never registered', async () => {
+      // The negative control for the case above: without it, "spares a running
+      // container" would pass on a sweep that spares everything.
+      mockListContainers.mockResolvedValueOnce([
+        {
+          Id: 'refused-1',
+          State: 'running',
+          Labels: { 'kici-managed': 'true', 'kici-agent-id': 'scaler-container-bbbb' },
+        },
+      ]);
+
+      const backend = await createBackend({ isRegistered: () => false });
+      const cleaned = await backend.cleanupOrphans();
+
+      expect(cleaned).toBe(1);
+      expect(mockGetContainer).toHaveBeenCalledWith('refused-1');
+    });
+
+    it('spares a container this backend is still tracking', async () => {
+      const backend = await createBackend({ isRegistered: () => false });
+      await backend.spawn(['linux', 'docker'], 'agent-tracked', 'http://localhost:4000');
+      vi.clearAllMocks();
+      mockListContainers.mockResolvedValueOnce([
+        {
+          Id: 'container-abc123',
+          State: 'running',
+          Labels: { 'kici-managed': 'true', 'kici-agent-id': 'agent-tracked' },
+        },
+      ]);
+
+      const cleaned = await backend.cleanupOrphans();
+      expect(cleaned).toBe(0);
+    });
+
+    it('reapUnowned removes a refused registration by its agent-id label', async () => {
+      // Narrowing the sweep above would strand a container whose registration
+      // the orchestrator refused, so the two must ship together.
+      mockListContainers.mockResolvedValueOnce([{ Id: 'refused-1', State: 'running' }]);
+      const backend = await createBackend();
+
+      await expect(backend.reapUnowned('scaler-container-cccc')).resolves.toBe(true);
+      expect(mockListContainers).toHaveBeenCalledWith({
+        all: true,
+        filters: {
+          label: [
+            'kici-managed=true',
+            'kici-scaler-name=test-container',
+            'kici-agent-id=scaler-container-cccc',
+          ],
+        },
+      });
+      expect(mockGetContainer).toHaveBeenCalledWith('refused-1');
+    });
+
+    it('returns 0 when no orphans found', async () => {
+      mockListContainers.mockResolvedValue([]);
+      const backend = await createBackend();
+      const cleaned = await backend.cleanupOrphans();
+      expect(cleaned).toBe(0);
+    });
+
+    it('spares an isolated-network address a neighbouring backend still holds', async () => {
+      // `kici-agent-net` is ONE fixed network on the host: a second container
+      // scaler, the bare-metal backend's container mode, and another
+      // orchestrator on the same runtime all put their agents on it. Reaping
+      // every address this backend does not track would delete a live
+      // neighbour's RFC1918 and cloud-metadata drops — a silent fail-open of
+      // the boundary this sweep exists to repair.
+      mockListContainers.mockResolvedValue([
+        {
+          Id: 'neighbour-1',
+          State: 'running',
+          Labels: {
+            'kici-managed': 'true',
+            'kici-scaler-name': 'some-other-scaler',
+            'kici-agent-id': 'agent-of-another-scaler',
+          },
+          NetworkSettings: { Networks: { 'kici-agent-net': { IPAddress: '172.30.0.7' } } },
+        },
+      ]);
+      mockListIsolationRules.mockResolvedValue(
+        new Map([
+          ['172.30.0.7', [11]], // the neighbour's live rules
+          ['172.30.0.9', [12]], // genuinely stranded — no container holds it
+        ]),
+      );
+
+      const backend = await createBackend({ networkIsolation: true });
+      await backend.cleanupOrphans();
+
+      // Negative control in the same assertion: the stranded address IS reaped,
+      // so a sweep that spared everything would fail here too.
+      expect(mockDeleteForwardRules).toHaveBeenCalledTimes(1);
+      expect(mockDeleteForwardRules).toHaveBeenCalledWith([12]);
+    });
+
+    it('reaps nothing when the host-wide container listing fails', async () => {
+      // A failed listing is not evidence that no container holds an address, so
+      // the sweep stands down rather than reaping blind. The scaler-scoped
+      // listing succeeds; only the host-wide one used for ownership fails.
+      mockListContainers.mockResolvedValueOnce([]).mockRejectedValue(new Error('socket gone'));
+      mockListIsolationRules.mockResolvedValue(new Map([['172.30.0.9', [12]]]));
+
+      const backend = await createBackend({ networkIsolation: true });
+      await expect(backend.cleanupOrphans()).resolves.toBe(0);
+      expect(mockDeleteForwardRules).not.toHaveBeenCalled();
+    });
+
+    it('handles stop failures gracefully during cleanup', async () => {
+      mockListContainers.mockResolvedValueOnce([{ Id: 'orphan-1', State: 'exited' }]);
+      mockStop.mockRejectedValueOnce(new Error('already stopped'));
+
+      const backend = await createBackend();
+      const cleaned = await backend.cleanupOrphans();
+      expect(cleaned).toBe(1);
+    });
+  });
+
+  describe('getActiveCount()', () => {
+    it('returns correct count', async () => {
+      const backend = await createBackend();
+      expect(backend.getActiveCount()).toBe(0);
+
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+      expect(backend.getActiveCount()).toBe(1);
+
+      mockCreateContainer.mockResolvedValueOnce({
+        id: 'container-2',
+        start: mockStart,
+        stop: mockStop,
+        remove: mockRemove,
+      });
+      await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
+      expect(backend.getActiveCount()).toBe(2);
+
+      await backend.destroy('agent-1');
+      expect(backend.getActiveCount()).toBe(1);
+    });
+  });
+
+  describe('reload()', () => {
+    it('validates container label sets must have image', async () => {
+      const backend = await createBackend();
+      const result = backend.reload([
+        { labels: ['linux', 'docker'], image: 'valid:latest' },
+        { labels: ['linux', 'node20'] }, // Missing image
+      ]);
+
+      expect(result.valid).toBe(false);
+      if (!result.valid) {
+        expect(result.errors).toHaveLength(1);
+        expect(result.errors[0]).toContain("'image'");
+      }
+    });
+
+    it('accepts valid label sets', async () => {
+      const backend = await createBackend();
+      const result = backend.reload([{ labels: ['linux', 'docker'], image: 'new-image:latest' }]);
+
+      expect(result.valid).toBe(true);
+    });
+
+    it('updates label sets on successful reload', async () => {
+      const backend = await createBackend();
+      const newLabelSets: LabelSetConfig[] = [{ labels: ['linux', 'new'], image: 'new:latest' }];
+      backend.reload(newLabelSets);
+
+      expect(backend.labelSets).toEqual(newLabelSets);
+    });
+
+    it('applies a new maxAgents on reload', async () => {
+      const backend = await createBackend();
+      expect(backend.maxAgents).toBe(5);
+
+      const result = backend.reload([{ labels: ['linux', 'docker'], image: 'a:latest' }], {
+        maxAgents: 9,
+      });
+
+      expect(result.valid).toBe(true);
+      expect(backend.maxAgents).toBe(9);
+    });
+
+    it('keeps the current maxAgents when the opts argument is omitted', async () => {
+      const backend = await createBackend();
+      backend.reload([{ labels: ['linux', 'docker'], image: 'a:latest' }]);
+      expect(backend.maxAgents).toBe(5);
+    });
+
+    it('leaves maxAgents untouched when the new label sets are invalid', async () => {
+      const backend = await createBackend();
+      const result = backend.reload([{ labels: ['linux', 'node20'] }], { maxAgents: 9 });
+
+      expect(result.valid).toBe(false);
+      expect(backend.maxAgents).toBe(5);
+    });
+  });
+
+  describe('type', () => {
+    it('returns "container"', async () => {
+      const backend = await createBackend();
+      expect(backend.type).toBe('container');
+    });
+  });
+
+  describe('create() factory', () => {
+    it('succeeds with host option (no socket detection)', async () => {
+      const backend = await ContainerScalerBackend.create({
+        name: 'remote',
+        labelSets: defaultLabelSets,
+        maxAgents: 5,
+        host: 'tcp://192.168.1.10:2376',
+      });
+
+      expect(backend.type).toBe('container');
+      expect(backend.maxAgents).toBe(5);
+    });
+
+    it('succeeds with explicit socketPath', async () => {
+      const backend = await ContainerScalerBackend.create({
+        name: 'explicit',
+        labelSets: defaultLabelSets,
+        maxAgents: 5,
+        socketPath: '/custom/path.sock',
+      });
+
+      expect(backend.type).toBe('container');
+    });
+
+    it('throws when no runtime found and no host configured', async () => {
+      mockAccess.mockRejectedValue(new Error('ENOENT'));
+
+      await expect(
+        ContainerScalerBackend.create({
+          name: 'missing',
+          labelSets: defaultLabelSets,
+          maxAgents: 5,
+        }),
+      ).rejects.toThrow('No container runtime found');
+    });
+
+    it('declares spawnsOnLocalHost=false for a remote runtime host', async () => {
+      const backend = await ContainerScalerBackend.create({
+        name: 'remote',
+        labelSets: defaultLabelSets,
+        maxAgents: 5,
+        host: 'tcp://192.168.1.10:2376',
+      });
+
+      expect(backend.spawnsOnLocalHost).toBe(false);
+    });
+
+    it('declares spawnsOnLocalHost=true for a local socket', async () => {
+      const backend = await createBackend();
+
+      expect(backend.spawnsOnLocalHost).toBe(true);
+    });
+  });
+
+  describe('isolated network', () => {
+    it('creates kici-agent-net network on startup if not exists', async () => {
+      mockListNetworks.mockResolvedValueOnce([]);
+      await createBackend();
+
+      expect(mockCreateNetwork).toHaveBeenCalledWith({
+        Name: 'kici-agent-net',
+        Driver: 'bridge',
+        IPAM: {
+          Config: [{ Subnet: '172.30.0.0/16', Gateway: '172.30.0.1' }],
+        },
+        Labels: { 'kici-managed': 'true' },
+      });
+    });
+
+    it('reuses existing kici-agent-net network', async () => {
+      mockListNetworks.mockResolvedValueOnce([{ Name: 'kici-agent-net', Id: 'existing-net-id' }]);
+      mockGetNetwork.mockReturnValue({
+        inspect: vi.fn().mockResolvedValue({
+          Id: 'existing-net-id',
+          Options: { 'com.docker.network.bridge.name': 'br-existing' },
+        }),
+      });
+
+      await createBackend();
+
+      // Should NOT try to create a new network
+      expect(mockCreateNetwork).not.toHaveBeenCalled();
+    });
+
+    it('handles Docker substring matching by verifying exact name', async () => {
+      // Docker's name filter does substring matching, so "kici-agent-net" might
+      // match "kici-agent-network-other" -- we verify exact name match
+      mockListNetworks.mockResolvedValueOnce([
+        { Name: 'kici-agent-network-other', Id: 'wrong-net-id' },
+      ]);
+
+      await createBackend();
+
+      // Should create network since exact name doesn't match
+      expect(mockCreateNetwork).toHaveBeenCalled();
+    });
+
+    it('prepares nftables table during network creation (rules applied per-container in spawn)', async () => {
+      await createBackend();
+
+      expect(mockEnsureKiciTable).toHaveBeenCalledOnce();
+      // addIsolationRules is NOT called at creation time — it's per-container during spawn
+      expect(mockAddIsolationRules).not.toHaveBeenCalled();
+    });
+
+    it('fails backend creation when nftables validation fails', async () => {
+      mockValidateNftablesAvailability.mockRejectedValueOnce(
+        new Error('nftables binary not found at /usr/sbin/nft.'),
+      );
+
+      await expect(createBackend()).rejects.toThrow('nftables binary not found');
+    });
+
+    it('fails backend creation when ensureKiciTable fails (strict enforcement)', async () => {
+      mockEnsureKiciTable.mockRejectedValueOnce(new Error('nft: command failed'));
+
+      await expect(createBackend()).rejects.toThrow('nft: command failed');
+    });
+
+    it('fails spawn when addIsolationRules fails (strict enforcement)', async () => {
+      mockAddIsolationRules.mockRejectedValueOnce(new Error('nftables rule error'));
+
+      const backend = await createBackend();
+      await expect(
+        backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000'),
+      ).rejects.toThrow('nftables rule error');
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('calls validateNftablesAvailability and ensureKiciTable during creation, addIsolationRules during spawn', async () => {
+      const callOrder: string[] = [];
+      mockValidateNftablesAvailability.mockImplementation(async () => {
+        callOrder.push('validate');
+      });
+      mockEnsureKiciTable.mockImplementation(async () => {
+        callOrder.push('ensureTable');
+      });
+      mockAddIsolationRules.mockImplementation(async () => {
+        callOrder.push('addRules');
+      });
+
+      const backend = await createBackend();
+      expect(callOrder).toEqual(['validate', 'ensureTable']);
+
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+      expect(callOrder).toEqual(['validate', 'ensureTable', 'addRules']);
+    });
+
+    it('handles 409 conflict on createNetwork race condition', async () => {
+      mockListNetworks
+        .mockResolvedValueOnce([]) // First check: empty
+        .mockResolvedValueOnce([{ Name: 'kici-agent-net', Id: 'raced-net-id' }]); // Retry after 409
+      mockCreateNetwork.mockRejectedValueOnce(
+        Object.assign(new Error('Conflict'), { statusCode: 409 }),
+      );
+      mockGetNetwork.mockReturnValue({
+        inspect: vi.fn().mockResolvedValue({
+          Id: 'raced-net-id',
+          Options: { 'com.docker.network.bridge.name': 'br-raced' },
+        }),
+      });
+
+      const backend = await createBackend();
+      expect(backend).toBeDefined();
+    });
+
+    it('attaches containers to isolated network', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      expect(args.NetworkingConfig).toEqual({
+        EndpointsConfig: {
+          'kici-agent-net': {},
+        },
+      });
+    });
+
+    it('falls back to br-<id> pattern when bridge name not in Options', async () => {
+      mockNetworkInspect.mockResolvedValueOnce({
+        Id: 'net-abc123456789',
+        Options: {}, // No bridge name in Options (Podman/netavark)
+      });
+
+      // Should not throw — br-<id> fallback is used internally
+      const backend = await createBackend();
+      expect(backend).toBeDefined();
+    });
+
+    it('cleans up per-container nftables rules on shutdownAll', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      mockRemoveIsolationRules.mockResolvedValue(undefined);
+      await backend.shutdownAll();
+
+      expect(mockRemoveIsolationRules).toHaveBeenCalledWith('172.30.0.5');
+    });
+
+    it('handles per-container nftables cleanup failure gracefully', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      mockRemoveIsolationRules.mockRejectedValueOnce(new Error('nft failed'));
+
+      // Should NOT throw
+      await backend.shutdownAll();
+    });
+  });
+
+  describe('detectRuntime()', () => {
+    it('returns null when no sockets accessible', async () => {
+      mockAccess.mockRejectedValue(new Error('ENOENT'));
+
+      const result = await detectRuntime();
+      expect(result).toBeNull();
+    });
+
+    it('only probes podman paths when runtime hint is podman', async () => {
+      mockAccess.mockRejectedValue(new Error('ENOENT'));
+
+      const result = await detectRuntime('podman');
+      expect(result).toBeNull();
+
+      // Should not have probed the docker socket path
+      // (only podman paths are tried)
+      const calledPaths = mockAccess.mock.calls.map((c: unknown[]) => c[0]);
+      expect(calledPaths).not.toContain('/var/run/docker.sock');
+      expect(calledPaths).toContain('/run/podman/podman.sock');
+    });
+
+    it('returns docker when docker socket is accessible', async () => {
+      mockAccess.mockImplementation(async (path: string) => {
+        if (path === '/var/run/docker.sock') return undefined;
+        throw new Error('ENOENT');
+      });
+
+      const result = await detectRuntime();
+      expect(result).toEqual({
+        socketPath: '/var/run/docker.sock',
+        runtime: 'docker',
+      });
+    });
+  });
+
+  describe('getRequiredTools', () => {
+    type Entry = Parameters<typeof ContainerScalerBackend.getRequiredTools>[0];
+
+    it('requires a container runtime (docker or podman) when auto-detecting', () => {
+      const entry = {
+        name: 'container-default',
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'container'], image: 'quay.io/kici-dev/kici-agent' }],
+      } as Entry;
+      const reqs = ContainerScalerBackend.getRequiredTools(entry);
+      const runtimeReq = reqs.find((r) => r.type === 'any-path-binary');
+      expect(runtimeReq).toBeDefined();
+      expect(runtimeReq).toMatchObject({ names: ['docker', 'podman'] });
+      expect(runtimeReq!.reason).toMatch(/container scaler "container-default"/);
+    });
+
+    it('skips the binary check when a socketPath is configured (reachability validated at create)', () => {
+      const entry = {
+        name: 'container-default',
+        type: 'container',
+        socketPath: '/run/user/1000/podman/podman.sock',
+        labelSets: [{ labels: ['linux', 'container'], image: 'quay.io/kici-dev/kici-agent' }],
+      } as Entry;
+      expect(ContainerScalerBackend.getRequiredTools(entry)).toEqual([]);
+    });
+
+    it('skips the binary check when a remote host is configured', () => {
+      const entry = {
+        name: 'remote',
+        type: 'container',
+        host: 'tcp://192.168.1.10:2376',
+        labelSets: [{ labels: ['linux', 'container'], image: 'quay.io/kici-dev/kici-agent' }],
+      } as Entry;
+      expect(ContainerScalerBackend.getRequiredTools(entry)).toEqual([]);
+    });
+  });
+});
+
+describe('ContainerScalerBackend per-job image', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreateContainer.mockResolvedValue(mockContainer);
+    mockVolumeInspect.mockResolvedValue({});
+    mockGetVolume.mockReturnValue({ inspect: mockVolumeInspect, remove: mockVolumeRemove });
+  });
+
+  const jobContainer = {
+    image: 'reg.internal:5000/acme/ci:1.2',
+    authconfig: {
+      username: 'bot',
+      password: 's3cr3t',
+      serveraddress: 'reg.internal:5000',
+    },
+  };
+
+  it('spawns the job own image with the runtime injected, not the pool image', async () => {
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-perjob', 'ws://orch/ws', () => {}, undefined, {
+      boundJobId: 'job-1',
+      runId: 'run-1',
+      container: jobContainer,
+    });
+
+    const created = mockCreateContainer.mock.calls.at(-1)![0] as {
+      Image: string;
+      Cmd?: string[];
+      HostConfig: { Binds?: string[] };
+    };
+    expect(created.Image).toBe('reg.internal:5000/acme/ci:1.2');
+    // The injected runtime is what lets an arbitrary image run without Node.
+    expect(created.HostConfig.Binds?.some((b) => b.endsWith(':/opt/kici:ro'))).toBe(true);
+    // A per-job image declares its OWN default CMD, so without naming the agent
+    // the container runs the customer's entrypoint and never registers.
+    expect((created as { Cmd?: string[] }).Cmd).toEqual([
+      '/opt/kici/node/bin/node',
+      '/opt/kici/app/packages/agent/dist/server.js',
+    ]);
+  });
+
+  it('authenticates the pull for a private per-job image', async () => {
+    // Absent only for the JOB image, so the pull runs. The AGENT image must
+    // still inspect: the runtime volume is keyed by its content id.
+    mockGetImage.mockImplementation((image: string) => ({
+      inspect:
+        image === 'reg.internal:5000/acme/ci:1.2'
+          ? vi.fn().mockRejectedValue(new Error('absent'))
+          : vi.fn().mockResolvedValue({ Id: 'sha256:' + 'a'.repeat(64) }),
+    }));
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-priv', 'ws://orch/ws', () => {}, undefined, {
+      container: jobContainer,
+    });
+
+    const pullCall = mockPull.mock.calls.find((c) => c[0] === 'reg.internal:5000/acme/ci:1.2');
+    expect((pullCall?.[1] as { authconfig?: unknown })?.authconfig).toEqual(
+      jobContainer.authconfig,
+    );
+  });
+
+  it('spawns the fixed pool image and injects nothing when no job image is set', async () => {
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-fixed', 'ws://orch/ws', () => {}, undefined, {
+      boundJobId: 'job-1',
+    });
+
+    const created = mockCreateContainer.mock.calls.at(-1)![0] as {
+      Image: string;
+      Cmd?: string[];
+      HostConfig: { Binds?: string[] };
+    };
+    // The agent image already carries the runtime — injecting into it would
+    // shadow its own /opt/kici.
+    expect(created.Image).not.toBe('reg.internal:5000/acme/ci:1.2');
+    expect(created.HostConfig.Binds?.some((b) => b.endsWith(':/opt/kici:ro'))).toBeFalsy();
+    // The pool's agent image already starts the agent by default; overriding
+    // its CMD would be a second way to say the same thing.
+    expect((created as { Cmd?: string[] }).Cmd).toBeUndefined();
+  });
+});

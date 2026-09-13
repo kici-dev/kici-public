@@ -1,0 +1,83 @@
+name: kici-agent
+run-name: kici-agent ${{ inputs.agent_id }}
+
+# One-shot KiCI agent runner, dispatched by an `event` scaler's provisioning
+# workflow. The agent exchanges its single-use claim code for an ephemeral
+# token, registers with the orchestrator, runs exactly one job, and exits.
+#
+# The real agent token never reaches this file. GitHub logs `workflow_dispatch`
+# inputs, so only the claim code travels here — it is single-use, short-lived,
+# and worthless once redeemed.
+#
+# The agent runs bare-metal on the runner rather than inside a container, so job
+# steps that need Docker use the runner's own daemon.
+
+# #region agent
+on:
+  workflow_dispatch:
+    inputs:
+      claim_code:
+        description: Single-use claim code the agent exchanges for its token
+        required: true
+      orchestrator_url:
+        description: Orchestrator WebSocket URL the agent connects back to
+        required: true
+      agent_id:
+        description: Agent id the orchestrator correlates the spawn with
+        required: true
+      labels:
+        description: Comma-separated label set the pending job needs
+        required: false
+        default: ''
+      agent_bundle_release:
+        description: >-
+          Release tag in this repo holding a `kici-admin agent package` tarball.
+          Leave empty to install the published agent from npm.
+        required: false
+        default: ''
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Default path: the published agent, from npm.
+      - name: Set up Node.js
+        if: ${{ inputs.agent_bundle_release == '' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+      - name: Install the KiCI agent
+        if: ${{ inputs.agent_bundle_release == '' }}
+        run: npm install -g kici-admin
+
+      # Pinned path: a self-contained bundle your orchestrator produced with
+      # `kici-admin agent package`. It vendors its own Node, so it needs no
+      # setup-node. Use it to pin an exact agent build, or for runners that
+      # cannot reach npm. Prepending it to PATH keeps the run step below uniform.
+      - name: Install the KiCI agent (packaged bundle)
+        if: ${{ inputs.agent_bundle_release != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.agent_bundle_release }}
+        run: |
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'kici-agent-linux-x64.tar.gz*' --clobber
+          sha256sum -c kici-agent-linux-x64.tar.gz.sha256
+          mkdir -p kici-agent-dist
+          tar xzf kici-agent-linux-x64.tar.gz -C kici-agent-dist
+          echo "$PWD/kici-agent-dist" >> "$GITHUB_PATH"
+
+      - name: Run the one-shot KiCI agent
+        env:
+          KICI_ORCHESTRATOR_URL: ${{ inputs.orchestrator_url }}
+          KICI_SCALER_CLAIM_CODE: ${{ inputs.claim_code }}
+          KICI_AGENT_ID: ${{ inputs.agent_id }}
+          KICI_LABELS: ${{ inputs.labels }}
+          # Managed mode + zero idle timeout: register, run one job, exit.
+          KICI_SCALER_MANAGED: '1'
+          KICI_EXECUTION_MODE: bare-metal
+          KICI_SCALER_IDLE_TIMEOUT: '0'
+        run: exec kici-agent
+# #endregion

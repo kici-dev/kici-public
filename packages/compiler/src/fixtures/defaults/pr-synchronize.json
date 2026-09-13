@@ -1,0 +1,27 @@
+{
+  "action": "synchronize",
+  "number": 1,
+  "pull_request": {
+    "number": 1,
+    "title": "Test PR",
+    "state": "open",
+    "head": {
+      "ref": "feature-branch",
+      "sha": "abc123"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "def456"
+    }
+  },
+  "repository": {
+    "name": "test-repo",
+    "full_name": "owner/test-repo",
+    "owner": {
+      "login": "owner"
+    }
+  },
+  "sender": {
+    "login": "user"
+  }
+}

@@ -1,0 +1,332 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+
+// Mock os.homedir to isolate tests from real home directory
+vi.mock('node:os', async () => {
+  const actual = await vi.importActual<typeof import('node:os')>('node:os');
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      homedir: vi.fn(),
+    },
+  };
+});
+
+// Mock global fetch
+const mockFetch = vi.fn();
+vi.stubGlobal('fetch', mockFetch);
+
+import { hashKiciSourceTree } from '@kici-dev/core/kici-source-digest';
+
+import { typesCommand } from './types.js';
+
+/** Build a Response-like object DashboardClient understands (reads res.text()). */
+function jsonOk(body: unknown) {
+  const text = JSON.stringify(body);
+  return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
+}
+
+describe('kici types', () => {
+  let tempDir: string;
+  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-types-test-'));
+    vi.mocked(os.homedir).mockReturnValue(tempDir);
+    // The homedir mock alone does not isolate this suite: getConfigDir()
+    // refuses the ambient config under the KiCI test-isolation marker before
+    // it consults homedir(). Name the same directory the mock produces
+    // explicitly.
+    process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
+    consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockFetch.mockReset();
+  });
+
+  afterEach(async () => {
+    delete process.env.KICI_CONFIG_DIR;
+    vi.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function writeConfig(config: Record<string, unknown>): Promise<void> {
+    const configDir = path.join(tempDir, '.kici');
+    await fs.mkdir(configDir, { recursive: true });
+    await fs.writeFile(path.join(configDir, 'config'), JSON.stringify(config), { mode: 0o600 });
+  }
+
+  const platformConfig = {
+    pat: 'kici_pat_abc',
+    platformEndpoint: 'https://platform.example.com',
+    activeOrgId: 'org-1',
+  };
+
+  describe('successful generation', () => {
+    it('writes .d.ts to correct path', async () => {
+      await writeConfig(platformConfig);
+
+      mockFetch.mockResolvedValue(
+        jsonOk({
+          contexts: [
+            {
+              name: 'production',
+              secretKeys: ['DB_HOST', 'DB_PASS'],
+              allowLocalExecution: true,
+              enabled: true,
+            },
+          ],
+        }),
+      );
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const result = await typesCommand({ kiciDir });
+
+      expect(result).toBe(true);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://platform.example.com/api/v1/orgs/org-1/contexts?includeSecrets=true',
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: 'Bearer kici_pat_abc' }),
+        }),
+      );
+
+      const outputPath = path.join(kiciDir, 'types', 'secrets.d.ts');
+      const content = await fs.readFile(outputPath, 'utf-8');
+      expect(content).toContain("declare module '@kici-dev/sdk'");
+      expect(content).toContain('DB_HOST: string;');
+      expect(content).toContain('DB_PASS: string;');
+    });
+
+    it('generated file contains KnownSecretKeys and ContextSecrets', async () => {
+      await writeConfig(platformConfig);
+
+      mockFetch.mockResolvedValue(
+        jsonOk({
+          contexts: [
+            { name: 'staging', secretKeys: ['KEY1'], allowLocalExecution: true, enabled: true },
+          ],
+        }),
+      );
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const result = await typesCommand({ kiciDir });
+
+      expect(result).toBe(true);
+      const outputPath = path.join(kiciDir, 'types', 'secrets.d.ts');
+      const content = await fs.readFile(outputPath, 'utf-8');
+      expect(content).toContain('interface KnownSecretKeys');
+      expect(content).toContain('interface ContextSecrets');
+      expect(content).not.toContain('KnownContexts');
+    });
+
+    it('suppresses the success line on stdout when quiet', async () => {
+      await writeConfig(platformConfig);
+
+      mockFetch.mockResolvedValue(
+        jsonOk({
+          contexts: [
+            { name: 'staging', secretKeys: ['KEY1'], allowLocalExecution: true, enabled: true },
+          ],
+        }),
+      );
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const result = await typesCommand({ kiciDir, quiet: true });
+      expect(result).toBe(true);
+      // The "Types generated" line is a direct stdout write — under quiet it
+      // must not fire so a machine-readable caller keeps stdout pure.
+      expect(logSpy).not.toHaveBeenCalled();
+      logSpy.mockRestore();
+    });
+  });
+
+  /** Read the generated declaration file for a given .kici dir. */
+  async function readStub(kiciDir: string): Promise<string> {
+    return fs.readFile(path.join(kiciDir, 'types', 'secrets.d.ts'), 'utf-8');
+  }
+
+  describe('offline stub when the Platform is unreachable', () => {
+    it('writes an empty stub and succeeds when not authenticated', async () => {
+      // No config file at all — DashboardClient.fromConfig throws not_logged_in.
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
+
+      // Does NOT fail: the file must exist so an unauthenticated fresh clone
+      // typechecks against "no known keys" rather than "no exported member".
+      expect(result).toBe(true);
+      const content = await readStub(kiciDir);
+      expect(content).toContain("declare module '@kici-dev/sdk'");
+      expect(content).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
+      expect(content).toContain('// Source: offline stub -- Platform unreachable');
+      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      expect(errors).toContain('offline type stub');
+    });
+
+    it('writes an empty stub and succeeds when no active organization is set', async () => {
+      await writeConfig({ pat: 'kici_pat_abc', platformEndpoint: 'https://platform.example.com' });
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
+
+      expect(result).toBe(true);
+      // No org means no fetch is attempted (the client refuses before the wire).
+      expect(mockFetch).not.toHaveBeenCalled();
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: offline stub -- Platform unreachable');
+    });
+
+    it('does NOT overwrite an existing populated file on a transient offline error', async () => {
+      await writeConfig(platformConfig);
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+      // A developer's real, populated declaration file generated on a prior
+      // authenticated run.
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(path.join(kiciDir, 'types'), { recursive: true });
+      const populated =
+        "declare module '@kici-dev/sdk' { interface KnownSecretKeys { DB_PASS: string } }\nexport {};\n";
+      await fs.writeFile(path.join(kiciDir, 'types', 'secrets.d.ts'), populated, 'utf-8');
+
+      const result = await typesCommand({ kiciDir });
+
+      // The command still succeeds, but the good file is preserved verbatim —
+      // a Platform blip must not downgrade type-checking to "any key accepted".
+      expect(result).toBe(true);
+      expect(await readStub(kiciDir)).toBe(populated);
+      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      expect(errors).toContain('Keeping the existing');
+    });
+
+    it('writes an empty stub and succeeds on a network failure', async () => {
+      await writeConfig(platformConfig);
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
+
+      expect(result).toBe(true);
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: offline stub -- Platform unreachable');
+      expect(content).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
+    });
+  });
+
+  describe('surfaces genuine auth/permission errors (no stub)', () => {
+    it('returns false on 403 response without writing a stub', async () => {
+      await writeConfig(platformConfig);
+
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: 'Insufficient permission: contexts.read needed' }),
+      });
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
+
+      // A forbidden response is a real permission problem the user must see —
+      // masking it behind a stub would hide the misconfiguration.
+      expect(result).toBe(false);
+      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      expect(errors).toContain('contexts.read');
+      await expect(readStub(kiciDir)).rejects.toThrow();
+    });
+  });
+  describe('digest invariance (the drift-gate seam)', () => {
+    /**
+     * The lock file's `contentHash` is a digest over the whole `.kici/` tree,
+     * recorded by the compiler and re-derived by the agent before it runs a
+     * job. So every file `kici compile` writes into that tree has to be one
+     * the digest excludes, from every working directory the CLI accepts.
+     *
+     * Asserting the digest rather than a file list is deliberate: it is the
+     * property the gate depends on, and it keeps holding when the compiler
+     * starts writing some file this test never heard of.
+     */
+    async function digestAfterTypes(opts: {
+      kiciDir: string;
+      cwd: string;
+      passKiciDir: string | undefined;
+    }): Promise<{ before: string; after: string }> {
+      await fs.mkdir(path.join(opts.kiciDir, 'workflows'), { recursive: true });
+      await fs.writeFile(
+        path.join(opts.kiciDir, 'workflows', 'ci.ts'),
+        'export default {};\n',
+        'utf-8',
+      );
+      const before = await hashKiciSourceTree(opts.kiciDir);
+
+      const originalCwd = process.cwd();
+      process.chdir(opts.cwd);
+      try {
+        expect(await typesCommand({ kiciDir: opts.passKiciDir })).toBe(true);
+      } finally {
+        process.chdir(originalCwd);
+      }
+
+      return { before, after: await hashKiciSourceTree(opts.kiciDir) };
+    }
+
+    beforeEach(async () => {
+      await writeConfig(platformConfig);
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+    });
+
+    it('leaves the tree digest unchanged when run from the project root', async () => {
+      const project = path.join(tempDir, 'project');
+      const kiciDir = path.join(project, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const { before, after } = await digestAfterTypes({
+        kiciDir,
+        cwd: project,
+        passKiciDir: '.kici',
+      });
+
+      expect(after).toBe(before);
+    });
+
+    it('leaves the tree digest unchanged when run from inside .kici/', async () => {
+      // `resolveKiciDir` accepts this invocation, so the declarations must not
+      // land at `.kici/.kici/types/` — a path inside the hashed tree that the
+      // `.kici/types/` exclusion cannot match.
+      const project = path.join(tempDir, 'project');
+      const kiciDir = path.join(project, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const { before, after } = await digestAfterTypes({
+        kiciDir,
+        cwd: kiciDir,
+        passKiciDir: '.kici',
+      });
+
+      expect(after).toBe(before);
+      await expect(fs.access(path.join(kiciDir, '.kici'))).rejects.toThrow();
+      await expect(fs.access(path.join(kiciDir, 'types', 'secrets.d.ts'))).resolves.toBeUndefined();
+    });
+
+    it('leaves the tree digest unchanged for an absolute kiciDir from an unrelated cwd', async () => {
+      const project = path.join(tempDir, 'project');
+      const kiciDir = path.join(project, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const { before, after } = await digestAfterTypes({
+        kiciDir,
+        cwd: tempDir,
+        passKiciDir: kiciDir,
+      });
+
+      expect(after).toBe(before);
+    });
+  });
+});

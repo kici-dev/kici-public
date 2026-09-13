@@ -1,0 +1,352 @@
+/**
+ * @kici-dev/engine - Consolidated business logic for KiCI.
+ *
+ * Single source of truth for shared logic used across tiers:
+ * - Protocol message schemas (Zod-based, direction-specific unions)
+ * - Trigger matching engine (branch, path, event evaluation)
+ * - Webhook signature verification (HMAC-SHA256)
+ * - WebSocket close codes (unified across all tiers)
+ */
+
+// --- Protocol: version, common messages, auth ---
+export * from './protocol/version.js';
+export * from './protocol/source-origin.js';
+export * from './provenance/attestation-origin.js';
+export * from './provenance/id-token-event-claims.js';
+export * from './protocol/messages/common.js';
+export * from './protocol/messages/actor.js';
+export * from './protocol/messages/pat-kind.js';
+export * from './mcp/tool-schemas.js';
+export * from './mcp/held-run-resolve.js';
+export * from './mcp/fence.js';
+export * from './protocol/messages/auth.js';
+export * from './protocol/messages/capabilities.js';
+
+// --- Protocol: Platform <-> Orchestrator messages ---
+// Explicit curated re-exports of the platform-orchestrator protocol surface,
+// rather than `export *`. The list deliberately omits the capabilities-update
+// shapes (orchCapabilitiesUpdateSchema / OrchCapabilitiesUpdate) and the bare
+// `ExecutionEvent` type: those stay internal to the discriminated unions and
+// are not part of the barrel surface (only executionEventSchema is exported).
+export {
+  webhookRelaySchema,
+  webhookRelayStartSchema,
+  webhookRelayChunkSchema,
+  webhookAckSchema,
+  WebhookRelayResult,
+  WEBHOOK_RELAY_MAX_BODY_BYTES,
+  WEBHOOK_RELAY_CHUNK_SIZE,
+  executionEventSchema,
+  logChunkSchema,
+  orchLogChunkSchema,
+  OrchLogPhase,
+  peerDiscoverSchema,
+  peerUpdateSchema,
+  cacheStatsSchema,
+  orchMetricsSchema,
+  clusterMembershipSchema,
+  CLUSTER_MEMBERSHIP_MAX_WORKERS,
+  planHeadroomSchema,
+  platformToOrchestratorMessageSchema,
+  orchestratorToPlatformMessageSchema,
+  collectDiscriminatorTypes,
+  ORCH_TO_PLATFORM_RECOGNIZED_TYPES,
+  PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
+  type WebhookRelay,
+  type WebhookRelayStart,
+  type WebhookRelayChunk,
+  type WebhookAck,
+  type LogChunk,
+  type OrchLogChunk,
+  type PeerDiscover,
+  type PeerUpdate,
+  type CacheStats,
+  type OrchMetrics,
+  type ClusterMembership,
+  type PlanHeadroom,
+  DEFAULT_APPROVAL_EXPIRY_HOURS,
+  DEFAULT_APPROVAL_EXPIRY_SECONDS,
+  SECONDS_PER_HOUR,
+  MIN_APPROVAL_EXPIRY_SECONDS,
+  MAX_APPROVAL_EXPIRY_HOURS,
+  MAX_APPROVAL_EXPIRY_SECONDS,
+  approvalExpirySecondsOf,
+  approvalExpiryHoursOf,
+  ForkPolicy,
+  CiTrustLevel,
+  trustPolicySchema,
+  type TrustPolicy,
+  trustPolicyUpdateSchema,
+  type TrustPolicyUpdate,
+  staleCheckrunCleanupSchema,
+  type StaleCheckrunCleanup,
+  platformCapabilitiesMessageSchema,
+  type PlatformCapabilitiesMessage,
+  type PlatformToOrchestratorMessage,
+  type OrchestratorToPlatformMessage,
+} from './protocol/messages/platform-orchestrator.js';
+
+// --- Protocol: Execution status (orchestrator -> Platform, in main union) ---
+export * from './protocol/messages/execution-status.js';
+
+// --- Execution-status presentation vocabulary (browser-safe) ---
+export * from './status/presentation.js';
+
+// --- Protocol: Agent-facing provenance-tagged run-result (read path) ---
+export * from './protocol/messages/agent-run-result.js';
+
+// --- Protocol: Agent-facing dev-ops read shapes (orgs, orchestrators, diagnostics, secrets) ---
+export * from './protocol/messages/agent-dev-ops.js';
+
+// --- Protocol: Heartbeat-freshness policy (shared by Platform + dashboard) ---
+export * from './protocol/messages/heartbeat-health.js';
+
+// --- Developer-operations API contract (registry + congruence helpers) ---
+export * from './dev-ops/operations.js';
+
+// --- Protocol: Orchestrator deployment identity (browser-safe, pure Zod) ---
+export * from './protocol/messages/deployment-identity.js';
+
+// --- Protocol: Orchestrator config file paths (browser-safe, pure Zod) ---
+export * from './protocol/messages/config-paths.js';
+
+// --- Protocol: Scaler lifecycle event types (emitted by all scaler backends) ---
+export * from './protocol/messages/scaler-event.js';
+
+// --- Protocol: Inbound webhook delivery log (status + payload-omitted enums) ---
+export * from './protocol/messages/event-log.js';
+
+// --- Protocol: Access log (read/write attribution; orchestrator access_log table) ---
+export * from './protocol/messages/access-log.js';
+
+// --- Approval: shared requirement + clause types (browser-safe, pure Zod) ---
+export * from './approval/types.js';
+
+// --- Audit: per-action access-log policy + sampling helper ---
+export * from './audit/access-log-policy.js';
+
+// --- Audit: per-action warm-retention policy (cold-store eligibility) ---
+export * from './audit/retention-policy.js';
+
+// --- Audit: unified Activity row + filter schemas (federated dashboard view) ---
+export * from './audit/activity.js';
+
+// --- Protocol: Log pull (separate union, not in main platform-orchestrator protocol) ---
+export * from './protocol/messages/log-pull.js';
+
+// --- Protocol: Dashboard REST-over-WS messages (separate union for dashboard proxy) ---
+export * from './protocol/messages/dashboard.js';
+
+// --- Protocol: chunked event-log payload streaming constants ---
+export * from './protocol/event-log-payload.js';
+
+// --- Protocol: Browser-Platform WS messages (browser live streaming) ---
+export * from './protocol/messages/browser.js';
+
+// --- Protocol: Run events and job context (timeline, summary tab) ---
+export * from './protocol/messages/run-events.js';
+
+// --- Protocol: Source registration ---
+export {
+  sourceRegistrationSchema,
+  sourceRegistrationAckSchema,
+  sourceDeregisterSchema,
+  sourceDeregisterAckSchema,
+  SourceSubtype,
+  SourceProvider,
+  OrchestratorMode,
+  PLATFORM_CONNECTED_MODES,
+  RELAY_INGRESS_MODES,
+  OWN_INGRESS_MODES,
+  type SourceRegistration,
+  type SourceRegistrationAck,
+  type SourceDeregister,
+  type SourceDeregisterAck,
+} from './protocol/messages/source-registration.js';
+
+// --- Protocol: Cluster join (zero-knowledge bootstrap) ---
+export * from './protocol/messages/join.js';
+
+// --- Protocol: Peer-to-peer messages (orchestrator cluster) ---
+export * from './protocol/messages/peer.js';
+
+// --- Protocol: Orchestrator <-> Agent messages ---
+export * from './protocol/messages/log-stream.js';
+export * from './protocol/messages/orchestrator-agent.js';
+
+// --- Regex flag hygiene (shared by the SDK producers, the compiler, and both
+// memoizing readers) ---
+export * from './regex-flags.js';
+
+// --- Trigger matching ---
+export * from './sandbox/capabilities.js';
+export * from './trigger/types.js';
+export * from './trigger/text-match.js';
+export * from './trigger/trigger-event-type.js';
+export * from './trigger/decision-trace.js';
+export * from './trigger/matcher.js';
+// Exported so the orchestrator's org-level repo policy matches repo
+// identifiers by the same rules a workflow's own `repos:` patterns do. A
+// second, subtly different repo matcher is how a deny-list pattern came to
+// mean one thing in the policy and another in the trigger.
+export { getRepoGlobMatcher } from './trigger/compiled-matchers.js';
+// The one classifier for "picomatch would read this repo pattern as a
+// negation", shared by every surface that stores a repo pattern — the
+// Platform's role allow-list and the orchestrator's global-workflow policy
+// lists. A second, hand-maintained ban list would let the same pattern
+// language be read two ways.
+export {
+  REGEX_NEGATIVE_ASSERTION,
+  isNegatedPattern,
+  negatedPatternReason,
+} from './repo/pattern-negation.js';
+export * from './trigger/event-buckets.js';
+export { scheduleTriggerKey } from './trigger/schedule-key.js';
+
+// --- Dispatch inputs (descriptor + extract/build/coerce; browser-safe) ---
+export * from './inputs/index.js';
+
+// --- Provider interfaces ---
+export * from './provider/index.js';
+
+// --- Webhook URL format (browser-safe; org-scoped route shape) ---
+export { githubWebhookPath, githubIngressPath } from './webhook/webhook-url-format.js';
+
+// --- Webhook event types (browser-safe; shared subscribable enum) ---
+export {
+  PING_EVENT_TYPE,
+  SUBSCRIBABLE_WEBHOOK_EVENT_TYPES,
+  SubscribableWebhookEventType,
+  WebhookEventType,
+} from './webhook/event-types.js';
+
+// --- WebSocket types ---
+export type { WsLike } from './ws/ws-like.js';
+
+// --- WebSocket close codes ---
+export * from './ws/close-codes.js';
+
+// --- WebSocket rate limiting ---
+export { WsRateLimiter } from './ws/rate-limiter.js';
+export type { RateLimiterConfig, RateLimitResult } from './ws/rate-limiter.js';
+
+// --- Environment allowlist ---
+export * from './env/environment-allowlist.js';
+
+// --- Secrets management ---
+export * from './secrets/index.js';
+
+// --- Context model (scoped secrets, context merge, protection gates) ---
+export * from './context/index.js';
+
+// --- Structured auto-labels (kici:os:, kici:arch:, kici:agent:, kici:scaler:, kici:host:, kici:role:) ---
+export {
+  deriveOsArchLabels,
+  derivePlatformTaints,
+  PLATFORM_TAINT_LABELS,
+  ScalerOs,
+  ScalerArch,
+  scalerPlatformSchema,
+  platformToOsArchLabels,
+  platformToTaints,
+  nodePlatformToScalerOs,
+  nodeArchToScalerArch,
+  hostToScalerPlatform,
+  hostLabel,
+  parseHostLabel,
+  HOST_LABEL_PREFIX,
+  agentTypeLabel,
+  scalerLabel,
+  mergeAutoLabels,
+  normalizeRunsOn,
+  KNOWN_ROLES,
+  resolveRoleLabels,
+  validateNoReservedLabels,
+  scalerAgentLabels,
+  isSelfReportedLabel,
+  SELF_REPORTED_LABEL_PREFIXES,
+  CAPABILITY_LABEL_PREFIX,
+  capabilityLabel,
+  SSH_TRANSPORT_CAPABILITY,
+  RUNTIME_LABEL_PREFIX,
+  runtimeLabel,
+  RuntimeFact,
+  CONTAINER_BUILD_RUNTIME_LABEL,
+  INIT_LABEL,
+  PRIVILEGED_ROOT_LABEL,
+  INIT_RUNNER_ROLE_LABEL,
+} from './labels.js';
+export type { NormalizedRunsOn } from './labels.js';
+export type { AgentRole } from './labels.js';
+export type { ScalerPlatform } from './labels.js';
+
+// --- Canonical labels (the fold applied at every matching-domain ingress) ---
+export {
+  type CanonicalLabel,
+  canonicalizeLabel,
+  canonicalizeLabels,
+  canonicalizeLabelSet,
+} from './labels-canonical.js';
+
+// --- Label matchers (glob/regex selectors, browser-safe eval) ---
+export {
+  LabelMatcher,
+  type CanonicalMatcher,
+  canonicalizeMatcher,
+  matcherMatches,
+  matcherSatisfiedBy,
+  partitionMatchers,
+  compileRegexMatcher,
+  HostTargetValue,
+  HostTargetSelector,
+  hostSatisfiesTarget,
+} from './labels-match.js';
+
+// --- Host inventory (canonical queryable roster schema) ---
+export * from './inventory.js';
+
+// --- Scaler types ---
+export * from './scaler/scaler-backend-type.js';
+export * from './scaler/scaler-events.js';
+export * from './scaler/resource-types.js';
+
+// --- Registration types ---
+export * from './registration/registerable-trigger-type.js';
+
+// --- Bundler (shared rolldown config for compiler/agent) ---
+export * from './bundler/index.js';
+
+// --- Matrix expansion + suffix formatting (pure, browser-safe) ---
+export {
+  expandSingleDimension,
+  expandMultiDimension,
+  expandMatrix,
+  applyIncludeExclude,
+  normalizeMatrixInput,
+  matrixCombinationCount,
+  findDuplicateCombination,
+  MatrixShapeError,
+  type NormalizedMatrix,
+  type StaticMatrixArray,
+  type StaticMatrixObject,
+  type MatrixInclude,
+  type MatrixExclude,
+  type MatrixValues,
+} from './matrix/expand.js';
+export { formatMatrixSuffix, formatExpandedJobName } from './matrix/format.js';
+
+// --- Fanout materialization (matrix jobs -> N dispatchable children) ---
+export * from './fanout/materialize.js';
+
+// --- Check mode (idempotent run mode + per-step outcome) ---
+export * from './check-mode.js';
+
+// --- Artifacts: the shared name contract (trust boundary + SDK) ---
+export * from './artifacts/name.js';
+
+// --- Billing: hosted plan-tier vocabulary (browser-safe, pure Zod) ---
+export * from './billing/plan-type.js';
+export * from './billing/subscription-status.js';
+
+// --- Diagnostics: infrastructure alert vocabulary (browser-safe, pure Zod) ---
+export * from './diagnostics/infra-alert.js';

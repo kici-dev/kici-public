@@ -1,0 +1,212 @@
+---
+title: 'SDK reference: validation & events'
+description: validateDag(), event definitions, and event emission
+---
+
+## Validation
+
+### validateDag(nodes)
+
+Validate a directed acyclic graph for correctness.
+
+```typescript
+function validateDag(nodes: DagNode[]): DagValidationResult;
+```
+
+**DagNode:**
+
+```typescript
+interface DagNode {
+  id: string;
+  needs: string[];
+}
+```
+
+**DagValidationResult** (discriminated union):
+
+```typescript
+// Valid graph with topological sort order
+{ valid: true; sortedOrder: string[] }
+
+// Cycle detected
+{ valid: false; error: 'cycle'; nodesInCycle: string[] }
+
+// Job depends on itself
+{ valid: false; error: 'self-reference'; nodeId: string }
+
+// Job depends on non-existent job
+{ valid: false; error: 'missing-dependency'; nodeId: string; missingDep: string }
+```
+
+Checks (in order): self-references, missing dependencies, cycles (Kahn's algorithm).
+
+```typescript
+const result = validateDag([
+  { id: 'lint', needs: [] },
+  { id: 'test', needs: ['lint'] },
+  { id: 'deploy', needs: ['test'] },
+]);
+
+if (result.valid) {
+  console.log(result.sortedOrder); // ['lint', 'test', 'deploy']
+}
+```
+
+## Event definitions
+
+The `defineEvent()` helper creates typed event definitions with Zod validation schemas. Event definitions serve as contracts for custom event payloads used with `ctx.emit()` and `kiciEvent()`.
+
+### defineEvent(name, schema)
+
+```typescript
+function defineEvent<T extends z.ZodTypeAny>(name: string, schema: T): EventDefinition<T>;
+```
+
+**Parameters:**
+
+| Parameter | Type        | Required | Description                       |
+| --------- | ----------- | -------- | --------------------------------- |
+| `name`    | `string`    | yes      | Unique event name                 |
+| `schema`  | `z.ZodType` | yes      | Zod schema for payload validation |
+
+**Returns:** `EventDefinition<T>` -- a frozen event definition with `name` and `schema`.
+
+```typescript
+import { defineEvent, z } from '@kici-dev/sdk';
+
+const deployComplete = defineEvent(
+  'deploy-complete',
+  z.object({
+    env: z.string(),
+    version: z.string(),
+    services: z.array(z.string()),
+  }),
+);
+```
+
+The `z` (Zod) module is re-exported from `@kici-dev/sdk` so you can define event schemas without adding Zod as a direct dependency.
+
+## Emitting events
+
+Workflow steps can emit custom events via `ctx.emit()`. Emitted events are delivered immediately (mid-workflow, not queued until completion) and can trigger other workflows that listen with `kiciEvent()`, `workflowComplete()`, or `jobComplete()` triggers.
+
+### ctx.emit(eventName, payload?, options?)
+
+```typescript
+// Typed — a defineEvent() definition drives payload type-checking
+emit<T extends z.ZodTypeAny>(
+  definition: EventDefinition<T>,
+  payload: z.infer<T>,
+  options?: EventEmitOptions,
+): Promise<{ deliveryId: string }>;
+
+// Ad-hoc — event name string, payload typed as Record<string, unknown>
+emit(
+  eventName: string,
+  payload?: Record<string, unknown>,
+  options?: EventEmitOptions,
+): Promise<{ deliveryId: string }>;
+```
+
+**Parameters:**
+
+| Parameter        | Type                      | Required | Description                                                                  |
+| ---------------- | ------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `definition`     | `EventDefinition<T>`      | —        | A `defineEvent()` definition; its Zod schema types `payload` as `z.infer<T>` |
+| `eventName`      | `string`                  | yes      | Name of the event to emit                                                    |
+| `payload`        | `Record<string, unknown>` | no       | Event payload data                                                           |
+| `options.target` | `{ repos?: string[] }`    | no       | Target specific repos for cross-repo delivery                                |
+
+**Returns:** `Promise<{ deliveryId: string }>` -- a delivery receipt after the event is persisted and routed.
+
+**Examples:**
+
+```typescript
+// Typed emit — payload is checked against the deploy-complete schema
+import { defineEvent, z } from '@kici-dev/sdk';
+
+const deployComplete = defineEvent(
+  'deploy-complete',
+  z.object({ env: z.string(), version: z.string() }),
+);
+
+step('notify-typed', async (ctx) => {
+  await ctx.emit(deployComplete, { env: 'prod', version: '1.2.3' });
+});
+
+// Emit a simple event
+step('notify', async (ctx) => {
+  await ctx.emit('deploy-complete', { env: 'prod', version: '1.2.3' });
+});
+
+// Cross-repo targeting
+step('notify-other-repos', async (ctx) => {
+  await ctx.emit(
+    'deploy-complete',
+    { env: 'prod' },
+    {
+      target: { repos: ['org/other-repo', 'org/monitoring'] },
+    },
+  );
+});
+```
+
+### Cross-repo event delivery
+
+Events emitted from one repo can trigger workflows in another repo, provided:
+
+1. A trust relationship exists between the source and target repos (configured via the admin API)
+2. The target workflow uses a trigger with `source` filter matching the emitting repo
+
+```typescript
+// In repo A: emit event
+step('deploy', async (ctx) => {
+  await ctx.emit(
+    'deploy-complete',
+    { env: 'prod' },
+    {
+      target: { repos: ['org/repo-B'] },
+    },
+  );
+});
+
+// In repo B: listen for event from repo A
+workflow('post-deploy', {
+  on: kiciEvent({ name: 'deploy-complete', source: 'org/repo-A' }),
+  jobs: [postDeployJob],
+});
+```
+
+### System events
+
+The orchestrator automatically emits system events for workflow and job completions. You do not need to call `ctx.emit()` for these -- they are generated by the orchestrator after execution. Listen for them with `workflowComplete()` and `jobComplete()` triggers.
+
+### Event scaler events
+
+The [event scaler backend](../../operator/orchestrator/event-scaler.md) emits two reserved events that your provisioning and teardown workflows subscribe to. The SDK exports their names and payload schemas, so a workflow imports the contract instead of re-declaring it.
+
+| Export                   | What it is                                                                                                              |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `SCALER_EVENT_NAMES`     | The two reserved event names: `SCALER_EVENT_NAMES.scaleUp` and `SCALER_EVENT_NAMES.scaleDown`.                          |
+| `ScalerScaleUpPayload`   | Schema of the scale-up payload. `.parse(ctx.rawPayload)` returns the typed payload and rejects a malformed one.         |
+| `ScalerScaleDownPayload` | Schema of the scale-down payload, including the narrowed `reason`.                                                      |
+| `ScaleDownReason`        | Why the scaler asked for a teardown: `idle`, `job-complete`, `heartbeat-timeout`, `spawn-timeout`, `drain`, `shutdown`. |
+
+```ts
+import { workflow, job, kiciEvent, SCALER_EVENT_NAMES, ScalerScaleUpPayload } from '@kici-dev/sdk';
+
+export default workflow('provision', {
+  on: [kiciEvent({ name: SCALER_EVENT_NAMES.scaleUp, match: { '$.scalerName': 'hetzner' } })],
+  jobs: [
+    job('provision', {
+      runsOn: ['kici:os:linux'],
+      run: async (ctx) => {
+        const payload = ScalerScaleUpPayload.parse(ctx.rawPayload);
+        ctx.log.info(`provision agent ${payload.agentId}`);
+      },
+    }),
+  ],
+});
+```
+
+These names are reserved. `ctx.emit()` rejects any event name that starts with `kici.`, so a workflow step cannot forge a scaler event. For every payload field, see the [event contract reference](../../operator/orchestrator/event-scaler-events.md). For complete provisioning and teardown workflows, see [autoscaling workflows](../workflows/autoscaling-workflows.md).

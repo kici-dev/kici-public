@@ -1,0 +1,35 @@
+# gitleaks configuration for the KiCI repos.
+#
+# Authored in the private monorepo root and projected verbatim into
+# github.com/kici-dev/kici-public via ROOT_FILES_TO_COPY (see
+# packages/ci/src/project-public.ts), so the public repo's CI and the
+# sync-time secret gate in hack/sync-public.ts share one source of truth.
+# gitleaks auto-discovers a `.gitleaks.toml` at the scan source root, so
+# projecting it to the public repo root is all the wiring CI needs.
+#
+# It extends gitleaks' default rule set and allowlists the file
+# categories that are public-by-design and carry only placeholder /
+# fixture values: unit-test fixtures, runnable examples, and the
+# operator/user/architecture docs. A real credential must never live in
+# those files (the docs-content rules forbid secrets in docs, examples
+# ship REPLACE_ME templates, and test fixtures are fake by construction),
+# so allowlisting them removes the heuristic noise without hiding a
+# genuine leak in product source.
+
+title = "KiCI gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public-by-design placeholder/fixture content — no real secrets"
+paths = [
+  # Unit-test fixtures embed fake tokens and keys by construction
+  # (e.g. ghs_abc123xyz, "-----BEGIN RSA PRIVATE KEY-----\nfake").
+  '''.*\.test\.ts$''',
+  # Runnable examples ship placeholder templates (REPLACE_ME_* etc.).
+  '''(^|/)examples/.*''',
+  # Operator/user/architecture docs illustrate config with placeholders
+  # such as a1b2c3d4e5f6... and <64-char-hex-master-key>.
+  '''(^|/)docs/.*\.md$''',
+]

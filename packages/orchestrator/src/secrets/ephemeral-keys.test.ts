@@ -1,0 +1,249 @@
+/**
+ * Tests for ephemeral key pair management.
+ *
+ * Covers:
+ * - X25519 key pair generation
+ * - Private key encrypt/decrypt round-trip with secret key
+ * - Wrong key rejection
+ * - decryptSecretOutput ECDH + HKDF + AES-GCM round-trip
+ */
+import { describe, it, expect } from 'vitest';
+import {
+  generateRunKeyPair,
+  encryptPrivateKey,
+  decryptPrivateKey,
+  decryptSecretOutput,
+  decryptDashboardSealedWrite,
+} from './ephemeral-keys.js';
+import { generateKeyPairSync, diffieHellman, hkdfSync, randomBytes } from 'node:crypto';
+import { createCipheriv, createPrivateKey, createPublicKey } from 'node:crypto';
+
+/**
+ * Simulate the browser-side seal for a dashboard write: exactly what the
+ * dashboard's @noble sealed-box must produce, expressed with node:crypto so the
+ * interop contract (DER-SPKI ephemeral pubkey + `kici-dashboard-sealed-write`
+ * HKDF info + IV||tag||ct framing) is locked from the node decrypt side.
+ */
+function browserSealDashboardWrite(
+  value: string,
+  orchPublicKeyDer: Buffer,
+): { ephemeralPublicKey: string; encrypted: string } {
+  const eph = generateKeyPairSync('x25519', {
+    publicKeyEncoding: { type: 'spki', format: 'der' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'der' },
+  });
+  const shared = diffieHellman({
+    privateKey: createPrivateKey({ key: eph.privateKey as Buffer, format: 'der', type: 'pkcs8' }),
+    publicKey: createPublicKey({ key: orchPublicKeyDer, format: 'der', type: 'spki' }),
+  });
+  const aesKey = Buffer.from(
+    hkdfSync('sha256', shared, Buffer.alloc(0), 'kici-dashboard-sealed-write', 32),
+  );
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', aesKey, iv, { authTagLength: 16 });
+  const ct = Buffer.concat([cipher.update(value, 'utf-8'), cipher.final()]);
+  return {
+    ephemeralPublicKey: (eph.publicKey as Buffer).toString('base64'),
+    encrypted: Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64'),
+  };
+}
+
+// Helper to simulate agent-side encryption (what the agent would do)
+function agentEncryptSecret(
+  value: string,
+  runPublicKeyDer: Buffer,
+): { agentPublicKey: string; encrypted: string } {
+  // Generate agent ephemeral key pair
+  const agentKeyPair = generateKeyPairSync('x25519', {
+    publicKeyEncoding: { type: 'spki', format: 'der' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'der' },
+  });
+
+  // Derive shared secret via ECDH
+  const agentPrivateKeyObj = require('node:crypto').createPrivateKey({
+    key: agentKeyPair.privateKey as Buffer,
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const runPublicKeyObj = require('node:crypto').createPublicKey({
+    key: runPublicKeyDer,
+    format: 'der',
+    type: 'spki',
+  });
+
+  const sharedSecret = diffieHellman({
+    privateKey: agentPrivateKeyObj,
+    publicKey: runPublicKeyObj,
+  });
+
+  // HKDF to derive AES key
+  const aesKey = Buffer.from(
+    hkdfSync('sha256', sharedSecret, Buffer.alloc(0), 'kici-run-secret-outputs', 32),
+  );
+
+  // AES-256-GCM encrypt
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', aesKey, iv, { authTagLength: 16 });
+  const encrypted = Buffer.concat([cipher.update(value, 'utf-8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  // Pack: IV || AuthTag || Ciphertext (same format as crypto.ts)
+  const packed = Buffer.concat([iv, authTag, encrypted]);
+
+  return {
+    agentPublicKey: (agentKeyPair.publicKey as Buffer).toString('base64'),
+    encrypted: packed.toString('base64'),
+  };
+}
+
+describe('ephemeral keys', () => {
+  const testSecretKey = 'a'.repeat(64); // 64 hex chars = 32 bytes
+
+  describe('generateRunKeyPair', () => {
+    it('produces publicKey and privateKey as Buffers', () => {
+      const pair = generateRunKeyPair();
+      expect(pair.publicKey).toBeInstanceOf(Buffer);
+      expect(pair.privateKey).toBeInstanceOf(Buffer);
+    });
+
+    it('generates non-empty keys', () => {
+      const pair = generateRunKeyPair();
+      expect(pair.publicKey.length).toBeGreaterThan(0);
+      expect(pair.privateKey.length).toBeGreaterThan(0);
+    });
+
+    it('generates unique key pairs', () => {
+      const a = generateRunKeyPair();
+      const b = generateRunKeyPair();
+      expect(a.publicKey.equals(b.publicKey)).toBe(false);
+      expect(a.privateKey.equals(b.privateKey)).toBe(false);
+    });
+  });
+
+  describe('encryptPrivateKey / decryptPrivateKey', () => {
+    it('round-trips private key with correct secret key', () => {
+      const pair = generateRunKeyPair();
+      const encrypted = encryptPrivateKey(pair.privateKey, testSecretKey);
+      expect(typeof encrypted).toBe('string');
+
+      const decrypted = decryptPrivateKey(encrypted, testSecretKey);
+      expect(decrypted.equals(pair.privateKey)).toBe(true);
+    });
+
+    it('produces different ciphertexts for same key (unique IVs)', () => {
+      const pair = generateRunKeyPair();
+      const a = encryptPrivateKey(pair.privateKey, testSecretKey);
+      const b = encryptPrivateKey(pair.privateKey, testSecretKey);
+      expect(a).not.toBe(b);
+    });
+
+    it('throws with wrong secret key', () => {
+      const pair = generateRunKeyPair();
+      const encrypted = encryptPrivateKey(pair.privateKey, testSecretKey);
+      const wrongKey = 'b'.repeat(64);
+      expect(() => decryptPrivateKey(encrypted, wrongKey)).toThrow();
+    });
+  });
+
+  describe('decryptSecretOutput', () => {
+    it('decrypts agent-encrypted envelope using run private key', () => {
+      const pair = generateRunKeyPair();
+      const secretValue = 'my-secret-api-key-12345';
+
+      const envelope = agentEncryptSecret(secretValue, pair.publicKey);
+      const decrypted = decryptSecretOutput(envelope, pair.privateKey);
+      expect(decrypted).toBe(secretValue);
+    });
+
+    it('decrypts empty string', () => {
+      const pair = generateRunKeyPair();
+      const envelope = agentEncryptSecret('', pair.publicKey);
+      const decrypted = decryptSecretOutput(envelope, pair.privateKey);
+      expect(decrypted).toBe('');
+    });
+
+    it('decrypts unicode values', () => {
+      const pair = generateRunKeyPair();
+      const secretValue = 'unicode secret value for verification';
+      const envelope = agentEncryptSecret(secretValue, pair.publicKey);
+      const decrypted = decryptSecretOutput(envelope, pair.privateKey);
+      expect(decrypted).toBe(secretValue);
+    });
+
+    it('throws with wrong run private key', () => {
+      const pair = generateRunKeyPair();
+      const otherPair = generateRunKeyPair();
+      const envelope = agentEncryptSecret('secret', pair.publicKey);
+
+      // Use a different run's private key -- ECDH shared secret will be wrong
+      expect(() => decryptSecretOutput(envelope, otherPair.privateKey)).toThrow();
+    });
+  });
+
+  describe('decryptDashboardSealedWrite', () => {
+    it('round-trips a browser-shaped sealed write', () => {
+      const pair = generateRunKeyPair();
+      const env = browserSealDashboardWrite('s3cr3t', pair.publicKey);
+      expect(decryptDashboardSealedWrite(env, pair.privateKey)).toBe('s3cr3t');
+    });
+
+    it('round-trips empty and unicode values', () => {
+      const pair = generateRunKeyPair();
+      expect(
+        decryptDashboardSealedWrite(browserSealDashboardWrite('', pair.publicKey), pair.privateKey),
+      ).toBe('');
+      const u = 'kici sealed value ✓ 世界';
+      expect(
+        decryptDashboardSealedWrite(browserSealDashboardWrite(u, pair.publicKey), pair.privateKey),
+      ).toBe(u);
+    });
+
+    it('throws with the wrong private key', () => {
+      const pair = generateRunKeyPair();
+      const other = generateRunKeyPair();
+      const env = browserSealDashboardWrite('secret', pair.publicKey);
+      expect(() => decryptDashboardSealedWrite(env, other.privateKey)).toThrow();
+    });
+
+    it('does NOT cross-decrypt a run-output envelope (domain separation)', () => {
+      // A run-output envelope (kici-run-secret-outputs info) must not decrypt as
+      // a dashboard-sealed write (kici-dashboard-sealed-write info): the derived
+      // AES key differs, so GCM auth fails.
+      const pair = generateRunKeyPair();
+      const runEnv = agentEncryptSecret('secret', pair.publicKey);
+      expect(() =>
+        decryptDashboardSealedWrite(
+          { ephemeralPublicKey: runEnv.agentPublicKey, encrypted: runEnv.encrypted },
+          pair.privateKey,
+        ),
+      ).toThrow();
+    });
+  });
+});
+
+describe('decryptPrivateKey dual-key fallback', () => {
+  const CURRENT = '0'.repeat(64);
+  const OLD = '1'.repeat(64);
+
+  it('decrypts a key sealed under the OLD master key when the old key is supplied', () => {
+    const { privateKey } = generateRunKeyPair();
+    const sealed = encryptPrivateKey(privateKey, OLD);
+
+    // Positive control: unreadable with the current key alone.
+    expect(() => decryptPrivateKey(sealed, CURRENT)).toThrow();
+
+    expect(decryptPrivateKey(sealed, CURRENT, OLD).equals(privateKey)).toBe(true);
+  });
+
+  it('still decrypts a key sealed under the CURRENT master key', () => {
+    const { privateKey } = generateRunKeyPair();
+    const sealed = encryptPrivateKey(privateKey, CURRENT);
+    expect(decryptPrivateKey(sealed, CURRENT, OLD).equals(privateKey)).toBe(true);
+  });
+
+  it('throws when neither key opens it', () => {
+    const { privateKey } = generateRunKeyPair();
+    const sealed = encryptPrivateKey(privateKey, '2'.repeat(64));
+    expect(() => decryptPrivateKey(sealed, CURRENT, OLD)).toThrow();
+  });
+});

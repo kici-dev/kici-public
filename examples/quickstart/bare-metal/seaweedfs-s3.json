@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "kici-local",
+      "credentials": [{ "accessKey": "kici-local", "secretKey": "kici-local-secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

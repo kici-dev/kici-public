@@ -1,0 +1,85 @@
+name: Agent report — advertised vs actual
+description: Report a mismatch between what KiCI's docs or CLI advertise and what it does
+labels: ['bug', 'agent-filed']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when the published docs or the CLI advertise one behaviour
+        and KiCI does another. It is the form a coding agent drafts; a person
+        reviews it and files it.
+
+        For **security** issues, do not use this form — open a private
+        [Security Advisory](https://github.com/kici-dev/kici-public/security/advisories/new) instead.
+
+        For a problem with **your own runs**, do not use this form either — send a
+        redacted diagnostic bundle privately with `kici report --run <run-id> --upload`.
+
+        **Never put secrets, tokens, private repository names, internal hostnames,
+        organization ids, or run ids in this public issue.** Reproduce with a
+        minimal synthetic workflow, not your real one.
+  - type: textarea
+    id: advertised
+    attributes:
+      label: What the docs or CLI advertise
+      description: The exact claim, quoted, plus its source — a docs URL, or the command whose `--help` says it.
+      placeholder: |
+        https://kici.dev/docs/user/cli-reference/ says:
+        > `kici compile --check` type-checks without writing a lock file.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What actually happened
+      description: The real output or behaviour, quoted, with any error text.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction, including setup
+      description: Every step from an empty directory — setup commands, a minimal synthetic workflow, and the exact command you ran.
+      placeholder: |
+        $ mkdir /tmp/repro && cd /tmp/repro
+        $ kici init
+        # .kici/workflows/example.ts
+        ...
+        $ kici compile --check
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: KiCI version
+      description: Output of `kici --version`. Reports against a locally built or unreleased version are out of scope.
+      placeholder: '0.1.16'
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Node version and OS.
+      placeholder: 'Node 24.13.0, Ubuntu 24.04'
+    validations:
+      required: true
+  - type: textarea
+    id: justification
+    attributes:
+      label: Why this is a discrepancy
+      description: One or two sentences ruling out the likely misreads — why the docs cannot be read to match what you observed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Review
+      options:
+        - label: This report was drafted by a coding agent and reviewed by me before filing, or written by me directly.
+          required: true
+        - label: I checked open and closed issues for a duplicate.
+          required: true
+        - label: This issue contains no secrets, credentials, or private infrastructure names.
+          required: true
