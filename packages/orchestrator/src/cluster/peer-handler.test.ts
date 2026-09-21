@@ -112,6 +112,7 @@ function makeLocalInventory(): Omit<PeerHeartbeat, 'type'> {
         maxConcurrency: 2,
         platform: 'linux',
         arch: 'x64',
+        mandatoryLabels: [],
       },
     ],
     capabilities: { s3LogAccess: false },
@@ -990,6 +991,7 @@ describe('PeerHandler', () => {
             maxConcurrency: 4,
             platform: 'darwin',
             arch: 'arm64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: true },
@@ -1245,39 +1247,56 @@ describe('PeerHandler', () => {
   });
 
   describe('protocol version check', () => {
-    it('rejects peer with protocol version below MIN_PROTOCOL_VERSION', async () => {
-      const { handler } = createTestHandler();
-      const ws = new MockPeerWs();
+    const findAuthResponse = (ws: MockPeerWs, sessionKey: Buffer): any => {
+      for (const msg of ws.sentMessages.slice(1)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.auth.response') return parsed;
+        } catch {
+          // not an encrypted frame
+        }
+      }
+      return null;
+    };
 
+    const sendPeerAuth = async (protocolVersion: number) => {
+      const { handler, registry } = createTestHandler();
+      const ws = new MockPeerWs();
       handler.handleConnection(ws);
       const { sessionKey } = completeEcdhHandshake(ws);
-
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'remote-peer',
-        protocolVersion: 0, // below minimum
+        protocolVersion,
         token: 'kici_join_v1.test.token',
       };
       ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
       await vi.advanceTimersByTimeAsync(0);
+      return { ws, registry, authResponse: findAuthResponse(ws, sessionKey) };
+    };
 
-      let authResponse: any = null;
-      for (const msg of ws.sentMessages.slice(1)) {
-        try {
-          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
-          if (parsed.type === 'peer.auth.response') {
-            authResponse = parsed;
-            break;
-          }
-        } catch {
-          // ignore
-        }
-      }
+    it('rejects peer with protocol version one below the floor', async () => {
+      // fails-when: MIN_PROTOCOL_VERSION drops below PROTOCOL_VERSION.
+      const { ws, authResponse } = await sendPeerAuth(PROTOCOL_VERSION - 1);
 
       expect(authResponse).not.toBeNull();
       expect(authResponse.accepted).toBe(false);
       expect(authResponse.reason).toContain('Unsupported protocol version');
       expect(ws.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+    });
+
+    it('rejects protocol version 2, the value every 0.8.x peer sends', async () => {
+      // 0.8.0 already shipped PROTOCOL_VERSION = 2, so a floor of 2 refuses no
+      // published build: a 0.8.x peer let through has its heartbeat refused by
+      // the strict 0.9.0 schema instead of being told at connect.
+      //
+      // fails-when: the floor drops back to 2 — the relative probe above would
+      // then drive 1 and still pass while a real 0.8.x peer connects.
+      const { ws, registry, authResponse } = await sendPeerAuth(2);
+
+      expect(authResponse?.accepted).toBe(false);
+      expect(ws.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+      expect(registry.getPeer('remote-peer')).toBeUndefined();
     });
 
     it('accepts peer with protocol version equal to MIN_PROTOCOL_VERSION', async () => {

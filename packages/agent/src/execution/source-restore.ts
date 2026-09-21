@@ -7,18 +7,13 @@
  * optimization — source tarballs are tiny (kilobytes, not the hundreds of
  * megabytes a `node_modules/` tarball carries).
  *
- * Two properties this path is responsible for, both of which it previously
- * lacked:
+ * Two properties this path is responsible for:
  *
  * **Verification.** `dispatch.sourceTarDigest` is the SHA-256 of the tarball's
  * own bytes, so the download is checked before anything is extracted — the same
- * contract `restoreDeps` has always had via `depsHash`. The older
- * `dispatch.sourceTarHash` field carries the workflow `contentHash` instead, so
- * it never could serve this purpose; it stays on the wire for older peers and
- * is deliberately not used as a verification input here. When no digest is
- * dispatched (an older orchestrator, or a source that did not come from the
- * content-addressed cache) the restore proceeds unverified rather than failing,
- * so a mixed-version rollout still runs.
+ * contract `restoreDeps` has via `depsHash`. When no digest is dispatched (a
+ * source that did not come from the content-addressed cache) the restore
+ * proceeds unverified rather than failing.
  *
  * **Replacement, not overlay.** Extraction lands in a scratch directory and the
  * result REPLACES `workDir/.kici` wholesale, save for `node_modules/` — the one

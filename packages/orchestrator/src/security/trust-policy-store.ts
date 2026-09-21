@@ -33,8 +33,6 @@ export type TrustPolicySource = z.infer<typeof TrustPolicySource>;
  */
 export const DEFAULT_TRUST_POLICY: TrustPolicy = {
   forkPolicy: DEFAULT_FORK_POLICY,
-  unknownContributorPolicy: 'hold',
-  workflowChangePolicy: 'hold',
   approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 };
@@ -100,9 +98,6 @@ export class TrustPolicyStore {
     if (!row) return null;
     return {
       forkPolicy: row.fork_policy as TrustPolicy['forkPolicy'],
-      unknownContributorPolicy:
-        row.unknown_contributor_policy as TrustPolicy['unknownContributorPolicy'],
-      workflowChangePolicy: row.workflow_change_policy as TrustPolicy['workflowChangePolicy'],
       // The seconds column is authoritative; a NULL one means the row predates
       // it (or an older build wrote it), so the hours column supplies the
       // window instead. Resolved here, once, so no caller has to know the rule.
@@ -137,9 +132,8 @@ export class TrustPolicyStore {
    * COMMITTED two concurrent PATCHes both read the pre-existing row, and the
    * second `ON CONFLICT DO UPDATE` then overwrites every column from its own
    * stale merge — silently dropping the first operator's change (a tightened
-   * `unknownContributorPolicy` reverting to whatever the second caller last
-   * saw). The lock releases on commit or rollback, so there is no unlock to
-   * leak.
+   * `forkPolicy` reverting to whatever the second caller last saw). The lock
+   * releases on commit or rollback, so there is no unlock to leak.
    *
    * `onWrite` receives the same transaction and the merged result, so an audit
    * row written there commits or rolls back with the policy itself — a
@@ -162,14 +156,6 @@ export class TrustPolicyStore {
       const existing = await this.get(orgId, trx);
       const merged: TrustPolicy = {
         forkPolicy: patch.forkPolicy ?? existing?.forkPolicy ?? DEFAULT_TRUST_POLICY.forkPolicy,
-        unknownContributorPolicy:
-          patch.unknownContributorPolicy ??
-          existing?.unknownContributorPolicy ??
-          DEFAULT_TRUST_POLICY.unknownContributorPolicy,
-        workflowChangePolicy:
-          patch.workflowChangePolicy ??
-          existing?.workflowChangePolicy ??
-          DEFAULT_TRUST_POLICY.workflowChangePolicy,
         // Resolved from the patch as a WHOLE, not field-by-field: a patch
         // naming only seconds must not keep a stale hours value beside it, and
         // a patch naming only hours must not keep a stale seconds value that
@@ -196,8 +182,6 @@ export class TrustPolicyStore {
     const seconds = approvalExpirySecondsOf(policy);
     const columns = {
       fork_policy: policy.forkPolicy,
-      unknown_contributor_policy: policy.unknownContributorPolicy,
-      workflow_change_policy: policy.workflowChangePolicy,
       approval_expiry_hours: approvalExpiryHoursOf(seconds),
       approval_expiry_seconds: seconds,
       source,

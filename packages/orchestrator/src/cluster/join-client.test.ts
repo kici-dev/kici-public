@@ -4,7 +4,6 @@ import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
 import { envDef, loadConfig } from '../config.js';
@@ -13,9 +12,7 @@ import { deriveKeys, encryptBundle } from './join-token.js';
 import {
   STORAGE_ENV_VARS,
   buildEnvFile,
-  buildLocalConfig,
   decryptAndParseBundle,
-  writeConfigFile,
   writeEnvFile,
 } from './join-client.js';
 
@@ -48,64 +45,6 @@ describe('decryptAndParseBundle', () => {
     const encryptedB64 = encrypted.toString('base64');
 
     expect(() => decryptAndParseBundle(encryptedB64, keys2.encryptionKey)).toThrow();
-  });
-});
-
-describe('buildLocalConfig', () => {
-  it('creates a LocalConfig object from a ConfigBundle with all fields mapped (no PSK)', () => {
-    const bundle = {
-      databaseUrl: 'postgres://localhost/kici',
-      clusterId: 'cluster-1',
-      storage: {
-        type: 's3' as const,
-        bucket: 'my-bucket',
-        prefix: 'kici/',
-        region: 'us-east-1',
-        endpoint: 'http://s3:9000',
-        forcePathStyle: true,
-        logBucket: 'logs',
-      },
-      secretKey: 'my-secret',
-    };
-
-    const config = buildLocalConfig(bundle);
-
-    expect(config.database.url).toBe('postgres://localhost/kici');
-    expect((config as any).cluster).toBeUndefined();
-    expect(config.storage).toEqual(bundle.storage);
-    expect(config.secrets).toEqual({ key: 'my-secret' });
-  });
-
-  it('handles missing optional fields (no storage, no secretKey)', () => {
-    const bundle = {
-      databaseUrl: 'postgres://localhost/kici',
-      clusterId: 'cluster-1',
-    };
-
-    const config = buildLocalConfig(bundle);
-
-    expect(config.database.url).toBe('postgres://localhost/kici');
-    expect((config as any).cluster).toBeUndefined();
-    expect(config.storage).toBeUndefined();
-    expect(config.secrets).toBeUndefined();
-  });
-});
-
-describe('writeConfigFile', () => {
-  it('writes YAML to the specified path', async () => {
-    const configPath = join(tmpdir(), `kici-test-config-${Date.now()}.yaml`);
-    const config = {
-      database: { url: 'postgres://localhost/kici' },
-    };
-
-    try {
-      await writeConfigFile(configPath, config);
-      const content = await readFile(configPath, 'utf-8');
-      const parsed = parseYaml(content);
-      expect(parsed.database.url).toBe('postgres://localhost/kici');
-    } finally {
-      await unlink(configPath).catch(() => {});
-    }
   });
 });
 
@@ -352,56 +291,7 @@ describe('writeEnvFile', () => {
   });
 });
 
-describe('writeConfigFile (deprecated --config path)', () => {
-  // breaks-if-wrong: the deprecated artifact keeps its exact content, so an
-  //   operator script that parses it is unaffected by the default moving to
-  //   the env file. Pinned verbatim rather than round-tripped, since a
-  //   round-trip would pass against a reformatted file too.
-  it('writes byte-identical YAML', async () => {
-    const configPath = join(tmpdir(), `kici-test-join-${Date.now()}.yaml`);
-    try {
-      const bundle = {
-        databaseUrl: 'postgres://localhost/kici',
-        clusterId: 'cluster-1',
-        storage: { type: 's3' as const, bucket: 'my-bucket' },
-        secretKey: 'my-secret',
-      };
-      await writeConfigFile(
-        configPath,
-        buildLocalConfig(bundle) as unknown as Record<string, unknown>,
-      );
-
-      expect(await readFile(configPath, 'utf-8')).toBe(
-        [
-          'database:',
-          '  url: postgres://localhost/kici',
-          'storage:',
-          '  type: s3',
-          '  bucket: my-bucket',
-          'secrets:',
-          '  key: my-secret',
-          '',
-        ].join('\n'),
-      );
-    } finally {
-      await unlink(configPath).catch(() => {});
-    }
-  });
-
-  // fails-when: the deprecated artifact keeps the 0644 it used to be written
-  //   with, while carrying the same master secret key as the env file.
-  it('writes the YAML readable by its owner only', async () => {
-    const configPath = join(tmpdir(), `kici-test-join-mode-${Date.now()}.yaml`);
-    try {
-      await writeConfigFile(configPath, { database: { url: 'postgres://localhost/kici' } });
-      expect(statSync(configPath).mode & 0o777).toBe(0o600);
-    } finally {
-      await unlink(configPath).catch(() => {});
-    }
-  });
-});
-
-describe('JoinClient artifact selection', () => {
+describe('JoinClient artifact', () => {
   function makeToken(): { token: string; encryptionKey: Buffer } {
     const secret = randomBytes(32);
     const routing = Buffer.from(
@@ -413,7 +303,7 @@ describe('JoinClient artifact selection', () => {
     };
   }
 
-  async function runJoin(options: { configPath?: string; envFilePath?: string }): Promise<void> {
+  async function runJoin(options: { envFilePath?: string }): Promise<void> {
     const { JoinClient } = await import('./join-client.js');
     const { token, encryptionKey } = makeToken();
     const bundle = {
@@ -440,8 +330,9 @@ describe('JoinClient artifact selection', () => {
     }
   }
 
-  // fails-when: the join keeps writing only the YAML no boot path reads. The
-  //   default artifact is the one `orchestrator install --env-file` consumes.
+  // fails-when: a YAML artifact is written beside the env file again. The env
+  //   file is the only artifact: it is what `orchestrator install --env-file`
+  //   consumes, and no boot path ever read the YAML.
   it('writes only the env file when no artifact flag is passed', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kici-join-default-'));
     const cwd = process.cwd();
@@ -456,28 +347,14 @@ describe('JoinClient artifact selection', () => {
     }
   });
 
-  // breaks-if-wrong: an operator whose script passes --config keeps getting
-  //   exactly the file they asked for, and no surprise second artifact.
-  it('writes only the YAML when --config names one', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'kici-join-config-'));
-    const cwd = process.cwd();
+  it('writes the env file where --env-file points', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kici-join-env-'));
     try {
-      process.chdir(dir);
-      await runJoin({ configPath: join(dir, 'legacy.yaml') });
-      expect(existsSync(join(dir, 'legacy.yaml'))).toBe(true);
-      expect(existsSync(join(dir, 'kici-orchestrator.env'))).toBe(false);
-    } finally {
-      process.chdir(cwd);
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('writes both when both flags are passed', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'kici-join-both-'));
-    try {
-      await runJoin({ configPath: join(dir, 'legacy.yaml'), envFilePath: join(dir, 'peer.env') });
-      expect(existsSync(join(dir, 'legacy.yaml'))).toBe(true);
+      await runJoin({ envFilePath: join(dir, 'peer.env') });
       expect(existsSync(join(dir, 'peer.env'))).toBe(true);
+      expect(await readFile(join(dir, 'peer.env'), 'utf-8')).toContain(
+        'KICI_DATABASE_URL=postgresql://joiner:pw@db:5432/kici',
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

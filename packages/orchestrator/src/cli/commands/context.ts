@@ -32,6 +32,7 @@ import {
   toErrorMessage,
 } from '@kici-dev/shared';
 import type { ContextRow, ShowContextResult, SeedContextResult } from '@kici-dev/shared';
+import { MinimumTrustSchema, type MinimumTrust } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
@@ -54,6 +55,22 @@ function parseCsvOption(raw: string | undefined): string[] | undefined {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+}
+
+/**
+ * Parse `--minimum-trust`. Direct-DB mode writes the row with no route schema
+ * in front of it, so the CLI is where an unknown tier is refused. `"null"`
+ * clears the floor.
+ */
+function parseMinimumTrustOption(raw: string | undefined): MinimumTrust | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = MinimumTrustSchema.safeParse(raw === 'null' ? null : raw);
+  if (!parsed.success) {
+    throw new Error(
+      `--minimum-trust: must be "${MinimumTrustSchema.unwrap().value}" or "null" (got "${raw}")`,
+    );
+  }
+  return parsed.data;
 }
 
 function parseIntOption(raw: string | undefined, label: string): number | undefined {
@@ -167,7 +184,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs (or empty to clear)')
     .option('--wait-timer <seconds>', 'Wait timer before release (seconds)')
     .option('--hold-expiry <seconds>', 'Hold expiry TTL (seconds)')
-    .option('--minimum-trust <level>', 'Minimum trust (known|trusted)')
+    .option('--minimum-trust <level>', 'Minimum trust (trusted)')
     .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .option('--json', 'Emit JSON output')
     .action(async (opts) => {
@@ -196,7 +213,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           requiredReviewers,
           waitTimerSeconds,
           holdExpirySeconds,
-          minimumTrust: opts.minimumTrust,
+          minimumTrust: parseMinimumTrustOption(opts.minimumTrust),
         };
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result: SeedContextResult = dbUrl
@@ -265,7 +282,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs (empty to clear)')
     .option('--wait-timer <seconds>', 'Wait timer before release (seconds)')
     .option('--hold-expiry <seconds>', 'Hold expiry TTL in seconds (empty to clear)')
-    .option('--minimum-trust <level>', 'Minimum trust (known|trusted, or "null" to clear)')
+    .option('--minimum-trust <level>', 'Minimum trust (trusted, or "null" to clear)')
     .option('--enabled <bool>', 'Enabled flag (true|false)')
     .option(
       '--allow-local-execution <bool>',
@@ -295,7 +312,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           payload.holdExpirySeconds = parseIntOrClearOption(opts.holdExpiry, '--hold-expiry');
         }
         if (opts.minimumTrust !== undefined) {
-          payload.minimumTrust = opts.minimumTrust === 'null' ? null : opts.minimumTrust;
+          payload.minimumTrust = parseMinimumTrustOption(opts.minimumTrust);
         }
         if (opts.enabled !== undefined) {
           payload.enabled = opts.enabled === 'false' ? false : true;
@@ -455,7 +472,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs')
     .option('--wait-timer <seconds>', 'Wait timer (seconds)')
     .option('--hold-expiry <seconds>', 'Hold expiry TTL (seconds)')
-    .option('--minimum-trust <level>', 'Minimum trust (known|trusted)')
+    .option('--minimum-trust <level>', 'Minimum trust (trusted)')
     .option('--variables <json>', 'JSON object of env variables to seed (e.g. \'{"K":"V"}\')')
     .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .option('--json', 'Emit JSON output')
@@ -484,7 +501,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           requiredReviewers,
           waitTimerSeconds,
           holdExpirySeconds,
-          minimumTrust: opts.minimumTrust,
+          minimumTrust: parseMinimumTrustOption(opts.minimumTrust),
           variables,
         };
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);

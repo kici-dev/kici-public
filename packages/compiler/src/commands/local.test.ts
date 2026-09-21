@@ -299,7 +299,7 @@ describe('kici local commands', () => {
   it('localAttachCommand attaches when logged in with an active org', async () => {
     loadGlobalConfig.mockResolvedValue({
       pat: 'kici_pat_abc',
-      platformEndpoint: 'https://thinker1.dev.kici.dev/kici-stg',
+      platformEndpoint: 'https://platform.example.com/kici-stg',
       activeOrgId: 'kiciStg00001',
     });
     const { localAttachCommand } = await import('./local.js');
@@ -307,7 +307,7 @@ describe('kici local commands', () => {
     const ok = await localAttachCommand();
     expect(ok).toBe(true);
     expect(attachPlane).toHaveBeenCalledWith({
-      apiBase: 'https://thinker1.dev.kici.dev/kici-stg',
+      apiBase: 'https://platform.example.com/kici-stg',
       pat: 'kici_pat_abc',
       orgId: 'kiciStg00001',
     });

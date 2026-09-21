@@ -11,20 +11,16 @@ import { canonicalizeLabels, canonicalizeLabelSet } from '@kici-dev/engine';
 
 /**
  * The taint gate for one label set of a peer's advertised scaler-capacity
- * entry.
- *
- * Prefers the index-aligned `labelSetMandatoryLabels`, falling back to the
- * scaler-wide `mandatoryLabels` when it is absent (a peer that predates the
- * per-label-set field) or when its length does not match `labelSets` — a
- * mismatched array carries no trustworthy alignment, so indexing into it would
- * apply one label set's gate to another. Falling back to the union over-gates,
- * which is the safe direction: a wrong index could under-gate and send a job to
- * a peer that cannot run it.
+ * entry, read from the index-aligned `labelSetMandatoryLabels`. `null` when
+ * the array's length does not match `labelSets` — a mismatched array carries no
+ * trustworthy alignment, so indexing into it would apply one label set's gate
+ * to another, and the safe reading is that the entry routes nothing: a wrong
+ * index could under-gate and send a job to a peer that cannot run it.
  */
-function scalerGateForLabelSet(sc: ScalerCapacitySummary, index: number): string[] {
+function scalerGateForLabelSet(sc: ScalerCapacitySummary, index: number): string[] | null {
   const perSet = sc.labelSetMandatoryLabels;
-  if (perSet && perSet.length === sc.labelSets.length) return perSet[index] ?? [];
-  return sc.mandatoryLabels ?? [];
+  if (perSet.length !== sc.labelSets.length) return null;
+  return perSet[index] ?? [];
 }
 
 /**
@@ -55,6 +51,7 @@ function scalerCapacityMatchesRequiredLabels(
   const requiredLower = new Set(requiredLabels.map((l) => l.toLowerCase()));
   return sc.labelSets.some((scalerLabels, i) => {
     const mandatory = scalerGateForLabelSet(sc, i);
+    if (mandatory === null) return false;
     if (requiredLabels.length === 0) {
       // Empty required labels: only an ungated label set can match, and it
       // supplies every (zero) required label trivially.
@@ -299,10 +296,8 @@ export class PeerRegistry {
       maxConcurrency: a.maxConcurrency,
       platform: a.platform,
       arch: a.arch,
-      // Legacy peers omit `mandatoryLabels`; the schema's `.default([])`
-      // surfaces it as the empty array (no gate), matching pre-gate
-      // routing behavior.
-      mandatoryLabels: canonicalizeLabels(a.mandatoryLabels ?? []),
+      // Always present on the wire; a static agent carries `[]` (no gate).
+      mandatoryLabels: canonicalizeLabels(a.mandatoryLabels),
       // Scaler binding for diagnostics grouping; null/omitted for static agents.
       scalerName: a.scalerName ?? null,
     }));
@@ -312,13 +307,7 @@ export class PeerRegistry {
       ? heartbeat.scalerCapacity.map((sc) => ({
           ...sc,
           labelSets: sc.labelSets.map((ls) => canonicalizeLabels(ls)),
-          mandatoryLabels: canonicalizeLabels(sc.mandatoryLabels ?? []),
-          // Kept `undefined` when the peer omits it: `undefined` is the only
-          // value that means "fall back to the scaler-wide gate", so mapping it
-          // to `[]` would advertise every label set as ungated.
-          ...(sc.labelSetMandatoryLabels && {
-            labelSetMandatoryLabels: sc.labelSetMandatoryLabels.map((ls) => canonicalizeLabels(ls)),
-          }),
+          labelSetMandatoryLabels: sc.labelSetMandatoryLabels.map((ls) => canonicalizeLabels(ls)),
         }))
       : undefined;
     peer.term = heartbeat.term;

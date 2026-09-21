@@ -882,7 +882,6 @@ export async function bootstrapWorker(
           routingKey: msg.routingKey,
           requestId: msg.requestId,
           sourceTarUrl: msg.sourceTarUrl,
-          sourceTarHash: msg.sourceTarHash,
           sourceTarDigest: msg.sourceTarDigest,
           depsUrl: msg.depsUrl,
           depsHash: msg.depsHash,

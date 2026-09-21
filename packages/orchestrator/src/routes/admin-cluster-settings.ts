@@ -45,8 +45,6 @@ const COLUMNS = {
   eventLogMaxPayloadBytes: 'event_log_max_payload_bytes',
   lockFileMaxBytes: 'lock_file_max_bytes',
   webhookDedupTtlMs: 'webhook_dedup_ttl_ms',
-  /** @deprecated Read and written; no runtime read consumes it. Removed at v1.0.0. */
-  contributorCacheTtlMs: 'contributor_cache_ttl_ms',
   eventRouterEventTtlSeconds: 'event_router_event_ttl_seconds',
   eventRouterMaxDispatchAttempts: 'event_router_max_dispatch_attempts',
   queueMaxDepth: 'queue_max_depth',
@@ -110,139 +108,148 @@ const BOOLEAN_COLUMNS = {
 
 type CamelBooleanKnob = keyof typeof BOOLEAN_COLUMNS;
 
-// Per-knob minimum floors mirroring the config.ts field constraints.
-const updateSchema = z.object({
-  maxGithubPayloadBytes: z.number().int().min(1024).nullable().optional(),
-  eventLogMaxPayloadBytes: z.number().int().min(1024).nullable().optional(),
-  lockFileMaxBytes: z.number().int().min(1024).nullable().optional(),
-  webhookDedupTtlMs: z.number().int().min(1000).nullable().optional(),
-  /** @deprecated Still accepted and stored; no runtime read consumes it. Removed at v1.0.0. */
-  contributorCacheTtlMs: z.number().int().min(1000).nullable().optional(),
-  eventRouterEventTtlSeconds: z.number().int().min(1).nullable().optional(),
-  eventRouterMaxDispatchAttempts: z.number().int().min(1).nullable().optional(),
-  queueMaxDepth: z.number().int().min(1).nullable().optional(),
-  rerouteFlapGraceMs: z.number().int().min(1000).nullable().optional(),
-  maxFanoutHosts: z.number().int().min(1).nullable().optional(),
-  eventRouterRateLimitPerWorkflowPerMinute: z.number().int().min(1).nullable().optional(),
-  cacheMaxTarballBytes: z.number().int().min(1024).nullable().optional(),
-  cacheTtlDays: z.number().int().min(1).nullable().optional(),
-  /** 0 disables the check-run tracking retention sweep, so the floor is 0, not 1. */
-  checkRunTrackingTtlDays: z.number().int().min(0).nullable().optional(),
-  /** 0 disables each retention window, so the floor is 0, not 1. */
-  runRetentionDays: z.number().int().min(0).nullable().optional(),
-  auditRetentionDays: z.number().int().min(0).nullable().optional(),
-  provenanceRetentionDays: z.number().int().min(0).nullable().optional(),
-  heldRunRetentionDays: z.number().int().min(0).nullable().optional(),
-  concurrencyWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  agentTokenTtlMs: z.number().int().min(1000).nullable().optional(),
-  ownershipDbCheckTimeoutMs: z.number().int().min(100).nullable().optional(),
-  /** 0 disables unroutable fast-fail, so the floor is 0, not 1000. */
-  unroutableGraceMs: z.number().int().min(0).nullable().optional(),
-  /**
-   * Floor of 60s: reclaiming a claim sooner than a pipeline can plausibly
-   * finish makes the drain pass re-run work that is still in flight.
-   */
-  ingestOverflowClaimTimeoutMs: z.number().int().min(60_000).nullable().optional(),
-  /**
-   * Lock-file and Tier-1 content cache sizing. Structural to the underlying
-   * LRU, which is built once at boot, so a change lands at the next restart.
-   *
-   * The two entry counts are capped at {@link CACHE_MAX_ENTRIES_CEILING}: the
-   * LRU allocates its index arrays eagerly from `max`, so an unbounded value
-   * crashes `bootstrapOrchestrator` before the admin API listens — taking away
-   * the only route back to the stored value. This rejection is the good error
-   * message; `clampCacheMaxEntries` at the read site is the actual guarantee,
-   * since a bad value may already be stored.
-   */
-  lockfileCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
-  lockfileCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
-  lockfileCacheTtlMs: z.number().int().min(1000).nullable().optional(),
-  contentCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
-  contentCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
-  contentCacheTtlMs: z.number().int().min(1000).nullable().optional(),
-  /**
-   * Tier-2 global eval round budgets. Both are read per round and shipped to
-   * the agent in the round's job config, so a change lands on the next push.
-   */
-  globalEvalRoundTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  globalEvalCandidateTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  /**
-   * Round-result cache size. Capped at {@link CACHE_MAX_ENTRIES_CEILING} for the
-   * same boot-safety reason as the two cache knobs above — the LRU allocates
-   * eagerly from `max`, and this one is built during bootstrap too.
-   */
-  globalEvalCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
-  /**
-   * Orchestrator-side ceiling on waiting for a round to settle. Set it above
-   * `globalEvalRoundTimeoutMs`: the agent's own budget starts only once the
-   * round job is running, so a ceiling below it would fire on every round that
-   * merely waited for an agent.
-   */
-  globalEvalWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  /**
-   * Event-scaler provision reaper. All four are read per sweep, so a change
-   * lands on the next tick with no restart — the interval itself reschedules
-   * the timer at the end of the sweep that observed it.
-   *
-   * Floor of 5s on the interval: the sweep does a table scan plus a delete, so
-   * a sub-second value would hammer the database for a backstop whose whole
-   * point is to run rarely.
-   */
-  scalerReapIntervalMs: z.number().int().min(5000).nullable().optional(),
-  /**
-   * Set the stranded window well above the peer heartbeat period. "Registered
-   * nowhere in the cluster" is partly heartbeat-derived, so a short window can
-   * read a peer that has not yet reported its agents as a strand and tear down
-   * a live provision. The floor is one minute, not a safe setting.
-   */
-  scalerReapStrandedTimeoutMs: z.number().int().min(60_000).nullable().optional(),
-  scalerReapReattemptIntervalMs: z.number().int().min(60_000).nullable().optional(),
-  /**
-   * Retention for expired provisioning claims. Floor of 0: an expired claim can
-   * never be redeemed, so purging it the moment it expires is a legitimate
-   * setting — it only costs a late redeemer the "expired" diagnostic.
-   */
-  scalerClaimRetentionMs: z.number().int().min(0).nullable().optional(),
-  /**
-   * External-provision backoff. All three are read per spawn request, so a
-   * change lands on the next request with no restart.
-   *
-   * Floor of 1s on the base: the point of the deferral is to stop hammering a
-   * provider that is already refusing work, and a sub-second first step defers
-   * nothing in practice. The ceiling carries the same floor, so no setting can
-   * cap a deferral below one second. Their ORDERING is checked in the PATCH
-   * handler instead, against the effective pair — the patch overlaid on the
-   * stored row. A patch that lowers only the ceiling carries no base for a
-   * schema-level check to compare it against, and that is the case an operator
-   * actually reaches.
-   */
-  scalerProvisionBackoffBaseMs: z.number().int().min(1000).nullable().optional(),
-  scalerProvisionBackoffMaxMs: z.number().int().min(1000).nullable().optional(),
-  /**
-   * Floor of 1: the count is "how many consecutive failures before the refusal
-   * names repeated failure", and 0 would mean a scaler that has never failed is
-   * already past its limit.
-   */
-  scalerProvisionMaxConsecutiveFailures: z.number().int().min(1).nullable().optional(),
-  /**
-   * Verified-tier origin for browser-sealed dashboard writes. Must be an
-   * absolute http(s) origin (the dashboard fetches `<issuer>/.well-known/jwks.json`
-   * from it and shows it to the operator); null clears the override.
-   */
-  dashboardVerifiedIssuer: z
-    .string()
-    .trim()
-    .refine((v) => /^https?:\/\/[^\s]+$/.test(v), {
-      message: 'dashboardVerifiedIssuer must be an absolute http(s) URL',
-    })
-    .nullable()
-    .optional(),
-  /**
-   * Fleet-wide master switch for global workflows. null clears the override →
-   * the orchestrator's configured default (`KICI_GLOBAL_WORKFLOWS_ENABLED`).
-   */
-  globalWorkflowsEnabled: z.boolean().nullable().optional(),
-});
+// Per-knob minimum floors mirroring the config.ts field constraints. Strict,
+// like the sibling org-settings and trust-policy bodies: a field this route
+// does not know — a removed knob from an older kici-admin — is refused with a
+// 400 rather than silently dropped.
+const updateSchema = z
+  .object({
+    maxGithubPayloadBytes: z.number().int().min(1024).nullable().optional(),
+    eventLogMaxPayloadBytes: z.number().int().min(1024).nullable().optional(),
+    lockFileMaxBytes: z.number().int().min(1024).nullable().optional(),
+    webhookDedupTtlMs: z.number().int().min(1000).nullable().optional(),
+    eventRouterEventTtlSeconds: z.number().int().min(1).nullable().optional(),
+    eventRouterMaxDispatchAttempts: z.number().int().min(1).nullable().optional(),
+    queueMaxDepth: z.number().int().min(1).nullable().optional(),
+    rerouteFlapGraceMs: z.number().int().min(1000).nullable().optional(),
+    maxFanoutHosts: z.number().int().min(1).nullable().optional(),
+    eventRouterRateLimitPerWorkflowPerMinute: z.number().int().min(1).nullable().optional(),
+    cacheMaxTarballBytes: z.number().int().min(1024).nullable().optional(),
+    cacheTtlDays: z.number().int().min(1).nullable().optional(),
+    /** 0 disables the check-run tracking retention sweep, so the floor is 0, not 1. */
+    checkRunTrackingTtlDays: z.number().int().min(0).nullable().optional(),
+    /** 0 disables each retention window, so the floor is 0, not 1. */
+    runRetentionDays: z.number().int().min(0).nullable().optional(),
+    auditRetentionDays: z.number().int().min(0).nullable().optional(),
+    provenanceRetentionDays: z.number().int().min(0).nullable().optional(),
+    heldRunRetentionDays: z.number().int().min(0).nullable().optional(),
+    concurrencyWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    agentTokenTtlMs: z.number().int().min(1000).nullable().optional(),
+    ownershipDbCheckTimeoutMs: z.number().int().min(100).nullable().optional(),
+    /** 0 disables unroutable fast-fail, so the floor is 0, not 1000. */
+    unroutableGraceMs: z.number().int().min(0).nullable().optional(),
+    /**
+     * Floor of 60s: reclaiming a claim sooner than a pipeline can plausibly
+     * finish makes the drain pass re-run work that is still in flight.
+     */
+    ingestOverflowClaimTimeoutMs: z.number().int().min(60_000).nullable().optional(),
+    /**
+     * Lock-file and Tier-1 content cache sizing. Structural to the underlying
+     * LRU, which is built once at boot, so a change lands at the next restart.
+     *
+     * The two entry counts are capped at {@link CACHE_MAX_ENTRIES_CEILING}: the
+     * LRU allocates its index arrays eagerly from `max`, so an unbounded value
+     * crashes `bootstrapOrchestrator` before the admin API listens — taking away
+     * the only route back to the stored value. This rejection is the good error
+     * message; `clampCacheMaxEntries` at the read site is the actual guarantee,
+     * since a bad value may already be stored.
+     */
+    lockfileCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
+    lockfileCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
+    lockfileCacheTtlMs: z.number().int().min(1000).nullable().optional(),
+    contentCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
+    contentCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
+    contentCacheTtlMs: z.number().int().min(1000).nullable().optional(),
+    /**
+     * Tier-2 global eval round budgets. Both are read per round and shipped to
+     * the agent in the round's job config, so a change lands on the next push.
+     */
+    globalEvalRoundTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    globalEvalCandidateTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    /**
+     * Round-result cache size. Capped at {@link CACHE_MAX_ENTRIES_CEILING} for the
+     * same boot-safety reason as the two cache knobs above — the LRU allocates
+     * eagerly from `max`, and this one is built during bootstrap too.
+     */
+    globalEvalCacheMax: z
+      .number()
+      .int()
+      .min(1)
+      .max(CACHE_MAX_ENTRIES_CEILING)
+      .nullable()
+      .optional(),
+    /**
+     * Orchestrator-side ceiling on waiting for a round to settle. Set it above
+     * `globalEvalRoundTimeoutMs`: the agent's own budget starts only once the
+     * round job is running, so a ceiling below it would fire on every round that
+     * merely waited for an agent.
+     */
+    globalEvalWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    /**
+     * Event-scaler provision reaper. All four are read per sweep, so a change
+     * lands on the next tick with no restart — the interval itself reschedules
+     * the timer at the end of the sweep that observed it.
+     *
+     * Floor of 5s on the interval: the sweep does a table scan plus a delete, so
+     * a sub-second value would hammer the database for a backstop whose whole
+     * point is to run rarely.
+     */
+    scalerReapIntervalMs: z.number().int().min(5000).nullable().optional(),
+    /**
+     * Set the stranded window well above the peer heartbeat period. "Registered
+     * nowhere in the cluster" is partly heartbeat-derived, so a short window can
+     * read a peer that has not yet reported its agents as a strand and tear down
+     * a live provision. The floor is one minute, not a safe setting.
+     */
+    scalerReapStrandedTimeoutMs: z.number().int().min(60_000).nullable().optional(),
+    scalerReapReattemptIntervalMs: z.number().int().min(60_000).nullable().optional(),
+    /**
+     * Retention for expired provisioning claims. Floor of 0: an expired claim can
+     * never be redeemed, so purging it the moment it expires is a legitimate
+     * setting — it only costs a late redeemer the "expired" diagnostic.
+     */
+    scalerClaimRetentionMs: z.number().int().min(0).nullable().optional(),
+    /**
+     * External-provision backoff. All three are read per spawn request, so a
+     * change lands on the next request with no restart.
+     *
+     * Floor of 1s on the base: the point of the deferral is to stop hammering a
+     * provider that is already refusing work, and a sub-second first step defers
+     * nothing in practice. The ceiling carries the same floor, so no setting can
+     * cap a deferral below one second. Their ORDERING is checked in the PATCH
+     * handler instead, against the effective pair — the patch overlaid on the
+     * stored row. A patch that lowers only the ceiling carries no base for a
+     * schema-level check to compare it against, and that is the case an operator
+     * actually reaches.
+     */
+    scalerProvisionBackoffBaseMs: z.number().int().min(1000).nullable().optional(),
+    scalerProvisionBackoffMaxMs: z.number().int().min(1000).nullable().optional(),
+    /**
+     * Floor of 1: the count is "how many consecutive failures before the refusal
+     * names repeated failure", and 0 would mean a scaler that has never failed is
+     * already past its limit.
+     */
+    scalerProvisionMaxConsecutiveFailures: z.number().int().min(1).nullable().optional(),
+    /**
+     * Verified-tier origin for browser-sealed dashboard writes. Must be an
+     * absolute http(s) origin (the dashboard fetches `<issuer>/.well-known/jwks.json`
+     * from it and shows it to the operator); null clears the override.
+     */
+    dashboardVerifiedIssuer: z
+      .string()
+      .trim()
+      .refine((v) => /^https?:\/\/[^\s]+$/.test(v), {
+        message: 'dashboardVerifiedIssuer must be an absolute http(s) URL',
+      })
+      .nullable()
+      .optional(),
+    /**
+     * Fleet-wide master switch for global workflows. null clears the override →
+     * the orchestrator's configured default (`KICI_GLOBAL_WORKFLOWS_ENABLED`).
+     */
+    globalWorkflowsEnabled: z.boolean().nullable().optional(),
+  })
+  .strict();
 
 type ProjectedClusterSettings = Record<CamelKnob, number | null> &
   Record<CamelStringKnob, string | null> &

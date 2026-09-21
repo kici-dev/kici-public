@@ -390,7 +390,7 @@ describe('evaluateProtectionRules', () => {
   it('should hold for trust gate after branch passes but before reviewer', async () => {
     const env = makeEnv({
       branchRestrictions: ['main'],
-      minimumTrust: 'known',
+      minimumTrust: 'trusted',
       requiredReviewers: ['user:alice'],
     });
     // Branch passes (main matches), trust gate holds (unknown contributor)
@@ -404,7 +404,7 @@ describe('evaluateProtectionRules', () => {
     expect(result.action).toBe('hold');
     expect(result.holdType).toBe(HoldType.enum.security);
     // Reviewer gate should NOT be reached
-    expect(result.reason).toContain('known contributors');
+    expect(result.reason).toContain('trusted contributors');
   });
 
   it('should skip trust gate when no trustTier provided', async () => {
@@ -415,7 +415,7 @@ describe('evaluateProtectionRules', () => {
   });
 
   it('should pass trust gate when contributor meets minimum trust', async () => {
-    const env = makeEnv({ minimumTrust: 'known' });
+    const env = makeEnv({ minimumTrust: 'trusted' });
     const result = await evaluateProtectionRules(env, makeCtx(), 0, 'group-1', 'trusted');
     expect(result.action).toBe('pass');
   });

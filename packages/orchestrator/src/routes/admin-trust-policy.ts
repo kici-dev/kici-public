@@ -31,7 +31,7 @@ import {
 } from '@kici-dev/engine';
 import { handleAdminError } from './admin-errors.js';
 import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import { resolveEffectivePolicy, TrustPolicyEnforcement } from '../security/trust-policy-gate.js';
+import { resolveEffectivePolicy } from '../security/trust-policy-gate.js';
 import type { TrustPolicyStore } from '../security/trust-policy-store.js';
 import type { TrustDirectory, TrustDirectoryStore } from '../security/trust-directory-store.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
@@ -106,26 +106,29 @@ type AdminEnv = {
   };
 };
 
-const updateSchema = z.object({
-  customerId: z.string().min(1),
-  // The wire enum itself, so the route accepts every value the gate honours —
-  // including `ignore`, which is what an orchestrator with no stored row
-  // already applies and therefore has to be expressible.
-  forkPolicy: ForkPolicy.optional(),
-  /** @deprecated Accepted and stored; no dispatch decision reads it. */
-  unknownContributorPolicy: z.enum(['hold', 'reject']).optional(),
-  /** @deprecated Accepted and stored; no dispatch decision reads it. */
-  workflowChangePolicy: z.enum(['hold', 'reject', 'allow']).optional(),
-  /** The coarse spelling of the hold window; still fully supported on its own. */
-  approvalExpiryHours: z.number().int().min(1).optional(),
-  /**
-   * The authoritative hold window, and the only spelling that can express a
-   * sub-hour hold. When a PATCH carries both, this one wins — it is the more
-   * specific of the two — and the store rewrites the hours column to match, so
-   * the two can never be left disagreeing.
-   */
-  approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
-});
+/**
+ * Strict, like the Platform route: a body naming a field this build does not
+ * know — a removed policy arm from an older `kici-admin` — is refused with a
+ * structured 400 rather than silently no-oping.
+ */
+const updateSchema = z
+  .object({
+    customerId: z.string().min(1),
+    // The wire enum itself, so the route accepts every value the gate honours —
+    // including `ignore`, which is what an orchestrator with no stored row
+    // already applies and therefore has to be expressible.
+    forkPolicy: ForkPolicy.optional(),
+    /** The coarse spelling of the hold window; still fully supported on its own. */
+    approvalExpiryHours: z.number().int().min(1).optional(),
+    /**
+     * The authoritative hold window, and the only spelling that can express a
+     * sub-hour hold. When a PATCH carries both, this one wins — it is the more
+     * specific of the two — and the store rewrites the hours column to match, so
+     * the two can never be left disagreeing.
+     */
+    approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
+  })
+  .strict();
 
 /**
  * One member's approval registration.
@@ -210,13 +213,6 @@ export function createTrustPolicyRoutes(deps: TrustPolicyRouteDeps): Hono<AdminE
         policy: {
           customerId,
           ...effective,
-          /**
-           * @deprecated Always `policy`: `resolveEffectivePolicy` returns a
-           * policy for every input, so the values above are always the ones
-           * being applied. Emitted so an older `kici-admin` binary, which reads
-           * this field to decide whether to render them, keeps working.
-           */
-          enforcement: TrustPolicyEnforcement.enum.policy,
           source: stored?.source ?? null,
           updatedAt: stored?.updatedAt?.toISOString() ?? null,
           /**

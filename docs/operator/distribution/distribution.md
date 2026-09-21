@@ -147,8 +147,6 @@ retirement did this:
   only: a retired version's digest does not pull.
 - **GitHub** — earlier releases and tags on `kici-dev/kici-public` are removed.
 
-The [deprecations page](../../user/deprecations.md) records the retirement.
-
 ---
 
 ## Firecracker rootfs

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { OrchestratorSigningKeyRow } from '../db/types.js';
+import { buildIdTokenClaims } from '../oidc/id-token-claims.js';
 import { buildOpenidConfiguration, createProvenanceOidcRoutes } from './provenance-oidc.js';
 
 const PUBLIC_JWK = {
@@ -40,6 +41,34 @@ describe('buildOpenidConfiguration', () => {
     expect(doc.id_token_signing_alg_values_supported).toEqual(['ES256']);
     expect(doc.jwks_uri).toBe('https://orch.example/.well-known/jwks.json');
     expect(doc.issuer).toBe('https://orch.example/');
+  });
+
+  it('advertises exactly the claims the ID-token builder emits', () => {
+    // fails-when: a claim is added to buildIdTokenClaims and not to the
+    // advertised list (or vice versa) — a relying party reads this document.
+    const claims = buildIdTokenClaims(
+      {
+        run_id: 'run-1',
+        org_id: 'org-1',
+        repo_identifier: 'acme/app',
+        ref: 'main',
+        sha: 'abc',
+        workflow_name: 'deploy',
+        provider: 'github',
+        local_working_tree: false,
+        trigger_event: 'push',
+        subject_trigger_event: null,
+        head_ref: null,
+        head_repository: null,
+        is_fork: false,
+        trust_tier: 'trusted',
+        trigger_actor_username: 'alice',
+      },
+      { run_id: 'run-1', job_id: 'job-1', orchestrator_id: 'orch-1', status: 'running' },
+      { issuer: 'https://orch.example', audience: 'aud', nowSeconds: 1, ttlSeconds: 600 },
+    );
+    const doc = buildOpenidConfiguration('https://orch.example');
+    expect([...doc.claims_supported].sort()).toEqual(Object.keys(claims).sort());
   });
 });
 
@@ -161,7 +190,7 @@ describe('the empty-JWKS 503 reports "nothing to publish", not "no issuer"', () 
   });
 
   // The state that makes an issuer-shaped body a lie: the issuer IS configured
-  // and signing IS on, the signing key simply is not provisioned yet.
+  // and signing IS on, the signing key is not provisioned yet.
   it('says no_published_keys when the issuer is configured but no key is provisioned', async () => {
     const body = await jwksError(
       createProvenanceOidcRoutes({

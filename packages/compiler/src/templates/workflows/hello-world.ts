@@ -1,5 +1,5 @@
 // Hello World -- minimal push workflow
-// Docs: https://kici.dev/docs/sdk-reference
+// Docs: https://docs.kici.dev/user/sdk-reference/
 
 import { workflow, job, step, push } from '@kici-dev/sdk';
 

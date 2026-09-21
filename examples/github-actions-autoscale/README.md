@@ -42,7 +42,7 @@ The token stays a secret — variables are plaintext at rest, so never put a
 credential in one.
 
 The full walkthrough, including the provisioning and teardown workflows, is in
-[Autoscaling workflows](https://kici.dev/docs/user/workflows/autoscaling-workflows/).
+[Autoscaling workflows](https://docs.kici.dev/user/workflows/autoscaling-workflows/).
 
 ## The token never travels
 

@@ -1,6 +1,6 @@
 ---
 title: 'kici-admin: inspection & recovery'
-description: 'Cold-storage inspection, attestation backfill, access / event logs, and diagnostic bundles'
+description: 'Cold-storage inspection, cache maintenance, attestation backfill, access / event logs, and diagnostic bundles'
 ---
 
 ## Guide
@@ -32,6 +32,20 @@ Inspects and operates the orchestrator-side cold-storage archival. Every subcomm
 - `list-purgeable` (read-only) lists chunks past their cold-retention horizon. `--table` filters to a single adapter, `--bucket` scopes to a single cold-bucket (`30d` / `180d` / `1y` / `2y`), `--limit` caps candidates inspected (default 1000).
 - `purge-now` deletes expired chunks from S3 + PG bookkeeping. **Defaults to dry-run** — pass `--apply` to actually delete. Same `--table` / `--bucket` / `--limit` filters as `list-purgeable`.
 - `peek-chunk <chunkId>` streams the first N rows of a chunk to stdout (default `--limit 10`) for debugging.
+
+### cache -- object-storage cache maintenance (direct storage access)
+
+```bash
+kici-admin cache purge-legacy [--yes] [--org <id>]
+```
+
+Removes cache objects written under the retired key layouts. The orchestrator reads only the current layouts (see [retired layouts](../storage-layout.md#retired-layouts)). The cache TTL is enforced lazily on access, so the product never removes an object nothing reads. A retired `cache/` entry goes only through over-quota eviction; a retired `source/` or `deps/` object stays for good. This command is the removal path, alongside a bucket lifecycle rule the operator manages. It talks **directly** to the configured cache storage backend — the same `KICI_STORAGE_*` configuration the orchestrator runs with — and needs no database, no admin token, and no running orchestrator.
+
+- Without `--yes` the command is a **dry run**: it lists the object count and byte total per prefix (`cache/`, `source/`, `deps/`) and deletes nothing.
+- `--yes` deletes the listed objects and prints the counts.
+- `--org <id>` narrows the sweep to the user-cache prefix of that org (`cache/<org>/`). The retired source and dependency layouts carry no org segment, so an org-scoped run leaves them untouched.
+
+An object the current writers produce is never a candidate: a user-cache entry whose stem carries a discriminator, an in-flight `.tmp-` upload, a `source/v2/` object, or a content-addressed dependency tarball. A retired dependency tarball is recognised by its same-stem `.hash` sidecar; the sidecar itself stays, because its key is also a valid current pointer key and the next build for that lock file overwrites it.
 
 ### attestations -- provenance verdict backfill and listing
 
@@ -321,6 +335,25 @@ Synopsis: `kici-admin attestations reverify [options]`
 | `--all`                |         | Re-evaluate every attestation (default: only pending/unverifiable) |
 | `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL)                       |
 | `--yes`                |         | Skip the --all confirmation prompt                                 |
+
+### `kici-admin cache`
+
+Maintain the orchestrator object-storage cache (direct storage access)
+
+Synopsis: `kici-admin cache`
+
+### `kici-admin cache purge-legacy`
+
+Remove cache objects written under the retired key layouts. DRY RUN by default — pass --yes to delete.
+
+Synopsis: `kici-admin cache purge-legacy [options]`
+
+**Options**
+
+| Option       | Default | Description                                                             |
+| ------------ | ------- | ----------------------------------------------------------------------- |
+| `--yes`      |         | Delete the matched objects (default is a dry run that only counts them) |
+| `--org <id>` |         | Only sweep this org user-cache prefix (cache/<org>/)                    |
 
 ### `kici-admin cold-store`
 

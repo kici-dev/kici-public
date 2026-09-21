@@ -443,6 +443,7 @@ describe('handleDiagnosticsRequest', () => {
           maxConcurrency: 4,
           platform: 'linux',
           arch: 'x64',
+          mandatoryLabels: [],
         },
       ],
       draining: false,
@@ -490,6 +491,7 @@ describe('handleDiagnosticsRequest', () => {
           activeCount: 1,
           maxAgents: 5,
           labelSets: [['linux', 'x64']],
+          labelSetMandatoryLabels: [[]],
         },
       ],
     } as PeerHeartbeat);

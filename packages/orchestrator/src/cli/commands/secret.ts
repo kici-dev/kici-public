@@ -132,15 +132,13 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
 
   sec
     .command('scopes <orgId>')
-    .description('List secret scopes for an organization')
-    .option(
-      '--all-backends',
-      'List scopes from every registered backend, qualified as <backend>:<path> ' +
-        '(default today: the pg backend only, unqualified — this default flips at v1.0.0)',
+    .description(
+      'List secret scopes for an organization, from every registered backend, ' +
+        'qualified as <backend>:<path>',
     )
-    .action(async (orgId: string, opts: { allBackends?: boolean }) => {
+    .action(async (orgId: string) => {
       try {
-        const { scopes } = await getClient().listScopes(orgId, opts.allBackends === true);
+        const { scopes } = await getClient().listScopes(orgId);
         if (scopes.length === 0) {
           console.log('No scopes found.');
           return;

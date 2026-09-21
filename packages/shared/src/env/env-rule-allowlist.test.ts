@@ -24,7 +24,16 @@
  * collect violations, expect [] at the end.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
 import { IS_ALLOWED_ENV_NAME } from './allowlist.js';
 
@@ -48,6 +57,13 @@ const SCAN_ROOTS = ['packages', 'scripts', 'e2e'];
  * documentation purposes (e.g. the example in this very paragraph).
  */
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.cache', 'coverage', '.git']);
+/**
+ * Gitignored scratch trees a gate materialises next to the sources it checks
+ * (`e2e/.tmp-template-check-*` renders every workflow template — fixtures that
+ * read arbitrary env names on purpose). They are not source, and a tree left
+ * behind by a killed run must not fail an unrelated package's tests.
+ */
+const SCRATCH_DIR = /^\.tmp-/;
 const SELF_FILES = new Set([
   resolve(import.meta.dirname, 'allowlist.ts'),
   resolve(import.meta.dirname, 'env-rule-allowlist.test.ts'),
@@ -74,7 +90,7 @@ function walk(dir: string, out: string[] = []): string[] {
     return out;
   }
   for (const name of entries) {
-    if (SKIP_DIRS.has(name)) continue;
+    if (SKIP_DIRS.has(name) || SCRATCH_DIR.test(name)) continue;
     const full = join(dir, name);
     let stat;
     try {
@@ -193,5 +209,23 @@ describe('env-var allowlist (filesystem walk)', () => {
       .join('\n');
     const message = `Found ${violations.length} unallowlisted process.env access(es). Either:\n  - rename the env var to KICI_* (preferred), or\n  - add it to MIGRATING_ENV_VARS in packages/shared/src/env/allowlist.ts\n    (and mirror in eslint.config.js inline regex), or\n  - extend OS_SDK_ALLOWLIST_REGEX if it is a genuine OS/SDK name.\n\nViolations:\n${formatted}`;
     expect(violations, message).toEqual([]);
+  });
+
+  // fails-when: the walker descends into a `.tmp-*` tree — the probe file it
+  // finds there reads an unallowlisted name, so it would surface as a violation.
+  // breaks-if-wrong: a source file NEXT to the scratch tree must still be
+  // walked, or the skip has silenced the whole root.
+  it('skips gitignored .tmp-* scratch trees but still walks their siblings', () => {
+    const root = mkdtempSync(join(tmpdir(), 'allowlist-walk-'));
+    try {
+      const scratch = join(root, '.tmp-template-check-probe');
+      mkdirSync(scratch, { recursive: true });
+      writeFileSync(join(scratch, 'fixture.ts'), 'process.env.NOT_ALLOWLISTED_PROBE;\n');
+      writeFileSync(join(root, 'real.ts'), 'export const x = 1;\n');
+      const files = walk(root);
+      expect(files).toEqual([join(root, 'real.ts')]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

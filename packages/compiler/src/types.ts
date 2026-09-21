@@ -8,7 +8,7 @@
  * v6 replaces job-level contexts with environment/env/concurrencyGroup.
  * v7 adds hook flags, step rules, gracePeriod, and workflow concurrency config.
  * v8 adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
- * v11 adds LockInlineValue type for pure function inline evaluation.
+ * v11 added an inline-expression value shape for dynamic fields, which is no longer parsed.
  * v15 adds per-job init config(s).
  * v17 widens per-job init to typed presets ('mise' / { mise }) and 'auto' detection.
  */
@@ -473,35 +473,6 @@ export function isLockParallelStep(entry: LockStepEntry): entry is LockParallelS
 }
 
 /**
- * Serialized inline expression for a dynamic env/context/concurrencyGroup
- * field, shaped as `{ _type: 'inline', expression: '(event) => ...' }`
- * alongside the existing 'static' and 'dynamic' discriminants.
- *
- * @deprecated Schema v11 inline expressions are no longer evaluated in the
- * orchestrator. Dynamic env/context/concurrencyGroup fields are resolved on the
- * eval agent's init-runner. The compiler no longer emits this type; readers keep
- * recognizing it only to defer an old lock's field to the init round. Removed at
- * the next major (v1.0.0).
- */
-export interface LockInlineValue {
-  readonly _type: 'inline';
-  readonly expression: string;
-}
-
-/**
- * Type guard for inline expression values.
- *
- * @deprecated See {@link LockInlineValue}. Retained only so a reader can
- * recognize an old lock's inline field and defer it to the eval agent's
- * init-runner. Removed at the next major (v1.0.0).
- */
-export function isLockInlineValue(value: unknown): value is LockInlineValue {
-  return (
-    typeof value === 'object' && value !== null && (value as LockInlineValue)._type === 'inline'
-  );
-}
-
-/**
  * Static job in lock file.
  * Contains all orchestrator-readable information for scheduling.
  *
@@ -588,18 +559,18 @@ export interface LockJob {
         };
       };
   /**
-   * Bound contexts in merge order. Each entry is a static name or inline
-   * expression (pure function); `dynamic` is set when it is a function resolved at
-   * two-phase eval. Later entries override earlier ones on name collisions.
+   * Bound contexts in merge order. Each entry is a static name; `dynamic` is set
+   * when it is a function resolved on the eval agent's init-runner. Later entries
+   * override earlier ones on name collisions.
    */
-  readonly contexts?: ReadonlyArray<{ value: string | LockInlineValue; dynamic: boolean }>;
-  /** Static environment variables or inline expression (pure function). */
-  readonly env?: Record<string, string> | LockInlineValue;
-  /** When true, env is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */
+  readonly contexts?: ReadonlyArray<{ value: string; dynamic: boolean }>;
+  /** Static environment variables. */
+  readonly env?: Record<string, string>;
+  /** When true, env is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicEnv?: boolean;
-  /** Concurrency group name (static string) or inline expression (pure function). */
-  readonly concurrencyGroup?: string | LockInlineValue;
-  /** When true, concurrencyGroup is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */
+  /** Concurrency group name (static string). */
+  readonly concurrencyGroup?: string;
+  /** When true, concurrencyGroup is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicConcurrencyGroup?: boolean;
   /** Whether this job has an onCancel hook. */
   readonly hasOnCancel?: boolean;
@@ -748,7 +719,7 @@ export interface LockWorkflow {
  * v6 replaces job-level contexts with environment/env/concurrencyGroup.
  * v7 adds hook flags, step rules, gracePeriod, and workflow concurrency config.
  * v8 adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
- * v11 adds LockInlineValue type for pure function inline evaluation.
+ * v11 added an inline-expression value shape for dynamic fields, which is no longer parsed.
  * v13 adds job-level and workflow-level timeout.
  * v34 adds LockWorkflow.hasFilter (workflow-level pre-dispatch filter predicate).
  */

@@ -7,7 +7,7 @@ This guide covers the operational aspects of KiCI's deployment context system: d
 
 ## Database tables
 
-Contexts are stored in the **orchestrator database**. The squashed baseline migration `001_initial.ts` creates the following tables:
+Contexts are stored in the **orchestrator database**, in the following tables:
 
 | Table                      | Purpose                                          |
 | -------------------------- | ------------------------------------------------ |
@@ -17,7 +17,7 @@ Contexts are stored in the **orchestrator database**. The squashed baseline migr
 | `context_bindings`         | Scope-to-context secret bindings                 |
 | `held_runs`                | Runs held by protection gates (pending approval) |
 
-The `execution_runs` table also gains an `context` column (TEXT, nullable) to track which context each run targeted.
+The `execution_runs` table also gains a `context` column (TEXT, nullable) to track which context each run targeted.
 
 ### Key constraints
 
@@ -86,10 +86,10 @@ Secrets can be stored in PostgreSQL (default) or HashiCorp Vault. Backends are m
 kici-admin backend add my-vault \
   --type vault \
   --vault-url https://vault.example.com \
-  --vault-auth-method token \
-  --vault-token hvs.xxx \
-  --vault-mount-path secret \
-  --vault-base-path kici/secrets
+  --auth-method token \
+  --token hvs.xxx \
+  --mount-path secret \
+  --base-path kici/secrets
 
 # List registered backends
 kici-admin backend list
@@ -139,12 +139,13 @@ Two further sentinels, `__workflow_modification__` and `__unknown_contributor__`
 
 ### States
 
-| State      | Description                                   |
-| ---------- | --------------------------------------------- |
-| `pending`  | Awaiting reviewer approval or timer expiry    |
-| `approved` | Reviewer approved; job proceeds to dispatch   |
-| `rejected` | Reviewer rejected; job is cancelled           |
-| `expired`  | Hold expiry timeout reached; job is cancelled |
+| State      | Description                                     |
+| ---------- | ----------------------------------------------- |
+| `pending`  | Awaiting reviewer approval or timer expiry      |
+| `approved` | Reviewer approved; job proceeds to dispatch     |
+| `rejected` | Reviewer rejected; job is cancelled             |
+| `expired`  | Hold expiry timeout reached; job is cancelled   |
+| `released` | Workflow-scope wait timer elapsed; run proceeds |
 
 ### Expiry and cleanup
 
@@ -157,9 +158,9 @@ Two further sentinels, `__workflow_modification__` and `__unknown_contributor__`
 
 ### Approval flow
 
-1. Job targets an context with `required_reviewers`
+1. Job targets a context with `required_reviewers`
 2. Orchestrator creates a `held_runs` entry with status `pending`
-3. Reviewer approves via dashboard or API (`POST /runs/:id/approve`)
+3. Reviewer approves via the dashboard, `kici approve <run-id>`, or -- on an independent orchestrator -- `kici-admin held-run approve` (the admin API route `POST /api/v1/admin/held-runs/decision`); see [Approvals](approvals.md)
 4. Held run transitions to `approved`
 5. Job is re-queued for dispatch
 
@@ -266,7 +267,7 @@ SELECT name, glob_pattern FROM contexts
 WHERE org_id = 'your-org' AND type = 'glob';
 ```
 
-The glob matching uses picomatch. Verify the pattern matches the dynamic name:
+Glob patterns follow standard glob syntax: `*` matches one path segment, `**` matches any depth. Verify the pattern matches the dynamic name:
 
 - `review/*` matches `review/PR-123` (single segment)
 - `review/**` matches `review/PR-123` and `review/deep/path`

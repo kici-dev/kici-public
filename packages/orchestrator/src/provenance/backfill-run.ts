@@ -1,7 +1,7 @@
 /**
- * Replay the run/job rows the Platform missed while it was down, so a deferred
- * attestation's later mint has the `execution_runs` / `execution_jobs` rows it
- * derives identity claims from. This is NOT a new ingestion path: it re-sends
+ * Replay the run/job rows the Platform mirror missed while it was down, so a
+ * deferred attestation surfaces against `execution_runs` / `execution_jobs`
+ * rows the dashboard knows about. This is NOT a new ingestion path: it re-sends
  * exactly the `execution.status` + `job.status.forward` messages the
  * orchestrator would have sent live (from the same org-asserted local rows), so
  * it concedes no more trust independence than the live path already does. The

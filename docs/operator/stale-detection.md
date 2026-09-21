@@ -144,6 +144,12 @@ If the orchestrator itself crashes and restarts, the stale detector runs an **im
 
 The completion logic includes a **DB-fallback path** that works even when in-memory state is empty (post-restart), so `execution_runs.status` is correctly updated even after a crash.
 
+### Runs left behind after every job finished
+
+Each scan also finds runs whose every `execution_jobs` row is terminal while the `execution_runs` row is still `pending` or `running`, and finishes them through the same DB-fallback path. The run's status is computed from its job rows.
+
+This covers a coordinator that died between its last job finishing and its own completion write. In a [cluster](orchestrator/clustering.md#runs-that-span-coordinators) it also covers a coordinator that died while it still held a registration window on the run, after a sibling had deferred to it. A run qualifies only when its last job completed more than one stale threshold ago, so a completion in flight is not raced. It also qualifies only when no live coordinator still holds a registration window on it.
+
 ## Queue timeout expiry
 
 Jobs waiting in the dispatch queue (no matching agent available) are automatically expired after a configurable timeout. When a job expires:
@@ -169,6 +175,8 @@ KICI_QUEUE_TIMEOUT_MS=7200000
 | Setting           | Default            | Description                                                                      |
 | ----------------- | ------------------ | -------------------------------------------------------------------------------- |
 | `queue.timeoutMs` | `3600000` (1 hour) | How long a job can wait in the dispatch queue before expiring. `0` = indefinite. |
+
+The cluster value is the last fallback. A queued job's deadline is resolved as `job.timeoutMs ?? org_settings.queue_timeout_ms ?? queue.timeoutMs`: a job-level `timeout` on the workflow wins outright, then a per-org override set with [`kici-admin org-settings queue-timeout set <ms> --customer-id <id>`](orchestrator/kici-admin/org-settings.md#queue-timeout--per-org-dispatch-queue-job-timeout) (`reset` clears it), and only then the cluster-wide `queue.timeoutMs`. `0` at any layer means indefinite.
 
 ### Platform safety-net GC
 

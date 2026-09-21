@@ -49,8 +49,8 @@ export interface BuildStatementInput {
 
 /**
  * Agent-local job context used to freeze a provenance statement for a deferred
- * attestation. When the Platform mint fails transiently there is no identity
- * token to read claims from, so the statement is built from facts the agent
+ * attestation. When the orchestrator's mint defers there is no identity token
+ * to read claims from, so the statement is built from facts the agent
  * already holds about the job it just ran. Only the identity token is deferred;
  * these attested facts are sealed (DSSE-signed) at build time.
  */

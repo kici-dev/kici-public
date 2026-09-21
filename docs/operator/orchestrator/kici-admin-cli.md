@@ -128,7 +128,7 @@ The full command reference is split by area:
 - [Runs, execution & events](./kici-admin/runs-execution-events.md) — `runs`, `execution`, `check-run`, `queue`, `registration`, `workflow`, `event`, `event-dlq`
 - [Cluster & infrastructure](./kici-admin/cluster-and-infra.md) — `orchestrator`, `cluster`, `cluster-name`, `cluster-settings`, `scaler`, `firecracker`
 - [Org settings](./kici-admin/org-settings.md) — `org-settings`, `trust-policy`, `held-run`
-- [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
+- [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `cache`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
 
 Each area page carries a `## Guide` section (per-namespace concepts and worked examples) and a `## Reference` section (the always-current generated signature list for that area's commands).
 

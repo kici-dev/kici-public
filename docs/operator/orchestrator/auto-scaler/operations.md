@@ -128,9 +128,9 @@ These labels use the reserved `kici:` prefix namespace. You do not need to inclu
 
 ### What happens when no match is found
 
-If a job's labels do not match any scaler's label sets **and** no static agent with matching labels is connected, the job is queued locally as a fallback (with `queued-no-backend` status) while the cluster coordinator attempts peer rerouting. The queued job is registered on the run, so the run cannot finish without it.
+If a job's labels do not match any scaler's label sets **and** no static agent with matching labels is connected, the job is queued locally as a fallback (with `queued-no-backend` status). Meanwhile the cluster coordinator attempts peer rerouting. The queued job is registered on the run, so the run cannot finish without it.
 
-If a peer accepts the job, the local fallback entry is cancelled and the peer runs it. Otherwise — no peer can handle the labels, or the deployment has no cluster peers at all — the job stays queued until an agent that satisfies its labels appears (a scaler pool sitting at zero can still scale up and drain it) or the queue window expires.
+If a peer accepts the job, the local fallback entry is cancelled and the peer runs it. Otherwise — no peer can handle the labels, or the deployment has no cluster peers at all — the job stays queued until an agent that satisfies its labels appears, or the queue window expires. A scaler pool sitting at zero can still scale up and drain it.
 
 At expiry the verdict splits:
 

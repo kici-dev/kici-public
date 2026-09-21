@@ -327,12 +327,8 @@ export interface ArtifactRequestIpc {
   name: string;
   /** Packed tarball size in bytes — drives the enforcement gates. `beginUpload` only. */
   declaredSizeBytes?: number;
-  /** Confirmed tarball size in bytes. `completeUpload` only. */
-  sizeBytes?: number;
   /** SHA-256 of the tarball bytes. `completeUpload` only. */
   sha256?: string;
-  /** Storage key echoed from the grant response. `completeUpload` only. */
-  storageKey?: string;
 }
 
 export type RunnerToAgentMessage =
@@ -606,7 +602,6 @@ export interface JobExecutionRequest {
    */
   credentialHelperPath?: string;
   /** SHA-256 hash of the source tarball bytes for integrity verification. */
-  sourceTarHash?: string;
   sourceTarDigest?: string;
 
   /** URL to pre-built dependency tarball (skip install if present). */

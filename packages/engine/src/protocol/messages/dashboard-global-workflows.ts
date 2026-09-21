@@ -14,18 +14,16 @@
  * source in the org. When present, it qualifies the entry to a single
  * webhook source (e.g., `github:42` vs `generic:org:abcd`).
  *
- * Three independent policy axes (see GlobalWorkflowPolicy in the orchestrator):
+ * Two independent policy axes (see GlobalWorkflowPolicy in the orchestrator):
  *   - `allowedRepos` restricts which repos may AUTHOR global workflows.
  *   - `deniedRepos` blocks global dispatches for events FROM these SOURCE repos.
- *   - `elevatedRepos` is DEPRECATED and not enforced — see the field comments
- *     below and `docs/user/deprecations.md`.
  */
 import { z } from 'zod';
 import { negatedPatternReason } from '../../repo/pattern-negation.js';
 import { actorPrincipalSchema } from './actor.js';
 
 /**
- * One entry in any of the three repo-pattern lists. `routingKey` is the
+ * One entry in either repo-pattern list. `routingKey` is the
  * source-qualifier; when absent the entry applies to any source in the org.
  */
 export const repoPatternEntrySchema = z.object({
@@ -64,27 +62,27 @@ export function invalidRepoPatternReason(pattern: string): string | null {
   return null;
 }
 
-/** Projected org-level global workflow settings. */
-export const globalWorkflowSettingsSchema = z.object({
-  customerId: z.string(),
-  /**
-   * The effective fleet-wide master switch
-   * (`cluster_settings.global_workflows_enabled`, set with `kici-admin
-   * cluster-settings`). Read-only here — the dashboard renders it as a status
-   * badge; it is not a per-org value and cannot be flipped from the dashboard.
-   */
-  enabled: z.boolean(),
-  allowedRepos: z.array(repoPatternEntrySchema).nullable(),
-  deniedRepos: z.array(repoPatternEntrySchema).nullable(),
-  /**
-   * @deprecated Stored and echoed back, but never enforced: an organization-wide
-   * workflow's job is dispatched with no secret material at all, so there is no
-   * secret access for this list to widen. Removal at v1.0.0.
-   */
-  elevatedRepos: z.array(repoPatternEntrySchema).nullable(),
-  createdAt: z.string().nullable(),
-  updatedAt: z.string().nullable(),
-});
+/**
+ * Projected org-level global workflow settings. `.strict()`: the projection
+ * once carried an unenforced elevated-access list, so an orchestrator still
+ * echoing one is on a build this protocol floor refuses.
+ */
+export const globalWorkflowSettingsSchema = z
+  .object({
+    customerId: z.string(),
+    /**
+     * The effective fleet-wide master switch
+     * (`cluster_settings.global_workflows_enabled`, set with `kici-admin
+     * cluster-settings`). Read-only here — the dashboard renders it as a status
+     * badge; it is not a per-org value and cannot be flipped from the dashboard.
+     */
+    enabled: z.boolean(),
+    allowedRepos: z.array(repoPatternEntrySchema).nullable(),
+    deniedRepos: z.array(repoPatternEntrySchema).nullable(),
+    createdAt: z.string().nullable(),
+    updatedAt: z.string().nullable(),
+  })
+  .strict();
 
 export type GlobalWorkflowSettings = z.infer<typeof globalWorkflowSettingsSchema>;
 
@@ -115,8 +113,6 @@ export const globalWorkflowsUpdateRequestSchema = z
     actor: actorPrincipalSchema,
     allowedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
     deniedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-    /** @deprecated Accepted and stored, but never enforced. Removal at v1.0.0. */
-    elevatedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
   })
   .strict();
 

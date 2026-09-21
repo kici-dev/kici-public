@@ -708,6 +708,19 @@ await guardStartup(logger, async () => {
     void gracefulShutdown('scaler-claim-failed', 1);
   };
 
+  // -- Permanent authentication failure --
+
+  // The client never reconnects after an auth.failure frame or an auth-failed
+  // close code (a revoked token, or an agent below the orchestrator's protocol
+  // floor). A process that can never register again must not sit behind a
+  // healthy-looking HTTP server: exit non-zero so a service manager reports it
+  // and a one-shot scaler runner is released instead of hanging until its job
+  // timeout.
+  client.onAuthFailedPermanently = (reason) => {
+    logger.error('Authentication failed permanently, shutting down', { reason });
+    void gracefulShutdown('auth-failed', 1);
+  };
+
   // -- Drain mode (SIGUSR1) --
 
   process.on('SIGUSR1', () => {

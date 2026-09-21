@@ -3,6 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './042_dispatch_queue_patterns.js';
+import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -46,10 +47,7 @@ describeDb('migration 042_dispatch_queue_patterns', () => {
     await pool?.end().catch(() => {});
     const admin = new pg.Pool({ connectionString: adminUrl });
     try {
-      await admin.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(admin, TEST_DB);
       await admin.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await admin.end();

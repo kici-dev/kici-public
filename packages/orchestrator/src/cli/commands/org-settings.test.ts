@@ -27,7 +27,6 @@ const SAMPLE_SETTINGS = {
   enabled: true,
   allowedRepos: [{ pattern: 'myorg/ci-*' }],
   deniedRepos: null,
-  elevatedRepos: null,
   allowHttpNpmRegistries: false,
   userCacheQuotaBytes: null,
   userCacheTtlMs: null,
@@ -113,6 +112,8 @@ describe('kici-admin org-settings global-workflows', () => {
     expect(stdout).toContain('Enabled (cluster-wide):');
     expect(stdout).toContain('Allowed authors:');
     expect(stdout).toContain('Denied source repos:');
+    // fails-when: the removed elevated-access list is rendered again.
+    expect(stdout).not.toContain('Elevated');
   });
 
   it('show accepts --org as an alias for --customer-id', async () => {
@@ -316,24 +317,21 @@ describe('kici-admin org-settings global-workflows', () => {
     });
   });
 
-  it('elevate-add appends to the elevated list', async () => {
-    mockGet.mockResolvedValueOnce({
-      settings: { ...SAMPLE_SETTINGS, elevatedRepos: [{ pattern: 'myorg/deploy' }] },
-    });
-    mockPatch.mockResolvedValueOnce({
-      settings: {
-        ...SAMPLE_SETTINGS,
-        elevatedRepos: [{ pattern: 'myorg/deploy' }, { pattern: 'myorg/release' }],
-      },
-    });
-    await runCommand(
-      ['org-settings', 'global-workflows', 'elevate-add', 'myorg/release', '--customer-id', ORG],
-      client,
-    );
-    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
-      customerId: ORG,
-      elevatedRepos: [{ pattern: 'myorg/deploy' }, { pattern: 'myorg/release' }],
-    });
+  // fails-when: the elevate-add / elevate-remove mutators are registered
+  //   again. The list they edited granted nothing: an organization-wide
+  //   workflow's job is dispatched with no secret material.
+  it.each(['elevate-add', 'elevate-remove'])('%s is an unknown command', async (sub) => {
+    const program = new Command();
+    program.exitOverride();
+    program.configureOutput({ writeErr: () => {} });
+    registerOrgSettingsCommands(program, () => client as AdminApiClient);
+    await expect(
+      program.parseAsync(
+        ['org-settings', 'global-workflows', sub, 'myorg/release', '--customer-id', ORG],
+        { from: 'user' },
+      ),
+    ).rejects.toThrow(/unknown command 'elevate-(add|remove)'/);
+    expect(mockPatch).not.toHaveBeenCalled();
   });
 });
 

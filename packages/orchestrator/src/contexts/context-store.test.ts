@@ -352,6 +352,20 @@ describe('ContextStore', () => {
       expect(env.minimumTrust).toBe('trusted');
     });
 
+    it('reads a NULL minimum_trust as no requirement', () => {
+      const env = toContext(makeEnvRow({ minimum_trust: null }) as any);
+
+      expect(env.minimumTrust).toBeUndefined();
+    });
+
+    // fails-when: a stored legacy `known` floor reads back as `'trusted'` (holding
+    // runs the context never gated) or the read throws
+    it('reads the retired known floor as no requirement', () => {
+      const env = toContext(makeEnvRow({ minimum_trust: 'known' }) as any);
+
+      expect(env.minimumTrust).toBeUndefined();
+    });
+
     it('should handle string timestamps (non-Date objects)', () => {
       const row = makeEnvRow({
         created_at: '2026-03-08T10:00:00Z',

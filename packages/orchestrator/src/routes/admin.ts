@@ -286,7 +286,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   const routeScope = async (wireScope: string) =>
     resolveScope(wireScope, await loadStores(), deps.secretStore);
 
-  // List scopes for an org
+  // List an org's scopes across every registered backend, each qualified as
+  // `<backend>:<path>`.
   app.get('/api/v1/admin/secrets/scopes', async (c) => {
     try {
       const denied = requireUnscopedToken(c);
@@ -294,13 +295,6 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       deps.rbac.requirePermission(c.get('role'), 'secret.read');
       const orgId = c.req.query('orgId');
       if (!orgId) return c.json({ error: 'orgId required' }, 400);
-      if (c.req.query('allBackends') !== 'true') {
-        // Default: bare, pg-only. Byte-identical to the historical response —
-        // cross-backend aggregation is opt-in until the default flips at v1.0.0
-        // (see docs/user/deprecations.md).
-        const scopes = await deps.secretStore.listScopes(orgId);
-        return c.json({ scopes }, 200);
-      }
       const stores = await loadStores();
       const scopes: string[] = [];
       for (const [backendName, store] of stores) {

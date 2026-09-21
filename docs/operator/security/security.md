@@ -20,8 +20,6 @@ One organization-level setting decides what happens to a pull request from a for
 - **`hold`** creates the run, holds it, and posts a pending `KiCI Security` check. Approving it runs the workflow — still untrusted.
 - **`allow`** runs the workflow immediately, untrusted.
 
-`reject` is a deprecated fourth value that behaves as `ignore`. A stored `reject` keeps working; set `ignore` when you next change the policy.
-
 Nothing else about a fork pull request is configurable. There is no separate policy for unknown contributors and no separate policy for workflow changes — both are answered by the ref itself.
 
 ### Defaults and fail-closed behaviour
@@ -113,12 +111,12 @@ Step-scoped holds are refused. Answering one means notifying the waiting agent, 
 
 `ci_trust` is one of the 18 RBAC resources.
 
-| Level   | Capabilities                                                                                 |
-| ------- | -------------------------------------------------------------------------------------------- |
-| `none`  | No CI trust capability                                                                       |
-| `read`  | See the **CI trust** settings tab, which carries the fork switch                             |
-| `write` | Release or reject a security hold, from the dashboard or with `/kici approve`                |
-| `admin` | Change the org fork switch and approval expiry, and set another member's per-member override |
+| Level   | Capabilities                                                                  |
+| ------- | ----------------------------------------------------------------------------- |
+| `none`  | No CI trust capability                                                        |
+| `read`  | See the **CI trust** settings tab, which carries the fork switch              |
+| `write` | Release or reject a security hold, from the dashboard or with `/kici approve` |
+| `admin` | Change the org fork switch and approval expiry                                |
 
 ### Built-in role defaults
 
@@ -127,21 +125,18 @@ Step-scoped holds are refused. Answering one means notifying the waiting agent, 
 | Owner  | admin            |
 | Member | none             |
 
-Members must be explicitly granted `ci_trust` through a custom role.
-
-A per-member override supersedes the role-derived level where one is set. It is deprecated and is removed at v1.0.0 — grant the level through a role instead, directly or through a team. See [deprecations](../../user/deprecations.md).
+Members must be explicitly granted `ci_trust` through a custom role, directly or through a team.
 
 ## Context minimum trust
 
 The `minimumTrust` protection rule on a context holds a job whose run came from a fork.
 
-| minimumTrust | Effect                                                     |
-| ------------ | ---------------------------------------------------------- |
-| `trusted`    | Holds a run whose ref came from a fork                     |
-| `known`      | Same effect; the value is deprecated and removed at v1.0.0 |
-| (unset)      | No trust-based gating                                      |
+| minimumTrust | Effect                                 |
+| ------------ | -------------------------------------- |
+| `trusted`    | Holds a run whose ref came from a fork |
+| (unset)      | No trust-based gating                  |
 
-Any value blocks the same thing, because trust is a ref-based, two-value judgement. The declared value still decides the wording of the hold reason.
+Trust is a ref-based, two-value judgement: a ref in the repository is `trusted`, a ref from a fork is `unknown`.
 
 A run that resolved **no** tier passes the gate — a pull request from a source with no fork model, or an internal run whose inheritance lookup failed. A run whose tier resolved `trusted` passes too.
 

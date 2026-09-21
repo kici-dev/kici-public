@@ -38,7 +38,10 @@ describe('renderRunBanner (attached)', () => {
   it('states the hybrid/attached plane and REAL Platform identity', () => {
     expect(banner).toContain('local dev orchestrator (hybrid, attached)');
     expect(banner).toContain('REAL scoped (org: kiciStg00001)');
-    expect(banner).toContain('real Platform OIDC + attestation');
+    // The hybrid plane is its own issuer, like a deployed orchestrator — the
+    // row names that issuer rather than the hosted Platform, which mints nothing.
+    expect(banner).toContain('plane-signed OIDC + attestation (iss=http://127.0.0.1:4319)');
+    expect(banner).not.toContain('real Platform OIDC');
   });
 
   it('titles the connected run and offers --offline as the force flag', () => {

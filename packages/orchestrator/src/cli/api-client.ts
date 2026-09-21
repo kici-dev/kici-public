@@ -301,15 +301,11 @@ export class AdminApiClient {
   // --- Scoped secret management ---
 
   /**
-   * List secret scopes for an org.
-   *
-   * @param allBackends - Aggregate every registered backend and return scopes
-   *   in qualified `<backend>:<path>` form. Default (false) returns the bare,
-   *   pg-only listing; that default flips at v1.0.0.
+   * List an org's secret scopes across every registered backend, each in
+   * qualified `<backend>:<path>` form.
    */
-  async listScopes(orgId: string, allBackends = false): Promise<{ scopes: string[] }> {
+  async listScopes(orgId: string): Promise<{ scopes: string[] }> {
     const params = new URLSearchParams({ orgId });
-    if (allBackends) params.set('allBackends', 'true');
     return this.request<{ scopes: string[] }>('GET', `/api/v1/admin/secrets/scopes?${params}`);
   }
 

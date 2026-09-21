@@ -9,7 +9,7 @@ Each guide is split into two parts. **Part 1** gets you a green run against your
 
 ## Bring a coding agent
 
-Workflows are TypeScript, so a coding agent can write them. KiCI ships its docs in a form an agent reads directly: point yours at [llms.txt](https://kici.dev/docs/llms.txt), or pipe a task bundle straight into its context with `kici docs llm` (`kici docs llm sdk` for the authoring API, `kici docs llm patterns` for recipes). An agent briefed that way can scaffold your first workflow, compile it, and read the failure when it breaks.
+Workflows are TypeScript, so a coding agent can write them. KiCI ships its docs in a form an agent reads directly: point yours at [llms.txt](https://kici.dev/llms.txt), or pipe a task bundle straight into its context with `kici docs llm` (`kici docs llm sdk` for the authoring API, `kici docs llm patterns` for recipes). An agent briefed that way can scaffold your first workflow, compile it, and read the failure when it breaks.
 
 If your agent finds that these docs promise something KiCI does not do, that is worth telling us — `kici feedback` prints how to report it, and [Reporting a discrepancy](./reporting-discrepancies.md) is the full guide.
 

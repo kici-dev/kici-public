@@ -386,6 +386,8 @@ The Platform resolves the source by both the routing key and the URL's `orgId`, 
 
 Sources using bearer token, IP allowlist, or no verification are automatically flagged as `skip_verification` in the Platform -- the orchestrator handles verification instead.
 
+The Platform also deduplicates before it relays, on two keys: the delivery id (`X-Delivery-ID` or `X-Request-ID`), and the raw body bytes against deliveries it accepted for the same source within the last minute. A second POST with the same body inside that minute is answered 200 `{ "status": "duplicate" }` and not relayed, whatever delivery id it carries. This is what collapses a provider that emits one event twice. A sender that means to fire the same event twice within a minute must vary the body -- a timestamp or nonce field is enough. The orchestrator's own `dedupWindowSeconds` / idempotency-key window applies after the relay and is unaffected.
+
 ## Cross-repo trust
 
 By default, events emitted from one repository can only trigger workflows in the same repository. Cross-repo event delivery requires explicit trust relationships.
@@ -417,7 +419,7 @@ curl -X POST https://<orchestrator>/api/v1/admin/trust \
 | `targetRoutingKey` | string   | yes      | Routing key of the target repo                       |
 | `allowedEvents`    | string[] | no       | Glob patterns for allowed event names (default: all) |
 
-The `allowedEvents` field supports glob patterns (via picomatch) to restrict which events can cross repo boundaries. For example, `["deploy-*"]` allows only events matching the `deploy-*` pattern.
+The `allowedEvents` field supports glob patterns to restrict which events can cross repo boundaries. For example, `["deploy-*"]` allows only events matching the `deploy-*` pattern.
 
 ### Managing trust
 

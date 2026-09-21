@@ -34,13 +34,11 @@ import {
   type TrustDirectoryStore,
 } from '../security/trust-directory-store.js';
 import { RbacEnforcer, type Role } from '../secrets/rbac.js';
-import { DEFAULT_FORK_POLICY, TrustPolicyEnforcement } from '../security/trust-policy-gate.js';
+import { DEFAULT_FORK_POLICY } from '../security/trust-policy-gate.js';
 import type { AccessLogRecord, AccessLogWriter } from '../audit/access-log.js';
 
 const STORED: StoredTrustPolicy = {
-  forkPolicy: 'reject',
-  unknownContributorPolicy: 'hold',
-  workflowChangePolicy: 'allow',
+  forkPolicy: 'hold',
   approvalExpiryHours: 12,
   source: 'platform',
   updatedAt: new Date('2026-07-29T00:00:00Z'),
@@ -138,13 +136,7 @@ function makeApp(opts: {
         patch: Record<string, unknown>,
         onWrite?: (trx: unknown, merged: Record<string, unknown>) => Promise<void>,
       ) => {
-        const merged = {
-          forkPolicy: 'hold',
-          unknownContributorPolicy: 'hold',
-          workflowChangePolicy: 'hold',
-          approvalExpiryHours: 72,
-          ...patch,
-        };
+        const merged = { forkPolicy: 'hold', approvalExpiryHours: 72, ...patch };
         const staged: AuditRow[] = [];
         await onWrite?.({ staged }, merged);
         auditRows.push(...staged);
@@ -260,13 +252,16 @@ describe('GET /trust-policy', () => {
     const { body } = await getPolicy(app);
     expect(body.policy).toMatchObject({
       customerId: 'org-1',
-      forkPolicy: 'reject',
+      forkPolicy: 'hold',
       approvalExpiryHours: 12,
       source: 'platform',
       effectiveDefault: false,
-      enforcement: TrustPolicyEnforcement.enum.policy,
       platformManaged: true,
     });
+    // fails-when: a removed field is reported again.
+    expect(body.policy).not.toHaveProperty('enforcement');
+    expect(body.policy).not.toHaveProperty('unknownContributorPolicy');
+    expect(body.policy).not.toHaveProperty('workflowChangePolicy');
   });
 
   it('reports the fail-closed defaults when Platform-attached with no row', async () => {
@@ -274,11 +269,8 @@ describe('GET /trust-policy', () => {
     const { body } = await getPolicy(app);
     expect(body.policy).toMatchObject({
       forkPolicy: DEFAULT_FORK_POLICY,
-      unknownContributorPolicy: 'hold',
-      workflowChangePolicy: 'hold',
       source: null,
       effectiveDefault: true,
-      enforcement: TrustPolicyEnforcement.enum.policy,
     });
   });
 
@@ -290,20 +282,16 @@ describe('GET /trust-policy', () => {
     const { body } = await getPolicy(app);
     expect(body.policy).toMatchObject({
       forkPolicy: DEFAULT_FORK_POLICY,
-      enforcement: TrustPolicyEnforcement.enum.policy,
       effectiveDefault: true,
       platformManaged: false,
     });
   });
 
-  it('reports enforcement `policy` for every mode, with and without a row', async () => {
-    // The field is deprecated and now constant; older `kici-admin` binaries key
-    // their rendering off it, so it must never come back as anything else.
+  it('reports a fork policy for every mode, with and without a row', async () => {
     for (const mode of OrchestratorMode.options) {
       for (const stored of [STORED, null]) {
         const { app } = makeApp({ mode, stored });
         const { body } = await getPolicy(app);
-        expect(body.policy.enforcement).toBe(TrustPolicyEnforcement.enum.policy);
         expect(body.policy).toHaveProperty('forkPolicy');
       }
     }
@@ -492,13 +480,30 @@ describe('PATCH /trust-policy', () => {
     expect(upsertLocal).not.toHaveBeenCalled();
   });
 
-  it('rejects `allow` for the unknown-contributor policy (no such wire value)', async () => {
+  it('rejects the retired `reject` fork-policy value rather than storing it', async () => {
+    // fails-when: `reject` re-enters the wire enum the route validates against.
     const { app, upsertLocal } = makeApp({ mode: 'independent' });
-    const { status } = await patchPolicy(app, {
-      customerId: 'org-1',
-      unknownContributorPolicy: 'allow',
-    });
+    const { status } = await patchPolicy(app, { customerId: 'org-1', forkPolicy: 'reject' });
     expect(status).not.toBe(200);
+    expect(upsertLocal).not.toHaveBeenCalled();
+  });
+
+  it('refuses a body carrying a removed policy arm with a structured 400', async () => {
+    // The shape a 0.8.x `kici-admin trust-policy set --unknown-contributor-policy`
+    // still sends. Ignoring the key would report success for a knob that no
+    // longer exists.
+    //
+    // fails-when: the schema drops `.strict()` and the unknown key is ignored
+    // (200, and the write goes through without it).
+    const { app, upsertLocal } = makeApp({ mode: 'independent' });
+    const { status, body } = await patchPolicy(app, {
+      customerId: 'org-1',
+      forkPolicy: 'allow',
+      unknownContributorPolicy: 'hold',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toBe('Validation error');
+    expect(JSON.stringify(body.details)).toContain('unknownContributorPolicy');
     expect(upsertLocal).not.toHaveBeenCalled();
   });
 

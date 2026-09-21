@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { invalidRepoPatternReason, repoPatternEntrySchema } from './dashboard-global-workflows.js';
+import {
+  globalWorkflowSettingsSchema,
+  globalWorkflowsUpdateRequestSchema,
+  invalidRepoPatternReason,
+  repoPatternEntrySchema,
+} from './dashboard-global-workflows.js';
 
 describe('invalidRepoPatternReason', () => {
   it('rejects a leading-bang negation', () => {
@@ -59,5 +64,36 @@ describe('invalidRepoPatternReason', () => {
 
   it('leaves the entry schema itself permissive, so stored rows keep parsing', () => {
     expect(repoPatternEntrySchema.safeParse({ pattern: '!myorg/x' }).success).toBe(true);
+  });
+});
+
+describe('globalWorkflowSettingsSchema', () => {
+  const valid = {
+    customerId: 'org-1',
+    enabled: true,
+    allowedRepos: null,
+    deniedRepos: [{ pattern: 'acme/*' }],
+    createdAt: null,
+    updatedAt: null,
+  };
+
+  it('parses the current shape', () => {
+    // breaks-if-wrong: the current projection still parses once `elevatedRepos` is gone.
+    expect(globalWorkflowSettingsSchema.safeParse(valid).success).toBe(true);
+  });
+
+  it('refuses the removed elevatedRepos list (strict object)', () => {
+    // fails-when: the removed list is accepted again on the projection or the patch.
+    expect(globalWorkflowSettingsSchema.safeParse({ ...valid, elevatedRepos: [] }).success).toBe(
+      false,
+    );
+    expect(
+      globalWorkflowsUpdateRequestSchema.safeParse({
+        type: 'dashboard.global-workflows.update',
+        requestId: 'r1',
+        actor: { type: 'user', sub: 'u-1' },
+        elevatedRepos: [],
+      }).success,
+    ).toBe(false);
   });
 });

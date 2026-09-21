@@ -103,7 +103,7 @@ export function createDepthRefresher(options: DepthRefresherOptions): DepthRefre
 
       options.onTick?.(pending);
     } catch (err) {
-      // Refresher must never crash the orchestrator — the metric simply
+      // Refresher must never crash the orchestrator — the metric
       // goes stale until the next successful tick.
       options.logger.error('dispatch queue depth refresh failed', {
         error: err instanceof Error ? err.message : String(err),

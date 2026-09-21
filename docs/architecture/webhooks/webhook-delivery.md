@@ -70,7 +70,7 @@ GitHub includes these headers with every webhook delivery:
 
 ### Step 2: KiCI routes the webhook
 
-KiCI receives the webhook, validates provider headers, resolves the routing key, and dedups against its delivery log. It then chunk-relays the body bytes byte-identical to the orchestrator that owns the routing key, over the existing WebSocket. That relay is load-balanced across the pool of relay-eligible connected orchestrators, and retried against the next candidate on ACK timeout. If the orchestrator is connected to another KiCI instance, the delivery is cross-routed there; that hop carries a pointer to the body, not the body itself. Orchestrators running in observed mode are excluded from that pool: they ingest provider deliveries directly on their own URL, so their sources are recorded as observe-only and never routed. They stay fully addressable for dashboard reads, re-run, and cancel. KiCI never sees customer signing material; signature verification happens entirely on the orchestrator after reassembly.
+KiCI receives the webhook, validates provider headers, resolves the routing key, and dedups against its delivery log on two keys. The first is the delivery id. The second is the body bytes. A delivery whose body is identical to one already accepted for the same source within the last minute is answered `duplicate`, even under a fresh delivery id. So a provider that emits one event twice produces one run. It then chunk-relays the body bytes byte-identical to the orchestrator that owns the routing key, over the existing WebSocket. That relay is load-balanced across the pool of relay-eligible connected orchestrators, and retried against the next candidate on ACK timeout. If the orchestrator is connected to another KiCI instance, the delivery is cross-routed there; that hop carries a pointer to the body, not the body itself. Orchestrators running in observed mode are excluded from that pool: they ingest provider deliveries directly on their own URL, so their sources are recorded as observe-only and never routed. They stay fully addressable for dashboard reads, re-run, and cancel. KiCI never sees customer signing material; signature verification happens entirely on the orchestrator after reassembly.
 
 ### Failure modes
 
@@ -135,7 +135,7 @@ For each matched workflow, the orchestrator:
 1. Generates a UUID `runId` per matched workflow (each workflow gets its own `runId` so execution tracking, check runs, and upstream event forwarding don't collide when multiple workflows match the same webhook)
 2. Checks the source tarball cache for the workflow's `contentHash` and the dep cache for the lock file's `lockfileHash` (if configured)
 3. Iterates over the workflow's jobs (static jobs only -- dynamic jobs are resolved at agent runtime)
-4. Sends a `job.dispatch` message to a matching agent via WebSocket, including `sourceTarUrl`/`sourceTarHash` and `depsUrl`/`depsHash` if the respective caches hit
+4. Sends a `job.dispatch` message to a matching agent via WebSocket, including `sourceTarUrl`/`sourceTarDigest` and `depsUrl`/`depsHash` if the respective caches hit
 5. Tracks the job in the queue and marks the agent slot as occupied
 
 If no agent with matching labels is connected, the job is queued and dispatched when a matching agent connects.
@@ -189,7 +189,7 @@ When a workflow's `contentHash` is found in the cache:
 
 1. The orchestrator retrieves the source tarball URL from the cache storage (`S3CacheStorage`)
 2. The URL is a pre-signed S3 GET URL (15-minute expiry); the `touch-on-read` refreshes the entry's TTL
-3. The `sourceTarUrl` and `sourceTarHash` (the workflow's `contentHash`, not the tarball-bytes hash) are included in the `job.dispatch` message. The dep cache provides `depsUrl`/`depsHash` the same way.
+3. The `sourceTarUrl` and `sourceTarDigest` (the tarball's SHA-256) are included in the `job.dispatch` message. The dep cache provides `depsUrl`/`depsHash` the same way.
 4. The execution agent downloads and extracts the tarball over its checkout, registers the shared TypeScript loader hook, and dynamic-imports the workflow `.ts` directly — no `npm ci` of `.kici/`, no runtime bundler.
 
 ### Cache miss
@@ -267,7 +267,7 @@ Two mechanics make this work:
 - **`RegistrationIndex.globalByOrgAndTriggerType`** — an in-memory index keyed by `${customerId}|${triggerType}` that surfaces every global workflow in the org regardless of which routing key authored it. The routing-key-scoped `globalByTriggerType` (used for same-source dispatch within a single GitHub App) would hide every cross-provider author, so the org-scoped index runs in parallel.
 - **Split dispatch auth** — `jobDispatchSchema` carries `sourceAuth` (minted from the inbound bundle for cloning the source repo) **and** `workflowAuth` (minted from the registration's bundle for cloning the workflow repo). When a Forgejo PAT source delivers a push that fires a GitHub App-authored global workflow, each clone uses the right credential. When both repos live under the same bundle, `workflowAuth` mirrors `sourceAuth`.
 
-Two-axis policy (`isWorkflowRepoAllowed` / `isSourceRepoAllowed`) runs against the **registration's** routing key — the authoring source's `org_settings` row owns the allow/deny/elevate lists. See [Global workflows](../global-workflows.md#cross-provider-dispatch-universal-git) for the full contract.
+Two-axis policy (`isWorkflowRepoAllowed` / `isSourceRepoAllowed`) runs against the **registration's** routing key — the authoring source's `org_settings` row owns the allow/deny lists. See [Global workflows](../global-workflows.md#cross-provider-dispatch-universal-git) for the full contract.
 
 Routing-key collisions (e.g., a GitHub App source and a universal-git source targeting the same `owner/repo`) are allowed: each produces its own registration and fires its own run. Operators who want deduplication can either constrain one side via `global_workflow_denied_repos` or avoid creating duplicate sources.
 
@@ -322,7 +322,7 @@ the originating instance times out and buffers the delivery for replay.
 
 **Trigger:** No orchestrator for this routing key is connected to any Platform instance -- the classic window during an orchestrator restart, upgrade, or transient network blip.
 
-**Result:** The Platform **buffers the webhook** and returns **200** `{ status: "buffered" }`. The buffered delivery -- body and headers stored verbatim -- is **replayed the moment an orchestrator reconnects** for that routing key, and by a periodic timer as a backstop. Replay re-runs the full delivery sequence, so the orchestrator still verifies the signature and processes the event exactly as if it had arrived live; the Platform never sees signing material. Replays dedup on delivery ID, so a buffered webhook that a customer also manually redelivers produces the run only once.
+**Result:** The Platform **buffers the webhook** and returns **200** `{ status: "buffered" }`. The buffered delivery -- body and headers stored verbatim -- is **replayed the moment an orchestrator reconnects** for that routing key, and by a periodic timer as a backstop. Replay re-runs the full delivery sequence, so the orchestrator still verifies the signature and processes the event exactly as if it had arrived live; the Platform never sees signing material. Replays dedup on delivery ID and on body bytes, so a buffered webhook that a customer also manually redelivers, or that the provider emitted twice, produces the run only once.
 
 Buffering is bounded per org and globally (item + byte budgets and a hard cap). When a budget is exhausted the Platform fails loud with **503** `Retry-After: 5` rather than silently dropping. A buffered webhook that no orchestrator returns for within the buffer TTL is dropped as **expired** -- recorded in the delivery log and on a metric, never silently. This buffering is the recovery mechanism for the no-orchestrator window: unlike a queued job, GitHub Apps do **not** auto-retry a failed webhook delivery, so a 503 here would lose the event outright.
 
@@ -369,7 +369,7 @@ Buffering is bounded per org and globally (item + byte budgets and a hard cap). 
 
 **Ephemeral (auto-scaler) agent -- no recovery window.** These agents are destroyed on disconnect, so there is nobody to reconnect and reclaim the job. A job that had already started is failed immediately; a job that had not yet started is requeued for another agent (bounded by the dispatch-attempt limit).
 
-**No automatic re-dispatch to a different agent.** Once a job is permanently failed, the orchestrator does not hand it to another agent. The next webhook from GitHub (e.g., another push) can re-trigger the workflow. This design choice avoids retry storms and leverages GitHub's own retry mechanism for infrastructure-level failures.
+**No automatic re-dispatch to a different agent.** Once a job is permanently failed, the orchestrator does not hand it to another agent. The next webhook from GitHub (e.g., another push) can re-trigger the workflow. This design choice avoids retry storms. Recovery from an infrastructure failure is a new delivery, not a retry of the failed job.
 
 > See [Reconnection and event buffering](../clustering/reconnection.md) for the full recovery protocol.
 

@@ -83,135 +83,16 @@ path or a precomputed digest:
 
 The identity token is fetched and masked in logs automatically — you never
 handle it. The call returns `{ storageKey, subjectDigest, bundleMediaType }`
-identifying the stored bundle.
+identifying the stored bundle. `ctx.attestProvenance` builds on the run's OIDC
+identity token; to mint that token yourself and exchange it with Cloudsmith,
+AWS, or any OIDC-federated service, see
+[Workload identity with OIDC](./oidc.md).
 
 `ctx.attestProvenance` is only available inside a running job step; calling it
 outside one rejects with a clear error. `kici run --local` runs are supported:
 the offline local dev plane signs with a dev identity under the
 clearly-non-production issuer `kici-local`, and those bundles verify against a
 trust root exported with `kici local trust-root`.
-
-### Requesting a raw identity token
-
-`ctx.attestProvenance` builds on a lower-level primitive you can call directly
-when you need the identity token for a different tool:
-
-```typescript
-step('mint', async (ctx) => {
-  const { token, expiresIn } = await ctx.kici.oidc.token({ audience: 'sigstore' });
-  ctx.log.info(`Got an ID token valid for ${expiresIn}s`);
-  // Hand `token` to a tool that exchanges it with a service trusting the issuer.
-});
-```
-
-The token is a short-lived (about 10 minutes) signed JWT scoped to the current
-run and job. Its identity claims (`repository`, `ref`, `sha`, `kici_run_id`,
-`kici_job_id`) are derived by the orchestrator from the run context, so a step
-cannot spoof them. The returned token value is automatically masked in step logs,
-and the step never holds signing credentials — the orchestrator mints and signs
-the token on the step's behalf from its own run records. Like `attestProvenance`,
-it is only available inside a running job step.
-
-## ID-token claims and cloud trust policies
-
-A cloud provider's OIDC trust policy decides which builds may assume a role. The
-token below is what your policy matches on, so read this section before you
-write one.
-
-### The claim set
-
-| Claim                         | Value                                                                                                            |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `iss`                         | Your orchestrator's provenance issuer                                                                            |
-| `aud`                         | The audience you asked for                                                                                       |
-| `sub`                         | The build identity — see the two shapes below                                                                    |
-| `repository`                  | `owner/repo` the run acted on                                                                                    |
-| `ref`                         | The branch or tag the run PRESENTS. For a pull request this is the **base** branch, not the contributor's branch |
-| `base_ref`                    | The same value as `ref`, named the way GitHub Actions names it                                                   |
-| `head_ref`                    | The pull request's HEAD branch; `''` for a non-PR run                                                            |
-| `head_repository`             | `owner/repo` of the pull-request HEAD — the contributor's fork for a fork PR; `''` for a non-PR run              |
-| `is_fork`                     | `'true'`, `'false'`, or `'unresolved'`                                                                           |
-| `event_name`                  | The event that started the run (`push`, `pull_request:opened`, `schedule`, …)                                    |
-| `trust_tier`                  | The resolved trust tier of the triggering actor, or `'unresolved'`                                               |
-| `actor`                       | Provider login of the triggering actor                                                                           |
-| `sha`                         | The run's commit                                                                                                 |
-| `workflow_ref`                | `<workflow name>@<sha>`                                                                                          |
-| `kici_run_id` / `kici_job_id` | The run and job this token was minted for                                                                        |
-| `org_id`                      | Your organization id                                                                                             |
-
-Every claim in the table is **always present**. A value the run did not resolve
-is `''` or `'unresolved'`, never omitted and never guessed. That matters: an
-absent claim makes a `StringEquals` condition pass, which would silently remove
-a constraint you wrote expecting it to be enforced.
-
-### The two `sub` shapes
-
-```
-push, tag, schedule, …     repo:<owner/repo>:ref:<ref>:workflow:<workflow name>
-pull request, review       repo:<owner/repo>:pull_request
-```
-
-The pull-request shape carries **no ref segment**, mirroring GitHub Actions. A
-pull request's `ref` is its base branch. So a ref-bearing subject would be
-identical for a fork pull request targeting `main` and a trusted push to `main`.
-A policy pinning that subject would hand your cloud role to any contributor who
-opened a pull request running the same workflow.
-
-**A re-run keeps the shape of the run it repeats.** Re-running a pull-request
-run presents `repo:<owner/repo>:pull_request`, because it rebuilds the same
-commit from the same source. Its `event_name` claim still reads `rerun` — that
-claim says what started the run, while `sub` says which identity the run
-presents. A policy that pins the branch-shaped subject therefore does not match
-a re-run of a pull request, which is the same protection the first run gets.
-
-### A worked AWS trust policy
-
-Pin `sub`, and pin the fork context too. `sub` alone tells you a pull request
-ran; it does not tell you whose code ran.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/orch.example.com" },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "orch.example.com:aud": "sts.amazonaws.com",
-          "orch.example.com:sub": "repo:acme/app:ref:main:workflow:deploy",
-          "orch.example.com:is_fork": "false",
-          "orch.example.com:head_repository": "acme/app",
-          "orch.example.com:trust_tier": "trusted"
-        }
-      }
-    }
-  ]
-}
-```
-
-This grants the role only to a run on `main` in `acme/app`, from code in that
-same repository, triggered by an actor your orchestrator resolved as trusted.
-A fork pull request fails on all three of the extra conditions, and a run whose
-context did not resolve fails too — `'unresolved'` matches none of them, so the
-policy fails closed.
-
-To let a same-repo pull request assume the role, add a second statement pinning
-`"sub": "repo:acme/app:pull_request"` alongside `"is_fork": "false"` and
-`"head_repository": "acme/app"`.
-
-### Migrating an existing policy
-
-If you already pin a ref-bearing `sub` for pull-request runs, that policy stops
-matching once you upgrade — which is the fix, because it was matching runs it
-should not have. Move it to `repo:<owner/repo>:pull_request` plus the fork
-conditions above. The same move covers a re-run of a pull request, which
-presents the pull-request subject too.
-
-While you migrate, `KICI_OIDC_LEGACY_PR_SUB=1` on the orchestrator restores the
-old subject. It restores the collision with it, so treat it as a short bridge,
-not a setting. See [deprecations](deprecations.md).
 
 ## Verifying an attestation
 
@@ -344,7 +225,9 @@ Opening a row leads to the **attestation detail page**:
 
 ## See also
 
-- [SDK runtime reference](./sdk/runtime.md) — the `ctx.attestProvenance` and
-  `ctx.kici.oidc.token` step APIs in full.
+- [Workload identity with OIDC](./oidc.md) — minting the identity token
+  yourself and exchanging it with an external service.
+- [SDK runtime reference](./sdk/runtime.md) — the `ctx.attestProvenance` step
+  API in full.
 - [CLI reference](./cli/notifications-and-diagnostics.md#kici-verify-attestation) — every
   `kici verify-attestation` flag and exit code.

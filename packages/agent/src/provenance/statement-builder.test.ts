@@ -4,7 +4,7 @@ import { crossCheckBuildContext } from '@kici-dev/engine/provenance/verify';
 import { buildLocalProvenanceStatement, buildProvenanceStatement } from './statement-builder.js';
 
 const claims = {
-  iss: 'https://thinker1.dev.kici.dev/kici-stg',
+  iss: 'https://platform.example.com/kici-stg',
   repository: 'github.com/acme/api',
   ref: 'refs/tags/v0.4.2',
   sha: 'deadbeef',
@@ -31,7 +31,7 @@ describe('buildProvenanceStatement', () => {
     expect(stmt.predicate.buildDefinition.internalParameters?.commit).toBe('deadbeef');
     expect(stmt.predicate.buildDefinition.internalParameters?.runId).toBe('run-1');
     expect(stmt.predicate.runDetails.builder.id).toBe(
-      'https://thinker1.dev.kici.dev/kici-stg/orchestrator/orch-9',
+      'https://platform.example.com/kici-stg/orchestrator/orch-9',
     );
     expect(stmt.predicate.runDetails.metadata?.invocationId).toBe('run-1');
   });

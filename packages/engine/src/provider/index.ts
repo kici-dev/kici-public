@@ -14,7 +14,7 @@
  */
 
 export type { ProviderType } from './types.js';
-export type { WebhookNormalizer, AccessCacheInvalidation } from './webhook-normalizer.js';
+export type { WebhookNormalizer } from './webhook-normalizer.js';
 export type { LockFileFetcher } from './lock-file-fetcher.js';
 export { LockFileParseError } from './lock-file-parse-error.js';
 export type { ChangedFilesFetcher, ChangedFilesResult } from './changed-files-fetcher.js';
@@ -30,11 +30,6 @@ export type {
 } from './git-credential.js';
 export { isMintedRef } from './git-credential.js';
 export type { RepoUrlBuilder } from './repo-url-builder.js';
-export type {
-  ContributorResolver,
-  ContributorInfo,
-  ContributorPermission,
-} from './contributor-resolver.js';
 export type {
   CheckStatusPoster,
   CheckStatus,

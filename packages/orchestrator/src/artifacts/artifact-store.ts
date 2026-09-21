@@ -330,12 +330,12 @@ export class ArtifactStore {
    * is the immutability backstop for a racing duplicate that slipped past the
    * pre-mint check.
    *
-   * Neither agent-supplied value is trusted: the storage key is re-derived from
-   * the server-resolved `runId` + `name`, and the recorded size is the real byte
-   * size of the stored object read back from the storage backend. Agents run
-   * untrusted customer workflow code, so an echoed key could otherwise point a
-   * row at another tenant's object, and a declared size could under-account the
-   * per-org quota (a presigned PUT does not bind content length).
+   * The agent asserts neither the key nor the size: the storage key is derived
+   * from the server-resolved `runId` + `name`, and the recorded size is the real
+   * byte size of the stored object read back from the storage backend. Agents
+   * run untrusted customer workflow code, so an echoed key could otherwise point
+   * a row at another tenant's object, and a declared size could under-account
+   * the per-org quota (a presigned PUT does not bind content length).
    *
    * The name is re-validated here, not only at `beginUpload`: a commit is its
    * own inbound message, so an agent can send one for a name it never got a
@@ -354,11 +354,7 @@ export class ArtifactStore {
     runId: string;
     jobId: string;
     name: string;
-    /** Agent-declared size. Advisory — the stored object is stat'd instead. */
-    sizeBytes: number;
     sha256: string;
-    /** Agent-echoed key. Ignored — the key is re-derived server-side. */
-    storageKey: string;
   }): Promise<void> {
     const nameIssue = checkArtifactName(args.name);
     if (nameIssue !== null) {
@@ -372,14 +368,6 @@ export class ArtifactStore {
     }
 
     const derivedKey = artifactStorageKey(args.runId, args.name);
-    if (args.storageKey !== derivedKey) {
-      logger.warn('artifact complete storageKey mismatch — using server-derived key', {
-        runId: args.runId,
-        name: args.name,
-        wireKey: args.storageKey,
-        derivedKey,
-      });
-    }
 
     // Verify the object exists and record its real size (the org quota sums the
     // stored size_bytes, so an unverified size is a quota-accounting hole).
@@ -391,14 +379,6 @@ export class ArtifactStore {
         derivedKey,
       });
       throw new ArtifactObjectMissingError(derivedKey);
-    }
-    if (realSize !== args.sizeBytes) {
-      logger.warn('artifact declared size does not match the stored object', {
-        runId: args.runId,
-        name: args.name,
-        declaredSizeBytes: args.sizeBytes,
-        realSizeBytes: realSize,
-      });
     }
 
     // Presigned PUTs write only the data object; initMeta writes the metadata

@@ -380,13 +380,15 @@ const deploy = job('deploy', {
 
 Request a short-lived OIDC ID token for the current job, bound to an `audience`. The token is a signed JWT whose identity claims (`repository`, `ref`, `sha`, `kici_run_id`, `kici_job_id`) are derived by your orchestrator from the run context — a step cannot spoof them. Use it to authenticate the build to an external service that trusts the orchestrator's OIDC issuer (for example, when generating build provenance).
 
-The token also carries the event context a cloud trust policy needs to tell a fork pull request from a trusted push — `is_fork`, `head_repository`, `trust_tier`, `event_name`, and a pull-request-specific `sub`. See [ID-token claims and cloud trust policies](../provenance.md#id-token-claims-and-cloud-trust-policies) for the full claim table and a worked AWS policy.
+The token also carries the event context a cloud trust policy needs to tell a fork pull request from a trusted push — `is_fork`, `head_repository`, `trust_tier`, `event_name`, and a pull-request-specific `sub`. See [ID-token claims and cloud trust policies](../oidc.md#id-token-claims-and-cloud-trust-policies) for the full claim table and a worked AWS policy.
 
 ```typescript
 const publish = job('publish', {
   steps: [
     step('mint', async (ctx) => {
-      const { token, expiresIn } = await ctx.kici.oidc.token({ audience: 'sigstore' });
+      const minted = await ctx.kici.oidc.token({ audience: 'sigstore' });
+      if ('deferred' in minted) throw new Error(`ID token deferred: ${minted.code}`);
+      const { token, expiresIn } = minted;
       ctx.log.info(`Got an ID token valid for ${expiresIn}s`);
       // Hand `token` to a tool that exchanges it with the trusting service.
     }),
@@ -396,6 +398,7 @@ const publish = job('publish', {
 
 **Behavior:**
 
+- The result is the minted token, or `{ deferred: true, code }` (`unavailable` | `failed`) when the orchestrator could not mint one right now. A step that exchanges the token fails on `deferred`; `ctx.attestProvenance` handles it by freezing the statement for later fulfilment.
 - The token is short-lived (about 10 minutes) and scoped to the current run and job.
 - The returned token value is automatically masked in step logs.
 - The step never holds signing credentials — the orchestrator mints and signs the token on the step's behalf from its own run records.

@@ -149,14 +149,16 @@ describe('buildIdTokenClaims — subject', () => {
     expect(claims.sub).toBe('repo:acme/app:pull_request');
   });
 
-  it('restores the colliding subject under the legacy escape hatch', () => {
-    const legacy = { ...OPTS, legacyPullRequestSubject: true };
-    expect(buildIdTokenClaims(forkPr, JOB, legacy).sub).toBe(
-      buildIdTokenClaims(push, JOB, legacy).sub,
-    );
-    expect(buildIdTokenClaims(forkPr, JOB, legacy).sub).toBe(
-      'repo:acme/app:ref:main:workflow:deploy',
-    );
+  it('has no escape hatch back to the colliding subject', () => {
+    // fails-when: the removed `legacyPullRequestSubject` option is honoured
+    // again, making a fork PR and a push to its base branch mint one identity.
+    expect(
+      buildIdTokenClaims(forkPr, JOB, {
+        ...OPTS,
+        // @ts-expect-error — the option no longer exists.
+        legacyPullRequestSubject: true,
+      }).sub,
+    ).toBe('repo:acme/app:pull_request');
   });
 });
 

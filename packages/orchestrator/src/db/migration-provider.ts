@@ -146,6 +146,9 @@ import * as m138 from './migrations/138_execution_runs_subject_trigger_event.js'
 import * as m139 from './migrations/139_admin_token_subject.js';
 import * as m140 from './migrations/140_dispatch_queue_canonical_labels.js';
 import * as m141 from './migrations/141_event_log_shed.js';
+import * as m142 from './migrations/142_sweep_deprecated_columns.js';
+import * as m143 from './migrations/143_execution_jobs_precursor_result.js';
+import * as m144 from './migrations/144_execution_runs_registration_window.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -292,6 +295,9 @@ export function createMigrationProvider(): MigrationProvider {
         '139_admin_token_subject': m139,
         '140_dispatch_queue_canonical_labels': m140,
         '141_event_log_shed': m141,
+        '142_sweep_deprecated_columns': m142,
+        '143_execution_jobs_precursor_result': m143,
+        '144_execution_runs_registration_window': m144,
       };
     },
   };

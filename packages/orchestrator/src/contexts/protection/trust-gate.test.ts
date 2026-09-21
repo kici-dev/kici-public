@@ -42,7 +42,6 @@ function makeEnv(overrides: Partial<Context> = {}): Context {
  * element type it just lost.
  */
 const MINIMUM_TRUST_VALUES = Object.keys({
-  known: true,
   trusted: true,
 } satisfies Record<NonNullable<Context['minimumTrust']>, true>) as ReadonlyArray<
   NonNullable<Context['minimumTrust']>
@@ -64,12 +63,10 @@ describe('evaluateTrustGate', () => {
     },
   );
 
-  // ── Both floors block exactly the fork tier ─────────────────
+  // ── The floor blocks exactly the fork tier ──────────────────
   //
   // Trust is ref-based, so `'unknown'` means the ref came from a fork and
-  // `'trusted'` means it lives in the base repo. A context declaring either
-  // floor asks the same question, so each table below drives both floors
-  // through one assertion: a floor that stopped agreeing fails its own row.
+  // `'trusted'` means it lives in the base repo.
 
   it.each(MINIMUM_TRUST_VALUES)(
     'should hold a fork ref when minimumTrust is %s',
@@ -89,47 +86,18 @@ describe('evaluateTrustGate', () => {
     },
   );
 
-  it.each(MINIMUM_TRUST_VALUES)(
-    'should pass the legacy known tier when minimumTrust is %s',
-    (minimumTrust) => {
-      // `resolveRefTrust` no longer produces `'known'`, but an
-      // internally-triggered run can still inherit it from a stored
-      // `execution_runs.trust_tier` row. It is not a fork ref, so it passes
-      // both floors.
-      const result = evaluateTrustGate(makeEnv({ minimumTrust }), 'known');
-      expect(result.action).toBe('pass');
-    },
-  );
-
-  // ── The declared floor selects the reason ──────────────────
-
-  it('names the known floor when the context declares it', () => {
-    const result = evaluateTrustGate(makeEnv({ minimumTrust: 'known' }), 'unknown');
-    expect(result.reason).toContain('known contributors');
-  });
-
-  it('names the trusted floor when the context declares it', () => {
+  it('names the trusted floor in the reason', () => {
     const result = evaluateTrustGate(makeEnv({ minimumTrust: 'trusted' }), 'unknown');
     expect(result.reason).toContain('trusted contributors');
   });
 
-  // ── Byte-identity pins ─────────────────────────────────────
+  // ── Byte-identity pin ──────────────────────────────────────
   //
   // The reason text comes from the shared engine template that the ci-security
-  // DB fixture and its assertions also read. These two pins compare the gate's
-  // emitted bytes against literals, so a drift in that shared template — from
+  // DB fixture and its assertions also read. This pin compares the gate's
+  // emitted bytes against a literal, so a drift in that shared template — from
   // either side — fails here instead of silently changing what is persisted
   // into `held_runs.reason`.
-
-  it('emits the exact known-contributor reason bytes', () => {
-    const result = evaluateTrustGate(
-      makeEnv({ name: 'ci-security-env', minimumTrust: 'known' }),
-      'unknown',
-    );
-    expect(result.reason).toBe(
-      "Context 'ci-security-env' requires known contributors (contributor is unknown)",
-    );
-  });
 
   it('emits the exact trusted-contributor reason bytes', () => {
     const result = evaluateTrustGate(

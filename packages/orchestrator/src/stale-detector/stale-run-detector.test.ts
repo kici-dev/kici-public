@@ -69,6 +69,7 @@ function createDeps() {
     forwardJobTerminalStatus: vi.fn(),
     emitInfraEvent: vi.fn(),
     completeRunIfAllJobsTerminal: vi.fn().mockResolvedValue(undefined),
+    pruneRunsFinishedElsewhere: vi.fn().mockResolvedValue(0),
     cancelStepsForJob: vi.fn().mockResolvedValue(undefined),
   };
 
@@ -639,6 +640,71 @@ describe('StaleRunDetector', () => {
    * `pending`. `failRun` writes DB rows and no check run, so an unanswered hold
    * left it `in_progress` on the commit forever.
    */
+  describe('scan() finishes a run whose every job is terminal', () => {
+    it('routes each all-terminal candidate through the run completion check', async () => {
+      const mocks = createDeps();
+      // Sub-scans A, B, C find nothing; the all-terminal sweep (F) reads one
+      // candidate run row and then its (stale) holder's heartbeat row.
+      const db = createSequentialDb({
+        selects: [
+          { executeResult: [] },
+          { executeResult: [] },
+          { executeResult: [] },
+          {
+            executeResult: [
+              { run_id: 'run-orphaned', registration_window_instance_id: 'coord-dead' },
+            ],
+          },
+          { executeResult: [] },
+        ],
+        updates: [],
+      });
+      const detector = new StaleRunDetector(makeDeps(db, mocks));
+      await detector.scan();
+
+      // breaks-if-wrong: a run whose window holder died after a sibling
+      // deferred to it — every job terminal, the run row still running — has
+      // no other finalizer left; this sweep is what finishes it.
+      expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith(
+        'run-orphaned',
+      );
+    });
+
+    it('releases in-memory runs another coordinator finished, on every tick', async () => {
+      const mocks = createDeps();
+      const detector = new StaleRunDetector(
+        makeDeps(createSequentialDb({ selects: [], updates: [] }), mocks),
+      );
+      await detector.scan();
+      // fails-when: nothing on the tick calls the tracker's sweep — a run whose
+      // last job a sibling saw stays in this coordinator's memory for the life
+      // of the process.
+      expect(mocks.executionTracker.pruneRunsFinishedElsewhere).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves a run alone while its window holder is alive', async () => {
+      const mocks = createDeps();
+      const db = createSequentialDb({
+        selects: [
+          { executeResult: [] },
+          { executeResult: [] },
+          { executeResult: [] },
+          {
+            executeResult: [{ run_id: 'run-held', registration_window_instance_id: 'coord-live' }],
+          },
+          { executeResult: [{ instance_id: 'coord-live' }] },
+        ],
+        updates: [],
+      });
+      const detector = new StaleRunDetector(makeDeps(db, mocks));
+      await detector.scan();
+
+      // fails-when: the sweep ignores liveness — it finishes a run on its
+      // build job alone while the owner is still registering the real jobs.
+      expect(mocks.executionTracker.completeRunIfAllJobsTerminal).not.toHaveBeenCalled();
+    });
+  });
+
   describe('scan() completes the security check of an expired hold', () => {
     /**
      * The `execution_runs` row the settled security check is addressed from —
@@ -662,6 +728,8 @@ describe('StaleRunDetector', () => {
       const mocks = createDeps();
       const db = createSequentialDb({
         selects: [
+          // Sub-scans A, B, C, and the all-terminal run sweep (F), each empty.
+          { executeResult: [] },
           { executeResult: [] },
           { executeResult: [] },
           { executeResult: [] },
@@ -1318,12 +1386,11 @@ describe('StaleRunDetector — the reaped job carries the run trust posture', ()
     // A reap posts a completion check like any other. On a degraded fork run
     // that check is one of only two the contributor gets, so dropping the
     // posture here hides the explanation on exactly the path that most needs
-    // it. `known` is legacy vocabulary `resolveRefTrust` no longer produces, so
-    // a forwarded value can only have come from the run row.
+    // it.
     const mocks = createDeps();
     const db = createSequentialDb({
       selects: [
-        { executeResult: [staleJob({ trust_tier: 'known', lock_file_source: 'base' })] },
+        { executeResult: [staleJob({ trust_tier: 'unknown', lock_file_source: 'base' })] },
         { executeResult: [] },
         { executeResult: [] },
       ],
@@ -1334,7 +1401,7 @@ describe('StaleRunDetector — the reaped job carries the run trust posture', ()
     await detector.scan();
 
     expect(mocks.checkRunReporter.updateJobStatus).toHaveBeenCalledWith(
-      expect.objectContaining({ trustTier: 'known', lockFileSource: 'base' }),
+      expect.objectContaining({ trustTier: 'unknown', lockFileSource: 'base' }),
     );
   });
 

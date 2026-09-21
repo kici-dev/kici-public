@@ -81,6 +81,13 @@ export interface FileDriftEntry {
   /** Set when content capture was intentionally skipped — used by the renderer to explain the gap. */
   contentSkipped?: ContentSkipReason;
   /**
+   * SHA-256 hex of the remote file bytes. Set for category `content` whenever
+   * the box could hash the file — independent of whether the bytes themselves
+   * were captured, so a suppressed, over-size or binary payload still has an
+   * identity a consumer can compare across previews without holding content.
+   */
+  remoteDigest?: string;
+  /**
    * Fleet machine the remote side of this comparison lives on. Stamped by the
    * preview helpers, which already know the box. Consumers that aggregate
    * drift across a whole fleet need it to attribute a file to a machine —

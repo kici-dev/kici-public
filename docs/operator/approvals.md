@@ -35,11 +35,7 @@ The check runs on the server, so one policy covers every surface: the dashboard,
 
 The `/kici approve` PR-comment channel acts only on **security** holds, and releasing one that way requires the same `ci_trust:write`. A reviewer, wait-timer, or concurrency hold is not resolvable by comment — use the dashboard or `kici approve`.
 
-A per-member CI trust override (Members tab) sets the trust level a member's security-hold decisions are judged at, on every surface including the dashboard — which reads the same override-resolved level the server decides with, so an override that lowers a member hides the controls rather than offering ones the API refuses.
-
-An override adjusts an existing approver's level; it does not create an approver. A member still has to hold `contexts:write` or `ci_trust:write` from a role to reach the approve and reject routes at all, because that check reads role-derived permissions and the override is deliberately kept out of them — folding it in would let an `admin` override confer the power to edit trust policy and set other members' overrides. So raise a member with an override only on top of a role that already grants one of those two; to make someone an approver from nothing, grant the permission.
-
-An org API key is its own principal with its own permission matrix and does not inherit its owner's override.
+A member's `ci_trust` level comes from the roles they hold, directly or through a team. To make someone an approver, grant the permission on a role. An org API key is its own principal with its own permission matrix and does not inherit its owner's level.
 
 ## Org settings
 

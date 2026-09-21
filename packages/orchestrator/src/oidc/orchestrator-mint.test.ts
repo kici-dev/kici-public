@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { decodeJwt, importJWK } from 'jose';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
@@ -232,5 +232,32 @@ describe('mintOrchestratorIdToken', () => {
     });
     const result = await handler('agent-x', { jobId: 'job-1', audience: 'kici-provenance' });
     expect(result).toEqual({ deferred: true, code: 'unavailable' });
+  });
+
+  it('handler defers for a marker audience under the test-only fault predicate, before the signer', async () => {
+    // fails-when: the injected predicate is ignored, or the signer is resolved
+    // before it runs — the predicate may only ever defer, never sign.
+    const { signer } = await DbSigner.generate(KEY);
+    const db = fakeDb({
+      run: RUN,
+      job: { run_id: 'run-1', job_id: 'job-1', status: 'running' },
+      sourceCustomerId: 'org-acme',
+    });
+    const resolveSigner = vi.fn(async () => signer);
+    const handler = createOrchestratorOidcTokenHandler({
+      dispatcher: { resolveOwnedJob: () => ({ runId: 'run-1' }) },
+      resolveSigner,
+      mint: { db, issuer: ISSUER, orchestratorId: 'orch-1' },
+      initialMintFault: (audience) => audience === 'kici-provenance-defer',
+    });
+    const deferred = await handler('agent-x', {
+      jobId: 'job-1',
+      audience: 'kici-provenance-defer',
+    });
+    expect(deferred).toEqual({ deferred: true, code: 'unavailable' });
+    expect(resolveSigner).not.toHaveBeenCalled();
+    // breaks-if-wrong: an audience the predicate does not name still mints.
+    const minted = await handler('agent-x', { jobId: 'job-1', audience: 'kici-provenance' });
+    expect('token' in minted && minted.token).toBeTruthy();
   });
 });

@@ -13,6 +13,7 @@ export * from './protocol/version.js';
 export * from './protocol/source-origin.js';
 export * from './provenance/attestation-origin.js';
 export * from './provenance/id-token-event-claims.js';
+export * from './provenance/id-token-claim-names.js';
 export * from './protocol/messages/common.js';
 export * from './protocol/messages/actor.js';
 export * from './protocol/messages/pat-kind.js';

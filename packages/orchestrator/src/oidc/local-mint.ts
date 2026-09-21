@@ -1,19 +1,16 @@
 /**
  * Local dev-signed OIDC mint (independent mode only).
  *
- * The Platform-connected orchestrator relays `oidc.token.request` to the hosted
- * Platform, which reads its own run/job rows and mints (`ws/oidc-token-relay.ts`
- * → `oidc.mint.request`). The offline local dev plane has no Platform, so this
- * module mints locally: it reads the orchestrator's OWN execution_runs/
- * execution_jobs rows and signs claims with the in-process `LocalDevSigner`,
- * issuer `kici-local`.
+ * The production sibling is `orchestrator-mint.ts`, which signs with the
+ * orchestrator's own long-lived key under its real issuer. The offline local dev
+ * plane has no provenance issuer configured, so this module mints with the
+ * in-process `LocalDevSigner` under the issuer `kici-local`, reading the
+ * orchestrator's OWN execution_runs/execution_jobs rows.
  *
  * Security: this path is registered ONLY when the orchestrator runs in
- * `independent` mode with a `LocalDevSigner` present, and app.ts registers the
- * Platform relay in preference (the local path is registered strictly in the
- * `else` branch), so a Platform-connected orchestrator can never reach the local
- * signer — it keeps minting via the Platform exactly as today. The agent never
- * asserts its own claims; every identity claim is read server-side from the
+ * `independent` mode with a `LocalDevSigner` present and no orchestrator-owned
+ * signer is configured (`selectOidcMintRegistration`). The agent never asserts
+ * its own claims; every identity claim is read server-side from the
  * orchestrator's rows, and the job-ownership check is against dispatch state.
  */
 import type { Kysely } from 'kysely';
@@ -27,7 +24,7 @@ import { buildIdTokenClaims, type IdTokenClaims } from './id-token-claims.js';
 import { signCompactJws } from './jwt.js';
 import { KICI_LOCAL_ISSUER, type LocalSigner } from './local-dev-signer.js';
 
-/** ID-token lifetime (seconds). Matches the Platform's 10-minute cap. */
+/** ID-token lifetime (seconds). Matches the production mint's 10-minute cap. */
 export const LOCAL_ID_TOKEN_TTL_SECONDS = 600;
 
 /** The org anchor stamped into a local-plane token (the plane's default org). */
@@ -91,7 +88,7 @@ export async function mintLocalIdToken(
   if (!job)
     throw new LocalMintJobNotFoundError(`job ${input.jobId} not found for run ${input.runId}`);
   // A live agent mint requires a running (non-terminal) job — same invariant as
-  // the Platform. The local plane never mints for a completed job.
+  // the production mint. The local plane never mints for a completed job.
   if (TERMINAL_JOB_STATES.has(job.status)) {
     throw new LocalMintJobNotActiveError(`job ${input.jobId} is ${job.status}`);
   }

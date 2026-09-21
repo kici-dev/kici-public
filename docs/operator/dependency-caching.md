@@ -81,7 +81,7 @@ The workflow `contentHash` is mixed with a `COMPILE_SCHEMA_VERSION` constant (cu
 ### Integrity verification
 
 - **Dependency tarball:** the build agent reports the SHA-256 of the tarball bytes in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file and sends it alongside `depsUrl` in `job.dispatch`. The execution agent streams the download through a SHA-256 hasher and fails the job (with up to 2 retries on HTTP(S) transports) if the hash does not match.
-- **Source tarball:** `sourceTarHash` on the `job.dispatch` message carries the **workflow `contentHash`**, not the tarball-bytes hash. The orchestrator-signed S3 GET URL establishes provenance; after extraction, `loadWorkflowSource` re-computes `contentHash` against the extracted raw source and fails the job with a **"lock file is out of date"** error if it diverges from the lock file's value. This covers lock-file drift end-to-end.
+- **Source tarball:** `sourceTarDigest` on the `job.dispatch` message is the SHA-256 of the tarball bytes, verified before extraction. After extraction, `loadWorkflowSource` re-computes the workflow `contentHash` against the extracted raw source and fails the job with a **"lock file is out of date"** error if it diverges from the lock file's value. This covers lock-file drift end-to-end.
 
 ### Lock file and drift
 

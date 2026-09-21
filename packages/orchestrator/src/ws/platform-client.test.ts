@@ -230,7 +230,7 @@ describe('PlatformClient', () => {
     it('includes dashboardWrites in auth.request when supplied via options', () => {
       const client = createClient({
         orchCapabilities: {
-          dashboardWrites: { 'secrets.set': false, 'variables.set': false },
+          dashboardWrites: { 'secrets.set': 'disabled', 'variables.set': 'disabled' },
         },
       });
       client.connect();
@@ -241,8 +241,8 @@ describe('PlatformClient', () => {
       const authReq = JSON.parse(mock.sentMessages[0]);
       expect(authReq.type).toBe('auth.request');
       expect(authReq.capabilities.dashboardWrites).toEqual({
-        'secrets.set': false,
-        'variables.set': false,
+        'secrets.set': 'disabled',
+        'variables.set': 'disabled',
       });
       expect(authReq.capabilities.orchRole).toBe('coordinator');
     });
@@ -253,7 +253,7 @@ describe('PlatformClient', () => {
       mock.sentMessages = [];
 
       client.broadcastCapabilities({
-        dashboardWrites: { 'secrets.set': false },
+        dashboardWrites: { 'secrets.set': 'disabled' },
       });
 
       const sent = getSentMessages(mock);
@@ -263,7 +263,7 @@ describe('PlatformClient', () => {
         capabilities: {
           orchRole: 'coordinator',
           supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
-          dashboardWrites: { 'secrets.set': false },
+          dashboardWrites: { 'secrets.set': 'disabled' },
         },
       });
     });
@@ -272,7 +272,7 @@ describe('PlatformClient', () => {
       const client = createClient();
 
       client.broadcastCapabilities({
-        dashboardWrites: { 'held_runs.approve': false },
+        dashboardWrites: { 'held_runs.approve': 'disabled' },
       });
 
       expect(client.getBufferedCount()).toBe(1);
@@ -283,8 +283,8 @@ describe('PlatformClient', () => {
       const mock = authenticateClient(client);
       mock.sentMessages = [];
 
-      client.broadcastCapabilities({ dashboardWrites: { 'secrets.set': false } });
-      client.broadcastCapabilities({ dashboardWrites: { 'variables.set': false } });
+      client.broadcastCapabilities({ dashboardWrites: { 'secrets.set': 'disabled' } });
+      client.broadcastCapabilities({ dashboardWrites: { 'variables.set': 'disabled' } });
 
       const sent = getSentMessages(mock) as Array<{
         type: string;
@@ -294,27 +294,27 @@ describe('PlatformClient', () => {
       // Second broadcast replaces dashboardWrites with the new map; the
       // caller is responsible for merging on its side (server.ts passes
       // the full policy map every time).
-      expect(sent[1].capabilities.dashboardWrites).toEqual({ 'variables.set': false });
+      expect(sent[1].capabilities.dashboardWrites).toEqual({ 'variables.set': 'disabled' });
       expect(sent[1].capabilities.orchRole).toBe('coordinator');
     });
 
     it('getCapabilities reflects merged state after broadcastCapabilities', () => {
       const client = createClient({
         orchCapabilities: {
-          dashboardWrites: { 'secrets.set': false },
+          dashboardWrites: { 'secrets.set': 'disabled' },
         },
       });
       expect(client.getCapabilities()).toEqual({
         orchRole: 'coordinator',
         supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
-        dashboardWrites: { 'secrets.set': false },
+        dashboardWrites: { 'secrets.set': 'disabled' },
       });
 
-      client.broadcastCapabilities({ dashboardWrites: { 'secrets.delete': false } });
+      client.broadcastCapabilities({ dashboardWrites: { 'secrets.delete': 'disabled' } });
       expect(client.getCapabilities()).toEqual({
         orchRole: 'coordinator',
         supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
-        dashboardWrites: { 'secrets.delete': false },
+        dashboardWrites: { 'secrets.delete': 'disabled' },
       });
     });
 
@@ -2252,8 +2252,8 @@ describe('PlatformClient', () => {
   // (compromised Platform credential / rogue Platform process). The Platform
   // pushes `trust_policy.update` carrying `identityLinks` + `memberCiTrustLevels`
   // (consumed by `server.ts:798 onTrustPolicyUpdate` to update orchestrator
-  // in-memory state) and `policy.{forkPolicy,unknownContributorPolicy,
-  // workflowChangePolicy,approvalExpiryHours}` (received but DROPPED).
+  // in-memory state) and `policy.{forkPolicy,approvalExpiryHours}` (received
+  // but DROPPED).
   //
   // The wire-side invariant pinned here: the message reaches
   // `onTrustPolicyUpdate` AS-IS. The orchestrator is then free to consume or
@@ -2261,7 +2261,7 @@ describe('PlatformClient', () => {
   // (Platform-supplied data alone cannot fake `tier='trusted'`) is pinned in
   // `packages/orchestrator/src/security/trust-resolver.test.ts`.
   describe('trust_policy.update — wire dispatch surface (security invariant)', () => {
-    it('full trust_policy.update message — including unused policy.* fields — is forwarded to onTrustPolicyUpdate as-is', async () => {
+    it('full trust_policy.update message is forwarded to onTrustPolicyUpdate as-is', async () => {
       const onTrustPolicyUpdate = vi.fn();
       const client = createClient({ onTrustPolicyUpdate });
       const mock = authenticateClient(client);
@@ -2276,12 +2276,7 @@ describe('PlatformClient', () => {
       simulateMessage(mock, {
         type: 'trust_policy.update',
         orgId: 'org-1',
-        policy: {
-          forkPolicy: 'allow',
-          unknownContributorPolicy: 'hold',
-          workflowChangePolicy: 'allow',
-          approvalExpiryHours: 1,
-        },
+        policy: { forkPolicy: 'allow', approvalExpiryHours: 1 },
         identityLinks: [
           {
             userId: 'forged-user',
@@ -2298,13 +2293,8 @@ describe('PlatformClient', () => {
       const arg = onTrustPolicyUpdate.mock.calls[0][0];
       expect(arg.orgId).toBe('org-1');
       expect(arg.teamMemberships).toEqual([{ teamName: 'leads', memberUserIds: ['u-1', 'u-2'] }]);
-      // policy.* fields ARE present on the wire — the orchestrator's
-      // server.ts callback chooses to drop them. This test pins the wire
-      // shape so a future schema-narrowing refactor that intentionally
-      // drops policy.* from the schema (and thus the type-system) is a
-      // visible breaking change.
       expect(arg.policy.forkPolicy).toBe('allow');
-      expect(arg.policy.workflowChangePolicy).toBe('allow');
+      expect(arg.policy.approvalExpiryHours).toBe(1);
       expect(arg.identityLinks).toHaveLength(1);
       expect(arg.identityLinks[0].userId).toBe('forged-user');
       expect(arg.memberCiTrustLevels['forged-user']).toBe('admin');
@@ -2432,7 +2422,7 @@ describe('PlatformClient — version-skew NACK + Platform capabilities', () => {
     // Platform advertises a set WITHOUT orchMetrics → gated send suppressed.
     simulateMessage(mock, {
       type: 'platform.capabilities',
-      capabilities: { oidcMint: true },
+      capabilities: { futureFlag: true },
     });
     mock.sentMessages.length = 0;
 

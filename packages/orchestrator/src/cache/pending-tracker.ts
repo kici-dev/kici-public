@@ -121,4 +121,17 @@ export class PendingTracker<T> {
   get size(): number {
     return this.pending.size;
   }
+
+  /**
+   * The job ids currently awaited, for the shared-database channel.
+   *
+   * The local agent socket is one of two channels that settle an entry. A job
+   * this coordinator dispatched may be claimed from the shared queue by an
+   * agent connected to a sibling coordinator, whose terminal frame never
+   * reaches this process — the sibling writes it to `execution_jobs` instead.
+   * `PendingPrecursorDbWatcher` polls those rows for exactly this set.
+   */
+  trackedJobIds(): string[] {
+    return [...this.pending.keys()];
+  }
 }

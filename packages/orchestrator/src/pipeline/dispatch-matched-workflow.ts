@@ -20,7 +20,6 @@ import type { Kysely, Transaction } from 'kysely';
 import {
   isLockStaticJob,
   isLockDynamicJobFn,
-  isLockInlineValue,
   DEFAULT_APPROVAL_EXPIRY_SECONDS,
   CheckRunConclusion,
   ExecutionJobStatus,
@@ -671,7 +670,6 @@ interface DispatchSetup {
 
 interface BuildPrepResult {
   sourceTarUrl: string | undefined;
-  sourceTarHash: string | undefined;
   /** SHA-256 of the source tarball's own bytes; the agent verifies against it. */
   sourceTarDigest: string | undefined;
   depsUrl: string | undefined;
@@ -1380,8 +1378,16 @@ async function runBuildJob(args: {
         // job has run. Taken here rather than after the build so it is in place
         // before the build can report terminal; released by
         // dispatchMatchedWorkflow's finally.
+        //
+        // The token guards only this process. The dispatch queue is
+        // cluster-wide, so the build may be claimed by an agent connected to a
+        // sibling coordinator, which rehydrates the run from the row and sees
+        // the build alone; the token's durable form (the run row's
+        // registration-window column) is what makes that sibling defer, and
+        // the build wait below must not start before it has landed.
         if (args.hasPostBuildJobs && deps.executionTracker.holdRunForPendingJobs(runId)) {
           args.ctx.dispatchWindowTokenHeld = true;
+          await deps.executionTracker.registrationWindowSettled(runId);
         }
       }
       if (
@@ -1390,6 +1396,8 @@ async function runBuildJob(args: {
           result.status === 'queued' ||
           result.status === 'queued-no-backend')
       ) {
+        // Settled by whichever channel sees the build finish: the local agent
+        // socket, or the shared execution_jobs row when a sibling's agent ran it.
         await deps.pendingBuilds.track(result.jobId);
       }
     });
@@ -1507,14 +1515,12 @@ async function recordBuildFailure(args: {
  */
 function cacheArtifactFields(buildPrep: BuildPrepResult): {
   sourceTarUrl: string | undefined;
-  sourceTarHash: string | undefined;
   sourceTarDigest: string | undefined;
   depsUrl: string | undefined;
   depsHash: string | undefined;
 } {
   return {
     sourceTarUrl: buildPrep.sourceTarUrl,
-    sourceTarHash: buildPrep.sourceTarHash,
     sourceTarDigest: buildPrep.sourceTarDigest,
     depsUrl: buildPrep.depsUrl,
     depsHash: buildPrep.depsHash,
@@ -1534,7 +1540,6 @@ async function readPostBuildCacheUrls(args: {
   targetArch: string;
 }): Promise<{
   sourceTarUrl: string | undefined;
-  sourceTarHash: string | undefined;
   sourceTarDigest: string | undefined;
   depsUrl: string | undefined;
   depsHash: string | undefined;
@@ -1557,7 +1562,6 @@ async function readPostBuildCacheUrls(args: {
     });
   }
   let sourceTarUrl: string | undefined;
-  let sourceTarHash: string | undefined;
   let sourceTarDigest: string | undefined;
   let depsUrl: string | undefined;
   let depsHash: string | undefined;
@@ -1565,7 +1569,6 @@ async function readPostBuildCacheUrls(args: {
     const hit = await deps.sourceCache.getUrlAndDigest(ctx.resolvedOrgId, contentHash);
     sourceTarUrl = hit?.url;
     sourceTarDigest = hit?.digest;
-    sourceTarHash = contentHash;
   }
   if (lockfileHash && deps.depCache) {
     const depResult = await deps.depCache.getUrlAndHash(
@@ -1579,7 +1582,7 @@ async function readPostBuildCacheUrls(args: {
       depsHash = depResult.hash;
     }
   }
-  return { sourceTarUrl, sourceTarHash, sourceTarDigest, depsUrl, depsHash };
+  return { sourceTarUrl, sourceTarDigest, depsUrl, depsHash };
 }
 
 /**
@@ -1969,7 +1972,6 @@ async function prepareCacheAndBuild(
   );
 
   let sourceTarUrl: string | undefined;
-  let sourceTarHash: string | undefined;
   let sourceTarDigest: string | undefined;
   let depsUrl: string | undefined;
   let depsHash: string | undefined;
@@ -2034,7 +2036,6 @@ async function prepareCacheAndBuild(
     if (result.rejected) {
       return {
         sourceTarUrl,
-        sourceTarHash,
         sourceTarDigest,
         depsUrl,
         depsHash,
@@ -2083,7 +2084,6 @@ async function prepareCacheAndBuild(
       } else {
         return {
           sourceTarUrl,
-          sourceTarHash,
           sourceTarDigest,
           depsUrl,
           depsHash,
@@ -2108,21 +2108,19 @@ async function prepareCacheAndBuild(
     } else {
       const buildDuration = Number(process.hrtime.bigint() - buildStart) / 1e9;
       buildDurationSeconds.record(buildDuration);
-      ({ sourceTarUrl, sourceTarHash, sourceTarDigest, depsUrl, depsHash } =
-        await readPostBuildCacheUrls({
-          ctx,
-          setup,
-          contentHash,
-          lockfileHash,
-          targetPlatform,
-          targetArch,
-        }));
+      ({ sourceTarUrl, sourceTarDigest, depsUrl, depsHash } = await readPostBuildCacheUrls({
+        ctx,
+        setup,
+        contentHash,
+        lockfileHash,
+        targetPlatform,
+        targetArch,
+      }));
     }
   } else if (sourceHit && contentHash && deps.sourceCache) {
     const hit = await deps.sourceCache.getUrlAndDigest(ctx.resolvedOrgId, contentHash);
     sourceTarUrl = hit?.url;
     sourceTarDigest = hit?.digest;
-    sourceTarHash = contentHash;
   }
 
   if (depHit && lockfileHash && deps.depCache) {
@@ -2152,7 +2150,6 @@ async function prepareCacheAndBuild(
 
   return {
     sourceTarUrl,
-    sourceTarHash,
     sourceTarDigest,
     depsUrl,
     depsHash,
@@ -2450,7 +2447,6 @@ function buildDeferredInitJob(args: {
     routingKey: setup.info.routingKey,
     requestId: getRequestContext().requestId,
     sourceTarUrl: buildPrep.sourceTarUrl,
-    sourceTarHash: buildPrep.contentHash || undefined,
     sourceTarDigest: buildPrep.sourceTarDigest,
     depsUrl: buildPrep.depsUrl,
     depsHash: buildPrep.depsHash,
@@ -3252,8 +3248,7 @@ export async function evaluateJobContexts(args: {
       continue;
     }
 
-    const jobEnv: Record<string, string> | undefined =
-      lockJob.dynamicEnv || isLockInlineValue(lockJob.env) ? undefined : lockJob.env;
+    const jobEnv: Record<string, string> | undefined = lockJob.dynamicEnv ? undefined : lockJob.env;
     const concurrencyGroup: string | undefined =
       lockJob.dynamicConcurrencyGroup || typeof lockJob.concurrencyGroup !== 'string'
         ? undefined
@@ -3371,7 +3366,7 @@ async function readAllowUntrustedDockerfileBuilds(ctx: WorkflowDispatchContext):
  * reaches it only where the operator said so.
  *
  * "Without a trusted emitter" covers both halves of the internal case: a
- * `kiciEvent()` subscriber that inherited a `known` / `unknown` tier, and one
+ * `kiciEvent()` subscriber that inherited an `unknown` tier, and one
  * that inherited nothing at all (no emitting run, no persisted tier, a lookup
  * that failed) — the strict fallback, which is not an "untrusted emitter".
  *
@@ -4182,7 +4177,6 @@ async function clusterRouteRootJobs(args: {
         providerContext: credentials as Record<string, unknown>,
         routingKey: setup.info.routingKey,
         sourceTarUrl: jtr.sourceTarUrl,
-        sourceTarHash: jtr.sourceTarHash,
         sourceTarDigest: jtr.sourceTarDigest,
         depsUrl: jtr.depsUrl,
         depsHash: jtr.depsHash,
@@ -5850,8 +5844,20 @@ function startDeferredInitDispatch(args: {
           initJob: initJobInput.jobName,
         });
         const dispatchResult = await setup.dispatcher.dispatch(initJobInput);
-        if (dispatchResult.status !== 'dispatched' && dispatchResult.status !== 'queued') {
+        if (dispatchResult.status === 'rejected' || dispatchResult.status === 'duplicate') {
           throw new Error(`Init job dispatch rejected: ${dispatchResult.status}`);
+        }
+        // `queued-no-backend` is tracked exactly like `queued`, as at every
+        // other dispatch site: the init job IS in the dispatch queue under
+        // `dispatchResult.jobId` and runs once an agent appears, so failing the
+        // run here left it dead while its init job later ran on a fresh agent.
+        if (dispatchResult.status === 'queued-no-backend') {
+          logger.warn('Init job has no matching backend (tracked, awaiting capacity)', {
+            runId,
+            workflow: workflow.name,
+            job: mat.expandedName,
+            initJob: initJobInput.jobName,
+          });
         }
         const initResult = await pendingInits.track(dispatchResult.jobId);
         const jobEnvData = jobContextData.get(mat.expandedName) ?? {};
@@ -6142,7 +6148,6 @@ async function dispatchEvalJob(args: {
     routingKey: setup.info.routingKey,
     requestId: getRequestContext().requestId,
     sourceTarUrl: buildPrep.sourceTarUrl,
-    sourceTarHash: buildPrep.contentHash || undefined,
     sourceTarDigest: buildPrep.sourceTarDigest,
     depsUrl: buildPrep.depsUrl,
     depsHash: buildPrep.depsHash,
@@ -6302,9 +6307,7 @@ export async function resolveGeneratedJobConfigs(args: {
       let genNamespacedSecrets: Record<string, Record<string, string>> = {
         ...resolvedNamespacedSecrets,
       };
-      const genEnvNames = (genJob.contexts ?? [])
-        .filter((e) => !e.dynamic && typeof e.value === 'string')
-        .map((e) => e.value as string);
+      const genEnvNames = (genJob.contexts ?? []).filter((e) => !e.dynamic).map((e) => e.value);
       if (genEnvNames.length > 0 && deps.contextStore) {
         const present: Array<{ name: string; env: EngineContext }> = [];
         for (const name of genEnvNames) {
@@ -6486,7 +6489,6 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
       providerContext: credentials as Record<string, unknown>,
       routingKey: setup.info.routingKey,
       sourceTarUrl: buildPrep.sourceTarUrl,
-      sourceTarHash: buildPrep.contentHash || undefined,
       sourceTarDigest: buildPrep.sourceTarDigest,
       depsUrl: buildPrep.depsUrl,
       depsHash: buildPrep.depsHash,
@@ -6570,7 +6572,6 @@ async function directDispatchGeneratedJobs(args: {
         providerContext: credentials as Record<string, unknown>,
         routingKey: setup.info.routingKey,
         sourceTarUrl: buildPrep.sourceTarUrl,
-        sourceTarHash: buildPrep.contentHash || undefined,
         sourceTarDigest: buildPrep.sourceTarDigest,
         depsUrl: buildPrep.depsUrl,
         depsHash: buildPrep.depsHash,
@@ -6662,7 +6663,6 @@ async function routeRootGeneratedJobs(args: {
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
       sourceTarUrl: buildPrep.sourceTarUrl,
-      sourceTarHash: buildPrep.contentHash || undefined,
       sourceTarDigest: buildPrep.sourceTarDigest,
       depsUrl: buildPrep.depsUrl,
       depsHash: buildPrep.depsHash,

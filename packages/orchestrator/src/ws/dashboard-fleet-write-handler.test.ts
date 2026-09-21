@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Kysely } from 'kysely';
+import type { DashboardWritePolicyMap } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import { DashboardFleetWriteHandler } from './dashboard-fleet-write-handler.js';
 import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-policy.js';
 import type { HostRosterStore } from '../agent/host-roster.js';
@@ -9,7 +10,7 @@ import type { Database } from '../db/types.js';
  * Build a handler with a stubbed `db` whose `org_settings.dashboard_write_policy`
  * is `policy` (undefined ⇒ permissive). Mirrors the env-handler gate test.
  */
-function buildHandler(policy: Record<string, boolean> | undefined): {
+function buildHandler(policy: DashboardWritePolicyMap | undefined): {
   handler: DashboardFleetWriteHandler;
   sent: unknown[];
   declareStatic: ReturnType<typeof vi.fn>;
@@ -41,7 +42,7 @@ describe('DashboardFleetWriteHandler', () => {
   beforeEach(() => invalidateDashboardWritePolicyCache());
 
   it('declare with a disabled policy short-circuits and emits operation_disabled', async () => {
-    const { handler, sent, declareStatic } = buildHandler({ 'fleet.host.declare': false });
+    const { handler, sent, declareStatic } = buildHandler({ 'fleet.host.declare': 'disabled' });
 
     await handler.handleMessage({
       type: 'dashboard.fleet.host.declare',
@@ -151,7 +152,7 @@ describe('DashboardFleetWriteHandler', () => {
   });
 
   it('remove with a disabled policy short-circuits and never calls removeStatic', async () => {
-    const { handler, sent, removeStatic } = buildHandler({ 'fleet.host.remove': false });
+    const { handler, sent, removeStatic } = buildHandler({ 'fleet.host.remove': 'disabled' });
 
     await handler.handleMessage({
       type: 'dashboard.fleet.host.remove',

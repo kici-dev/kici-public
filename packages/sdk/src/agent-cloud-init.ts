@@ -1,25 +1,15 @@
 /**
  * Cloud-init `user_data` builder for a scaler-provisioned KiCI agent.
  *
- * Renders a `#cloud-config` that installs + starts the agent with the claimed
- * ephemeral credentials, plus teardown layer L2 — an in-instance max-lifetime
- * self-poweroff. The agent token is written ONLY into a root-only `0600` env
- * file; it never appears in a comment, a process argument, or any other file.
+ * Renders a `#cloud-config` that installs + starts the agent from a single-use
+ * claim code, plus teardown layer L2 — an in-instance max-lifetime
+ * self-poweroff. The claim code is written ONLY into a root-only `0600` env
+ * file; it never appears in a comment, a process argument, or any other file,
+ * and the agent token it is exchanged for never transits cloud-init at all.
  */
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
-/**
- * @deprecated Pass a claim code (ClaimCodeCredentials) so the token never
- * transits cloud-init. Removed at v1.0.0.
- */
-export interface CloudInitCredentials {
-  agentToken: string;
-  agentId: string;
-  orchestratorUrl: string;
-  labels: string[];
-}
-
-/** Preferred: the agent self-claims from a single-use code; the token is minted in-instance. */
+/** The agent self-claims from a single-use code; the token is minted in-instance. */
 export interface ClaimCodeCredentials {
   claimCode: string;
   agentId: string;
@@ -27,8 +17,8 @@ export interface ClaimCodeCredentials {
   labels: string[];
 }
 
-/** Either credential shape accepted by `buildAgentCloudInit`. */
-export type AgentCloudInitCredentials = CloudInitCredentials | ClaimCodeCredentials;
+/** The credential shape accepted by `buildAgentCloudInit`. */
+export type AgentCloudInitCredentials = ClaimCodeCredentials;
 
 /** How the agent binary is delivered onto the instance. */
 export type AgentDeliveryMode = 'container' | 'payload';
@@ -92,28 +82,19 @@ interface CloudConfigModel {
 }
 
 /**
- * The credential-specific env lines. The claim-code form emits a single-use
- * code the agent exchanges for its own token in-instance; the token form emits
- * the token directly (the ONLY place the token appears).
+ * The credential env lines: the single-use claim code the agent exchanges for
+ * its own token in-instance, plus the identity the exchange is made under.
  */
 function credentialEnvLines(creds: AgentCloudInitCredentials): string[] {
-  if ('claimCode' in creds) {
-    return [
-      `KICI_ORCHESTRATOR_URL=${creds.orchestratorUrl}`,
-      `KICI_SCALER_CLAIM_CODE=${creds.claimCode}`,
-      `KICI_AGENT_ID=${creds.agentId}`,
-      `KICI_LABELS=${creds.labels.join(',')}`,
-    ];
-  }
   return [
     `KICI_ORCHESTRATOR_URL=${creds.orchestratorUrl}`,
-    `KICI_AGENT_TOKEN=${creds.agentToken}`,
+    `KICI_SCALER_CLAIM_CODE=${creds.claimCode}`,
     `KICI_AGENT_ID=${creds.agentId}`,
     `KICI_LABELS=${creds.labels.join(',')}`,
   ];
 }
 
-/** Render the agent env-file content (the ONLY place the token appears, in the token form). */
+/** Render the agent env-file content (the ONLY place the claim code appears). */
 function renderEnvFileContent(
   creds: AgentCloudInitCredentials,
   agentEnv: Record<string, string> | undefined,
@@ -193,9 +174,9 @@ function renderStartCommand(opts: AgentCloudInitOptions): string {
 }
 
 /**
- * Build the cloud-config `user_data` string. In the token form the agent token
- * appears only in the reserved env-file write entry (`0600`, root-only); the
- * claim-code form keeps the token off the provisioning channel entirely.
+ * Build the cloud-config `user_data` string. The claim code appears only in the
+ * reserved env-file write entry (`0600`, root-only), and the agent token the
+ * instance exchanges it for stays off the provisioning channel entirely.
  */
 export function buildAgentCloudInit(
   creds: AgentCloudInitCredentials,

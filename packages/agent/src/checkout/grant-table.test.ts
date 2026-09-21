@@ -12,7 +12,7 @@ describe('GrantTable', () => {
       expiresAt: T0 + 60_000,
     });
     expect(t.lookup('kici-dev/tester', T0)).toMatchObject({ permissions: { contents: 'write' } });
-    expect(t.lookup('cmaster11/main', T0)).toBeNull();
+    expect(t.lookup('acme/main', T0)).toBeNull();
   });
 
   it('normalises a .git suffix and a leading slash so git path forms match', () => {

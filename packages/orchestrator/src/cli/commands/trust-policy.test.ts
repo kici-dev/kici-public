@@ -6,7 +6,6 @@ import {
   formatDirectory,
   formatPolicy,
   formatExpiry,
-  policyDeprecationWarnings,
   policyExpiryWarnings,
   registerTrustPolicyCommands,
   type TrustDirectoryView,
@@ -17,8 +16,6 @@ import type { AdminApiClient } from '../api-client.js';
 const VIEW: TrustPolicyView = {
   customerId: 'org-1',
   forkPolicy: 'hold',
-  unknownContributorPolicy: 'reject',
-  workflowChangePolicy: 'allow',
   approvalExpiryHours: 72,
   source: 'platform',
   updatedAt: '2026-07-29T06:00:00.000Z',
@@ -59,15 +56,6 @@ describe('formatPolicy', () => {
     expect(out).toContain('72 h');
     expect(out).toContain('managed by the KiCI Platform');
     expect(out).toContain('2026-07-29T06:00:00.000Z');
-  });
-
-  it('omits the two arms nothing enforces', () => {
-    // Both are still stored and still echoed back, but no dispatch decision
-    // reads either — a row for them would assert an enforcement that is not
-    // happening. `--format json` below keeps the values reachable.
-    const out = formatPolicy(VIEW, 'table');
-    expect(out).not.toContain('Unknown contributor policy');
-    expect(out).not.toContain('Workflow change policy');
   });
 
   it('renders `unknown` rather than `undefined` for a field an older route omitted', () => {
@@ -114,11 +102,6 @@ describe('formatPolicy', () => {
     expect(out).not.toContain('kici-admin event-log list');
   });
 
-  it('warns for the deprecated reject value, which drops exactly the same way', () => {
-    const out = formatPolicy({ ...VIEW, forkPolicy: ForkPolicy.enum.reject }, 'table');
-    expect(out).toContain('drops fork pull requests before dispatch');
-  });
-
   it('does not warn under a policy that leaves the contributor something to see', () => {
     // Non-vacuity for the three cases above: `hold` and `allow` both produce a
     // run or a check, so a build that warned unconditionally would fail here.
@@ -161,28 +144,18 @@ describe('formatPolicy', () => {
     expect(out).not.toContain('nobody chose');
   });
 
-  it('emits JSON when asked, carrying the fields the table omits', () => {
+  it('emits JSON when asked', () => {
     expect(JSON.parse(formatPolicy(VIEW, 'json'))).toMatchObject({
       forkPolicy: 'hold',
-      unknownContributorPolicy: 'reject',
-      workflowChangePolicy: 'allow',
+      approvalExpiryHours: 72,
     });
   });
 });
 
 describe('buildPolicyPatch', () => {
   it('maps kebab flags onto the wire field names', () => {
-    expect(
-      buildPolicyPatch({
-        forkPolicy: 'reject',
-        unknownContributorPolicy: 'hold',
-        workflowChangePolicy: 'allow',
-        approvalExpiryHours: '12',
-      }),
-    ).toEqual({
-      forkPolicy: 'reject',
-      unknownContributorPolicy: 'hold',
-      workflowChangePolicy: 'allow',
+    expect(buildPolicyPatch({ forkPolicy: 'hold', approvalExpiryHours: '12' })).toEqual({
+      forkPolicy: 'hold',
       approvalExpiryHours: 12,
     });
   });
@@ -210,11 +183,18 @@ describe('buildPolicyPatch', () => {
     expect(msg).toContain(ForkPolicy.options.join(' | '));
   });
 
-  it('rejects `allow` for the unknown-contributor policy', () => {
-    // The wire schema declares no `allow` member for that arm; offering it would
-    // produce a value the Platform can never send and the route would refuse.
-    const msg = expectExit(() => buildPolicyPatch({ unknownContributorPolicy: 'allow' }));
-    expect(msg).toContain('hold | reject');
+  it('rejects the removed `reject` fork-policy value', () => {
+    // fails-when: the retired value is offered again — the wire enum no longer
+    // carries it, so the route would refuse the patch.
+    const msg = expectExit(() => buildPolicyPatch({ forkPolicy: 'reject' }));
+    expect(msg).toContain(ForkPolicy.options.join(' | '));
+  });
+
+  it('ignores the removed non-fork arms rather than sending them', () => {
+    // fails-when: a stale flag value reaches the PATCH body.
+    expect(
+      buildPolicyPatch({ unknownContributorPolicy: 'hold', workflowChangePolicy: 'allow' }),
+    ).toEqual({});
   });
 
   it.each(['0', '-1', '1.5', 'abc'])('rejects approval expiry %s', (value) => {
@@ -278,37 +258,6 @@ describe('policyExpiryWarnings', () => {
     expect(policyExpiryWarnings({ approvalExpiryHours: 72 })).toEqual([]);
     expect(policyExpiryWarnings({ approvalExpirySeconds: 30 })).toEqual([]);
     expect(policyExpiryWarnings({ forkPolicy: 'hold' })).toEqual([]);
-  });
-});
-
-describe('policyDeprecationWarnings', () => {
-  it('warns that `reject` is deprecated in favour of `ignore`', () => {
-    const [warning, ...rest] = policyDeprecationWarnings({ forkPolicy: ForkPolicy.enum.reject });
-    expect(rest).toEqual([]);
-    expect(warning).toContain('--fork-policy reject is deprecated');
-    expect(warning).toContain('--fork-policy ignore');
-  });
-
-  it('says nothing about a live fork-policy value', () => {
-    for (const value of [ForkPolicy.enum.ignore, ForkPolicy.enum.hold, ForkPolicy.enum.allow]) {
-      expect(policyDeprecationWarnings({ forkPolicy: value })).toEqual([]);
-    }
-  });
-
-  it('warns that each dead arm is no longer enforced', () => {
-    const warnings = policyDeprecationWarnings({
-      unknownContributorPolicy: 'hold',
-      workflowChangePolicy: 'allow',
-    });
-    expect(warnings).toHaveLength(2);
-    expect(warnings[0]).toContain('--unknown-contributor-policy');
-    expect(warnings[0]).toContain('no longer enforced; removed at v1.0.0');
-    expect(warnings[1]).toContain('--workflow-change-policy');
-    expect(warnings[1]).toContain('no longer enforced; removed at v1.0.0');
-  });
-
-  it('says nothing for a patch that touches only live fields', () => {
-    expect(policyDeprecationWarnings({ forkPolicy: 'hold', approvalExpiryHours: 12 })).toEqual([]);
   });
 });
 

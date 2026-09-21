@@ -75,7 +75,6 @@ Categories you may see:
 - **No agent available to run this job** — no agent matching the job's `runs-on` labels was reachable.
 - **Matrix expansion failed** — a job's dynamic matrix function threw or timed out while resolving its matrix values, so that job is marked failed before any of its steps run.
 - **Sandbox escape-hatch request not permitted** — the workflow requested a container-sandbox capability or host networking the org's allow-list does not permit.
-- **Rejected by the org trust policy** — the org's trust policy is set to `reject` for this pull request (a fork PR, an unresolvable contributor, or a workflow-file change by a non-trusted contributor). The run fails before any job starts and is **not** approvable — an org owner must change the policy under **Settings > CI trust**, after which a new push re-evaluates it. See [CI security](security/security.md).
 - **Approval gate misconfigured** — an approval gate carried an invalid timeout (it must be a positive integer number of seconds). The whole run fails before any job dispatches rather than letting the gate silently expire open. Fix the `approval.timeout` in the workflow (or the lock file) and re-run.
 
 For run-scoped failures (the whole run never started), the dashboard offers

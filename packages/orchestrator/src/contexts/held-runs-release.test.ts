@@ -7,6 +7,7 @@ import { HoldScope, HoldType, installGateJobId, TriggerSource } from '@kici-dev/
 import { createMigrationProvider } from '../db/migration-provider.js';
 import { HeldRunStore } from './held-runs.js';
 import type { Database } from '../db/types.js';
+import { terminateTestDbBackends } from '../__test-helpers__/test-db.js';
 
 /**
  * Real-Postgres integration test for the workflow install-hold release helper
@@ -76,10 +77,7 @@ describeDb('HeldRunStore release helpers', () => {
     await pool?.end().catch(() => {});
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      await adminPool.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await adminPool.end();

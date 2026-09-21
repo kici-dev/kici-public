@@ -22,11 +22,9 @@ interface GlobalWorkflowPermission {
  * off — or the cluster row is unreadable, which fails closed — no repo may
  * register or dispatch a global workflow, whatever the per-org lists say.
  *
- * With the switch on, three independent per-org axes apply (each stored as a
+ * With the switch on, two independent per-org axes apply (each stored as a
  * jsonb array of `{routingKey?, pattern}` entries on `org_settings`). A missing
- * `org_settings` row means "no per-org restrictions" for the repo and source
- * axes, not a denial; elevated access still requires an explicit list, so a
- * missing row grants none.
+ * `org_settings` row means "no per-org restrictions", not a denial.
  *
  * - Workflow-repo allow-list (`global_workflow_allowed_repos`): which repos
  *   may author global workflows. null/empty = any repo. Checked at
@@ -37,9 +35,6 @@ interface GlobalWorkflowPermission {
  *   must never have global workflows run against their events (e.g., forks,
  *   untrusted contrib repos). Checked at dispatch time against the EVENT's
  *   repo (the repo that emitted the webhook).
- *
- * - Elevated access (`global_workflow_elevated_repos`): which workflow-
- *   authoring repos can read source-repo secrets during execution.
  *
  * Each entry can optionally pin a `routingKey`, restricting the entry to
  * one webhook source. An entry without a routing key applies to any source
@@ -60,7 +55,7 @@ export class GlobalWorkflowPolicy {
    * The fleet-wide master gate, consulted before any per-org list.
    *
    * Returns `undefined` when the gate passes, or the denial to return
-   * verbatim when it does not — so all three axes share one decision and one
+   * verbatim when it does not — so both axes share one decision and one
    * pair of reasons.
    *
    * Fails closed on `{ ok: false }`. That case is a database fault, not an
@@ -153,39 +148,6 @@ export class GlobalWorkflowPolicy {
     return { allowed: true };
   }
 
-  /**
-   * Check whether a workflow-authoring repository is on the elevated-access
-   * list. The workflow's routing key is matched against each entry's optional
-   * `routingKey` qualifier. Returns false if no org_settings row or the
-   * elevated list is null/empty.
-   *
-   * @deprecated Not enforced, and not enforceable in this shape. It was meant
-   * to gate a global workflow's job reading the *source* repository's secrets,
-   * but the organization-wide dispatch path resolves no secrets at all — it
-   * binds no secret contexts, and writes no secret material into a job config
-   * (asserted by `pipeline/process-webhook-globals-secrets.test.ts`). So there
-   * is no injection for a grant to widen, and this method has no caller.
-   *
-   * Granting it would not be a matter of calling this from the dispatch path:
-   * secrets are stored `(org_id, scope, key)` with no repository dimension, so
-   * "the source repository's secrets" is not a set the orchestrator can name
-   * today. The list, its admin route, its CLI mutators and its wire field are
-   * deprecated pending removal at v1.0.0 (`docs/user/deprecations.md`).
-   */
-  async isElevatedAccessAllowed(
-    workflowRoutingKey: string,
-    repoIdentifier: string,
-    customerId: string,
-  ): Promise<boolean> {
-    if (await this.clusterGate()) return false;
-    const settings = await this.getSettings(customerId);
-    if (!settings?.global_workflow_elevated_repos) return false;
-    // Elevated list: an unstorable entry grants nothing.
-    return settings.global_workflow_elevated_repos.some((entry) =>
-      matchesEntry(entry, workflowRoutingKey, repoIdentifier, customerId, false),
-    );
-  }
-
   private async getSettings(customerId: string) {
     return this.db
       .selectFrom('org_settings')
@@ -208,8 +170,8 @@ export class GlobalWorkflowPolicy {
  * pair, not a file path, so a leading dot carries no meaning of its own and a
  * wildcard segment matches one: `myorg/*` covers `myorg/.github`.
  *
- * That is what an operator writing `myorg/*` means in any of the three lists,
- * and on the deny-list it is load-bearing. Under path-glob semantics no
+ * That is what an operator writing `myorg/*` means in either list, and on the
+ * deny-list it is load-bearing. Under path-glob semantics no
  * wildcard segment matched a dot-prefixed one, so a deny entry of `myorg/*`,
  * `myorg/**`, or even `**` silently ADMITTED `myorg/.github` — a control that
  * did not do what its pattern said, in the one direction where failing means
@@ -228,9 +190,8 @@ function matchesEntry(
   customerId: string,
   /**
    * The verdict for an entry whose pattern is invalid. Always the fail-closed
-   * direction of the list being evaluated: `false` on an allow list or the
-   * elevated list (the entry grants nothing), `true` on a deny list (the entry
-   * blocks).
+   * direction of the list being evaluated: `false` on the allow list (the
+   * entry grants nothing), `true` on the deny list (the entry blocks).
    */
   onInvalid: boolean,
 ): boolean {

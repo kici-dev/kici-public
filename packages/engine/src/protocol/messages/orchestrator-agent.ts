@@ -131,13 +131,6 @@ export const jobDispatchSchema = z
     /** URL or file:// path to a pre-packed `.kici/` source tarball. If present, agent extracts it into workDir instead of cloning the repo. */
     sourceTarUrl: z.string().optional(),
     /**
-     * @deprecated Use `sourceTarDigest`. Despite its name this carries the
-     * workflow `contentHash`, not a hash of the tarball bytes, so an agent
-     * could not verify a restored tarball against it. Kept on the wire for
-     * older agents; removed at v1.0.0.
-     */
-    sourceTarHash: z.string().optional(),
-    /**
      * SHA-256 of the source tarball's own bytes, for integrity verification
      * before extraction. The sibling of `depsHash`, which has always carried
      * the dependency tarball's real digest.
@@ -882,31 +875,24 @@ export const artifactsUploadResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Agent -> Orchestrator: confirm an artifact upload finished; records the DB row. */
-export const artifactsUploadCompleteSchema = z.object({
-  type: z.literal('artifacts.upload.complete'),
-  messageId: z.string(),
-  jobId: z.string(),
-  name: z.string(),
-  /**
-   * Packed tarball size in bytes.
-   *
-   * @deprecated Advisory only — the orchestrator reads the real object size back
-   * from storage and records that instead. Still sent for backward compatibility
-   * with older orchestrators; removed at v1.0.0.
-   */
-  sizeBytes: z.number().int().nonnegative(),
-  /** SHA-256 (hex) of the tarball bytes. */
-  sha256: z.string(),
-  /**
-   * Storage key echoed from the grant response.
-   *
-   * @deprecated Ignored server-side — the orchestrator derives the storage key
-   * from the server-resolved run and artifact name. Still sent for backward
-   * compatibility with older orchestrators; removed at v1.0.0.
-   */
-  storageKey: z.string(),
-});
+/**
+ * Agent -> Orchestrator: confirm an artifact upload finished; records the DB row.
+ *
+ * The orchestrator derives the storage key from the server-resolved run and
+ * artifact name and reads the real object size back from storage, so the agent
+ * asserts neither. `.strict()`: an agent still echoing either is on a build the
+ * protocol floor refuses, and a stray field is a version-skew signal.
+ */
+export const artifactsUploadCompleteSchema = z
+  .object({
+    type: z.literal('artifacts.upload.complete'),
+    messageId: z.string(),
+    jobId: z.string(),
+    name: z.string(),
+    /** SHA-256 (hex) of the tarball bytes. */
+    sha256: z.string(),
+  })
+  .strict();
 
 /**
  * Outcome the orchestrator reports for an artifact commit: the DB row was

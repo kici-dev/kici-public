@@ -107,8 +107,6 @@ export const platformCapabilitiesSchema = z
   .object({
     /** Platform ingests periodic `orch.metrics` telemetry pushes. */
     orchMetrics: z.boolean().optional(),
-    /** Platform serves the orchestrator-initiated `oidc.mint.request` RPC. */
-    oidcMint: z.boolean().optional(),
   })
   .passthrough();
 
@@ -118,7 +116,6 @@ export type PlatformCapabilities = z.infer<typeof platformCapabilitiesSchema>;
 /** Default Platform capabilities advertised to the orchestrator after auth. */
 export const PLATFORM_CAPABILITIES = Object.freeze({
   orchMetrics: true,
-  oidcMint: true,
 } satisfies PlatformCapabilities);
 
 /**

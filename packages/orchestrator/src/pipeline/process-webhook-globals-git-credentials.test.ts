@@ -106,7 +106,6 @@ function makeDeps(): {
     globalWorkflowPolicy: {
       isWorkflowRepoAllowed: vi.fn(async () => ({ allowed: true })),
       isSourceRepoAllowed: vi.fn(async () => ({ allowed: true })),
-      isElevatedAccessAllowed: vi.fn(async () => false),
     },
     executionTracker: {
       onExecutionStarted: vi.fn(async () => undefined),

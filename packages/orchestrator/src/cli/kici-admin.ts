@@ -58,6 +58,7 @@ import { registerRegistrationCommands } from './commands/registration.js';
 import { registerEventCommands } from './commands/event.js';
 import { registerEventDlqCommands } from './commands/event-dlq.js';
 import { registerColdStoreCommands } from './commands/cold-store.js';
+import { registerCacheCommands } from './commands/cache.js';
 import { registerFirecrackerCommands } from './commands/firecracker/index.js';
 import { registerScalerCommands } from './commands/scaler.js';
 import { registerJoinCommand } from './join.js';
@@ -198,6 +199,9 @@ export function buildProgram(): Command {
   registerEventDlqCommands(program, getClient);
   // Cold-store CLI stubs (standalone namespace; admin HTTP-backed).
   registerColdStoreCommands(program, getClient);
+  // Cache maintenance talks to the storage backend directly — no admin HTTP
+  // client, no DB, no running orchestrator.
+  registerCacheCommands(program);
   // Join command does not use AdminApiClient (connects directly to Platform/peer)
   registerJoinCommand(program);
 

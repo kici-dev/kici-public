@@ -8,13 +8,9 @@
  * it records the run with `dispatchedContexts: undefined` precisely because "this
  * path binds no secret contexts".
  *
- * That is the fact `global_workflow_elevated_repos` was meant to gate, and it is
- * why the list is inert: there is no secret injection on this path for a grant to
- * widen. `GlobalWorkflowPolicy.isElevatedAccessAllowed` is deprecated rather than
- * enforced for the same reason (see its doc comment and
- * `global-workflow-policy.test.ts`), and this test is the behavioural half of
- * that claim — it fails the moment secret material starts reaching a global job,
- * which is exactly when the elevated-access question has to be reopened.
+ * This test pins that: it fails the moment secret material starts reaching a
+ * global job, which is when the question of which repository's secrets such a
+ * job may read has to be answered before anything ships.
  *
  * The fixture shape mirrors `process-webhook-globals-payload.test.ts`.
  */
@@ -80,12 +76,10 @@ function makeDeps(): {
   deps: Parameters<typeof processWebhook>[1];
   dispatch: ReturnType<typeof vi.fn>;
   resolveForJob: ReturnType<typeof vi.fn>;
-  isElevatedAccessAllowed: ReturnType<typeof vi.fn>;
 } {
   const dispatch = vi.fn().mockResolvedValue({ status: 'queued' });
   // A resolver that would hand out a secret if anything asked it to.
   const resolveForJob = vi.fn().mockResolvedValue({ PROD_TOKEN: 'super-secret' });
-  const isElevatedAccessAllowed = vi.fn(async () => true);
 
   const bundle = {
     normalizer: {
@@ -131,13 +125,12 @@ function makeDeps(): {
     globalWorkflowPolicy: {
       isWorkflowRepoAllowed: vi.fn(async () => ({ allowed: true })),
       isSourceRepoAllowed: vi.fn(async () => ({ allowed: true })),
-      isElevatedAccessAllowed,
     },
     dispatcher: { dispatch },
     lockFileCache: { get: vi.fn(async () => null) },
   } as unknown as Parameters<typeof processWebhook>[1];
 
-  return { deps, dispatch, resolveForJob, isElevatedAccessAllowed };
+  return { deps, dispatch, resolveForJob };
 }
 
 describe('an organization-wide workflow job carries no secret material', () => {
@@ -161,16 +154,5 @@ describe('an organization-wide workflow job carries no secret material', () => {
 
     expect(dispatch).toHaveBeenCalled();
     expect(resolveForJob).not.toHaveBeenCalled();
-  });
-
-  it('never consults the elevated-access list, even when it would say yes', async () => {
-    // The grant is configured and would return true. Nothing asks — which is
-    // the whole finding: the setting names a permission no code reads.
-    const { deps, dispatch, isElevatedAccessAllowed } = makeDeps();
-
-    await processWebhook(makeInfo(), deps);
-
-    expect(dispatch).toHaveBeenCalled();
-    expect(isElevatedAccessAllowed).not.toHaveBeenCalled();
   });
 });

@@ -105,7 +105,7 @@ Webhook arrives
    7a. Resolve context name (static from lock file, or via init phase for dynamic)
    7b. Look up context in DB (ContextStore.matchContext)
        - Fixed: exact name match
-       - Glob: picomatch pattern match
+       - Glob: glob pattern match
    7c. Evaluate protection rules (sequential pipeline)
        - Branch gate -> Trust gate -> Concurrency gate -> Reviewer gate -> Timer gate
    7d. On reject: mark job as rejected, set error_message
@@ -127,8 +127,6 @@ Each job's ordered bound-context name list is persisted on its `execution_jobs.c
 ### Dynamic field resolution
 
 When a lock file job has dynamic fields (`dynamicContext`, `dynamicEnv`, or `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. It never evaluates workflow code in-process — every dynamic function runs on the eval agent's init runner.
-
-`LockInlineValue` (`_type: 'inline'`) is a **deprecated, read-only-recognized** lock shape. An already-deployed lock may still carry a dynamic field serialized as `{ _type: 'inline', expression: … }`; the orchestrator recognizes the shape but **never evaluates it** — it defers the field to the init step exactly like any other dynamic field. The compiler no longer emits it (see [deprecations](../user/deprecations.md)).
 
 #### Init model
 
@@ -276,7 +274,7 @@ Resolution for context 'production' (bound to both patterns):
 The algorithm:
 
 1. Collect all scope patterns bound to the context
-2. For each pattern, find matching secrets using picomatch glob matching
+2. For each pattern, find matching secrets using glob matching
 3. Sort matched secrets by scope path length (descending)
 4. Build flat map: last-write-wins on key collisions (longest path = highest priority)
 
@@ -356,9 +354,9 @@ The lock file (v6+) includes per-job context fields:
 }
 ```
 
-- `context` -- static context name (`string`); an older lock may carry a deprecated `LockInlineValue`, which the orchestrator defers to the init step rather than evaluating
+- `context` -- static context name (`string`)
 - `dynamicContext` -- `true` when context is a function (resolved on the agent's init step)
-- `env` -- static environment variables (`Record<string, string>`); an older lock may carry a deprecated `LockInlineValue`, deferred to the init step
+- `env` -- static environment variables (`Record<string, string>`)
 - `dynamicEnv` -- `true` when env is a function
-- `concurrencyGroup` -- static concurrency group name (`string`); an older lock may carry a deprecated `LockInlineValue`, deferred to the init step
+- `concurrencyGroup` -- static concurrency group name (`string`)
 - `dynamicConcurrencyGroup` -- `true` when concurrencyGroup is a function

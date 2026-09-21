@@ -13,6 +13,7 @@ import {
 import type { LabelMatcher } from '@kici-dev/engine';
 import { matchHostPattern } from '@kici-dev/engine/context/host-match';
 import type { Database } from '../db/types.js';
+import { terminateTestDbBackends } from '../__test-helpers__/test-db.js';
 
 /** An exact-match matcher, the post-compile equivalent of a plain label string. */
 const exact = (value: string): LabelMatcher => ({ kind: 'exact', value });
@@ -54,10 +55,7 @@ describeDb('HostRosterStore', () => {
     await pool?.end().catch(() => {});
     const admin = new pg.Pool({ connectionString: adminUrl });
     try {
-      await admin.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(admin, TEST_DB);
       await admin.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await admin.end();

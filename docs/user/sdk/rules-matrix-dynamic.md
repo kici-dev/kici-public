@@ -82,9 +82,8 @@ The throw is a `ChangedFilesUnavailableError` (exported from `@kici-dev/sdk`, ca
 ### evaluateRules(rules, context, label, onRuleResult?)
 
 The agent calls this on your behalf. A workflow does not call it. It lives on
-`@kici-dev/sdk/internal`, outside semver, and stays exported from the root barrel as
-`@deprecated` until v1.0.0 — see [deprecations](../deprecations.md). It is described here
-because its return shape is what a rule's outcome looks like in the run log.
+`@kici-dev/sdk/internal`, outside semver, and is not exported from the root barrel. It is
+described here because its return shape is what a rule's outcome looks like in the run log.
 
 Evaluate an array of rules sequentially with fail-fast behavior. Stops on the first failure.
 
@@ -337,9 +336,8 @@ isDynamicFunction(matrix); // true if async function
 ### Matrix expansion utilities
 
 The agent expands a matrix for you. A workflow does not call these. They live on
-`@kici-dev/sdk/internal`, outside semver, and stay exported from the root barrel as
-`@deprecated` until v1.0.0 — see [deprecations](../deprecations.md). They are described
-here because they define the combinations a matrix job actually produces.
+`@kici-dev/sdk/internal`, outside semver, and are not exported from the root barrel. They are
+described here because they define the combinations a matrix job actually produces.
 
 ```typescript
 import { expandMatrix, applyIncludeExclude } from '@kici-dev/sdk/internal';

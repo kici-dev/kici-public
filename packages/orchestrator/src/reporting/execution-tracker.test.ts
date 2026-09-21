@@ -85,8 +85,15 @@ function createMockDb() {
       // insert values could not express a recovered posture at all.
       trust_tier?: string | null;
       lock_file_source?: string | null;
+      registration_window_instance_id?: string | null;
     }
   >();
+  /**
+   * `cluster_instances` rows with a fresh heartbeat. The registration-window
+   * holder check reads liveness from here, so a test declares which sibling
+   * coordinators are alive.
+   */
+  const liveInstances = new Set<string>();
 
   const db = {
     insertInto: vi.fn((table: string) => {
@@ -337,6 +344,18 @@ function createMockDb() {
                 return 0;
               }
             }
+            // The registration-window clear is guarded on the holder still
+            // being this coordinator; a clear against a sibling's window is a
+            // no-op, the same way Postgres behaves.
+            const holderGuard = currentWheres.find(
+              (w) => w[0] === 'registration_window_instance_id' && w[1] === '=',
+            );
+            if (table === 'execution_runs' && runId && holderGuard) {
+              const existing = runRows.get(String(runId));
+              if ((existing?.registration_window_instance_id ?? null) !== holderGuard[2]) {
+                return 0;
+              }
+            }
             updates.push({ table, values: vals, where: [...currentWheres] });
             // Keep the tracked run row current, so a later upsert's guard and
             // the rehydration path both see what the row actually holds. Merged
@@ -349,6 +368,10 @@ function createMockDb() {
               if ('trust_tier' in vals) next.trust_tier = vals.trust_tier as string | null;
               if ('lock_file_source' in vals) {
                 next.lock_file_source = vals.lock_file_source as string | null;
+              }
+              if ('registration_window_instance_id' in vals) {
+                next.registration_window_instance_id = vals.registration_window_instance_id as
+                  string | null;
               }
               runRows.set(String(runId), next);
             }
@@ -380,6 +403,26 @@ function createMockDb() {
               // map cannot represent.
               execute: vi.fn(async () => {
                 selects.push({ table, where: [...currentWheres] });
+                // The finished-elsewhere sweep: every tracked run row whose id
+                // is asked for and whose status is in the asked set.
+                if (table === 'execution_runs') {
+                  const ids = currentWheres.find((w) => w[0] === 'run_id' && w[1] === 'in')?.[2];
+                  const statuses = currentWheres.find(
+                    (w) => w[0] === 'status' && w[1] === 'in',
+                  )?.[2];
+                  if (!Array.isArray(ids) || !Array.isArray(statuses)) return [];
+                  return (ids as string[])
+                    .map((id) => [id, runRows.get(id)] as const)
+                    .filter(([, row]) => row?.status !== undefined && statuses.includes(row.status))
+                    .map(([run_id, row]) => ({ run_id, status: row!.status }));
+                }
+                if (table === 'cluster_instances') {
+                  const asked = currentWheres.find((w) => w[0] === 'instance_id')?.[2];
+                  const ids = Array.isArray(asked) ? (asked as string[]) : [];
+                  return ids
+                    .filter((id) => liveInstances.has(id))
+                    .map((instance_id) => ({ instance_id }));
+                }
                 const only = currentWheres.length === 1 ? currentWheres[0] : undefined;
                 if (table !== 'execution_jobs' || only?.[0] !== 'run_id' || only[1] !== '=') {
                   return [];
@@ -387,7 +430,7 @@ function createMockDb() {
                 const prefix = `${String(only[2])}:`;
                 return [...jobRows.entries()]
                   .filter(([key]) => key.startsWith(prefix))
-                  .map(([, r]) => ({ status: r.status, job_name: r.job_name }));
+                  .map(([, r]) => ({ status: r.status, job_name: r.job_name, job_id: r.job_id }));
               }),
               executeTakeFirst: vi.fn(async () => {
                 selects.push({ table, where: [...currentWheres] });
@@ -460,6 +503,7 @@ function createMockDb() {
                     workflow_repo_identifier: row.workflow_repo_identifier ?? null,
                     trust_tier: row.trust_tier ?? null,
                     lock_file_source: row.lock_file_source ?? null,
+                    registration_window_instance_id: row.registration_window_instance_id ?? null,
                   };
                 }
                 return undefined;
@@ -504,7 +548,9 @@ function createMockDb() {
     selects,
     stepRows,
     jobRows,
+    runRows,
     dispatchQueueRows,
+    liveInstances,
   };
 }
 
@@ -2825,8 +2871,6 @@ describe('ExecutionTracker', () => {
     });
 
     it('carries the trust posture once the dispatch site stamps it', async () => {
-      // `known` is legacy vocabulary `resolveRefTrust` no longer produces, so a
-      // forwarded value can only have come from this call.
       await tracker.onExecutionStarted(
         'run-posture',
         'ci',
@@ -2842,10 +2886,10 @@ describe('ExecutionTracker', () => {
       // Absent before the stamp — the fields are optional, not defaulted.
       expect(tracker.getExecutionContext('run-posture')).not.toHaveProperty('trustTier');
 
-      tracker.setRunTrustContext('run-posture', 'known', 'base');
+      tracker.setRunTrustContext('run-posture', 'unknown', 'base');
 
       expect(tracker.getExecutionContext('run-posture')).toMatchObject({
-        trustTier: 'known',
+        trustTier: 'unknown',
         lockFileSource: 'base',
       });
     });
@@ -4926,6 +4970,80 @@ describe('ExecutionTracker', () => {
     });
   });
 
+  describe('onJobStatus precursor_result persistence', () => {
+    const start = (jobId: string, jobName: string) =>
+      tracker.onExecutionStarted(
+        'run-pre',
+        'wf',
+        'github',
+        'org/repo',
+        'main',
+        'refs/heads/main',
+        'd1',
+        {},
+        null,
+        [{ jobId, jobName }],
+        'github:1',
+      );
+    const terminalUpdate = (jobId: string) =>
+      mockDb.updates.find(
+        (u) =>
+          u.table === 'execution_jobs' &&
+          u.values.status === ExecutionJobStatus.enum.success &&
+          u.where.some(([col, op, val]) => col === 'job_id' && op === '=' && val === jobId),
+      );
+
+    it('persists the build marker on the terminal row so a sibling coordinator can read it', async () => {
+      await start('build-1', '__build__wf');
+      await tracker.onJobStatus(
+        'run-pre',
+        'build-1',
+        ExecutionJobStatus.enum.success,
+        Date.now(),
+        'agent-1',
+        { buildComplete: true, workflowName: 'wf' },
+      );
+      // fails-when: the terminal upsert omits precursor_result — the shared
+      // row carries the status but not the marker, and a coordinator awaiting
+      // this build from the database never settles.
+      const update = terminalUpdate('build-1');
+      expect(update).toBeDefined();
+      expect(update!.values.precursor_result).toBe(JSON.stringify({ buildComplete: true }));
+    });
+
+    it('persists the init result beside its marker', async () => {
+      await start('init-1', '__init__wf');
+      await tracker.onJobStatus(
+        'run-pre',
+        'init-1',
+        ExecutionJobStatus.enum.success,
+        Date.now(),
+        'agent-1',
+        { initComplete: true, initResult: { env: { A: '1' } } },
+      );
+      expect(terminalUpdate('init-1')!.values.precursor_result).toBe(
+        JSON.stringify({ initComplete: true, initResult: { env: { A: '1' } } }),
+      );
+    });
+
+    it('writes no precursor_result for an ordinary job', async () => {
+      // breaks-if-wrong: every ordinary job would carry a payload column it
+      // never reported, and the watcher would settle nothing from it anyway.
+      await start('job-1', 'test');
+      await tracker.onJobStatus(
+        'run-pre',
+        'job-1',
+        ExecutionJobStatus.enum.success,
+        Date.now(),
+        'agent-1',
+        { outputs: { a: 1 } },
+      );
+      const update = terminalUpdate('job-1');
+      expect(update).toBeDefined();
+      expect(update!.values).not.toHaveProperty('precursor_result');
+    });
+  });
+
   describe('onJobStatus with initFailure', () => {
     it('persists init_failure on the execution_jobs row when provided', async () => {
       const onJobStatusChange = vi.fn();
@@ -5000,6 +5118,379 @@ describe('ExecutionTracker', () => {
 
   // The per-run lock that prevents the synthetic→real job-swap race
   // (addJobsToRun vs a concurrent onJobStatus) from wedging a run in `running`.
+  describe('registration window across coordinators', () => {
+    const OWNER = 'coord-b';
+    const SIBLING = 'coord-a';
+    const RUN = 'run-ha';
+
+    /** A tracker standing in for one coordinator of a cluster, on the shared mock DB. */
+    const coordinator = (instanceId: string) => {
+      const complete = vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionComplete']>>();
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        instanceId,
+        onExecutionComplete: complete,
+      });
+      return { tracker: t, complete };
+    };
+
+    /** The owner registers the run with its build job alone and takes the window token. */
+    const ownerStartsBuildWindow = async (owner: ExecutionTracker) => {
+      await owner.onExecutionStarted(
+        RUN,
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-ha',
+        { installationId: 42 },
+        { matched: true },
+        [{ jobId: 'build-1', jobName: '__build__ci' }],
+      );
+      expect(owner.holdRunForPendingJobs(RUN)).toBe(true);
+      await owner.registrationWindowSettled(RUN);
+    };
+
+    /**
+     * The sibling's agent reports the build: the sibling holds no in-memory
+     * run, so it rehydrates one from the row and learns only this job.
+     */
+    const siblingReportsBuild = async (sibling: ExecutionTracker, state: string) => {
+      mockDb.dispatchQueueRows.set('build-1', '__build__ci');
+      await sibling.onJobStatus(RUN, 'build-1', ExecutionJobStatus.enum.running, Date.now(), 'ag');
+      await sibling.onJobStatus(RUN, 'build-1', state, Date.now(), 'ag', { buildComplete: true });
+    };
+
+    it('the owner writes its instance id when it takes its first token and clears it on the last release', async () => {
+      const { tracker: owner } = coordinator(OWNER);
+      await ownerStartsBuildWindow(owner);
+      // fails-when: the token stays in-memory only — a sibling rehydrating the
+      // run reads NULL and finalizes on the build job alone.
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBe(OWNER);
+
+      // A second token does not rewrite the column; only the last release clears it.
+      expect(owner.holdRunForPendingJobs(RUN)).toBe(true);
+      await owner.releasePendingJobsHold(RUN);
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBe(OWNER);
+      await owner.releasePendingJobsHold(RUN);
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBeNull();
+    });
+
+    it('a release after the run left memory still clears the window', async () => {
+      const { tracker: owner } = coordinator(OWNER);
+      await ownerStartsBuildWindow(owner);
+      await owner.failRun(RUN, 'dispatch loop threw');
+      // breaks-if-wrong: failRun drops the in-memory run, so a release keyed
+      // on the counter alone would leave a live holder behind and every
+      // sibling would defer the recovered run forever.
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBeNull();
+      await owner.releasePendingJobsHold(RUN);
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBeNull();
+    });
+
+    it('a sibling that sees the build finish defers while the live owner still registers jobs', async () => {
+      const { tracker: owner } = coordinator(OWNER);
+      const { tracker: sibling, complete: siblingComplete } = coordinator(SIBLING);
+      await ownerStartsBuildWindow(owner);
+      mockDb.liveInstances.add(OWNER);
+
+      await siblingReportsBuild(sibling, ExecutionJobStatus.enum.success);
+
+      // fails-when: the sibling finalizes on the build job alone — the exact
+      // false-green the window exists to stop.
+      expect(siblingComplete).not.toHaveBeenCalled();
+      expect(mockDb.runRows.get(RUN)?.status).not.toBe(ExecutionRunStatus.enum.success);
+    });
+
+    it('the owner finalizes on release with the jobs a sibling finished folded in', async () => {
+      const { tracker: owner, complete: ownerComplete } = coordinator(OWNER);
+      const { tracker: sibling, complete: siblingComplete } = coordinator(SIBLING);
+      await ownerStartsBuildWindow(owner);
+      mockDb.liveInstances.add(OWNER);
+      await siblingReportsBuild(sibling, ExecutionJobStatus.enum.success);
+
+      // The owner's watcher settled its build wait; it dispatches the real
+      // job, which the sibling's agent claims and fails before the owner's
+      // pipeline releases the window.
+      owner.updateInMemoryJob(RUN, 'build-1', ExecutionJobStatus.enum.success);
+      await owner.addJobsToRun(RUN, [{ jobId: 'check-1', jobName: 'check' }]);
+      mockDb.dispatchQueueRows.set('check-1', 'check');
+      await sibling.onJobStatus(RUN, 'check-1', ExecutionJobStatus.enum.failed, Date.now(), 'ag', {
+        error: 'boom',
+      });
+      expect(siblingComplete).not.toHaveBeenCalled();
+
+      await owner.releasePendingJobsHold(RUN);
+
+      // breaks-if-wrong: the owner's own map still holds check-1 as pending
+      // (its frames went to the sibling), so a memory-only check leaves the
+      // run in `running` forever — and a status computed over the owner's
+      // map alone would miss the failure.
+      expect(mockDb.runRows.get(RUN)?.status).toBe(ExecutionRunStatus.enum.failed);
+      expect(ownerComplete).toHaveBeenCalledWith(
+        RUN,
+        ExecutionRunStatus.enum.failed,
+        expect.objectContaining({ workflowName: 'ci' }),
+        'Failed jobs: check',
+      );
+      expect(siblingComplete).not.toHaveBeenCalled();
+    });
+
+    it('the sibling finalizes with the whole job set once the owner released the window', async () => {
+      const { tracker: owner, complete: ownerComplete } = coordinator(OWNER);
+      const { tracker: sibling, complete: siblingComplete } = coordinator(SIBLING);
+      await ownerStartsBuildWindow(owner);
+      mockDb.liveInstances.add(OWNER);
+      await siblingReportsBuild(sibling, ExecutionJobStatus.enum.success);
+      owner.updateInMemoryJob(RUN, 'build-1', ExecutionJobStatus.enum.success);
+      await owner.addJobsToRun(RUN, [{ jobId: 'check-1', jobName: 'check' }]);
+      await owner.releasePendingJobsHold(RUN);
+      // The owner's release finds the real job still pending, so it finalizes nothing.
+      expect(ownerComplete).not.toHaveBeenCalled();
+
+      mockDb.dispatchQueueRows.set('check-1', 'check');
+      await sibling.onJobStatus(RUN, 'check-1', ExecutionJobStatus.enum.success, Date.now(), 'ag');
+
+      // breaks-if-wrong: the legitimate case — the window is gone, every job
+      // is terminal, and the coordinator that saw the last job must finish
+      // the run, or nothing does.
+      expect(mockDb.runRows.get(RUN)?.status).toBe(ExecutionRunStatus.enum.success);
+      expect(siblingComplete).toHaveBeenCalledWith(
+        RUN,
+        ExecutionRunStatus.enum.success,
+        expect.objectContaining({ workflowName: 'ci' }),
+        undefined,
+      );
+    });
+
+    it('a dead holder reads as no window', async () => {
+      const { tracker: owner } = coordinator(OWNER);
+      const { tracker: sibling, complete: siblingComplete } = coordinator(SIBLING);
+      await ownerStartsBuildWindow(owner);
+      // The owner's heartbeat row is stale — it is gone.
+      mockDb.liveInstances.clear();
+
+      await siblingReportsBuild(sibling, ExecutionJobStatus.enum.success);
+
+      // breaks-if-wrong: a holder that died mid-window would otherwise hold the
+      // run open forever, since nothing will ever clear its id.
+      expect(siblingComplete).toHaveBeenCalledWith(
+        RUN,
+        ExecutionRunStatus.enum.success,
+        expect.anything(),
+        undefined,
+      );
+    });
+
+    it('a sibling-owned job that is not terminal keeps the run open even with no window', async () => {
+      // A two-job run the owner registered in full and never held a window on:
+      // the sibling's agent finishes one job while the other still runs.
+      const { tracker: owner } = coordinator(OWNER);
+      const { tracker: sibling, complete: siblingComplete } = coordinator(SIBLING);
+      await owner.onExecutionStarted(
+        RUN,
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-ha',
+        {},
+        null,
+        [
+          { jobId: 'j1', jobName: 'lint' },
+          { jobId: 'j2', jobName: 'test' },
+        ],
+      );
+      mockDb.dispatchQueueRows.set('j1', 'lint');
+      await sibling.onJobStatus(RUN, 'j1', ExecutionJobStatus.enum.success, Date.now(), 'ag');
+
+      // fails-when: the sibling's map holds only j1, so a memory-only check
+      // finalizes a two-job run after one job.
+      expect(siblingComplete).not.toHaveBeenCalled();
+      expect(mockDb.runRows.get(RUN)?.status).not.toBe(ExecutionRunStatus.enum.success);
+
+      mockDb.dispatchQueueRows.set('j2', 'test');
+      await sibling.onJobStatus(RUN, 'j2', ExecutionJobStatus.enum.success, Date.now(), 'ag');
+      expect(siblingComplete).toHaveBeenCalledTimes(1);
+      expect(mockDb.runRows.get(RUN)?.status).toBe(ExecutionRunStatus.enum.success);
+    });
+
+    it('a tracker with no instance id holds no durable window', async () => {
+      await tracker.onExecutionStarted(
+        RUN,
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-ha',
+        {},
+        null,
+        [{ jobId: 'build-1', jobName: '__build__ci' }],
+      );
+      tracker.holdRunForPendingJobs(RUN);
+      await tracker.registrationWindowSettled(RUN);
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBeUndefined();
+    });
+  });
+
+  describe('runs finished by another coordinator are released from memory', () => {
+    const RUN = 'run-elsewhere';
+    const start = async (t: ExecutionTracker, runId = RUN) => {
+      await t.onExecutionStarted(
+        runId,
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'd',
+        {},
+        null,
+        [{ jobId: 'build-1', jobName: '__build__ci' }],
+      );
+    };
+    const finishedElsewhere = (runId: string, status: string) =>
+      mockDb.runRows.set(runId, { ...mockDb.runRows.get(runId), status });
+
+    it('the sweep releases a run whose row another writer finished, without re-emitting completion', async () => {
+      const onRunTerminalCleanup = vi.fn();
+      const complete = vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionComplete']>>();
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        instanceId: 'coord-a',
+        onExecutionComplete: complete,
+        onRunTerminalCleanup,
+      });
+      await start(t);
+      expect(t.holdRunForPendingJobs(RUN)).toBe(true);
+      expect(t.getActiveRunCount()).toBe(1);
+      finishedElsewhere(RUN, ExecutionRunStatus.enum.success);
+
+      expect(await t.pruneRunsFinishedElsewhere()).toBe(1);
+
+      // fails-when: the sweep does not exist or never matches — the run stays
+      // active in memory for the life of the process, one per
+      // cross-coordinator run.
+      expect(t.getActiveRunCount()).toBe(0);
+      expect(onRunTerminalCleanup).toHaveBeenCalledWith(RUN);
+      // The finalizer already emitted these and wrote the row.
+      expect(complete).not.toHaveBeenCalled();
+      expect(mockDb.updates.filter((u) => u.table === 'execution_runs' && u.values.status)).toEqual(
+        [],
+      );
+      // A token counted before the release cannot hold the dead run open, and
+      // the late release clears the durable window rather than finding a run.
+      expect(t.holdRunForPendingJobs(RUN)).toBe(false);
+      await t.releasePendingJobsHold(RUN);
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1);
+      expect(t.isRunComplete(RUN)).toBe(false); // gone from memory entirely
+      expect(await t.pruneRunsFinishedElsewhere()).toBe(0); // idempotent
+    });
+
+    it('leaves a run this coordinator still legitimately holds alone', async () => {
+      const onRunTerminalCleanup = vi.fn();
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        instanceId: 'coord-b',
+        onRunTerminalCleanup,
+      });
+      await start(t);
+      expect(t.holdRunForPendingJobs(RUN)).toBe(true);
+      await t.registrationWindowSettled(RUN);
+      // The row is still running: the window is open and nothing finished it.
+      expect(await t.pruneRunsFinishedElsewhere()).toBe(0);
+      // breaks-if-wrong: a run mid-window pruned here loses its token, and the
+      // sibling's next terminal frame finalizes the run on the build alone.
+      expect(t.getActiveRunCount()).toBe(1);
+      expect(onRunTerminalCleanup).not.toHaveBeenCalled();
+      expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBe('coord-b');
+    });
+
+    it('a replayed terminal frame for a run finished elsewhere releases it too', async () => {
+      const t = new ExecutionTracker({ db: mockDb.db, instanceId: 'coord-a' });
+      // The job row is already terminal (a sibling's agent reported it) and
+      // the run row is finished; the agent's outbox then replays the frame here.
+      const other = 'run-elsewhere-2';
+      await start(t, other);
+      mockDb.jobRows.set(`${other}:build-1`, {
+        ...mockDb.jobRows.get(`${other}:build-1`)!,
+        status: ExecutionJobStatus.enum.success,
+      });
+      finishedElsewhere(other, ExecutionRunStatus.enum.failed);
+      expect(t.getActiveRunCount()).toBe(1);
+      await t.onJobStatus(other, 'build-1', ExecutionJobStatus.enum.success, Date.now());
+      // fails-when: the already-terminal early return leaves the run in memory.
+      expect(t.getActiveRunCount()).toBe(0);
+    });
+  });
+
+  describe('terminal run writes are monotonic', () => {
+    const start = async (t: ExecutionTracker, runId: string) => {
+      await t.onExecutionStarted(
+        runId,
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'd',
+        {},
+        null,
+        [{ jobId: 'build-1', jobName: '__build__ci' }],
+      );
+    };
+
+    it('onBuildFailed does not overwrite a run a sibling already finished', async () => {
+      await start(tracker, 'run-mono');
+      // A sibling coordinator finished the whole run in the meantime.
+      mockDb.runRows.set('run-mono', {
+        ...mockDb.runRows.get('run-mono'),
+        status: ExecutionRunStatus.enum.success,
+      });
+      await tracker.onBuildFailed('run-mono');
+      // fails-when: the build-failure write is unguarded — the run the sibling
+      // completed green is flipped to failed by a stale build wait.
+      expect(mockDb.runRows.get('run-mono')?.status).toBe(ExecutionRunStatus.enum.success);
+    });
+
+    it('onBuildFailed still fails a running run', async () => {
+      await start(tracker, 'run-mono-ok');
+      await tracker.onBuildFailed('run-mono-ok');
+      // breaks-if-wrong: the legitimate build failure must still land.
+      expect(mockDb.runRows.get('run-mono-ok')?.status).toBe(ExecutionRunStatus.enum.failed);
+    });
+
+    it('a normal completion does not overwrite a row another writer finished', async () => {
+      await start(tracker, 'run-mono-fin');
+      mockDb.runRows.set('run-mono-fin', {
+        ...mockDb.runRows.get('run-mono-fin'),
+        status: ExecutionRunStatus.enum.failed,
+      });
+      await tracker.onJobStatus(
+        'run-mono-fin',
+        'build-1',
+        ExecutionJobStatus.enum.success,
+        Date.now(),
+      );
+      expect(mockDb.runRows.get('run-mono-fin')?.status).toBe(ExecutionRunStatus.enum.failed);
+    });
+
+    it.each([
+      [ExecutionJobStatus.enum.failed, ExecutionRunStatus.enum.failed],
+      [ExecutionJobStatus.enum.cancelled, ExecutionRunStatus.enum.cancelled],
+      [ExecutionJobStatus.enum.success, ExecutionRunStatus.enum.success],
+    ])('a %s job still finalizes a running run as %s', async (jobState, runStatus) => {
+      // breaks-if-wrong: a guard that rejected the write it exists to protect
+      // would leave every run in `running` — the shape that has shipped before.
+      await start(tracker, 'run-mono-legit');
+      await tracker.onJobStatus('run-mono-legit', 'build-1', jobState, Date.now());
+      expect(mockDb.runRows.get('run-mono-legit')?.status).toBe(runStatus);
+    });
+  });
+
   describe('withRunLock (per-run job-swap serialization)', () => {
     // Pure promise-chaining — no timers — so use real timers for deterministic
     // microtask flushing (the suite-wide beforeEach installs fake timers).
@@ -5378,7 +5869,7 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
     );
     await mockDb.db
       .updateTable('execution_runs')
-      .set({ trust_tier: 'known', lock_file_source: 'base' })
+      .set({ trust_tier: 'unknown', lock_file_source: 'base' })
       .where('run_id', '=', 'run-posture-recover')
       .execute();
     const restarted = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
@@ -5394,7 +5885,7 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
     // completion path uses — rather than the status-change forward, which
     // builds its own context literal and carries no posture.
     expect(restarted.getExecutionContext('run-posture-recover')).toMatchObject({
-      trustTier: 'known',
+      trustTier: 'unknown',
       lockFileSource: 'base',
     });
   });

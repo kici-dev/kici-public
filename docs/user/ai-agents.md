@@ -41,9 +41,7 @@ behalf). The token is printed once — save it now; it cannot be retrieved later
 
 **Option B — an agent org API key.** Create one from the dashboard's
 **Settings → API keys** tab: set the key's kind to **Agent** and give it an
-agent name (the agent label). The same key can also be minted with
-`kici-platform-admin user api-key create --org <id> --agent --agent-label <label>`.
-Reach for an org agent key when the agent should act as a shared service account
+agent name (the agent label). Reach for an org agent key when the agent should act as a shared service account
 rather than as a single user — for example, a long-lived CI bot that outlives any
 individual's membership.
 

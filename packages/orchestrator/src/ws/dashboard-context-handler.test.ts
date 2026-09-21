@@ -347,7 +347,7 @@ describe('DashboardContextHandler', () => {
     it('is denied (CLI-only) when the policy disables the operation', async () => {
       // org_settings row disables contexts.test_access.set for this org.
       (deps.db.executeTakeFirst as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        dashboard_write_policy: { 'contexts.test_access.set': false },
+        dashboard_write_policy: { 'contexts.test_access.set': 'disabled' },
       });
 
       const handled = await handler.handleMessage({
@@ -1084,7 +1084,7 @@ describe('DashboardContextHandler', () => {
         // string data with the orchestrator's own orgId. The store layer
         // (PG/Vault) is responsible for handling/rejecting the scope shape
         // (e.g., PG INSERT with a unique-constraint on (org_id, scope, key)
-        // simply stores the row; Vault rejects scope characters its API
+        // stores the row; Vault rejects scope characters its API
         // disallows). Either way: cross-tenant write is impossible because
         // the orgId argument is hardcoded to deps.orgId.
         if ((deps.secretStore.setSecret as ReturnType<typeof vi.fn>).mock.calls.length > 0) {

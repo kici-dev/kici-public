@@ -924,17 +924,9 @@ function buildArtifactTransport(): ArtifactTransport {
         ...(response.rejectionDetail && { error: response.rejectionDetail }),
       };
     },
-    async completeUpload(name, sizeBytes, sha256, storageKey) {
+    async completeUpload(name, sha256) {
       const requestId = randomUUID();
-      sendMessage({
-        type: 'artifacts.request',
-        requestId,
-        op: 'completeUpload',
-        name,
-        sizeBytes,
-        sha256,
-        storageKey,
-      });
+      sendMessage({ type: 'artifacts.request', requestId, op: 'completeUpload', name, sha256 });
       const response = await waitForArtifactResponse(requestId);
       if (response.error) throw new Error(`Artifact upload-complete failed: ${response.error}`);
     },

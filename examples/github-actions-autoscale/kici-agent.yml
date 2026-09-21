@@ -39,6 +39,11 @@ on:
 jobs:
   agent:
     runs-on: ubuntu-latest
+    # A one-shot agent registers, runs one job and exits, so a run that is still
+    # alive after this long is wedged (an agent the orchestrator refused, a job
+    # that never dispatched) and must release the runner rather than bill the
+    # default six hours. Raise it if your jobs legitimately run longer.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:

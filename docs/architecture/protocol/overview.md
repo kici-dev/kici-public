@@ -126,12 +126,12 @@ Used during WebSocket connection establishment. The connecting party sends `auth
 
 Sent by the connecting party (orchestrator to Platform, or agent to orchestrator) to authenticate.
 
-| Field           | Type             | Required | Description                                                                                |
-| --------------- | ---------------- | -------- | ------------------------------------------------------------------------------------------ |
-| type            | `"auth.request"` | Yes      | Message discriminator                                                                      |
-| token           | string           | Yes      | API key or authentication token                                                            |
-| protocolVersion | number (int > 0) | Yes      | Protocol version (currently `2`; the minimum accepted is `1`)                              |
-| capabilities    | OrchCapabilities | No       | Orchestrator capabilities (optional for backward compat with pre-capability orchestrators) |
+| Field           | Type             | Required | Description                                                                                                   |
+| --------------- | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
+| type            | `"auth.request"` | Yes      | Message discriminator                                                                                         |
+| token           | string           | Yes      | API key or authentication token                                                                               |
+| protocolVersion | number (int > 0) | Yes      | Protocol version (currently `3`; the minimum accepted is also `3`, so a `2` — every 0.8.x build — is refused) |
+| capabilities    | OrchCapabilities | No       | Orchestrator capabilities (optional for backward compat with pre-capability orchestrators)                    |
 
 **OrchCapabilities fields:**
 

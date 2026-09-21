@@ -242,16 +242,16 @@ Sent every 30 seconds by each peer. Carries agent inventory, scaler capacity, an
 
 PeerAgentSummary:
 
-| Field           | Type           | Required | Description                                                                                              |
-| --------------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------- |
-| agentId         | string         | Yes      | Agent identifier                                                                                         |
-| labels          | string[]       | Yes      | Capability labels                                                                                        |
-| activeJobs      | number         | Yes      | Currently running jobs                                                                                   |
-| maxConcurrency  | number         | Yes      | Maximum concurrent jobs                                                                                  |
-| platform        | string         | Yes      | OS platform (e.g., linux)                                                                                |
-| arch            | string         | Yes      | CPU architecture (e.g., x64, arm64)                                                                      |
-| mandatoryLabels | string[]       | No       | Taint gate inherited from the spawning scaler. Empty or absent for a static agent, and for a legacy peer |
-| scalerName      | string or null | No       | Backend that spawned this agent, or null for a static agent. Groups the peer's agents in diagnostics     |
+| Field           | Type           | Required | Description                                                                                          |
+| --------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| agentId         | string         | Yes      | Agent identifier                                                                                     |
+| labels          | string[]       | Yes      | Capability labels                                                                                    |
+| activeJobs      | number         | Yes      | Currently running jobs                                                                               |
+| maxConcurrency  | number         | Yes      | Maximum concurrent jobs                                                                              |
+| platform        | string         | Yes      | OS platform (e.g., linux)                                                                            |
+| arch            | string         | Yes      | CPU architecture (e.g., x64, arm64)                                                                  |
+| mandatoryLabels | string[]       | Yes      | Taint gate inherited from the spawning scaler. A static agent sends `[]`, which is "no gate"         |
+| scalerName      | string or null | No       | Backend that spawned this agent, or null for a static agent. Groups the peer's agents in diagnostics |
 
 PeerCapabilities:
 
@@ -262,16 +262,17 @@ PeerCapabilities:
 
 ScalerCapacitySummary:
 
-| Field                   | Type       | Required | Description                                                                                    |
-| ----------------------- | ---------- | -------- | ---------------------------------------------------------------------------------------------- |
-| name                    | string     | No       | Scaler backend name (e.g., `stg-worker-bare-metal`)                                            |
-| type                    | string     | No       | Scaler backend type (e.g., `bare-metal`, `container`)                                          |
-| labelSets               | string[][] | Yes      | Label sets this backend provisions                                                             |
-| maxAgents               | number     | Yes      | Maximum agents for this backend                                                                |
-| activeCount             | number     | Yes      | Current active agent count                                                                     |
-| spawnsOnLocalHost       | boolean    | No       | Whether this backend spawns its agents on the peer's own host                                  |
-| mandatoryLabels         | string[]   | No       | Deprecated. The union of every entry in `labelSetMandatoryLabels`                              |
-| labelSetMandatoryLabels | string[][] | No       | Taint gate per label set, index-aligned with `labelSets`. Absent from a peer without the field |
+| Field                   | Type       | Required | Description                                                                                                                                |
+| ----------------------- | ---------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| name                    | string     | No       | Scaler backend name (e.g., `stg-worker-bare-metal`)                                                                                        |
+| type                    | string     | No       | Scaler backend type (e.g., `bare-metal`, `container`)                                                                                      |
+| labelSets               | string[][] | Yes      | Label sets this backend provisions                                                                                                         |
+| maxAgents               | number     | Yes      | Maximum agents for this backend                                                                                                            |
+| activeCount             | number     | Yes      | Current active agent count                                                                                                                 |
+| spawnsOnLocalHost       | boolean    | No       | Whether this backend spawns its agents on the peer's own host                                                                              |
+| labelSetMandatoryLabels | string[][] | Yes      | Taint gate per label set, index-aligned with `labelSets`; an empty entry is "no gate". An entry whose length does not match routes nothing |
+
+The object is strict: a frame carrying any other field fails to parse.
 
 #### raft.vote.request
 
@@ -338,7 +339,6 @@ Sent by the coordinator to a peer when no local agent can handle a job. Contains
 | provider                   | string                  | No       | Provider type (e.g., `github`)                                                                                                                                                                             |
 | providerContext            | Record<string, unknown> | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                                         |
 | sourceTarUrl               | string                  | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                                                |
-| sourceTarHash              | string                  | No       | **Deprecated** — carries the workflow `contentHash`, not a hash of the tarball bytes. Use `sourceTarDigest`                                                                                                |
 | sourceTarDigest            | string                  | No       | SHA-256 of the source tarball's own bytes, for integrity verification                                                                                                                                      |
 | depsUrl                    | string                  | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                                              |
 | depsHash                   | string                  | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                                    |
@@ -775,7 +775,7 @@ KiCI defines custom close codes in the 4000-4999 range (reserved for application
 | Code | Constant                           | Meaning                                                                                                                                                                                                                                                                                                                                                             | Sent By |
 | ---- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | 1000 | --                                 | Normal closure. Sent by the connecting side when it disconnects on purpose -- an agent or orchestrator shutting down its uplink, or any client (agent, orchestrator uplink, or peer) abandoning a handshake that failed                                                                                                                                             | Client  |
-| 1001 | `WS_CLOSE_GOING_AWAY`              | Server shutdown or browser navigating away                                                                                                                                                                                                                                                                                                                          | Server  |
+| 1001 | `WS_CLOSE_GOING_AWAY`              | Server shutdown or browser navigating away. The orchestrator also sends it to an agent that exceeds the ownership-violation threshold (5 frames for jobs it does not own within 60 seconds)                                                                                                                                                                         | Server  |
 | 4001 | `WS_CLOSE_UNAUTHORIZED`            | Client failed authentication. Also sent when the Platform times out an unauthenticated connection, when a client's API key is revoked mid-session, and on an operator force-disconnect                                                                                                                                                                              | Server  |
 | 4002 | `WS_CLOSE_AUTH_TIMEOUT`            | Auth timeout expired                                                                                                                                                                                                                                                                                                                                                | Server  |
 | 4003 | `WS_CLOSE_INVALID_MESSAGE`         | Invalid or unparseable message received                                                                                                                                                                                                                                                                                                                             | Server  |
@@ -784,7 +784,7 @@ KiCI defines custom close codes in the 4000-4999 range (reserved for application
 | 4006 | `WS_CLOSE_INTERNAL_ERROR`          | Unexpected internal server error                                                                                                                                                                                                                                                                                                                                    | Server  |
 | 4010 | `WS_CLOSE_AGENT_AUTH_FAILED`       | Agent token authentication failed. On the Platform-orchestrator channel the same code is also sent as a safety fallback when every source in a `source.register` is rejected for missing S3 log storage in a multi-orchestrator pool                                                                                                                                | Server  |
 | 4011 | `WS_CLOSE_CLUSTER_NAME_CONFLICT`   | Reserved constant; no Platform code path emits this today. Platform accepts N connected orchestrators per `(org_id, cluster_name)` and the dashboard listing dedupes by cluster name                                                                                                                                                                                | —       |
-| 4020 | `WS_CLOSE_PLAN_LIMIT`              | Organization has reached its plan limit                                                                                                                                                                                                                                                                                                                             | Server  |
+| 4020 | `WS_CLOSE_PLAN_LIMIT`              | Organization has reached its plan limit. Sent by the Platform when it closes an excess orchestrator connection, and by a coordinator refusing a worker join because the org is at its orchestrator ceiling (coordinators and workers combined)                                                                                                                      | Server  |
 | 4030 | `WS_CLOSE_REBALANCE`               | Connection rebalancing: a newly-joined Platform instance asked peers holding excess connections to shed some; the orchestrator reconnects immediately and load redistributes evenly                                                                                                                                                                                 | Server  |
 | 4031 | `WS_CLOSE_DISPATCH_ACK_TIMEOUT`    | A dispatched job went unacknowledged past its deadline; the orchestrator requeues the job and disconnects the unresponsive agent                                                                                                                                                                                                                                    | Server  |
 | 4032 | `WS_CLOSE_SUPERSEDED_BY_RECONNECT` | The same agent registered on a newer socket, so the older one is a ghost. The orchestrator retires it at registration time, before the OS or the WebSocket ping reaps it, because a half-open socket carries the same agent id and its later close would tear down the live registration. The agent is already connected on the newer socket and does not reconnect | Server  |

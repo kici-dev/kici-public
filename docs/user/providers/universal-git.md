@@ -207,8 +207,8 @@ kici-admin org-settings global-workflows deny-add \
 ```
 
 See [Global workflows](../../architecture/global-workflows.md) for the
-policy model (`isWorkflowRepoAllowed` + `isSourceRepoAllowed` +
-`isElevatedAccessAllowed`) and the cross-provider dispatch contract.
+policy model (`isWorkflowRepoAllowed` + `isSourceRepoAllowed`) and the
+cross-provider dispatch contract.
 
 ## Routing-key collisions
 

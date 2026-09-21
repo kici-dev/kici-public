@@ -25,12 +25,14 @@ The left sidebar provides persistent navigation across all org-scoped pages:
 - **Notifications** -- execution-notification channels, Slack connections, subscriptions, and the delivery log
 - **Settings** -- organization settings with tabbed sub-pages
 
+Below the navigation entries, a separate group holds two links that leave the dashboard and open in a new tab: **Documentation** (the docs site) and **Status** (the public status page). The collapsed sidebar shows the same two as icons.
+
 The sidebar footer shows the WebSocket connection indicator, your user profile, UTC/local time toggle, theme toggle, and a collapse button.
 
 
 ### Mobile navigation
 
-On screens narrower than 768px (the `sm` breakpoint), the sidebar collapses and is replaced by a bottom tab bar. The bar shows four primary destinations -- Runs, Infra (infrastructure), Metrics, Settings -- plus a **More** tab that opens a drawer listing every remaining destination: Workflows, Attestations, Contexts, Secrets, Approval queue, Activity, DLQ, Notifications, and (when applicable) Getting started and Fleet. Every destination in the desktop sidebar is therefore reachable on mobile.
+On screens narrower than 768px (the `sm` breakpoint), the sidebar collapses and is replaced by a bottom tab bar. The bar shows four primary destinations -- Runs, Infra (infrastructure), Metrics, Settings -- plus a **More** tab. That tab opens a drawer listing every remaining destination: Workflows, Attestations, Contexts, Secrets, Approval queue, Activity, DLQ, Notifications, and (when applicable) Getting started and Fleet. The drawer ends with the same **Documentation** and **Status** external links the desktop sidebar carries. Every destination in the desktop sidebar is therefore reachable on mobile.
 
 When runs are waiting for your approval, an **Approvals** tab with a red count badge appears directly in the bottom bar so approvers can reach the approval queue in one tap; otherwise the approval queue lives in the More drawer. The mobile tab list is derived from the same navigation source as the desktop sidebar, so the two never drift.
 

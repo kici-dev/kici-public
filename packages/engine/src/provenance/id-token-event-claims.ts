@@ -120,22 +120,16 @@ export function buildEventClaims(run: EventClaimSource): EventClaims {
  * `trigger_event` itself is left alone because two other readers depend on it:
  * the dashboard's trigger-type filter and the git credential relay's
  * `triggerTypeFilters`, both of which must keep seeing `'rerun'`.
- *
- * `legacyPullRequestSubject` restores the old, colliding form for one release —
- * see `KICI_OIDC_LEGACY_PR_SUB`. It is deprecated on arrival.
- *
- * @deprecated `legacyPullRequestSubject` is removed at v1.0.0.
  */
 export function buildIdTokenSubject(
   run: Pick<
     EventClaimSource,
     'repo_identifier' | 'ref' | 'workflow_name' | 'trigger_event' | 'subject_trigger_event'
   >,
-  opts?: { legacyPullRequestSubject?: boolean },
 ): string {
   const repository = run.repo_identifier ?? 'unknown';
   const subjectEvent = run.subject_trigger_event ?? run.trigger_event;
-  if (!opts?.legacyPullRequestSubject && isPullRequestFamilyTriggerEvent(subjectEvent)) {
+  if (isPullRequestFamilyTriggerEvent(subjectEvent)) {
     return `repo:${repository}:pull_request`;
   }
   return `repo:${repository}:ref:${run.ref ?? 'unknown'}:workflow:${run.workflow_name ?? 'unknown'}`;

@@ -45,12 +45,12 @@ export enum HeldRunStatus {
  *
  * - `fork_pr` — the org trust policy's fork switch held the run.
  * - `context_trust` — a context's minimum-trust gate held the run.
- * - `workflow_modification` — deprecated; no longer raised. Modifications to
- *   `.kici/` are surfaced on their own informational check and no longer feed
- *   a policy arm. Removed at v1.0.0.
- * - `unknown_contributor` — deprecated; no longer raised. The policy turns on
- *   whether the pull request came from a fork, not on who opened it. Removed
- *   at v1.0.0.
+ * - `workflow_modification` — no longer raised. Modifications to `.kici/`
+ *   are surfaced on their own informational check and no longer feed a policy
+ *   arm. Kept so stored `held_runs` rows with this reason still render.
+ * - `unknown_contributor` — no longer raised. The policy turns on whether the
+ *   pull request came from a fork, not on who opened it. Kept so stored
+ *   `held_runs` rows with this reason still render.
  */
 export const SecurityHoldReason = z.enum([
   'workflow_modification',

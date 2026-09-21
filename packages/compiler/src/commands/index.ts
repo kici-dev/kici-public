@@ -93,9 +93,19 @@ export { drainWorkerCommand } from './drain-worker.js';
 export type { DrainWorkerOptions } from './drain-worker.js';
 
 export { docsCommand, docsLlmCommand } from './docs.js';
-export { feedbackCommand, FEEDBACK_CONTRACT } from './feedback.js';
+export {
+  feedbackCommand,
+  FEEDBACK_CONTRACT,
+  parseFeedbackDraft,
+  draftIssueUrl,
+} from './feedback.js';
 export type { DocsOptions, DocsLlmOptions } from './docs.js';
-export type { FeedbackOptions, FeedbackContract, FeedbackField } from './feedback.js';
+export type {
+  FeedbackOptions,
+  FeedbackContract,
+  FeedbackField,
+  FeedbackDraft,
+} from './feedback.js';
 
 export { verifyAttestationCommand } from './verify-attestation.js';
 export type { VerifyAttestationOptions } from './verify-attestation.js';

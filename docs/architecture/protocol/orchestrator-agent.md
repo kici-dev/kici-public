@@ -50,7 +50,7 @@ Dispatches a job to an agent for execution. Contains everything the agent needs 
 | maxLogSizeBytes          | number                                  | No       | Max log size per step in bytes (agent defaults to 10MB)                                                                                                                                                                                                                                                                                                                   |
 | concurrencyWaitTimeoutMs | number                                  | No       | Orchestrator-resolved concurrency-slot wait timeout in milliseconds, from the fleet-wide `cluster_settings.concurrency_wait_timeout_ms`. Absent on orchestrators that predate the setting — the agent then falls back to its own env/config default (1h).                                                                                                                 |
 | sourceTarUrl             | string                                  | No       | Pre-signed URL to the `.kici/` source tarball (skips agent-side clone). Agent extracts into the work directory and imports the workflow `.ts` via the shared TypeScript loader hook.                                                                                                                                                                                      |
-| sourceTarHash            | string                                  | No       | Workflow `contentHash` (NOT the tarball-bytes hash). The agent re-computes this hash against the extracted source to detect drift against the lock file; the tarball bytes themselves are trusted via the orchestrator-signed S3 GET URL.                                                                                                                                 |
+| sourceTarDigest          | string                                  | No       | SHA-256 of the source tarball's own bytes. The agent verifies the download against it before extraction; after extraction it re-computes the workflow `contentHash` against the extracted source to detect drift against the lock file.                                                                                                                                   |
 | depsUrl                  | string                                  | No       | Pre-signed URL to the `node_modules` tarball (skips npm install)                                                                                                                                                                                                                                                                                                          |
 | depsHash                 | string                                  | No       | SHA-256 hash of the dependency tarball bytes, used for streaming integrity verification on download                                                                                                                                                                                                                                                                       |
 | requestId                | string                                  | No       | Trace ID (UUIDv4) from the originating webhook event                                                                                                                                                                                                                                                                                                                      |
@@ -576,17 +576,15 @@ Request a pre-signed PUT URL for a named artifact upload.
 
 Confirm an artifact upload finished so the orchestrator records the artifacts row. The orchestrator replies with an [`artifacts.upload.complete.ack`](#artifactsuploadcompleteack) when it advertises the `artifactCompleteAck` capability, and the agent waits for it before the upload step returns.
 
-The orchestrator does not trust the agent's `storageKey` or `sizeBytes`: it derives the storage key from the run and artifact name it resolved server-side, and records the real object size it reads back from storage. Both fields stay on the wire (deprecated, still sent) for compatibility with older orchestrators — see [deprecations](../../user/deprecations.md).
+| Field     | Type                          | Required | Description                        |
+| --------- | ----------------------------- | -------- | ---------------------------------- |
+| type      | `"artifacts.upload.complete"` | Yes      | Message discriminator              |
+| messageId | string                        | Yes      | Unique message ID                  |
+| jobId     | string                        | Yes      | Job producing the artifact         |
+| name      | string                        | Yes      | Artifact name                      |
+| sha256    | string                        | Yes      | SHA-256 (hex) of the tarball bytes |
 
-| Field      | Type                          | Required | Description                                                                                      |
-| ---------- | ----------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
-| type       | `"artifacts.upload.complete"` | Yes      | Message discriminator                                                                            |
-| messageId  | string                        | Yes      | Unique message ID                                                                                |
-| jobId      | string                        | Yes      | Job producing the artifact                                                                       |
-| name       | string                        | Yes      | Artifact name                                                                                    |
-| sizeBytes  | number (int >= 0)             | Yes      | Packed tarball size in bytes. Deprecated — advisory; the orchestrator records the verified size  |
-| sha256     | string                        | Yes      | SHA-256 (hex) of the tarball bytes                                                               |
-| storageKey | string                        | Yes      | Storage key echoed from the grant response. Deprecated — ignored; the key is derived server-side |
+The object is strict. The orchestrator derives the storage key from the run and artifact name it resolved server-side, and it records the real object size it reads back from storage. A frame carrying `storageKey`, `sizeBytes`, or any other field outside this table is refused.
 
 #### artifacts.download.request
 
@@ -613,7 +611,7 @@ A `rejected` carries either `reason` (an enforcement gate was hit) or `error` (t
 | requestId  | string                        | Yes      | Correlates to the original request                                                                                           |
 | outcome    | enum                          | Yes      | One of: `granted`, `rejected`                                                                                                |
 | uploadUrl  | string                        | No       | Pre-signed PUT URL (present only on `granted`)                                                                               |
-| storageKey | string                        | No       | Final storage key the agent echoes back on complete (present only on `granted`)                                              |
+| storageKey | string                        | No       | Storage key of the object the grant covers (present only on `granted`)                                                       |
 | reason     | enum                          | No       | Enforcement refusal reason (present only on an enforcement `rejected`): `duplicate_name`, `size_cap`, `run_cap`, `org_quota` |
 | error      | string                        | No       | Failure detail — invalid name or internal failure (present only on a `rejected` with no `reason`)                            |
 
@@ -812,7 +810,7 @@ The bring-up and roster methods take `write` because they change host state; eve
 
 Mints a build-provenance ID token bound to the job the calling agent actually owns. The agent supplies only its job and the requested audience -- every identity claim (repository, ref, workflow) is derived on the orchestrator side, so a workflow can never assert an identity it does not have.
 
-Which mint serves the call is the anti-forgery choke point. An orchestrator that owns a signing key and its own issuer always signs locally, even when connected to the hosted control plane, because the orchestrator is the root of trust. A connected orchestrator with no key of its own falls back to the deprecated upstream relay. The offline local dev plane mints locally under the `kici-local` issuer. A standalone orchestrator with no key registers nothing, so the method is unknown.
+Which mint serves the call is the anti-forgery choke point. An orchestrator that owns a signing key and its own issuer signs locally, because the orchestrator is the root of trust. The offline local dev plane mints locally under the `kici-local` issuer. An orchestrator with no key registers nothing, so the method is unknown.
 
 Params:
 

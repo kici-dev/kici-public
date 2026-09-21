@@ -23,7 +23,7 @@
  * a test failure rather than a silent contract drift.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { resolveRoleLabels, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
+import { PROTOCOL_VERSION, resolveRoleLabels, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
 import { createAgentWsHandler } from './agent-handler.js';
 import { authorizedAgentTokenLabels } from '../cli/commands/agent.js';
 import { AgentRegistry } from '../agent/registry.js';
@@ -49,7 +49,7 @@ function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
   return {
     type: 'auth.request' as const,
     token,
-    protocolVersion: 1,
+    protocolVersion: PROTOCOL_VERSION,
   };
 }
 

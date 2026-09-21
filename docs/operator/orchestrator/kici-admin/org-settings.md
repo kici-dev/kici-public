@@ -13,8 +13,6 @@ kici-admin org-settings global-workflows allow-add <pattern> --customer-id <id> 
 kici-admin org-settings global-workflows allow-remove <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
 kici-admin org-settings global-workflows deny-add <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
 kici-admin org-settings global-workflows deny-remove <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
-kici-admin org-settings global-workflows elevate-add <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
-kici-admin org-settings global-workflows elevate-remove <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
 kici-admin org-settings allow-http-npm true|false --customer-id <id> [--format json|table]
 kici-admin org-settings user-cache show --customer-id <id> [--format json|table]
 kici-admin org-settings user-cache set-quota <bytes> --customer-id <id> [--format json|table]
@@ -27,7 +25,7 @@ kici-admin org-settings approval set-expiry <seconds> --customer-id <id> [--form
 kici-admin org-settings approval set-self-approval true|false --customer-id <id> [--format json|table]
 ```
 
-Manages per-org global-workflow policy (workflow-author allow-list, source-repo deny-list, and the deprecated elevated-access list). Settings are org-scoped — there is one row per `customer_id` regardless of how many webhook sources the org has. Each list entry can optionally pin to a specific source via `--source <routingKey>`. Calls the orchestrator admin API directly (not the Platform dashboard proxy) so it stays operable even when Platform is unavailable.
+Manages per-org global-workflow policy (workflow-author allow-list and source-repo deny-list). Settings are org-scoped — there is one row per `customer_id` regardless of how many webhook sources the org has. Each list entry can optionally pin to a specific source via `--source <routingKey>`. Calls the orchestrator admin API directly (not the Platform dashboard proxy) so it stays operable even when Platform is unavailable.
 
 - `--customer-id <id>` (alias: `--org <id>`) selects the org row.
 - `--source <routingKey>` on `*-add` stores the entry pinned to that single webhook source. Omit for "any source in the org".
@@ -35,13 +33,12 @@ Manages per-org global-workflow policy (workflow-author allow-list, source-repo 
 - `show` prints the current settings row for the given org. Its `Enabled (cluster-wide)` line is informational — it reports the effective fleet-wide master switch (`cluster_settings.global_workflows_enabled`), which you set with [`kici-admin cluster-settings`](./cluster-and-infra.md), not a per-org value.
 - `allow-add` / `allow-remove` mutate the workflow-author allow-list.
 - `deny-add` / `deny-remove` mutate the source-repo deny-list.
-- `elevate-add` / `elevate-remove` mutate the elevated-access list. **Deprecated and not enforced:** an organization-wide workflow's job is dispatched with no secret material, so the list grants nothing. Removed at v1.0.0.
 
 ##### Accepted pattern shape
 
 A `<pattern>` is a plain glob over a repository identifier (`owner/name`). An identifier is not a file path, so a leading dot carries no special meaning: `myorg/*` and `**` both cover `myorg/.github`.
 
-Negation forms are refused. Each of these is rejected at write time, on all three lists:
+Negation forms are refused. Each of these is rejected at write time, on both lists:
 
 - a leading `!` — `!myorg/x`
 - extglob negation — `!(a|b)/x` and `myorg/!(secret)`
@@ -53,7 +50,7 @@ The list you add to already decides the direction: `allow-add` grants, `deny-add
 
 `myorg/[!a]*` is **not** a negation and is accepted. The matcher reads `[!a]` as a literal class holding the two characters `!` and `a`, so the pattern matches only the repositories whose name begins with one of them — a genuine restriction, and the exact inverse of `myorg/[^a]*`.
 
-A pattern of one of these shapes that is already stored is not applied as a negation. The allow-list and elevated-access list grant nothing for it, the deny-list blocks, and the orchestrator logs a warning naming the org and the pattern. Remove such an entry with `allow-remove` / `deny-remove` / `elevate-remove` and write the repositories you mean.
+A pattern of one of these shapes that is already stored is not applied as a negation. The allow-list grants nothing for it, the deny-list blocks, and the orchestrator logs a warning naming the org and the pattern. Remove such an entry with `allow-remove` / `deny-remove` and write the repositories you mean.
 
 #### `allow-http-npm` — permit non-https private npm registries
 
@@ -268,8 +265,6 @@ The org-wide switch deciding what happens to a pull request from a fork. `--fork
 `--approval-expiry-hours` and `--approval-expiry-seconds` set how long a security hold waits for an approval before it expires. They are two spellings of one window. Hours is the ergonomic form (integer, at least 1). Seconds is the only form that can express a window shorter than an hour (integer, at least 1, up to one year). Setting either recomputes the other, so they cannot disagree. Pass both and the seconds value wins, because it is the more specific. The CLI then prints a warning naming the value it ignored.
 
 `show` prints a whole-hour window as hours (`72 h`) and anything finer as seconds (`30 s`).
-
-Three inputs are deprecated and are removed at v1.0.0. `--fork-policy reject` behaves as `ignore`; the CLI stores the value as given and prints a warning. `--unknown-contributor-policy` and `--workflow-change-policy` are still accepted, stored, and echoed back, but no dispatch decision reads them, so setting one changes no outcome. The `show` table omits those two values for that reason; `--format json` still prints them.
 
 `directory` prints the stored approval directory — the identity links, member CI trust levels, and teams that `/kici approve` is resolved against. Use it to tell a stale directory from an absent one when an approval comment is refused.
 
@@ -903,48 +898,6 @@ Synopsis: `kici-admin org-settings global-workflows deny-remove <pattern> [optio
 | `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
 | `--format <format>`     | `table` | Output format: json\|table                                                     |
 
-### `kici-admin org-settings global-workflows elevate-add`
-
-Add a glob pattern to the elevated-access list (DEPRECATED: not enforced, removed at v1.0.0). Use --source to qualify the entry to one webhook source.
-
-Synopsis: `kici-admin org-settings global-workflows elevate-add <pattern> [options]`
-
-**Arguments**
-
-| Argument  | Required | Variadic | Description |
-| --------- | -------- | -------- | ----------- |
-| `pattern` | yes      | no       |             |
-
-**Options**
-
-| Option                  | Default | Description                                                                |
-| ----------------------- | ------- | -------------------------------------------------------------------------- |
-| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                           |
-| `--org <id>`            |         | Alias for --customer-id                                                    |
-| `--source <routingKey>` |         | Pin the entry to one webhook source (e.g. github:42). Omit for any source. |
-| `--format <format>`     | `table` | Output format: json\|table                                                 |
-
-### `kici-admin org-settings global-workflows elevate-remove`
-
-Remove a glob pattern from the elevated-access list (DEPRECATED: not enforced, removed at v1.0.0). Use --source to target a source-qualified entry.
-
-Synopsis: `kici-admin org-settings global-workflows elevate-remove <pattern> [options]`
-
-**Arguments**
-
-| Argument  | Required | Variadic | Description |
-| --------- | -------- | -------- | ----------- |
-| `pattern` | yes      | no       |             |
-
-**Options**
-
-| Option                  | Default | Description                                                                    |
-| ----------------------- | ------- | ------------------------------------------------------------------------------ |
-| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                               |
-| `--org <id>`            |         | Alias for --customer-id                                                        |
-| `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
-| `--format <format>`     | `table` | Output format: json\|table                                                     |
-
 ### `kici-admin org-settings global-workflows show`
 
 Print current global workflow settings for an org
@@ -1393,15 +1346,13 @@ Synopsis: `kici-admin trust-policy set [options]`
 
 **Options**
 
-| Option                                 | Default | Description                                                                                                      |
-| -------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>`                   |         | Org / customer id                                                                                                |
-| `--format <format>`                    | `table` | Output format: json\|table                                                                                       |
-| `--fork-policy <value>`                |         | Fork PR policy (ignore \| hold \| reject \| allow)                                                               |
-| `--unknown-contributor-policy <value>` |         | Unknown contributor policy (hold \| reject) [deprecated: no longer enforced; removed at v1.0.0]                  |
-| `--workflow-change-policy <value>`     |         | Workflow change policy (hold \| reject \| allow) [deprecated: no longer enforced; removed at v1.0.0]             |
-| `--approval-expiry-hours <value>`      |         | Security-hold approval expiry, in hours (integer >= 1)                                                           |
-| `--approval-expiry-seconds <value>`    |         | Security-hold approval expiry, in seconds (integer >= 1). Wins over --approval-expiry-hours when both are given. |
+| Option                              | Default | Description                                                                                                      |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--customer-id <id>`                |         | Org / customer id                                                                                                |
+| `--format <format>`                 | `table` | Output format: json\|table                                                                                       |
+| `--fork-policy <value>`             |         | Fork PR policy (ignore \| hold \| allow)                                                                         |
+| `--approval-expiry-hours <value>`   |         | Security-hold approval expiry, in hours (integer >= 1)                                                           |
+| `--approval-expiry-seconds <value>` |         | Security-hold approval expiry, in seconds (integer >= 1). Wins over --approval-expiry-hours when both are given. |
 
 ### `kici-admin trust-policy show`
 

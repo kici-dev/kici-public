@@ -18,7 +18,7 @@ const DECLARED_APP_REF = {
 function jobFacts(overrides: Partial<JobCredentialContext> = {}): JobCredentialContext {
   return {
     orgId: 'org-1',
-    sourceRepo: 'cmaster11/main',
+    sourceRepo: 'acme/main',
     declaredCredentials: { default: { ...DECLARED_APP_REF } },
     trustTier: 'trusted',
     branch: 'main',
@@ -65,10 +65,10 @@ describe('git credential relay handler', () => {
     // sibling repo must need no credential in workflow code.
     await handlerWith(broker)('agent-1', {
       jobId: 'job-1',
-      repositories: ['cmaster11/shared-lib'],
+      repositories: ['acme/shared-lib'],
     });
     expect(broker.resolve).toHaveBeenCalledWith(
-      expect.objectContaining({ repositories: ['cmaster11/shared-lib'] }),
+      expect.objectContaining({ repositories: ['acme/shared-lib'] }),
     );
   });
 
@@ -88,7 +88,7 @@ describe('git credential relay handler', () => {
     const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
     await handlerWith(broker)('agent-1', {
       jobId: 'job-1',
-      repositories: ['cmaster11/another-repo'],
+      repositories: ['acme/another-repo'],
       permissions: { contents: 'write' },
     });
     expect(broker.resolve).toHaveBeenCalled();
@@ -101,7 +101,7 @@ describe('git credential relay handler', () => {
     await expect(
       handlerWith(broker)('agent-1', {
         jobId: 'job-1',
-        repositories: ['cmaster11/another-repo', 'someone-else/their-repo'],
+        repositories: ['acme/another-repo', 'someone-else/their-repo'],
         permissions: { contents: 'write' },
       }),
     ).rejects.toThrow(/someone-else\/their-repo/);
@@ -112,11 +112,11 @@ describe('git credential relay handler', () => {
     const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
     await handlerWith(broker)('agent-1', {
       jobId: 'job-1',
-      repositories: ['cmaster11/one', 'cmaster11/two'],
+      repositories: ['acme/one', 'acme/two'],
       permissions: { contents: 'write' },
     });
     expect(broker.resolve).toHaveBeenCalledWith(
-      expect.objectContaining({ repositories: ['cmaster11/one', 'cmaster11/two'] }),
+      expect.objectContaining({ repositories: ['acme/one', 'acme/two'] }),
     );
   });
 
@@ -154,7 +154,7 @@ describe('git credential relay handler', () => {
       resolve: vi.fn().mockRejectedValue(new Error('boom ghs_supersecrettokenvalue0001')),
     };
     await expect(
-      handlerWith(broker)('agent-1', { jobId: 'job-1', repositories: ['cmaster11/main'] }),
+      handlerWith(broker)('agent-1', { jobId: 'job-1', repositories: ['acme/main'] }),
     ).rejects.toThrow(/\[REDACTED\]/);
   });
 
@@ -165,14 +165,14 @@ describe('git credential relay handler', () => {
         .mockRejectedValue(new Error('boom -----BEGIN RSA PRIVATE KEY-----\nMII\n-----END X-----')),
     };
     await expect(
-      handlerWith(broker)('agent-1', { jobId: 'job-1', repositories: ['cmaster11/main'] }),
+      handlerWith(broker)('agent-1', { jobId: 'job-1', repositories: ['acme/main'] }),
     ).rejects.toThrow(/\[REDACTED_KEY\]/);
   });
   it("forwards the run's server-truth dispatch facts to the broker gate", async () => {
     const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
     await handlerWith(broker)('agent-1', {
       jobId: 'job-1',
-      repositories: ['cmaster11/main'],
+      repositories: ['acme/main'],
       ref: { ...DECLARED_APP_REF },
     });
     expect(broker.resolve).toHaveBeenCalledWith(
@@ -181,7 +181,7 @@ describe('git credential relay handler', () => {
           dispatchCtx: {
             branch: 'main',
             triggerType: 'push',
-            repository: 'cmaster11/main',
+            repository: 'acme/main',
             runId: 'run-1',
             jobId: 'job-1',
           },
@@ -197,7 +197,7 @@ describe('git credential relay handler', () => {
       await expect(
         handlerWith(broker)('agent-1', {
           jobId: 'job-1',
-          repositories: ['cmaster11/main'],
+          repositories: ['acme/main'],
           ref: { kind: 'token', tokenSecret: 'prod:AWS_SECRET_ACCESS_KEY' },
         }),
       ).rejects.toThrow(/not declared by this job's lock/);
@@ -209,7 +209,7 @@ describe('git credential relay handler', () => {
       await expect(
         handlerWith(broker)('agent-1', {
           jobId: 'job-1',
-          repositories: ['cmaster11/main'],
+          repositories: ['acme/main'],
           ref: { ...DECLARED_APP_REF, privateKeySecret: 'prod:APP_KEY' },
         }),
       ).rejects.toThrow(/not declared by this job's lock/);
@@ -222,7 +222,7 @@ describe('git credential relay handler', () => {
       await expect(
         handlerWith(broker)('agent-1', {
           jobId: 'job-1',
-          repositories: ['cmaster11/main'],
+          repositories: ['acme/main'],
           ref: { kind: 'token', tokenSecret: 'ci:T' },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any),
@@ -235,7 +235,7 @@ describe('git credential relay handler', () => {
       await expect(
         handlerWith(broker, jobFacts({ declaredCredentials: {} }))('agent-1', {
           jobId: 'job-1',
-          repositories: ['cmaster11/main'],
+          repositories: ['acme/main'],
           ref: { ...DECLARED_APP_REF },
         }),
       ).rejects.toThrow(/\(none\)/);
@@ -246,7 +246,7 @@ describe('git credential relay handler', () => {
       const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
       await handlerWith(broker, jobFacts({ declaredCredentials: {} }))('agent-1', {
         jobId: 'job-1',
-        repositories: ['cmaster11/main'],
+        repositories: ['acme/main'],
       });
       expect(broker.resolve).toHaveBeenCalled();
     });
@@ -258,7 +258,7 @@ describe('git credential relay handler', () => {
       await expect(
         handlerWith(broker, jobFacts({ declaredCredentials: {} }))('agent-1', {
           jobId: 'job-1',
-          repositories: ['cmaster11/main'],
+          repositories: ['acme/main'],
           ref: { kind: 'token', tokenValue: 'ghp_forged' },
         }),
       ).rejects.toThrow(/not declared by this job's lock/);
@@ -278,34 +278,31 @@ describe('git credential relay handler', () => {
         'agent-1',
         {
           jobId: 'job-1',
-          repositories: ['cmaster11/main'],
+          repositories: ['acme/main'],
           ref: { ...runtimeRef },
         },
       );
       expect(broker.resolve).toHaveBeenCalled();
     });
 
-    it.each(['unknown', 'known'] as const)(
-      'refuses a workflow-supplied ref for the %s tier, before the declaration check',
-      async (tier) => {
-        const broker = { resolve: vi.fn() };
-        await expect(
-          handlerWith(broker, jobFacts({ trustTier: tier }))('agent-1', {
-            jobId: 'job-1',
-            repositories: ['cmaster11/main'],
-            ref: { ...DECLARED_APP_REF },
-          }),
-        ).rejects.toThrow(/contributor tier/);
-        expect(broker.resolve).not.toHaveBeenCalled();
-      },
-    );
+    it('refuses a workflow-supplied ref for the unknown tier, before the declaration check', async () => {
+      const broker = { resolve: vi.fn() };
+      await expect(
+        handlerWith(broker, jobFacts({ trustTier: 'unknown' }))('agent-1', {
+          jobId: 'job-1',
+          repositories: ['acme/main'],
+          ref: { ...DECLARED_APP_REF },
+        }),
+      ).rejects.toThrow(/contributor tier/);
+      expect(broker.resolve).not.toHaveBeenCalled();
+    });
 
     it('still serves the source credential to an untrusted ref', async () => {
       // The fence, not the tier, is what bounds a source-credential read.
       const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
       await handlerWith(broker, jobFacts({ trustTier: 'unknown' }))('agent-1', {
         jobId: 'job-1',
-        repositories: ['cmaster11/main'],
+        repositories: ['acme/main'],
       });
       expect(broker.resolve).toHaveBeenCalled();
     });

@@ -290,9 +290,7 @@ export interface QueuedJobInput {
   timeoutMs?: number;
   /** URL to pre-compiled bundle (from cache). Passed through to job.dispatch. */
   sourceTarUrl?: string;
-  /** Content hash of the pre-compiled bundle for verification. */
-  sourceTarHash?: string;
-  /** SHA-256 of the source tarball's own bytes (what `sourceTarHash` never was). */
+  /** SHA-256 of the source tarball's own bytes, for integrity verification. */
   sourceTarDigest?: string;
   /** URL to pre-built dependency tarball (from dep cache). Passed through to job.dispatch. */
   depsUrl?: string;
@@ -351,9 +349,7 @@ export interface QueuedJob {
   routingKey: string;
   /** URL to pre-compiled bundle (from cache). Passed through to job.dispatch. */
   sourceTarUrl?: string;
-  /** Content hash of the pre-compiled bundle for verification. */
-  sourceTarHash?: string;
-  /** SHA-256 of the source tarball's own bytes (what `sourceTarHash` never was). */
+  /** SHA-256 of the source tarball's own bytes, for integrity verification. */
   sourceTarDigest?: string;
   /** URL to pre-built dependency tarball (from dep cache). Passed through to job.dispatch. */
   depsUrl?: string;
@@ -522,7 +518,6 @@ export class JobQueue {
         provider: job.provider,
         provider_context: JSON.stringify(job.providerContext),
         source_tar_url: job.sourceTarUrl ?? null,
-        source_tar_hash: job.sourceTarHash ?? null,
         source_tar_digest: job.sourceTarDigest ?? null,
         deps_url: job.depsUrl ?? null,
         deps_hash: job.depsHash ?? null,
@@ -977,7 +972,6 @@ export class JobQueue {
         provider: job.provider,
         provider_context: JSON.stringify(job.providerContext),
         source_tar_url: job.sourceTarUrl ?? null,
-        source_tar_hash: job.sourceTarHash ?? null,
         source_tar_digest: job.sourceTarDigest ?? null,
         deps_url: job.depsUrl ?? null,
         deps_hash: job.depsHash ?? null,
@@ -1942,7 +1936,6 @@ export class JobQueue {
           ? JSON.parse(row.provider_context)
           : (row.provider_context ?? {}),
       sourceTarUrl: row.source_tar_url ?? undefined,
-      sourceTarHash: row.source_tar_hash ?? undefined,
       sourceTarDigest: row.source_tar_digest ?? undefined,
       depsUrl: row.deps_url ?? undefined,
       depsHash: row.deps_hash ?? undefined,

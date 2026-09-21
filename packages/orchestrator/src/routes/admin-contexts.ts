@@ -25,7 +25,7 @@ import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
 import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { ContextDeleteErrorCode } from '@kici-dev/engine';
+import { ContextDeleteErrorCode, MinimumTrustSchema } from '@kici-dev/engine';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import { ContextStore, ContextDeleteBlockedError } from '../contexts/context-store.js';
 import { BindingStore } from '../contexts/binding-store.js';
@@ -61,7 +61,7 @@ const createContextSchema = z.object({
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
   holdExpirySeconds: z.number().int().positive().nullable().optional(),
-  minimumTrust: z.string().nullable().optional(),
+  minimumTrust: MinimumTrustSchema.optional(),
   /** Gate that lets CLI-initiated test runs resolve secrets through this env. */
   allowLocalExecution: z.boolean().optional(),
 });
@@ -81,7 +81,7 @@ const setPolicySchema = z.object({
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
   holdExpirySeconds: z.number().int().positive().nullable().optional(),
-  minimumTrust: z.string().nullable().optional(),
+  minimumTrust: MinimumTrustSchema.optional(),
   enabled: z.boolean().optional(),
   allowLocalExecution: z.boolean().optional(),
 });
@@ -94,7 +94,7 @@ const createTemplateSchema = z.object({
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
   holdExpirySeconds: z.number().int().positive().nullable().optional(),
-  minimumTrust: z.string().nullable().optional(),
+  minimumTrust: MinimumTrustSchema.optional(),
   variables: z.record(z.string(), z.string()).optional(),
 });
 
@@ -144,7 +144,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
           requiredReviewers: body.requiredReviewers ?? undefined,
           waitTimerSeconds: body.waitTimerSeconds ?? undefined,
           holdExpirySeconds: body.holdExpirySeconds ?? undefined,
-          minimumTrust: body.minimumTrust as 'known' | 'trusted' | null | undefined,
+          minimumTrust: body.minimumTrust,
           allowLocalExecution: body.allowLocalExecution,
         });
         logger.info('context updated', { orgId: body.orgId, name: body.name });
@@ -160,7 +160,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
         requiredReviewers: body.requiredReviewers ?? undefined,
         waitTimerSeconds: body.waitTimerSeconds ?? undefined,
         holdExpirySeconds: body.holdExpirySeconds ?? undefined,
-        minimumTrust: body.minimumTrust as 'known' | 'trusted' | null | undefined,
+        minimumTrust: body.minimumTrust,
         allowLocalExecution: body.allowLocalExecution,
       });
       logger.info('context created', { orgId: body.orgId, name: body.name });
@@ -232,8 +232,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       if (body.requiredReviewers !== undefined) updates.requiredReviewers = body.requiredReviewers;
       if (body.waitTimerSeconds !== undefined) updates.waitTimerSeconds = body.waitTimerSeconds;
       if (body.holdExpirySeconds !== undefined) updates.holdExpirySeconds = body.holdExpirySeconds;
-      if (body.minimumTrust !== undefined)
-        updates.minimumTrust = body.minimumTrust as 'known' | 'trusted' | null;
+      if (body.minimumTrust !== undefined) updates.minimumTrust = body.minimumTrust;
       if (body.enabled !== undefined) updates.enabled = body.enabled;
       if (body.allowLocalExecution !== undefined)
         updates.allowLocalExecution = body.allowLocalExecution;
@@ -373,7 +372,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
           requiredReviewers: body.requiredReviewers ?? undefined,
           waitTimerSeconds: body.waitTimerSeconds ?? undefined,
           holdExpirySeconds: body.holdExpirySeconds ?? undefined,
-          minimumTrust: body.minimumTrust as 'known' | 'trusted' | null | undefined,
+          minimumTrust: body.minimumTrust,
         });
         envId = existing.id;
         created = false;
@@ -392,7 +391,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
           requiredReviewers: body.requiredReviewers ?? undefined,
           waitTimerSeconds: body.waitTimerSeconds ?? undefined,
           holdExpirySeconds: body.holdExpirySeconds ?? undefined,
-          minimumTrust: body.minimumTrust as 'known' | 'trusted' | null | undefined,
+          minimumTrust: body.minimumTrust,
         });
         envId = row.id;
         created = true;

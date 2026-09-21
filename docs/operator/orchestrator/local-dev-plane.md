@@ -20,7 +20,7 @@ use and stays warm for subsequent runs.
 | `kici local status`            | Report whether the plane is serving, its port, pid, and Postgres backend. A plane that is running but not ready is reported as such, with its readiness checks, rather than as stopped.                                                             |
 | `kici local down`              | Stop the orchestrator and Postgres and confirm the port was released before reporting success. Exits non-zero, naming the process still holding the port, when it cannot free it.                                                                   |
 | `kici local logs`              | Print the paths of the plane's logs and how they are rotated.                                                                                                                                                                                       |
-| `kici local attach`            | Attach the plane to the hosted Platform (hybrid), so `kici run --local` uses real Platform-minted OIDC and attestation.                                                                                                                             |
+| `kici local attach`            | Attach the plane to the hosted Platform (hybrid), so `kici run --local` mints OIDC and attestations with the plane's own signing key under its own issuer.                                                                                          |
 | `kici local detach`            | Detach the plane from the Platform and return it to offline (independent) mode.                                                                                                                                                                     |
 | `kici local trust-root <file>` | Export the plane's dev-signed identity trust root (`{ issuer, jwks }`) to a file, for offline `kici verify-attestation --trust-root`.                                                                                                               |
 
@@ -130,16 +130,16 @@ orchestrator (see [orchestrator setup](orchestrator-setup.md)).
 
 ## Dev-signed identity (offline)
 
-An offline routed run (`kici run --local --offline`) has no hosted platform to mint OIDC
-tokens or attest build provenance, so the plane signs them locally. On first boot it
+An offline routed run (`kici run --local --offline`) configures no provenance issuer, so
+the plane signs OIDC tokens and build provenance with a dev key. On first boot it
 generates a fresh ES256 keypair under `~/.kici/local/dev-identity/` (the private key is
 written at mode 0600 and is **never** derived from any real secret) and uses it to back
 `ctx.kici.oidc.token()` and `ctx.attestProvenance()`. Every token and bundle carries the
 fixed, clearly-non-production issuer `kici-local`.
 
-`kici-local` can never masquerade as the hosted issuer. `kici verify-attestation` pins the
-token issuer to a trust root supplied out-of-band, defaulting to the hosted issuer — so a
-dev-signed bundle **rejects** against the default trust root. To verify a dev-signed bundle
+`kici-local` can never masquerade as a real issuer. `kici verify-attestation` pins the
+token issuer to a trust root supplied out-of-band, defaulting to the configured
+orchestrator's issuer — so a dev-signed bundle **rejects** against the default trust root. To verify a dev-signed bundle
 offline, export the plane's trust root and pass it explicitly:
 
 ```bash
@@ -151,9 +151,10 @@ kici verify-attestation --bundle <bundle> --trust-root ./local-trust-root.json
 
 By default the plane runs offline (independent), with local secrets and the dev-signed
 identity above. Attaching it to the hosted KiCI Platform switches it to **hybrid** mode, so
-`kici run --local` mints OIDC tokens and provenance attestations through the **real
-Platform** — verifiable against the Platform's trust root — instead of the dev-signed
-substitute.
+`kici run --local` mints OIDC tokens and provenance attestations with the plane's **own
+signing key under its own issuer** (`http://127.0.0.1:<port>`) — exactly as a deployed
+orchestrator does, and verifiable against the plane's trust root — instead of the
+dev-signed substitute.
 
 - After `kici login`, an interactive prompt offers to attach the plane. Answer **Y** to
   attach, **n** to stay offline (`--no-attach` on `kici login` skips the prompt).
@@ -171,9 +172,9 @@ substitute.
 The agent always runs on this machine regardless of attachment — attaching only changes where
 secrets and identity come from.
 
-This dev-signed path is active only for the offline local dev plane. An orchestrator
-connected to the hosted platform always mints identity through the platform, never with the
-local key.
+This dev-signed path is active only for the offline local dev plane. An attached plane, like
+every deployed orchestrator, mints identity with its own signing key, never with the dev
+key.
 
 ## Trusted execution profile (`--trusted`)
 

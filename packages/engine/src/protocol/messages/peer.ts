@@ -20,16 +20,12 @@ const peerAgentSummarySchema = z.object({
   arch: z.string(),
   /**
    * Kubernetes-taint-style mandatory labels inherited from the spawning
-   * scaler (empty / omitted for static agents and warm-pool replenishment
-   * spawns). Cross-peer routing applies the same gate the local label
-   * matcher does: a connected-agent entry only matches when every
-   * mandatory label appears in the required label set.
-   *
-   * Optional + default `[]` for legacy peers — older orchestrators that
-   * predate the gate omit the field, and the coordinator falls back to
-   * "no gate" routing for those agents (matching pre-gate behavior).
+   * scaler. Always sent: a static agent and a warm-pool replenishment spawn
+   * carry `[]`, which is "no gate". Cross-peer routing applies the same gate
+   * the local label matcher does: a connected-agent entry only matches when
+   * every mandatory label appears in the required label set.
    */
-  mandatoryLabels: z.array(z.string()).optional().default([]),
+  mandatoryLabels: z.array(z.string()),
   /**
    * Name of the scaler backend that spawned this agent, or null/omitted for
    * static (stateful) agents not bound to any scaler. Carried so the dashboard
@@ -45,50 +41,41 @@ export const peerCapabilitiesSchema = z.object({
   logRoutingOverride: z.enum(['direct', 'coordinator']).optional(),
 });
 
-/** Scaler capacity summary included in peer heartbeat and auth response for routing decisions. */
-const scalerCapacitySummarySchema = z.object({
-  /** Scaler backend name (e.g. "stg-worker-bare-metal") */
-  name: z.string().optional(),
-  /** Scaler backend type (e.g. "bare-metal", "container") */
-  type: z.string().optional(),
-  /** Label sets this scaler backend can provision */
-  labelSets: z.array(z.array(z.string())),
-  /** Maximum agents for this backend */
-  maxAgents: z.number(),
-  /** Current active count for this backend */
-  activeCount: z.number(),
-  /**
-   * Whether this backend spawns its agents on the peer's own host (bare-metal,
-   * Firecracker, container on a local runtime socket). Lets diagnostics
-   * surface the peer's hostname as the scaler's spawning host.
-   */
-  spawnsOnLocalHost: z.boolean().optional(),
-  /**
-   * Labels a job MUST declare in `runsOn` to be allowed on this backend
-   * (Kubernetes-taint-style opt-in gate). When omitted (legacy peer) or
-   * empty the backend has no gate. Cross-peer routing applies the same
-   * rule as the local label matcher: a scaler-capacity entry only
-   * matches when every mandatory label appears in the required label set.
-   *
-   * @deprecated Use {@link labelSetMandatoryLabels}, which carries one gate
-   * per label set. This field is the union across every label set, so a
-   * scaler mixing `[linux, gpu]` with `[macos, xcode]` advertises a gate that
-   * makes its linux set unroutable. It stays populated for peers that predate
-   * the per-label-set field and is removed in v1.0.0.
-   */
-  mandatoryLabels: z.array(z.string()).optional().default([]),
-  /**
-   * Per-label-set taint gate, index-aligned with `labelSets`: entry `i` is the
-   * gate a job must satisfy to route to `labelSets[i]`.
-   *
-   * Deliberately `.optional()` with no default. `undefined` is the only value
-   * that can mean "this peer predates the field — fall back to the scaler-wide
-   * `mandatoryLabels`"; an empty array would read as "every label set is
-   * ungated". A consumer also falls back when the length does not equal
-   * `labelSets.length`, so a malformed advertisement is never indexed into.
-   */
-  labelSetMandatoryLabels: z.array(z.array(z.string())).optional(),
-});
+/**
+ * Scaler capacity summary included in peer heartbeat and auth response for
+ * routing decisions. `.strict()`: the entry once carried a scaler-wide taint
+ * union a peer on this protocol floor never sends, so a stray field is a
+ * version-skew signal rather than something to ignore.
+ */
+const scalerCapacitySummarySchema = z
+  .object({
+    /** Scaler backend name (e.g. "stg-worker-bare-metal") */
+    name: z.string().optional(),
+    /** Scaler backend type (e.g. "bare-metal", "container") */
+    type: z.string().optional(),
+    /** Label sets this scaler backend can provision */
+    labelSets: z.array(z.array(z.string())),
+    /** Maximum agents for this backend */
+    maxAgents: z.number(),
+    /** Current active count for this backend */
+    activeCount: z.number(),
+    /**
+     * Whether this backend spawns its agents on the peer's own host (bare-metal,
+     * Firecracker, container on a local runtime socket). Lets diagnostics
+     * surface the peer's hostname as the scaler's spawning host.
+     */
+    spawnsOnLocalHost: z.boolean().optional(),
+    /**
+     * Per-label-set taint gate (Kubernetes-taint-style opt-in), index-aligned
+     * with `labelSets`: entry `i` is the set of labels a job MUST declare in
+     * `runsOn` to route to `labelSets[i]`; an empty entry means that set has no
+     * gate. Cross-peer routing applies the same rule as the local label matcher.
+     * A consumer refuses to route through an entry whose length does not equal
+     * `labelSets.length`, so a malformed advertisement is never indexed into.
+     */
+    labelSetMandatoryLabels: z.array(z.array(z.string())),
+  })
+  .strict();
 
 // --- ECDH handshake ---
 
@@ -233,11 +220,6 @@ export const jobRerouteSchema = z.object({
   providerContext: z.record(z.string(), z.unknown()).optional(),
   /** Pre-signed source tarball download URL (cache hit). */
   sourceTarUrl: z.string().optional(),
-  /**
-   * @deprecated Use `sourceTarDigest` — this carries the workflow
-   * `contentHash`, not a hash of the tarball bytes.
-   */
-  sourceTarHash: z.string().optional(),
   /** SHA-256 of the source tarball's own bytes, for integrity verification. */
   sourceTarDigest: z.string().optional(),
   /** Pre-signed dependency tarball download URL (cache hit). */

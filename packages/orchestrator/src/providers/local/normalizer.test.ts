@@ -8,6 +8,17 @@ describe('LocalWebhookNormalizer', () => {
     expect(normalizer.provider).toBe('local');
   });
 
+  // fails-when: the access-cache invalidation hook returns to the normalizer
+  it('has no access-cache invalidation hook', () => {
+    expect('getAccessCacheInvalidations' in normalizer).toBe(false);
+  });
+
+  // breaks-if-wrong: the surviving normalizer methods must still be there
+  it('keeps the live normalizer methods', () => {
+    expect(typeof normalizer.normalizeEvent).toBe('function');
+    expect(typeof normalizer.verifySignature).toBe('function');
+  });
+
   describe('extractRoutingKey', () => {
     it('returns x-kici-routing-key header value when present', () => {
       const headers = { 'x-kici-routing-key': 'generic:e2e:source-1' };
@@ -224,61 +235,6 @@ describe('LocalWebhookNormalizer', () => {
   describe('extractCredentials', () => {
     it('returns empty object', () => {
       expect(normalizer.extractCredentials({ installation: { id: 123 } })).toEqual({});
-    });
-  });
-
-  describe('getAccessCacheInvalidations', () => {
-    it('returns repo-user for member events', () => {
-      const payload = {
-        action: 'added',
-        repository: { full_name: 'acme/frontend' },
-        member: { login: 'alice' },
-      };
-      expect(normalizer.getAccessCacheInvalidations('member', 'added', payload)).toEqual([
-        { kind: 'repo-user', repoFullName: 'acme/frontend', username: 'alice' },
-      ]);
-    });
-
-    it('returns user-in-org for organization events', () => {
-      const payload = {
-        action: 'member_added',
-        organization: { login: 'acme' },
-        membership: { user: { login: 'bob' } },
-      };
-      expect(
-        normalizer.getAccessCacheInvalidations('organization', 'member_added', payload),
-      ).toEqual([{ kind: 'user-in-org', orgLogin: 'acme', username: 'bob' }]);
-    });
-
-    it('returns user-in-org for membership events', () => {
-      const payload = {
-        action: 'added',
-        organization: { login: 'acme' },
-        member: { login: 'charlie' },
-      };
-      expect(normalizer.getAccessCacheInvalidations('membership', 'added', payload)).toEqual([
-        { kind: 'user-in-org', orgLogin: 'acme', username: 'charlie' },
-      ]);
-    });
-
-    it('returns repo for team repo-scoped events', () => {
-      const payload = {
-        action: 'added_to_repository',
-        repository: { full_name: 'acme/backend' },
-      };
-      expect(
-        normalizer.getAccessCacheInvalidations('team', 'added_to_repository', payload),
-      ).toEqual([{ kind: 'repo', repoFullName: 'acme/backend' }]);
-    });
-
-    it('returns empty for non-membership events (push / pull_request / etc.)', () => {
-      expect(normalizer.getAccessCacheInvalidations('push', null, {})).toEqual([]);
-      expect(normalizer.getAccessCacheInvalidations('pull_request', 'opened', {})).toEqual([]);
-    });
-
-    it('returns empty for malformed payloads without throwing', () => {
-      expect(normalizer.getAccessCacheInvalidations('member', 'added', null)).toEqual([]);
-      expect(normalizer.getAccessCacheInvalidations('member', 'added', {})).toEqual([]);
     });
   });
 });

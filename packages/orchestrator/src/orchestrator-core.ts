@@ -148,6 +148,7 @@ import {
 } from './provenance/trust-root.js';
 import { OrchestratorSigningKeyRepo } from './db/repos/signing-keys-repo.js';
 import { reconcileOrchestratorSigningKey } from './oidc/reconcile-signing-key.js';
+import { createBoundedSignerResolver } from './oidc/resolve-signer.js';
 import { DashboardEncryptionKeyRepo } from './db/repos/dashboard-encryption-keys-repo.js';
 import {
   reconcileDashboardEncryptionKey,
@@ -202,6 +203,7 @@ import { LogWriter } from './reporting/log-writer.js';
 import { createLogChunkSink, type NormalizedLogChunk } from './reporting/log-chunk-sink.js';
 import { normalizePeerLogChunk } from './reporting/peer-log-normalize.js';
 import { StaleRunDetector } from './stale-detector/stale-run-detector.js';
+import { PendingPrecursorDbWatcher } from './cache/pending-precursor-db-watcher.js';
 import { WorkflowDeadlineDetector } from './stale-detector/workflow-deadline-detector.js';
 import { GateDeadlineDetector } from './stale-detector/gate-deadline-detector.js';
 import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
@@ -328,6 +330,13 @@ export interface OrchestratorSubsystems {
    * Platform `auth.success` message via `onProvenanceIssuer`.
    */
   provenanceTrustRoot: ProvenanceTrustRoot;
+  /**
+   * Orchestrator-owned provenance signing, present when
+   * `KICI_ORCHESTRATOR_PROVENANCE_ISSUER` is configured. The deferred-attestation
+   * retrier mints with it; `resolveSigner` reconciles the active key lazily and
+   * returns null while the key is not yet resolvable.
+   */
+  provenanceSigning: { issuer: string; resolveSigner: () => Promise<Signer | null> } | undefined;
   sourceCache: SourceCache | undefined;
   depCache: DepCache | undefined;
   userCache: UserCache | undefined;
@@ -1796,7 +1805,6 @@ function buildOnDispatch(
     if (wfAuth) dispatchMsg.workflowAuth = wfAuth;
 
     if (job.sourceTarUrl) dispatchMsg.sourceTarUrl = job.sourceTarUrl;
-    if (job.sourceTarHash) dispatchMsg.sourceTarHash = job.sourceTarHash;
     if (job.sourceTarDigest) dispatchMsg.sourceTarDigest = job.sourceTarDigest;
     if (job.depsUrl) dispatchMsg.depsUrl = job.depsUrl;
     if (job.depsHash) dispatchMsg.depsHash = job.depsHash;
@@ -2894,6 +2902,14 @@ export async function bootstrapOrchestrator(
     observerRegistry,
     jobQueue: queue,
     resolveOrgId: (rk: string) => resolveOrgId(db, rk),
+    // The registration window this coordinator opens on a run it dispatches is
+    // recorded under its instance id, and a sibling's window is read against
+    // the same liveness grace the queue's ownership predicates use.
+    instanceId: config.instanceId,
+    instanceLivenessGraceMs: instanceLivenessGraceMs(
+      config.agentMaxReconnectDelayMs * 2,
+      config.clusterInstanceHeartbeatMs,
+    ),
     onRunTerminalCleanup: runTerminalCleanup,
     onExecutionComplete: (runId, status, context, description) => {
       const doWork = () => {
@@ -3973,7 +3989,6 @@ export async function bootstrapOrchestrator(
   const orchestratorSigningRepo = provenanceSigningEnabled
     ? new OrchestratorSigningKeyRepo(db)
     : undefined;
-  let cachedOrchestratorSigner: Signer | null = null;
   const reconcileSignerOnce = (): Promise<{ signer: Signer } | null> =>
     reconcileOrchestratorSigningKey({
       repo: orchestratorSigningRepo!,
@@ -4007,20 +4022,17 @@ export async function bootstrapOrchestrator(
   // must NOT fall back to the Platform relay (which would produce an intermittent
   // Platform-signed bundle that fails verification against the orchestrator trust
   // root). Once provisioned (eager reconcile at boot, or the first mint), the
-  // signer is memoized and returned immediately.
-  const resolveOrchestratorSigner = async (): Promise<Signer | null> => {
-    if (!orchestratorSigningRepo) return null;
-    if (cachedOrchestratorSigner) return cachedOrchestratorSigner;
-    for (let attempt = 0; attempt < 60; attempt++) {
-      const reconciled = await reconcileSignerOnce().catch(() => null);
-      if (reconciled) {
-        cachedOrchestratorSigner = reconciled.signer;
-        return cachedOrchestratorSigner;
-      }
-      await new Promise((res) => setTimeout(res, 500));
-    }
-    return null;
-  };
+  // signer is memoized and returned immediately. Only a not-ready reconcile is
+  // waited out; a reconcile that throws (a stranded key, no master key) ends the
+  // wait at once and is logged, since it cannot resolve itself within the window.
+  const resolveOrchestratorSigner: () => Promise<Signer | null> = orchestratorSigningRepo
+    ? createBoundedSignerResolver({
+        reconcile: reconcileSignerOnce,
+        maxAttempts: 60,
+        delayMs: 500,
+        logError: (message, meta) => logger.error(message, meta),
+      })
+    : async () => null;
 
   // Dashboard-encryption (X25519) key: the trust root for browser-sealed
   // dashboard writes under the `encrypted` posture. Available whenever the
@@ -4165,6 +4177,12 @@ export async function bootstrapOrchestrator(
     scalerConfig,
     cacheStorage,
     provenanceTrustRoot,
+    provenanceSigning: provenanceSigningEnabled
+      ? {
+          issuer: config.provenanceSigningIssuer as string,
+          resolveSigner: resolveOrchestratorSigner,
+        }
+      : undefined,
     sourceCache,
     depCache,
     userCache,
@@ -4730,6 +4748,10 @@ export async function bootstrapOrchestrator(
     rerouteFlapGraceFallbackMs: config.rerouteFlapGraceMs,
     staleThresholdMs: config.jobHeartbeatIntervalMs * config.staleDetectorThresholdMultiplier,
     scanIntervalMs: config.staleDetectorScanIntervalMs,
+    instanceLivenessGraceMs: instanceLivenessGraceMs(
+      config.agentMaxReconnectDelayMs * 2,
+      config.clusterInstanceHeartbeatMs,
+    ),
     // Approval-hold expiry: the held-run store (so overdue holds are expired)
     // and the step-approval bridge (so a step-scoped expiry notifies the
     // waiting agent). Both are supplied by the platform/hybrid mode hook.
@@ -4773,6 +4795,20 @@ export async function bootstrapOrchestrator(
     scanIntervalMs: config.staleDetectorScanIntervalMs,
     staleThresholdMs: config.jobHeartbeatIntervalMs * config.staleDetectorThresholdMultiplier,
   });
+
+  // 30b. Start the shared-database channel for pending precursor jobs. A build
+  // / init / dynamic-eval job this coordinator dispatched may be claimed by an
+  // agent connected to a sibling coordinator, whose terminal frame never
+  // reaches this process — the sibling writes it to `execution_jobs` instead,
+  // and this watcher settles the local tracker from that row.
+  const pendingPrecursorDbWatcher = new PendingPrecursorDbWatcher({
+    db,
+    pendingBuilds,
+    pendingInits,
+    pendingDynamics,
+    executionTracker,
+  });
+  pendingPrecursorDbWatcher.start();
 
   // 30a. Start the GitHub App name/slug refresher (only when a secret store is
   // wired — it needs decrypted App credentials to call GitHub). It re-fetches
@@ -5089,6 +5125,10 @@ export async function bootstrapOrchestrator(
       {
         name: 'Stopping stale run detector',
         fn: () => staleRunDetector.stop(),
+      },
+      {
+        name: 'Stopping pending precursor DB watcher',
+        fn: () => pendingPrecursorDbWatcher.stop(),
       },
       {
         name: 'Stopping workflow deadline detector',

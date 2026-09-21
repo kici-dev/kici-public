@@ -41,6 +41,12 @@ import type { ObserverRegistry } from '../ws/observer-registry.js';
 import type { LogStorage } from './log-storage.js';
 import type { JobQueue } from '../queue/job-queue.js';
 import { ROUND_JOB_PREFIX } from '../pipeline/global-eval-round.js';
+import { extractPrecursorResult } from '../cache/precursor-result.js';
+import {
+  DEFAULT_RECOVERY_GRACE_MS,
+  instanceLivenessGraceMs,
+  liveInstanceIds,
+} from '../cluster/instance-heartbeat.js';
 import { evaluateDownstreams, checkSchedulerInvariant } from '../pipeline/needs-scheduler.js';
 import { evaluateWave } from '../pipeline/wave-scheduler.js';
 
@@ -382,6 +388,22 @@ export interface ExecutionTrackerDeps {
    * `'__default__'` column default (the no-source fallback org).
    */
   resolveOrgId?: (routingKey: string) => Promise<string>;
+  /**
+   * This coordinator's cluster instance id. Written to
+   * `execution_runs.registration_window_instance_id` while this coordinator's
+   * dispatch pipeline still has jobs to register for a run, so a sibling that
+   * rehydrates the run from the database defers finalizing it. Optional for
+   * the same reason `JobQueue`'s is: a worker with no cluster identity leaves
+   * it undefined, holds no durable window, and reads every holder as a sibling.
+   */
+  instanceId?: string;
+  /**
+   * How stale a `cluster_instances` heartbeat may be and still read as live,
+   * for the registration-window holder check. Defaults to
+   * {@link instanceLivenessGraceMs} at the default recovery grace period —
+   * the same window the dispatch queue's ownership predicates use.
+   */
+  instanceLivenessGraceMs?: number;
 }
 
 /** The org used when no routing key / resolver is available (matches the column DEFAULT). */
@@ -569,7 +591,16 @@ export class ExecutionTracker {
   private readonly orgId?: string;
   private readonly jobQueue?: JobQueue;
   private readonly resolveOrgIdFn?: ExecutionTrackerDeps['resolveOrgId'];
+  private readonly instanceId?: string;
+  private readonly livenessGraceMs: number;
   private readonly runs = new Map<string, RunState>();
+  /**
+   * Per-run chain of the durable registration-window writes. The write that
+   * opens a window is fire-and-forget from the synchronous
+   * `holdRunForPendingJobs`; the clear on the last release awaits the chain
+   * first, so a clear can never overtake the open it undoes.
+   */
+  private readonly registrationWindowWrites = new Map<string, Promise<void>>();
   /**
    * Per-run async-mutex chain. `onJobStatus` and `addJobsToRun` mutate the same
    * `run.jobs` Map / `execution_jobs` row; without serialization a job-status
@@ -620,6 +651,9 @@ export class ExecutionTracker {
     this.orgId = deps.orgId;
     this.jobQueue = deps.jobQueue;
     this.resolveOrgIdFn = deps.resolveOrgId;
+    this.instanceId = deps.instanceId;
+    this.livenessGraceMs =
+      deps.instanceLivenessGraceMs ?? instanceLivenessGraceMs(DEFAULT_RECOVERY_GRACE_MS);
   }
 
   /**
@@ -1273,7 +1307,7 @@ export class ExecutionTracker {
     // swap would hang in `running` forever.
     if (reEvaluateCompletion.size > 0 && !run.completedAt && this.isRunComplete(runId)) {
       const stopAfterStuckCheck = await this.enforceSchedulerInvariantOrFail(runId);
-      if (!stopAfterStuckCheck && !run.completedAt && this.isRunComplete(runId)) {
+      if (!stopAfterStuckCheck && (await this.readyToFinalize(run, runId))) {
         await this.finalizeRunCompletion(run, runId, Date.now(), new Date());
       }
     }
@@ -1414,6 +1448,7 @@ export class ExecutionTracker {
           status: state,
           runStatus,
         });
+        this.releaseRunFinishedElsewhere(runId);
         return;
       }
       logger.debug('Job status write already recorded by an orchestrator-side writer', {
@@ -1492,9 +1527,93 @@ export class ExecutionTracker {
       if (stopAfterStuckCheck) return;
     }
 
-    if (TERMINAL_JOB_STATES.has(state) && run && !run.completedAt && this.isRunComplete(runId)) {
+    if (TERMINAL_JOB_STATES.has(state) && run && (await this.readyToFinalize(run, runId))) {
       await this.finalizeRunCompletion(run, runId, timestamp, now);
     }
+  }
+
+  /**
+   * Whether this coordinator may finalize the run now.
+   *
+   * The in-memory job map is only this coordinator's view: a run rehydrated
+   * from the database holds just the jobs its own agents reported, and even
+   * the run's owner holds a sibling-claimed job at the status it last heard.
+   * So once the map reads complete, the shared `execution_jobs` rows are
+   * folded in ({@link syncRunJobsFromRows}) and the check is repeated over the
+   * whole set — a job another coordinator is still running keeps the run
+   * open, and the status computed afterwards covers every job, not a subset.
+   *
+   * Then the registration window: while a LIVE sibling still has jobs to
+   * register (a build-window owner whose real jobs are dispatched only once
+   * the build finishes), the rows say nothing yet, so finalization is deferred
+   * to whichever coordinator sees the last job finish — or to that owner's
+   * own release, which re-runs this check. A dead holder reads as no window,
+   * and a run it left behind is finished by the stale detector's
+   * all-terminal sweep.
+   */
+  private async readyToFinalize(run: RunState, runId: string): Promise<boolean> {
+    if (run.completedAt || !this.isRunComplete(runId)) return false;
+    await this.syncRunJobsFromRows(run, runId);
+    if (!this.isRunComplete(runId)) {
+      logger.info('Run completion deferred: jobs owned by a sibling coordinator are not terminal', {
+        runId,
+      });
+      return false;
+    }
+    return !(await this.registrationWindowHeldByLiveSibling(runId));
+  }
+
+  /**
+   * Fold the run's persisted `execution_jobs` rows into its in-memory map:
+   * a row this coordinator never registered is added at the row's status, and
+   * a job it holds as non-terminal is lifted to the terminal status the row
+   * carries. Memory is never downgraded — the row for the job being reported
+   * was upserted before any completion check runs, so a terminal entry in
+   * memory is always at least as current as its row.
+   */
+  private async syncRunJobsFromRows(run: RunState, runId: string): Promise<void> {
+    const rows = await this.db
+      .selectFrom('execution_jobs')
+      .select(['job_id', 'job_name', 'status'])
+      .where('run_id', '=', runId)
+      .execute();
+    for (const row of rows) {
+      if (typeof row.job_id !== 'string') continue;
+      // The column is NOT NULL with a `pending` default; a row whose status
+      // did not come back is still a job, and an unknown status is not terminal.
+      const status = typeof row.status === 'string' ? row.status : ExecutionJobStatus.enum.pending;
+      const known = run.jobs.get(row.job_id);
+      if (!known) {
+        run.jobs.set(row.job_id, { name: row.job_name ?? row.job_id, status });
+        continue;
+      }
+      if (!TERMINAL_JOB_STATES.has(known.status) && TERMINAL_JOB_STATES.has(status)) {
+        known.status = status;
+      }
+    }
+  }
+
+  /**
+   * Whether a live sibling coordinator has a registration window open on the
+   * run — see {@link holdRunForPendingJobs}. This coordinator's own window is
+   * governed by its in-memory token, so its own id reads as no sibling.
+   */
+  private async registrationWindowHeldByLiveSibling(runId: string): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('execution_runs')
+      .select(['registration_window_instance_id'])
+      .where('run_id', '=', runId)
+      .executeTakeFirst();
+    const holder = row?.registration_window_instance_id;
+    if (typeof holder !== 'string' || holder.length === 0) return false;
+    if (holder === this.instanceId) return false;
+    const live = await liveInstanceIds(this.db, [holder], this.livenessGraceMs);
+    if (!live.has(holder)) return false;
+    logger.info('Run completion deferred: a sibling coordinator is still registering jobs', {
+      runId,
+      holder,
+    });
+    return true;
   }
 
   /**
@@ -1754,6 +1873,15 @@ export class ExecutionTracker {
       // Store plain outputs for cross-job transport and dashboard display
       if (data?.outputs) {
         updateValues.outputs = JSON.stringify(data.outputs);
+      }
+      // Persist the precursor payload (build / init / dynamic-eval markers and
+      // their results) so a sibling coordinator awaiting this job can settle
+      // its pending tracker from the shared row: the agent reports to the
+      // coordinator it is connected to, which is not always the one that
+      // dispatched the job.
+      const precursorResult = extractPrecursorResult(data);
+      if (precursorResult) {
+        updateValues.precursor_result = JSON.stringify(precursorResult);
       }
       // Persist per-job log byte total accumulated from terminal step.status
       // messages. Default to 0 if no steps reported (e.g. job failed before
@@ -2387,10 +2515,13 @@ export class ExecutionTracker {
 
     const failureClass = this.computeFailureClass(overallStatus, [...run.jobs.values()]);
 
-    // Do not override a run that was already marked failed due to a build
-    // failure — the build agent may still complete its job but the run's
-    // terminal state should be preserved.
-    await this.db
+    // The terminal write is monotonic: a row another writer already finished
+    // — a sibling coordinator that saw the last job, the build-failure path,
+    // a cancel — keeps its verdict, and this coordinator's view (its own jobs,
+    // folded with the rows it read a moment ago) does not overwrite it. The
+    // in-memory fan-out below still runs: it drains this coordinator's own log
+    // buffers and sheds its own run state, which no other writer can do.
+    const terminalWrite = await this.db
       .updateTable('execution_runs')
       .set({
         status: overallStatus,
@@ -2401,14 +2532,14 @@ export class ExecutionTracker {
         ...failureReasonUpdate,
       })
       .where('run_id', '=', runId)
-      .where((eb) =>
-        eb.or([
-          eb('status', '!=', ExecutionRunStatus.enum.failed),
-          eb('failure_reason', 'is', null),
-          eb(sql`lower(failure_reason)`, 'not like', '%build%'),
-        ]),
-      )
-      .execute();
+      .where('status', 'not in', [...TERMINAL_RUN_STATES])
+      .executeTakeFirst();
+    if (!guardedWriteApplied(terminalWrite)) {
+      logger.warn('Run terminal write rejected: row already terminal', {
+        runId,
+        rejectedStatus: overallStatus,
+      });
+    }
 
     executionsTotal.add(1, { status: overallStatus });
     executionDurationSeconds.record(durationMs / 1000);
@@ -2680,8 +2811,11 @@ export class ExecutionTracker {
 
     const failureReason = initFailure?.message ?? 'Build job failed';
 
-    // Update DB — cascade to execution_runs, execution_jobs, and dispatch_queue
-    await this.db
+    // Update DB — cascade to execution_runs, execution_jobs, and dispatch_queue.
+    // The run write is monotonic: a run a sibling coordinator already finished
+    // (it saw the build succeed and every later job run) keeps that verdict
+    // when this coordinator's own build wait times out afterwards.
+    const runWrite = await this.db
       .updateTable('execution_runs')
       .set({
         status: ExecutionRunStatus.enum.failed,
@@ -2690,7 +2824,12 @@ export class ExecutionTracker {
         ...(initFailure && { init_failure: JSON.stringify(initFailure) }),
       })
       .where('run_id', '=', runId)
-      .execute();
+      .where('status', 'not in', [...TERMINAL_RUN_STATES])
+      .executeTakeFirst();
+    if (!guardedWriteApplied(runWrite)) {
+      logger.warn('Build-failure run write rejected: row already terminal', { runId });
+    }
+    await this.clearRegistrationWindow(runId);
 
     // Cascade: mark pending/queued execution_jobs as failed
     await this.db
@@ -3391,6 +3530,7 @@ export class ExecutionTracker {
 
     // Cascade: mark pending/recovering dispatch_queue entries as failed
     await this.jobQueue?.failByRunId(runId);
+    await this.clearRegistrationWindow(runId);
 
     executionsTotal.add(1, { status: ExecutionRunStatus.enum.failed });
     executionDurationSeconds.record(durationMs / 1000);
@@ -3654,7 +3794,69 @@ export class ExecutionTracker {
     const run = this.runs.get(runId);
     if (!run || run.completedAt) return false;
     run.pendingJobRegistrations = (run.pendingJobRegistrations ?? 0) + 1;
+    if (run.pendingJobRegistrations === 1) this.openRegistrationWindow(runId);
     return true;
+  }
+
+  /**
+   * Record this coordinator as the run's registration-window holder in
+   * `execution_runs.registration_window_instance_id` — the token's durable
+   * form, which a sibling coordinator finalizing the run consults.
+   *
+   * Chained rather than awaited: the caller is synchronous by contract (the
+   * token must be counted before the next `await` can drop a sibling token),
+   * so the write rides a per-run chain that the clear on the last release
+   * awaits. `registrationWindowSettled` exposes the chain to a caller that
+   * must know the window is durable before it starts waiting on a job a
+   * sibling may finish. A coordinator with no instance id holds no durable
+   * window.
+   */
+  private openRegistrationWindow(runId: string): void {
+    const instanceId = this.instanceId;
+    if (!instanceId) return;
+    this.chainRegistrationWindowWrite(runId, async () => {
+      await this.db
+        .updateTable('execution_runs')
+        .set({ registration_window_instance_id: instanceId })
+        .where('run_id', '=', runId)
+        .execute();
+    });
+  }
+
+  /**
+   * Clear the durable registration window, only if it still names this
+   * coordinator — a sibling that took the run over owns the column now.
+   */
+  private async clearRegistrationWindow(runId: string): Promise<void> {
+    const instanceId = this.instanceId;
+    if (!instanceId) return;
+    await this.chainRegistrationWindowWrite(runId, async () => {
+      await this.db
+        .updateTable('execution_runs')
+        .set({ registration_window_instance_id: null })
+        .where('run_id', '=', runId)
+        .where('registration_window_instance_id', '=', instanceId)
+        .execute();
+    });
+  }
+
+  private chainRegistrationWindowWrite(runId: string, write: () => Promise<void>): Promise<void> {
+    const prior = this.registrationWindowWrites.get(runId) ?? Promise.resolve();
+    const next = prior.then(write).catch((err: unknown) => {
+      logger.error('Registration window write failed', { runId, error: toErrorMessage(err) });
+    });
+    this.registrationWindowWrites.set(runId, next);
+    void next.finally(() => {
+      if (this.registrationWindowWrites.get(runId) === next) {
+        this.registrationWindowWrites.delete(runId);
+      }
+    });
+    return next;
+  }
+
+  /** Resolves once every registration-window write queued so far for the run has landed. */
+  registrationWindowSettled(runId: string): Promise<void> {
+    return this.registrationWindowWrites.get(runId) ?? Promise.resolve();
   }
 
   /**
@@ -3674,15 +3876,30 @@ export class ExecutionTracker {
    * holding it open.
    */
   async releasePendingJobsHold(runId: string): Promise<void> {
+    if (!this.runs.has(runId)) {
+      // The run left memory while the token was held (failed, held, or
+      // finished by another path). Whatever ended it, this coordinator has no
+      // jobs left to register, so the durable window must not outlive it — a
+      // sibling reads a live holder as "still registering" and defers forever.
+      await this.clearRegistrationWindow(runId);
+      return;
+    }
     if ((this.runs.get(runId)?.pendingJobRegistrations ?? 0) <= 0) return;
     await this.withRunLock(runId, async () => {
       const run = this.runs.get(runId);
       if (!run || (run.pendingJobRegistrations ?? 0) <= 0) return;
       run.pendingJobRegistrations = Math.max(0, (run.pendingJobRegistrations ?? 0) - 1);
       if (run.pendingJobRegistrations > 0) return;
-      if (run.completedAt || !this.isRunComplete(runId)) return;
+      await this.clearRegistrationWindow(runId);
+      if (run.completedAt) return;
+      // Fold in what siblings finished while the window was open: a sibling
+      // that saw the last job finish deferred to this window, and nothing else
+      // re-drives its check. Only a run whose every job is terminal here — in
+      // memory or in the rows — goes on to finalize.
+      await this.syncRunJobsFromRows(run, runId);
+      if (!this.isRunComplete(runId)) return;
       const stopAfterStuckCheck = await this.enforceSchedulerInvariantOrFail(runId);
-      if (!stopAfterStuckCheck && !run.completedAt && this.isRunComplete(runId)) {
+      if (!stopAfterStuckCheck && (await this.readyToFinalize(run, runId))) {
         await this.finalizeRunCompletion(run, runId, Date.now(), new Date());
       }
     });
@@ -4325,6 +4542,11 @@ export class ExecutionTracker {
    * stale jobs.
    */
   async completeRunIfAllJobsTerminal(runId: string): Promise<void> {
+    // A sibling whose dispatch pipeline still has jobs to register for this
+    // run holds a durable registration window; the rows do not yet name those
+    // jobs, so neither path below may read "every row terminal" as done.
+    if (await this.registrationWindowHeldByLiveSibling(runId)) return;
+
     // Path A: in-memory state available and already complete (normal operation)
     const memRun = this.runs.get(runId);
     if (memRun && this.isRunComplete(runId)) {
@@ -4495,6 +4717,66 @@ export class ExecutionTracker {
     });
 
     this.scheduleRunPrune(runId);
+  }
+
+  /**
+   * Drop the in-memory state of every run another writer already finished.
+   *
+   * A coordinator finalizes a run — and schedules its own prune — only when it
+   * sees the run's last job finish. In a cluster the last job's frames may go
+   * to a sibling, which finalizes the run and prunes ITS state; this
+   * coordinator's copy has no later trigger and, without this sweep, stays in
+   * memory for the life of the process, one `RunState` per cross-coordinator
+   * run. The stale detector calls this on every tick. One query over the
+   * non-finished runs held here; a run whose row is terminal is released the
+   * way the finalizing path releases its own, minus the completion events and
+   * the row write, which the finalizer already did.
+   *
+   * A run this coordinator legitimately still holds — its row non-terminal,
+   * with or without an open registration window — is not touched.
+   */
+  async pruneRunsFinishedElsewhere(): Promise<number> {
+    const candidates = [...this.runs.entries()]
+      .filter(([, run]) => !run.completedAt)
+      .map(([runId]) => runId);
+    if (candidates.length === 0) return 0;
+    const rows = await this.db
+      .selectFrom('execution_runs')
+      .select(['run_id', 'status'])
+      .where('run_id', 'in', candidates)
+      .where('status', 'in', [...TERMINAL_RUN_STATES])
+      .execute();
+    let released = 0;
+    for (const row of rows) {
+      if (typeof row.run_id !== 'string') continue;
+      if (this.releaseRunFinishedElsewhere(row.run_id)) released++;
+    }
+    if (released > 0) {
+      logger.info('Released in-memory state of runs finished by another coordinator', {
+        released,
+      });
+    }
+    return released;
+  }
+
+  /**
+   * Treat a run whose row another writer finished as finished here too:
+   * mark it complete so no completion path re-enters it, shed the per-run
+   * state the terminal callback sheds, and schedule the prune. Emits no
+   * completion event and writes no row. Returns false when the run is not
+   * held here or is already finishing.
+   */
+  private releaseRunFinishedElsewhere(runId: string): boolean {
+    const run = this.runs.get(runId);
+    if (!run || run.completedAt) return false;
+    run.completedAt = Date.now();
+    // Any token still counted here is moot — the run is over — and dropping
+    // the state lets a late release find no run and clear the durable window.
+    run.pendingJobRegistrations = 0;
+    this.onRunTerminalCleanup?.(runId);
+    this.scheduleRunPrune(runId);
+    logger.info('Run finished by another coordinator; releasing in-memory state', { runId });
+    return true;
   }
 
   /**

@@ -7,13 +7,14 @@ export type {
   HeldRun,
   ProtectionGateResult,
   TrustTier,
+  MinimumTrust,
 } from './types.js';
 
-export { TrustTierSchema } from './types.js';
+export { TrustTierSchema, MinimumTrustSchema } from './types.js';
 
 export { HoldType, normalizePersistedHoldType, persistedHoldTypeSpellings } from './hold-type.js';
 
-export { trustedContributorHoldReason, unknownContributorHoldReason } from './hold-reason.js';
+export { trustedContributorHoldReason } from './hold-reason.js';
 
 export { HeldRunStatus } from './held-run-status.js';
 

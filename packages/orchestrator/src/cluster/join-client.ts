@@ -15,7 +15,6 @@
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { WS_MAX_PAYLOAD_BYTES, type JoinRequest, type JoinResponse } from '@kici-dev/engine';
-import { stringify as yamlStringify } from 'yaml';
 
 import { writeFileSecurely } from '../helpers/secure-write.js';
 import { parseToken, deriveKeys, decryptBundle } from './join-token.js';
@@ -31,13 +30,6 @@ interface JoinClientOptions {
   peerUrl?: string;
   /** API key for Platform authentication (required for --platform mode) */
   apiKey?: string;
-  /**
-   * Path to write the resulting local config YAML.
-   *
-   * @deprecated The orchestrator boots from its environment, so nothing reads
-   * this file. Leave it unset and use {@link JoinClientOptions.envFilePath}.
-   */
-  configPath?: string;
   /** Path to write the env file `orchestrator install --env-file` consumes. */
   envFilePath?: string;
 }
@@ -45,20 +37,8 @@ interface JoinClientOptions {
 /** Default path the join writes its env file to. */
 export const DEFAULT_JOIN_ENV_FILE = './kici-orchestrator.env';
 
-/** Mode for both join artifacts: they carry the cluster's master secret key. */
+/** Mode for the join artifact: it carries the cluster's master secret key. */
 const SECRET_FILE_MODE = 0o600;
-
-/**
- * Local config structure written by the deprecated `--config` path.
- *
- * @deprecated `loadLocalConfig()` strips `storage` and `secrets`, and the boot
- * path never reads the file at all.
- */
-interface JoinLocalConfig {
-  database: { url: string };
-  storage?: ConfigBundle['storage'];
-  secrets?: { key: string };
-}
 
 /**
  * Decrypt a base64-encoded encrypted config bundle using a derived encryption key.
@@ -66,29 +46,6 @@ interface JoinLocalConfig {
 export function decryptAndParseBundle(encryptedB64: string, encryptionKey: Buffer): ConfigBundle {
   const bundleData = Buffer.from(encryptedB64, 'base64');
   return decryptBundle(bundleData, encryptionKey) as ConfigBundle;
-}
-
-/**
- * Build a JoinLocalConfig from a decrypted ConfigBundle.
- * Maps bundle fields to the structure expected by loadLocalConfig().
- *
- * @deprecated Feeds the deprecated `--config` artifact. Use
- * {@link buildEnvFile}.
- */
-export function buildLocalConfig(bundle: ConfigBundle): JoinLocalConfig {
-  const config: JoinLocalConfig = {
-    database: { url: bundle.databaseUrl },
-  };
-
-  if (bundle.storage) {
-    config.storage = bundle.storage;
-  }
-
-  if (bundle.secretKey) {
-    config.secrets = { key: bundle.secretKey };
-  }
-
-  return config;
 }
 
 /**
@@ -183,19 +140,6 @@ export async function writeEnvFile(path: string, bundle: ConfigBundle): Promise<
   await writeSecretFile(path, buildEnvFile(bundle));
 }
 
-/**
- * Write a local config object to a YAML file.
- *
- * @deprecated The orchestrator boot path is environment-only, so nothing reads
- * this file. Use {@link writeEnvFile}.
- */
-export async function writeConfigFile(
-  path: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  await writeSecretFile(path, yamlStringify(config));
-}
-
 export class JoinClient {
   constructor(private readonly options: JoinClientOptions) {
     if (!options.platformUrl && !options.peerUrl) {
@@ -211,8 +155,7 @@ export class JoinClient {
    * 1. Send join.request with token to Platform relay or direct peer
    * 2. Receive join.response with encrypted config bundle
    * 3. Decrypt bundle using token-derived key
-   * 4. Write the env file the orchestrator boots from (and, when `--config`
-   *    names one, the deprecated local YAML)
+   * 4. Write the env file the orchestrator boots from
    */
   async join(): Promise<void> {
     const request: JoinRequest = { type: 'join.request', token: this.options.token };
@@ -237,28 +180,12 @@ export class JoinClient {
 
     logger.info('Join successful, writing config...', { clusterId: bundle.clusterId });
 
-    // The deprecated `--config` artifact is written only when the operator
-    // names one; the env file is the default and is written otherwise.
-    if (this.options.configPath) {
-      const localConfig = buildLocalConfig(bundle);
-      await writeConfigFile(
-        this.options.configPath,
-        localConfig as unknown as Record<string, unknown>,
-      );
-      logger.warn(
-        `--config is deprecated: the orchestrator boots from its environment and never reads ${this.options.configPath}. Use --env-file.`,
-      );
-      logger.info(`Config written to ${this.options.configPath}`);
-    }
-
-    if (this.options.envFilePath || !this.options.configPath) {
-      const envFilePath = this.options.envFilePath ?? DEFAULT_JOIN_ENV_FILE;
-      await writeEnvFile(envFilePath, bundle);
-      logger.info(`Env file written to ${envFilePath}`);
-      logger.info(
-        `Install the orchestrator with: kici-admin orchestrator install --env-file ${envFilePath}`,
-      );
-    }
+    const envFilePath = this.options.envFilePath ?? DEFAULT_JOIN_ENV_FILE;
+    await writeEnvFile(envFilePath, bundle);
+    logger.info(`Env file written to ${envFilePath}`);
+    logger.info(
+      `Install the orchestrator with: kici-admin orchestrator install --env-file ${envFilePath}`,
+    );
   }
 
   /**

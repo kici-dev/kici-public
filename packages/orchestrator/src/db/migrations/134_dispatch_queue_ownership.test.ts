@@ -3,6 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './134_dispatch_queue_ownership.js';
+import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
 
 /**
  * Real-Postgres test for migration 134: asserts the two `dispatch_queue`
@@ -91,10 +92,7 @@ describeDb('migration 134_dispatch_queue_ownership', () => {
     await pool?.end().catch(() => {});
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      await adminPool.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await adminPool.end();

@@ -13,7 +13,7 @@
  * Schema version 8 (additive): adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
  * Schema version 9 (additive): adds repos/notRepos repo pattern fields to git-event triggers for global workflow matching.
  * Schema version 10 (BREAKING): removes notRepos/notPaths fields, negative patterns use ! prefix in repos/paths arrays.
- * Schema version 11 (additive): adds LockInlineValue type for pure function inline evaluation.
+ * Schema version 11 (additive): added an inline-expression value shape for dynamic fields, which is no longer parsed.
  * Schema version 14 (additive): adds declarative cache specs to LockJob and LockStep.
  * Schema version 15 (additive): adds per-job init config(s) to LockJob.
  * Schema version 16 (additive): adds normalized approval config to LockWorkflow/LockJob/LockStep.
@@ -645,35 +645,6 @@ export function isLockParallelStep(entry: LockStepEntry): entry is LockParallelS
 }
 
 /**
- * Serialized inline expression for a dynamic env/context/concurrencyGroup
- * field, shaped as `{ _type: 'inline', expression: '(event) => ...' }`
- * alongside the existing 'static' and 'dynamic' discriminants.
- *
- * @deprecated Schema v11 inline expressions are no longer evaluated in the
- * orchestrator. Dynamic env/context/concurrencyGroup fields are resolved on the
- * eval agent's init-runner. The compiler no longer emits this type; readers keep
- * recognizing it only to defer an old lock's field to the init round. Removed at
- * the next major (v1.0.0).
- */
-export interface LockInlineValue {
-  readonly _type: 'inline';
-  readonly expression: string;
-}
-
-/**
- * Type guard for inline expression values.
- *
- * @deprecated See {@link LockInlineValue}. Retained only so a reader can
- * recognize an old lock's inline field and defer it to the eval agent's
- * init-runner. Removed at the next major (v1.0.0).
- */
-export function isLockInlineValue(value: unknown): value is LockInlineValue {
-  return (
-    typeof value === 'object' && value !== null && (value as LockInlineValue)._type === 'inline'
-  );
-}
-
-/**
  * Author-facing keyword sugar for a `needs` edge's run condition. Each keyword
  * resolves (at compile time) to a set of upstream terminal statuses; the
  * downstream edge is dispatch-satisfied when the upstream's terminal status is
@@ -899,22 +870,15 @@ export interface LockJob {
   /**
    * Bound contexts in merge order. Each entry is a static name; `dynamic` is set
    * when it is a function resolved on the eval agent's init-runner. Later entries
-   * override earlier ones on name collisions. The `LockInlineValue` shape is a
-   * deprecated form still accepted from old locks (see {@link LockInlineValue}).
+   * override earlier ones on name collisions.
    */
-  readonly contexts?: ReadonlyArray<{ value: string | LockInlineValue; dynamic: boolean }>;
-  /**
-   * Static environment variables. A deprecated `LockInlineValue` shape is still
-   * accepted from old locks (see {@link LockInlineValue}).
-   */
-  readonly env?: Record<string, string> | LockInlineValue;
+  readonly contexts?: ReadonlyArray<{ value: string; dynamic: boolean }>;
+  /** Static environment variables. */
+  readonly env?: Record<string, string>;
   /** When true, env is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicEnv?: boolean;
-  /**
-   * Concurrency group name (static string). A deprecated `LockInlineValue` shape
-   * is still accepted from old locks (see {@link LockInlineValue}).
-   */
-  readonly concurrencyGroup?: string | LockInlineValue;
+  /** Concurrency group name (static string). */
+  readonly concurrencyGroup?: string;
   /** When true, concurrencyGroup is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicConcurrencyGroup?: boolean;
   /** Total job wall-clock timeout in milliseconds (init + all steps + hooks). Threaded to the agent via jobConfig. */
@@ -1110,7 +1074,7 @@ export interface LockWorkflow {
  * v8 adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
  * v9 adds repos/notRepos repo pattern fields to git-event triggers for global workflow matching.
  * v10 removes notRepos/notPaths fields; negative patterns use ! prefix in repos/paths arrays.
- * v11 adds the LockInlineValue type (deprecated; inline dynamic fields are resolved on the eval agent).
+ * v11 added an inline-expression value shape for dynamic fields, which is no longer parsed.
  * v12 adds workflow-level registries and installEnv for private npm registry auth.
  * v13 adds job-level and workflow-level timeout.
  * v40 adds siblingsDigest — the in-repo `workspace:` sibling closure the deps

@@ -3,6 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m030 from './030_held_runs_env_set_null.js';
+import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
 
 /**
  * Real-Postgres test for migration 030.
@@ -85,10 +86,7 @@ describeDb('migration 030_held_runs_env_set_null', () => {
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
       // Terminate any lingering backends before dropping.
-      await adminPool.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await adminPool.end();

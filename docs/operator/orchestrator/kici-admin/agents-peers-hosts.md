@@ -98,8 +98,6 @@ Bootstraps a new orchestrator into an existing cluster. Connects via Platform re
 
   `KICI_PLATFORM_URL`, `KICI_PLATFORM_TOKEN` and `KICI_BOOTSTRAP_ADMIN_TOKEN` are read at start, so set them any time before you start the service.
 
-- `--config <path>` writes a local YAML config instead. **Deprecated** — the orchestrator starts from environment variables, so nothing reads that file. See [Deprecations](../../../user/deprecations.md).
-
 ### host -- host roster (declared inventory)
 
 ```bash
@@ -401,14 +399,13 @@ Synopsis: `kici-admin join [options]`
 
 **Options**
 
-| Option              | Default | Description                                                                                                          |
-| ------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
-| `--token <token>`   |         | Join token (kici_join_v1.<routing>.<secret>)                                                                         |
-| `--platform <url>`  |         | Platform WebSocket URL for relay mode (e.g., wss://api.kici.dev/ws)                                                  |
-| `--peer <url>`      |         | Peer HTTP URL for direct mode (e.g., https://orch-1:8080)                                                            |
-| `--api-key <key>`   |         | API key for Platform authentication (required for --platform mode)                                                   |
-| `--env-file <path>` |         | Path to write the env file `orchestrator install --env-file` consumes (default: ./kici-orchestrator.env)             |
-| `--config <path>`   |         | Deprecated: write a local config YAML instead. The orchestrator boots from its environment and never reads this file |
+| Option              | Default | Description                                                                                              |
+| ------------------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| `--token <token>`   |         | Join token (kici_join_v1.<routing>.<secret>)                                                             |
+| `--platform <url>`  |         | Platform WebSocket URL for relay mode (e.g., wss://api.kici.dev/ws)                                      |
+| `--peer <url>`      |         | Peer HTTP URL for direct mode (e.g., https://orch-1:8080)                                                |
+| `--api-key <key>`   |         | API key for Platform authentication (required for --platform mode)                                       |
+| `--env-file <path>` |         | Path to write the env file `orchestrator install --env-file` consumes (default: ./kici-orchestrator.env) |
 
 ### `kici-admin peer`
 

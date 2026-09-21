@@ -84,8 +84,8 @@ describe('restoreSource', () => {
   });
 
   it('restores unverified when no digest is dispatched', async () => {
-    // An older orchestrator sends no digest. Failing here would break every job
-    // during a mixed-version rollout, so the restore proceeds as it always did.
+    // A source that did not come from the content-addressed cache carries no
+    // digest, so the restore proceeds unverified rather than failing the job.
     const { file } = await packTarball({ 'workflows/w.ts': 'export default 1;\n' });
     await restoreSource(workDir, pathToFileURL(file).href);
     await expect(fs.access(path.join(workDir, '.kici/workflows/w.ts'))).resolves.toBeUndefined();

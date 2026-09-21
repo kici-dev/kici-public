@@ -222,6 +222,10 @@ registries: [
 ],
 ```
 
+To publish to Cloudsmith from a step without a stored token, exchange the job's
+OIDC identity token for a Cloudsmith credential — see
+[exchanging the token with an external service](./oidc.md#exchanging-the-token-with-an-external-service).
+
 ## Security model
 
 - **Per-context scoping.** Every `tokenSecret` and `installEnv` entry is qualified with a context name. The orchestrator runs the same protection-rule pipeline (branch / trust / concurrency / reviewer / wait-timer) against each named context **before** resolving any secret, so a workflow that wants a `production` token from a feature branch is rejected exactly like a job that tries to deploy to `production` from a feature branch. A reviewer-gated install context **pauses** the whole workflow dispatch as a workflow-scoped held run instead of resolving the token — see [Reviewer-gated installs](#reviewer-gated-installs) below.
@@ -253,7 +257,7 @@ The orchestrator exposes Prometheus counters and a histogram under the `kici_orc
 | ------------------------------------------------------------- | --------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `kici_orch_install_secrets_decisions_total`                   | Counter   | `decision`, `reason`           | Pass / reject / hold volume. `decision=hold` (reason `held`) counts dispatches paused at a reviewer-gated install context. Reject reasons enumerate the failure mode: `malformed_ref`, `invalid_url_scheme`, `env_not_found`, `protection_rule_block`, `missing_token`, `missing_install_env`, etc. |
 | `kici_orch_install_secrets_npm_registry_used_total`           | Counter   | `channel`, `provider`, `scope` | Per-channel + per-scope usage. `channel=registries` is Option A, `channel=install_env` is Option C. `scope=default` marks a no-scope default registry; `scope=-` marks Option C entries.                                                                                                            |
-| `kici_orch_install_secrets_contributor_stripped_total`        | Counter   | `trust_tier`                   | Number of dispatches where registry tokens were stripped because the contributor tier wasn't `trusted` (fork PRs from unknown / known contributors). Expected to be 0 in single-tenant orgs.                                                                                                        |
+| `kici_orch_install_secrets_contributor_stripped_total`        | Counter   | `trust_tier`                   | Number of dispatches where registry tokens were stripped because the contributor tier wasn't `trusted` (fork PRs). Expected to be 0 in single-tenant orgs.                                                                                                                                          |
 | `kici_orch_install_secrets_token_resolution_duration_seconds` | Histogram | `environment`                  | Latency of per-environment secret resolution. Pathological tails (>500ms) usually mean a Vault timeout or a slow Postgres replica.                                                                                                                                                                  |
 
 The dashboard JSON lives at `infra/terraform/modules/grafana/dashboards/install-secrets.json`; if you maintain your own monitoring stack, you can import it directly.

@@ -52,7 +52,7 @@ services:
     restart: unless-stopped
 
   seaweedfs:
-    image: docker.io/chrislusf/seaweedfs:4.46
+    image: docker.io/chrislusf/seaweedfs:4.47
     # Self-contained S3-compatible store for the cache (compiled bundles,
     # dependency tarballs, and `kici run remote` overlay uploads). A single
     # static identity is defined in seaweedfs-s3.json; the kici-cache bucket is
@@ -77,7 +77,7 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    image: quay.io/kici-dev/kici-orchestrator:0.8.0
+    image: quay.io/kici-dev/kici-orchestrator:0.9.0@sha256:58c36d0222832fcb82b0af33cdb46d474b97654b0051cb6c54fa96fca9a13af2
     # The orchestrator image runs as the unprivileged `node` user, but the
     # container scaler needs read/write access to the bind-mounted container
     # runtime socket below. On a standard Docker host that socket is

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/compiler",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Compiler and CLI for KiCI workflows. Compiles `.kici/workflows/*.ts` to a `kici.lock.json` file consumed by the orchestrator and agents, and runs workflows locally or against a remote orchestrator.",
   "keywords": [
     "ci",
@@ -45,16 +45,16 @@
     "./cli": "./dist/cli.js"
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsgo --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
     "postbuild": "zx hack/postbuild.mjs",
-    "typecheck": "tsgo --noEmit",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "postpublish": "node ../../packages/kici/hack/publish-wrapper.mjs",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/compiler --name @kici-dev/compiler"
   },
   "dependencies": {
-    "@inquirer/prompts": "^8.7.0",
+    "@inquirer/prompts": "^8.7.2",
     "@kici-dev/agent": "workspace:*",
     "@kici-dev/core": "workspace:*",
     "@kici-dev/engine": "workspace:*",
@@ -64,20 +64,20 @@
     "commander": "^15.0.0",
     "embedded-postgres": "18.4.0-beta.17",
     "fast-glob": "^3.3.3",
-    "open": "11.0.0",
+    "open": "11.0.4",
     "picocolors": "^1.1.1",
     "picomatch": "^4.0.7",
     "tar": "^7.5.22",
-    "typescript": "^6.0.3",
     "ws": "^8.21.3",
-    "wsl-utils": "^0.3.0",
-    "yaml": "^2.9.0",
-    "zod": "^4.4.3",
+    "wsl-utils": "^1.0.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5",
     "zx": "^8.8.5"
   },
   "devDependencies": {
     "@types/archiver": "^8.0.0",
-    "jszip": "^3.10.1"
+    "jszip": "^3.10.2",
+    "typescript": "npm:@typescript/typescript6@^6.0.2"
   },
   "peerDependencies": {
     "@kici-dev/sdk": "workspace:*"

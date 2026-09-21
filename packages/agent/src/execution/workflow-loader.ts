@@ -12,7 +12,7 @@ import path from 'node:path';
 import { register, createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
-import { normalizeLineEndings, sha256 } from '@kici-dev/shared';
+import { normalizeLineEndings, sha256, toErrorMessage } from '@kici-dev/shared';
 import {
   COMPILE_SCHEMA_VERSION,
   collectSourceSymlinks,
@@ -22,11 +22,6 @@ import {
 } from '@kici-dev/core/kici-source-digest';
 import type { Workflow, Job, StepInput, DynamicJobFn, OutputsMap, StepRefMap } from '@kici-dev/sdk';
 import { isDynamicJobFn } from '@kici-dev/sdk';
-import {
-  setStepOutputsMap as setStepOutputsMapBundled,
-  setStepRefMap as setStepRefMapBundled,
-  setJobOutputsMap as setJobOutputsMapBundled,
-} from '@kici-dev/sdk/internal';
 import { buildGeneratorContext, type GeneratorRepoPair } from './generator-context.js';
 
 /**
@@ -56,44 +51,42 @@ export interface SdkOutputSetters {
  * ESM modules by resolved URL, so importing that path yields the workflow's live
  * singleton, not a fresh copy.
  *
- * Both specifiers resolve to the same module-global maps — `internal.ts` and the
- * root barrel re-export the same `outputs.js` bindings — so the fallback below
- * changes which entry is imported, never which singleton is mutated.
- *
- * Falls back to the agent's bundled setters when neither resolves (mirrors
- * `resolveSdkSetters` in the compiler's test runner).
+ * The setters live only on `@kici-dev/sdk/internal`. A tree whose SDK does not
+ * publish that subpath cannot be wired to this agent, and the agent's own
+ * bundled setters would mutate a map the workflow's proxies never read — so the
+ * mismatch is refused here rather than surfacing later as an empty `.result`.
  */
 export async function resolveWorkflowSdkSetters(
   workflowFilePath: string,
 ): Promise<SdkOutputSetters> {
   const req = createRequire(workflowFilePath);
-  // The setters live on `@kici-dev/sdk/internal`; they also stay on the root
-  // barrel, `@deprecated`, for the whole 0.x line. Try the subpath first and
-  // fall back to the root, so a customer tree carrying an SDK older than the
-  // subpath still resolves the same module-global maps its proxies read.
-  for (const specifier of ['@kici-dev/sdk/internal', '@kici-dev/sdk']) {
-    try {
-      const sdkEntry = req.resolve(specifier);
-      const sdk = (await import(pathToFileURL(sdkEntry).href)) as Partial<SdkOutputSetters>;
-      if (
-        typeof sdk.setStepOutputsMap === 'function' &&
-        typeof sdk.setStepRefMap === 'function' &&
-        typeof sdk.setJobOutputsMap === 'function'
-      ) {
-        return {
-          setStepOutputsMap: sdk.setStepOutputsMap,
-          setStepRefMap: sdk.setStepRefMap,
-          setJobOutputsMap: sdk.setJobOutputsMap,
-        };
-      }
-    } catch {
-      // Try the next specifier, then the agent's bundled setters.
-    }
+  let sdk: Partial<SdkOutputSetters>;
+  try {
+    const sdkEntry = req.resolve('@kici-dev/sdk/internal');
+    sdk = (await import(pathToFileURL(sdkEntry).href)) as Partial<SdkOutputSetters>;
+  } catch (err) {
+    throw new Error(
+      `Could not resolve @kici-dev/sdk/internal from ${workflowFilePath}: the workflow tree ` +
+        `must depend on @kici-dev/sdk@>=0.8.0 to run on this agent ` +
+        `(agent baked @kici-dev/sdk@${AGENT_SDK_VERSION}). ` +
+        `Upgrade the repository's @kici-dev/sdk and recompile: ${toErrorMessage(err)}`,
+    );
+  }
+  if (
+    typeof sdk.setStepOutputsMap !== 'function' ||
+    typeof sdk.setStepRefMap !== 'function' ||
+    typeof sdk.setJobOutputsMap !== 'function'
+  ) {
+    throw new Error(
+      `@kici-dev/sdk/internal resolved from ${workflowFilePath} carries no output-map setters; ` +
+        `the workflow tree must depend on @kici-dev/sdk@>=0.8.0 to run on this agent ` +
+        `(agent baked @kici-dev/sdk@${AGENT_SDK_VERSION}).`,
+    );
   }
   return {
-    setStepOutputsMap: setStepOutputsMapBundled,
-    setStepRefMap: setStepRefMapBundled,
-    setJobOutputsMap: setJobOutputsMapBundled,
+    setStepOutputsMap: sdk.setStepOutputsMap,
+    setStepRefMap: sdk.setStepRefMap,
+    setJobOutputsMap: sdk.setJobOutputsMap,
   };
 }
 
@@ -432,7 +425,7 @@ export async function extractStepsFromDynamicJob(
 
   const { $ } = await import('zx');
   const { createLogger } = await import('@kici-dev/shared');
-  const { buildKiciApi, buildNeedsContext } = await import('@kici-dev/sdk');
+  const { buildKiciApi, buildNeedsContext } = await import('@kici-dev/sdk/internal');
   const log = createLogger({ prefix: `dynamic-job-fn:${workflow.name}` });
 
   const kici = buildKiciApi(

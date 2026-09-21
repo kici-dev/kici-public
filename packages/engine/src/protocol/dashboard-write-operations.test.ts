@@ -6,7 +6,6 @@ import {
   DASHBOARD_WRITE_OPERATIONS_BY_NAME,
   DASHBOARD_WRITE_OPERATIONS_BY_WIRE_TYPE,
   DASHBOARD_WRITE_OPERATION_VALUES,
-  coerceDashboardWritePolicyValue,
   dashboardWritePolicyMapSchema,
   getDashboardWriteOperationDescriptor,
   getDashboardWriteOperationsByCategory,
@@ -153,16 +152,21 @@ describe('three-state policy', () => {
     );
   });
 
-  it('coerces legacy boolean values (true→permissive, false→disabled)', () => {
-    expect(coerceDashboardWritePolicyValue(true)).toBe('permissive');
-    expect(coerceDashboardWritePolicyValue(false)).toBe('disabled');
-    expect(coerceDashboardWritePolicyValue('encrypted')).toBe('encrypted');
-    expect(dashboardWritePolicyMapSchema.parse({ 'secrets.set': false })).toEqual({
-      'secrets.set': 'disabled',
-    });
-    expect(dashboardWritePolicyMapSchema.parse({ 'secrets.set': true })).toEqual({
-      'secrets.set': 'permissive',
-    });
+  it('refuses boolean policy values (the tri-state is the only shape)', () => {
+    // fails-when: a boolean is coerced instead of refused.
+    expect(dashboardWritePolicyMapSchema.safeParse({ 'held_runs.approve': true }).success).toBe(
+      false,
+    );
+    expect(dashboardWritePolicyMapSchema.safeParse({ 'secrets.set': false }).success).toBe(false);
+  });
+
+  it('accepts every tri-state value on a plaintext op', () => {
+    // breaks-if-wrong: the current enum shape still parses.
+    for (const state of DashboardWritePolicyState.options) {
+      expect(dashboardWritePolicyMapSchema.parse({ 'secrets.set': state })).toEqual({
+        'secrets.set': state,
+      });
+    }
   });
 
   it('resolveFullPolicyStateView expands sparse map to all ops', () => {

@@ -917,8 +917,6 @@ function storeReturningExpiry(approvalExpiryHours: number) {
   return {
     get: vi.fn().mockResolvedValue({
       forkPolicy: 'hold',
-      unknownContributorPolicy: 'hold',
-      workflowChangePolicy: 'hold',
       approvalExpiryHours,
       approvalExpirySeconds: approvalExpiryHours * SECONDS_PER_HOUR,
       source: 'platform',
@@ -2113,6 +2111,11 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => timeline.push('register')),
+      // The durable form of the token must have landed before the build wait
+      // starts, so the settle is awaited right after the token is taken.
+      registrationWindowSettled: vi.fn(async () => {
+        timeline.push('durable');
+      }),
       releasePendingJobsHold: vi.fn(async () => {
         timeline.push('clear');
       }),
@@ -2134,7 +2137,13 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
     expect(dispatched.map((d) => d.jobName)).toEqual(['__build__ci', 'build']);
     // Registered before the workflow's own job is dispatched, cleared only once
     // dispatch is done registering it.
-    expect(timeline).toEqual(['dispatch:__build__ci', 'register', 'dispatch:build', 'clear']);
+    expect(timeline).toEqual([
+      'dispatch:__build__ci',
+      'register',
+      'durable',
+      'dispatch:build',
+      'clear',
+    ]);
   });
 
   it('releases the build-window token on the aborted-build early return', async () => {
@@ -2527,14 +2536,9 @@ async function runEvaluateJobContexts(over: {
 }
 
 describe('evaluateJobContexts — dynamic fields defer to the init round', () => {
-  it('defers a pure inline env to the init round instead of evaluating it in-process', async () => {
+  it('defers a dynamic env to the init round and carries no in-process value', async () => {
     const { deferredInitJobs, jobContextData } = await runEvaluateJobContexts({
-      lockJob: {
-        _type: 'static',
-        name: 'build',
-        env: { _type: 'inline', expression: '(event) => ({ E: event.type })' },
-        dynamicEnv: true,
-      },
+      lockJob: { _type: 'static', name: 'build', dynamicEnv: true },
       event: { type: 'push' },
     });
     expect(deferredInitJobs).toHaveLength(1);
@@ -5058,14 +5062,8 @@ describe('a fork-PR hold, held and released end to end', () => {
 });
 
 describe('dispatchMatchedWorkflow — the run trust posture reaches its call sites', () => {
-  /**
-   * The tier is `known`, deliberately. It is legacy vocabulary
-   * `resolveRefTrust` no longer produces, so no call site would ever hardcode
-   * it — a summary that prints it can only have read the run's real
-   * `trustResolution.tier`. `unknown` would pass just as well against a
-   * literal, which is exactly the gap these two cases close.
-   */
-  const LEGACY_UNTRUSTED_TIER = 'known';
+  /** The fork tier: the one value the posture note and the hold summary must carry. */
+  const UNTRUSTED_TIER = 'unknown';
 
   it('threads the real tier into the security-hold summary and carries the posture note', async () => {
     // A trust-policy hold stores a resume context, so `/kici approve` replays
@@ -5080,7 +5078,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     });
     ctx.securityDecision = holdDecision(SecurityHoldReason.enum.fork_pr);
     ctx.trustResolution = {
-      tier: LEGACY_UNTRUSTED_TIER,
+      tier: UNTRUSTED_TIER,
       contributorUsername: 'octocat',
     } as unknown as WorkflowDispatchContext['trustResolution'];
     ctx.lockFileSource = 'base';
@@ -5098,7 +5096,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
       (c) => c[2] === 'pending' && c[3] === 'Held for approval',
     );
     expect(holdCall).toBeDefined();
-    expect(String(holdCall![4])).toContain(`(tier: ${LEGACY_UNTRUSTED_TIER})`);
+    expect(String(holdCall![4])).toContain(`(tier: ${UNTRUSTED_TIER})`);
     expect(String(holdCall![4])).toContain(REDUCED_PRIVILEGE_MARKER);
     // `lockFileSource` is 'base' above, so the note's base-branch clause is the
     // half that can only come from the run's own recorded source.
@@ -5119,7 +5117,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     });
     ctx.securityDecision = rejectDecision(SecurityHoldReason.enum.fork_pr);
     ctx.trustResolution = {
-      tier: LEGACY_UNTRUSTED_TIER,
+      tier: UNTRUSTED_TIER,
       contributorUsername: 'octocat',
     } as unknown as WorkflowDispatchContext['trustResolution'];
     ctx.lockFileSource = 'base';
@@ -5132,7 +5130,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
 
     const rejectCall = postCheckStatus.mock.calls.find((c) => c[2] === 'failure');
     expect(rejectCall).toBeDefined();
-    expect(String(rejectCall![4])).toContain(`(tier: ${LEGACY_UNTRUSTED_TIER})`);
+    expect(String(rejectCall![4])).toContain(`(tier: ${UNTRUSTED_TIER})`);
     expect(String(rejectCall![4])).not.toContain(REDUCED_PRIVILEGE_MARKER);
   });
 
@@ -5152,14 +5150,14 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
       },
     });
     ctx.trustResolution = {
-      tier: LEGACY_UNTRUSTED_TIER,
+      tier: UNTRUSTED_TIER,
       contributorUsername: 'octocat',
     } as unknown as WorkflowDispatchContext['trustResolution'];
     ctx.lockFileSource = 'base';
 
     await dispatchMatchedWorkflow(ctx);
 
-    expect(setRunTrustContext).toHaveBeenCalledWith(ctx.runId, LEGACY_UNTRUSTED_TIER, 'base');
+    expect(setRunTrustContext).toHaveBeenCalledWith(ctx.runId, UNTRUSTED_TIER, 'base');
   });
 
   it('still records the rest of the run when the stamp cannot be applied', async () => {
@@ -5179,7 +5177,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
       },
     });
     ctx.trustResolution = {
-      tier: LEGACY_UNTRUSTED_TIER,
+      tier: UNTRUSTED_TIER,
       contributorUsername: 'octocat',
     } as unknown as WorkflowDispatchContext['trustResolution'];
     ctx.lockFileSource = 'base';

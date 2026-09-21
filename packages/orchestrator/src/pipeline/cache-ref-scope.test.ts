@@ -12,10 +12,6 @@ describe('deriveCacheRefScope', () => {
     expect(deriveCacheRefScope(trust('trusted'))).toBe(CacheRefScope.enum.shared);
   });
 
-  it('maps a known ref to the isolated scope', () => {
-    expect(deriveCacheRefScope(trust('known'))).toBe(CacheRefScope.enum.isolated);
-  });
-
   it('maps an unknown ref to the isolated scope', () => {
     expect(deriveCacheRefScope(trust('unknown'))).toBe(CacheRefScope.enum.isolated);
   });

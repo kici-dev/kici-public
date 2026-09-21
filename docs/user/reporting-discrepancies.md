@@ -11,8 +11,10 @@ promised. You can report that.
 A human reader can use this page too. The rules below exist because the tracker
 is public and you are filing under someone else's GitHub identity.
 
-Run `kici feedback` to print this contract in your terminal, or
-`kici feedback --json` to read it as structured data.
+Run `kici feedback` to print this contract in your terminal,
+`kici feedback --json` to read it as structured data, or
+`kici feedback --draft <file.json> --open` to turn a draft into the prefilled form
+and open it.
 
 ## The rule, in one sentence
 
@@ -87,19 +89,20 @@ approval rule.
 
 ## What the report must carry
 
-Five things. A report missing any of them cannot be acted on:
+A report missing any of these fields cannot be acted on:
 
 | Field                                 | What it holds                                                                                                        |
 | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | What the docs or CLI advertise        | The exact claim, quoted, plus its source: a docs URL or the command whose `--help` says it.                          |
 | What actually happened                | The real output or behaviour, quoted, with any error text.                                                           |
 | Minimal reproduction, including setup | Every step from an empty directory: the setup commands, a minimal synthetic workflow, and the exact command you ran. |
-| Version and environment               | Output of `kici --version`, plus Node version and OS.                                                                |
+| KiCI version                          | Output of `kici --version`.                                                                                          |
+| Environment                           | Node version and OS.                                                                                                 |
 | Why this is a discrepancy             | One or two sentences ruling out the likely misreads — why the docs cannot be read to match what you observed.        |
 
 The last field is the one agents skip, and it is the one that makes a report
 usable. "The docs say `--foo` exists and it does not" is a claim. "`--foo` is
-documented at <url>, and `kici bar --help` on 0.1.16 lists no such flag" is a
+documented at <url>, and `kici bar --help` on the version I ran lists no such flag" is a
 finding someone can act on in one pass.
 
 Include setup steps whenever your reproduction needed any. A reproduction that
@@ -108,22 +111,36 @@ starts from state a maintainer cannot recreate is not a reproduction.
 ## Filing it
 
 The tracker is [kici-dev/kici-public](https://github.com/kici-dev/kici-public),
-and the form is **Agent report**:
+and the form is **Agent report** (`agent_report.yml`). It is a GitHub issue
+form, which only the browser can submit — `gh issue create` cannot fill it.
+So you draft, and the person files.
 
-```bash
-kici feedback --open
+Write the draft as JSON, one key per field of the form (`kici feedback --json`
+lists them under `draftFields`):
+
+```json
+{
+  "title": "kici compile --check writes a lock file",
+  "advertised": "https://docs.kici.dev/user/cli-reference/ says: `kici compile --check` type-checks without writing a lock file.",
+  "observed": ".kici/kici.lock.json was written; mtime changed.",
+  "reproduction": "$ mkdir /tmp/repro && cd /tmp/repro\n$ kici init\n$ kici compile --check",
+  "version": "0.8.0",
+  "environment": "Node 24.13.0, Ubuntu 24.04",
+  "justification": "The sentence names --check as the no-write mode; no reading of it allows a write."
+}
 ```
 
-Draft the complete body first. Show it to the person you are working with —
-the whole body, not a summary of it. File only after they say yes:
+Then build the prefilled form:
 
 ```bash
-gh issue create --repo kici-dev/kici-public --template agent_report.yml
+kici feedback --draft draft.json --open
 ```
 
-The form asks you to confirm the report was drafted by an agent and reviewed by
-a person before filing. Answer honestly; it is what lets maintainers triage
-agent-filed reports as a group.
+The command prints the form URL with every field filled in and, with
+`--open`, opens it. It reaches no network and files nothing. Show the person
+you are working with the whole draft — not a summary of it. They open the
+URL, read the prefilled form, tick the review boxes, and submit. File only
+after they say yes.
 
 If they say no, that is the end of it. Do not re-file the same finding in
 another form, and do not open it as a question instead.

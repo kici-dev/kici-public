@@ -1259,12 +1259,12 @@ describe('processTestTrigger', () => {
     });
   });
 
-  describe('inline (pure dynamic) context resolution', () => {
-    const INLINE_ORG = 'org-inline';
+  describe('context resolution at test dispatch', () => {
+    const CTX_ORG = 'org-ctx';
 
     // db mock answering resolveOrgId (sources -> ORG) and the org-scoped
     // contexts lookup keyed on the env name.
-    function makeInlineDb(envRows: Record<string, { allow_local_execution: boolean }>) {
+    function makeContextDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
         fn: { countAll: () => ({ as: () => ({}) }) },
         selectFrom: vi.fn((table: string) => ({
@@ -1277,7 +1277,7 @@ describe('processTestTrigger', () => {
               }),
               innerJoin: vi.fn(() => chain),
               executeTakeFirst: vi.fn(async () => {
-                if (table === 'sources') return { customer_id: INLINE_ORG };
+                if (table === 'sources') return { customer_id: CTX_ORG };
                 if (table === 'generic_webhook_sources') return undefined;
                 if (table === 'contexts') return envName ? envRows[envName] : undefined;
                 if (table === 'execution_jobs') return { count: 0 };
@@ -1298,13 +1298,13 @@ describe('processTestTrigger', () => {
     }
 
     /** Env store whose matchContext returns a full row (no protection rules). */
-    function makeInlineEnvStore(name: string, allowLocalExecution = true) {
+    function makeContextEnvStore(name: string, allowLocalExecution = true) {
       return {
         matchContext: vi.fn(async (_org: string, n: string) =>
           n === name
             ? {
                 id: `env-${name}`,
-                org_id: INLINE_ORG,
+                org_id: CTX_ORG,
                 name,
                 type: 'deployment',
                 glob_pattern: null,
@@ -1329,10 +1329,7 @@ describe('processTestTrigger', () => {
       } as any;
     }
 
-    const inlineEnvExpression =
-      "(event) => event.targetBranch === 'master' ? 'test-db' : 'production'";
-
-    function inlineEnvWorkflow() {
+    function staticContextWorkflow() {
       return createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -1341,90 +1338,19 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          contexts: [
-            { value: { _type: 'inline' as const, expression: inlineEnvExpression }, dynamic: true },
-          ],
+          contexts: [{ value: 'test-db', dynamic: false }],
         },
       ]);
     }
 
-    it('does not resolve a pure inline context in-process (deferred to the init round)', async () => {
-      // The orchestrator no longer evaluates the inline expression at dispatch;
-      // the field is resolved by the agent's init job, exactly like an impure
-      // dynamic context. So no context gate query runs and no per-context secret
-      // resolution happens in-process — the run is still accepted.
-      const lockFile = createMockLockFile([inlineEnvWorkflow()]);
-      (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
-      deps.db = makeInlineDb({ 'test-db': { allow_local_execution: true } }) as any;
-      deps.contextStore = makeInlineEnvStore('test-db');
-
-      const resolveForJob = vi.fn(async () => ({ DB_URL: 'x' }));
-      deps.secretResolver = { resolveForJob } as any;
-
-      const dispatch = vi
-        .fn()
-        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
-      (deps.dispatcher as any).dispatch = dispatch;
-
-      const input = createMockInput({
-        routingKey: 'github:42',
-        workflowName: 'ci',
-        event: { type: 'push', targetBranch: 'master', payload: {} },
-      });
-
-      const result = await processTestTrigger(input, deps);
-
-      expect(result.status).toBe('accepted');
-      // No in-process context resolution: the inline name never becomes a bound
-      // context, so its secrets are not resolved here.
-      expect(resolveForJob).not.toHaveBeenCalled();
-      const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
-      expect(jobConfig.context).toBeUndefined();
-      expect(jobConfig.secrets).toBeUndefined();
-    });
-
-    it('accepts a run whose inline context expression would throw (no in-process eval)', async () => {
-      // A throwing inline expression is never executed at dispatch, so it cannot
-      // reject the run — the agent's init job is the only place it runs.
-      const failingWorkflow = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
-          name: 'broken-job',
-          runsOn: [{ kind: 'exact', value: 'default' }],
-          steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
-          rules: [],
-          contexts: [
-            {
-              value: { _type: 'inline' as const, expression: '(event) => event.nope.deref' },
-              dynamic: true,
-            },
-          ],
-        },
-      ]);
-      const lockFile = createMockLockFile([failingWorkflow]);
-      (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
-      deps.db = makeInlineDb({}) as any;
-
-      const input = createMockInput({
-        routingKey: 'github:42',
-        workflowName: 'ci',
-        event: { type: 'push', targetBranch: 'master', payload: {} },
-      });
-
-      const result = await processTestTrigger(input, deps);
-
-      expect(result.status).toBe('accepted');
-    });
-
     it('marks the run root jobs needs_satisfied through the chained update', async () => {
-      const lockFile = createMockLockFile([inlineEnvWorkflow()]);
+      const lockFile = createMockLockFile([staticContextWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       const executed: Array<Record<string, unknown>> = [];
-      const db = makeInlineDb({ 'test-db': { allow_local_execution: true } });
+      const db = makeContextDb({ 'test-db': { allow_local_execution: true } });
       db.updateTable = makeUpdateTableMock(undefined, (payload) => executed.push(payload));
       deps.db = db as any;
-      deps.contextStore = makeInlineEnvStore('test-db');
+      deps.contextStore = makeContextEnvStore('test-db');
       deps.secretResolver = { resolveForJob: vi.fn(async () => ({ DB_URL: 'x' })) } as any;
 
       const input = createMockInput({
@@ -1443,7 +1369,7 @@ describe('processTestTrigger', () => {
       expect(executed.some((payload) => payload.needs_satisfied === true)).toBe(true);
     });
 
-    it('skips impure dynamic contexts (marker set, no inline value)', async () => {
+    it('skips dynamic contexts (marker set, no value)', async () => {
       const impureWorkflow = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -1453,7 +1379,7 @@ describe('processTestTrigger', () => {
           needs: [],
           rules: [],
           dynamicContext: true,
-          // NO context field -- impure dynamic context.
+          // NO context field -- a dynamic context is resolved by the init round.
         },
       ]);
       const lockFile = createMockLockFile([impureWorkflow]);
@@ -1469,7 +1395,7 @@ describe('processTestTrigger', () => {
                 return chain;
               }),
               executeTakeFirst: vi.fn(async () => {
-                if (table === 'sources') return { customer_id: INLINE_ORG };
+                if (table === 'sources') return { customer_id: CTX_ORG };
                 return undefined;
               }),
             };
@@ -1635,11 +1561,10 @@ describe('processTestTrigger', () => {
       expect(deps.variableStore!.getResolvedVars).toHaveBeenCalledWith(ORG, 'env-1', 'github:42');
     });
 
-    it('does not resolve an inline jobEnv in-process (deferred to the init round)', async () => {
-      // The orchestrator no longer evaluates the inline env expression at
-      // dispatch; the agent's init job resolves it. So the dispatched job carries
-      // no in-process jobEnv — the field takes the init marker.
-      const inlineEnvJobWorkflow = createMockWorkflow('ci', [
+    it('dispatches a dynamic jobEnv with no in-process value (resolved by the init round)', async () => {
+      // The agent's init job resolves a dynamic env, so the dispatched job
+      // carries no in-process jobEnv — the field takes the init marker.
+      const dynamicEnvJobWorkflow = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
           name: 'deploy-job',
@@ -1648,13 +1573,9 @@ describe('processTestTrigger', () => {
           needs: [],
           rules: [],
           dynamicEnv: true,
-          env: {
-            _type: 'inline' as const,
-            expression: '(event) => ({ BRANCH: event.targetBranch })',
-          },
         },
       ]);
-      const lockFile = createMockLockFile([inlineEnvJobWorkflow]);
+      const lockFile = createMockLockFile([dynamicEnvJobWorkflow]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeParityDb({}) as any;
       const getJobConfig = captureDispatchedJobConfig(deps);

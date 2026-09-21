@@ -26,6 +26,7 @@ import { NeedsRunOn, OnUnreachableMode } from '../../trigger/types.js';
 import { HostTargetSelector } from '../../labels-match.js';
 import { ConcurrencyStrategy } from '../../context/concurrency-strategy.js';
 import { HeldRunStatus } from '../../context/held-run-status.js';
+import { TrustTierSchema } from '../../context/types.js';
 import { HostInventoryEntry } from '../../inventory.js';
 import {
   globalWorkflowsGetRequestSchema,
@@ -248,7 +249,7 @@ export const dashboardJobDetailSchema = z.object({
 
 /** Trust context from orchestrator execution_runs (populated for PR-triggered runs). */
 const trustContextSchema = z.object({
-  trustTier: z.enum(['trusted', 'known', 'unknown']).nullable(),
+  trustTier: TrustTierSchema.nullable(),
   lockFileSource: z.enum(['head', 'base']).nullable(),
   contributorUsername: z.string().nullable(),
 });
@@ -3292,8 +3293,6 @@ export type RunEvent = z.infer<typeof runEventSchema>;
  */
 export const trustPolicyResponseSchema = z.object({
   forkPolicy: z.string(),
-  unknownContributorPolicy: z.string(),
-  workflowChangePolicy: z.string(),
   approvalExpiryHours: z.number(),
   approvalExpirySeconds: z.number().optional(),
 });
@@ -3340,20 +3339,6 @@ export const orgMemberSchema = z.object({
   suspendedAt: z.coerce.string().nullable(),
   joinedAt: z.coerce.string(),
   ciTrustLevel: z.string(),
-  /**
-   * The per-member `ci_trust` override, when one is stored, or `null` when the
-   * member's level is entirely role-derived.
-   *
-   * Carried beside `ciTrustLevel` rather than folded into it, because the two
-   * answer different questions. `ciTrustLevel` is the effective level the CI
-   * trust gate decides with — the role-derived level with any override applied
-   * on top — so it cannot say which half produced it. An override OUTRANKS the
-   * roles, so an org that lowered a member by override has no way to see that,
-   * and no way to undo it, from a payload that reports only the result.
-   *
-   * Optional so an older client keeps parsing the response.
-   */
-  ciTrustOverride: z.string().nullable().optional(),
   identityLinks: z.array(memberIdentityLinkSchema),
 });
 

@@ -28,26 +28,13 @@ export interface ContextGateRejection {
 
 /** Effective protection parameters after most-restrictive aggregation. */
 export interface EffectiveProtection {
-  minimumTrust?: 'known' | 'trusted';
+  minimumTrust?: 'trusted';
   requiredReviewers: string[];
   waitTimerSeconds: number | null;
   holdExpirySeconds: number;
   concurrencyLimit: number | null;
   concurrencyStrategy: ConcurrencyStrategy;
 }
-
-/**
- * Rank of the `minimumTrust` floors the type admits, strictest highest.
- *
- * It no longer decides a verdict. `evaluateTrustGate` blocks the same tier
- * (`'unknown'`, the fork ref) for every non-null `minimumTrust`, so which floor
- * this picks cannot change whether a job is held. What it still decides is the
- * WORDING: the gate names the aggregated floor in the hold reason that is
- * written to `held_runs.reason`. So a `'trusted'` context bound alongside a
- * `'known'` one has its stricter bar named, instead of whichever of the two the
- * job happened to list first.
- */
-const TRUST_RANK: Record<'known' | 'trusted', number> = { known: 1, trusted: 2 };
 
 /**
  * Evaluate each context's hard reject gates against the run context. A name
@@ -128,25 +115,20 @@ function firstFailingRule(
 
 /**
  * Aggregate hold/wait/queue parameters across all bound contexts, most
- * restrictive wins: trust = strictest declared floor (see `TRUST_RANK` — a
- * wording choice, not a verdict), reviewers = sorted dedup union, wait timer =
- * max, hold expiry = min, concurrency limit = min (tightest). The concurrency
- * strategy follows the primary (first) context.
+ * restrictive wins: trust = the declared floor when any context declares one,
+ * reviewers = sorted dedup union, wait timer = max, hold expiry = min,
+ * concurrency limit = min (tightest). The concurrency strategy follows the
+ * primary (first) context.
  */
 export function aggregateProtectionParams(envs: ReadonlyArray<Context>): EffectiveProtection {
-  let minimumTrust: 'known' | 'trusted' | undefined;
+  let minimumTrust: 'trusted' | undefined;
   const reviewers = new Set<string>();
   let waitTimerSeconds: number | null = null;
   let holdExpirySeconds = Number.POSITIVE_INFINITY;
   let concurrencyLimit: number | null = null;
 
   for (const env of envs) {
-    if (
-      env.minimumTrust &&
-      (!minimumTrust || TRUST_RANK[env.minimumTrust] > TRUST_RANK[minimumTrust])
-    ) {
-      minimumTrust = env.minimumTrust;
-    }
+    if (env.minimumTrust) minimumTrust = env.minimumTrust;
     for (const r of env.requiredReviewers ?? []) reviewers.add(r);
     if (env.waitTimerSeconds !== null) {
       waitTimerSeconds = Math.max(waitTimerSeconds ?? 0, env.waitTimerSeconds);

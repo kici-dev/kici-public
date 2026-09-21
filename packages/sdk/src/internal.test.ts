@@ -9,9 +9,8 @@ const SRC = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * The runtime ABI the agent, compiler, and orchestrator drive on a workflow's
- * behalf. No workflow author calls any of it, so none of it belongs on a
- * compat-protected barrel — but each one stays there, `@deprecated`, until the
- * v1.0.0 removal sweep.
+ * behalf. No workflow author calls any of it, so none of it belongs on the
+ * compat-protected root barrel.
  *
  * Pinning the set is what stops the root barrel growing a new internal: adding
  * one to `index.ts` without adding it here fails, and the failure names the
@@ -45,26 +44,15 @@ describe('@kici-dev/sdk/internal', () => {
     }
   });
 
-  it('keeps each symbol on the root barrel, so an older customer tree still resolves', () => {
-    // The agent resolves the customer's OWN SDK copy at run time. Removing a
-    // symbol from the root before v1.0.0 breaks every tree that has not bumped.
-    for (const name of RUNTIME_INTERNALS) {
-      expect((root as Record<string, unknown>)[name]).toBe(
-        (internal as Record<string, unknown>)[name],
-      );
-    }
+  // fails-when: a runtime-internal symbol is re-exported from the root barrel again
+  it.each(RUNTIME_INTERNALS)('does not export %s from the root barrel', (name) => {
+    expect(name in root).toBe(false);
   });
 
-  it('marks every root re-export @deprecated', () => {
-    const barrel = readFileSync(path.join(SRC, 'index.ts'), 'utf8').split('\n');
-    for (const name of RUNTIME_INTERNALS) {
-      const line = barrel.findIndex(
-        (l) => /^export \{/.test(l) && new RegExp(`\\b${name}\\b`).test(l),
-      );
-      expect(line, `${name} is not re-exported on its own line in index.ts`).toBeGreaterThan(0);
-      expect(barrel[line - 1], `${name} is missing its @deprecated marker`).toContain(
-        '@deprecated',
-      );
+  // breaks-if-wrong: the agent's own import path must keep every setter
+  it('keeps every output-map setter on the subpath', () => {
+    for (const name of ['setStepOutputsMap', 'setJobOutputsMap', 'setStepRefMap']) {
+      expect(typeof (internal as Record<string, unknown>)[name]).toBe('function');
     }
   });
 

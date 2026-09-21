@@ -3,12 +3,9 @@
  *
  * A production orchestrator mints identity tokens locally with its own
  * long-lived signing key under its own real issuer
- * (`oidc/orchestrator-mint.ts`), falling back to the deprecated Platform relay
- * (`ws/oidc-token-relay.ts`) only when no provenance signer is configured. The
- * offline local dev plane has neither a configured signer nor a Platform
- * connection, so `ctx.kici.oidc.token()` / `ctx.attestProvenance()` would
- * return "unknown method". This module gives the plane a clearly-non-prod
- * substitute:
+ * (`oidc/orchestrator-mint.ts`). The offline local dev plane has no configured
+ * signer, so `ctx.kici.oidc.token()` / `ctx.attestProvenance()` would return
+ * "unknown method". This module gives the plane a clearly-non-prod substitute:
  * an in-process ES256 signer keyed to a keypair the CLI generates fresh under
  * `~/.kici/local/dev-identity/` (mode 0600, never derived from any sops secret),
  * minting tokens whose issuer is the fixed sentinel `kici-local`.
@@ -24,8 +21,7 @@
  * This signer is constructed ONLY when the orchestrator runs in `independent`
  * mode with `KICI_INDEPENDENT_IDENTITY=1` (set solely by the local dev plane's
  * boot). A production orchestrator never builds it and never registers the
- * local mint path — it mints with its own signer (or the deprecated Platform
- * relay when none is configured).
+ * local mint path — it mints with its own signer.
  */
 import { readFile } from 'node:fs/promises';
 import { calculateJwkThumbprint, type JWK } from 'jose';

@@ -46,10 +46,10 @@ import type { UserCache } from './cache/index.js';
 import type { ArtifactStore } from './artifacts/artifact-store.js';
 import type { DispatchCacheRefTracker } from './cache/index.js';
 import type { PendingBuildTracker } from './cache/index.js';
-import type { PendingInitTracker, InitResult } from './cache/index.js';
+import type { PendingInitTracker } from './cache/index.js';
 import type { PendingDynamicTracker, PendingGlobalEvalTracker } from './cache/index.js';
 import type { GlobalEvalRoundCache } from './cache/index.js';
-import { parseGlobalEvalResult } from './cache/pending-global-evals.js';
+import { settlePendingPrecursor } from './cache/precursor-result.js';
 import type { CacheStorage } from './storage/types.js';
 import type { ProvenanceTrustRoot } from './provenance/trust-root.js';
 import { PendingAttestationsRepo } from './provenance/pending-attestations-repo.js';
@@ -83,9 +83,8 @@ import type { StepLogBuffer } from './reporting/step-log-buffer.js';
 import type { SourceLocationData } from './reporting/check-run-summary.js';
 import type { Hono as HonoType } from 'hono';
 import type { PeerWsLike } from './cluster/peer-handler.js';
-import type { PeerToPeerMessage, InitFailure } from '@kici-dev/engine';
+import type { PeerToPeerMessage } from '@kici-dev/engine';
 import { ExecutionJobStatus, ExecutionRunStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
-import { AgentJobFailedError } from './cache/agent-job-failed-error.js';
 import type { AgentTokenStore } from './agent/token-store.js';
 import type { OwnershipTracker } from './agent/ownership-tracker.js';
 import type { ObserverRegistry } from './ws/observer-registry.js';
@@ -228,9 +227,9 @@ export interface AppDependencies {
    */
   ingestOverflowReplayer?: IngestOverflowReplayer;
   /**
-   * Fulfil deferred attestations on demand (mints in this process, which owns
-   * the Platform WS). Backs `POST /api/v1/admin/attestations/retry`. Wired only
-   * in coordinator mode where the retrier exists.
+   * Fulfil deferred attestations on demand (mints in this process with the
+   * orchestrator's own signer). Backs `POST /api/v1/admin/attestations/retry`.
+   * Wired only in coordinator mode where the retrier exists.
    */
   retryAttestations?: (opts: {
     runId?: string;
@@ -261,8 +260,9 @@ export interface AppDependencies {
   /**
    * In-process dev-signed identity signer for the offline local dev plane.
    * Present ONLY in independent mode with KICI_INDEPENDENT_IDENTITY=1. When set
-   * (and NOT Platform-connected), the local mint path for `OIDC_TOKEN_REQUEST_METHOD`
-   * is registered so `ctx.kici.oidc.token()` mints a `kici-local` dev token.
+   * (and no orchestrator-owned signer is configured), the local mint path for
+   * `OIDC_TOKEN_REQUEST_METHOD` is registered so `ctx.kici.oidc.token()` mints
+   * a `kici-local` dev token.
    */
   localOidcSigner?: LocalSigner;
   /**
@@ -718,16 +718,11 @@ export function createApp(deps: AppDependencies) {
 
   // Register the OIDC ID-token mint handler (read role). The choice of handler
   // is the anti-forgery choke point, made by `selectOidcMintRegistration`:
-  // orchestrator-owned signing (signer + own issuer configured) ALWAYS wins —
-  // even Platform-connected — because the orchestrator is the root of trust;
-  // a Platform-connected orchestrator with no signer falls back to the
-  // deprecated Platform relay; the offline local dev plane mints locally with
-  // issuer `kici-local`; a bare independent orchestrator with no signer
-  // registers nothing (the method returns "unknown method").
+  // orchestrator-owned signing (signer + own issuer configured) wins because
+  // the orchestrator is the root of trust; the offline local dev plane mints
+  // locally with issuer `kici-local`; an orchestrator with no signer registers
+  // nothing (the method returns "unknown method").
   const oidcMintReg = selectOidcMintRegistration({
-    platformUrl: deps.config.platformUrl,
-    platformToken: deps.config.platformToken,
-    platformClient: deps.platformClient,
     independentIdentity: deps.config.independentIdentity,
     localOidcSigner: deps.localOidcSigner,
     resolveOrchestratorSigner: deps.provenanceSigning?.resolveSigner,
@@ -735,7 +730,6 @@ export function createApp(deps: AppDependencies) {
     dispatcher: deps.dispatcher,
     db: deps.db,
     orchestratorId: deps.config.instanceId,
-    legacyPullRequestSubject: deps.config.oidcLegacyPrSub,
     // Only the build-time test double injects a fault predicate; undefined in
     // the shipped orchestrator means no fault injection.
     initialMintFault: deps.faultInjection?.initialMintFault,
@@ -881,104 +875,22 @@ export function createApp(deps: AppDependencies) {
           deps.executionTracker ||
           deps.pendingBuilds ||
           deps.pendingInits ||
+          deps.pendingDynamics ||
           deps.pendingGlobalEvals
             ? (_agentId, msg) => {
-                // Resolve/reject pending builds on terminal states
-                if (deps.pendingBuilds && deps.pendingBuilds.has(msg.jobId)) {
-                  if (msg.state === ExecutionJobStatus.enum.success && msg.data?.buildComplete) {
-                    deps.pendingBuilds.resolve(msg.jobId);
-                  } else if (
-                    msg.state === ExecutionJobStatus.enum.failed ||
-                    msg.state === ExecutionJobStatus.enum.cancelled
-                  ) {
-                    deps.pendingBuilds.reject(
-                      msg.jobId,
-                      new Error((msg.data?.error as string) ?? `Build ${msg.state}`),
-                    );
-                  }
-                }
-
-                // Resolve/reject pending init jobs on terminal states
-                if (deps.pendingInits && deps.pendingInits.has(msg.jobId)) {
-                  if (msg.state === ExecutionJobStatus.enum.success && msg.data?.initComplete) {
-                    deps.pendingInits.resolve(
-                      msg.jobId,
-                      ((msg.data.initResult as InitResult) ?? {}) as InitResult,
-                    );
-                  } else if (
-                    msg.state === ExecutionJobStatus.enum.failed ||
-                    msg.state === ExecutionJobStatus.enum.cancelled
-                  ) {
-                    deps.pendingInits.reject(
-                      msg.jobId,
-                      new AgentJobFailedError(
-                        (msg.data?.error as string) ?? `Init ${msg.state}`,
-                        msg.data?.initFailure as InitFailure | undefined,
-                      ),
-                    );
-                  }
-                }
-
-                // Resolve/reject pending DynamicJobFn eval jobs on terminal states
-                if (deps.pendingDynamics && deps.pendingDynamics.has(msg.jobId)) {
-                  if (msg.state === ExecutionJobStatus.enum.success && msg.data?.dynamicComplete) {
-                    deps.pendingDynamics.resolve(
-                      msg.jobId,
-                      (msg.data.dynamicJobs as import('@kici-dev/engine').LockJob[]) ?? [],
-                    );
-                  } else if (
-                    msg.state === ExecutionJobStatus.enum.failed ||
-                    msg.state === ExecutionJobStatus.enum.cancelled
-                  ) {
-                    deps.pendingDynamics.reject(
-                      msg.jobId,
-                      new AgentJobFailedError(
-                        (msg.data?.error as string) ?? `Dynamic eval ${msg.state}`,
-                        msg.data?.initFailure as InitFailure | undefined,
-                      ),
-                    );
-                  }
-                }
-
-                // Resolve/reject the pre-run global eval round on terminal states
-                if (deps.pendingGlobalEvals && deps.pendingGlobalEvals.has(msg.jobId)) {
-                  if (
-                    msg.state === ExecutionJobStatus.enum.success &&
-                    msg.data?.globalEvalComplete
-                  ) {
-                    // Parse, never cast: `msg.data` is an unvalidated record, so
-                    // a cast here would hand arbitrary agent-supplied JSON to a
-                    // consumer that dereferences it. A malformed result fails
-                    // the round rather than the process.
-                    const parsed = parseGlobalEvalResult(msg.data.globalEvalResult);
-                    if (parsed.ok) {
-                      deps.pendingGlobalEvals.resolve(msg.jobId, parsed.value);
-                    } else {
-                      deps.pendingGlobalEvals.reject(msg.jobId, new Error(parsed.error));
-                    }
-                  } else if (msg.state === ExecutionJobStatus.enum.success) {
-                    // A success carrying no `globalEvalComplete` marker settles
-                    // nothing on its own, and the round job has no later
-                    // terminal state to arrive — so the waiter would hang until
-                    // its wait ceiling fires. Reject on the spot instead: the
-                    // agent finished and told us nothing we can act on.
-                    deps.pendingGlobalEvals.reject(
-                      msg.jobId,
-                      new Error('Global eval round reported success without a result payload'),
-                    );
-                  } else if (
-                    msg.state === ExecutionJobStatus.enum.failed ||
-                    msg.state === ExecutionJobStatus.enum.cancelled
-                  ) {
-                    deps.pendingGlobalEvals.reject(
-                      msg.jobId,
-                      new AgentJobFailedError(
-                        (msg.data?.error as string) ?? `Global eval round ${msg.state}`,
-                        msg.data?.initFailure as InitFailure | undefined,
-                      ),
-                    );
-                  }
-                }
+                // Settle whichever precursor tracker awaits this job (build /
+                // init / dynamic eval / global eval round). The same function
+                // serves the shared-database channel, so a job claimed by a
+                // sibling coordinator's agent settles here on identical terms.
+                settlePendingPrecursor(
+                  {
+                    pendingBuilds: deps.pendingBuilds,
+                    pendingInits: deps.pendingInits,
+                    pendingDynamics: deps.pendingDynamics,
+                    pendingGlobalEvals: deps.pendingGlobalEvals,
+                  },
+                  { jobId: msg.jobId, state: msg.state, data: msg.data },
+                );
 
                 // Update execution tracker
                 deps.executionTracker

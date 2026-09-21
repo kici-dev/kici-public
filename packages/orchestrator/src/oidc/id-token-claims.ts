@@ -12,6 +12,7 @@ import {
   AttestationOrigin,
   buildEventClaims,
   buildIdTokenSubject,
+  ID_TOKEN_CLAIM_NAMES,
   SourceOrigin,
   type EventClaims,
 } from '@kici-dev/engine';
@@ -67,15 +68,6 @@ export interface BuildClaimsOpts {
    * for a completed job bound to a frozen statement.
    */
   deferred?: { statementHash: string; origin: 'deferred' | 'offline-backfill' };
-  /**
-   * Restore the pre-split pull-request `sub` — the branch-shaped form that
-   * collides with a push to the same base branch. An escape hatch for an
-   * operator whose cloud trust policy breaks mid-migration, set by
-   * `KICI_OIDC_LEGACY_PR_SUB`.
-   *
-   * @deprecated Removed at v1.0.0. Move the policy to `repo:<repo>:pull_request`.
-   */
-  legacyPullRequestSubject?: boolean;
 }
 
 /**
@@ -105,6 +97,16 @@ export interface IdTokenClaims extends EventClaims {
 }
 
 /**
+ * The claim names shared by both discovery documents live in `@kici-dev/engine`;
+ * re-exported here for the route and the drift test. The binding below fails
+ * to compile when the engine list names a claim this type does not carry, and
+ * the drift test in `routes/provenance-oidc.test.ts` fails when the builder
+ * emits a claim the list does not name — together they keep the two in step.
+ */
+export { ID_TOKEN_CLAIM_NAMES };
+ID_TOKEN_CLAIM_NAMES satisfies readonly (keyof IdTokenClaims)[];
+
+/**
  * Build the OIDC ID-token claims for a build job from the orchestrator's own
  * execution_runs/execution_jobs rows. A live (synchronous) mint leaves
  * `attestation_origin=live` and `statement_hash=null` (the statement is
@@ -122,9 +124,7 @@ export function buildIdTokenClaims(
       : run.workflow_name
     : null;
 
-  const sub = buildIdTokenSubject(run, {
-    legacyPullRequestSubject: opts.legacyPullRequestSubject === true,
-  });
+  const sub = buildIdTokenSubject(run);
 
   const sourceOrigin: SourceOrigin = run.local_working_tree
     ? SourceOrigin.enum['run-remote']

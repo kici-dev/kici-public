@@ -1714,7 +1714,7 @@ export const installSecretsRegistryUsedTotal = lazyCounter(
  * from leaving the orchestrator for those dispatches.
  *
  * Labels:
- * - trust_tier: unknown | known (the `trusted` tier does not strip and therefore never fires this counter)
+ * - trust_tier: unknown (the `trusted` tier does not strip and therefore never fires this counter)
  */
 export const installSecretsContributorStrippedTotal = lazyCounter(
   'kici_orch_install_secrets_contributor_stripped_total',
@@ -1734,7 +1734,7 @@ export const installSecretsContributorStrippedTotal = lazyCounter(
  * and registry auth is per-job, so one run can strip both, either, or neither.
  *
  * Labels:
- * - trust_tier: unknown | known (the `trusted` tier does not strip and therefore never fires this counter)
+ * - trust_tier: unknown (the `trusted` tier does not strip and therefore never fires this counter)
  */
 export const containerRegistryAuthContributorStrippedTotal = lazyCounter(
   'kici_orch_container_registry_auth_contributor_stripped_total',

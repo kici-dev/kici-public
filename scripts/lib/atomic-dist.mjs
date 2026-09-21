@@ -59,7 +59,7 @@ const STAGE_NAME_RE = new RegExp(`^${STAGE_PREFIX.replace('.', '\\.')}(\\d+)$`);
 
 /**
  * Bundle artifacts the build owns and may therefore remove. Declaration files
- * are excluded: `tsgo --emitDeclarationOnly` writes them after the bundler
+ * are excluded: `tsc --emitDeclarationOnly` writes them after the bundler
  * runs, and it overwrites rather than clearing, so they are never part of the
  * window this module closes.
  */

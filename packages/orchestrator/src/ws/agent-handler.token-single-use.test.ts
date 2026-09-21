@@ -31,7 +31,7 @@
  * path must keep working.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
+import { PROTOCOL_VERSION, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
 import { createAgentWsHandler } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
@@ -56,7 +56,7 @@ function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
   return {
     type: 'auth.request' as const,
     token,
-    protocolVersion: 1,
+    protocolVersion: PROTOCOL_VERSION,
   };
 }
 

@@ -242,13 +242,12 @@ Hold a job whose run came from a fork:
 Minimum trust: trusted
 ```
 
-| Value     | Effect                                                     |
-| --------- | ---------------------------------------------------------- |
-| `trusted` | Holds a run whose ref came from a fork                     |
-| `known`   | Same effect; the value is deprecated and removed at v1.0.0 |
-| (unset)   | No trust-based gating                                      |
+| Value     | Effect                                 |
+| --------- | -------------------------------------- |
+| `trusted` | Holds a run whose ref came from a fork |
+| (unset)   | No trust-based gating                  |
 
-Both values block the same thing. Trust comes from the git ref, and that judgement has two answers: a ref in your repository is `trusted`, a ref from a fork is `unknown`. The value you declare still decides the wording of the hold reason.
+Trust comes from the git ref, and that judgement has two answers: a ref in your repository is `trusted`, a ref from a fork is `unknown`.
 
 When the gate holds a job, it enters the security approval queue. Someone with `ci_trust:write` or higher must approve it before execution proceeds.
 

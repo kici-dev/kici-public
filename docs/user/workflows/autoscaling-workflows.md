@@ -105,7 +105,7 @@ Bind provisioning and teardown workflows to a context that carries the cloud cre
 
 ## The cloud-init that starts the agent
 
-`buildAgentCloudInit(creds, options)` renders the `#cloud-config` that boots the KiCI agent. In the claim-code form it writes the single-use claim code — never a token — into a root-only env file (`0600`, owned by root). The agent exchanges that code for its own token inside the instance, so the token never transits cloud-init, the instance metadata, or any other provisioning channel. The env file holds:
+`buildAgentCloudInit(creds, options)` renders the `#cloud-config` that boots the KiCI agent. It writes the single-use claim code — never a token — into a root-only env file (`0600`, owned by root). The agent exchanges that code for its own token inside the instance, so the token never transits cloud-init, the instance metadata, or any other provisioning channel. The env file holds:
 
 - `KICI_ORCHESTRATOR_URL` — from `creds.orchestratorUrl`.
 - `KICI_SCALER_CLAIM_CODE` — from `creds.claimCode`. The agent exchanges it for its own token in-instance.
@@ -121,11 +121,14 @@ The `0600` env file still protects the non-secret env from other users on the in
 
 Pass any of these options to shape the boot:
 
+- `agentImage` — the agent image `deliveryMode: 'container'` runs. Defaults to `quay.io/kici-dev/kici-agent:latest`.
+- `startCommand` — an escape hatch that replaces the whole agent-start command. It ignores `deliveryMode` and `agentImage`.
 - `packages` — extra apt/yum packages, merged into the cloud-init `packages:` list.
 - `writeFiles` — extra `write_files` entries (path, content, permissions, owner). The reserved env-file path is rejected, so a custom file cannot overwrite the credentials.
 - `runcmdBefore` / `runcmdAfter` — shell lines that run before or after the agent starts.
 - `agentEnv` — extra variables appended to the agent env file. Keys must be valid env names, and a value with a newline is rejected.
 - `baseCloudConfig` — a raw cloud-config document to merge everything into (users, ssh keys, apt mirrors, mounts, bootcmd). The builder unions its `packages`, `runcmd`, and `write_files` with yours.
+- `userDataEncoding` — `'raw'` (the default) returns the plain `#cloud-config` text that Hetzner `user_data` expects; `'base64'` returns it base64-encoded, the form AWS EC2 `UserData` and Azure `customData` expect.
 
 ## The teardown workflow
 
@@ -296,7 +299,7 @@ scalers:
 
 On `kici.scaler.scale-up`, the provisioning workflow dispatches a `kici-agent.yml` workflow run in a GitHub repo. It passes the claim code, orchestrator URL, agent id, and labels as dispatch inputs. The token never appears in those inputs — only the single-use claim code, which the agent exchanges for its own token in-instance.
 
-The `kici-agent.yml` run starts the agent on the runner itself with `KICI_SCALER_CLAIM_CODE` set. `KICI_SCALER_MANAGED=1` and a zero idle timeout make the agent register, run one job, and exit. The GitHub Actions run then completes on its own. By default the run installs the published agent from npm; set `agent_bundle_release` to a release tag holding a `kici-admin agent package` tarball to pin an exact build or to serve runners that cannot reach npm.
+The `kici-agent.yml` run starts the agent on the runner itself with `KICI_SCALER_CLAIM_CODE` set. `KICI_SCALER_MANAGED=1` and a zero idle timeout make the agent register, run one job, and exit. The GitHub Actions run then completes on its own. The job carries `timeout-minutes: 15`. A wedged run (an agent the orchestrator refused, a job that never dispatched) then releases the runner instead of holding it for the six-hour default. Raise the limit if your jobs run longer. By default the run installs the published agent from npm; set `agent_bundle_release` to a release tag holding a `kici-admin agent package` tarball to pin an exact build or to serve runners that cannot reach npm.
 
 Teardown is largely automatic. A GitHub Actions run self-completes when its agent exits. So the `kici.scaler.scale-down` workflow only cancels a run GitHub has not yet marked finished, and only for reasons where the agent will never do useful work (`spawn-timeout`, `heartbeat-timeout`).
 

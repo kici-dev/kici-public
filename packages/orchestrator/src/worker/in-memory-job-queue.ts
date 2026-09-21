@@ -99,7 +99,6 @@ export class InMemoryJobQueue {
       provider: input.provider,
       providerContext: input.providerContext,
       sourceTarUrl: input.sourceTarUrl,
-      sourceTarHash: input.sourceTarHash,
       sourceTarDigest: input.sourceTarDigest,
       depsUrl: input.depsUrl,
       depsHash: input.depsHash,

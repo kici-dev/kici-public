@@ -126,7 +126,7 @@ org's trust policy (`packages/orchestrator/src/security/trust-policy-gate.ts`).
 Both org-global dispatch paths — the fallback that runs globals when the source
 repo has no lock file, and the pass that dispatches globals authored in other
 repos — return without dispatching unless the verdict is `pass`. So a `hold` or
-`reject` verdict from the policy's fork switch stops the organization's global
+`ignore` verdict from the policy's fork switch stops the organization's global
 workflows too, not only the pull request's own workflows. This matters because globals run with **org**
 credentials against the **event's** head SHA: dispatching them for an event the
 policy refused would hand an untrusted head SHA the org's credentials.
@@ -199,12 +199,11 @@ The three per-org **lists** live in the `org_settings` table, which is
 sources the org has registered. A missing `org_settings` row means "no per-org
 restrictions" (the repo and source axes pass), not a denial:
 
-| Column                           | Type                 | Purpose                                                                                                                              |
-| -------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `customer_id`                    | `text` (PK)          | Organization identifier                                                                                                              |
-| `global_workflow_allowed_repos`  | `jsonb[]` (nullable) | **Authoring axis.** Entries `{routingKey?, pattern}`; repos allowed to register global workflows (null/empty = any author)           |
-| `global_workflow_denied_repos`   | `jsonb[]` (nullable) | **Source axis.** Entries `{routingKey?, pattern}`; source repos whose events must never trigger global workflows (null/empty = none) |
-| `global_workflow_elevated_repos` | `jsonb[]` (nullable) | **Deprecated, not enforced.** Entries `{routingKey?, pattern}`; stored and echoed back, read by nothing                              |
+| Column                          | Type                 | Purpose                                                                                                                              |
+| ------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `customer_id`                   | `text` (PK)          | Organization identifier                                                                                                              |
+| `global_workflow_allowed_repos` | `jsonb[]` (nullable) | **Authoring axis.** Entries `{routingKey?, pattern}`; repos allowed to register global workflows (null/empty = any author)           |
+| `global_workflow_denied_repos`  | `jsonb[]` (nullable) | **Source axis.** Entries `{routingKey?, pattern}`; source repos whose events must never trigger global workflows (null/empty = none) |
 
 Each list element is an object: `{routingKey?: string, pattern: string}`.
 When `routingKey` is absent, the entry applies to events from / workflows
@@ -214,11 +213,10 @@ events delivered on a Forgejo `generic:*` source in the same org. This is
 how the same `org/repo` identifier can appear under multiple sources
 without policy collisions.
 
-The `GlobalWorkflowPolicy` class (`packages/orchestrator/src/security/global-workflow-policy.ts`) encodes three decisions:
+The `GlobalWorkflowPolicy` class (`packages/orchestrator/src/security/global-workflow-policy.ts`) encodes two decisions:
 
 1. **`isWorkflowRepoAllowed(workflowRoutingKey, workflowRepo, customerId)`** — consults the allow-list. Each entry matches when `entry.routingKey` is absent OR equals `workflowRoutingKey`, AND the pattern matches the workflow repo. Applied at registration extraction (filters which workflows get stored) and at dispatch time (filters which authored workflows may run).
 2. **`isSourceRepoAllowed(eventRoutingKey, sourceRepo, customerId)`** — consults the deny-list. Each entry matches when `entry.routingKey` is absent OR equals the event's routing key, AND the pattern matches the source repo. Applied at dispatch time. Used to block events from untrusted repos (forks, public-contrib repos) before any global workflow is considered.
-3. **`isElevatedAccessAllowed(workflowRoutingKey, repo, customerId)`** — consults the elevated list, with the same source-qualifier rules. **Deprecated and unused:** no code calls it, and calling it would decide nothing, because the global dispatch path resolves no secrets for it to widen (see _Elevated access_ below).
 
 Allow-list and deny-list are **orthogonal**: the allow-list restricts authors, the deny-list restricts event sources. Both can be active simultaneously — they answer different questions.
 
@@ -258,7 +256,7 @@ For same-bundle globals (both repos under the same GitHub App) `workflowAuth` mi
 The in-memory `RegistrationIndex.globalByOrgAndTriggerType` index (keyed by `${customerId}|${triggerType}`) is what makes this cross-source lookup work — the routing-key-scoped `globalByTriggerType` only surfaces globals on the inbound routing key, which would hide every cross-provider author.
 
 Policy decisions look up a single org row (one per `customer_id`). The
-allow / elevate axes run against the **registration's** routing key — the
+allow axis runs against the **registration's** routing key — the
 authoring source is the one whose qualifier governs whether a given
 authored workflow may fire. The deny axis runs against the **event's**
 routing key — events are filtered by the source they actually arrived on.
@@ -267,11 +265,9 @@ routing key — events are filtered by the source they actually arrived on.
 
 Universal-git sources (Forgejo / Gitea / Gogs / GitLab / plain-GitHub webhooks, routing key `generic:<orgId>:<sourceId>`) share the same org-level row as the org's other sources. The policy code is purely string-based with no hardcoded provider checks, so a universal-git routing key works as a per-entry qualifier just like a `github:*` routing key. Enable cluster-wide via `kici-admin cluster-settings set --global-workflows-enabled true`, then tune the per-org lists via `kici-admin org-settings global-workflows {allow-add, deny-add} --customer-id <orgId> [--source generic:<orgId>:<sourceId>]`. See the [user guide](../user/providers/universal-git.md#global-workflows) for the operator surface.
 
-### Elevated access — deprecated, never enforced
+### No secrets on the global dispatch path
 
-The global dispatch path resolves **no secrets at all**: it binds no secret contexts and writes no secret material into a job config, so a global workflow's job runs with neither the source repo's secrets nor the workflow repo's own. `global_workflow_elevated_repos` was meant to widen that, and nothing reads it.
-
-Enforcing it is not a matter of calling `isElevatedAccessAllowed` from the dispatch path. Secrets are stored `(org_id, scope, key)` with no repository dimension, so "the source repo's secrets" is not a set the orchestrator can currently name — a grant would first need a repository-to-secret-context model that does not exist. The list, its admin route, its CLI mutators and its wire field are deprecated pending removal at v1.0.0.
+The global dispatch path resolves **no secrets at all**: it binds no secret contexts and writes no secret material into a job config. A global workflow's job runs with neither the source repo's secrets nor the workflow repo's own. Secrets are stored `(org_id, scope, key)` with no repository dimension, so "the source repo's secrets" is not a set the orchestrator can name — a grant would first need a repository-to-secret-context model that does not exist.
 
 ## Agent behavior
 
@@ -352,7 +348,6 @@ The org settings page exposes these knobs through the **Global workflows** tab (
 - A read-only master-switch badge showing the effective fleet-wide state (`cluster_settings.global_workflows_enabled`). It is set with `kici-admin cluster-settings`, not from the dashboard.
 - An **Allowed author repos** section with its own enable toggle and editable list bound to `global_workflow_allowed_repos` (the authoring axis). When the toggle is off, any repo in the org may author global workflows.
 - A **Blocked source repos** section with its own enable toggle and editable list bound to `global_workflow_denied_repos` (the source axis). Use this to protect forks and public-contrib repos from silently triggering org-wide automation.
-- An **Elevated access** list bound to `global_workflow_elevated_repos`, marked not enforced and deprecated.
 
 Every list row pairs a **source picker** with the existing **pattern**
 input. The source picker defaults to "Any source" — leaving it as such

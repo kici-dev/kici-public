@@ -24,7 +24,7 @@ body:
       label: What the docs or CLI advertise
       description: The exact claim, quoted, plus its source — a docs URL, or the command whose `--help` says it.
       placeholder: |
-        https://kici.dev/docs/user/cli-reference/ says:
+        https://docs.kici.dev/user/cli-reference/ says:
         > `kici compile --check` type-checks without writing a lock file.
     validations:
       required: true
@@ -54,7 +54,7 @@ body:
     attributes:
       label: KiCI version
       description: Output of `kici --version`. Reports against a locally built or unreleased version are out of scope.
-      placeholder: '0.1.16'
+      placeholder: 'the output of kici --version'
     validations:
       required: true
   - type: input

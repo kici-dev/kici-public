@@ -242,9 +242,10 @@ export async function localLogsCommand(): Promise<boolean> {
 }
 
 /**
- * Attach the local dev plane to the hosted Platform so `kici run --local` uses
- * real Platform-minted OIDC + attestation. Mints an org-scoped orchestrator key
- * with the logged-in PAT, then (re)boots the plane hybrid.
+ * Attach the local dev plane to the hosted Platform so `kici run --local` mints
+ * OIDC + attestation with the plane's own signing key under its own issuer, as
+ * a deployed orchestrator does. Mints an org-scoped orchestrator key with the
+ * logged-in PAT, then (re)boots the plane hybrid.
  */
 export async function localAttachCommand(): Promise<boolean> {
   const config = await loadGlobalConfig();
@@ -272,8 +273,9 @@ export async function localAttachCommand(): Promise<boolean> {
         pc.dim(`(org: ${orgId})`),
     );
     console.log(
-      pc.dim('`kici run --local` now uses real Platform OIDC + attestation. Detach: ') +
-        pc.cyan('kici local detach'),
+      pc.dim(
+        "`kici run --local` now mints OIDC + attestation with this plane's own key against the real Platform org. Detach: ",
+      ) + pc.cyan('kici local detach'),
     );
     return true;
   } catch (err) {

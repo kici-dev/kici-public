@@ -489,7 +489,7 @@ describe('kici init', () => {
 
   describe('workspace integrate mode', () => {
     // A .git marker bounds detectWorkspaceRoot's upward walk to tempDir, so the
-    // real myci26 workspace above the compiler package is never picked up.
+    // real workspace above the compiler package is never picked up.
     async function makePnpmWorkspace(): Promise<void> {
       await fs.writeFile(
         path.join(tempDir, 'pnpm-workspace.yaml'),

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/orchestrator",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Customer-deployable orchestrator for the KiCI CI/CD stack. Receives webhook events (direct or via Platform relay), matches triggers against the lock file, and dispatches jobs to connected agents.",
   "keywords": [
     "ci",
@@ -30,6 +30,7 @@
   "files": [
     "dist",
     "!dist/**/*.map",
+    "!dist/server-test.js",
     "!dist/server-test.d.ts",
     "!dist/testing",
     "sbom.spdx.json",
@@ -62,32 +63,32 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-service.mjs && tsgo --emitDeclarationOnly",
-    "typecheck": "tsgo --noEmit",
+    "build": "node ../../scripts/build-service.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:migrate": "kysely migrate:latest",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/orchestrator --name @kici-dev/orchestrator"
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.1121.0",
-    "@aws-sdk/client-s3": "^3.1121.0",
-    "@aws-sdk/lib-storage": "^3.1121.0",
-    "@aws-sdk/s3-request-presigner": "^3.1121.0",
+    "@aws-sdk/client-kms": "^3.1135.0",
+    "@aws-sdk/client-s3": "^3.1135.0",
+    "@aws-sdk/lib-storage": "^3.1135.0",
+    "@aws-sdk/s3-request-presigner": "^3.1135.0",
     "@hono/node-server": "^2.1.1",
-    "@inquirer/prompts": "^8.7.0",
+    "@inquirer/prompts": "^8.7.2",
     "@kici-dev/engine": "workspace:*",
     "@kici-dev/shared": "workspace:*",
-    "@octokit/auth-app": "^8.3.0",
+    "@octokit/auth-app": "^8.3.1",
     "@octokit/rest": "^22.0.1",
     "archiver": "^8.0.0",
     "commander": "^15.0.0",
     "croner": "^10.0.1",
     "dockerode": "^5.0.1",
     "hashi-vault-js": "^0.5.3",
-    "hono": "^4.13.2",
-    "jose": "^6.2.10",
+    "hono": "^4.13.7",
+    "jose": "^6.2.12",
     "jsonpath-plus": "^10.4.0",
-    "jszip": "^3.10.1",
+    "jszip": "^3.10.2",
     "kysely": "^0.29.4",
     "lru-cache": "^11.5.2",
     "nanoid": "^6.0.1",
@@ -96,8 +97,8 @@
     "strip-ansi": "^7.2.0",
     "tar": "^7.5.22",
     "ws": "^8.21.3",
-    "yaml": "^2.9.0",
-    "zod": "^4.4.3"
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
   },
   "kici": {
     "metrics": {

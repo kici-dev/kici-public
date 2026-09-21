@@ -281,6 +281,8 @@ These live in the shared orchestrator database, so any coordinator can read them
 | Agent-to-job correlation    | Lifecycle events stay attached to the run when another coordinator takes the agent.                                                                                                 |
 | Resource reservations       | Each row is stamped with the coordinator holding it.                                                                                                                                |
 | Reaper windows              | They are [cluster settings](./cluster-settings.md), read fresh on each sweep.                                                                                                       |
+| Precursor job results       | A build, init, or dynamic-eval result is written on the shared job row, so the coordinator that dispatched the job reads it back when another coordinator's agent ran it.           |
+| Registration windows        | The run row names the coordinator that still has jobs to register for it, so no sibling finalizes the run early. See [runs that span coordinators](#runs-that-span-coordinators).   |
 
 ### What stays local
 
@@ -305,6 +307,18 @@ Each orchestrator writes its own liveness into a shared `cluster_instances` tabl
 The heartbeat is in the database rather than derived from peer connections because a booting orchestrator has not connected to any peer yet, and boot is exactly when recovery runs. It needs no peer connectivity, so it behaves the same in a Raft cluster, a plain multi-coordinator deployment, and a standalone one.
 
 A clean shutdown removes the row, so a coordinator stopped on purpose is recognised as gone immediately rather than after the grace window.
+
+### Runs that span coordinators
+
+The dispatch queue is cluster-wide. An agent connected to any coordinator can claim a queued job, so the jobs of one run can execute on agents of several coordinators. Each agent reports to the coordinator it is connected to, which writes the job's status to the shared `execution_jobs` row. Between coordinators, the shared row is the report. No configuration is needed.
+
+Three mechanisms keep such a run correct:
+
+- **Precursor results travel on the job row.** A workflow's `__build__`, `__init__`, or dynamic-eval job produces a result the dispatching coordinator waits for before it dispatches the real jobs. When another coordinator's agent ran that job, the result is written to the shared row and the waiting coordinator reads it back within a few seconds. It does not wait out its build timeout.
+- **Completion is decided from the shared rows.** A coordinator finalizes a run only when every job row of the run is terminal, not only the jobs its own agents reported. The run's status covers every job.
+- **A registration window blocks early completion.** While a coordinator's dispatch pipeline still has jobs to register for a run (the post-build jobs, the jobs of a deferred init), the run row names that coordinator as the holder of a registration window. Every other coordinator defers finalizing the run while that holder is [alive](#coordinator-liveness). A build job that finishes on a sibling is therefore not read as "the run is complete".
+
+A holder that dies mid-window reads as no window. The [stale-job detector](../stale-detection.md#runs-left-behind-after-every-job-finished) finishes any run whose every job is terminal but whose finalizer never ran.
 
 #### Rows with no recorded owner
 

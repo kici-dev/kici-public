@@ -246,7 +246,7 @@ describe('CheckRunReporter', () => {
 
     /**
      * The trust policy let the run proceed, so no security check was ever
-     * posted and the job simply fails on something the run was never given.
+     * posted and the job fails on something the run was never given.
      * The two checks that do land — this one and the `kici/<workflow>`
      * roll-up — are where the contributor can be told why.
      */
@@ -1546,7 +1546,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('still publishes step progress after cleanupRun when the job never completed', async () => {
-      // Positive control for the pin above. Without it, a reporter that simply
+      // Positive control for the pin above. Without it, a reporter that
       // stopped publishing progress after any prune would pass that test while
       // being broken — the assertion there is an absence, and an absence proves
       // nothing unless the same setup can produce a presence.

@@ -47,7 +47,7 @@ The default is label-scoped, so the reaper is safe even when a project holds oth
 
 ## Deploying the host timer (operator step)
 
-The L4 reaper timer is operator setup, not part of the orchestrator. Its systemd unit lives in your own infrastructure repository. For KiCI's own deployment, that repository is `cmaster11-devops`, and the timer is named `kici-hetzner-leak-sweep`.
+The L4 reaper timer is operator setup, not part of the orchestrator. Its systemd unit lives in your own infrastructure repository; name the timer after the scaler it sweeps (for example `kici-hetzner-leak-sweep`).
 
 Run the reaper on a **few-minute cadence** — a short interval bounds how long a leaked instance can survive after L1 through L3 all miss. Set `KICI_HETZNER_REAP_TTL_MIN` above the longest expected instance lifetime, so the reaper never deletes a healthy in-use agent. A **TTL of about 30 minutes** suits a suite whose jobs finish well inside that window; raise it if your agents run longer.
 

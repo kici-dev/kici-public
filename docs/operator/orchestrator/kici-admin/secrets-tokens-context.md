@@ -8,7 +8,7 @@ description: 'Scoped secrets, context variables, secret backends, API tokens, an
 ### secret -- scoped secret management
 
 ```bash
-kici-admin secret scopes <orgId> [--all-backends]
+kici-admin secret scopes <orgId>
 kici-admin secret list <orgId> <scope>
 kici-admin secret set [orgId] [scope] [key] [--value <v> | --prompt | --from-stdin | --from-file <p> | --from-env <var>] [--no-trim] [--confirm-fingerprint <sha256>] [--dry-run] [--database-url <url>]
 kici-admin secret set --org <orgId> --context <name> --key <k> [value-source flags as above]
@@ -18,7 +18,7 @@ kici-admin secret fix-prefixed-scopes <orgId> [--dry-run] [--database-url <url>]
 
 - Secret values are **write-only** -- there is no command to read a secret value.
 - A `<scope>` may be **qualified** with the backend that owns it (`pg:production`, `openbao-prod:aws/creds`). The qualifier selects the backend and is not part of the stored name; an unqualified scope targets the PG backend. A head that names no registered backend stays part of the path.
-- `scopes --all-backends` aggregates every registered backend and prints scopes in qualified form. Without the flag it lists the PG backend only, unqualified — that default flips at v1.0.0.
+- `scopes` aggregates every registered backend and prints each scope in qualified form. A backend that is unreachable at that moment is skipped with a warning.
 - `fix-prefixed-scopes` repairs PG-backend scopes that an older orchestrator stored with a `pg:` qualifier attached (and which are therefore unreachable after upgrading). It re-encrypts each value as it renames, because the scope name is bound into the encryption. Preview with `--dry-run`; it never merges two scopes, never moves a secret between backends, and exits `2` when any scope was skipped.
 - `set` accepts either the positional `<orgId> <scope> <key>` form or the context-scope sugar form (`--org` + `--context` + `--key`). The two forms are mutually exclusive.
 - Value sources (mutually exclusive; first matching wins): `--prompt` (interactive no-echo, default on TTY), `--from-stdin` (read piped stdin until EOF; default when stdin is a pipe), `--from-file <path>` (file body, trailing newline trimmed unless `--no-trim`), `--from-env <var>` (named env var), `--value <plaintext>` (visible in shell history — discouraged).
@@ -161,13 +161,13 @@ See [Secrets management > Key rotation](../../security/secrets.md#key-rotation) 
 ### context -- context management (dual-mode)
 
 ```bash
-kici-admin context create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--database-url <url>] [--json]
+kici-admin context create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted] [--database-url <url>] [--json]
 kici-admin context bind --org <id> --env <name> --scope <pattern> [--host <pattern>] [--database-url <url>] [--json]
-kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted|null] [--enabled true|false] [--database-url <url>] [--json]
+kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted|null] [--enabled true|false] [--database-url <url>] [--json]
 kici-admin context list --org <id> [--database-url <url>] [--json]
 kici-admin context show --org <id> --name <name> [--database-url <url>] [--json]
 kici-admin context delete --org <id> --name <name> [--database-url <url>] [--json]
-kici-admin context create-template --org <id> --template <name> [--type template] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--variables <json>] [--database-url <url>] [--json]
+kici-admin context create-template --org <id> --template <name> [--type template] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted] [--variables <json>] [--database-url <url>] [--json]
 kici-admin context purge [--org <id>] [--database-url <url>] [--json]
 ```
 
@@ -393,7 +393,7 @@ Synopsis: `kici-admin context create [options]`
 | `--required-reviewers <csv>`   |         | CSV of required reviewer user IDs (or empty to clear)                           |
 | `--wait-timer <seconds>`       |         | Wait timer before release (seconds)                                             |
 | `--hold-expiry <seconds>`      |         | Hold expiry TTL (seconds)                                                       |
-| `--minimum-trust <level>`      |         | Minimum trust (known\|trusted)                                                  |
+| `--minimum-trust <level>`      |         | Minimum trust (trusted)                                                         |
 | `--database-url <url>`         |         | Use direct DB access instead of HTTP (offline mode)                             |
 | `--json`                       |         | Emit JSON output                                                                |
 
@@ -414,7 +414,7 @@ Synopsis: `kici-admin context create-template [options]`
 | `--required-reviewers <csv>`   |            | CSV of required reviewer user IDs                       |
 | `--wait-timer <seconds>`       |            | Wait timer (seconds)                                    |
 | `--hold-expiry <seconds>`      |            | Hold expiry TTL (seconds)                               |
-| `--minimum-trust <level>`      |            | Minimum trust (known\|trusted)                          |
+| `--minimum-trust <level>`      |            | Minimum trust (trusted)                                 |
 | `--variables <json>`           |            | JSON object of env variables to seed (e.g. '{"K":"V"}') |
 | `--database-url <url>`         |            | Use direct DB access instead of HTTP (offline mode)     |
 | `--json`                       |            | Emit JSON output                                        |
@@ -478,7 +478,7 @@ Synopsis: `kici-admin context set-policy [options]`
 | `--required-reviewers <csv>`     |         | CSV of required reviewer user IDs (empty to clear)    |
 | `--wait-timer <seconds>`         |         | Wait timer before release (seconds)                   |
 | `--hold-expiry <seconds>`        |         | Hold expiry TTL in seconds (empty to clear)           |
-| `--minimum-trust <level>`        |         | Minimum trust (known\|trusted, or "null" to clear)    |
+| `--minimum-trust <level>`        |         | Minimum trust (trusted, or "null" to clear)           |
 | `--enabled <bool>`               |         | Enabled flag (true\|false)                            |
 | `--allow-local-execution <bool>` |         | Allow CLI/test runs to resolve this env (true\|false) |
 | `--database-url <url>`           |         | Use direct DB access instead of HTTP (offline mode)   |
@@ -580,21 +580,15 @@ Synopsis: `kici-admin secret purge [options]`
 
 ### `kici-admin secret scopes`
 
-List secret scopes for an organization
+List secret scopes for an organization, from every registered backend, qualified as <backend>:<path>
 
-Synopsis: `kici-admin secret scopes <orgId> [options]`
+Synopsis: `kici-admin secret scopes <orgId>`
 
 **Arguments**
 
 | Argument | Required | Variadic | Description |
 | -------- | -------- | -------- | ----------- |
 | `orgId`  | yes      | no       |             |
-
-**Options**
-
-| Option           | Default | Description                                                                                                                                               |
-| ---------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--all-backends` |         | List scopes from every registered backend, qualified as <backend>:<path> (default today: the pg backend only, unqualified — this default flips at v1.0.0) |
 
 ### `kici-admin secret set`
 

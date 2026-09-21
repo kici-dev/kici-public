@@ -185,15 +185,10 @@ describe('trust-policy gate wiring', () => {
 });
 
 /**
- * Which pushed policy fields reach a decision site, and which deliberately do
- * not. The field list is derived from the wire schema rather than written out
- * here, so a field ADDED to `trustPolicySchema` lands in neither bucket and
- * fails loudly instead of shipping as one more inert setting.
- *
- * The two deprecated fields are the deliberate no-ops. Their JSDoc on the wire
- * schema claims they are "accepted for wire compatibility; not enforced", and
- * this is what holds that claim to the source: an arm reintroduced for either
- * of them would make the claim false and fail here.
+ * Which pushed policy fields reach a decision site. The field list is derived
+ * from the wire schema rather than written out here, so a field ADDED to
+ * `trustPolicySchema` is unaccounted for and fails loudly instead of shipping
+ * as an inert setting nothing reads.
  */
 describe('policy fields reach the decision sites they claim to', () => {
   const GATE = stripComments(
@@ -207,18 +202,18 @@ describe('policy fields reach the decision sites they claim to', () => {
   const HOLD_FOR_FORK = functionBody(GATE, 'function holdForFork(');
 
   const FIELDS = Object.keys(trustPolicySchema.shape);
-  /** Read by no decision site; carried only because the wire schema declares them. */
-  const INERT_FIELDS = ['unknownContributorPolicy', 'workflowChangePolicy'];
 
   it('enumerates the wire fields it is guarding', () => {
     // Positive control: if the schema import ever resolves to something without
     // a shape, every per-field case below would vacuously pass over an empty
     // list. Pin the membership so a silently-empty enumeration fails loudly.
-    expect(FIELDS.length).toBeGreaterThanOrEqual(5);
+    expect(FIELDS.length).toBeGreaterThanOrEqual(3);
     expect(FIELDS).toContain('forkPolicy');
     expect(FIELDS).toContain('approvalExpiryHours');
     expect(FIELDS).toContain('approvalExpirySeconds');
-    for (const inert of INERT_FIELDS) expect(FIELDS).toContain(inert);
+    // fails-when: a non-fork arm the gate never read is declared on the wire again.
+    expect(FIELDS).not.toContain('unknownContributorPolicy');
+    expect(FIELDS).not.toContain('workflowChangePolicy');
   });
 
   it('routes forkPolicy into the evaluator switch', () => {
@@ -241,20 +236,10 @@ describe('policy fields reach the decision sites they claim to', () => {
     expect(DISPATCH).toMatch(/decision\.approvalExpirySeconds\s*\?\?/);
   });
 
-  it.each(INERT_FIELDS)('does not route %s to any decision', (field) => {
-    expect(EVALUATOR).not.toMatch(new RegExp(`policy\\.${field}\\b`));
-  });
-
   it('accounts for every wire field', () => {
-    // A field added to the schema is neither the fork switch, nor the expiry,
-    // nor a known inert one — so it fails here until someone routes it or
-    // records it as deliberately inert.
-    const accounted = new Set([
-      'forkPolicy',
-      'approvalExpiryHours',
-      'approvalExpirySeconds',
-      ...INERT_FIELDS,
-    ]);
+    // A field added to the schema is neither the fork switch nor the expiry —
+    // so it fails here until someone routes it to a decision site.
+    const accounted = new Set(['forkPolicy', 'approvalExpiryHours', 'approvalExpirySeconds']);
     expect(FIELDS.filter((f) => !accounted.has(f))).toEqual([]);
   });
 });

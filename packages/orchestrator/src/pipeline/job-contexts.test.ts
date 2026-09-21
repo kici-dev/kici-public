@@ -41,23 +41,15 @@ describe('resolveJobContextNames', () => {
     expect(r.needsInit).toBe(false);
   });
 
-  it('flags needsInit for a pure inline dynamic element and drops it from names', () => {
+  it('flags needsInit for a dynamic element and keeps the static names', () => {
     const r = resolveJobContextNames({
       contexts: [
         { value: 'staging', dynamic: false },
-        { value: { _type: 'inline', expression: '(e) => e.x' }, dynamic: true },
+        { value: '', dynamic: true },
       ],
     } as unknown as LockJob);
     expect(r.names).toEqual(['staging']);
     expect(r.needsInit).toBe(true);
-  });
-
-  it('flags needsInit for an impure dynamic element', () => {
-    const r = resolveJobContextNames({
-      contexts: [{ value: '', dynamic: true }],
-    } as unknown as LockJob);
-    expect(r.needsInit).toBe(true);
-    expect(r.names).toEqual([]);
   });
 });
 
@@ -82,11 +74,10 @@ describe('buildJobContextDisplayNames', () => {
       buildJobContextDisplayNames({
         contexts: [
           { value: 'staging', dynamic: false },
-          { value: { _type: 'inline', expression: '(e) => e.x' }, dynamic: true },
           { value: '', dynamic: true },
         ],
       } as unknown as LockJob),
-    ).toEqual(['staging', '(dynamic)', '(dynamic)']);
+    ).toEqual(['staging', '(dynamic)']);
   });
 });
 

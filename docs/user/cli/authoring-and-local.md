@@ -100,7 +100,7 @@ kici local trust-root <file>               # Export the dev-signed trust root fo
 The plane runs in one of two modes:
 
 - **Independent (offline)** — the default for a plane that has never been attached. Identity tokens and attestations are signed by a local dev key under the clearly non-production issuer `kici-local`.
-- **Hybrid (attached)** — `kici local attach` mints an org-scoped key with your logged-in credentials and reboots the plane connected to the Platform, so local runs get real Platform-minted identity and attestation. `kici local up` honors a durable attachment record: an attached plane comes back up hybrid, and falls back to offline with a warning when the Platform is unreachable.
+- **Hybrid (attached)** — `kici local attach` mints an org-scoped key with your logged-in credentials and reboots the plane connected to the Platform, so local runs get identity and attestation signed by the plane's own key under its own issuer, as a deployed orchestrator would. `kici local up` honors a durable attachment record: an attached plane comes back up hybrid, and falls back to offline with a warning when the Platform is unreachable.
 
 `--offline` forces an independent boot without clearing the attachment record (only `detach` clears it); `--connected` requires an attached, reachable Platform and fails otherwise.
 
@@ -268,7 +268,7 @@ If multiple tools are detected, you are prompted to choose.
 Open the KiCI documentation site in the default browser. With the `llm` subcommand, print the LLM-friendly documentation bundle that ships with `@kici-dev/compiler` — pipe it into a coding agent's context buffer to brief the agent on authoring conventions without an internet round-trip.
 
 ```bash
-kici docs               # open https://kici.dev/docs/
+kici docs               # open https://docs.kici.dev/
 kici docs --no-open     # print the URL instead of opening a browser
 kici docs llm           # print the llms.txt index (a router over the task bundles)
 kici docs llm sdk       # print the SDK task bundle

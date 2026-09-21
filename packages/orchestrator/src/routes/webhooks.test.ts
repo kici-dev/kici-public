@@ -552,7 +552,7 @@ describe('generic webhook routes', () => {
      *
      * The route is wired to the REAL accept seam here rather than a stub, with
      * a pipeline that never resolves on its own. Against the previous
-     * await-the-pipeline wiring the request simply never completes, which is
+     * await-the-pipeline wiring the request never completes, which is
      * exactly the production failure — a provider abandons the delivery at 10
      * seconds while a matched workflow's build phase is capped at 600.
      */

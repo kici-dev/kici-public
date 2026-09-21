@@ -342,7 +342,7 @@ describe('kici-admin context CLI', () => {
         '--wait-timer',
         '120',
         '--minimum-trust',
-        'known',
+        'trusted',
         '--database-url',
         'postgres://local',
       ]);
@@ -353,7 +353,7 @@ describe('kici-admin context CLI', () => {
           orgId: 'o',
           contextName: 'staging',
           waitTimerSeconds: 120,
-          minimumTrust: 'known',
+          minimumTrust: 'trusted',
         }),
       );
       const callArgs = mockSetContextPolicyDirect.mock.calls[0][1];
@@ -388,6 +388,60 @@ describe('kici-admin context CLI', () => {
           contextName: 'prod',
           branchRestrictions: ['main', 'release/*'],
         }),
+      );
+    });
+
+    // fails-when: the removed `known` tier is parsed again. Direct-DB mode has
+    //   no route schema behind it, so the CLI is the only place the value is
+    //   checked before it reaches the row.
+    it.each(['create', 'set-policy', 'create-template'])(
+      '%s refuses --minimum-trust known and names the accepted value',
+      async (sub) => {
+        const target =
+          sub === 'create'
+            ? ['--name', 'staging']
+            : sub === 'set-policy'
+              ? ['--env', 'staging']
+              : ['--template', 'base'];
+        const { stderr, exitCode } = await runCommand([
+          'context',
+          sub,
+          '--org',
+          'o',
+          ...target,
+          '--minimum-trust',
+          'known',
+          '--database-url',
+          'postgres://local',
+        ]);
+        expect(exitCode).toBe(1);
+        expect(stderr).toMatch(/--minimum-trust/);
+        expect(stderr).toMatch(/trusted/);
+        expect(mockSeedContextDirect).not.toHaveBeenCalled();
+        expect(mockSetContextPolicyDirect).not.toHaveBeenCalled();
+        expect(mockCreateContextTemplateDirect).not.toHaveBeenCalled();
+      },
+    );
+
+    // breaks-if-wrong: "null" still clears the floor on set-policy.
+    it('set-policy --minimum-trust null clears the floor (direct mode)', async () => {
+      mockSetContextPolicyDirect.mockResolvedValue(undefined);
+      const { exitCode } = await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'staging',
+        '--minimum-trust',
+        'null',
+        '--database-url',
+        'postgres://local',
+      ]);
+      expect(exitCode).toBeNull();
+      expect(mockSetContextPolicyDirect).toHaveBeenCalledWith(
+        'postgres://local',
+        expect.objectContaining({ minimumTrust: null }),
       );
     });
 

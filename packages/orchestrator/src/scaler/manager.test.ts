@@ -4965,12 +4965,12 @@ describe('ScalerManager', () => {
       });
     }
 
-    it('taints a windows bare-metal backend mandatoryLabels (advertisement)', () => {
+    it('taints a windows bare-metal backend gate (advertisement)', () => {
       const status = createPlatformManager().getStatus();
       const win = status.backends.find((b) => b.name === 'win-pool');
-      expect(win?.mandatoryLabels).toContain('windows');
+      expect(win?.labelSetMandatoryLabels.flat()).toContain('windows');
       const lin = status.backends.find((b) => b.name === 'linux-pool');
-      expect(lin?.mandatoryLabels ?? []).not.toContain('windows');
+      expect(lin?.labelSetMandatoryLabels.flat() ?? []).not.toContain('windows');
     });
 
     it('rejects an unqualified bare-metal job on the windows pool (local matcher)', async () => {
@@ -5042,7 +5042,7 @@ describe('ScalerManager', () => {
       const pool = status.backends.find((b) => b.name === 'win2022-pool');
       // Without the structured field, `windows-2022` escapes PLATFORM_TAINT_LABELS
       // and the pool would carry no taint. With it, the pool is tainted.
-      expect(pool?.mandatoryLabels).toContain('windows');
+      expect(pool?.labelSetMandatoryLabels.flat()).toContain('windows');
     });
 
     it('injects the declared-platform os/arch labels into the pool label set', () => {
@@ -5108,13 +5108,13 @@ describe('ScalerManager', () => {
       });
     }
 
-    it('advertises a gate per label set, and the union on the deprecated field', () => {
+    it('advertises a gate per label set', () => {
       const status = createMixedManager().getStatus();
       const mixed = status.backends.find((b) => b.name === 'mixed-pool');
       expect(mixed?.labelSetMandatoryLabels).toEqual([[], ['macos']]);
-      // The scaler-wide field stays the union, for a peer that predates the
-      // per-label-set gate.
-      expect(mixed?.mandatoryLabels).toEqual(['macos']);
+      // fails-when: the scaler-wide union returns — on a mixed-platform scaler
+      // it names a taint no single label set can satisfy.
+      expect(mixed).not.toHaveProperty('mandatoryLabels');
     });
 
     it('keeps labelSetMandatoryLabels index-aligned with labelSets', () => {
@@ -5160,24 +5160,25 @@ describe('ScalerManager', () => {
       expect(registered?.mandatoryLabels).toEqual(['macos']);
     });
 
-    it('advertises the per-label-set gate to peers alongside the union', () => {
+    it('advertises the per-label-set gate to peers, and nothing scaler-wide', () => {
       const capacity = createMixedManager().getRoutableCapacity();
       const mixed = capacity.find((c) => c.name === 'mixed-pool');
       expect(mixed?.labelSetMandatoryLabels).toEqual([[], ['macos']]);
-      expect(mixed?.mandatoryLabels).toEqual(['macos']);
+      // fails-when: the removed scaler-wide union is advertised again — the
+      // strict wire schema on the receiving peer would refuse the whole
+      // heartbeat.
+      expect(mixed).not.toHaveProperty('mandatoryLabels');
     });
 
-    it('keeps the deprecated union in step with the per-set gates while retiring', () => {
+    it('keeps the per-set gates while retiring', () => {
       const manager = createMixedManager();
       retire(manager, 'mixed-pool');
       const mixed = manager.getStatus().backends.find((b) => b.name === 'mixed-pool');
-      // A retiring scaler has no enriched entry, so both gate fields take their
-      // fallback branch. `mandatoryLabels` is documented as the union of the
-      // per-set gates, and a fallback reading only the configured gate (empty
-      // here) would drop the `macos` taint the second label set carries.
+      // A retiring scaler has no enriched entry, so the gate takes its fallback
+      // branch, which must still carry the `macos` taint the second label set
+      // derives from its platform.
       expect(mixed?.retiring).toBe(true);
       expect(mixed?.labelSetMandatoryLabels).toEqual([[], ['macos']]);
-      expect(mixed?.mandatoryLabels).toEqual(['macos']);
     });
   });
 

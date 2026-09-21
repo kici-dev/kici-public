@@ -24,17 +24,10 @@ function docsUrl(slugPath, siteBaseUrl) {
 // repo-relative directory. docs/user/dashboard/ is dashboard UI-usage
 // documentation and docs/user/quickstart/ is install/deploy guidance — both
 // are user-facing but neither is workflow-authoring content, the audience of
-// these bundles. docs/user/deprecations.md is the customer-facing deprecation
-// ledger (backward-compatibility policy), reference material rather than
-// workflow-authoring content, so it is excluded on the same grounds. The
-// deepened coverage check in hack/llm-context.test.ts fails the build if a new
-// docs/user path is neither bundled nor excluded here, forcing an explicit
-// decision about whether it belongs in a bundle.
-export const EXCLUDED_FROM_LLM_BUNDLE = new Set([
-  'docs/user/dashboard/',
-  'docs/user/quickstart/',
-  'docs/user/deprecations.md',
-]);
+// these bundles. The deepened coverage check in hack/llm-context.test.ts fails
+// the build if a new docs/user path is neither bundled nor excluded here,
+// forcing an explicit decision about whether it belongs in a bundle.
+export const EXCLUDED_FROM_LLM_BUNDLE = new Set(['docs/user/dashboard/', 'docs/user/quickstart/']);
 
 // Per-task bundle size budget. A task bundle over this is a signal to split
 // the group — keeping each bundle small enough to drop into an LLM context
@@ -155,13 +148,14 @@ export const SCOPE_GROUPS = [
     id: 'features',
     label: 'Workflow features: access and approval',
     purpose:
-      'Deployment contexts, scoped secrets, private registries, approvals, provenance, dashboard and account access',
+      'Deployment contexts, scoped secrets, private registries, approvals, workload identity, provenance, dashboard and account access',
     dir: 'docs/user',
     recurse: false,
     only: [
       'contexts.md',
       'secrets.md',
       'private-registries.md',
+      'oidc.md',
       'approvals.md',
       'provenance.md',
       'dashboard.md',
@@ -457,7 +451,7 @@ function renderIndex(groups, siteBaseUrl, bundles) {
   lines.push('# KiCI');
   lines.push('');
   lines.push(
-    '> KiCI is a TypeScript-native CI/CD workflow engine. Workflows are defined in TypeScript (not YAML), compiled into a portable lock file, and executed by self-hosted agents. The docs below cover the SDK, the CLI, workflow patterns, and the runtime architecture an LLM coding agent needs in order to author and test KiCI workflows.',
+    '> KiCI is a TypeScript-native CI/CD workflow engine. Workflows are defined in TypeScript (not YAML), compiled into a portable lock file, and executed by self-hosted agents. The docs below cover the SDK, the CLI, workflow patterns, and the runtime architecture an LLM coding agent needs to author and test KiCI workflows.',
   );
   lines.push('');
   lines.push(

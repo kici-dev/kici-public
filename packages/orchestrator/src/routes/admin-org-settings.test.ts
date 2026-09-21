@@ -158,6 +158,39 @@ describe('org-settings/global-workflows — enabled projection (effective cluste
     expect((await res.json()).settings.enabled).toBe(false);
   });
 
+  // fails-when: the elevatedRepos field is accepted again — the strict body
+  //   schema would let it through and the row would carry the list.
+  it('rejects a PATCH carrying the removed elevatedRepos', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db, false);
+    const res = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: ORG, elevatedRepos: [{ pattern: 'myorg/deploy' }] }),
+    });
+    expect(res.status).toBe(400);
+    expect(rows.get(ORG)).toBeUndefined();
+  });
+
+  it('does not project elevatedRepos, and does not write its column', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db, false);
+    // breaks-if-wrong: the allow-list PATCH beside it still lands.
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: ORG, allowedRepos: [{ pattern: 'myorg/*' }] }),
+    });
+    expect(patch.status).toBe(200);
+    const row = rows.get(ORG)!;
+    expect(row).not.toHaveProperty('global_workflow_elevated_repos');
+    expect(row.global_workflow_allowed_repos).toBe(JSON.stringify([{ pattern: 'myorg/*' }]));
+    const res = await app.request(`/org-settings/global-workflows?customerId=${ORG}`);
+    const settings = (await res.json()).settings as Record<string, unknown>;
+    expect(settings.allowedRepos).toBeTruthy();
+    expect(settings).not.toHaveProperty('elevatedRepos');
+  });
+
   it('rejects a PATCH carrying enabled', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db, false);
@@ -655,7 +688,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customerId: 'kiciStg00001',
-        updates: { 'secrets.set': false },
+        updates: { 'secrets.set': 'disabled' },
       }),
     });
     expect(res.status).toBe(200);
@@ -670,7 +703,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customerId: 'kiciStg00001',
-        updates: { 'secrets.set': false },
+        updates: { 'secrets.set': 'disabled' },
         reset: true,
       }),
     });
@@ -703,7 +736,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customerId: 'kiciStg00001',
-        updates: { 'unknown.op': false },
+        updates: { 'unknown.op': 'disabled' },
       }),
     });
     expect(res.status).toBe(400);
@@ -736,7 +769,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
     await app.request('/org-settings/dashboard-writes', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', updates: { 'secrets.set': false } }),
+      body: JSON.stringify({ customerId: 'kiciStg00001', updates: { 'secrets.set': 'disabled' } }),
     });
     expect(vi.mocked(setDashboardWritePolicy).mock.calls[0][3]).toMatchObject({
       mode: 'independent',
@@ -788,7 +821,7 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customerId: 'kiciStg00001',
-        updates: { 'secrets.set': false, 'variables.set': false },
+        updates: { 'secrets.set': 'disabled', 'variables.set': 'disabled' },
       }),
     });
     expect(res.status).toBe(200);
@@ -834,7 +867,7 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customerId: 'kiciStg00001',
-        updates: { 'secrets.set': false },
+        updates: { 'secrets.set': 'disabled' },
       }),
     });
     expect(res.status).toBe(200);
@@ -871,7 +904,6 @@ describe('org-settings/global-workflows — repo-pattern negation forms', () => 
   for (const [list, bad] of [
     ['allowedRepos', '!myorg/x'],
     ['deniedRepos', '!(a|b)/x'],
-    ['elevatedRepos', 'myorg/[^a]*'],
   ] as const) {
     it(`rejects a negated ${list} entry with a 400 naming the pattern`, async () => {
       const { db, rows } = makeOrgSettingsDbStub();

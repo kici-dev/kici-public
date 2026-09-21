@@ -62,17 +62,23 @@ describe('spawnOrchestratorProcess / awaitOrchestratorReady', () => {
       secretKey: 'a'.repeat(64),
       scalerConfigFile: '/x/scaler.yaml',
       attach: {
-        platformWsUrl: 'wss://thinker1.dev.kici.dev/kici-stg/ws',
+        platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
         platformToken: 'kici_ok_secret',
       },
     });
     expect(res.pid).toBe(5252);
     const spawnOpts = spawnMock.mock.calls[0][2];
     expect(spawnOpts.env.KICI_MODE).toBe('hybrid');
-    expect(spawnOpts.env.KICI_PLATFORM_URL).toBe('wss://thinker1.dev.kici.dev/kici-stg/ws');
+    expect(spawnOpts.env.KICI_PLATFORM_URL).toBe('wss://platform.example.com/kici-stg/ws');
     expect(spawnOpts.env.KICI_PLATFORM_TOKEN).toBe('kici_ok_secret');
-    // Hybrid mints via the Platform relay — the dev-signed identity envs are
-    // deliberately absent so the local signer is never even configured.
+    // Hybrid mints with the orchestrator's own signing key under the plane's
+    // own issuer — the dev-signed identity envs are deliberately absent so the
+    // local signer is never even configured.
+    // fails-when: the issuer is dropped, which leaves the attached plane with
+    // no mint at all (`ctx.kici.oidc.token()` answers "unknown method").
+    expect(spawnOpts.env.KICI_ORCHESTRATOR_PROVENANCE_ISSUER).toMatch(
+      /^http:\/\/127\.0\.0\.1:\d+$/,
+    );
     expect(spawnOpts.env.KICI_INDEPENDENT_IDENTITY).toBeUndefined();
     expect(spawnOpts.env.KICI_DEV_IDENTITY_KEY_FILE).toBeUndefined();
     expect(spawnOpts.env.KICI_INDEPENDENT_SECRETS).toBeUndefined();

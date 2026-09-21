@@ -152,8 +152,8 @@ export interface ReservationSnapshot {
  *
  * The `eventBuffer` Map is also not persisted: events emitted before
  * correlation are observability, not correctness. A coord crash before
- * `correlateAgentToJob()` runs accepts losing those events (see the
- * wishlist for the rationale).
+ * `correlateAgentToJob()` runs accepts losing those events (they are
+ * observability, not correctness: nothing downstream waits on them).
  *
  * Ownership columns (`owner_instance_id`, `adopted_by`) let several
  * coordinators behind one shared endpoint divide the same tables between them.

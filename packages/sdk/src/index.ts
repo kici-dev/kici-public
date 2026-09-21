@@ -3,8 +3,6 @@ export { step } from './step.js';
 export { job } from './job.js';
 export { workflow } from './workflow.js';
 export { parallel, isParallelGroup } from './parallel.js';
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { flattenStepInputs } from './parallel.js';
 export type { ParallelGroup, ParallelOptions } from './parallel.js';
 
 // Invoke-gate API (global-workflow → source-repo invocation)
@@ -12,8 +10,6 @@ export { invokeSource } from './invoke.js';
 export type { InvokeConfig } from './invoke.js';
 
 // Approval gate API
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { normalizeApproval } from './approval.js';
 export type {
   ApprovalConfig,
   ApprovalWhen,
@@ -129,10 +125,6 @@ export type { HookConfig, HookFn, HookInput, HookContext, OutcomeMetadata } from
 
 // Rule factories
 export { rule, skip, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from './rules/index.js';
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { evaluateRules } from './rules/index.js';
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { createRuleContext } from './rules/index.js';
 export { ChangedFilesUnavailableError } from './rules/index.js';
 export type { CreateRuleContextInput } from './rules/index.js';
 export { isEventType } from './rules/index.js';
@@ -234,9 +226,7 @@ export type {
   NeedsWhenInput,
 } from './types.js';
 
-// Result-aware dynamic job generation: ctx.needs builder + snapshot proxy
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { buildNeedsContext } from './needs-context.js';
+// Result-aware dynamic job generation: ctx.needs snapshot types
 export type {
   UpstreamSnapshot,
   NeedsContext,
@@ -248,8 +238,6 @@ export type {
 
 // Cache types
 export { CacheSpecSchema } from './cache-types.js';
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { normalizeCacheSpecs } from './cache-types.js';
 export type { CacheSpec, CacheInput } from './cache-types.js';
 export type { CacheRestoreResult, CacheApi } from './cache-types.js';
 export { ArtifactNameSchema, ARTIFACT_NAME_MAX_LENGTH } from './artifacts-types.js';
@@ -282,15 +270,11 @@ export { isMatrixJobOutputs, isHostJobOutputs } from './context.js';
 
 // Workflow-level pre-dispatch filter
 export type { FilterContext, FilterFn } from './filter.js';
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { createFilterContext } from './filter-context.js';
 export type { CreateFilterContextInput } from './filter-context.js';
 
 export type { FanoutPosition } from './fanout-context.js';
 
 // KiCI API types (agent private API over WS)
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { buildKiciApi } from './api-types.js';
 export type {
   KiciApi,
   KiciApiTransport,
@@ -305,9 +289,7 @@ export type {
 // Error types
 export { SecretNotFoundError } from './errors.js';
 
-// Secrets factory
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { createStepSecrets } from './secrets.js';
+// Secrets types
 export type {
   StepSecrets,
   TrackedStepSecrets,
@@ -332,8 +314,6 @@ export {
   getJobOutputsMap,
   getStepRefMap,
 } from './outputs.js';
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { setStepOutputsMap, setJobOutputsMap, setStepRefMap } from './outputs.js';
 export type { OutputsMap, StepRefMap } from './outputs.js';
 
 // Matrix types
@@ -349,10 +329,6 @@ export type {
 } from './matrix/index.js';
 
 export { isStaticArray, isStaticObject, isDynamicFunction } from './matrix/index.js';
-
-// Matrix expansion utilities
-/** @deprecated Moved to `@kici-dev/sdk/internal` — internal runtime API, not covered by semver. */
-export { expandMatrix, applyIncludeExclude } from './matrix/index.js';
 
 // Event definitions
 export { defineEvent, isEventDefinition } from './events/index.js';
@@ -399,7 +375,6 @@ export {
 // Agent cloud-init builder
 export { buildAgentCloudInit } from './agent-cloud-init.js';
 export type {
-  CloudInitCredentials,
   ClaimCodeCredentials,
   AgentCloudInitCredentials,
   AgentDeliveryMode,

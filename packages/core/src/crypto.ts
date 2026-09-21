@@ -29,8 +29,7 @@ export async function sha256File(filePath: string): Promise<string> {
  *     both sides.
  *
  * Standalone `\r` is also collapsed to `\n` for safety against legacy
- * Mac-style endings, though TypeScript source files essentially never carry
- * those in practice.
+ * Mac-style endings, though TypeScript source files rarely carry those.
  */
 export function normalizeLineEndings(input: string): string {
   return input.replace(/\r\n?/g, '\n');

@@ -350,6 +350,25 @@ export class OrchestratorClient {
    */
   onClaimFailedPermanently: ((reason: string) => void) | null = null;
 
+  /**
+   * Fired once when authentication fails permanently — an `auth.failure` frame,
+   * or the orchestrator closing with WS_CLOSE_AGENT_AUTH_FAILED (a revoked token,
+   * or a protocol version below the orchestrator's floor). The client never
+   * reconnects after this, so server.ts wires it to a non-zero graceful
+   * shutdown; without it the health HTTP server keeps a process alive that can
+   * never register again, and a one-shot GitHub Actions agent holds its runner
+   * until the job timeout.
+   */
+  onAuthFailedPermanently: ((reason: string) => void) | null = null;
+
+  /** Marks the auth failure permanent and fires onAuthFailedPermanently exactly once. */
+  private failAuthPermanently(reason: string): void {
+    const first = !this.authFailed;
+    this.authFailed = true;
+    this.intentionalDisconnect = true;
+    if (first) this.onAuthFailedPermanently?.(reason);
+  }
+
   constructor(options: OrchestratorClientOptions) {
     this.url = options.url;
     this.agentId = options.agentId;
@@ -861,9 +880,7 @@ export class OrchestratorClient {
         messageId: completeId,
         jobId,
         name: request.name,
-        sizeBytes: request.sizeBytes!,
         sha256: request.sha256!,
-        storageKey: request.storageKey!,
       } as AgentToOrchestratorMessage;
 
       if (!hasOrchAgentCapability(this.orchCapabilities, 'artifactCompleteAck')) {
@@ -1185,8 +1202,7 @@ export class OrchestratorClient {
           'Orchestrator closed with auth-failed code -- token is invalid or revoked. NOT retrying.',
           { code, reason: reason.toString() },
         );
-        this.authFailed = true;
-        this.intentionalDisconnect = true;
+        this.failAuthPermanently(reason.toString() || 'orchestrator closed with auth-failed code');
       }
 
       this._state = 'disconnected';
@@ -1760,9 +1776,8 @@ export class OrchestratorClient {
           logger.error('Authentication FAILED -- token is invalid or expired. NOT retrying.', {
             reason: msg.reason,
           });
-          this.authFailed = true;
           // Do not reconnect -- the token is bad
-          this.intentionalDisconnect = true;
+          this.failAuthPermanently(msg.reason);
           if (this.ws) {
             this.ws.close(1000, 'Auth failed');
             this.ws = null;

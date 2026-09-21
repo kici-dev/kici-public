@@ -743,6 +743,10 @@ describe('OrchestratorClient', () => {
 
     it('auth.failure stops reconnecting permanently', () => {
       const client = createClient({ token: 'kat_bad_token' });
+      // server.ts wires this to a non-zero graceful shutdown; a refused agent
+      // must terminate rather than let the health server hold it open.
+      const onAuthFailedPermanently = vi.fn();
+      client.onAuthFailedPermanently = onAuthFailedPermanently;
       client.connect();
 
       const mock = getLatestMock();
@@ -756,12 +760,18 @@ describe('OrchestratorClient', () => {
       });
 
       expect(client.state).toBe('disconnected');
+      // fails-when: the auth.failure branch sets authFailed without firing the
+      // hook — the process would stay alive behind its health server.
+      expect(onAuthFailedPermanently).toHaveBeenCalledTimes(1);
+      expect(onAuthFailedPermanently).toHaveBeenCalledWith('Invalid or expired token');
 
       // Wait a very long time -- should NOT reconnect
       vi.advanceTimersByTime(300_000);
 
       // Only 1 mock instance created (the initial one) -- no reconnection
       expect(mockInstances.length).toBe(1);
+      // The close that follows the auth.failure frame must not fire it again.
+      expect(onAuthFailedPermanently).toHaveBeenCalledTimes(1);
     });
 
     // defense in depth: the close-code branch must stop the
@@ -771,6 +781,8 @@ describe('OrchestratorClient', () => {
     // the agent would reconnect-storm.
     it('close code 4010 (WS_CLOSE_AGENT_AUTH_FAILED) stops reconnecting permanently', () => {
       const client = createClient({ token: 'kat_revoked_token' });
+      const onAuthFailedPermanently = vi.fn();
+      client.onAuthFailedPermanently = onAuthFailedPermanently;
       client.connect();
 
       const mock = getLatestMock();
@@ -786,6 +798,10 @@ describe('OrchestratorClient', () => {
       mock.emit('close', 4010, Buffer.from('Token revoked'));
 
       expect(client.state).toBe('disconnected');
+      // fails-when: the close-code branch marks the failure without firing the
+      // hook — a lost auth.failure frame would leave the process alive.
+      expect(onAuthFailedPermanently).toHaveBeenCalledTimes(1);
+      expect(onAuthFailedPermanently).toHaveBeenCalledWith('Token revoked');
 
       // Wait a very long time -- the agent must NOT reconnect.
       vi.advanceTimersByTime(300_000);
@@ -1657,9 +1673,7 @@ describe('OrchestratorClient', () => {
         requestId,
         op: 'completeUpload' as const,
         name: 'bundle',
-        sizeBytes: 4096,
         sha256: 'deadbeef',
-        storageKey: 'artifacts/run-1/bundle.tar.gz',
       };
     }
 

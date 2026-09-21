@@ -10,8 +10,6 @@ export type ClusterNumberColumn =
   | 'event_log_max_payload_bytes'
   | 'lock_file_max_bytes'
   | 'webhook_dedup_ttl_ms'
-  /** @deprecated Readable, but no call site reads it. Removed at v1.0.0. */
-  | 'contributor_cache_ttl_ms'
   | 'event_router_event_ttl_seconds'
   | 'event_router_max_dispatch_attempts'
   | 'queue_max_depth'

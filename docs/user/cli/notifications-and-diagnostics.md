@@ -124,10 +124,11 @@ kici verify-attestation --bundle ./app.tgz.kici.json \
 token was minted relative to the build. A normal attestation prints no marker
 (the token was minted live). A **deferred** attestation prints an `ATTESTATION:
 deferred` line — the build facts were sealed at build time and the token was
-minted later, after a transient platform outage, bound to the frozen statement
-by its hash. An **offline-backfill** attestation prints an `ATTESTATION:
-offline-backfill` line — the run was ingested while the platform was down, so its
-run/job rows were backfilled before the token was minted. Both still verify
+minted later, once the orchestrator's signing key was available again, bound to
+the frozen statement by its hash. An **offline-backfill** attestation prints an
+`ATTESTATION: offline-backfill` line — the run was ingested while the platform
+was down, so its run/job records were replayed to the platform before the token
+was minted. Both still verify
 (PASS); the marker discloses the temporal gap, and the organization id remains
 the authoritative anchor.
 
@@ -286,6 +287,9 @@ kici feedback --open
 
 # Read the same contract as structured data
 kici feedback --json
+
+# Turn a JSON draft (keys: draftFields from --json) into the prefilled form URL
+kici feedback --draft draft.json --open
 ```
 
 `--json` exists for coding agents: KiCI is built to be driven by an LLM, and
@@ -336,10 +340,11 @@ Synopsis: `kici feedback [options]`
 
 **Options**
 
-| Option   | Default | Description                                          |
-| -------- | ------- | ---------------------------------------------------- |
-| `--open` |         | Open the prefilled issue form in the default browser |
-| `--json` |         | Emit the reporting contract as JSON                  |
+| Option           | Default | Description                                                                                   |
+| ---------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `--open`         |         | Open the prefilled issue form in the default browser                                          |
+| `--json`         |         | Emit the reporting contract as JSON                                                           |
+| `--draft <file>` |         | Build the prefilled issue-form URL from a JSON draft keyed by field id (with --open, open it) |
 
 ### `kici notifications`
 

@@ -46,7 +46,7 @@ function makeLockFile(workflows: LockWorkflow[]): LockFile {
 function callHelper(
   postCheckStatus: ReturnType<typeof vi.fn>,
   postWorkflowModificationCheck: ReturnType<typeof vi.fn>,
-  tier: 'unknown' | 'known' | 'trusted',
+  tier: 'unknown' | 'trusted',
   opts: { identical?: boolean } = {},
 ) {
   const bundle = {

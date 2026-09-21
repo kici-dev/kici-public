@@ -284,7 +284,7 @@ The first two treat "no tier" as untrusted. The last two treat it as "no opinion
 
 A subscriber that inherits a tier below `trusted` loses its install secrets. A job that installs from a private registry then fails at install time.
 
-A `minimumTrust` context holds an `unknown` subscriber for security review, whatever value the context declares. Trust is a ref-based judgement with two answers, so `minimumTrust: 'trusted'` and the deprecated `minimumTrust: 'known'` block the same thing. The declared value still decides the wording of the hold reason. A subscriber that inherited the legacy `known` tier from a run row written by an earlier build passes both.
+A `minimumTrust: 'trusted'` context holds an `unknown` subscriber for security review. Trust is a ref-based judgement with two answers, so that is the only floor a context can declare.
 
 Both symptoms appear far from their cause. The tier belongs to the **emitting** run, so read that run's tier first.
 

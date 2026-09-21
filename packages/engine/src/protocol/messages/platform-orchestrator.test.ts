@@ -46,8 +46,6 @@ describe('trustPolicyUpdateSchema', () => {
     orgId: 'org-1',
     policy: {
       forkPolicy: 'hold' as const,
-      unknownContributorPolicy: 'hold' as const,
-      workflowChangePolicy: 'hold' as const,
       approvalExpiryHours: 24,
     },
     identityLinks: [],
@@ -71,6 +69,39 @@ describe('trustPolicyUpdateSchema', () => {
   it('defaults teamMemberships to [] when omitted', () => {
     const parsed = trustPolicyUpdateSchema.parse(base);
     expect(parsed.teamMemberships).toEqual([]);
+  });
+
+  it('accepts every current forkPolicy value', () => {
+    // breaks-if-wrong: the tri-state switch still parses once `reject` is gone.
+    for (const forkPolicy of ['ignore', 'hold', 'allow'] as const) {
+      const parsed = trustPolicyUpdateSchema.parse({
+        ...base,
+        policy: { ...base.policy, forkPolicy },
+      });
+      expect(parsed.policy.forkPolicy).toBe(forkPolicy);
+    }
+  });
+
+  it('refuses forkPolicy reject and the removed non-fork arms (strict policy)', () => {
+    // fails-when: a removed value or field is accepted again.
+    expect(
+      trustPolicyUpdateSchema.safeParse({
+        ...base,
+        policy: { ...base.policy, forkPolicy: 'reject' },
+      }).success,
+    ).toBe(false);
+    expect(
+      trustPolicyUpdateSchema.safeParse({
+        ...base,
+        policy: { ...base.policy, unknownContributorPolicy: 'hold' },
+      }).success,
+    ).toBe(false);
+    expect(
+      trustPolicyUpdateSchema.safeParse({
+        ...base,
+        policy: { ...base.policy, workflowChangePolicy: 'hold' },
+      }).success,
+    ).toBe(false);
   });
 });
 
@@ -1250,8 +1281,6 @@ describe('recognized-type sets', () => {
 describe('trustPolicySchema approvalExpiryHours validation', () => {
   const validPolicy = {
     forkPolicy: 'hold',
-    unknownContributorPolicy: 'hold',
-    workflowChangePolicy: 'hold',
     approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   };
 
@@ -1349,31 +1378,29 @@ describe('approval expiry resolution', () => {
 });
 
 describe('trustPolicySchema fork switch', () => {
-  it('accepts ignore and the legacy values', () => {
+  it('accepts every value of the tri-state switch', () => {
     for (const forkPolicy of ForkPolicy.options) {
       const parsed = trustPolicySchema.parse({
         forkPolicy,
-        unknownContributorPolicy: 'hold',
-        workflowChangePolicy: 'hold',
         approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
       });
       expect(parsed.forkPolicy).toBe(forkPolicy);
     }
   });
 
-  it('enumerates ignore alongside the three values older peers send', () => {
-    expect([...ForkPolicy.options].sort()).toEqual(['allow', 'hold', 'ignore', 'reject']);
+  it('enumerates exactly ignore, hold and allow', () => {
+    expect([...ForkPolicy.options].sort()).toEqual(['allow', 'hold', 'ignore']);
   });
 
   it('rejects a value outside the vocabulary', () => {
-    expect(
-      trustPolicySchema.safeParse({
-        forkPolicy: 'drop',
-        unknownContributorPolicy: 'hold',
-        workflowChangePolicy: 'hold',
-        approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
-      }).success,
-    ).toBe(false);
+    for (const forkPolicy of ['drop', 'reject']) {
+      expect(
+        trustPolicySchema.safeParse({
+          forkPolicy,
+          approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+        }).success,
+      ).toBe(false);
+    }
   });
 });
 

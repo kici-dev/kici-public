@@ -181,7 +181,6 @@ function makeDeps(over: { allowed: boolean; orgId?: string; reason?: string }): 
     globalWorkflowPolicy: {
       isWorkflowRepoAllowed,
       isSourceRepoAllowed: vi.fn(async () => ({ allowed: true })),
-      isElevatedAccessAllowed: vi.fn(async () => false),
     },
     dispatcher: { dispatch: vi.fn(async () => ({ status: 'queued', jobId: 'j1' })) },
     lockFileCache: {

@@ -1707,16 +1707,14 @@ export class JobRunner {
     });
 
     buildLog('Packing .kici/ source tarball...');
-    const { tarball, hash: sourceTarHash } = await packKiciSource(workDir);
+    const { tarball, hash: sourceTarDigest } = await packKiciSource(workDir);
 
-    // `sourceTarHash` is the tarball's OWN digest — the orchestrator stores the
-    // object under it and the restoring agent verifies against it, exactly as
-    // `depsHash` already works. It used to be reported only as build telemetry
-    // while the object was named after the workflow contentHash, which is why
-    // nothing downstream could verify a restored tarball.
+    // `sourceTarDigest` is the tarball's OWN digest — the orchestrator stores
+    // the object under it and the restoring agent verifies against it, exactly
+    // as `depsHash` works.
     const sourceKey = {
       contentHash: buildConfig.contentHash,
-      sourceTarDigest: sourceTarHash,
+      sourceTarDigest,
       platform: os.platform(),
       arch: os.arch(),
     };
@@ -1740,7 +1738,7 @@ export class JobRunner {
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running, {
       buildEvent: 'source_packed',
       contentHash: buildConfig.contentHash,
-      sourceTarHash,
+      sourceTarDigest,
     });
   }
 

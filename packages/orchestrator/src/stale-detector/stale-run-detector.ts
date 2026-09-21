@@ -12,6 +12,9 @@
  * - Optimistic concurrency: WHERE status='running' prevents race with agent completion
  * - Does NOT call executionTracker.onJobStatus() to avoid redundant DB writes
  * - Updates in-memory state and calls completeRunIfAllJobsTerminal for run completion
+ * - Finishes a run whose every job is terminal but whose finalizer never ran
+ *   (a coordinator that died mid-way, or a registration-window holder that
+ *   died after a sibling deferred to it)
  * - Force-terminates stale agents via scaler manager
  * - Updates GitHub check runs with timed_out conclusion
  */
@@ -21,6 +24,11 @@ import { routeRelease } from '../approvals/resume-router.js';
 import { releaseQueuedHolds } from '../contexts/release-queued-holds.js';
 import type { Database } from '../db/types.js';
 import { selectStaleDispatchCandidates } from './stale-dispatch-candidates.js';
+import { selectAllTerminalRunCandidates } from './all-terminal-runs.js';
+import {
+  DEFAULT_RECOVERY_GRACE_MS,
+  instanceLivenessGraceMs,
+} from '../cluster/instance-heartbeat.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
 import type { ScalerManager } from '../scaler/manager.js';
@@ -72,6 +80,12 @@ export interface StaleRunDetectorDeps {
   staleThresholdMs: number;
   /** How often to scan for stale jobs in ms. Default: 60_000 */
   scanIntervalMs: number;
+  /**
+   * How stale a `cluster_instances` heartbeat may be and still read as live,
+   * for the all-terminal sweep's registration-window holder check. Defaults to
+   * {@link instanceLivenessGraceMs} at the default recovery grace period.
+   */
+  instanceLivenessGraceMs?: number;
   /** Held run store for expiring overdue held runs. Optional -- if not set, held run cleanup is skipped. */
   heldRunStore?: HeldRunStore;
   /** Step-approval bridge — notified when a step-scoped hold expires so the waiting agent fails the step. Optional. */
@@ -125,6 +139,7 @@ export class StaleRunDetector {
   private readonly rerouteFlapGraceFallbackMs: number;
   private readonly staleThresholdMs: number;
   private readonly scanIntervalMs: number;
+  private readonly instanceLivenessGraceMs: number;
   private readonly heldRunStore?: HeldRunStore;
   private readonly stepApprovalBridge?: StepApprovalBridge;
   private readonly failRun?: (runId: string, reason: string) => Promise<void>;
@@ -147,6 +162,8 @@ export class StaleRunDetector {
     this.rerouteFlapGraceFallbackMs = deps.rerouteFlapGraceFallbackMs;
     this.staleThresholdMs = deps.staleThresholdMs;
     this.scanIntervalMs = deps.scanIntervalMs;
+    this.instanceLivenessGraceMs =
+      deps.instanceLivenessGraceMs ?? instanceLivenessGraceMs(DEFAULT_RECOVERY_GRACE_MS);
     this.heldRunStore = deps.heldRunStore;
     this.stepApprovalBridge = deps.stepApprovalBridge;
     this.failRun = deps.failRun;
@@ -478,6 +495,15 @@ export class StaleRunDetector {
       // Sub-scan C: Dispatched queue entries that were never acknowledged
       staleCount += await this.scanStaleDispatchedJobs(threshold, timeBound, affectedRunIds);
 
+      // Sub-scan F: runs whose every job is terminal and whose finalizer never
+      // ran — routed through the same completion check as the sub-scans above,
+      // whose DB-fallback path finishes them from the rows.
+      await this.scanAllTerminalRuns(threshold, timeBound, affectedRunIds);
+
+      // Sub-scan G: in-memory runs another coordinator already finished. This
+      // coordinator never saw their last job, so nothing else prunes them.
+      await this.executionTracker.pruneRunsFinishedElsewhere();
+
       // Sub-scan E: Expire overdue held runs (after releasing wait-timer holds
       // so a wait-timer workflow hold resumes instead of being failed).
       if (this.heldRunStore) {
@@ -514,6 +540,37 @@ export class StaleRunDetector {
         error: toErrorMessage(err),
         stack: err instanceof Error ? err.stack : undefined,
       });
+    }
+  }
+
+  /**
+   * Sub-scan F: runs left non-terminal after every job row went terminal.
+   *
+   * The coordinator that saw the last job finish defers finalization while a
+   * live sibling still has a registration window open on the run; a holder
+   * that then dies leaves nothing to re-drive that check. A coordinator that
+   * dies between its jobs going terminal and its own finalization leaves the
+   * same shape. Both are finished here from the rows.
+   */
+  private async scanAllTerminalRuns(
+    threshold: Date,
+    timeBound: Date,
+    affectedRunIds: Set<string>,
+  ): Promise<void> {
+    try {
+      const runIds = await selectAllTerminalRunCandidates(this.db, {
+        threshold,
+        timeBound,
+        livenessGraceMs: this.instanceLivenessGraceMs,
+      });
+      for (const runId of runIds) {
+        logger.warn('Run left non-terminal after every job finished; finishing it from the rows', {
+          runId,
+        });
+        affectedRunIds.add(runId);
+      }
+    } catch (err) {
+      logger.error('All-terminal run scan failed', { error: toErrorMessage(err) });
     }
   }
 

@@ -17,10 +17,6 @@ describe('buildReducedPrivilegeNote', () => {
     expect(note).toContain('build-cache writes are confined to this run');
   });
 
-  it('names the posture for the legacy `known` tier stored rows may still hold', () => {
-    expect(buildReducedPrivilegeNote('known')).toContain(REDUCED_PRIVILEGE_MARKER);
-  });
-
   it('says nothing for a trusted ref', () => {
     expect(buildReducedPrivilegeNote('trusted')).toBeNull();
     expect(buildReducedPrivilegeNote('trusted', 'base')).toBeNull();

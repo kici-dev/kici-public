@@ -38,7 +38,7 @@ vi.mock('./scaler-config.js', () => ({
   writeScalerConfig: vi.fn().mockReturnValue('/tmp/scaler.yaml'),
 }));
 vi.mock('./platform-attach.js', () => ({
-  derivePlatformWsUrl: vi.fn().mockReturnValue('wss://thinker1.dev.kici.dev/kici-stg/ws'),
+  derivePlatformWsUrl: vi.fn().mockReturnValue('wss://platform.example.com/kici-stg/ws'),
   mintOrchestratorKey: vi
     .fn()
     .mockResolvedValue({ key: 'kici_ok_secret', keyId: 'key-123', keyPrefix: 'kici_ok_' }),
@@ -348,21 +348,21 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { attachPlane, readAttachment, readPlatformToken } = await import('./plane-manager.js');
     const { planePaths } = await import('./paths.js');
     const st = await attachPlane({
-      apiBase: 'https://thinker1.dev.kici.dev/kici-stg',
+      apiBase: 'https://platform.example.com/kici-stg',
       pat: 'kici_pat_abc',
       orgId: 'kiciStg00001',
     });
     expect(st.mode).toBe('hybrid');
     expect(st.attachment).toMatchObject({
-      platformWsUrl: 'wss://thinker1.dev.kici.dev/kici-stg/ws',
-      platformApiBase: 'https://thinker1.dev.kici.dev/kici-stg',
+      platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
+      platformApiBase: 'https://platform.example.com/kici-stg',
       orgId: 'kiciStg00001',
       keyId: 'key-123',
     });
     // Orchestrator booted hybrid with the minted token.
     const call = vi.mocked(spawnOrchestratorProcess).mock.calls.at(-1);
     expect(call?.[1].attach).toMatchObject({
-      platformWsUrl: 'wss://thinker1.dev.kici.dev/kici-stg/ws',
+      platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
       platformToken: 'kici_ok_secret',
     });
     // Token persisted 0600, NOT in the stamp; durable attachment written.

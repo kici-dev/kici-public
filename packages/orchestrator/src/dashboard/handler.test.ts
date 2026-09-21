@@ -2786,12 +2786,10 @@ describe('DashboardHandler', () => {
 
   // ── multi-tenant orgId resolution ───────────────────────────────
   //
-  // The wishlist invariant: when the orchestrator hosts more than one
-  // tenant (staging during an E2E batch), `recordAccess` MUST attribute
-  // the dashboard read to the **run's** owning org / routing key — not
-  // the handler-bound (LIMIT-1, no-ORDER-BY, non-deterministic) pair set
-  // by `setOrgContext`. Source: wishlist `20260505_105131_orchestrator-
-  // dashboard-handler-stamps-bound-orgId-not-run-owner.md`.
+  // The invariant: when the orchestrator hosts more than one tenant (staging
+  // during an E2E batch), `recordAccess` MUST attribute the dashboard read to
+  // the **run's** owning org / routing key — not the handler-bound (LIMIT-1,
+  // no-ORDER-BY, non-deterministic) pair set by `setOrgContext`.
   describe('multi-tenant orgId resolution', () => {
     it('handleRunDetail attributes access_log to the run-owning org, not the bound org', async () => {
       const {

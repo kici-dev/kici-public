@@ -3591,7 +3591,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
           runsOn: [{ kind: 'exact', value: 'linux' }],
           needs: [],
           steps: [{ name: 'Run', hasOutputs: false }],
-          // An impure (non-inline) dynamic context element triggers needsInit
+          // A dynamic context element triggers needsInit
           // (the agent resolves it via an init job).
           contexts: [{ value: '', dynamic: true }],
         },
@@ -4891,6 +4891,54 @@ describe('init job dispatch (dynamic fields)', () => {
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 
+  it('tracks a queued-no-backend init job like a queued one instead of failing the run', async () => {
+    // fails-when: the deferred init path throws on `queued-no-backend` — the run
+    // fails in milliseconds while the init job sits in the dispatch queue and
+    // later runs on a fresh agent for a run that is already dead. Every other
+    // dispatch site (build, regular, scheduler) treats the status like `queued`.
+    const mockDispatcher = createMockDispatcher();
+    mockDispatcher.dispatch
+      .mockResolvedValueOnce({ status: 'queued-no-backend', jobId: 'init-queued-1' })
+      .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'j2' });
+    const mockPendingInits = createMockPendingInits();
+
+    const deps = createDeps({
+      dispatcher: mockDispatcher as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
+      pendingInits: mockPendingInits as any,
+    });
+
+    await processWebhook(basePushInfo(), deps);
+    await waitForDeferredInits();
+
+    // The init result is awaited under the queued job's id, then the execution
+    // job is dispatched — the same shape as a plain `queued` init.
+    expect(mockPendingInits.track).toHaveBeenCalledWith('init-queued-1');
+    expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails parent job when a rejected init dispatch is not queued at all', async () => {
+    // breaks-if-wrong: a genuinely rejected init (no queue row) must still fail the run
+    const mockDispatcher = createMockDispatcher();
+    mockDispatcher.dispatch.mockResolvedValueOnce({
+      status: 'rejected',
+      reason: 'no such backend',
+    });
+    const mockPendingInits = createMockPendingInits();
+
+    const deps = createDeps({
+      dispatcher: mockDispatcher as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
+      pendingInits: mockPendingInits as any,
+    });
+
+    await processWebhook(basePushInfo(), deps);
+    await waitForDeferredInits();
+
+    expect(mockPendingInits.track).not.toHaveBeenCalled();
+    expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+  });
+
   it('fails parent job when init job fails', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
@@ -5043,223 +5091,6 @@ describe('init job dispatch (dynamic fields)', () => {
     expect(initCalls[1][0].jobName).toBe('__init__Deploy__deploy-prod');
   });
 });
-
-// -- Inline evaluation tests --
-
-function inlineContextLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
-    workflows: [
-      {
-        name: 'Deploy',
-        triggers: [
-          {
-            _type: 'push',
-            branches: [],
-            paths: [],
-          },
-        ],
-        jobs: [
-          {
-            _type: 'static',
-            name: 'deploy-job',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
-            contexts: [
-              {
-                value: {
-                  _type: 'inline' as const,
-                  expression: "(event) => event.payload.ref.split('/').pop()",
-                },
-                dynamic: true,
-              },
-            ],
-            steps: [{ name: 'Deploy', hasOutputs: false }],
-          },
-        ],
-      },
-    ],
-  };
-}
-
-function inlineContextErrorLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
-    workflows: [
-      {
-        name: 'Deploy',
-        triggers: [
-          {
-            _type: 'push',
-            branches: [],
-            paths: [],
-          },
-        ],
-        jobs: [
-          {
-            _type: 'static',
-            name: 'deploy-job',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
-            contexts: [
-              {
-                value: {
-                  _type: 'inline' as const,
-                  expression: '(event) => event.nonExistent.boom',
-                },
-                dynamic: true,
-              },
-            ],
-            steps: [{ name: 'Deploy', hasOutputs: false }],
-          },
-        ],
-      },
-    ],
-  };
-}
-
-function mixedInlineAndDynamicLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
-    workflows: [
-      {
-        name: 'Deploy',
-        triggers: [
-          {
-            _type: 'push',
-            branches: [],
-            paths: [],
-          },
-        ],
-        jobs: [
-          {
-            _type: 'static',
-            name: 'deploy-job',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
-            contexts: [
-              {
-                value: {
-                  _type: 'inline' as const,
-                  expression: "(event) => event.payload.ref.split('/').pop()",
-                },
-                dynamic: true,
-              },
-            ],
-            dynamicEnv: true,
-            // env is NOT inline -- needs init job
-            steps: [{ name: 'Deploy', hasOutputs: false }],
-          },
-        ],
-      },
-    ],
-  };
-}
-
-describe('inline evaluation (pure dynamic functions)', () => {
-  beforeEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  /** Wait for deferred init jobs to be dispatched (async microtask flush). */
-  async function waitForDeferredInits(): Promise<void> {
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setImmediate(r));
-    }
-  }
-
-  it('dispatches an init job for an inline context (deferred to the eval agent)', async () => {
-    const mockDispatcher = createMockDispatcher();
-    const mockPendingInits = createMockPendingInits();
-    const deps = createDeps({
-      dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(inlineContextLockFile()) as any,
-      pendingInits: mockPendingInits as any,
-    });
-
-    await processWebhook(basePushInfo(), deps);
-    await waitForDeferredInits();
-
-    // The orchestrator no longer evaluates the inline expression in-process; the
-    // agent's init job resolves it, exactly like an impure dynamic context.
-    const initCalls = mockDispatcher.dispatch.mock.calls.filter(
-      (call: any) => call[0].jobConfig?.initOnly,
-    );
-    expect(initCalls).toHaveLength(1);
-    expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
-  });
-
-  it('dispatches init job when dynamicContext is true but context is undefined (impure, )', async () => {
-    const mockDispatcher = createMockDispatcher();
-    const mockPendingInits = createMockPendingInits();
-    const deps = createDeps({
-      dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
-      pendingInits: mockPendingInits as any,
-    });
-
-    await processWebhook(basePushInfo(), deps);
-    await waitForDeferredInits();
-
-    // Should dispatch init job (backward compat for impure functions)
-    const initCalls = mockDispatcher.dispatch.mock.calls.filter(
-      (call: any) => call[0].jobConfig?.initOnly,
-    );
-    expect(initCalls).toHaveLength(1);
-    expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not evaluate a throwing inline expression in-process (deferred to init)', async () => {
-    const mockDispatcher = createMockDispatcher();
-    const mockPendingInits = createMockPendingInits();
-    const deps = createDeps({
-      dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(inlineContextErrorLockFile()) as any,
-      pendingInits: mockPendingInits as any,
-    });
-
-    // The inline expression is never run at dispatch, so a throwing expression
-    // cannot fail the run here — it defers to the agent's init job.
-    await expect(processWebhook(basePushInfo(), deps)).resolves.not.toThrow();
-    await waitForDeferredInits();
-
-    const initCalls = mockDispatcher.dispatch.mock.calls.filter(
-      (call: any) => call[0].jobConfig?.initOnly,
-    );
-    expect(initCalls).toHaveLength(1);
-  });
-
-  it('dispatches init job for non-inline dynamic field in mixed scenario', async () => {
-    const mockDispatcher = createMockDispatcher();
-    const mockPendingInits = createMockPendingInits();
-    const deps = createDeps({
-      dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(mixedInlineAndDynamicLockFile()) as any,
-      pendingInits: mockPendingInits as any,
-    });
-
-    await processWebhook(basePushInfo(), deps);
-    await waitForDeferredInits();
-
-    // Should dispatch init job for the non-inline dynamicEnv field
-    const initCalls = mockDispatcher.dispatch.mock.calls.filter(
-      (call: any) => call[0].jobConfig?.initOnly,
-    );
-    expect(initCalls).toHaveLength(1);
-    // Init job should indicate dynamicEnv needs resolution
-    expect(initCalls[0][0].jobConfig.dynamicEnv).toBe(true);
-    // The inline context is deferred to the same init job, not resolved in-orch.
-    expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
-  });
-});
-
-// -- PendingJobContext DB persistence tests --
 
 describe('PendingJobContext DB persistence', () => {
   const sampleJobInput = {

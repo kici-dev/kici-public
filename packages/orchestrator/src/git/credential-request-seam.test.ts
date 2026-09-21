@@ -89,7 +89,7 @@ function raceWindowDb() {
   const rows: Record<string, unknown> = {
     execution_runs: {
       customer_id: ORG,
-      repo_identifier: 'cmaster11/main',
+      repo_identifier: 'acme/main',
       ref: 'master',
       trigger_event: 'push',
       trust_tier: null,
@@ -131,7 +131,7 @@ describe('git.credential.request, relay through gate', () => {
     await expect(
       request({
         jobId: JOB_ID,
-        repositories: ['cmaster11/main'],
+        repositories: ['acme/main'],
         ref: { kind: 'token', tokenSecret: 'ci:GITCRED_TOKEN' },
       }),
     ).resolves.toMatchObject({ kind: 'basic', secret: SEEDED });
@@ -141,7 +141,7 @@ describe('git.credential.request, relay through gate', () => {
     await expect(
       request({
         jobId: JOB_ID,
-        repositories: ['cmaster11/main'],
+        repositories: ['acme/main'],
         ref: { kind: 'token', tokenSecret: 'ci:DB_PASSWORD' },
       }),
     ).rejects.toThrow(/not declared/);
@@ -151,7 +151,7 @@ describe('git.credential.request, relay through gate', () => {
     await expect(
       request({
         jobId: JOB_ID,
-        repositories: ['cmaster11/main'],
+        repositories: ['acme/main'],
         ref: { kind: 'token', tokenValue: 'ghp_forged_material_0000000000' },
       }),
     ).rejects.toThrow(/not declared/);
@@ -161,7 +161,7 @@ describe('git.credential.request, relay through gate', () => {
     await expect(
       request({
         jobId: JOB_ID,
-        repositories: ['cmaster11/main'],
+        repositories: ['acme/main'],
         ref: { kind: 'token', tokenSecret: 'locked:GITCRED_TOKEN' },
       }),
     ).rejects.toThrow(/does not admit this run/);
@@ -169,7 +169,7 @@ describe('git.credential.request, relay through gate', () => {
 
   it('refuses a request for a job this agent was never dispatched', async () => {
     await expect(
-      request({ jobId: 'someone-elses-job', repositories: ['cmaster11/main'] }),
+      request({ jobId: 'someone-elses-job', repositories: ['acme/main'] }),
     ).rejects.toThrow(/not owned by agent/);
   });
 });

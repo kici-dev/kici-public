@@ -14,6 +14,7 @@ import type { Database } from '../db/types.js';
 import { ExecutionTracker } from '../reporting/execution-tracker.js';
 import { DashboardHandler } from './handler.js';
 import { proxyJobName } from '../pipeline/invoke-gate.js';
+import { terminateTestDbBackends } from '../__test-helpers__/test-db.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -176,10 +177,7 @@ describeDb('handleRunDetail — invoke-gate run', () => {
     await pool?.end().catch(() => {});
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      await adminPool.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await adminPool.end();

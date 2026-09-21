@@ -208,7 +208,7 @@ export class OrphanRecovery {
 
     // A run that is still making progress is NOT orphaned, whatever the peer
     // registry says. The candidate query selects on `started_at`, so any run
-    // simply LONGER than the stale threshold lands here, and the peer check
+    // LONGER than the stale threshold lands here, and the peer check
     // above can never vouch for a single-node orchestrator (it has no peers).
     // Without this guard, a healthy long run on a single-node deployment is
     // force-failed by its own coordinator.

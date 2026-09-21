@@ -218,12 +218,11 @@ describe('reportJobCheckRunCompletion — the run trust posture', () => {
   });
 
   it('forwards the run trust posture so the completion summary can name it', () => {
-    // `known` is legacy vocabulary `resolveRefTrust` no longer produces, so a
-    // forwarded value proves the run's own context was read rather than a
-    // literal supplied here.
+    // A forwarded fork-tier posture proves the run's own context was read rather
+    // than a literal supplied here.
     const { updateJobStatus, deps } = makeDeps({
       ...execContext,
-      trustTier: 'known',
+      trustTier: 'unknown',
       lockFileSource: 'base',
     });
 
@@ -235,7 +234,7 @@ describe('reportJobCheckRunCompletion — the run trust posture', () => {
     });
 
     expect(updateJobStatus.mock.calls[0][0]).toMatchObject({
-      trustTier: 'known',
+      trustTier: 'unknown',
       lockFileSource: 'base',
     });
   });

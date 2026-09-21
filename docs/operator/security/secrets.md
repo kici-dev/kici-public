@@ -429,17 +429,17 @@ KiCI supports zero-downtime master key rotation using a dual-key mechanism. Duri
 
 Seven stores use `KICI_SECRET_KEY`. `rotate-key` sweeps all seven, and each has a dual-key read so it stays available for the whole transition window:
 
-| Store                       | Holds                                     | Losing it costs                                     |
-| --------------------------- | ----------------------------------------- | --------------------------------------------------- |
-| `scoped_secrets`            | workflow secrets                          | every job that resolves a secret                    |
-| `config_versions`           | encrypted config fields                   | `kici-admin config rollback`                        |
-| `secret_backends`           | external Vault/OpenBao connection configs | every secret served by a backend                    |
-| `orchestrator_signing_keys` | the provenance signing private key        | provenance signing, **and the orchestrator's boot** |
-| `dashboard_encryption_keys` | the dashboard-encryption private key      | every browser-sealed dashboard write                |
-| `run_ephemeral_keys`        | per-run X25519 private keys               | secret outputs for every run in flight              |
-| `run_secret_outputs`        | values published by `ctx.setSecretOutput` | downstream `needs:` reads and the dashboard reveal  |
+| Store                       | Holds                                     | Losing it costs                                    |
+| --------------------------- | ----------------------------------------- | -------------------------------------------------- |
+| `scoped_secrets`            | workflow secrets                          | every job that resolves a secret                   |
+| `config_versions`           | encrypted config fields                   | `kici-admin config rollback`                       |
+| `secret_backends`           | external Vault/OpenBao connection configs | every secret served by a backend                   |
+| `orchestrator_signing_keys` | the provenance signing private key        | every provenance mint (each one defers)            |
+| `dashboard_encryption_keys` | the dashboard-encryption private key      | every browser-sealed dashboard write               |
+| `run_ephemeral_keys`        | per-run X25519 private keys               | secret outputs for every run in flight             |
+| `run_secret_outputs`        | values published by `ctx.setSecretOutput` | downstream `needs:` reads and the dashboard reveal |
 
-The signing key is the one whose loss is not a degradation: the boot path unwraps it with no catch, so an orchestrator that cannot open it does not start.
+A signing key the orchestrator cannot open does not stop it from starting. The key is loaded on the first mint, so the orchestrator boots and logs `provenance signing key cannot be loaded; mints will defer until fixed` with the recovery text, once. Every provenance mint then defers into the retry queue until the key opens again — the same queue `kici-admin attestations retry` drains. Watch that queue: with signing enabled, a queue that only grows after a rotation is this failure.
 
 ### Cadence
 
@@ -520,7 +520,7 @@ sealed under a key that is no longer configured.
 
 First confirm step 4 reported **zero skips across every store**. Then remove `KICI_SECRET_KEY_OLD` (or `KICI_SECRET_KEY_FILE_OLD`) from the configuration and do another rolling restart. All seven stores are now encrypted with the new key only.
 
-Verify the restart came up clean: the orchestrator serves `/.well-known/jwks.json` with the same `kid` it served before the rotation. A signing key the sweep missed shows up here as a failed boot, not as a quiet degradation.
+Verify the restart came up clean: the orchestrator serves `/.well-known/jwks.json` with the same `kid` it served before the rotation, and the log carries no `provenance signing key cannot be loaded` line. A signing key the sweep missed does not fail the boot — the public half still serves, so the JWKS looks right — it defers every mint, and that log line is where it shows.
 
 ### Same-key re-encryption
 
@@ -546,7 +546,7 @@ provenance signing key was sealed under the old master key — re-encrypted unde
 dashboard-encryption key was sealed under the old master key — re-encrypted under the current key (self-heal)
 ```
 
-If neither key opens the row the orchestrator refuses to start with an error naming the store and the recovery, rather than a bare AES-GCM failure:
+If neither key opens the row, the orchestrator logs an error naming the store and the recovery, rather than a bare AES-GCM failure. For the dashboard-encryption key that error surfaces on the first sealed write; for the signing key it surfaces once, on the first mint, and every mint defers until the key opens:
 
 ```
 the provenance signing key cannot be decrypted with the configured master key(s).
@@ -701,25 +701,17 @@ recreate the secrets in the destination backend instead.
 
 ### Listing scopes across backends
 
-`secret scopes` lists the PG backend only, unqualified:
-
-```bash
-kici-admin secret scopes org-1
-#   - production/db
-```
-
-Pass `--all-backends` to aggregate every registered backend and print scopes in
+`secret scopes` aggregates every registered backend and prints each scope in
 qualified form:
 
 ```bash
-kici-admin secret scopes org-1 --all-backends
+kici-admin secret scopes org-1
 #   - pg:production/db
 #   - openbao-prod:aws/credentials
 ```
 
 A backend that is unreachable at that moment is skipped with a warning rather
-than failing the whole listing. `--all-backends` becomes the default at v1.0.0
-(see [Deprecations](../../user/deprecations.md)).
+than failing the whole listing.
 
 ### Repairing scopes stored with a stale qualifier
 

@@ -58,4 +58,4 @@ Issues and PRs are welcome at <https://github.com/kici-dev/kici-public> — see 
 
 ## Status
 
-KiCI is actively developed and dogfooded in production. It is pre-1.0 — protocols and the CLI surface can change between minor versions, so pin versions for production.
+KiCI is in public beta: actively developed and dogfooded in production. It is pre-1.0 — protocols and the CLI surface can change between minor versions, so pin versions for production.

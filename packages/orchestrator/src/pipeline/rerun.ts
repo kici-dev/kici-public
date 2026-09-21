@@ -1066,7 +1066,7 @@ async function recordRerunExecutionStart(opts: {
     //
     // Leaving these NULL renders every fork claim `'unresolved'`, which is
     // fail-closed but wrong in both directions: the worked trust policy in
-    // `docs/user/provenance.md` pins `is_fork = 'false'`, so re-running an
+    // `docs/user/oidc.md` pins `is_fork = 'false'`, so re-running an
     // ordinary push would be refused, and re-running a fork pull request would
     // report the fork question as unanswered when the original run answered it.
     //

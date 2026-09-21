@@ -1035,9 +1035,17 @@ Environment variables:
     )
     .option('--open', 'Open the prefilled issue form in the default browser')
     .option('--json', 'Emit the reporting contract as JSON')
+    .option(
+      '--draft <file>',
+      'Build the prefilled issue-form URL from a JSON draft keyed by field id (with --open, open it)',
+    )
     .action(async (options) => {
       const { feedbackCommand } = await import('./commands/index.js');
-      const success = await feedbackCommand({ open: options.open, json: options.json });
+      const success = await feedbackCommand({
+        open: options.open,
+        json: options.json,
+        draft: options.draft,
+      });
       process.exit(success ? 0 : 1);
     });
 

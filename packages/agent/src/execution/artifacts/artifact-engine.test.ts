@@ -51,8 +51,8 @@ describe('createArtifactsApi.upload', () => {
               storageKey: 'artifacts/r/bundle.tar.gz',
             };
           },
-          completeUpload: async (name, sizeBytes, sha256, storageKey) => {
-            completeArgs.push({ name, sizeBytes, sha256, storageKey });
+          completeUpload: async (name, sha256) => {
+            completeArgs.push({ name, sha256 });
           },
         }),
       );
@@ -61,14 +61,7 @@ describe('createArtifactsApi.upload', () => {
       expect(result.size).toBeGreaterThan(0);
       expect(uploaded).toHaveLength(1);
       expect(uploaded[0].url).toBe('https://s3/put');
-      expect(completeArgs).toEqual([
-        {
-          name: 'bundle',
-          sizeBytes: result.size,
-          sha256: result.sha256,
-          storageKey: 'artifacts/r/bundle.tar.gz',
-        },
-      ]);
+      expect(completeArgs).toEqual([{ name: 'bundle', sha256: result.sha256 }]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -236,7 +236,7 @@ const NO_CONTRIBUTOR = '';
  * Build the trust resolution an internally-triggered run carries.
  *
  * ONE builder for every internal branch — minted, inherited-trusted,
- * inherited-known/unknown — so the audit fields cannot disagree by branch.
+ * inherited-unknown — so the audit fields cannot disagree by branch.
  */
 function makeInternalTrustResolution(
   tier: TrustTier,
@@ -351,17 +351,36 @@ interface EmitterInheritance {
 const NO_INHERITANCE: EmitterInheritance = { trustResolution: undefined, branch: '' };
 
 /**
+ * Read a persisted `trust_tier` back as the tier the emitting run carried.
+ *
+ * SQL NULL is a run that never had a tier (a feature-branch push, a run that
+ * predates trust resolution) and stays unresolved. A NON-null value the schema
+ * does not recognize is a tier the run DID carry, spelled in a vocabulary this
+ * orchestrator no longer reads — a row written before the tier set narrowed
+ * holds `known`, which meant "not trusted". Reading that as unresolved would be
+ * a fail-open: `isUntrustedTier(undefined)` passes the trust gate, so a
+ * subscriber of a once-untrusted run would inherit MORE privilege than the run
+ * had. So it reads as `unknown`, the strict tier.
+ */
+function inheritedTier(stored: unknown): TrustTier | undefined {
+  if (stored === null || stored === undefined) return undefined;
+  const parsed = TrustTierSchema.safeParse(stored);
+  return parsed.success ? parsed.data : TrustTierSchema.enum.unknown;
+}
+
+/**
  * Read a run's persisted trust tier and branch, and inherit both.
  *
  * EVERY failure is the strict direction — no db, a run row that no longer
- * exists, an absent or unrecognized tier, or a query that throws all resolve to
- * no tier (which `deriveCacheRefScope` maps to the isolated scope) and no
- * branch (which the context branch gate rejects). A lookup failure never fails
- * the dispatch: an internally triggered run that silently never fires is worse
- * than one that runs with the narrower privilege.
+ * exists, an absent tier, or a query that throws all resolve to no tier (which
+ * `deriveCacheRefScope` maps to the isolated scope) and no branch (which the
+ * context branch gate rejects); a tier the schema does not recognize resolves
+ * to `unknown` (`inheritedTier`). A lookup failure never fails the dispatch: an
+ * internally triggered run that silently never fires is worse than one that
+ * runs with the narrower privilege.
  *
- * The tier and the branch resolve independently: a run row with an unreadable
- * tier still yields its branch, because the two answer different questions.
+ * The tier and the branch resolve independently: a run row with no tier still
+ * yields its branch, because the two answer different questions.
  */
 async function inheritRunResolution(
   runId: string,
@@ -375,13 +394,13 @@ async function inheritRunResolution(
       .where('run_id', '=', runId)
       .executeTakeFirst();
     const branch = branchFromRef(runRow?.ref);
-    const tier = TrustTierSchema.safeParse(runRow?.trust_tier);
-    if (!tier.success) return { trustResolution: undefined, branch };
+    const tier = inheritedTier(runRow?.trust_tier);
+    if (tier === undefined) return { trustResolution: undefined, branch };
     return {
       trustResolution: makeInternalTrustResolution(
-        tier.data,
+        tier,
         runRow?.contributor_username ?? NO_CONTRIBUTOR,
-        `Inherited the '${tier.data}' tier of the emitting run ${runId}`,
+        `Inherited the '${tier}' tier of the emitting run ${runId}`,
       ),
       branch,
     };
@@ -439,10 +458,7 @@ async function inheritEmitterResolution(
  *
  * Only `trusted` is actually privileged: `isUntrustedTier` is `tier !==
  * 'trusted'` and `deriveCacheRefScope` gives the shared scope to `trusted`
- * alone, so `known` and `unknown` are both untrusted for every consumer that
- * branches on the tier. They are still ranked rather than collapsed, because
- * the tier travels onward as an audit fact and `known` is genuinely a narrower
- * claim than `unknown`.
+ * alone.
  *
  * A `Record<TrustTier, number>` and NOT an ordered array, because the mapped
  * type is what makes the exhaustiveness real: a tier added to `TrustTierSchema`
@@ -458,8 +474,7 @@ async function inheritEmitterResolution(
  */
 const TRUST_TIER_RANK: Record<TrustTier, number> = {
   [TrustTierSchema.enum.trusted]: 0,
-  [TrustTierSchema.enum.known]: 1,
-  [TrustTierSchema.enum.unknown]: 2,
+  [TrustTierSchema.enum.unknown]: 1,
 };
 
 /**
@@ -741,7 +756,7 @@ export async function dispatchInternalEventViaPipeline(
     securityDecision: { action: 'pass' },
     // Every dispatch through this adapter is orchestrator-triggered. The
     // context branch gate reads this to tell a genuinely branchless run (empty
-    // `event.targetBranch`) apart from a run whose branch simply does not
+    // `event.targetBranch`) apart from a run whose branch does not
     // match, so it can name the real cause instead of quoting an empty value.
     internallyTriggered: true,
     triggerEventOverride: triggerEvent,

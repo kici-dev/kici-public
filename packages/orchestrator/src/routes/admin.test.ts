@@ -128,7 +128,7 @@ describe('admin routes', () => {
       const res = await request(app, 'GET', '/secrets/scopes?orgId=org-1', { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.scopes).toEqual(['aws/prod', 'aws/staging']);
+      expect(body.scopes).toEqual(['pg:aws/prod', 'pg:aws/staging']);
     });
 
     it('list scopes requires secret.read permission', async () => {
@@ -548,21 +548,8 @@ describe('admin routes', () => {
   });
 
   // ── Cross-backend scope listing ───────────────────────────────
-  describe('GET /secrets/scopes ?allBackends', () => {
-    it('defaults to the bare pg-only listing (byte-identical to before)', async () => {
-      (deps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
-      const res = await request(app, 'GET', '/secrets/scopes?orgId=org-1', { token: validToken });
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ scopes: ['aws/prod'] });
-    });
-
-    it('qualifies every scope when allBackends=true', async () => {
-      const vaultStore = {
-        listScopes: vi.fn().mockResolvedValue(['aws/staging']),
-        listKeys: vi.fn(),
-        setSecret: vi.fn(),
-        deleteSecret: vi.fn(),
-      };
+  describe('GET /secrets/scopes', () => {
+    function multiBackendApp(vaultStore: Record<string, unknown>) {
       const multiDeps = createMockDeps({
         backendRegistry: {
           loadAllStores: vi.fn().mockResolvedValue(new Map([['vault', vaultStore]])),
@@ -570,30 +557,42 @@ describe('admin routes', () => {
       });
       (multiDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
       (multiDeps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
-      const multiApp = createAdminRoutes(multiDeps);
-      const res = await request(multiApp, 'GET', '/secrets/scopes?orgId=org-1&allBackends=true', {
+      return createAdminRoutes(multiDeps);
+    }
+
+    // fails-when: the pg-only default returns — the response would be the bare
+    //   ['aws/prod'] and carry no vault scope at all.
+    it('lists every registered backend, qualified, with no query parameter', async () => {
+      const multiApp = multiBackendApp({
+        listScopes: vi.fn().mockResolvedValue(['aws/staging']),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+      });
+      const res = await request(multiApp, 'GET', '/secrets/scopes?orgId=org-1', {
         token: validToken,
       });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ scopes: ['pg:aws/prod', 'vault:aws/staging'] });
     });
 
+    // breaks-if-wrong: an orchestrator with only the built-in store still
+    //   answers, in the same qualified form.
+    it('qualifies the pg store when it is the only backend', async () => {
+      (deps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
+      const res = await request(app, 'GET', '/secrets/scopes?orgId=org-1', { token: validToken });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ scopes: ['pg:aws/prod'] });
+    });
+
     it('skips an unreachable backend instead of failing the whole listing', async () => {
-      const vaultStore = {
+      const multiApp = multiBackendApp({
         listScopes: vi.fn().mockRejectedValue(new Error('vault unreachable')),
         listKeys: vi.fn(),
         setSecret: vi.fn(),
         deleteSecret: vi.fn(),
-      };
-      const multiDeps = createMockDeps({
-        backendRegistry: {
-          loadAllStores: vi.fn().mockResolvedValue(new Map([['vault', vaultStore]])),
-        } as any,
       });
-      (multiDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
-      (multiDeps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
-      const multiApp = createAdminRoutes(multiDeps);
-      const res = await request(multiApp, 'GET', '/secrets/scopes?orgId=org-1&allBackends=true', {
+      const res = await request(multiApp, 'GET', '/secrets/scopes?orgId=org-1', {
         token: validToken,
       });
       expect(res.status).toBe(200);
@@ -1196,7 +1195,7 @@ describe('trust-policy mount requires an audit sink', () => {
 
   it('mounts the route when an access log is wired', async () => {
     // Positive control: without this, the negative below would also pass if the
-    // route had simply been deleted or renamed.
+    // route had been deleted or renamed.
     const app = withDeps({ accessLog: { recordInTransaction: vi.fn() } as never });
     const res = await request(app, 'GET', '/trust-policy', { token: validToken });
     expect(res.status).not.toBe(404);

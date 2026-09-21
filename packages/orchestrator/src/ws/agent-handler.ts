@@ -2549,9 +2549,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               runId: ref.runId,
               jobId: msg.jobId,
               name: msg.name,
-              sizeBytes: msg.sizeBytes,
               sha256: msg.sha256,
-              storageKey: msg.storageKey,
             });
             sendCompleteAck(ArtifactCompleteAckOutcome.enum.committed);
           } catch (err) {

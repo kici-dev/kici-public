@@ -30,6 +30,7 @@
  * (`it.fails`). When the fix lands, flip `it.fails` -> `it`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { PROTOCOL_VERSION } from '@kici-dev/engine';
 import { createAgentWsHandler } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
@@ -54,7 +55,7 @@ function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
   return {
     type: 'auth.request' as const,
     token,
-    protocolVersion: 1,
+    protocolVersion: PROTOCOL_VERSION,
   };
 }
 

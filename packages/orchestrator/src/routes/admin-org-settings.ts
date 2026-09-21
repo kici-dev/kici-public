@@ -101,7 +101,6 @@ const updateSchema = z
     customerId: z.string().min(1),
     allowedRepos: validatedPatternList.nullable().optional(),
     deniedRepos: validatedPatternList.nullable().optional(),
-    elevatedRepos: validatedPatternList.nullable().optional(),
     allowHttpNpmRegistries: z.boolean().optional(),
     allowUntrustedDockerfileBuilds: z.boolean().optional(),
     // null clears the per-org override and falls back to the cluster-wide
@@ -150,7 +149,6 @@ interface ProjectedSettings {
   enabled: boolean;
   allowedRepos: RepoPatternEntry[] | null;
   deniedRepos: RepoPatternEntry[] | null;
-  elevatedRepos: RepoPatternEntry[] | null;
   allowHttpNpmRegistries: boolean;
   allowUntrustedDockerfileBuilds: boolean;
   /** Per-org user-cache byte quota; null = cluster-wide default. */
@@ -228,7 +226,6 @@ function projectRow(
       enabled,
       allowedRepos: null,
       deniedRepos: null,
-      elevatedRepos: null,
       allowHttpNpmRegistries: false,
       allowUntrustedDockerfileBuilds: false,
       userCacheQuotaBytes: null,
@@ -260,7 +257,6 @@ function projectRow(
     enabled,
     allowedRepos: row.global_workflow_allowed_repos,
     deniedRepos: row.global_workflow_denied_repos,
-    elevatedRepos: row.global_workflow_elevated_repos,
     allowHttpNpmRegistries: row.allow_http_npm_registries,
     allowUntrustedDockerfileBuilds: row.allow_untrusted_dockerfile_builds,
     userCacheQuotaBytes: bigintToNumber(row.user_cache_quota_bytes),
@@ -336,8 +332,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
 
       let allowedRepos: RepoPatternEntry[] | null = existing?.global_workflow_allowed_repos ?? null;
       let deniedRepos: RepoPatternEntry[] | null = existing?.global_workflow_denied_repos ?? null;
-      let elevatedRepos: RepoPatternEntry[] | null =
-        existing?.global_workflow_elevated_repos ?? null;
       let allowHttpNpmRegistries = existing?.allow_http_npm_registries ?? false;
       let allowUntrustedDockerfileBuilds = existing?.allow_untrusted_dockerfile_builds ?? false;
       // BIGINT columns: existing comes back as string | null from pg.
@@ -378,7 +372,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
 
       if (body.allowedRepos !== undefined) allowedRepos = body.allowedRepos;
       if (body.deniedRepos !== undefined) deniedRepos = body.deniedRepos;
-      if (body.elevatedRepos !== undefined) elevatedRepos = body.elevatedRepos;
       if (body.allowHttpNpmRegistries !== undefined)
         allowHttpNpmRegistries = body.allowHttpNpmRegistries;
       if (body.allowUntrustedDockerfileBuilds !== undefined)
@@ -422,7 +415,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
 
       const allowedJson = serializeJsonbList(allowedRepos);
       const deniedJson = serializeJsonbList(deniedRepos);
-      const elevatedJson = serializeJsonbList(elevatedRepos);
 
       await deps.db
         .insertInto('org_settings')
@@ -430,7 +422,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
           customer_id: body.customerId,
           global_workflow_allowed_repos: allowedJson,
           global_workflow_denied_repos: deniedJson,
-          global_workflow_elevated_repos: elevatedJson,
           allow_http_npm_registries: allowHttpNpmRegistries,
           allow_untrusted_dockerfile_builds: allowUntrustedDockerfileBuilds,
           user_cache_quota_bytes: userCacheQuotaBytes,
@@ -456,7 +447,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
           oc.column('customer_id').doUpdateSet({
             global_workflow_allowed_repos: allowedJson,
             global_workflow_denied_repos: deniedJson,
-            global_workflow_elevated_repos: elevatedJson,
             allow_http_npm_registries: allowHttpNpmRegistries,
             allow_untrusted_dockerfile_builds: allowUntrustedDockerfileBuilds,
             user_cache_quota_bytes: userCacheQuotaBytes,

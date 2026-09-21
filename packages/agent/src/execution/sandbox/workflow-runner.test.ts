@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { buildKiciApi, createStepSecrets } from '@kici-dev/sdk';
+import { buildKiciApi, createStepSecrets } from '@kici-dev/sdk/internal';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
 import { LogMasker } from './log-masker.js';
 import type {

@@ -165,4 +165,6 @@ kici verify-attestation ./dist/app.tgz --bundle ./app.tgz.kici.json \
 ```
 
 See [build provenance and attestations](../../user/provenance.md) for the full
-verify story and the three verification paths.
+verify story and the three verification paths. See
+[workload identity with OIDC](../../user/oidc.md) for the exchanges that trust
+this issuer.

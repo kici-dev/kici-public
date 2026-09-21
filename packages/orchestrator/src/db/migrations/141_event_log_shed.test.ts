@@ -6,6 +6,7 @@ import pg from 'pg';
 import { EventLogStatus } from '@kici-dev/engine';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m141 from './141_event_log_shed.js';
+import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
 
 /**
  * Real-Postgres test for migration 141.
@@ -109,10 +110,7 @@ describeDb('migration 141_event_log_shed', () => {
 
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      await adminPool.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await adminPool.end();

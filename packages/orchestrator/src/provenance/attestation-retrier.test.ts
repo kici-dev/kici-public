@@ -1,5 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Capture the module logger so the per-drain operator warning can be counted.
+// createLogger() is only used by attestation-retrier.ts for its module-level
+// logger, so a warn-spying stub is safe.
+const mockWarn = vi.hoisted(() => vi.fn());
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: () => ({ info: vi.fn(), warn: mockWarn, error: vi.fn(), debug: vi.fn() }),
+  };
+});
+
 import { AttestationRetrier } from './attestation-retrier.js';
+
+beforeEach(() => mockWarn.mockClear());
 
 function row(over: Record<string, unknown> = {}) {
   return {
@@ -203,5 +218,55 @@ describe('AttestationRetrier.runOnce', () => {
     const r = new AttestationRetrier(d as never);
     await r.runOnce();
     expect(d.repo.clearRejected).not.toHaveBeenCalled();
+  });
+});
+
+describe('AttestationRetrier operator hint', () => {
+  const HINT = 'set KICI_ORCHESTRATOR_PROVENANCE_ISSUER';
+  const threeRows = () => [row({ id: 'p1' }), row({ id: 'p2' }), row({ id: 'p3' })];
+
+  it('warns once per tick, not once per row, when every mint defers with the same hint', async () => {
+    // fails-when: the hint is logged inside fulfilOne (three warnings), or the
+    // hint is dropped on the floor (zero).
+    const d = deps({
+      repo: {
+        list: vi.fn(async () => threeRows()),
+        recordAttempt: vi.fn(async () => {}),
+        delete: vi.fn(async () => {}),
+        countAndOldest: vi.fn(async () => ({ count: 3, oldestCreatedAt: null })),
+        countRejected: vi.fn(async () => 0),
+        markRejected: vi.fn(async () => {}),
+        clearRejected: vi.fn(async () => 0),
+      },
+      requestMint: vi.fn(async () => ({ deferred: true, code: 'unavailable', operatorHint: HINT })),
+    });
+    const r = new AttestationRetrier(d as never);
+    await r.tick();
+
+    const hintWarnings = mockWarn.mock.calls.filter((c) => c[1]?.hint === HINT);
+    expect(hintWarnings).toHaveLength(1);
+    expect(hintWarnings[0][1]).toMatchObject({ pendingRows: 3, hint: HINT });
+    // Every row was still attempted and recorded.
+    expect(d.repo.recordAttempt).toHaveBeenCalledTimes(3);
+  });
+
+  it('warns again on the next drain, and not at all for a hint-less deferral', async () => {
+    // breaks-if-wrong: a transient defer (key still reconciling) must stay quiet,
+    // and the once-per-drain set must reset between drains rather than dedupe
+    // forever.
+    const d = deps({
+      requestMint: vi.fn(async () => ({ deferred: true, code: 'unavailable' })),
+    });
+    const r = new AttestationRetrier(d as never);
+    await r.runOnce();
+    expect(mockWarn.mock.calls.filter((c) => c[1]?.hint !== undefined)).toHaveLength(0);
+
+    const hinted = deps({
+      requestMint: vi.fn(async () => ({ deferred: true, code: 'unavailable', operatorHint: HINT })),
+    });
+    const r2 = new AttestationRetrier(hinted as never);
+    await r2.runOnce();
+    await r2.runOnce();
+    expect(mockWarn.mock.calls.filter((c) => c[1]?.hint === HINT)).toHaveLength(2);
   });
 });

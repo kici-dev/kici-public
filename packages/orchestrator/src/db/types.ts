@@ -6,6 +6,7 @@ import type {
   InitFailure,
   StepApprovalPayload,
 } from '@kici-dev/engine';
+import type { PrecursorResult } from '../cache/precursor-result.js';
 
 /**
  * Job kind stored in `execution_jobs.job_kind`. `Standard` runs steps on an
@@ -280,8 +281,6 @@ export interface DispatchQueueTable {
   provider_context: Generated<string>;
   /** Pre-packed `.kici/` source tarball URL (from cache). Nullable. */
   source_tar_url: string | null;
-  /** SHA-256 hash of the source tarball bytes for integrity verification. Nullable. */
-  source_tar_hash: string | null;
   source_tar_digest: string | null;
   /** Pre-built dependency tarball URL (from dep cache). Nullable. */
   deps_url: string | null;
@@ -749,6 +748,18 @@ export interface ExecutionRunTable {
    * breaker bounds recursion. Defaults to 0.
    */
   chain_depth: Generated<number>;
+  /**
+   * The coordinator whose dispatch pipeline still has jobs to register for
+   * this run — the durable form of the in-memory pending-jobs token
+   * (`ExecutionTracker.holdRunForPendingJobs`). The owner writes its instance
+   * id when it takes its first token and clears it when it drops its last;
+   * every finalization path defers while the column names a LIVE sibling
+   * (liveness from `cluster_instances`, the same read the dispatch queue's
+   * `owner_instance_id` predicates use). A dead holder's id reads as no
+   * window. NULL for every run with no window open and every row written
+   * before the column existed.
+   */
+  registration_window_instance_id: string | null;
 }
 
 /**
@@ -901,6 +912,16 @@ export interface ExecutionJobTable {
    * proxies have not all terminalized in time. NULL = no gate timeout.
    */
   timeout_ms: number | null;
+  /**
+   * The precursor payload a build / init / dynamic-eval job reported on its
+   * terminal `job.status` (shape: `PrecursorResult`), persisted so a
+   * coordinator other than the one whose agent ran the job can settle its
+   * pending tracker from the shared row. JSONB: the driver returns a parsed
+   * object on SELECT, while writers pass a `JSON.stringify` string. NULL for
+   * every ordinary job and for a precursor job that has not reached a
+   * terminal state.
+   */
+  precursor_result: ColumnType<PrecursorResult | null, string | null | undefined, string | null>;
 }
 
 /**
@@ -1949,12 +1970,6 @@ export interface OrgSettingsTable {
     OrgSettingsRepoPatternEntry[] | null | undefined | string,
     OrgSettingsRepoPatternEntry[] | null | string
   >;
-  /** Repos with elevated trust for global workflow execution (null = none) */
-  global_workflow_elevated_repos: ColumnType<
-    OrgSettingsRepoPatternEntry[] | null,
-    OrgSettingsRepoPatternEntry[] | null | undefined | string,
-    OrgSettingsRepoPatternEntry[] | null | string
-  >;
   /**
    * Repos explicitly denied as event sources for global workflows.
    * Deny takes precedence over the allow-list (null = no deny patterns).
@@ -2125,19 +2140,15 @@ export type OrgSettingsUpdate = Updateable<OrgSettingsTable>;
  * tunes org_settings, the Platform owns this. `source` records which of the two
  * wrote the row.
  *
- * The three policy columns are plain `string`, not the Zod enums that name the
- * known vocabulary — same reasoning as `held_runs.hold_type`: a value written by
- * a newer Platform must still be readable rather than failing the row.
+ * The policy column is plain `string`, not the Zod enum that names the known
+ * vocabulary — same reasoning as `held_runs.hold_type`: a value written by a
+ * newer Platform must still be readable rather than failing the row.
  */
 export interface OrgTrustPolicyTable {
   /** Customer/org identifier (primary key) */
   customer_id: string;
-  /** How to treat a pull request opened from a fork: hold | reject | allow */
+  /** How to treat a pull request opened from a fork: ignore | hold | allow */
   fork_policy: string;
-  /** How to treat a PR from a contributor with no resolved identity: hold | reject */
-  unknown_contributor_policy: string;
-  /** How to treat a PR that modifies workflow files: hold | reject | allow */
-  workflow_change_policy: string;
   /**
    * The coarse, hours-granularity view of the security-hold window.
    *
@@ -2252,7 +2263,6 @@ export interface ClusterSettingsTable {
   event_log_max_payload_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   lock_file_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   webhook_dedup_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
-  contributor_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   event_router_event_ttl_seconds: ColumnType<
     number | null,
     number | null | undefined,

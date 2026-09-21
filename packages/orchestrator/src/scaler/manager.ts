@@ -338,16 +338,6 @@ export interface ScalerStatus {
     /** Machine-pool reference, if any. */
     machinePool?: string;
     /**
-     * The union of every entry in {@link labelSetMandatoryLabels}. Surfaced in
-     * heartbeat-side scaler capacity summaries for a peer that predates the
-     * per-label-set gate.
-     *
-     * @deprecated Use {@link labelSetMandatoryLabels}. On a scaler whose label
-     * sets declare different platforms this union names a taint no single set
-     * can satisfy, which is what made a mixed-platform scaler unroutable.
-     */
-    mandatoryLabels: string[];
-    /**
      * Labels a job MUST declare in `runsOn` to be allowed on each label set,
      * index-aligned with `labelSets`. An empty entry means that set has no
      * gate.
@@ -1507,25 +1497,6 @@ export class ScalerManager {
   }
 
   /**
-   * The scaler-wide taint gate: {@link labelSetMandatoryLabels} unioned across
-   * every label set the backend declares.
-   *
-   * Its only remaining consumers are the deprecated scaler-wide fields — the
-   * `mandatoryLabels` entry on `ScalerStatus['backends']` and the peer
-   * scaler-capacity summary — which stay populated for a peer that predates the
-   * per-label-set gate. Do NOT gate routing or stamp an agent with this: on a
-   * scaler whose label sets declare different platforms the union names a taint
-   * no single set can satisfy.
-   */
-  private effectiveMandatoryLabels(
-    name: string,
-    backend: { type: string; labelSets: { labels: string[] }[] },
-  ): string[] {
-    const declared = backend.labelSets.flatMap((ls) => ls.labels);
-    return this.labelSetMandatoryLabels(name, backend, declared);
-  }
-
-  /**
    * Build enriched scaler entries with auto-labels injected into each label set.
    * This ensures label matching accounts for auto-injected labels (kici:role:*,
    * kici:os:*, kici:arch:*, kici:agent:*, kici:scaler:*) that agents receive
@@ -1582,7 +1553,6 @@ export class ScalerManager {
           labelSetMandatoryLabels: backend.labelSets.map((ls) =>
             this.labelSetMandatoryLabels(name, backend, ls.labels),
           ),
-          mandatoryLabels: this.effectiveMandatoryLabels(name, backend),
         };
       });
   }
@@ -3645,13 +3615,9 @@ export class ScalerManager {
         usage: { cpus: usage.cpus, memBytes: usage.memBytes },
         resourceCap: this.resourceCaps.get(name),
         machinePool: this.scalerMachinePools.get(name),
-        // A retiring scaler has no enriched entry, so both gate fields derive
-        // directly — `labelSets` above falls back to `backend.labelSets` in the
-        // same case, and all three must stay in step. The deprecated field is
-        // the union of the per-set gates, so its fallback derives the same way:
-        // reading the configured `mandatoryLabels` alone would drop the
-        // platform taints a retiring pool still carries.
-        mandatoryLabels: enriched?.mandatoryLabels ?? this.effectiveMandatoryLabels(name, backend),
+        // A retiring scaler has no enriched entry, so the gate derives directly
+        // — `labelSets` above falls back to `backend.labelSets` in the same
+        // case, and the two must stay in step.
         labelSetMandatoryLabels:
           enriched?.labelSetMandatoryLabels ??
           backend.labelSets.map((ls) => this.labelSetMandatoryLabels(name, backend, ls.labels)),
@@ -3688,9 +3654,6 @@ export class ScalerManager {
         maxAgents: b.maxAgents,
         activeCount: b.activeCount,
         spawnsOnLocalHost: b.spawnsOnLocalHost,
-        // The scaler-wide union stays populated for a peer that predates the
-        // per-label-set gate; a peer that understands the new field prefers it.
-        mandatoryLabels: b.mandatoryLabels,
         labelSetMandatoryLabels: b.labelSetMandatoryLabels,
       }));
   }
@@ -4166,8 +4129,8 @@ export class ScalerManager {
    *
    * The `globalUsage` counter is recomputed from `perScalerUsage` to
    * keep the cap math consistent. `eventBuffer` is NOT restored — events
-   * emitted by the previous coord before correlation are lost (see
-   * wishlist for the rationale).
+   * emitted by the previous coord before correlation are lost (they are
+   * observability, not correctness: nothing downstream waits on them).
    *
    * Both reads are scoped to this instance's own rows. An unscoped read
    * hydrates a peer's in-flight spawns and reservations as our own, so our

@@ -922,30 +922,9 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
     expect(cacheRefScope).toBe('shared');
   });
 
-  it.each([
-    ['known', 'known'],
-    ['unknown', 'unknown'],
-  ])(
-    'a batch mixing trusted with %s resolves the most restrictive tier',
-    async (otherTier, expected) => {
-      const { db } = makeFakeDb({
-        runRows: { 'run-a': emitterRun('trusted'), 'run-b': emitterRun(otherTier) },
-      });
-
-      const { trust, cacheRefScope } = await dispatchWith({
-        eventName: '__workflows_failed_batch',
-        db,
-        payload: { total: 2, runs: [{ runId: 'run-a' }, { runId: 'run-b' }] },
-      });
-
-      expect((trust as { tier: string }).tier).toBe(expected);
-      expect(cacheRefScope).toBe('isolated');
-    },
-  );
-
-  it('a batch mixing known with unknown resolves unknown', async () => {
+  it('a batch mixing trusted with unknown resolves the most restrictive tier', async () => {
     const { db } = makeFakeDb({
-      runRows: { 'run-a': emitterRun('known'), 'run-b': emitterRun('unknown') },
+      runRows: { 'run-a': emitterRun('trusted'), 'run-b': emitterRun('unknown') },
     });
 
     const { trust, cacheRefScope } = await dispatchWith({
@@ -1078,25 +1057,22 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
     expect(cacheRefScope).toBe('shared');
   });
 
-  it.each([['known'], ['unknown']])(
-    'inherits a %s emitter — a fork-PR subscriber cannot launder its way to shared',
-    async (tier) => {
-      const { db } = makeFakeDb({
-        rows: {
-          kici_events: { source_run_id: 'run-emitter' },
-          execution_runs: emitterRun(tier),
-        },
-      });
+  it('inherits an unknown emitter — a fork-PR subscriber cannot launder its way to shared', async () => {
+    const { db } = makeFakeDb({
+      rows: {
+        kici_events: { source_run_id: 'run-emitter' },
+        execution_runs: emitterRun('unknown'),
+      },
+    });
 
-      const { trust, cacheRefScope } = await dispatchWith({ eventName: 'my.custom.event', db });
+    const { trust, cacheRefScope } = await dispatchWith({ eventName: 'my.custom.event', db });
 
-      // The tier is carried, not blanked: `known` is STRICTER than `undefined`
-      // at the context trust gate (which passes an unresolved tier) and at the
-      // install-secrets registry gate.
-      expect((trust as { tier: string }).tier).toBe(tier);
-      expect(cacheRefScope).toBe('isolated');
-    },
-  );
+    // The tier is carried, not blanked: `unknown` is STRICTER than `undefined`
+    // at the context trust gate (which passes an unresolved tier) and at the
+    // install-secrets registry gate.
+    expect((trust as { tier: string }).tier).toBe('unknown');
+    expect(cacheRefScope).toBe('isolated');
+  });
 
   it('a feature-branch emitter (no persisted tier) leaves the subscriber isolated', async () => {
     const { db } = makeFakeDb({
@@ -1112,19 +1088,46 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
     expect(cacheRefScope).toBe('isolated');
   });
 
-  it('an unreadable tier is not a tier — it falls back to isolated', async () => {
-    // A value the schema does not recognize (a hand-edited row, a tier renamed
-    // by a future migration) must never be forwarded as if it were understood.
+  /**
+   * A stored tier the schema no longer admits is a tier the run DID carry, in a
+   * vocabulary this orchestrator stopped reading — a row written before the
+   * tier set narrowed holds `known`, which meant "not trusted". It inherits as
+   * `unknown`, never as unresolved: `isUntrustedTier(undefined)` is `false`, so
+   * an unresolved read would let a subscriber of a once-untrusted run PASS the
+   * trust gate its emitter was held at.
+   */
+  it.each([['known'], ['super-trusted']])(
+    // fails-when: a non-null stored tier that fails the schema reads as unresolved
+    'a stored %s tier the schema no longer admits inherits as unknown, not as unresolved',
+    async (stored) => {
+      const { db } = makeFakeDb({
+        rows: {
+          kici_events: { source_run_id: 'run-emitter' },
+          execution_runs: emitterRun(stored),
+        },
+      });
+
+      const { trust, cacheRefScope } = await dispatchWith({ eventName: 'my.custom.event', db });
+
+      expect((trust as { tier: string }).tier).toBe('unknown');
+      expect(cacheRefScope).toBe('isolated');
+    },
+  );
+
+  // fails-when: one `known` member reads as unresolved and the batch, instead of
+  // resolving `unknown`, is refused outright — or worse, narrowed to the rest
+  it('a batch carrying a stored known member resolves unknown', async () => {
     const { db } = makeFakeDb({
-      rows: {
-        kici_events: { source_run_id: 'run-emitter' },
-        execution_runs: emitterRun('super-trusted'),
-      },
+      runRows: { 'run-a': emitterRun('trusted'), 'run-b': emitterRun('known') },
     });
 
-    const { trust, cacheRefScope } = await dispatchWith({ eventName: 'my.custom.event', db });
+    const { trust, cacheRefScope } = await dispatchWith({
+      eventName: '__workflows_failed_batch',
+      db,
+      payload: { total: 2, runs: [{ runId: 'run-a' }, { runId: 'run-b' }] },
+    });
 
-    expect(trust).toBeUndefined();
+    expect((trust as { tier: string }).tier).toBe('unknown');
     expect(cacheRefScope).toBe('isolated');
   });
 

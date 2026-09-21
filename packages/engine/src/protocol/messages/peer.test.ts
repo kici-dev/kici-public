@@ -191,6 +191,19 @@ describe('peerHeartbeatSchema', () => {
     expect(peerHeartbeatSchema.parse(msg)).toEqual(msg);
   });
 
+  it('refuses an agent entry that omits mandatoryLabels', () => {
+    // fails-when: the field regains an `.optional().default([])` — the schema
+    // would then fill in "no gate" for a peer that never said so.
+    const { mandatoryLabels: _omitted, ...agentWithout } = valid.agents[0];
+    const msg = { ...valid, agents: [agentWithout] };
+    expect(peerHeartbeatSchema.safeParse(msg).success).toBe(false);
+  });
+
+  it('accepts an empty mandatoryLabels array as the static-agent "no gate"', () => {
+    // breaks-if-wrong: a static agent sends `[]` and must keep parsing.
+    expect(peerHeartbeatSchema.parse(valid).agents[0].mandatoryLabels).toEqual([]);
+  });
+
   it('accepts capabilities without logRoutingOverride', () => {
     const msg = { ...valid, capabilities: { s3LogAccess: false } };
     const parsed = peerHeartbeatSchema.parse(msg);
@@ -247,11 +260,13 @@ describe('peerHeartbeatSchema', () => {
           ],
           maxAgents: 10,
           activeCount: 3,
+          labelSetMandatoryLabels: [[], []],
         },
         {
           labelSets: [['linux', 'gpu']],
           maxAgents: 4,
           activeCount: 0,
+          labelSetMandatoryLabels: [['gpu']],
         },
       ],
     };
@@ -271,41 +286,8 @@ describe('peerHeartbeatSchema', () => {
     expect(parsed.scalerCapacity).toBeUndefined();
   });
 
-  it('accepts heartbeat with scalerCapacity carrying mandatoryLabels', () => {
-    const msg = {
-      ...valid,
-      scalerCapacity: [
-        {
-          name: 'gpu-pool',
-          type: 'container',
-          labelSets: [['linux', 'gpu']],
-          maxAgents: 5,
-          activeCount: 1,
-          mandatoryLabels: ['gpu'],
-        },
-      ],
-    };
-    const parsed = peerHeartbeatSchema.parse(msg);
-    expect(parsed.scalerCapacity![0].mandatoryLabels).toEqual(['gpu']);
-  });
-
-  it('defaults mandatoryLabels to [] when omitted on a scalerCapacity entry (legacy peer)', () => {
-    const msg = {
-      ...valid,
-      scalerCapacity: [
-        {
-          labelSets: [['linux', 'x64']],
-          maxAgents: 5,
-          activeCount: 1,
-          // mandatoryLabels intentionally omitted
-        },
-      ],
-    };
-    const parsed = peerHeartbeatSchema.parse(msg);
-    expect(parsed.scalerCapacity![0].mandatoryLabels).toEqual([]);
-  });
-
   it('accepts scalerCapacity carrying a per-label-set gate index-aligned with labelSets', () => {
+    // breaks-if-wrong: the current per-label-set shape still parses.
     const msg = {
       ...valid,
       scalerCapacity: [
@@ -318,35 +300,39 @@ describe('peerHeartbeatSchema', () => {
           ],
           maxAgents: 5,
           activeCount: 1,
-          mandatoryLabels: ['gpu', 'macos'],
           labelSetMandatoryLabels: [['gpu'], ['macos']],
         },
       ],
     };
     const parsed = peerHeartbeatSchema.parse(msg);
     expect(parsed.scalerCapacity![0].labelSetMandatoryLabels).toEqual([['gpu'], ['macos']]);
-    // The scaler-wide union stays populated alongside it for peers that
-    // predate the per-label-set field.
-    expect(parsed.scalerCapacity![0].mandatoryLabels).toEqual(['gpu', 'macos']);
   });
 
-  it('leaves labelSetMandatoryLabels undefined when omitted, never defaulting it to []', () => {
-    const msg = {
-      ...valid,
-      scalerCapacity: [
-        {
-          labelSets: [['linux', 'x64']],
-          maxAgents: 5,
-          activeCount: 1,
-          mandatoryLabels: ['gpu'],
-          // labelSetMandatoryLabels intentionally omitted (legacy peer)
-        },
-      ],
+  it('refuses a scalerCapacity entry carrying the removed scaler-wide mandatoryLabels', () => {
+    // fails-when: the removed union field is accepted again (strict entry).
+    const cap = {
+      labelSets: [['linux', 'gpu']],
+      maxAgents: 5,
+      activeCount: 1,
+      labelSetMandatoryLabels: [['gpu']],
     };
-    const parsed = peerHeartbeatSchema.parse(msg);
-    // `[]` would read as "every label set is ungated"; only `undefined` can
-    // mean "fall back to the scaler-wide gate".
-    expect(parsed.scalerCapacity![0].labelSetMandatoryLabels).toBeUndefined();
+    expect(
+      peerHeartbeatSchema.safeParse({
+        ...valid,
+        scalerCapacity: [{ ...cap, mandatoryLabels: ['x'] }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('requires labelSetMandatoryLabels on a scalerCapacity entry', () => {
+    // fails-when: an entry with no per-label-set gate parses — there is no
+    // scaler-wide union left to fall back to, so the gate must be explicit.
+    expect(
+      peerHeartbeatSchema.safeParse({
+        ...valid,
+        scalerCapacity: [{ labelSets: [['linux', 'x64']], maxAgents: 5, activeCount: 1 }],
+      }).success,
+    ).toBe(false);
   });
 });
 

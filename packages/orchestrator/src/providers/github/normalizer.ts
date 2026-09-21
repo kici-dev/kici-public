@@ -5,7 +5,7 @@
  * Handles header extraction, HMAC-SHA256 signature verification, and event normalization.
  */
 
-import type { WebhookNormalizer, SimulatedEvent, AccessCacheInvalidation } from '@kici-dev/engine';
+import type { WebhookNormalizer, SimulatedEvent } from '@kici-dev/engine';
 import { verifySignature as verifyHmacSignature } from '@kici-dev/engine/webhook/signature';
 import { githubFilterText } from './commit-message.js';
 
@@ -154,81 +154,6 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
     const installationId =
       installation && typeof installation.id === 'number' ? installation.id : null;
     return { installationId };
-  }
-
-  /**
-   * Map GitHub membership-related webhook events to permission-cache
-   * invalidations. See WebhookNormalizer.getAccessCacheInvalidations, which is
-   * deprecated and has no caller.
-   *
-   * Covered event types:
-   *
-   * - `member` (`added` / `removed` / `edited`): a collaborator's repo
-   *   permission changed -> `repo-user` invalidation for the exact
-   *   `{repo, user}` pair.
-   * - `organization` (`member_added` / `member_removed`): a user was added
-   *   to or removed from the org. The user's effective permission on every
-   *   repo under the org may have shifted -> `user-in-org`.
-   * - `membership` (`added` / `removed`, usually team scope): same reasoning
-   *   as `organization`. Slightly broader than strictly required, but the
-   *   cache refills cheaply and over-invalidation is safe.
-   * - `team` (`added_to_repository` / `removed_from_repository`): every
-   *   member of the team gained or lost repo access -> `repo`.
-   *
-   * Any other event type (including other `team` actions like `created` /
-   * `deleted` / `edited` which carry no repo context) returns `[]`.
-   *
-   * Payload fields are probed defensively; a missing field returns `[]`
-   * rather than throwing — this is best-effort and we do not want a
-   * malformed payload to crash webhook processing.
-   */
-  getAccessCacheInvalidations(
-    eventType: string,
-    _action: string | null,
-    payload: unknown,
-  ): AccessCacheInvalidation[] {
-    if (payload === null || typeof payload !== 'object') return [];
-    const p = payload as Record<string, unknown>;
-
-    switch (eventType) {
-      case 'member': {
-        const repo = p.repository as { full_name?: string } | undefined;
-        const member = p.member as { login?: string } | undefined;
-        const repoFullName = repo?.full_name;
-        const username = member?.login;
-        if (!repoFullName || !username) return [];
-        return [{ kind: 'repo-user', repoFullName, username }];
-      }
-
-      case 'organization': {
-        const org = p.organization as { login?: string } | undefined;
-        const membership = p.membership as { user?: { login?: string } } | undefined;
-        const orgLogin = org?.login;
-        const username = membership?.user?.login;
-        if (!orgLogin || !username) return [];
-        return [{ kind: 'user-in-org', orgLogin, username }];
-      }
-
-      case 'membership': {
-        const org = p.organization as { login?: string } | undefined;
-        const member = p.member as { login?: string } | undefined;
-        const orgLogin = org?.login;
-        const username = member?.login;
-        if (!orgLogin || !username) return [];
-        return [{ kind: 'user-in-org', orgLogin, username }];
-      }
-
-      case 'team': {
-        // Only repo-scoped actions carry a repository field.
-        const repo = p.repository as { full_name?: string } | undefined;
-        const repoFullName = repo?.full_name;
-        if (!repoFullName) return [];
-        return [{ kind: 'repo', repoFullName }];
-      }
-
-      default:
-        return [];
-    }
   }
 }
 

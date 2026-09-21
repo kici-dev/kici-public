@@ -7,8 +7,12 @@
  */
 import picomatch from 'picomatch';
 import { sql, type Kysely } from 'kysely';
-import { DEFAULT_CONCURRENCY_STRATEGY, DEFAULT_HOLD_EXPIRY_SECONDS } from '@kici-dev/engine';
-import type { ConcurrencyStrategy, Context as EngineContext } from '@kici-dev/engine';
+import {
+  DEFAULT_CONCURRENCY_STRATEGY,
+  DEFAULT_HOLD_EXPIRY_SECONDS,
+  MinimumTrustSchema,
+} from '@kici-dev/engine';
+import type { ConcurrencyStrategy, Context as EngineContext, MinimumTrust } from '@kici-dev/engine';
 import type { Database, Context, NewContext } from '../db/types.js';
 import { HeldRunStatus } from './held-runs.js';
 import { compareGlobSpecificity } from './glob-specificity.js';
@@ -47,6 +51,22 @@ function parseJsonArrayOrNull(value: unknown): string[] | null {
 }
 
 /**
+ * Read a persisted `minimum_trust` back as the requirement the trust gate
+ * compares against, or `undefined` when the context sets none.
+ *
+ * A stored value the schema does not recognize reads as no requirement. The one
+ * such value a row can hold is the retired `'known'` floor, which admitted
+ * every recognized contributor; reading it as `'trusted'` would hold runs the
+ * context was never configured to hold. The gate compares against `'trusted'`
+ * alone, so a floor it does not know is a floor it cannot enforce.
+ */
+function readMinimumTrust(stored: string | null): EngineContext['minimumTrust'] {
+  if (stored === null) return undefined;
+  const parsed = MinimumTrustSchema.safeParse(stored);
+  return parsed.success ? (parsed.data ?? undefined) : undefined;
+}
+
+/**
  * Map a DB context row (snake_case) to the engine Context type (camelCase).
  *
  * Kysely returns JSONB columns as strings; this function parses them into arrays.
@@ -73,7 +93,7 @@ export function toContext(row: Context): EngineContext {
     requiredReviewers: parseJsonArrayOrNull(row.required_reviewers),
     waitTimerSeconds: row.wait_timer_seconds,
     holdExpirySeconds: row.hold_expiry_seconds ?? DEFAULT_HOLD_EXPIRY_SECONDS,
-    minimumTrust: (row.minimum_trust as EngineContext['minimumTrust']) ?? undefined,
+    minimumTrust: readMinimumTrust(row.minimum_trust),
     allowLocalExecution: row.allow_local_execution,
     enabled: row.enabled,
     createdAt:
@@ -98,7 +118,7 @@ export interface ContextCreateInput {
   requiredReviewers?: string[] | null;
   waitTimerSeconds?: number | null;
   holdExpirySeconds?: number;
-  minimumTrust?: 'known' | 'trusted' | null;
+  minimumTrust?: MinimumTrust;
   allowLocalExecution?: boolean;
   enabled?: boolean;
   createdBy?: string | null;
@@ -128,7 +148,7 @@ export interface ContextUpdateInput {
   requiredReviewers?: string[] | null;
   waitTimerSeconds?: number | null;
   holdExpirySeconds?: number | null;
-  minimumTrust?: 'known' | 'trusted' | null;
+  minimumTrust?: MinimumTrust;
   allowLocalExecution?: boolean;
   enabled?: boolean;
 }

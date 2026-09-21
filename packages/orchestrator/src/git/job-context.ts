@@ -21,16 +21,20 @@ type DeclaredCredentials = Record<string, Record<string, string>>;
 /**
  * Read a persisted `trust_tier` back as a tier, or `undefined`.
  *
- * `undefined` is the lenient reading everywhere else in the orchestrator (see
- * `security/trust-tier.ts`), and it is what a non-pull-request run legitimately
- * carries. A value that is not a known tier is treated the same way rather than
- * being passed through: an unrecognized string would satisfy no `minimumTrust`
- * comparison and is more likely a schema drift than a real tier.
+ * SQL NULL is what a non-pull-request run legitimately carries, and `undefined`
+ * is the lenient reading everywhere else in the orchestrator (see
+ * `security/trust-tier.ts`). A NON-null value the schema does not recognize is
+ * a tier the run DID carry, in a vocabulary this orchestrator no longer reads —
+ * a row written before the tier set narrowed holds `known`, which meant "not
+ * trusted". Reading that as `undefined` would be a fail-open: the relay's
+ * `isUntrustedTier(undefined)` is `false`, so a once-untrusted run would be
+ * handed credentials it was denied when it ran. So it reads as `unknown`, the
+ * strict tier — the same mapping the internal-event pipeline applies.
  */
 function parseTrustTier(raw: string | null): TrustTier | undefined {
   if (raw === null) return undefined;
   const parsed = TrustTierSchema.safeParse(raw);
-  return parsed.success ? parsed.data : undefined;
+  return parsed.success ? parsed.data : TrustTierSchema.enum.unknown;
 }
 
 /** `dispatch_queue.id` is a uuid column, so anything else was never a row in it. */

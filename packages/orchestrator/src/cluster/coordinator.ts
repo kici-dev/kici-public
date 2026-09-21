@@ -82,7 +82,6 @@ export interface JobToRoute {
   ref: string;
   sha: string;
   sourceTarUrl?: string;
-  sourceTarHash?: string;
   sourceTarDigest?: string;
   depsUrl?: string;
   depsHash?: string;
@@ -351,7 +350,6 @@ export class RunCoordinator {
           : {},
         routingKey: runContext.routingKey,
         sourceTarUrl: job.sourceTarUrl,
-        sourceTarHash: job.sourceTarHash,
         sourceTarDigest: job.sourceTarDigest,
         depsUrl: job.depsUrl,
         depsHash: job.depsHash,
@@ -467,7 +465,6 @@ export class RunCoordinator {
       routingKey: msg.routingKey,
       requestId: msg.requestId,
       sourceTarUrl: msg.sourceTarUrl,
-      sourceTarHash: msg.sourceTarHash,
       sourceTarDigest: msg.sourceTarDigest,
       depsUrl: msg.depsUrl,
       depsHash: msg.depsHash,
@@ -1145,7 +1142,6 @@ export class RunCoordinator {
         ? { installationId: runContext.installationId }
         : {},
       sourceTarUrl: job.sourceTarUrl,
-      sourceTarHash: job.sourceTarHash,
       sourceTarDigest: job.sourceTarDigest,
       depsUrl: job.depsUrl,
       depsHash: job.depsHash,
@@ -1295,8 +1291,8 @@ export class RunCoordinator {
    * tracking entry once the shared row is terminal, otherwise re-arm the window
    * as a reap poll.
    *
-   * The entry cannot simply be dropped here: cancel propagation still needs it
-   * while the job runs. It also cannot simply be kept, because a peer
+   * The entry cannot be dropped here: cancel propagation still needs it
+   * while the job runs. It also cannot be kept, because a peer
    * COORDINATOR relays no terminal `job.progress` — the shared row IS its
    * report — so nothing else would ever release it and `reroutedJobs` would
    * grow for the lifetime of the process. A read fault re-arms (never releases),
@@ -1476,7 +1472,6 @@ export class RunCoordinator {
         : {},
       routingKey: runContext.routingKey,
       sourceTarUrl: job.sourceTarUrl,
-      sourceTarHash: job.sourceTarHash,
       sourceTarDigest: job.sourceTarDigest,
       depsUrl: job.depsUrl,
       depsHash: job.depsHash,

@@ -115,8 +115,7 @@ const { getDashboardWritePolicy, dashboardWritePolicyEvents } =
 const { AttestationRetrier } = await import('./provenance/attestation-retrier.js');
 const { PendingAttestationsRepo } = await import('./provenance/pending-attestations-repo.js');
 const { backfillRunToPlatform } = await import('./provenance/backfill-run.js');
-const { requestMint, MintUnavailableError, MintRelayError, MintRejectedError } =
-  await import('./ws/oidc-token-relay.js');
+const { createRetrierMintRequest } = await import('./provenance/retrier-mint.js');
 const { computeAttestationVerdict } = await import('./provenance/verify-at-ingest.js');
 const {
   setPendingAttestations,
@@ -1909,40 +1908,11 @@ export async function runServer(
             intervalMs: 60_000,
             isLeader: () => sub.raft.isLeader(),
             provenanceStorageKey,
-            requestMint: async (a) => {
-              // Test-only fault injection: the build-time test double supplies
-              // `remintReject` to force a TERMINAL rejection for a marker audience,
-              // so an E2E can exercise the markRejected → gauge-exclusion →
-              // `--include-rejected` re-arm cycle with a REAL deferred row. It
-              // returns before the real requestMint, so the signing choke point is
-              // preserved. The shipped orchestrator leaves it undefined.
-              if (faultInjection?.remintReject?.(a.audience)) {
-                return {
-                  rejected: true,
-                  reason: 'test-only mint-reject fault-injection (injected policy)',
-                };
-              }
-              try {
-                return await requestMint({
-                  platformClient,
-                  orchestratorId: a.orchestratorId,
-                  runId: a.runId,
-                  jobId: a.jobId,
-                  audience: a.audience,
-                  deferred: a.deferred,
-                });
-              } catch (err) {
-                // A transient mint failure DEFERS (retried later). A definitive
-                // Platform rejection (run/job absent) is terminal — surfaced so the
-                // retrier stamps rejected_at and stops re-attempting it.
-                if (err instanceof MintUnavailableError)
-                  return { deferred: true, code: 'unavailable' };
-                if (err instanceof MintRelayError) return { deferred: true, code: 'failed' };
-                if (err instanceof MintRejectedError)
-                  return { rejected: true, reason: err.message };
-                throw err;
-              }
-            },
+            requestMint: createRetrierMintRequest({
+              db: sub.db,
+              provenanceSigning: sub.provenanceSigning,
+              remintReject: faultInjection?.remintReject,
+            }),
             uploadBundle: async ({ bundle, storageKey }) => {
               if (!sub.cacheStorage) throw new Error('provenance storage unavailable');
               await sub.cacheStorage.put(storageKey, JSON.stringify(bundle));

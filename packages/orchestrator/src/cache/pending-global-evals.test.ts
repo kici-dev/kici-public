@@ -91,27 +91,47 @@ describe('PendingGlobalEvalTracker', () => {
  * No unit test can observe `createApp`'s `onJobStatus` callback without standing
  * up the whole agent WebSocket server, but the property that matters is textual
  * and exact: the round result must be **parsed** where it arrives, never cast.
- * Same idiom the agent uses for its own cross-file ordering guards.
+ * The arrival point is `settlePendingPrecursor` (`precursor-result.ts`), which
+ * `app.ts` hands every agent `job.status` frame to — so both files are read:
+ * the settle function for the parse, `app.ts` for the fact that it routes
+ * through it rather than reading the payload itself. Same idiom the agent uses
+ * for its own cross-file ordering guards.
  */
-describe('app.ts wires the round result through the parser', () => {
+describe('the agent job.status boundary wires the round result through the parser', () => {
+  const settleSource = readFileSync(
+    fileURLToPath(new URL('./precursor-result.ts', import.meta.url)),
+    'utf8',
+  );
   const appSource = readFileSync(fileURLToPath(new URL('../app.ts', import.meta.url)), 'utf8');
 
   it('reads globalEvalResult in exactly one place (positive control)', () => {
-    const reads = appSource.match(/globalEvalResult/g) ?? [];
+    const reads = settleSource.match(/globalEvalResult/g) ?? [];
     expect(reads).toHaveLength(1);
+    // fails-when: app.ts grows its own read of the payload beside the settle
+    // function — a second, uncovered boundary.
+    expect(appSource.match(/globalEvalResult/g) ?? []).toHaveLength(0);
   });
 
   it('parses that read instead of casting it', () => {
-    expect(appSource).toContain('parseGlobalEvalResult(msg.data.globalEvalResult)');
+    expect(settleSource).toContain('parseGlobalEvalResult(data.globalEvalResult)');
     // The cast this replaced would silently hand arbitrary agent JSON to a
     // consumer that dereferences it.
+    expect(settleSource).not.toContain('as GlobalEvalRoundResult');
     expect(appSource).not.toContain('as GlobalEvalRoundResult');
   });
 
   it('rejects the pending round when the parse fails', () => {
-    const branch = appSource.slice(
-      appSource.indexOf('parseGlobalEvalResult(msg.data.globalEvalResult)'),
+    const branch = settleSource.slice(
+      settleSource.indexOf('parseGlobalEvalResult(data.globalEvalResult)'),
     );
-    expect(branch.slice(0, 400)).toContain('deps.pendingGlobalEvals.reject(msg.jobId');
+    expect(branch.slice(0, 400)).toContain('pendingGlobalEvals.reject(jobId');
+  });
+
+  it('app.ts hands the agent frame to the shared settle function', () => {
+    // fails-when: app.ts settles a tracker inline again, so the local socket
+    // and the shared-database channel can drift on what "finished" means.
+    expect(appSource).toContain('settlePendingPrecursor(');
+    expect(appSource).not.toContain('deps.pendingGlobalEvals.resolve(');
+    expect(appSource).not.toContain('deps.pendingBuilds.resolve(');
   });
 });

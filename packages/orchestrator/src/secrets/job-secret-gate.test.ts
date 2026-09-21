@@ -136,7 +136,7 @@ describe('resolveJobQualifiedSecret', () => {
     expect(resolver.resolveNamedInternal).not.toHaveBeenCalled();
   });
 
-  it.each(['unknown', 'known'] as const)('refuses the %s contributor tier', async (tier) => {
+  it('refuses the unknown contributor tier', async () => {
     const resolver = resolverReturning('s3cret');
     const contextStore = storeReturning(contextRow());
     await expect(
@@ -147,7 +147,7 @@ describe('resolveJobQualifiedSecret', () => {
         context: 'prod',
         key: 'DEPLOY_TOKEN',
         dispatchCtx: dispatchCtx(),
-        trustTier: tier,
+        trustTier: 'unknown',
       }),
     ).rejects.toThrow(/contributor tier/);
     // Refused before the store is even consulted.

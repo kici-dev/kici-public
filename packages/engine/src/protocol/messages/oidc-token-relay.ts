@@ -1,10 +1,9 @@
 import { z } from 'zod';
-import { AttestationOrigin } from '../../provenance/attestation-origin.js';
 
 /**
- * agent.api method name for the provenance ID-token relay.
+ * agent.api method name for the provenance ID-token request.
  *
- * Single source of truth: both the orchestrator's relay-handler registration
+ * Single source of truth: both the orchestrator's mint-handler registration
  * and the SDK `ctx.kici.oidc.token()` wrapper import this constant, so the
  * wire method name lives in exactly one place.
  */
@@ -21,12 +20,6 @@ export const oidcTokenRequestParamsSchema = z.object({
   audience: z.string().min(1).max(255),
 });
 export type OidcTokenRequestParams = z.infer<typeof oidcTokenRequestParamsSchema>;
-
-// The 3-way mint error contract lives with the WS-RPC mint message
-// (`oidc-mint.ts`); re-export it so this file stays the single import surface
-// for the relay contract.
-export { OidcMintErrorCode } from './oidc-mint.js';
-export type { OidcMintErrorCode as OidcMintErrorCodeType } from './oidc-mint.js';
 
 /** A successfully minted ID token bound to a job. */
 export const oidcMintedTokenSchema = z.object({
@@ -51,10 +44,3 @@ export const oidcTokenResultSchema = z.union([
   }),
 ]);
 export type OidcTokenResult = z.infer<typeof oidcTokenResultSchema>;
-
-/** Extra fields a deferred *fulfilment* mint carries (orchestrator -> Platform). */
-export const deferredMintParamsSchema = z.object({
-  statementHash: z.string(),
-  origin: AttestationOrigin.extract(['deferred', 'offline-backfill']),
-});
-export type DeferredMintParams = z.infer<typeof deferredMintParamsSchema>;

@@ -32,14 +32,15 @@ interface SdkOutputSetters {
 /**
  * Resolve SDK output setter functions from the workflow's module instance.
  * This ensures the output maps are set on the same SDK module that the
- * workflow code uses for .result proxy resolution and ctx.outputsOf().
+ * workflow code uses for .result proxy resolution and ctx.outputsOf(). The
+ * setters live only on the `@kici-dev/sdk/internal` subpath.
  *
  * Falls back to the compiler's own SDK import if dynamic resolution fails.
  */
 async function resolveSdkSetters(kiciDir?: string): Promise<SdkOutputSetters> {
   if (kiciDir) {
     try {
-      const sdkPath = path.join(kiciDir, 'node_modules', '@kici-dev', 'sdk', 'dist', 'index.js');
+      const sdkPath = path.join(kiciDir, 'node_modules', '@kici-dev', 'sdk', 'dist', 'internal.js');
       const sdkUrl = pathToFileURL(sdkPath).href;
       const sdk = await import(sdkUrl);
       return {

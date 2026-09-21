@@ -3,7 +3,7 @@
  *
  * Responds to `dashboard.global-workflows.*` WS messages from Platform by
  * reading or upserting the `org_settings` row keyed by `customer_id`. The row
- * holds the three per-org repo-pattern lists (allow / deny / elevate); each
+ * holds the per-org repo-pattern lists (allow / deny); each
  * entry is a `{routingKey?, pattern}` object that may optionally pin to one
  * source. The master enable switch is fleet-wide
  * (`cluster_settings.global_workflows_enabled`) and read-only here — projected
@@ -277,20 +277,17 @@ export class DashboardGlobalWorkflowsHandler {
     // implicit coercion.
     const allowed = patch.allowedRepos === null ? null : JSON.stringify(patch.allowedRepos);
     const denied = patch.deniedRepos === null ? null : JSON.stringify(patch.deniedRepos);
-    const elevated = patch.elevatedRepos === null ? null : JSON.stringify(patch.elevatedRepos);
     await this.deps.db
       .insertInto('org_settings')
       .values({
         customer_id: this.deps.customerId,
         global_workflow_allowed_repos: allowed,
         global_workflow_denied_repos: denied,
-        global_workflow_elevated_repos: elevated,
       })
       .onConflict((oc) =>
         oc.column('customer_id').doUpdateSet({
           global_workflow_allowed_repos: allowed,
           global_workflow_denied_repos: denied,
-          global_workflow_elevated_repos: elevated,
           // Bump updated_at via a raw SQL expression; the generated type
           // for the column expects a Date, but the DB-side `now()` is the
           // operationally correct value.
@@ -322,7 +319,6 @@ export class DashboardGlobalWorkflowsHandler {
 interface NormalizedPatch {
   allowedRepos: RepoPatternEntry[] | null;
   deniedRepos: RepoPatternEntry[] | null;
-  elevatedRepos: RepoPatternEntry[] | null;
 }
 
 /**
@@ -338,7 +334,6 @@ function firstInvalidPattern(msg: GlobalWorkflowsUpdateRequest): string | null {
   const lists = [
     ['allowedRepos', msg.allowedRepos],
     ['deniedRepos', msg.deniedRepos],
-    ['elevatedRepos', msg.elevatedRepos],
   ] as const;
   for (const [name, entries] of lists) {
     if (!entries) continue;
@@ -362,12 +357,10 @@ export function buildPatch(
   const start: NormalizedPatch = {
     allowedRepos: existing?.global_workflow_allowed_repos ?? null,
     deniedRepos: existing?.global_workflow_denied_repos ?? null,
-    elevatedRepos: existing?.global_workflow_elevated_repos ?? null,
   };
 
   if (msg.allowedRepos !== undefined) start.allowedRepos = msg.allowedRepos;
   if (msg.deniedRepos !== undefined) start.deniedRepos = msg.deniedRepos;
-  if (msg.elevatedRepos !== undefined) start.elevatedRepos = msg.elevatedRepos;
 
   return start;
 }
@@ -375,8 +368,8 @@ export function buildPatch(
 /**
  * Project a row into the public settings shape. `enabled` is the effective
  * fleet-wide master switch, supplied by the caller (read-only here). When the
- * row does not yet exist, the three per-org lists project as null so callers
- * always get a renderable state.
+ * row does not yet exist, the per-org lists project as null so callers always
+ * get a renderable state.
  */
 export function rowToSettings(
   customerId: string,
@@ -389,7 +382,6 @@ export function rowToSettings(
       enabled,
       allowedRepos: null,
       deniedRepos: null,
-      elevatedRepos: null,
       createdAt: null,
       updatedAt: null,
     };
@@ -399,7 +391,6 @@ export function rowToSettings(
     enabled,
     allowedRepos: row.global_workflow_allowed_repos,
     deniedRepos: row.global_workflow_denied_repos,
-    elevatedRepos: row.global_workflow_elevated_repos,
     createdAt:
       row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
     updatedAt:

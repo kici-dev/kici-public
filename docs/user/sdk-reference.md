@@ -37,11 +37,8 @@ a `.result` proxy reads, build the step context your workflow body receives, eva
 rules, and expand its matrix. The agent drives all of it on your behalf.
 
 It is **not covered by semver** and may change shape in any release. Do not import it from
-a workflow. Everything a workflow author needs is on the root entry point above.
-
-Those same symbols are also still exported from the root barrel, marked `@deprecated`, so
-an older SDK in a repository keeps working. They are removed from the root at v1.0.0 — see
-[deprecations](deprecations.md).
+a workflow. Everything a workflow author needs is on the root entry point above, and none
+of the runtime contract is exported there.
 
 ## See also
 

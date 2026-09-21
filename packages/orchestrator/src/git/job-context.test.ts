@@ -36,7 +36,7 @@ function fakeDb(rows: {
 
 const RUN: RunRow = {
   customer_id: 'org-1',
-  repo_identifier: 'cmaster11/main',
+  repo_identifier: 'acme/main',
   ref: 'main',
   trigger_event: 'push',
   trust_tier: null,
@@ -59,7 +59,7 @@ describe('createJobCredentialContextReader', () => {
     );
     await expect(read('run-1', JOB_ID)).resolves.toEqual({
       orgId: 'org-1',
-      sourceRepo: 'cmaster11/main',
+      sourceRepo: 'acme/main',
       declaredCredentials: { forge: { kind: 'token' } },
       trustTier: 'trusted',
       branch: 'main',
@@ -165,15 +165,20 @@ describe('createJobCredentialContextReader', () => {
     await expect(read('run-1', JOB_ID)).resolves.toMatchObject({ trustTier: undefined });
   });
 
-  it('drops an unrecognized trust tier rather than passing it through', async () => {
-    const read = createJobCredentialContextReader(
-      fakeDb({
-        execution_runs: { ...RUN, trust_tier: 'wat' },
-        execution_jobs: { git_credentials: null },
-      }),
-    );
-    await expect(read('run-1', JOB_ID)).resolves.toMatchObject({ trustTier: undefined });
-  });
+  // fails-when: a non-null stored tier the schema no longer admits reads as
+  // `undefined`, which the relay's `isUntrustedTier` treats as "not untrusted"
+  it.each([['known'], ['wat']])(
+    'reads a stored %s tier the schema no longer admits as unknown, not as unresolved',
+    async (stored) => {
+      const read = createJobCredentialContextReader(
+        fakeDb({
+          execution_runs: { ...RUN, trust_tier: stored },
+          execution_jobs: { git_credentials: null },
+        }),
+      );
+      await expect(read('run-1', JOB_ID)).resolves.toMatchObject({ trustTier: 'unknown' });
+    },
+  );
 
   it('reads an unrecorded trigger event as empty, which fails a trigger filter closed', async () => {
     const read = createJobCredentialContextReader(

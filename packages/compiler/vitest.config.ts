@@ -10,6 +10,14 @@ export default defineConfig({
     // The default 5s timeout surfaces spurious "test took too long" failures
     // even though the same tests pass in <2s in isolation.
     testTimeout: 15_000,
+    // Type-level tests (`*.test-d.ts`) run through Vitest's typecheck runner so
+    // a lock-file union regaining a removed member fails the suite. Only
+    // `*.test-d.ts` files go through the (slower) tsc-backed runner; regular
+    // runtime tests are unaffected.
+    typecheck: {
+      enabled: true,
+      include: ['src/**/*.test-d.ts'],
+    },
   },
   resolve: {
     alias: [

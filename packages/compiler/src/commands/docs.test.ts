@@ -17,10 +17,14 @@ const { openMock, loggerMock } = vi.hoisted(() => {
 
 vi.mock('open', () => ({ default: openMock }));
 
-vi.mock('@kici-dev/core', () => ({
-  logger: loggerMock,
-  toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
-}));
+vi.mock('@kici-dev/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/core')>();
+  return {
+    ...actual,
+    logger: loggerMock,
+    toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+  };
+});
 
 import { docsCommand, docsLlmCommand } from './docs.js';
 
@@ -34,14 +38,14 @@ describe('docs command', () => {
   it('opens the docs URL via `open` by default', async () => {
     const ok = await docsCommand({ open: true });
     expect(ok).toBe(true);
-    expect(openMock).toHaveBeenCalledWith('https://kici.dev/docs/');
+    expect(openMock).toHaveBeenCalledWith('https://docs.kici.dev/');
   });
 
   it('prints the URL when --no-open is passed', async () => {
     const ok = await docsCommand({ open: false });
     expect(ok).toBe(true);
     expect(openMock).not.toHaveBeenCalled();
-    expect(loggerMock.info).toHaveBeenCalledWith('https://kici.dev/docs/');
+    expect(loggerMock.info).toHaveBeenCalledWith('https://docs.kici.dev/');
   });
 });
 

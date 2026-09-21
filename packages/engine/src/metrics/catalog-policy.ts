@@ -213,10 +213,10 @@ export const METRIC_LABEL_POLICY: Partial<
     scope: { maxUniqueValues: 100 },
   },
   kici_orch_container_registry_auth_contributor_stripped_total: {
-    trust_tier: { values: ['unknown', 'known'] },
+    trust_tier: { values: ['unknown'] },
   },
   kici_orch_install_secrets_contributor_stripped_total: {
-    trust_tier: { values: ['unknown', 'known'] },
+    trust_tier: { values: ['unknown'] },
   },
   kici_orch_install_secrets_token_resolution_duration_seconds: {
     // Per-org environment count typically <10; cap allows pathological churn without exhausting cardinality.

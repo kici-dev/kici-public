@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -105,10 +105,6 @@
       "import": "./dist/protocol/messages/dashboard-sealed-write.js",
       "types": "./dist/protocol/messages/dashboard-sealed-write.d.ts"
     },
-    "./protocol/messages/oidc-mint": {
-      "import": "./dist/protocol/messages/oidc-mint.js",
-      "types": "./dist/protocol/messages/oidc-mint.d.ts"
-    },
     "./protocol/messages/git-credential-relay": {
       "import": "./dist/protocol/messages/git-credential-relay.js",
       "types": "./dist/protocol/messages/git-credential-relay.d.ts"
@@ -147,21 +143,21 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsgo --emitDeclarationOnly",
-    "typecheck": "tsgo --noEmit",
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/engine --name @kici-dev/engine"
   },
   "dependencies": {
-    "jose": "^6.2.10",
+    "jose": "^6.2.12",
     "jsonpath-plus": "^10.4.0",
     "picomatch": "^4.0.7",
     "safe-regex": "^2.1.1",
-    "yaml": "^2.9.0",
-    "zod": "^4.4.3"
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^24.12.0",
+    "@types/node": "^24.13.4",
     "@types/safe-regex": "^1.1.6"
   }
 }

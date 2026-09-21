@@ -28,18 +28,18 @@ export interface ResolvedJobContexts {
 
 /**
  * Resolve the ordered bound-context names from a lock job. Static elements
- * use their value verbatim; any dynamic element (inline or impure) is resolved
- * by the agent's init job and flags `needsInit`.
+ * use their value verbatim; a dynamic element is resolved by the agent's init
+ * job and flags `needsInit`.
  */
 export function resolveJobContextNames(lockJob: LockJob): ResolvedJobContexts {
   const names: string[] = [];
   let needsInit = false;
   for (const e of lockJob.contexts ?? []) {
     if (!e.dynamic) {
-      if (typeof e.value === 'string') names.push(e.value);
+      names.push(e.value);
       continue;
     }
-    // Any dynamic element (inline or impure) is resolved by the agent init job.
+    // A dynamic element is resolved by the agent init job.
     needsInit = true;
   }
   return { names, needsInit };
@@ -55,9 +55,7 @@ export function resolveJobContextNames(lockJob: LockJob): ResolvedJobContexts {
  * resolves the name. Returns an empty array when the job binds no context.
  */
 export function buildJobContextDisplayNames(lockJob: LockJob): string[] {
-  return (lockJob.contexts ?? []).map((e) =>
-    !e.dynamic && typeof e.value === 'string' ? e.value : DYNAMIC_ENV_PLACEHOLDER,
-  );
+  return (lockJob.contexts ?? []).map((e) => (e.dynamic ? DYNAMIC_ENV_PLACEHOLDER : e.value));
 }
 
 /** Merged secrets/variables across an ordered list of resolved contexts. */

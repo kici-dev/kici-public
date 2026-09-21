@@ -153,23 +153,27 @@ its signing-keys store, so fresh rotations and revocations are reflected
 immediately. Bundles signed by the hosted platform before the orchestrator owned
 signing are verified against the platform's provenance issuer instead. When no
 provenance trust root is configured, every verdict is recorded as `unverifiable`
-rather than silently `verified`. The orchestrator
-never mints tokens or holds signing material — it only consumes the public
-issuer + key set to check bundles.
+rather than silently `verified`. Verification consumes only the public issuer +
+key set; the private signing key never takes part in checking a bundle.
 
 ## Deferred attestations (attest-later)
 
-Minting the identity token is the one part of attestation that needs the hosted
-Platform. When the Platform is briefly unreachable during a build's mint, the
-attestation is **deferred** rather than lost, and the job stays green.
+Minting the identity token needs the orchestrator's signing key. That key can be
+unresolvable at the moment of a build's mint: it is still being reconciled after
+a cold start or a leader election, or the mint fails transiently. In that case
+the attestation is **deferred** rather than lost, and the job stays green.
+
+An orchestrator with no provenance issuer configured
+(`KICI_ORCHESTRATOR_PROVENANCE_ISSUER` unset) has no signing key at all, so it
+cannot complete a deferred attestation. The rows stay queued, and the retrier
+logs one warning per drain naming the variable to set.
 
 The lifecycle:
 
 1. **Freeze at build time.** The agent builds the statement from the **build
    context the orchestrator sent with the job** — the same run-row facts a live
-   mint reads — and DSSE-signs it with its ephemeral key immediately. No
-   Platform is needed. The attested facts are sealed live; only the identity
-   token is deferred.
+   mint reads — and DSSE-signs it with its ephemeral key immediately. The
+   attested facts are sealed live; only the identity token is deferred.
 
    Sending that context is what makes the statement checkable. Built from the
    agent's own view instead, it would disagree with the claims by construction.
@@ -189,15 +193,16 @@ The lifecycle:
    request) still fails the step — only transient failures defer.
 3. **Fulfil later.** A Raft-leader-only retrier mints each pending attestation
    exactly once — on a periodic sweep and immediately when the orchestrator's
-   Platform connection re-authenticates. It requests the identity token bound to
-   the frozen `statement_hash`, attaches it to the already-frozen envelope,
-   uploads the bundle, records the attestation with a verify-at-ingest verdict,
-   and drains the outbox row. Operators can trigger a drain on demand with
-   `kici-admin attestations retry`.
+   Platform connection re-authenticates. It mints the identity token with the
+   orchestrator's own key, bound to the frozen `statement_hash`, attaches it to
+   the already-frozen envelope, uploads the bundle, records the attestation with
+   a verify-at-ingest verdict, and drains the outbox row. Operators can trigger a
+   drain on demand with `kici-admin attestations retry`.
 4. **Run-sync backfill.** A run ingested while the Platform was fully down has no
-   Platform run/job records for the mint to read, so the retrier first replays
-   the run and job status the Platform missed (the same org-asserted data the
-   live path sends), then mints.
+   Platform run/job records, so the retrier first replays the run and job status
+   the Platform mirror missed (the same org-asserted data the live path sends),
+   then mints. The mint reads the orchestrator's own rows, so the replay serves
+   the dashboard, not the mint.
 
 ### Truth contract
 
@@ -227,7 +232,7 @@ Deferral preserves the attestation's truth:
   that field is unsigned and producer-written, so a verifier ignores it. A token
   carrying no marker is treated as `live`, which is the stricter reading.
 - **Temporal honesty.** The predicate keeps the true build timestamps; the token
-  is minted later against a knowingly-completed job (the Platform relaxes its
+  is minted later against a knowingly-completed job (the mint relaxes its
   live-job check only for an explicitly-flagged deferred mint). The bundle
   carries a mint-timing marker — `deferred`, or `offline-backfill` for a
   fully-offline-ingested run — so the gap is disclosed, never hidden.

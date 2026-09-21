@@ -15,8 +15,8 @@ vi.mock('./platform-attach.js', () => ({
 }));
 
 const ATTACHMENT = {
-  platformWsUrl: 'wss://thinker1.dev.kici.dev/kici-stg/ws',
-  platformApiBase: 'https://thinker1.dev.kici.dev/kici-stg',
+  platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
+  platformApiBase: 'https://platform.example.com/kici-stg',
   orgId: 'kiciStg00001',
   keyId: 'key-1',
 };

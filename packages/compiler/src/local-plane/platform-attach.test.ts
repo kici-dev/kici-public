@@ -11,13 +11,13 @@ describe('derivePlatformWsUrl', () => {
     expect(derivePlatformWsUrl('https://api.kici.dev')).toBe('wss://api.kici.dev/ws');
   });
   it('derives wss + /ws from an https staging sub-path base', () => {
-    expect(derivePlatformWsUrl('https://thinker1.dev.kici.dev/kici-stg')).toBe(
-      'wss://thinker1.dev.kici.dev/kici-stg/ws',
+    expect(derivePlatformWsUrl('https://platform.example.com/kici-stg')).toBe(
+      'wss://platform.example.com/kici-stg/ws',
     );
   });
   it('is idempotent when the base already ends in /ws', () => {
-    expect(derivePlatformWsUrl('https://thinker1.dev.kici.dev/kici-stg/ws')).toBe(
-      'wss://thinker1.dev.kici.dev/kici-stg/ws',
+    expect(derivePlatformWsUrl('https://platform.example.com/kici-stg/ws')).toBe(
+      'wss://platform.example.com/kici-stg/ws',
     );
   });
   it('maps http → ws', () => {
@@ -45,14 +45,14 @@ describe('mintOrchestratorKey', () => {
       json: async () => ({ key: 'kici_ok_secret', id: 'key-123', keyPrefix: 'kici_ok_' }),
     });
     const res = await mintOrchestratorKey({
-      apiBase: 'https://thinker1.dev.kici.dev/kici-stg',
+      apiBase: 'https://platform.example.com/kici-stg',
       pat: 'kici_pat_abc',
       orgId: 'kiciStg00001',
     });
     expect(res).toEqual({ key: 'kici_ok_secret', keyId: 'key-123', keyPrefix: 'kici_ok_' });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe(
-      'https://thinker1.dev.kici.dev/kici-stg/api/v1/orgs/kiciStg00001/orchestrator-keys',
+      'https://platform.example.com/kici-stg/api/v1/orgs/kiciStg00001/orchestrator-keys',
     );
     expect(init.method).toBe('POST');
     expect(init.headers.Authorization).toBe('Bearer kici_pat_abc');

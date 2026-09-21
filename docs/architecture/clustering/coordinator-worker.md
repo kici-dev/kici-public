@@ -155,9 +155,9 @@ Defined in `packages/engine/src/protocol/version.ts` as `PROTOCOL_VERSION` and `
 - **Coordinator-worker:** Peer handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 - **Agent-orchestrator:** Agent handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 
-Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` is currently `2` and `MIN_PROTOCOL_VERSION` is `1`, so every peer still connects.
+Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION` are both `3`: a peer on protocol 2 (an orchestrator, agent or peer from the 0.8.x line — 0.8.0 already sent `2`) or older is refused at connect with `WS_CLOSE_PROTOCOL_ERROR` and the reason `Unsupported protocol version`. Version 3 exists because a version-2 peer cannot parse the 0.9.0 `trust_policy.update` policy, peer heartbeat and `artifacts.upload.complete` frames.
 
-Raising `PROTOCOL_VERSION` on its own is additive. A sender that needs to know whether a peer can parse a new value gates on the version that peer negotiated, against a named floor, and down-converts for anything older. `FORK_POLICY_IGNORE_MIN_PROTOCOL_VERSION` is the first such floor: it names the version whose `trust_policy.update` reader accepts `forkPolicy: 'ignore'`. Raising `MIN_PROTOCOL_VERSION` is the breaking half, and it is what forces every node to be upgraded.
+The minimum accepted version is pinned to the current version, so raising `PROTOCOL_VERSION` raises the floor: every node must be upgraded in the same window, and no down-convert path for an older peer exists.
 
 ### Capability flags (per-feature negotiation)
 

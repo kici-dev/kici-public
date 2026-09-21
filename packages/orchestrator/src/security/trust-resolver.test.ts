@@ -21,10 +21,4 @@ describe('resolveRefTrust', () => {
       resolveRefTrust({ isForkPR: false, contributorUsername: 'bob' }).contributorUsername,
     ).toBe('bob');
   });
-
-  it('never produces the legacy known tier', () => {
-    for (const isForkPR of [true, false]) {
-      expect(resolveRefTrust({ isForkPR, contributorUsername: 'carol' }).tier).not.toBe('known');
-    }
-  });
 });

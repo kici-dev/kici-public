@@ -76,25 +76,6 @@ const baseSchema = z.object({
    * `command` (generic external signer). Only consulted when signing is on.
    */
   provenanceSignerKind: z.string().optional(),
-  /**
-   * Restore the pre-split pull-request OIDC `sub` (`KICI_OIDC_LEGACY_PR_SUB`).
-   *
-   * A pull-request run's `ref` is its BASE branch, so the branch-shaped subject
-   * `repo:<repo>:ref:<ref>:workflow:<name>` was byte-identical for a fork PR
-   * against `main` and a trusted push to `main`. Pull-request-family runs now
-   * mint `repo:<repo>:pull_request` instead — GitHub Actions' own shape, which
-   * carries no ref segment for exactly this reason.
-   *
-   * Set this only to keep an existing cloud trust policy working while it is
-   * migrated. It restores the collision, so a fork contributor can again mint
-   * the subject a push-targeting policy pins.
-   *
-   * @deprecated Removed at v1.0.0. See `docs/user/deprecations.md`.
-   */
-  oidcLegacyPrSub: z
-    .union([z.boolean(), z.string()])
-    .default(false)
-    .transform((v) => (typeof v === 'boolean' ? v : v === 'true')),
   /** AWS KMS key ARN for `aws-kms` custody (`KICI_ORCHESTRATOR_KMS_KEY_ARN`). */
   provenanceKmsKeyArn: z.string().optional(),
   /** AWS region for `aws-kms` custody (`KICI_ORCHESTRATOR_KMS_REGION`). */
@@ -661,15 +642,6 @@ const baseSchema = z.object({
     .int()
     .min(1000)
     .default(24 * 60 * 60 * 1000),
-  // Contributor-cache entry TTL (ms).
-  // @deprecated Nothing reads this value: trust is resolved from the ref a pull
-  // request pushes to, so no contributor-permission lookup is made and there is
-  // no cache to size. Accepted for compatibility; removed at v1.0.0.
-  contributorCacheTtlMs: z.coerce
-    .number()
-    .int()
-    .min(1000)
-    .default(15 * 60 * 1000),
   // How long ClusterSettingsReader caches the single cluster_settings row (ms).
   // Bootstrap/perf detail about reaching the config store — env-only by design,
   // deliberately NOT itself a cluster_settings knob.
@@ -971,7 +943,6 @@ export const envDef = defineEnv({
     provenanceIssuer: 'KICI_PROVENANCE_ISSUER',
     provenanceSigningIssuer: 'KICI_ORCHESTRATOR_PROVENANCE_ISSUER',
     provenanceSignerKind: 'KICI_ORCHESTRATOR_SIGNER_KIND',
-    oidcLegacyPrSub: 'KICI_OIDC_LEGACY_PR_SUB',
     provenanceKmsKeyArn: 'KICI_ORCHESTRATOR_KMS_KEY_ARN',
     provenanceKmsRegion: 'KICI_ORCHESTRATOR_KMS_REGION',
     provenanceKmsAccessKeyId: 'KICI_ORCHESTRATOR_KMS_ACCESS_KEY_ID',
@@ -1103,7 +1074,6 @@ export const envDef = defineEnv({
     maxGithubPayloadBytes: 'KICI_MAX_GITHUB_PAYLOAD_BYTES',
     lockFileMaxBytes: 'KICI_LOCK_FILE_MAX_BYTES',
     webhookDedupTtlMs: 'KICI_WEBHOOK_DEDUP_TTL_MS',
-    contributorCacheTtlMs: 'KICI_CONTRIBUTOR_CACHE_TTL_MS',
     clusterSettingsCacheTtlMs: 'KICI_CLUSTER_SETTINGS_CACHE_TTL_MS',
     logLevel: 'KICI_LOG_LEVEL',
     nodeEnv: 'NODE_ENV',

@@ -31,7 +31,6 @@ describe('lock-file source selection — A7 untrusted contributor cannot inject 
     // direct write access to the repo; HEAD is correct.
     expect(selectLockFileSource(false, undefined)).toBe('head');
     expect(selectLockFileSource(false, 'unknown')).toBe('head');
-    expect(selectLockFileSource(false, 'known')).toBe('head');
     expect(selectLockFileSource(false, 'trusted')).toBe('head');
   });
 
@@ -48,12 +47,6 @@ describe('lock-file source selection — A7 untrusted contributor cannot inject 
     expect(selectLockFileSource(true, 'unknown')).toBe('base');
   });
 
-  it('returns "base" for a PR event carrying the legacy "known" tier', () => {
-    // `known` is legacy vocabulary that nothing produces any more. A row
-    // stored before the ref-based model must still read as untrusted.
-    expect(selectLockFileSource(true, 'known')).toBe('base');
-  });
-
   it('returns "head" only for a PR event on a trusted ref', () => {
     // `trusted` means the head ref lives in the base repo, which an A7
     // fork-PR sender cannot arrange. Only this tier earns HEAD-branch
@@ -65,11 +58,10 @@ describe('lock-file source selection — A7 untrusted contributor cannot inject 
     // Documentation-as-code: enumerating every TrustTier value here
     // makes the compiler complain if a new tier is added without
     // explicitly considering its lock-file-source policy.
-    const tiers: (TrustTier | undefined)[] = ['unknown', 'known', 'trusted', undefined];
+    const tiers: (TrustTier | undefined)[] = ['unknown', 'trusted', undefined];
     const results = tiers.map((t) => [t, selectLockFileSource(true, t)] as const);
     expect(results).toEqual([
       ['unknown', 'base'],
-      ['known', 'base'],
       ['trusted', 'head'],
       [undefined, 'base'],
     ]);

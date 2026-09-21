@@ -9,28 +9,6 @@
 import type { SimulatedEvent } from '../trigger/types.js';
 import type { ProviderType } from './types.js';
 
-/**
- * Discriminated union describing which cached provider-permission entries a
- * webhook event invalidates. Returned by
- * `WebhookNormalizer.getAccessCacheInvalidations`.
- *
- * @deprecated Trust is derived from the git ref, so the orchestrator holds no
- * contributor-permission cache and nothing consumes these entries. Removed at
- * v1.0.0.
- *
- * Three scopes:
- * - `repo-user`: a single `{repo, user}` permission changed (e.g. GitHub
- *   `member` event on a specific collaborator).
- * - `repo`: every contributor's effective permission on a repo may have
- *   shifted (e.g. a team was added/removed from the repo).
- * - `user-in-org`: a user's org membership changed, so any repo under that
- *   org may now return a different permission for them.
- */
-export type AccessCacheInvalidation =
-  | { kind: 'repo-user'; repoFullName: string; username: string }
-  | { kind: 'repo'; repoFullName: string }
-  | { kind: 'user-in-org'; orgLogin: string; username: string };
-
 export interface WebhookNormalizer {
   readonly provider: ProviderType;
 
@@ -150,22 +128,4 @@ export interface WebhookNormalizer {
    * Returns null when the field is missing or cannot be resolved.
    */
   extractDefaultBranch?(payload: unknown): string | null;
-
-  /**
-   * Map a webhook event to the cached provider-permission entries it implies a
-   * shift in. Events that do not imply a permission shift (most events,
-   * including `push` / `pull_request` / etc.) return `[]`.
-   *
-   * @deprecated Trust is derived from the git ref, so the orchestrator holds no
-   * contributor-permission cache and never calls this. Removed at v1.0.0.
-   *
-   * @param eventType Provider-specific event type (from extractEventType).
-   * @param action Event action/sub-type, if applicable.
-   * @param payload Raw webhook payload.
-   */
-  getAccessCacheInvalidations?(
-    eventType: string,
-    action: string | null,
-    payload: unknown,
-  ): AccessCacheInvalidation[];
 }

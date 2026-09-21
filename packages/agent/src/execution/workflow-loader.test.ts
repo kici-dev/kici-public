@@ -19,12 +19,18 @@ import { hashKiciSourceTree } from '@kici-dev/core/kici-source-digest';
 
 let tempDir: string;
 
-beforeAll(async () => {
-  tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-wf-loader-'));
-
-  // The loadWorkflowSource function expects @kici-dev/sdk to be resolvable from the
-  // working directory's node_modules (production: cloned repo). In tests we write
-  // workflow files to a temp dir, so we symlink the real SDK package there.
+/**
+ * Link the real `@kici-dev/sdk` into `dir/node_modules` so a workflow written
+ * under `dir` resolves the SDK the way a cloned repository does: through its
+ * own `node_modules`, by the `createRequire` walk the loader performs.
+ *
+ * Every fixture tree that the loader must accept needs this. A bare temp tree
+ * with no `node_modules` still resolves the SDK on a workstation where pnpm
+ * exports its private hoist directory through `NODE_PATH`, and fails on any
+ * host where that directory does not carry the workspace `sdk` link — which is
+ * a property of the host's install, not of the loader under test.
+ */
+async function linkRealSdk(dir: string): Promise<void> {
   const realSdk = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     '../../node_modules/@kici-dev/sdk',
@@ -33,19 +39,28 @@ beforeAll(async () => {
   let sdkTarget = realSdk;
   const { existsSync } = await import('node:fs');
   if (!existsSync(sdkTarget)) {
-    let dir = path.dirname(fileURLToPath(import.meta.url));
-    while (dir !== path.dirname(dir)) {
-      const candidate = path.join(dir, 'node_modules', '@kici-dev', 'sdk');
+    let walk = path.dirname(fileURLToPath(import.meta.url));
+    while (walk !== path.dirname(walk)) {
+      const candidate = path.join(walk, 'node_modules', '@kici-dev', 'sdk');
       if (existsSync(candidate)) {
         sdkTarget = candidate;
         break;
       }
-      dir = path.dirname(dir);
+      walk = path.dirname(walk);
     }
   }
-  const scopeDir = path.join(tempDir, 'node_modules', '@kici-dev');
+  const scopeDir = path.join(dir, 'node_modules', '@kici-dev');
   await fs.mkdir(scopeDir, { recursive: true });
   await fs.symlink(sdkTarget, path.join(scopeDir, 'sdk'));
+}
+
+beforeAll(async () => {
+  tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-wf-loader-'));
+
+  // The loadWorkflowSource function expects @kici-dev/sdk to be resolvable from the
+  // working directory's node_modules (production: cloned repo). In tests we write
+  // workflow files to a temp dir, so we symlink the real SDK package there.
+  await linkRealSdk(tempDir);
 });
 
 afterAll(async () => {
@@ -584,14 +599,24 @@ describe('resolveWorkflowSdkSetters', () => {
         name: '@kici-dev/sdk',
         version: '0.0.0-stub',
         type: 'module',
-        exports: { '.': { import: './dist/index.js', default: './dist/index.js' } },
+        exports: {
+          '.': { import: './dist/index.js', default: './dist/index.js' },
+          './internal': { import: './dist/internal.js', default: './dist/internal.js' },
+        },
       }),
       'utf-8',
     );
+    // The root barrel carries no setters — only the internal subpath does, as
+    // in the published package — so a resolver that reached for the root would
+    // find nothing to call.
     await fs.writeFile(
       path.join(sdkDistDir, 'index.js'),
-      `export const __STUB__ = true;
-export function setStepOutputsMap(m) { globalThis.__stubStepMap = m; }
+      'export const __STUB__ = true;\n',
+      'utf-8',
+    );
+    await fs.writeFile(
+      path.join(sdkDistDir, 'internal.js'),
+      `export function setStepOutputsMap(m) { globalThis.__stubStepMap = m; }
 export function setStepRefMap(m) { globalThis.__stubRefMap = m; }
 export function setJobOutputsMap(m) { globalThis.__stubJobMap = m; }
 `,
@@ -624,13 +649,42 @@ export function setJobOutputsMap(m) { globalThis.__stubJobMap = m; }
     expect((globalThis as Record<string, unknown>).__stubJobMap).toBe(jobMap);
   });
 
-  it('falls back to the bundled setters when no SDK resolves from the file context', async () => {
-    const setters = await resolveWorkflowSdkSetters('/nonexistent/dir/wf.ts');
-    // Bundled fallback: callable and non-throwing (the agent's own SDK setters).
-    expect(typeof setters.setStepOutputsMap).toBe('function');
-    expect(typeof setters.setStepRefMap).toBe('function');
-    expect(typeof setters.setJobOutputsMap).toBe('function');
-    expect(() => setters.setStepOutputsMap(new Map())).not.toThrow();
+  // fails-when: the resolver falls back to the root barrel or to the agent's
+  // bundled setters instead of refusing an SDK that predates the subpath
+  it('refuses a tree whose SDK does not publish the internal subpath', async () => {
+    const oldDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-wf-old-sdk-'));
+    try {
+      const pkgDir = path.join(oldDir, 'node_modules', '@kici-dev', 'sdk');
+      await fs.mkdir(path.join(pkgDir, 'dist'), { recursive: true });
+      await fs.writeFile(
+        path.join(pkgDir, 'package.json'),
+        JSON.stringify({
+          name: '@kici-dev/sdk',
+          version: '0.6.0',
+          type: 'module',
+          exports: { '.': { import: './dist/index.js', default: './dist/index.js' } },
+        }),
+        'utf-8',
+      );
+      // A root barrel that still carries the setters, the way an SDK older than
+      // the subpath did — the resolver must not reach for them.
+      await fs.writeFile(
+        path.join(pkgDir, 'dist', 'index.js'),
+        `export function setStepOutputsMap() {}
+export function setStepRefMap() {}
+export function setJobOutputsMap() {}
+`,
+        'utf-8',
+      );
+      await fs.mkdir(path.join(oldDir, 'workflows'), { recursive: true });
+      await fs.writeFile(path.join(oldDir, 'workflows', 'wf.ts'), 'export default {};', 'utf-8');
+
+      await expect(
+        resolveWorkflowSdkSetters(path.join(oldDir, 'workflows', 'wf.ts')),
+      ).rejects.toThrow(/@kici-dev\/sdk@>=0\.8\.0/);
+    } finally {
+      await fs.rm(oldDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });
 
@@ -644,6 +698,7 @@ export default { name: 'tree-gate', helper };
 
   beforeEach(async () => {
     workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-tree-gate-'));
+    await linkRealSdk(workDir);
     await fs.mkdir(path.join(workDir, '.kici/workflows'), { recursive: true });
     await fs.mkdir(path.join(workDir, '.kici/lib'), { recursive: true });
     await fs.writeFile(path.join(workDir, '.kici/workflows/w.ts'), entry, 'utf-8');
@@ -698,6 +753,7 @@ describe('compile schema version gate', () => {
 
   beforeEach(async () => {
     workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-schema-gate-'));
+    await linkRealSdk(workDir);
     await fs.mkdir(path.join(workDir, '.kici/workflows'), { recursive: true });
     await fs.writeFile(
       path.join(workDir, '.kici/workflows/w.ts'),

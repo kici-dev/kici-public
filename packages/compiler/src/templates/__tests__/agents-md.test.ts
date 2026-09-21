@@ -16,6 +16,19 @@ describe('agents-md template', () => {
     expect(agentsMdTemplate).toContain('https://kici.dev/llms-full.txt');
   });
 
+  it('names only kici docs llm forms the CLI accepts', () => {
+    // fails-when: a flag form returns (`kici docs llm --index` shipped in the
+    // scaffold while no such flag existed) or a topic the bundle set lacks.
+    const forms = [...agentsMdTemplate.matchAll(/kici docs llm(?: ([a-z-]+))?/g)].map(
+      (m) => m[1] ?? '',
+    );
+    expect(forms.length).toBeGreaterThan(0);
+    for (const arg of forms) expect(['', 'full', 'sdk'], arg).toContain(arg);
+    // breaks-if-wrong: the index, the full bundle and a task bundle are each
+    // named once, so a reader learns all three entry points.
+    expect(new Set(forms)).toEqual(new Set(['', 'full', 'sdk']));
+  });
+
   it('covers the canonical anti-patterns', () => {
     expect(agentsMdTemplate).toContain('Do NOT write `.yml` / `.yaml`');
     expect(agentsMdTemplate).toContain('/dist/');

@@ -177,6 +177,47 @@ describe('admin cluster-settings route', () => {
     expect(body.settings.eventRouterMaxDispatchAttempts).toBe(7);
   });
 
+  it('refuses the removed contributorCacheTtlMs with a structured 400 and writes no row', async () => {
+    // fails-when: the body schema is non-strict again — the field would be
+    //   stripped and the PATCH would answer 200 for a knob that no longer exists.
+    const { db, rows } = makeClusterSettingsDbStub();
+    const app = buildApp(db);
+    const res = await app.request('/cluster-settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ queueMaxDepth: 42, contributorCacheTtlMs: 900_000 }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(JSON.stringify(body)).toContain('contributorCacheTtlMs');
+    expect(rows.get('default')).toBeUndefined();
+  });
+
+  it('does not project contributorCacheTtlMs on GET', async () => {
+    // fails-when: the field is back in COLUMNS.
+    const { db } = makeClusterSettingsDbStub();
+    const app = buildApp(db);
+    const get = await app.request('/cluster-settings');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings).not.toHaveProperty('contributorCacheTtlMs');
+    // breaks-if-wrong: the live knobs are still projected.
+    expect(body.settings).toHaveProperty('queueMaxDepth');
+  });
+
+  it('PATCH with only known knobs still lands (positive control for strict)', async () => {
+    // breaks-if-wrong: strictness must refuse unknown fields only, never a
+    //   well-formed live knob.
+    const { db, rows } = makeClusterSettingsDbStub();
+    const app = buildApp(db);
+    const res = await app.request('/cluster-settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ queueMaxDepth: 42 }),
+    });
+    expect(res.status).toBe(200);
+    expect(rows.get('default')!.queue_max_depth).toBe(42);
+  });
+
   it('PATCH rejects a webhookDedupTtlMs below the 1000ms floor (Zod)', async () => {
     const { db } = makeClusterSettingsDbStub();
     const app = buildApp(db);

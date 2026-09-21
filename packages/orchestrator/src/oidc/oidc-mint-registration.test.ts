@@ -4,7 +4,6 @@ import type { LocalSigner } from './local-dev-signer.js';
 
 const dispatcher = { resolveOwnedJob: () => undefined } as any;
 const db = {} as any;
-const platformClient = { sendRequestAndAwait: async () => ({}) } as any;
 const localOidcSigner = {
   alg: 'ES256',
   sign: async () => new Uint8Array(64),
@@ -28,79 +27,31 @@ const orchestratorSigner = {
 } as any;
 
 describe('selectOidcMintRegistration — anti-forgery choke point', () => {
-  it('orchestrator signer configured → orchestrator-owned mint (wins over the Platform relay)', () => {
+  it('orchestrator signer configured → orchestrator-owned mint', () => {
     const reg = selectOidcMintRegistration({
       ...base,
       resolveOrchestratorSigner: async () => orchestratorSigner,
       provenanceSigningIssuer: 'https://orch.example',
-      platformUrl: 'wss://platform',
-      platformToken: 'tok',
-      platformClient,
       independentIdentity: false,
       localOidcSigner: undefined,
     });
     expect(reg?.kind).toBe('orchestrator');
   });
 
-  it('no orchestrator signer, Platform-connected → relay (deprecated path)', () => {
+  it('orchestrator signer configured → wins over the local dev signer', () => {
+    // fails-when: the local dev signer is consulted while orchestrator-owned
+    // signing is configured — the orchestrator is the root of trust.
     const reg = selectOidcMintRegistration({
       ...base,
-      platformUrl: 'wss://platform',
-      platformToken: 'tok',
-      platformClient,
-      independentIdentity: false,
-      localOidcSigner: undefined,
-    });
-    expect(reg?.kind).toBe('relay');
-  });
-
-  it('Platform-connected → relay (local signer NEVER consulted)', () => {
-    const reg = selectOidcMintRegistration({
-      ...base,
-      platformUrl: 'wss://platform',
-      platformToken: 'tok',
-      platformClient,
-      independentIdentity: false,
-      localOidcSigner: undefined,
-    });
-    expect(reg?.kind).toBe('relay');
-  });
-
-  it('Platform-connected AND independentIdentity+signer set → STILL relay (local unreachable)', () => {
-    // The critical guarantee: even if KICI_INDEPENDENT_IDENTITY is somehow set
-    // on a Platform-connected orchestrator, the local mint path is unreachable.
-    const reg = selectOidcMintRegistration({
-      ...base,
-      platformUrl: 'wss://platform',
-      platformToken: 'tok',
-      platformClient,
+      resolveOrchestratorSigner: async () => orchestratorSigner,
+      provenanceSigningIssuer: 'https://orch.example',
       independentIdentity: true,
       localOidcSigner,
     });
-    expect(reg?.kind).toBe('relay');
-    expect(reg?.kind).not.toBe('local');
+    expect(reg?.kind).toBe('orchestrator');
   });
 
-  it('hybrid local dev plane (attach) → relay, never the dev signer (Phase 3 boundary)', () => {
-    // When `kici local attach` boots the plane hybrid, the orchestrator has a
-    // Platform connection (KICI_PLATFORM_URL/_TOKEN + a live client) and the
-    // dev-signer envs are NOT set. Even if a stale dev signer were somehow
-    // present, the relay wins — an attached run mints via the real Platform, so
-    // its OIDC/attestation verify against the Platform issuer and can never
-    // carry the non-prod `kici-local` issuer.
-    const reg = selectOidcMintRegistration({
-      ...base,
-      platformUrl: 'wss://thinker1.dev.kici.dev/kici-stg/ws',
-      platformToken: 'kici_ok_secret',
-      platformClient,
-      independentIdentity: true,
-      localOidcSigner,
-    });
-    expect(reg?.kind).toBe('relay');
-    expect(reg?.kind).not.toBe('local');
-  });
-
-  it('offline plane (independentIdentity + signer, no Platform) → local dev-signed', () => {
+  it('offline plane (independentIdentity + signer) → local dev-signed', () => {
     const reg = selectOidcMintRegistration({
       ...base,
       independentIdentity: true,
@@ -127,12 +78,12 @@ describe('selectOidcMintRegistration — anti-forgery choke point', () => {
     expect(reg).toBeUndefined();
   });
 
-  it('partial Platform config (missing client) does not register the relay', () => {
+  it('an issuer with no signer resolver → no registration', () => {
+    // Half of the orchestrator-owned configuration is not a mint path: the
+    // local dev signer is not reached for through it either.
     const reg = selectOidcMintRegistration({
       ...base,
-      platformUrl: 'wss://platform',
-      platformToken: 'tok',
-      platformClient: undefined,
+      provenanceSigningIssuer: 'https://orch.example',
       independentIdentity: false,
       localOidcSigner: undefined,
     });

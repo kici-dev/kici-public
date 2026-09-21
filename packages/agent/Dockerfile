@@ -9,7 +9,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.20.0-0-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.21.0-1-debian13-dev AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin 11.3.0 to match the runtime stage (see below): the same
@@ -148,7 +148,7 @@ RUN rm -f .npmrc \
 # Runtime base is the -dev variant because the agent needs apt-installed
 # host tools (git/bash/iptables) at runtime. ca-certificates ships with
 # the DHI base, so it isn't installed here.
-FROM ${DHI_PREFIX}/node:24.20.0-0-debian13-dev
+FROM ${DHI_PREFIX}/node:24.21.0-1-debian13-dev
 
 # Install the CI userland, then strip perl ENTIRELY — including the Essential
 # perl-base. The agent never invokes perl, so removing it eliminates the whole
@@ -251,9 +251,11 @@ RUN corepack enable \
 # Version matches the base image's node so the image carries one Node version.
 # Both digests are the upstream SHASUMS256.txt values, verified at build time —
 # an unverified tarball here would execute in every customer job container.
-ARG KICI_RUNTIME_NODE_VERSION=24.20.0
-ARG KICI_RUNTIME_NODE_SHA256_X64=2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2
-ARG KICI_RUNTIME_NODE_SHA256_ARM64=5f4ddab610c1ab2016b3c227cebdbf6d9495161487e4739c7b90090595f465f7
+# The download retries on any error, like the corepack steps above: a single
+# dropped TLS handshake must not fail the whole image build.
+ARG KICI_RUNTIME_NODE_VERSION=24.21.0
+ARG KICI_RUNTIME_NODE_SHA256_X64=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
+ARG KICI_RUNTIME_NODE_SHA256_ARM64=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
 RUN set -eu; \
   arch="$(dpkg --print-architecture)"; \
   case "$arch" in \
@@ -262,7 +264,7 @@ RUN set -eu; \
     *) echo "unsupported architecture for the KiCI runtime: $arch" >&2; exit 1 ;; \
   esac; \
   tarball="node-v${KICI_RUNTIME_NODE_VERSION}-linux-${nodearch}.tar.xz"; \
-  curl -fsSLo "/tmp/$tarball" \
+  curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "/tmp/$tarball" \
     "https://nodejs.org/dist/v${KICI_RUNTIME_NODE_VERSION}/$tarball"; \
   echo "$sha  /tmp/$tarball" | sha256sum -c -; \
   mkdir -p /opt/kici/node; \

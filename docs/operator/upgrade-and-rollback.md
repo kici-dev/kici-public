@@ -17,7 +17,10 @@ service install.
 
 ## Safe order: orchestrator first, then agents
 
-Upgrade the orchestrator first, then the agents.
+Upgrade the orchestrator first, then the agents. When a release raises the
+minimum accepted protocol version, move both tiers in the same maintenance
+window. 0.9.0 raises it to 3: a 0.9.0 orchestrator refuses a 0.8.x agent
+(protocol 2) at connect until the agent is upgraded.
 
 - **Ephemeral scaler-spawned agents** update themselves on the next spawn once
   you update the image reference in the scaler label-set config and reload — each
@@ -25,11 +28,15 @@ Upgrade the orchestrator first, then the agents.
 - **Long-lived installed agents** are upgraded with `kici-admin agent upgrade`.
 
 On version skew: the orchestrator enforces a protocol-version floor during the
-agent handshake and rejects any agent below it. The agent also reports its
-application version, but that is display metadata only — nothing warns or rejects
-on an application-version mismatch. Running the orchestrator and agents on the
-same release is the supported configuration; transient skew while a rolling
-upgrade is in flight is expected and tolerated.
+agent handshake and rejects any agent below it with close code `4005`
+(`Unsupported protocol version`). The agent also reports its application
+version, but that is display metadata only — nothing warns or rejects on an
+application-version mismatch. Running the orchestrator and agents on the same
+release is the supported configuration. Transient skew while a rolling upgrade
+is in flight is tolerated only between releases that share a protocol floor;
+across a floor change (0.8.x → 0.9.0) every not-yet-upgraded agent stays
+disconnected until its own upgrade, so upgrade the agents right after the
+orchestrator.
 
 ## Drain before upgrading
 

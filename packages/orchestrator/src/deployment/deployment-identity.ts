@@ -42,7 +42,7 @@ function globalBinDirFrom(entryPath: string | undefined): string | undefined {
  * This module's own location, or `undefined` when it cannot be expressed as a
  * filesystem path. Resolved defensively because it is a default parameter of a
  * function called during startup, and no deployment shape is worth failing to
- * boot over — an unresolvable location simply drops the first shim candidate.
+ * boot over — an unresolvable location drops the first shim candidate.
  */
 function selfPath(): string | undefined {
   try {

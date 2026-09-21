@@ -3,7 +3,7 @@
  *
  * This is the regression suite for the defect that parked this feature through
  * nine reviews: the trust policy gated the pull request's OWN workflows, but
- * both org-global dispatch paths ran regardless. With `forkPolicy: 'reject'` a
+ * both org-global dispatch paths ran regardless. With `forkPolicy: 'hold'` a
  * fork PR still executed the organization's global workflows against its head
  * SHA with ORG credentials — the same false assurance the feature exists to
  * remove.
@@ -179,8 +179,6 @@ function makeDeps(
 
 const HOLD_ALL: TrustPolicy = {
   forkPolicy: 'hold',
-  unknownContributorPolicy: 'hold',
-  workflowChangePolicy: 'hold',
   approvalExpiryHours: 72,
 };
 
@@ -188,19 +186,11 @@ describe('global-workflow dispatch honours the event trust decision', () => {
   it('reaches the policy on the no-lock-file path, which used to return first', async () => {
     // The blocker's direct regression test. Before the fix, Phase F returned
     // before `evaluateSecurityPolicy` ran, so the store was never even read.
-    const { deps, dispatch } = makeDeps({ ...HOLD_ALL, forkPolicy: 'reject' });
+    const { deps, dispatch } = makeDeps({ ...HOLD_ALL, forkPolicy: 'hold' });
 
     await processWebhook(makeInfo(), deps);
 
     expect(deps.trustPolicyStore!.get).toHaveBeenCalledWith(ORG);
-    expect(dispatch).not.toHaveBeenCalled();
-  });
-
-  it('dispatches no global workflow when the policy rejects the event', async () => {
-    const { deps, dispatch } = makeDeps({ ...HOLD_ALL, forkPolicy: 'reject' });
-
-    await processWebhook(makeInfo(), deps);
-
     expect(dispatch).not.toHaveBeenCalled();
   });
 
@@ -214,13 +204,9 @@ describe('global-workflow dispatch honours the event trust decision', () => {
 
   it('still dispatches global workflows when the policy passes', async () => {
     // The non-vacuity control: with the fork explicitly allowed the SAME
-    // fixture dispatches, so the three assertions above are about the policy
+    // fixture dispatches, so the assertions above are about the policy
     // and not about a harness that never dispatches anything.
-    const { deps, dispatch } = makeDeps({
-      ...HOLD_ALL,
-      forkPolicy: 'allow',
-      unknownContributorPolicy: 'hold',
-    });
+    const { deps, dispatch } = makeDeps({ ...HOLD_ALL, forkPolicy: 'allow' });
 
     await processWebhook(makeInfo(), deps);
 
@@ -232,9 +218,9 @@ describe('global-workflow dispatch honours the event trust decision', () => {
   // It failed for a different reason than Phase F — it received the decision's
   // siblings but never the decision — so it needs its own falsifiable coverage.
 
-  it('dispatches no cross-repo global workflow when the policy rejects (lock-file path)', async () => {
+  it('dispatches no cross-repo global workflow when the policy holds (lock-file path)', async () => {
     const { deps, dispatch } = makeDeps(
-      { ...HOLD_ALL, forkPolicy: 'reject' },
+      { ...HOLD_ALL, forkPolicy: 'hold' },
       { withLockFile: true },
     );
 

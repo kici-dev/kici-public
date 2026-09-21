@@ -7,8 +7,7 @@
  * provider API call, no identity lookup.
  *
  * The stored/wire tier vocabulary keeps 'unknown' as the name for
- * "untrusted" and 'trusted' for "trusted"; 'known' is legacy vocabulary
- * that is no longer produced.
+ * "untrusted" and 'trusted' for "trusted".
  */
 import type { TrustTier } from '@kici-dev/engine';
 

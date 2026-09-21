@@ -282,6 +282,27 @@ class CaseFoldingStorage implements CacheStorage {
   }
 }
 
+/**
+ * Models a presigned-PUT backend: an object uploaded straight to its temp key
+ * carries no metadata until commit runs `initMeta` on the final key, exactly
+ * as S3 reports it. Records deletes so a test can assert what eviction reclaimed.
+ */
+class PresignedUploadStorage extends FakeStorage {
+  readonly deleted: string[] = [];
+
+  override async getMetadata(
+    key: string,
+  ): Promise<import('../storage/types.js').CacheMetadata | null> {
+    if (key.slice(key.lastIndexOf('/') + 1).startsWith('.tmp-')) return null;
+    return super.getMetadata(key);
+  }
+
+  override async delete(key: string): Promise<boolean> {
+    this.deleted.push(key);
+    return super.delete(key);
+  }
+}
+
 describe('UserCache', () => {
   let storage: FakeStorage;
   let cache: UserCache;
@@ -494,6 +515,35 @@ describe('UserCache', () => {
     expect(typeof fields.key).toBe('string');
   });
 
+  // fails-when: the in-flight-upload filter is dropped from the eviction
+  // candidate set — the metadata-less temp object sorts first and is deleted.
+  it('quota eviction never reclaims a concurrent save in-flight upload', async () => {
+    const presigned = new PresignedUploadStorage();
+    cache = new UserCache({ storage: presigned, quotaBytes: 25, ttlMs: 86_400_000 });
+    const begin = await cache.beginSave({ org, repo, scope: 'shared', key: 'in-flight' });
+    expect(begin.skip).toBe(false);
+    // The agent's presigned PUT has landed but the commit has not run yet.
+    await presigned.put(begin.tempKey!, Buffer.alloc(10));
+    await cache.commitSave({ org, repo, scope: 'shared', key: 'a', tarHash: 'h', sizeBytes: 10 });
+    await cache.commitSave({ org, repo, scope: 'shared', key: 'b', tarHash: 'h', sizeBytes: 10 });
+    await cache.commitSave({ org, repo, scope: 'shared', key: 'c', tarHash: 'h', sizeBytes: 10 }); // 30 > 25
+    expect(presigned.deleted).not.toContain(begin.tempKey);
+    expect(await presigned.has(begin.tempKey!)).toBe(true);
+    // The over-quota bytes were still reclaimed from a committed entry.
+    expect((await cache.restore({ org, repo, scope: 'shared', key: 'a' })).hit).toBe(false);
+    // And the pending save can still commit through its temp key.
+    await cache.commitSave({
+      org,
+      repo,
+      scope: 'shared',
+      key: 'in-flight',
+      tarHash: 'h',
+      sizeBytes: 10,
+      tempKey: begin.tempKey,
+    });
+    expect((await cache.restore({ org, repo, scope: 'shared', key: 'in-flight' })).hit).toBe(true);
+  });
+
   it('LRU eviction: a restored (recently-used) entry survives over an older-created but unused one', async () => {
     cache = new UserCache({ storage, quotaBytes: 25, ttlMs: 86_400_000 });
     mockLogger.info.mockClear();
@@ -613,78 +663,55 @@ describe('UserCache', () => {
     });
   });
 
-  describe('transitional read of the un-discriminated key format', () => {
+  describe('the retired un-discriminated layout is not read', () => {
     const sharedPrefix = 'cache/org-1/owner_repo/shared/';
 
-    /** Write an entry in the pre-discriminator format, sidecars included. */
-    async function seedLegacyEntry(
-      store: FakeStorage | CaseFoldingStorage,
-      key: string,
-      tarHash: string,
-    ): Promise<void> {
-      await store.put(`${sharedPrefix}${key}${'.tar.gz'}`, Buffer.from('LEGACY'));
-      await store.put(`${sharedPrefix}${key}.tar.gz.hash`, tarHash);
-      await store.put(`${sharedPrefix}${key}.tar.gz.size`, '6');
+    /** Write an entry in the retired format, sidecars included. */
+    async function seedLegacyEntry(key: string, tarHash: string): Promise<void> {
+      await storage.put(`${sharedPrefix}${key}.tar.gz`, Buffer.from('LEGACY'));
+      await storage.put(`${sharedPrefix}${key}.tar.gz.hash`, tarHash);
+      await storage.put(`${sharedPrefix}${key}.tar.gz.size`, '6');
     }
 
-    it('restores an entry written before the discriminator existed', async () => {
-      await seedLegacyEntry(storage, 'node-deps-v1', 'legacy-hash');
+    // fails-when: an exact-key lookup falls back to the un-discriminated object.
+    it('an exact-key restore misses an entry present only in the retired layout', async () => {
+      await seedLegacyEntry('node-deps-v1', 'legacy-hash');
       const r = await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' });
-      expect(r.hit).toBe(true);
-      expect(r.matchedKey).toBe('node-deps-v1');
-      expect(r.tarHash).toBe('legacy-hash');
+      expect(r).toEqual({ hit: false });
     });
 
-    // Uppercase means the old format could have folded this onto a case variant,
-    // so the fallback must decline rather than risk serving the wrong tarball.
-    it('declines a key that is not lowercase', async () => {
-      await seedLegacyEntry(storage, 'Build', 'legacy-hash');
-      expect((await cache.restore({ org, repo, scope: 'shared', key: 'Build' })).hit).toBe(false);
-    });
-
-    // `seg()` rewrites the space to `_`, so `node deps` and `node_deps` are two
-    // keys that sanitize to one legacy object — exactly the many-to-one case.
-    it('declines a key that sanitization would rewrite', async () => {
-      await seedLegacyEntry(storage, 'node_deps', 'legacy-hash');
-      expect((await cache.restore({ org, repo, scope: 'shared', key: 'node deps' })).hit).toBe(
-        false,
-      );
-    });
-
-    // The second gate on its own: the key passes the static predicate, but the
-    // object really on disk was created as `Build`, and a case-insensitive
-    // backend would happily resolve `build` to it.
-    it('declines when the stored object has a different real name', async () => {
-      const folding = new CaseFoldingStorage(new FakeStorage());
-      const foldingCache = new UserCache({
-        storage: folding,
-        quotaBytes: 1_000_000,
-        ttlMs: 86_400_000,
-      });
-      await seedLegacyEntry(folding, 'Build', 'wrong-entry');
-      expect((await foldingCache.restore({ org, repo, scope: 'shared', key: 'build' })).hit).toBe(
-        false,
-      );
-    });
-
-    it('commits under the discriminated key after a legacy restore', async () => {
-      await seedLegacyEntry(storage, 'node-deps-v1', 'legacy-hash');
-      await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' });
-      await cache.commitSave({
+    // fails-when: the restoreKeys scan serves any `.tar.gz` object under the
+    // prefix rather than only committed `<stem>-<discriminator>.tar.gz` entries.
+    it('a restoreKeys prefix scan skips an entry present only in the retired layout', async () => {
+      await seedLegacyEntry('node-deps-v1', 'legacy-hash');
+      const r = await cache.restore({
         org,
         repo,
         scope: 'shared',
-        key: 'node-deps-v1',
-        tarHash: 'fresh',
-        sizeBytes: 10,
+        key: 'node-deps-v2',
+        restoreKeys: ['node-deps-'],
       });
-      expect(
-        await storage.has(`${sharedPrefix}node-deps-v1-${keyDiscriminator('node-deps-v1')}.tar.gz`),
-      ).toBe(true);
+      expect(r).toEqual({ hit: false });
     });
 
-    it('prefers a discriminated entry over a legacy one', async () => {
-      await seedLegacyEntry(storage, 'node-deps-v1', 'legacy-hash');
+    // The same filter keeps an in-flight upload out of the scan: a `.tmp-` object
+    // is a partial tarball until commit copies it to its final key.
+    it('a restoreKeys prefix scan never serves an in-flight .tmp- upload', async () => {
+      await storage.put(`${sharedPrefix}.tmp-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0.tar.gz`, 'PART');
+      const r = await cache.restore({
+        org,
+        repo,
+        scope: 'shared',
+        key: '.tmp-missing',
+        restoreKeys: ['.tmp-'],
+      });
+      expect(r).toEqual({ hit: false });
+    });
+
+    // Positive counterpart: the current layout keeps hitting on both paths, so
+    // the misses above are the filter working and not a broken restore.
+    it('the current layout still hits beside a retired entry, exact and by prefix', async () => {
+      await seedLegacyEntry('node-deps-v1', 'legacy-hash');
       await cache.commitSave({
         org,
         repo,
@@ -693,9 +720,19 @@ describe('UserCache', () => {
         tarHash: 'current',
         sizeBytes: 10,
       });
-      expect(
-        (await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' })).tarHash,
-      ).toBe('current');
+      const exact = await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' });
+      expect(exact.hit).toBe(true);
+      expect(exact.tarHash).toBe('current');
+      const byPrefix = await cache.restore({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'node-deps-v2',
+        restoreKeys: ['node-deps-'],
+      });
+      expect(byPrefix.hit).toBe(true);
+      expect(byPrefix.matchedKey).toBe('node-deps-v1');
+      expect(byPrefix.tarHash).toBe('current');
     });
   });
 

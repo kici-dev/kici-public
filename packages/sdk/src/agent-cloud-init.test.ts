@@ -1,12 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import {
-  buildAgentCloudInit,
-  type ClaimCodeCredentials,
-  type CloudInitCredentials,
-} from './agent-cloud-init.js';
+import { buildAgentCloudInit, type ClaimCodeCredentials } from './agent-cloud-init.js';
 
-const creds: CloudInitCredentials = {
-  agentToken: 'kat_supersecret',
+const creds: ClaimCodeCredentials = {
+  claimCode: 'kcc_supersecret',
   agentId: 'a1',
   orchestratorUrl: 'wss://orch/ws',
   labels: ['cloud=hetzner', 'linux'],
@@ -18,10 +14,16 @@ describe('buildAgentCloudInit — core', () => {
   it('embeds the four agent env vars and KICI_SCALER_MANAGED=1', () => {
     const out = buildAgentCloudInit(creds, { maxLifetimeMinutes: 30, deliveryMode: 'payload' });
     expect(out).toContain('KICI_ORCHESTRATOR_URL=wss://orch/ws');
-    expect(out).toContain('KICI_AGENT_TOKEN=kat_supersecret');
+    expect(out).toContain('KICI_SCALER_CLAIM_CODE=kcc_supersecret');
     expect(out).toContain('KICI_AGENT_ID=a1');
     expect(out).toContain('KICI_LABELS=cloud=hetzner,linux');
     expect(out).toContain('KICI_SCALER_MANAGED=1');
+  });
+
+  // fails-when: the removed agent-token form is rendered again
+  it('never renders an agent token', () => {
+    const out = buildAgentCloudInit(creds, { maxLifetimeMinutes: 30, deliveryMode: 'payload' });
+    expect(out).not.toContain('KICI_AGENT_TOKEN');
   });
 
   it('starts with the #cloud-config header', () => {
@@ -39,9 +41,9 @@ describe('buildAgentCloudInit — core', () => {
     expect(out).toMatch(/--on-active=1m/);
   });
 
-  it('writes the token only in the root-only env-file entry, nowhere else', () => {
+  it('writes the claim code only in the root-only env-file entry, nowhere else', () => {
     const out = buildAgentCloudInit(creds, { maxLifetimeMinutes: 30, deliveryMode: 'container' });
-    expect(out.split('kat_supersecret').length - 1).toBe(1);
+    expect(out.split('kcc_supersecret').length - 1).toBe(1);
     expect(out).toMatch(/permissions:\s*['"]?0600['"]?/);
   });
 
@@ -81,15 +83,6 @@ describe('buildAgentCloudInit — claim-code delivery', () => {
     expect(out).toContain('KICI_SCALER_MANAGED=1');
     expect(out).not.toContain('KICI_AGENT_TOKEN');
   });
-
-  it('still renders the deprecated token form', () => {
-    const out = buildAgentCloudInit(creds, {
-      maxLifetimeMinutes: 30,
-      deliveryMode: 'container',
-    });
-    expect(out).toContain('KICI_AGENT_TOKEN=kat_supersecret');
-    expect(out).not.toContain('KICI_SCALER_CLAIM_CODE');
-  });
 });
 
 describe('buildAgentCloudInit — customization axes', () => {
@@ -104,7 +97,7 @@ describe('buildAgentCloudInit — customization axes', () => {
 
   it('stamps an arbitrary correlation env via agentEnv (no dedicated e2e field)', () => {
     const out = buildAgentCloudInit(
-      { agentToken: 't', agentId: 'a1', orchestratorUrl: 'http://o', labels: [] },
+      { claimCode: 'c', agentId: 'a1', orchestratorUrl: 'http://o', labels: [] },
       { maxLifetimeMinutes: 30, agentEnv: { KICI_E2E_RUN_ID: 'run-xyz' } },
     );
     expect(out).toContain('KICI_E2E_RUN_ID=run-xyz');
@@ -144,13 +137,13 @@ describe('buildAgentCloudInit — customization axes', () => {
     expect(iStart).toBeLessThan(iAfter);
   });
 
-  it('keeps the token out of runcmd even with custom runcmd', () => {
+  it('keeps the claim code out of runcmd even with custom runcmd', () => {
     const out = buildAgentCloudInit(creds, {
       maxLifetimeMinutes: 30,
       runcmdBefore: ['echo hi'],
       agentEnv: { FOO: 'bar' },
     });
-    expect(out.split('kat_supersecret').length - 1).toBe(1);
+    expect(out.split('kcc_supersecret').length - 1).toBe(1);
   });
 });
 
@@ -195,10 +188,10 @@ describe('buildAgentCloudInit — baseCloudConfig merge', () => {
     expect(iPre).toBeLessThan(iStart);
   });
 
-  it('keeps the env file present and the token single-occurrence with a base', () => {
+  it('keeps the env file present and the claim code single-occurrence with a base', () => {
     const out = buildAgentCloudInit(creds, { maxLifetimeMinutes: 30, baseCloudConfig: base });
     expect(out).toContain(AGENT_ENV_FILE_FOR_TEST);
-    expect(out.split('kat_supersecret').length - 1).toBe(1);
+    expect(out.split('kcc_supersecret').length - 1).toBe(1);
   });
 
   it("preserves a base's own non-reserved write_files entry alongside the env file", () => {
@@ -213,12 +206,12 @@ describe('buildAgentCloudInit — baseCloudConfig merge', () => {
       baseCloudConfig: baseWithFile,
     });
     // Both the base's file and the KiCI env file survive the concat, and the
-    // env file is still the only 0600 entry carrying the token.
+    // env file is still the only 0600 entry carrying the claim code.
     expect(out).toContain('/etc/motd');
     expect(out).toContain('welcome');
     expect(out).toContain(AGENT_ENV_FILE_FOR_TEST);
     expect(out).toMatch(/permissions:\s*['"]?0600['"]?/);
-    expect(out.split('kat_supersecret').length - 1).toBe(1);
+    expect(out.split('kcc_supersecret').length - 1).toBe(1);
   });
 });
 
@@ -236,8 +229,8 @@ describe('buildAgentCloudInit — userDataEncoding', () => {
     const decoded = Buffer.from(encoded, 'base64').toString('utf8');
     expect(decoded).toBe(raw);
     expect(decoded.startsWith('#cloud-config')).toBe(true);
-    // The token appears exactly once on the decoded form.
-    expect(decoded.split('kat_supersecret').length - 1).toBe(1);
+    // The claim code appears exactly once on the decoded form.
+    expect(decoded.split('kcc_supersecret').length - 1).toBe(1);
   });
 
   it("default ('raw' / omitted) is unchanged and still starts with #cloud-config", () => {

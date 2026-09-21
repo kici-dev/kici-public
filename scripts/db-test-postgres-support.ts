@@ -60,8 +60,8 @@ function defaultProbe(cmd: string): boolean {
  *
  * Deliberately NOT `podman … || docker …`: on a host with both, `podman ps`
  * exits 0 with empty output so the `||` never falls through and docker is never
- * seen (.claude/rules/e2e-executor-109.md). thinker1 is podman, the 109 E2E
- * executor is Docker, so both must work.
+ * seen (.claude/rules/e2e-executor-109.md). The primary dev machine is podman,
+ * the E2E executor is Docker, so both must work.
  */
 export function resolveContainerRuntime(
   probe: (cmd: string) => boolean = defaultProbe,

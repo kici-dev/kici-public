@@ -390,7 +390,7 @@ describe('AccessLogWriter (mocked — sampler integration)', () => {
 });
 
 describe('AccessLogWriter.getById (cold-store fallback)', () => {
-  // Mirrors the matrix specified by the wishlist plan: hot hit, hot miss
+  // The lookup matrix: hot hit, hot miss
   // (with and without a cold-store wired), cold hit with `--org-id`, cold
   // hit without `--org-id` (synthetic tenant), cold miss, and cold-store
   // throws. The fallback exists because `query()` already merges hot+cold

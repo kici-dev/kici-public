@@ -66,9 +66,9 @@ describe('serveCredential', () => {
       expiresAt: Date.now() + 60_000,
     });
     const request = vi.fn().mockResolvedValue({ kind: 'basic', user: 'u', secret: 's' });
-    await serveCredential({ ...query, path: 'cmaster11/main.git' }, { grants, request });
+    await serveCredential({ ...query, path: 'acme/main.git' }, { grants, request });
     expect(request).toHaveBeenCalledWith(
-      expect.objectContaining({ repository: 'cmaster11/main', permissions: { contents: 'read' } }),
+      expect.objectContaining({ repository: 'acme/main', permissions: { contents: 'read' } }),
     );
   });
 

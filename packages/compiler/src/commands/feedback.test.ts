@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 const { openMock, loggerMock } = vi.hoisted(() => {
   return {
@@ -14,10 +17,14 @@ const { openMock, loggerMock } = vi.hoisted(() => {
 
 vi.mock('open', () => ({ default: openMock }));
 
-vi.mock('@kici-dev/core', () => ({
-  logger: loggerMock,
-  toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
-}));
+vi.mock('@kici-dev/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/core')>();
+  return {
+    ...actual,
+    logger: loggerMock,
+    toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+  };
+});
 
 import {
   feedbackCommand,
@@ -25,6 +32,8 @@ import {
   FEEDBACK_NEW_ISSUE_URL,
   FEEDBACK_SECURITY_ADVISORY_URL,
   FEEDBACK_TRACKER_URL,
+  parseFeedbackDraft,
+  draftIssueUrl,
 } from './feedback.js';
 
 function printed(): string {
@@ -130,5 +139,110 @@ describe('feedback command', () => {
   it('names the issue template the tracker actually serves', () => {
     expect(FEEDBACK_NEW_ISSUE_URL).toContain(FEEDBACK_CONTRACT.template);
     expect(FEEDBACK_CONTRACT.template).toMatch(/\.yml$/);
+  });
+});
+
+describe('feedback draft', () => {
+  const complete = {
+    title: 'kici compile --check writes a lock file',
+    advertised: 'docs say --check writes nothing',
+    observed: 'it wrote .kici/lock.json',
+    reproduction: '$ kici init\n$ kici compile --check',
+    version: '0.8.0',
+    environment: 'Node 24, Ubuntu 24.04',
+    justification: 'the docs cannot be read to allow a write',
+  };
+
+  beforeEach(() => {
+    openMock.mockClear();
+    loggerMock.info.mockClear();
+    loggerMock.error.mockClear();
+  });
+
+  it('builds the prefilled issue-form URL from a complete draft, one query param per field', () => {
+    const r = parseFeedbackDraft(complete);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const url = new URL(draftIssueUrl(r.draft));
+    expect(url.origin + url.pathname).toBe('https://github.com/kici-dev/kici-public/issues/new');
+    expect(url.searchParams.get('template')).toBe(FEEDBACK_CONTRACT.template);
+    // breaks-if-wrong: every field must round-trip through the encoding,
+    // newlines included — GitHub reads the value back verbatim.
+    for (const [k, v] of Object.entries(complete)) expect(url.searchParams.get(k)).toBe(v);
+  });
+
+  it('refuses a draft missing a required field, naming it', () => {
+    // fails-when: `justification` is absent — the field agents skip most.
+    const { justification: _drop, ...partial } = complete;
+    const r = parseFeedbackDraft(partial);
+    expect(r).toEqual({ ok: false, problems: ['missing required field: justification'] });
+  });
+
+  it('refuses unknown keys and non-string values', () => {
+    const r = parseFeedbackDraft({ ...complete, extra: 'x', version: 8 });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.problems).toEqual(
+      expect.arrayContaining(['unknown field: extra', 'field must be a non-empty string: version']),
+    );
+  });
+
+  it('--draft prints the URL as the last stdout line and opens it only with --open', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'kici-feedback-'));
+    const file = path.join(dir, 'draft.json');
+    await writeFile(file, JSON.stringify(complete));
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      expect(await feedbackCommand({ draft: file })).toBe(true);
+      expect(openMock).not.toHaveBeenCalled();
+      const url = writes.join('').trim().split('\n').at(-1)!;
+      expect(url.startsWith(FEEDBACK_NEW_ISSUE_URL)).toBe(true);
+
+      expect(await feedbackCommand({ draft: file, open: true })).toBe(true);
+      expect(openMock).toHaveBeenCalledWith(url);
+    } finally {
+      spy.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--draft with an invalid file exits non-zero and files nothing', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'kici-feedback-'));
+    const file = path.join(dir, 'draft.json');
+    await writeFile(file, JSON.stringify({ title: 'only a title' }));
+    try {
+      expect(await feedbackCommand({ draft: file, open: true })).toBe(false);
+      expect(openMock).not.toHaveBeenCalled();
+      expect(loggerMock.error.mock.calls.flat().join('\n')).toContain(
+        'missing required field: advertised',
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--json teaches the draft path', async () => {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      await feedbackCommand({ json: true });
+    } finally {
+      spy.mockRestore();
+    }
+    const contract = JSON.parse(writes.join(''));
+    expect(contract.draftCommand).toBe('kici feedback --draft <file.json> --open');
+    // The literal in the contract and the field list are authored separately;
+    // fails-when: a field is added to one and not the other.
+    expect(contract.draftFields).toEqual([
+      'title',
+      ...FEEDBACK_CONTRACT.requiredFields.map((f) => f.id),
+    ]);
   });
 });

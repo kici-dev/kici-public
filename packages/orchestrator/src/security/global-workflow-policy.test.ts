@@ -41,7 +41,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: 'org-1',
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: [{ pattern: 'myorg/*' }],
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_OFF, false);
 
@@ -52,8 +51,6 @@ describe('GlobalWorkflowPolicy', () => {
       const source = await policy.isSourceRepoAllowed('github:1', 'myorg/src', 'org-1');
       expect(source.allowed).toBe(false);
       expect(source.reason).toBe('Global workflows are disabled cluster-wide');
-
-      expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/wf', 'org-1')).toBe(false);
     });
 
     it('falls back to the configured default when the column is NULL', async () => {
@@ -87,7 +84,6 @@ describe('GlobalWorkflowPolicy', () => {
       const result = await policy.isWorkflowRepoAllowed('github:1', 'myorg/wf', 'org-1');
       expect(result.allowed).toBe(false);
       expect(result.reason).toBe('Global workflows: cluster settings unreadable');
-      expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/wf', 'org-1')).toBe(false);
     });
 
     // The semantic change: a missing org_settings row used to be a hard deny.
@@ -104,19 +100,11 @@ describe('GlobalWorkflowPolicy', () => {
       );
     });
 
-    // Elevated access is NOT widened by the same change: it still requires an
-    // explicit list, so a missing row grants nothing.
-    it('still denies elevated access with the switch on and NO org row', async () => {
-      const policy = new GlobalWorkflowPolicy(makeMockDb(undefined), CLUSTER_ON, false);
-      expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/wf', 'org-1')).toBe(false);
-    });
-
     it('still applies the per-org lists when the switch is on', async () => {
       const db = makeMockDb({
         customer_id: 'org-1',
         global_workflow_allowed_repos: [{ pattern: 'myorg/allowed' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
       expect(
@@ -134,7 +122,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -150,7 +137,6 @@ describe('GlobalWorkflowPolicy', () => {
           { pattern: 'myorg/shared-pipelines' },
         ],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -163,7 +149,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ pattern: 'myorg/ci-workflows' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -177,7 +162,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ pattern: 'myorg/*' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -190,7 +174,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -203,7 +186,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'myorg/ci-workflows' }],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -216,7 +198,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ routingKey: 'github:42', pattern: 'myorg/ci-*' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -239,7 +220,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ pattern: 'myorg/ci-*' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -256,7 +236,6 @@ describe('GlobalWorkflowPolicy', () => {
           { routingKey: 'generic:kiciStg00001:deleted', pattern: 'myorg/ci-*' },
         ],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -271,7 +250,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -284,7 +262,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -297,7 +274,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'myorg/fork-*' }],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -311,7 +287,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'myorg/fork-*' }],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -326,7 +301,6 @@ describe('GlobalWorkflowPolicy', () => {
         global_workflow_denied_repos: [
           { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/main' },
         ],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -348,93 +322,11 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ pattern: 'myorg/ci-workflows' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
       const result = await policy.isSourceRepoAllowed('github:42', 'otherorg/random', ORG);
       expect(result.allowed).toBe(true);
-    });
-  });
-
-  describe('isElevatedAccessAllowed', () => {
-    it('returns true when repo is in elevated_repos', async () => {
-      const db = makeMockDb({
-        customer_id: ORG,
-        global_workflow_allowed_repos: null,
-        global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: [{ pattern: 'myorg/ci-workflows' }],
-      });
-      const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
-
-      const result = await policy.isElevatedAccessAllowed('github:42', 'myorg/ci-workflows', ORG);
-      expect(result).toBe(true);
-    });
-
-    it('returns false when repo is NOT in elevated_repos', async () => {
-      const db = makeMockDb({
-        customer_id: ORG,
-        global_workflow_allowed_repos: null,
-        global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: [{ pattern: 'myorg/ci-workflows' }],
-      });
-      const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
-
-      const result = await policy.isElevatedAccessAllowed('github:42', 'myorg/other-repo', ORG);
-      expect(result).toBe(false);
-    });
-
-    it('returns false when elevated_repos is null', async () => {
-      const db = makeMockDb({
-        customer_id: ORG,
-        global_workflow_allowed_repos: null,
-        global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
-      });
-      const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
-
-      const result = await policy.isElevatedAccessAllowed('github:42', 'myorg/repo', ORG);
-      expect(result).toBe(false);
-    });
-
-    it('returns false when no org_settings row exists', async () => {
-      const db = makeMockDb(undefined);
-      const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
-
-      const result = await policy.isElevatedAccessAllowed('github:42', 'myorg/repo', ORG);
-      expect(result).toBe(false);
-    });
-
-    it('supports glob patterns in elevated_repos', async () => {
-      const db = makeMockDb({
-        customer_id: ORG,
-        global_workflow_allowed_repos: null,
-        global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: [{ pattern: 'myorg/ci-*' }],
-      });
-      const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
-
-      const result = await policy.isElevatedAccessAllowed('github:42', 'myorg/ci-workflows', ORG);
-      expect(result).toBe(true);
-    });
-
-    it('source-qualified elevated entry only matches its routing key', async () => {
-      const db = makeMockDb({
-        customer_id: ORG,
-        global_workflow_allowed_repos: null,
-        global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: [{ routingKey: 'github:42', pattern: 'myorg/ci-deploy' }],
-      });
-      const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
-
-      const same = await policy.isElevatedAccessAllowed('github:42', 'myorg/ci-deploy', ORG);
-      const other = await policy.isElevatedAccessAllowed(
-        'generic:kiciStg00001:src-b',
-        'myorg/ci-deploy',
-        ORG,
-      );
-      expect(same).toBe(true);
-      expect(other).toBe(false);
     });
   });
 
@@ -452,7 +344,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ pattern: 'forgejo.example.com/ci-workflows/*' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -469,7 +360,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: [{ pattern: 'forgejo.example.com/ci-workflows/*' }],
         global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -487,7 +377,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'group/subgroup/untrusted-*' }],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -505,7 +394,6 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'group/subgroup/untrusted-*' }],
-        global_workflow_elevated_repos: null,
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -517,7 +405,7 @@ describe('GlobalWorkflowPolicy', () => {
       expect(result.allowed).toBe(true);
     });
 
-    it('with the switch on and no org row, the repo/source axes allow and elevated denies', async () => {
+    it('with the switch on and no org row, the repo/source axes allow', async () => {
       const db = makeMockDb(undefined);
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
@@ -527,14 +415,8 @@ describe('GlobalWorkflowPolicy', () => {
         ORG,
       );
       const src = await policy.isSourceRepoAllowed(routingKey, 'forgejo.example.com/any/repo', ORG);
-      const elevated = await policy.isElevatedAccessAllowed(
-        routingKey,
-        'forgejo.example.com/any/repo',
-        ORG,
-      );
       expect(wf.allowed).toBe(true);
       expect(src.allowed).toBe(true);
-      expect(elevated).toBe(false);
     });
   });
 });
@@ -546,7 +428,7 @@ describe('GlobalWorkflowPolicy', () => {
  * a deny entry of `myorg/*` — or `myorg/**`, or even `**` — silently ADMITTED
  * `myorg/.github`. That is a control failing in the one direction that lets an
  * event through, and `.github` is an ordinary repository name rather than a
- * contrived one, so the gap was reachable. All three axes now match repo
+ * contrived one, so the gap was reachable. Both axes now match repo
  * identifiers with the same matcher a workflow's own `repos:` patterns use.
  */
 describe('GlobalWorkflowPolicy matches a dot-prefixed repository name', () => {
@@ -558,7 +440,6 @@ describe('GlobalWorkflowPolicy matches a dot-prefixed repository name', () => {
       customer_id: ORG,
       global_workflow_allowed_repos: null,
       global_workflow_denied_repos: null,
-      global_workflow_elevated_repos: null,
       ...over,
     });
   }
@@ -618,7 +499,7 @@ describe('GlobalWorkflowPolicy matches a dot-prefixed repository name', () => {
     });
   });
 
-  describe('the allow-list and elevated-access list, which read the same way', () => {
+  describe('the allow-list', () => {
     it("'myorg/*' authorizes a dot-prefixed repo to author global workflows", async () => {
       const policy = new GlobalWorkflowPolicy(
         settings({ global_workflow_allowed_repos: [{ pattern: 'myorg/*' }] }),
@@ -632,17 +513,6 @@ describe('GlobalWorkflowPolicy matches a dot-prefixed repository name', () => {
         false,
       );
     });
-
-    it("'myorg/*' elevates a dot-prefixed repo", async () => {
-      const policy = new GlobalWorkflowPolicy(
-        settings({ global_workflow_elevated_repos: [{ pattern: 'myorg/*' }] }),
-        CLUSTER_ON,
-        false,
-      );
-
-      expect(await policy.isElevatedAccessAllowed('github:42', DOT_REPO, ORG)).toBe(true);
-      expect(await policy.isElevatedAccessAllowed('github:42', 'otherorg/x', ORG)).toBe(false);
-    });
   });
 });
 
@@ -652,7 +522,6 @@ describe('GlobalWorkflowPolicy fails closed on a stored negation pattern', () =>
       customer_id: ORG,
       global_workflow_allowed_repos: null,
       global_workflow_denied_repos: null,
-      global_workflow_elevated_repos: null,
       ...over,
     });
   }
@@ -683,16 +552,6 @@ describe('GlobalWorkflowPolicy fails closed on a stored negation pattern', () =>
     // while denying everything else. Failing closed, it denies both.
     expect((await policy.isSourceRepoAllowed('github:1', 'myorg/x', ORG)).allowed).toBe(false);
     expect((await policy.isSourceRepoAllowed('github:1', 'myorg/y', ORG)).allowed).toBe(false);
-  });
-
-  it('an elevated-list negation entry grants nothing', async () => {
-    const policy = new GlobalWorkflowPolicy(
-      settings({ global_workflow_elevated_repos: [{ pattern: 'myorg/[^a]*' }] }),
-      CLUSTER_ON,
-      false,
-    );
-    expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/x', ORG)).toBe(false);
-    expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/abc', ORG)).toBe(false);
   });
 
   it('an allow-list negative lookahead grants nothing, not every repo but one', async () => {

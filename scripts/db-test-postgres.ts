@@ -123,7 +123,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
   // and the container is left running — the leak the CONTAINER_PREFIX comment
   // predicts. Reap old strays here, where the runtime is already resolved.
   // Purely best-effort: hygiene must never fail a test run, so every call goes
-  // through the module's nothrow `shell` and a failure is simply ignored.
+  // through the module's nothrow `shell` and a failure is ignored.
   const listed =
     await shell`${runtime} ps --filter ${`name=${CONTAINER_PREFIX}`} --format {{.Names}}`;
   if (listed.exitCode === 0) {

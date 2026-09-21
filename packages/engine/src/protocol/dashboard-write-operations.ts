@@ -423,21 +423,6 @@ export const DashboardWritePolicyState = z.enum(['permissive', 'encrypted', 'dis
 export type DashboardWritePolicyState = z.infer<typeof DashboardWritePolicyState>;
 
 /**
- * Coerce a single stored / on-the-wire policy value to a
- * {@link DashboardWritePolicyState}. Older orchestrators (and pre-migration
- * JSONB rows) carry the legacy boolean shape: `true` (enabled/permissive) and
- * `false` (disabled). New peers carry the enum string directly. This keeps the
- * protected wire + storage surfaces backward-compatible during the deprecation
- * window — a boolean is never rejected, it is translated.
- */
-export function coerceDashboardWritePolicyValue(value: unknown): DashboardWritePolicyState {
-  if (value === true) return 'permissive';
-  if (value === false) return 'disabled';
-  const parsed = DashboardWritePolicyState.safeParse(value);
-  return parsed.success ? parsed.data : 'permissive';
-}
-
-/**
  * Map of operation → posture. Omitted operations default to `permissive`.
  * The orch persists this shape verbatim as JSONB; the Platform mirrors it in
  * its per-org cache.
@@ -447,9 +432,8 @@ export type DashboardWritePolicyMap = Partial<
 >;
 
 /**
- * Validates a sparse policy map. Accepts BOTH the enum-string shape and the
- * legacy boolean shape (coerced), so an older orchestrator's boolean map and a
- * pre-migration JSONB row both parse. `encrypted` is rejected for any operation
+ * Validates a sparse policy map. Every value is a
+ * {@link DashboardWritePolicyState}; `encrypted` is rejected for any operation
  * whose sensitivity is not `plaintext` (nothing to seal without a plaintext
  * payload; the signing half that would cover authority/dispatch ops is a
  * separate feature). Use this where the value is required but may be empty
@@ -458,14 +442,7 @@ export type DashboardWritePolicyMap = Partial<
  * as `undefined` rather than being coerced to `{}`.
  */
 export const dashboardWritePolicyMap = z
-  .partialRecord(DashboardWriteOperation, z.union([z.boolean(), DashboardWritePolicyState]))
-  .transform((map) => {
-    const out: DashboardWritePolicyMap = {};
-    for (const [op, value] of Object.entries(map)) {
-      out[op as DashboardWriteOperation] = coerceDashboardWritePolicyValue(value);
-    }
-    return out;
-  })
+  .partialRecord(DashboardWriteOperation, DashboardWritePolicyState)
   .superRefine((map, ctx) => {
     for (const [op, state] of Object.entries(map)) {
       if (state !== 'encrypted') continue;
@@ -490,12 +467,7 @@ export function resolvePolicyState(
   policy: DashboardWritePolicyMap | null | undefined,
   op: DashboardWriteOperation,
 ): DashboardWritePolicyState {
-  const raw = policy?.[op];
-  if (raw === undefined) return 'permissive';
-  // Coerce defensively: a policy map that reached this resolver without going
-  // through the schema (e.g. a raw legacy-boolean map cached from an older
-  // orchestrator) must still resolve `false` → disabled, never fail-open.
-  return coerceDashboardWritePolicyValue(raw);
+  return policy?.[op] ?? 'permissive';
 }
 
 /**

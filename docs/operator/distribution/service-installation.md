@@ -98,6 +98,8 @@ kici-admin orchestrator start
 kici-admin orchestrator status --instance-dir ~/kici-deploy
 ```
 
+> **`sudo` with a version manager.** When node comes from a version manager such as nvm or mise, `sudo kici-admin …` fails with `command not found`: `sudo` resets `PATH` to its own `secure_path`, which does not include the version manager's install directory. Run the command without `sudo` and pass `--system`. The CLI refuses and prints the same command with the full paths of the node binary and the CLI script. Run that printed command.
+
 ### macOS (launchd)
 
 ```bash
@@ -606,7 +608,7 @@ See [Orchestrator setup — database](../orchestrator/orchestrator-setup.md#data
 
 ### Cluster upgrade order
 
-In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. A release that raises the protocol version alone changes nothing: the minimum stays where it is, so a node on the older version keeps connecting. Upgrade every node when a release raises the **minimum accepted** version — the release notes name both numbers. See [Coordinator-worker — upgrade procedure](../../architecture/clustering/coordinator-worker.md#upgrade-procedure) for the full sequence.
+In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. 0.9.0 raises it to 3, so a 0.8.x node (protocol 2) is refused by an upgraded peer until it is upgraded too. See [Coordinator-worker — upgrade procedure](../../architecture/clustering/coordinator-worker.md#upgrade-procedure) for the full sequence.
 
 ### Job recovery during upgrade
 

@@ -1,31 +1,23 @@
 import { describe, it, expect } from 'vitest';
 
-import { trustedContributorHoldReason, unknownContributorHoldReason } from './hold-reason.js';
+import * as holdReason from './hold-reason.js';
+import { trustedContributorHoldReason } from './hold-reason.js';
 
-describe('unknownContributorHoldReason', () => {
-  it('renders the trust gate sentence for a minimumTrust=known hold', () => {
-    expect(unknownContributorHoldReason('production')).toBe(
-      "Context 'production' requires known contributors (contributor is unknown)",
+describe('trustedContributorHoldReason', () => {
+  it('renders the trust gate sentence for a minimumTrust=trusted hold', () => {
+    expect(trustedContributorHoldReason('production', 'unknown')).toBe(
+      "Context 'production' requires trusted contributors (contributor is unknown)",
     );
   });
 
   it('interpolates the context name verbatim', () => {
-    expect(unknownContributorHoldReason('ci-security-env')).toBe(
-      "Context 'ci-security-env' requires known contributors (contributor is unknown)",
-    );
-  });
-});
-
-describe('trustedContributorHoldReason', () => {
-  it('renders the trust gate sentence for a minimumTrust=trusted hold', () => {
-    expect(trustedContributorHoldReason('production', 'known')).toBe(
-      "Context 'production' requires trusted contributors (contributor is known)",
+    expect(trustedContributorHoldReason('ci-security-env', 'unknown')).toBe(
+      "Context 'ci-security-env' requires trusted contributors (contributor is unknown)",
     );
   });
 
-  it('interpolates the contributor tier verbatim', () => {
-    expect(trustedContributorHoldReason('production', 'unknown')).toBe(
-      "Context 'production' requires trusted contributors (contributor is unknown)",
-    );
+  // fails-when: a second hold-reason template for a removed trust floor is exported again
+  it('is the only hold-reason template', () => {
+    expect(Object.keys(holdReason)).toEqual(['trustedContributorHoldReason']);
   });
 });

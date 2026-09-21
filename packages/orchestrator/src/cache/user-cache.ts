@@ -60,11 +60,36 @@ export type UserCacheOrgLimitsReader = (orgId: string) => Promise<UserCacheOrgLi
 /** Tarball suffix for committed cache entries. */
 const TAR_SUFFIX = '.tar.gz';
 
+/**
+ * Stem prefix of an in-flight upload, `.tmp-<uuid>.tar.gz`: the presigned PUT
+ * target a save lands on before commit copies it to its final key. Shared with
+ * the retired-layout classifier so both agree on what an upload looks like.
+ */
+export const TEMP_UPLOAD_STEM = '.tmp-';
+
+/** Whether a listed object is an in-flight upload rather than a cache entry. */
+function isTempUpload(key: string): boolean {
+  return key.slice(key.lastIndexOf('/') + 1).startsWith(TEMP_UPLOAD_STEM);
+}
+
 /** Matches a stem ending in the fixed-width discriminator this module appends. */
 const KEY_DISCRIMINATOR_TAIL = new RegExp(`^(.*)-([0-9a-f]{${KEY_DISCRIMINATOR_LENGTH}})$`);
 
 /**
- * Recover the reported cache key from a stored object's stem.
+ * Whether a listed object is a committed entry, `<stem>-<discriminator>.tar.gz`.
+ *
+ * This is the filter the `restoreKeys` prefix scan applies to a listing, and it
+ * is what keeps two other kinds of object out of a restore: an in-flight
+ * `.tmp-<uuid>.tar.gz` upload, which is a partial tarball until commit copies
+ * it to its final key, and an object under the retired un-discriminated layout,
+ * which nothing writes and which `kici-admin cache purge-legacy` removes.
+ */
+function isCommittedEntry(key: string): boolean {
+  return key.endsWith(TAR_SUFFIX) && KEY_DISCRIMINATOR_TAIL.test(key.slice(0, -TAR_SUFFIX.length));
+}
+
+/**
+ * Recover the reported cache key from a committed entry's stem.
  *
  * The value on this path is already the sanitized, lossy form, so this only
  * needs to undo the discriminator the key format appends. A stem that itself
@@ -75,30 +100,22 @@ function stripKeyDiscriminator(stem: string): string {
   return KEY_DISCRIMINATOR_TAIL.exec(stem)?.[1] ?? stem;
 }
 
-/** Device names NTFS reserves; a file cannot actually be created under one. */
-const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/;
-
-/** Keys that cannot have been part of a case collision in the old key format. */
-const UNAMBIGUOUS_LEGACY_KEY = /^[a-z0-9_][a-z0-9._-]*$/;
-
 /**
- * Whether a cache key is safe to look up in the pre-discriminator key format.
+ * Sanitize a path segment so a key can never escape its org/repo/scope
+ * namespace. Beyond stripping disallowed characters, a segment consisting
+ * only of dots (`.`, `..`, …) is replaced wholesale: such a segment is a
+ * dot-segment that HTTP/S3 path canonicalization collapses (`a/./b` → `a/b`,
+ * `a/../b` → `b`), which both corrupts the namespace and breaks the SigV4
+ * signature on a pre-signed PUT/GET. Repo identifiers like `.` (the internal
+ * provider's repo id) hit exactly this case, so the all-dots guard keeps the
+ * object key canonical and the namespace boundary intact.
  *
- * Every clause rules out a way the old format could have folded two distinct
- * keys onto one object:
- *
- * - the character class is a subset of what `seg()` preserves, so a match
- *   implies the key survives sanitization unchanged (no many-to-one rewrite)
- *   and is pure ASCII, which rules out HFS+ Unicode normalisation;
- * - requiring lowercase rules out case folding, the collision this change fixes;
- * - a trailing `.` is stripped by NTFS, and a reserved device name cannot be
- *   created there at all.
- *
- * A key failing any clause gets no legacy fallback — it is re-fetched
- * and re-saved under the discriminated key, which is always correct.
+ * Exported so an operator tool that addresses an org's prefix from a raw org id
+ * (`kici-admin cache purge-legacy --org`) lands on the segment the writer used.
  */
-function unambiguousLegacyKey(key: string): boolean {
-  return UNAMBIGUOUS_LEGACY_KEY.test(key) && !key.endsWith('.') && !WINDOWS_RESERVED_NAME.test(key);
+export function sanitizeSegment(s: string): string {
+  const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '_');
+  return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 
 /** Identifies the org + repo + write scope a cache operation targets. */
@@ -123,6 +140,64 @@ export interface UserCacheBeginSaveResult {
   skip: boolean;
   uploadUrl?: string;
   tempKey?: string;
+}
+
+/** Org-level prefix: the per-tenant isolation boundary and quota scope. */
+function orgPrefix(ref: UserCacheRef): string {
+  return `cache/${sanitizeSegment(ref.org)}/`;
+}
+
+/** Org + repo prefix shared by every scope of a repo. */
+function repoPrefix(ref: UserCacheRef): string {
+  return `${orgPrefix(ref)}${sanitizeSegment(ref.repo)}`;
+}
+
+/** Namespace prefix for the WRITE scope of a ref (shared OR per-run isolated). */
+function writePrefix(ref: UserCacheRef): string {
+  const base = repoPrefix(ref);
+  if (ref.scope === 'isolated') {
+    if (!ref.runId) throw new Error('isolated cache scope requires a runId');
+    return `${base}/iso/${sanitizeSegment(ref.runId)}/`;
+  }
+  return `${base}/shared/`;
+}
+
+/** Namespace prefixes the ref may READ, in priority order. Isolated reads its own run scope, then shared. */
+function readPrefixes(ref: UserCacheRef): string[] {
+  const base = repoPrefix(ref);
+  if (ref.scope === 'isolated') {
+    if (!ref.runId) throw new Error('isolated cache scope requires a runId');
+    return [`${base}/iso/${sanitizeSegment(ref.runId)}/`, `${base}/shared/`];
+  }
+  return [`${base}/shared/`];
+}
+
+/**
+ * Object key for a committed cache entry.
+ *
+ * The trailing discriminator is a hash of the EXACT cache key, and it is what
+ * keeps `build` and `Build` apart on a case-insensitive namespace — the
+ * filesystem backend on a macOS or Windows host, where the two would
+ * otherwise resolve to one object and a restore could return the other key's
+ * tarball.
+ *
+ * It is deliberately a SUFFIX: `restoreByPrefix` matches `restoreKeys` by
+ * string prefix, so appending leaves those semantics untouched. The only
+ * parse that has to know about it is the `matchedKey` slice.
+ */
+function finalKey(prefix: string, key: string): string {
+  return `${prefix}${sanitizeSegment(key)}-${keyDiscriminator(key)}${TAR_SUFFIX}`;
+}
+
+/**
+ * The object key a committed save under `key` lands on for this ref. This is
+ * the writer's own path — `beginSave` and `commitSave` address the entry
+ * through it — so anything that must recognise a current-layout key (the
+ * legacy-layout classifier tests) takes it from here rather than restating
+ * the format.
+ */
+export function userCacheEntryKey(ref: UserCacheRef, key: string): string {
+  return finalKey(writePrefix(ref), key);
 }
 
 export class UserCache {
@@ -174,119 +249,12 @@ export class UserCache {
     };
   }
 
-  /**
-   * Sanitize a path segment so a key can never escape its org/repo/scope
-   * namespace. Beyond stripping disallowed characters, a segment consisting
-   * only of dots (`.`, `..`, …) is replaced wholesale: such a segment is a
-   * dot-segment that HTTP/S3 path canonicalization collapses (`a/./b` → `a/b`,
-   * `a/../b` → `b`), which both corrupts the namespace and breaks the SigV4
-   * signature on a pre-signed PUT/GET. Repo identifiers like `.` (the internal
-   * provider's repo id) hit exactly this case, so the all-dots guard keeps the
-   * object key canonical and the namespace boundary intact.
-   */
-  private seg(s: string): string {
-    const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '_');
-    return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
-  }
-
-  /** Org-level prefix: the per-tenant isolation boundary and quota scope. */
-  private orgPrefix(ref: UserCacheRef): string {
-    return `cache/${this.seg(ref.org)}/`;
-  }
-
-  /** Org + repo prefix shared by every scope of a repo. */
-  private repoPrefix(ref: UserCacheRef): string {
-    return `${this.orgPrefix(ref)}${this.seg(ref.repo)}`;
-  }
-
-  /** Namespace prefix for the WRITE scope of a ref (shared OR per-run isolated). */
-  private writePrefix(ref: UserCacheRef): string {
-    const base = this.repoPrefix(ref);
-    if (ref.scope === 'isolated') {
-      if (!ref.runId) throw new Error('isolated cache scope requires a runId');
-      return `${base}/iso/${this.seg(ref.runId)}/`;
-    }
-    return `${base}/shared/`;
-  }
-
-  /** Namespace prefixes the ref may READ, in priority order. Isolated reads its own run scope, then shared. */
-  private readPrefixes(ref: UserCacheRef): string[] {
-    const base = this.repoPrefix(ref);
-    if (ref.scope === 'isolated') {
-      if (!ref.runId) throw new Error('isolated cache scope requires a runId');
-      return [`${base}/iso/${this.seg(ref.runId)}/`, `${base}/shared/`];
-    }
-    return [`${base}/shared/`];
-  }
-
-  /**
-   * Object key for a committed cache entry.
-   *
-   * The trailing discriminator is a hash of the EXACT cache key, and it is what
-   * keeps `build` and `Build` apart on a case-insensitive namespace — the
-   * filesystem backend on a macOS or Windows host, where the two would
-   * otherwise resolve to one object and a restore could return the other key's
-   * tarball.
-   *
-   * It is deliberately a SUFFIX: `restoreByPrefix` matches `restoreKeys` by
-   * string prefix, so appending leaves those semantics untouched. The only
-   * parse that has to know about it is the `matchedKey` slice.
-   */
-  private finalKey(prefix: string, key: string): string {
-    return `${prefix}${this.seg(key)}-${keyDiscriminator(key)}${TAR_SUFFIX}`;
-  }
-
-  /**
-   * The pre-discriminator object key.
-   *
-   * @deprecated Read-only compatibility path for entries written before the key
-   * carried a discriminator. Nothing writes this format; it is removed at the
-   * next major, by which point every such entry has aged out of the cache TTL.
-   */
-  private legacyFinalKey(prefix: string, key: string): string {
-    return `${prefix}${this.seg(key)}${TAR_SUFFIX}`;
-  }
-
-  /**
-   * Restore an entry still stored in the pre-discriminator key format.
-   *
-   * Two gates, and BOTH are load-bearing — dropping either re-creates the
-   * wrong-cache-hit this change fixes:
-   *
-   * 1. `unambiguousLegacyKey` statically rules out any key that could have
-   *    collided with a case variant in the old format.
-   * 2. The listed name must match byte-exactly. A case-insensitive backend
-   *    resolves `getUrl('build')` to an object created as `Build`, but its
-   *    *listing* reports the real created name — so comparing against the
-   *    listing is what detects that the object is not really ours.
-   *
-   * @deprecated Removed at the next major; see `legacyFinalKey`.
-   */
-  private async restoreLegacyExact(
-    ref: UserCacheRef & { key: string },
-    prefix: string,
-    ttlMs: number,
-  ): Promise<UserCacheRestoreResult | null> {
-    if (!unambiguousLegacyKey(ref.key)) return null;
-    const legacyKey = this.legacyFinalKey(prefix, ref.key);
-    if (!(await this.storage.list(prefix)).includes(legacyKey)) return null;
-    const url = await this.storage.getUrl(legacyKey, ttlMs);
-    if (!url) return null;
-    await this.storage.touch(legacyKey);
-    return {
-      hit: true,
-      matchedKey: ref.key,
-      downloadUrl: url,
-      tarHash: await this.readHash(legacyKey),
-    };
-  }
-
   /** Restore: try the exact key across read prefixes, then restoreKeys prefix scan (newest wins). */
   async restore(
     ref: UserCacheRef & { key: string; restoreKeys?: string[] },
   ): Promise<UserCacheRestoreResult> {
     const { ttlMs } = await this.resolveLimits(ref.org);
-    const prefixes = this.readPrefixes(ref);
+    const prefixes = readPrefixes(ref);
     const exact = await this.restoreExact(ref, prefixes, ttlMs);
     if (exact) return exact;
     return (await this.restoreByPrefix(ref, prefixes, ttlMs)) ?? { hit: false };
@@ -299,7 +267,7 @@ export class UserCache {
     ttlMs: number,
   ): Promise<UserCacheRestoreResult | null> {
     for (const prefix of prefixes) {
-      const key = this.finalKey(prefix, ref.key);
+      const key = finalKey(prefix, ref.key);
       const url = await this.storage.getUrl(key, ttlMs);
       if (url) {
         await this.storage.touch(key);
@@ -310,10 +278,6 @@ export class UserCache {
           tarHash: await this.readHash(key),
         };
       }
-      // Fall back to the pre-discriminator format within this same prefix, so
-      // scope priority (isolated before shared) still dominates key format.
-      const legacy = await this.restoreLegacyExact(ref, prefix, ttlMs);
-      if (legacy) return legacy;
     }
     return null;
   }
@@ -326,8 +290,8 @@ export class UserCache {
   ): Promise<UserCacheRestoreResult | null> {
     for (const rk of ref.restoreKeys ?? []) {
       for (const prefix of prefixes) {
-        const matches = (await this.storage.list(`${prefix}${this.seg(rk)}`)).filter((k) =>
-          k.endsWith(TAR_SUFFIX),
+        const matches = (await this.storage.list(`${prefix}${sanitizeSegment(rk)}`)).filter(
+          isCommittedEntry,
         );
         if (matches.length === 0) continue;
         const winner = matches[0]; // newest-first
@@ -343,13 +307,12 @@ export class UserCache {
 
   /** Begin a save: presigned PUT to a temp key, or skip=true when the immutable key exists. */
   async beginSave(ref: UserCacheRef & { key: string }): Promise<UserCacheBeginSaveResult> {
-    const prefix = this.writePrefix(ref);
-    const final = this.finalKey(prefix, ref.key);
+    const final = userCacheEntryKey(ref, ref.key);
     if (await this.storage.has(final)) {
       logger.info('user-cache save skipped (immutable key exists)', { key: ref.key });
       return { skip: true };
     }
-    const tempKey = `${prefix}.tmp-${randomUUID()}${TAR_SUFFIX}`;
+    const tempKey = `${writePrefix(ref)}${TEMP_UPLOAD_STEM}${randomUUID()}${TAR_SUFFIX}`;
     const uploadUrl = await this.storage.getUploadUrl(tempKey);
     return { skip: false, uploadUrl, tempKey };
   }
@@ -358,8 +321,7 @@ export class UserCache {
   async commitSave(
     ref: UserCacheRef & { key: string; tarHash: string; sizeBytes: number; tempKey?: string },
   ): Promise<void> {
-    const prefix = this.writePrefix(ref);
-    const final = this.finalKey(prefix, ref.key);
+    const final = userCacheEntryKey(ref, ref.key);
     if (await this.storage.has(final)) return; // race: someone committed first — immutable no-op
     if (ref.tempKey) {
       await this.storage.copy(ref.tempKey, final);
@@ -377,11 +339,20 @@ export class UserCache {
     return data?.toString('utf-8') || undefined;
   }
 
-  /** Evict least-recently-used entries for the org until total tarball size <= the per-org quota. */
+  /**
+   * Evict least-recently-used entries for the org until total tarball size <= the per-org quota.
+   *
+   * An in-flight `.tmp-` upload is never a candidate. A presigned PUT carries
+   * no metadata, so it would rank oldest and be reclaimed first — freeing
+   * nothing, since it has no `.size` — and the concurrent commit would then
+   * fail on its copy to the final key. Retired un-discriminated entries stay
+   * in the set: they hold accounted bytes and are evictable like any other.
+   */
   private async enforceQuota(ref: UserCacheRef): Promise<void> {
     const { quotaBytes } = await this.resolveLimits(ref.org);
-    const orgPrefix = this.orgPrefix(ref);
-    const keys = (await this.storage.list(orgPrefix)).filter((k) => k.endsWith(TAR_SUFFIX));
+    const keys = (await this.storage.list(orgPrefix(ref))).filter(
+      (k) => k.endsWith(TAR_SUFFIX) && !isTempUpload(k),
+    );
     const sized: { key: string; size: number }[] = [];
     let total = 0;
     for (const k of keys) {

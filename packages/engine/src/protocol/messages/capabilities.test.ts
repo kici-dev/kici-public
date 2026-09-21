@@ -101,7 +101,7 @@ describe('platformCapabilitiesSchema', () => {
   });
 
   it('accepts the known flags', () => {
-    const caps = { orchMetrics: true, oidcMint: false };
+    const caps = { orchMetrics: true };
     expect(platformCapabilitiesSchema.parse(caps)).toEqual(caps);
   });
 
@@ -116,9 +116,10 @@ describe('platformCapabilitiesSchema', () => {
 });
 
 describe('PLATFORM_CAPABILITIES', () => {
-  it('advertises orchMetrics and oidcMint', () => {
+  it('advertises orchMetrics and no mint capability', () => {
+    // fails-when: the Platform advertises the removed `oidcMint` RPC again.
     expect(PLATFORM_CAPABILITIES.orchMetrics).toBe(true);
-    expect(PLATFORM_CAPABILITIES.oidcMint).toBe(true);
+    expect(PLATFORM_CAPABILITIES).not.toHaveProperty('oidcMint');
   });
 
   it('is frozen', () => {

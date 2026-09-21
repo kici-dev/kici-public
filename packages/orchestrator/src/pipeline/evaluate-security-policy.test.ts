@@ -31,8 +31,6 @@ function depsWith(store: unknown): ProcessingDeps {
 function storedRow(forkPolicy: string) {
   return {
     forkPolicy,
-    unknownContributorPolicy: 'hold',
-    workflowChangePolicy: 'hold',
     // Deliberately hours-only: a stored row that predates the seconds column
     // reads NULL there, so the gate must still resolve a 72-hour window from
     // the hours field rather than inventing the default.
@@ -46,7 +44,7 @@ const BASE = {
   isPREvent: true,
   resolvedOrgId: 'org-1',
   mode: 'platform' as const,
-  trustResolution: { tier: 'known' } as never,
+  trustResolution: { tier: 'unknown' } as never,
   isForkPR: false,
 };
 

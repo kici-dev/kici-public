@@ -19,8 +19,6 @@ const TEST_DB = `kici_trustpolicy_test_${process.pid}_${Date.now()}`;
 
 const POLICY: TrustPolicy = {
   forkPolicy: 'hold',
-  unknownContributorPolicy: 'reject',
-  workflowChangePolicy: 'allow',
   approvalExpiryHours: 48,
 };
 
@@ -84,14 +82,14 @@ describeDb('TrustPolicyStore', () => {
 
   it('a second push overwrites rather than duplicating the org row', async () => {
     await store.upsertFromPlatform('org-1', POLICY);
-    await store.upsertFromPlatform('org-1', { ...POLICY, forkPolicy: 'reject' });
+    await store.upsertFromPlatform('org-1', { ...POLICY, forkPolicy: 'ignore' });
     const rows = await db
       .selectFrom('org_trust_policy')
       .selectAll()
       .where('customer_id', '=', 'org-1')
       .execute();
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.fork_policy).toBe('reject');
+    expect(rows[0]!.fork_policy).toBe('ignore');
   });
 
   it('a platform push overwrites a local write (the Platform is the authority)', async () => {
@@ -106,8 +104,6 @@ describeDb('TrustPolicyStore', () => {
     await store.upsertLocal('org-1', { forkPolicy: 'allow' });
     expect(await store.get('org-1')).toMatchObject({
       forkPolicy: 'allow',
-      unknownContributorPolicy: DEFAULT_TRUST_POLICY.unknownContributorPolicy,
-      workflowChangePolicy: DEFAULT_TRUST_POLICY.workflowChangePolicy,
       approvalExpiryHours: DEFAULT_TRUST_POLICY.approvalExpiryHours,
     });
   });
@@ -117,8 +113,6 @@ describeDb('TrustPolicyStore', () => {
     await store.upsertLocal('org-1', { approvalExpiryHours: 6 });
     expect(await store.get('org-1')).toMatchObject({
       forkPolicy: POLICY.forkPolicy,
-      unknownContributorPolicy: POLICY.unknownContributorPolicy,
-      workflowChangePolicy: POLICY.workflowChangePolicy,
       approvalExpiryHours: 6,
       source: TrustPolicySource.enum.local,
     });
@@ -156,9 +150,8 @@ describeDb('TrustPolicyStore', () => {
     // with 72.
     await sql`
       INSERT INTO org_trust_policy
-        (customer_id, fork_policy, unknown_contributor_policy,
-         workflow_change_policy, approval_expiry_hours, source)
-      VALUES ('org-legacy', 'hold', 'hold', 'hold', 5, 'platform')
+        (customer_id, fork_policy, approval_expiry_hours, source)
+      VALUES ('org-legacy', 'hold', 5, 'platform')
     `.execute(db);
     const stored = await store.get('org-legacy');
     expect(stored!.approvalExpirySeconds).toBe(5 * 3600);
@@ -194,9 +187,9 @@ describeDb('TrustPolicyStore', () => {
 
   it('keeps orgs isolated from one another', async () => {
     await store.upsertFromPlatform('org-1', POLICY);
-    await store.upsertFromPlatform('org-2', { ...POLICY, forkPolicy: 'reject' });
+    await store.upsertFromPlatform('org-2', { ...POLICY, forkPolicy: 'ignore' });
     expect((await store.get('org-1'))!.forkPolicy).toBe('hold');
-    expect((await store.get('org-2'))!.forkPolicy).toBe('reject');
+    expect((await store.get('org-2'))!.forkPolicy).toBe('ignore');
   });
 
   it('reads back a policy value it does not know the vocabulary for', async () => {
@@ -204,9 +197,8 @@ describeDb('TrustPolicyStore', () => {
     // Platform must still be readable rather than failing the row.
     await sql`
       INSERT INTO org_trust_policy
-        (customer_id, fork_policy, unknown_contributor_policy,
-         workflow_change_policy, approval_expiry_hours, source)
-      VALUES ('org-future', 'quarantine', 'hold', 'hold', 72, 'platform')
+        (customer_id, fork_policy, approval_expiry_hours, source)
+      VALUES ('org-future', 'quarantine', 72, 'platform')
     `.execute(db);
     expect((await store.get('org-future'))!.forkPolicy).toBe('quarantine');
   });

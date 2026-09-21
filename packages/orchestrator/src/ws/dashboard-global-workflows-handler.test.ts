@@ -64,7 +64,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         enabled: false,
         allowedRepos: null,
         deniedRepos: null,
-        elevatedRepos: null,
       });
       expect('routingKey' in msg.settings).toBe(false);
     });
@@ -102,7 +101,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
           customer_id: ORG,
           global_workflow_allowed_repos: [{ pattern: 'myorg/ci-*' }],
           global_workflow_denied_repos: null,
-          global_workflow_elevated_repos: [{ routingKey: 'github:42', pattern: 'myorg/ci-deploy' }],
           created_at: now,
           updated_at: now,
         },
@@ -111,9 +109,9 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       const msg = sent[0] as any;
       expect(msg.settings.enabled).toBe(true);
       expect(msg.settings.allowedRepos).toEqual([{ pattern: 'myorg/ci-*' }]);
-      expect(msg.settings.elevatedRepos).toEqual([
-        { routingKey: 'github:42', pattern: 'myorg/ci-deploy' },
-      ]);
+      // fails-when: the removed elevated list is projected again — the strict
+      // wire schema on the Platform would refuse the whole response.
+      expect(msg.settings).not.toHaveProperty('elevatedRepos');
       expect(msg.settings.createdAt).toBe('2026-04-17T10:00:00.000Z');
     });
 
@@ -140,7 +138,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'myorg/blocked-*' }],
-        global_workflow_elevated_repos: null,
         created_at: new Date('2026-04-17T10:00:00Z'),
         updated_at: new Date('2026-04-17T10:00:00Z'),
       };
@@ -189,18 +186,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       expect(mocks.insertInto).not.toHaveBeenCalled();
     });
 
-    it('refuses a negated entry on the elevated list', async () => {
-      const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: undefined });
-      await handler.handleMessage({
-        type: 'dashboard.global-workflows.update',
-        requestId: 'req-elev',
-        actor: ACTOR,
-        elevatedRepos: [{ pattern: 'myorg/[^a]*' }],
-      });
-      expect((sent.at(-1) as any).error).toContain('myorg/[^a]*');
-      expect(mocks.insertInto).not.toHaveBeenCalled();
-    });
-
     it('accepts ordinary globs, including a dot-prefixed repo name', async () => {
       const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: undefined });
       await handler.handleMessage({
@@ -237,7 +222,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       customer_id: ORG,
       global_workflow_allowed_repos: [{ pattern: 'myorg/*' }],
       global_workflow_denied_repos: null,
-      global_workflow_elevated_repos: [{ pattern: 'myorg/deployer' }],
       created_at: new Date(),
       updated_at: new Date(),
     } as unknown as OrgSettings;
@@ -250,7 +234,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       expect(patch).toEqual({
         allowedRepos: [{ pattern: 'myorg/*' }],
         deniedRepos: null,
-        elevatedRepos: [{ pattern: 'myorg/deployer' }],
       });
     });
 
@@ -299,7 +282,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       expect(patch).toEqual({
         allowedRepos: null,
         deniedRepos: null,
-        elevatedRepos: null,
       });
     });
   });
@@ -312,7 +294,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         global_workflow_denied_repos: [
           { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/blocked-*' },
         ],
-        global_workflow_elevated_repos: null,
         created_at: new Date(),
         updated_at: new Date(),
       } as unknown as OrgSettings;
@@ -331,7 +312,6 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         enabled: false,
         allowedRepos: null,
         deniedRepos: null,
-        elevatedRepos: null,
         createdAt: null,
         updatedAt: null,
       });

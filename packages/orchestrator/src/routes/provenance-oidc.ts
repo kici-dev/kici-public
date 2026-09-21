@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { OrchestratorSigningKeyRepo } from '../db/repos/signing-keys-repo.js';
 import type { DashboardEncryptionKeyRepo } from '../db/repos/dashboard-encryption-keys-repo.js';
+import { ID_TOKEN_CLAIM_NAMES } from '../oidc/id-token-claims.js';
 
 /** OIDC discovery document for the orchestrator provenance issuer. */
 export interface OpenidConfiguration {
@@ -21,20 +22,7 @@ export function buildOpenidConfiguration(issuer: string): OpenidConfiguration {
     id_token_signing_alg_values_supported: ['ES256'],
     response_types_supported: ['id_token'],
     subject_types_supported: ['public'],
-    claims_supported: [
-      'iss',
-      'sub',
-      'aud',
-      'exp',
-      'iat',
-      'jti',
-      'kici_run_id',
-      'kici_job_id',
-      'repository',
-      'ref',
-      'sha',
-      'workflow_ref',
-    ],
+    claims_supported: [...ID_TOKEN_CLAIM_NAMES],
   };
 }
 

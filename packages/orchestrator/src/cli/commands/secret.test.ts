@@ -294,26 +294,27 @@ describe('kici-admin secret CLI', () => {
 
   // ── scopes / list / delete (already existing, minimal coverage) ──────────
   describe('scopes / list / delete', () => {
-    it('scopes prints each scope', async () => {
-      const client = makeMockClient();
-      client.listScopes.mockResolvedValue({ scopes: ['staging', 'production'] });
-      const { stdout, exitCode } = await runCommand(['secret', 'scopes', 'org-1'], client);
-      expect(exitCode).toBeNull();
-      expect(client.listScopes).toHaveBeenCalledWith('org-1', false);
-      expect(stdout).toContain('staging');
-      expect(stdout).toContain('production');
-    });
-
-    it('scopes --all-backends asks for the cross-backend listing', async () => {
+    it("scopes prints every backend's scopes in qualified form", async () => {
       const client = makeMockClient();
       client.listScopes.mockResolvedValue({ scopes: ['pg:staging', 'vault:aws/prod'] });
-      const { stdout, exitCode } = await runCommand(
-        ['secret', 'scopes', 'org-1', '--all-backends'],
-        client,
-      );
+      const { stdout, exitCode } = await runCommand(['secret', 'scopes', 'org-1'], client);
       expect(exitCode).toBeNull();
-      expect(client.listScopes).toHaveBeenCalledWith('org-1', true);
+      // breaks-if-wrong: the listing must still reach the client with only the org.
+      expect(client.listScopes).toHaveBeenCalledWith('org-1');
+      expect(stdout).toContain('pg:staging');
       expect(stdout).toContain('vault:aws/prod');
+    });
+
+    // fails-when: the option is registered again. Every backend is listed by
+    //   default, so there is nothing left for the flag to opt into.
+    it('scopes refuses the removed --all-backends flag', async () => {
+      const program = new Command();
+      program.exitOverride();
+      program.configureOutput({ writeErr: () => {} });
+      registerSecretCommands(program, () => makeMockClient() as any);
+      await expect(
+        program.parseAsync(['secret', 'scopes', 'org-1', '--all-backends'], { from: 'user' }),
+      ).rejects.toThrow(/unknown option '--all-backends'/);
     });
 
     it('list prints each key', async () => {

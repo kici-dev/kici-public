@@ -29,59 +29,48 @@ const PR_SUBJECT = 'repo:acme/app:pull_request';
 
 describe('buildIdTokenSubject — subject_trigger_event', () => {
   const cases: ReadonlyArray<
-    readonly [
-      label: string,
-      run: Partial<EventClaimSource>,
-      expected: string,
-      expectedUnderLegacy: string,
-    ]
+    readonly [label: string, run: Partial<EventClaimSource>, expected: string]
   > = [
     [
       'a first-run pull request keeps the pull-request shape',
       { trigger_event: 'pull_request:opened' },
       PR_SUBJECT,
-      BRANCH_SUBJECT,
     ],
     [
       'a re-run of a pull request presents the pull-request shape',
       { trigger_event: 'rerun', subject_trigger_event: 'pull_request:opened' },
       PR_SUBJECT,
-      BRANCH_SUBJECT,
     ],
     [
       'a legacy re-run row, with no inherited event, keeps the branch shape',
       { trigger_event: 'rerun', subject_trigger_event: null },
-      BRANCH_SUBJECT,
       BRANCH_SUBJECT,
     ],
     [
       'a re-run of a push keeps the branch shape',
       { trigger_event: 'rerun', subject_trigger_event: 'push' },
       BRANCH_SUBJECT,
-      BRANCH_SUBJECT,
     ],
     [
       'the inherited event is authoritative when set',
       { trigger_event: 'push', subject_trigger_event: 'pull_request:opened' },
       PR_SUBJECT,
-      BRANCH_SUBJECT,
     ],
-    [
-      'a plain push keeps the branch shape',
-      { trigger_event: 'push' },
-      BRANCH_SUBJECT,
-      BRANCH_SUBJECT,
-    ],
+    ['a plain push keeps the branch shape', { trigger_event: 'push' }, BRANCH_SUBJECT],
   ];
 
   it.each(cases)('%s', (_label, run, expected) => {
     expect(buildIdTokenSubject({ ...BASE, ...run })).toBe(expected);
   });
 
-  it.each(cases)('%s — under the legacy escape hatch', (_label, run, _expected, underLegacy) => {
-    expect(buildIdTokenSubject({ ...BASE, ...run }, { legacyPullRequestSubject: true })).toBe(
-      underLegacy,
-    );
+  it('has no legacy pull-request subject escape hatch', () => {
+    // fails-when: the removed `legacyPullRequestSubject` option is accepted
+    // again and restores the colliding branch-shaped subject for a PR.
+    const run = { ...BASE, trigger_event: 'pull_request:opened' };
+    expect(
+      // @ts-expect-error — the option no longer exists.
+      buildIdTokenSubject(run, { legacyPullRequestSubject: true }),
+    ).toBe(PR_SUBJECT);
   });
 
   it('gives a re-run of a pull request a different subject from a re-run of a push', () => {

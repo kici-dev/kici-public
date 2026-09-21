@@ -14,13 +14,14 @@
  * guards what the gate actually does at runtime.
  */
 import { describe, it, expect, vi } from 'vitest';
+import type { DashboardWritePolicyMap } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
   DashboardContextHandler,
   type DashboardContextHandlerDeps,
 } from '../ws/dashboard-context-handler.js';
 import { invalidateDashboardWritePolicyCache } from './dashboard-write-policy.js';
 
-function buildDepsWithDisabledPolicy(disabled: Record<string, boolean>): {
+function buildDepsWithDisabledPolicy(disabled: DashboardWritePolicyMap): {
   deps: DashboardContextHandlerDeps;
   sent: unknown[];
   setSecret: ReturnType<typeof vi.fn>;
@@ -61,7 +62,7 @@ function buildDepsWithDisabledPolicy(disabled: Record<string, boolean>): {
 describe('orch-side dashboard-write policy gate (behaviour)', () => {
   it('short-circuits secrets.set when policy has the op disabled', async () => {
     invalidateDashboardWritePolicyCache();
-    const { deps, sent, setSecret } = buildDepsWithDisabledPolicy({ 'secrets.set': false });
+    const { deps, sent, setSecret } = buildDepsWithDisabledPolicy({ 'secrets.set': 'disabled' });
     const handler = new DashboardContextHandler(deps);
 
     await handler.handleMessage({
@@ -86,7 +87,7 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
   it('short-circuits secrets.delete when policy has the op disabled', async () => {
     invalidateDashboardWritePolicyCache();
     const { deps, sent, deleteSecret } = buildDepsWithDisabledPolicy({
-      'secrets.delete': false,
+      'secrets.delete': 'disabled',
     });
     const handler = new DashboardContextHandler(deps);
 

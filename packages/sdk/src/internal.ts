@@ -15,10 +15,10 @@
  * dual-shape window — for a function no customer ever called. Every internal
  * refactor of the runtime would pay the public-API tax forever.
  *
- * Each symbol also stays on the root barrel, marked `@deprecated`, for the whole
- * 0.x line. The agent resolves the customer's own SDK copy at run time
- * (`workflow-loader.ts`), so a tree carrying an SDK older than this subpath must
- * keep working.
+ * These symbols live only here. The agent and the compiler test runner resolve
+ * the customer's own SDK copy at run time (`workflow-loader.ts`,
+ * `job-executor.ts`) through this subpath, so an SDK that predates it cannot
+ * drive a workflow on a current agent.
  *
  * Do not import this from a workflow. It carries no compatibility promise and
  * may change shape in any release.

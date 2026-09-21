@@ -52,7 +52,7 @@ import type { ActorPrincipal, OrchestratorMode } from '@kici-dev/engine';
 
 interface FakeRow {
   customer_id: string;
-  dashboard_write_policy: Record<string, boolean>;
+  dashboard_write_policy: Record<string, string>;
 }
 
 /**
@@ -62,7 +62,7 @@ interface FakeRow {
  * spinning up Postgres for a unit test.
  */
 function makeFakeDb(initialRows: FakeRow[] = []) {
-  const rows = new Map<string, Record<string, boolean>>();
+  const rows = new Map<string, Record<string, string>>();
   for (const row of initialRows) {
     rows.set(row.customer_id, { ...row.dashboard_write_policy });
   }
@@ -72,7 +72,7 @@ function makeFakeDb(initialRows: FakeRow[] = []) {
       const policy = rows.get(customerId);
       return policy === undefined ? undefined : { dashboard_write_policy: policy };
     },
-    upsert(customerId: string, policy: Record<string, boolean>) {
+    upsert(customerId: string, policy: Record<string, string>) {
       rows.set(customerId, { ...policy });
     },
     get(customerId: string) {
@@ -194,7 +194,7 @@ describe('getDashboardWritePolicy', () => {
 
   it('returns the persisted policy for a known customer', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     const policy = await getDashboardWritePolicy(db, 'customer-1');
     expect(policy).toEqual({ 'secrets.set': 'disabled' });
@@ -204,7 +204,7 @@ describe('getDashboardWritePolicy', () => {
     const { db } = makeFakeDb([
       {
         customer_id: 'customer-1',
-        dashboard_write_policy: { 'unknown.op': false } as unknown as Record<string, boolean>,
+        dashboard_write_policy: { 'unknown.op': 'disabled' },
       },
     ]);
     const policy = await getDashboardWritePolicy(db, 'customer-1');
@@ -220,14 +220,14 @@ describe('isDashboardWriteEnabled', () => {
 
   it('returns false when explicitly disabled', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     expect(await isDashboardWriteEnabled(db, 'customer-1', 'secrets.set')).toBe(false);
   });
 
   it('returns true for unrelated operations when one is disabled', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     expect(await isDashboardWriteEnabled(db, 'customer-1', 'held_runs.approve')).toBe(true);
   });
@@ -243,7 +243,7 @@ describe('assertDashboardWriteAllowed', () => {
 
   it('throws DashboardWritePolicyDisabledError when disabled', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     await expect(
       assertDashboardWriteAllowed(db, 'customer-1', 'secrets.set'),
@@ -252,7 +252,7 @@ describe('assertDashboardWriteAllowed', () => {
 
   it('error carries the operation + cliEquivalent hint', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     try {
       await assertDashboardWriteAllowed(db, 'customer-1', 'secrets.set');
@@ -278,7 +278,7 @@ describe('setDashboardWritePolicy', () => {
     const { db, handle } = makeFakeDb([
       {
         customer_id: 'customer-1',
-        dashboard_write_policy: { 'secrets.set': false, 'variables.set': false },
+        dashboard_write_policy: { 'secrets.set': 'disabled', 'variables.set': 'disabled' },
       },
     ]);
     await setDashboardWritePolicy(
@@ -296,7 +296,7 @@ describe('setDashboardWritePolicy', () => {
       setDashboardWritePolicy(
         db,
         'customer-1',
-        { 'bogus.op': false } as unknown as Parameters<typeof setDashboardWritePolicy>[2],
+        { 'bogus.op': 'disabled' } as unknown as Parameters<typeof setDashboardWritePolicy>[2],
         { actor, mode },
       ),
     ).rejects.toThrow();
@@ -304,7 +304,7 @@ describe('setDashboardWritePolicy', () => {
 
   it('no-ops (no DB write, no audit, no event) when nothing changes', async () => {
     const { db, handle } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     const onChange = vi.fn().mockResolvedValue(undefined);
     const eventSpy = vi.fn();
@@ -313,7 +313,7 @@ describe('setDashboardWritePolicy', () => {
     await setDashboardWritePolicy(
       db,
       'customer-1',
-      { 'secrets.set': false },
+      { 'secrets.set': 'disabled' },
       { actor, mode, onChange },
     );
     expect(handle.get('customer-1')).toEqual(beforeUpsert);
@@ -327,7 +327,7 @@ describe('setDashboardWritePolicy', () => {
     await setDashboardWritePolicy(
       db,
       'customer-1',
-      { 'secrets.set': false, 'variables.set': false, 'held_runs.approve': false },
+      { 'secrets.set': 'disabled', 'variables.set': 'disabled', 'held_runs.approve': 'disabled' },
       { actor, mode, onChange },
     );
     expect(onChange).toHaveBeenCalledTimes(3);
@@ -349,7 +349,7 @@ describe('setDashboardWritePolicy', () => {
     const { db } = makeFakeDb();
     const eventSpy = vi.fn();
     dashboardWritePolicyEvents.on('changed', eventSpy);
-    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': false }, { actor, mode });
+    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': 'disabled' }, { actor, mode });
     expect(eventSpy).toHaveBeenCalledOnce();
     const arg = eventSpy.mock.calls[0]?.[0] as { customerId: string; policy: unknown };
     expect(arg.customerId).toBe('customer-1');
@@ -376,7 +376,7 @@ describe('setDashboardWritePolicy', () => {
 
   it('does not notify when nothing changed', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     await setDashboardWritePolicy(
       db,
@@ -390,7 +390,7 @@ describe('setDashboardWritePolicy', () => {
   it('invalidates the cache so subsequent reads pick up the change', async () => {
     const { db } = makeFakeDb();
     await getDashboardWritePolicy(db, 'customer-1');
-    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': false }, { actor, mode });
+    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': 'disabled' }, { actor, mode });
     expect(await getDashboardWritePolicy(db, 'customer-1')).toEqual({ 'secrets.set': 'disabled' });
   });
 });
@@ -400,7 +400,7 @@ describe('resetDashboardWritePolicy', () => {
     const { db, handle } = makeFakeDb([
       {
         customer_id: 'customer-1',
-        dashboard_write_policy: { 'secrets.set': false, 'variables.set': false },
+        dashboard_write_policy: { 'secrets.set': 'disabled', 'variables.set': 'disabled' },
       },
     ]);
     const next = await resetDashboardWritePolicy(db, 'customer-1', { actor, mode });
@@ -421,7 +421,7 @@ describe('resetDashboardWritePolicy', () => {
   // and must stay usable as the way OUT of one.
   it('is permitted on a Platform-attached orchestrator even when a held-run write is disabled', async () => {
     const { db, handle } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': 'disabled' } },
     ]);
     await resetDashboardWritePolicy(db, 'customer-1', { actor, mode: 'platform' });
     expect(handle.get('customer-1')).toEqual({});
@@ -523,7 +523,7 @@ describe('held-run lockout refusal', () => {
   // possible on the very orchestrator the refusal guards.
   it('permits re-enabling a held-run write on a Platform-attached orchestrator', async () => {
     const { db, handle } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': 'disabled' } },
     ]);
     await setDashboardWritePolicy(
       db,
@@ -538,8 +538,8 @@ describe('held-run lockout refusal', () => {
 describe('findHeldRunLockouts', () => {
   it('reports an org already locked out on a Platform-attached orchestrator', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': false } },
-      { customer_id: 'customer-2', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': 'disabled' } },
+      { customer_id: 'customer-2', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     expect(await findHeldRunLockouts(db, 'platform')).toEqual([
       { customerId: 'customer-1', operations: ['held_runs.approve'] },
@@ -548,7 +548,7 @@ describe('findHeldRunLockouts', () => {
 
   it('reports nothing on an independent orchestrator, where the CLI can answer', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': false } },
+      { customer_id: 'customer-1', dashboard_write_policy: { 'held_runs.approve': 'disabled' } },
     ]);
     expect(await findHeldRunLockouts(db, 'independent')).toEqual([]);
   });
@@ -576,8 +576,8 @@ describe('resolveFullPolicyView', () => {
 describe('cache invalidation', () => {
   it('clears all entries when customerId is omitted', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'c-a', dashboard_write_policy: { 'secrets.set': false } },
-      { customer_id: 'c-b', dashboard_write_policy: { 'variables.set': false } },
+      { customer_id: 'c-a', dashboard_write_policy: { 'secrets.set': 'disabled' } },
+      { customer_id: 'c-b', dashboard_write_policy: { 'variables.set': 'disabled' } },
     ]);
     await getDashboardWritePolicy(db, 'c-a');
     await getDashboardWritePolicy(db, 'c-b');
@@ -590,7 +590,7 @@ describe('cache invalidation', () => {
 
   it('clears only one entry when customerId is specified', async () => {
     const { db } = makeFakeDb([
-      { customer_id: 'c-a', dashboard_write_policy: { 'secrets.set': false } },
+      { customer_id: 'c-a', dashboard_write_policy: { 'secrets.set': 'disabled' } },
     ]);
     await getDashboardWritePolicy(db, 'c-a');
     invalidateDashboardWritePolicyCache('c-a');

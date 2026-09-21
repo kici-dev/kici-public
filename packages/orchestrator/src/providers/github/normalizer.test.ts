@@ -19,6 +19,17 @@ describe('GitHubWebhookNormalizer', () => {
     expect(normalizer.provider).toBe('github');
   });
 
+  // fails-when: the access-cache invalidation hook returns to the normalizer
+  it('has no access-cache invalidation hook', () => {
+    expect('getAccessCacheInvalidations' in normalizer).toBe(false);
+  });
+
+  // breaks-if-wrong: the surviving normalizer methods must still be there
+  it('keeps the live normalizer methods', () => {
+    expect(typeof normalizer.normalizeEvent).toBe('function');
+    expect(typeof normalizer.verifySignature).toBe('function');
+  });
+
   describe('extractRoutingKey', () => {
     it('returns github:{id} from x-github-hook-installation-target-id header', () => {
       const headers = { 'x-github-hook-installation-target-id': '12345' };
@@ -780,173 +791,6 @@ describe('GitHubWebhookNormalizer', () => {
     it('returns null installationId when id is not a number', () => {
       const payload = { installation: { id: 'not-a-number' } };
       expect(normalizer.extractCredentials(payload)).toEqual({ installationId: null });
-    });
-  });
-
-  describe('getAccessCacheInvalidations', () => {
-    it('returns repo-user invalidation for member.added', () => {
-      const payload = {
-        action: 'added',
-        repository: { full_name: 'acme/frontend' },
-        member: { login: 'alice' },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations('member', 'added', payload);
-
-      expect(result).toEqual([
-        { kind: 'repo-user', repoFullName: 'acme/frontend', username: 'alice' },
-      ]);
-    });
-
-    it('returns repo-user invalidation for member.removed', () => {
-      const payload = {
-        action: 'removed',
-        repository: { full_name: 'acme/frontend' },
-        member: { login: 'bob' },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations('member', 'removed', payload);
-
-      expect(result).toEqual([
-        { kind: 'repo-user', repoFullName: 'acme/frontend', username: 'bob' },
-      ]);
-    });
-
-    it('returns empty for member event with missing repository', () => {
-      const payload = { action: 'added', member: { login: 'alice' } };
-      expect(normalizer.getAccessCacheInvalidations('member', 'added', payload)).toEqual([]);
-    });
-
-    it('returns empty for member event with missing member login', () => {
-      const payload = { action: 'added', repository: { full_name: 'acme/frontend' } };
-      expect(normalizer.getAccessCacheInvalidations('member', 'added', payload)).toEqual([]);
-    });
-
-    it('returns user-in-org invalidation for organization.member_added', () => {
-      const payload = {
-        action: 'member_added',
-        organization: { login: 'acme' },
-        membership: { user: { login: 'charlie' } },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations(
-        'organization',
-        'member_added',
-        payload,
-      );
-
-      expect(result).toEqual([{ kind: 'user-in-org', orgLogin: 'acme', username: 'charlie' }]);
-    });
-
-    it('returns user-in-org invalidation for organization.member_removed', () => {
-      const payload = {
-        action: 'member_removed',
-        organization: { login: 'acme' },
-        membership: { user: { login: 'charlie' } },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations(
-        'organization',
-        'member_removed',
-        payload,
-      );
-
-      expect(result).toEqual([{ kind: 'user-in-org', orgLogin: 'acme', username: 'charlie' }]);
-    });
-
-    it('returns empty for organization event with missing membership user', () => {
-      const payload = { action: 'member_added', organization: { login: 'acme' } };
-      expect(
-        normalizer.getAccessCacheInvalidations('organization', 'member_added', payload),
-      ).toEqual([]);
-    });
-
-    it('returns user-in-org invalidation for membership.added (team scope)', () => {
-      const payload = {
-        action: 'added',
-        scope: 'team',
-        organization: { login: 'acme' },
-        member: { login: 'dave' },
-        team: { name: 'engineering' },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations('membership', 'added', payload);
-
-      expect(result).toEqual([{ kind: 'user-in-org', orgLogin: 'acme', username: 'dave' }]);
-    });
-
-    it('returns user-in-org invalidation for membership.removed', () => {
-      const payload = {
-        action: 'removed',
-        organization: { login: 'acme' },
-        member: { login: 'dave' },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations('membership', 'removed', payload);
-
-      expect(result).toEqual([{ kind: 'user-in-org', orgLogin: 'acme', username: 'dave' }]);
-    });
-
-    it('returns empty for membership event with missing member', () => {
-      const payload = { action: 'added', organization: { login: 'acme' } };
-      expect(normalizer.getAccessCacheInvalidations('membership', 'added', payload)).toEqual([]);
-    });
-
-    it('returns repo invalidation for team.added_to_repository', () => {
-      const payload = {
-        action: 'added_to_repository',
-        repository: { full_name: 'acme/backend' },
-        team: { name: 'engineering' },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations('team', 'added_to_repository', payload);
-
-      expect(result).toEqual([{ kind: 'repo', repoFullName: 'acme/backend' }]);
-    });
-
-    it('returns repo invalidation for team.removed_from_repository', () => {
-      const payload = {
-        action: 'removed_from_repository',
-        repository: { full_name: 'acme/backend' },
-        team: { name: 'engineering' },
-      };
-
-      const result = normalizer.getAccessCacheInvalidations(
-        'team',
-        'removed_from_repository',
-        payload,
-      );
-
-      expect(result).toEqual([{ kind: 'repo', repoFullName: 'acme/backend' }]);
-    });
-
-    it('returns empty for team.created (no repo context)', () => {
-      const payload = {
-        action: 'created',
-        team: { name: 'engineering' },
-        organization: { login: 'acme' },
-      };
-      expect(normalizer.getAccessCacheInvalidations('team', 'created', payload)).toEqual([]);
-    });
-
-    it('returns empty for team.deleted (no repo context)', () => {
-      const payload = { action: 'deleted', team: { name: 'engineering' } };
-      expect(normalizer.getAccessCacheInvalidations('team', 'deleted', payload)).toEqual([]);
-    });
-
-    it('returns empty for unrelated event types (push, pull_request, etc.)', () => {
-      expect(normalizer.getAccessCacheInvalidations('push', null, {})).toEqual([]);
-      expect(normalizer.getAccessCacheInvalidations('pull_request', 'opened', {})).toEqual([]);
-      expect(normalizer.getAccessCacheInvalidations('issue_comment', 'created', {})).toEqual([]);
-      expect(normalizer.getAccessCacheInvalidations('release', 'published', {})).toEqual([]);
-    });
-
-    it('returns empty for malformed payload without throwing', () => {
-      expect(normalizer.getAccessCacheInvalidations('member', 'added', null)).toEqual([]);
-      expect(normalizer.getAccessCacheInvalidations('organization', 'member_added', {})).toEqual(
-        [],
-      );
-      expect(normalizer.getAccessCacheInvalidations('team', 'added_to_repository', {})).toEqual([]);
     });
   });
 });

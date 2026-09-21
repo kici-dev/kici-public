@@ -1,15 +1,14 @@
 /**
  * Raft-leader-only fulfilment of deferred attestations. For each pending row
- * (oldest-first) it optionally backfills the run/job rows the mint needs
- * (offline-backfill, for the Platform-relay mint path), mints the deferred
- * token bound to the frozen statement hash, attaches it to the frozen DSSE
+ * (oldest-first) it replays the run/job rows the Platform mirror missed
+ * (offline-backfill rows), mints the deferred token with the orchestrator's own
+ * signing key bound to the frozen statement hash, attaches it to the frozen DSSE
  * envelope, uploads the bundle, records one `attestations` row (idempotent
  * across the cluster), and drains the pending row. A transiently-failing mint
  * leaves the row with a bumped attempt count and a `last_error` — never
- * silently dropped. A definitive mint
- * rejection (run/job absent) is terminal: the row is stamped `rejected_at`,
- * skipped by future drains, and re-armed only via
- * `kici-admin attestations retry --include-rejected`.
+ * silently dropped. A definitive mint rejection (run/job absent) is terminal:
+ * the row is stamped `rejected_at`, skipped by future drains, and re-armed only
+ * via `kici-admin attestations retry --include-rejected`.
  *
  * Lifecycle mirrors `StaleRunDetector`: a timer runs only while this instance is
  * the Raft leader (so each pending attestation mints exactly once cluster-wide),
@@ -26,12 +25,21 @@ const logger = createLogger({ prefix: 'attestation-retrier' });
 /** A minted token, a still-transient deferral, or a terminal rejection. */
 export type RetrierMintResult =
   | { token: string; expiresIn: number; jti: string }
-  | { deferred: true; code: string }
+  | {
+      deferred: true;
+      code: string;
+      /**
+       * What the operator has to change for the deferral to ever clear. Logged
+       * once per drain, not per row: the whole queue defers for the same
+       * reason, and it defers again on every tick until the operator acts.
+       */
+      operatorHint?: string;
+    }
   | { rejected: true; reason: string };
 
 export interface AttestationRetrierDeps {
   repo: PendingAttestationsRepo;
-  /** Mint the deferred token (the OIDC relay with deferred params, Task 5). */
+  /** Mint the deferred token with the orchestrator's own signer. */
   requestMint: (args: {
     orchestratorId: string;
     runId: string;
@@ -74,6 +82,8 @@ export interface AttestationRetrierDeps {
 
 export class AttestationRetrier {
   private interval: ReturnType<typeof setInterval> | null = null;
+  /** Operator hints the current drain has collected; flushed once per drain. */
+  private drainHints = new Set<string>();
   private running = false;
   constructor(private readonly deps: AttestationRetrierDeps) {}
 
@@ -128,6 +138,7 @@ export class AttestationRetrier {
           logger.error('Attestation fulfilment error', { id: row.id, error: toErrorMessage(err) });
         }
       }
+      this.flushDrainHints(pending.length);
       const { count, oldestCreatedAt } = await this.deps.repo.countAndOldest();
       const rejected = await this.deps.repo.countRejected();
       this.deps.setMetrics(count, oldestCreatedAt, rejected);
@@ -159,17 +170,29 @@ export class AttestationRetrier {
       else if (outcome === 'rejected') rejected += 1;
       else stillPending += 1;
     }
+    this.flushDrainHints(rows.length);
     const { count, oldestCreatedAt } = await this.deps.repo.countAndOldest();
     const rejectedCount = await this.deps.repo.countRejected();
     this.deps.setMetrics(count, oldestCreatedAt, rejectedCount);
     return { minted, stillPending, rejected };
   }
 
+  /** One warning per distinct hint per drain, naming how many rows it holds up. */
+  private flushDrainHints(pendingRows: number): void {
+    for (const hint of this.drainHints) {
+      logger.warn('Deferred attestations cannot be completed until the operator acts', {
+        pendingRows,
+        hint,
+      });
+    }
+    this.drainHints.clear();
+  }
+
   async fulfilOne(row: PendingAttestationRow): Promise<'minted' | 'rejected' | 'deferred'> {
     try {
       if (row.origin_kind === 'offline-backfill') {
-        // Backfill -> then mint (ordered): the Platform learns the run/job rows
-        // its mint reads before we ask it to mint.
+        // Replay the run/job rows the Platform mirror missed while it was down,
+        // so the attestation surfaces against a run the dashboard knows about.
         await this.deps.backfillRun(row.run_id);
       }
       const minted = await this.deps.requestMint({
@@ -183,9 +206,9 @@ export class AttestationRetrier {
         },
       });
       if ('rejected' in minted) {
-        // The Platform definitively cannot mint this row (run/job absent). This
-        // is a terminal answer, not a transient blip: park the row so the
-        // retrier stops re-attempting it and the pending gauge drains.
+        // The mint definitively cannot bind this row (run/job absent). This is
+        // a terminal answer, not a transient blip: park the row so the retrier
+        // stops re-attempting it and the pending gauge drains.
         await this.deps.repo.markRejected(row.id, minted.reason);
         logger.warn('Deferred attestation permanently rejected; will not retry', {
           id: row.id,
@@ -195,6 +218,7 @@ export class AttestationRetrier {
         return 'rejected';
       }
       if ('deferred' in minted) {
+        if (minted.operatorHint) this.drainHints.add(minted.operatorHint);
         await this.deps.repo.recordAttempt(row.id, `mint still ${minted.code}`);
         return 'deferred';
       }

@@ -18,7 +18,6 @@ import {
 } from './source-registration.js';
 import { dashboardPlatformToOrchSchema } from './dashboard.js';
 import { runEventMessageSchema, jobContextMessageSchema } from './run-events.js';
-import { oidcMintRequestSchema, oidcMintResponseSchema } from './oidc-mint.js';
 
 // --- Platform -> Orchestrator messages ---
 
@@ -105,9 +104,8 @@ export function approvalExpiryHoursOf(seconds: number): number {
  *   bounds how long that approval stays open.
  * - `allow` — the operator permits fork pull requests to run with reduced
  *   privilege.
- * - `reject` — deprecated in favour of `ignore`; removed at v1.0.0.
  */
-export const ForkPolicy = z.enum(['ignore', 'hold', 'reject', 'allow']);
+export const ForkPolicy = z.enum(['ignore', 'hold', 'allow']);
 export type ForkPolicy = z.infer<typeof ForkPolicy>;
 
 /**
@@ -122,49 +120,42 @@ export type ForkPolicy = z.infer<typeof ForkPolicy>;
 export const CiTrustLevel = z.enum(['none', 'read', 'write', 'admin']);
 export type CiTrustLevel = z.infer<typeof CiTrustLevel>;
 
-export const trustPolicySchema = z.object({
-  forkPolicy: ForkPolicy,
-  /**
-   * @deprecated Accepted for wire compatibility and still stored and echoed
-   * back, so an orchestrator or CLI on an older build keeps seeing the value it
-   * expects. The orchestrator's trust-policy gate does not read it, so it
-   * changes no dispatch outcome. Removed at v1.0.0.
-   */
-  unknownContributorPolicy: z.enum(['hold', 'reject']),
-  /**
-   * @deprecated Accepted for wire compatibility and still stored and echoed
-   * back, so an orchestrator or CLI on an older build keeps seeing the value it
-   * expects. The orchestrator's trust-policy gate does not read it, so it
-   * changes no dispatch outcome. Removed at v1.0.0.
-   */
-  workflowChangePolicy: z.enum(['hold', 'reject', 'allow']),
-  /**
-   * Hours a security hold stays open — the coarse spelling of
-   * `approvalExpirySeconds`, kept required so an orchestrator or CLI on an
-   * older build still receives a window it can read. Not deprecated: it is read,
-   * enforced whenever no seconds value accompanies it, and remains the
-   * ergonomic way to say "72 hours".
-   *
-   * Integer and positive: the column is INTEGER NOT NULL, so a fractional value
-   * throws inside the fire-and-forget persist and the policy is then silently
-   * never stored, and a zero or negative value mints an already-expired hold.
-   */
-  approvalExpiryHours: z.number().int().min(1),
-  /**
-   * Seconds a security hold stays open — the authoritative window, and the one
-   * granularity that can express a sub-hour hold.
-   *
-   * Optional because an older Platform sends only the hours field; a frame
-   * without it resolves through {@link approvalExpirySecondsOf}, which falls
-   * back to `approvalExpiryHours * SECONDS_PER_HOUR`. When both are present this
-   * one wins, at every layer.
-   *
-   * Integer and at least {@link MIN_APPROVAL_EXPIRY_SECONDS} for the same two
-   * reasons the hours field is: the column is INTEGER, and a non-positive window
-   * mints an already-expired hold.
-   */
-  approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
-});
+/**
+ * `.strict()`: the policy object once carried per-arm fields the gate never
+ * read, so a sender still emitting one is on a build this protocol floor
+ * refuses — a stray field is a version-skew signal, not something to ignore.
+ */
+export const trustPolicySchema = z
+  .object({
+    forkPolicy: ForkPolicy,
+    /**
+     * Hours a security hold stays open — the coarse spelling of
+     * `approvalExpirySeconds`, kept required so an orchestrator or CLI on an
+     * older build still receives a window it can read. Not deprecated: it is read,
+     * enforced whenever no seconds value accompanies it, and remains the
+     * ergonomic way to say "72 hours".
+     *
+     * Integer and positive: the column is INTEGER NOT NULL, so a fractional value
+     * throws inside the fire-and-forget persist and the policy is then silently
+     * never stored, and a zero or negative value mints an already-expired hold.
+     */
+    approvalExpiryHours: z.number().int().min(1),
+    /**
+     * Seconds a security hold stays open — the authoritative window, and the one
+     * granularity that can express a sub-hour hold.
+     *
+     * Optional because an older Platform sends only the hours field; a frame
+     * without it resolves through {@link approvalExpirySecondsOf}, which falls
+     * back to `approvalExpiryHours * SECONDS_PER_HOUR`. When both are present this
+     * one wins, at every layer.
+     *
+     * Integer and at least {@link MIN_APPROVAL_EXPIRY_SECONDS} for the same two
+     * reasons the hours field is: the column is INTEGER, and a non-positive window
+     * mints an already-expired hold.
+     */
+    approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
+  })
+  .strict();
 export type TrustPolicy = z.infer<typeof trustPolicySchema>;
 
 /** Trust policy update pushed from Platform to orchestrator when policy or identity links change. */
@@ -635,7 +626,6 @@ export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', 
   peerDiscoverSchema,
   peerUpdateSchema,
   staleCheckrunCleanupSchema,
-  oidcMintResponseSchema,
   // Platform capability advertisement (Platform → orchestrator direction).
   platformCapabilitiesMessageSchema,
   // Per-coordinator orchestrator ceiling (Platform → coordinator direction).
@@ -677,7 +667,6 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
   runEventMessageSchema,
   jobContextMessageSchema,
   orchMetricsSchema,
-  oidcMintRequestSchema,
   // Worker-peer membership snapshot (coordinator → Platform direction).
   clusterMembershipSchema,
   // Negative acknowledgment: the orchestrator's diagnosable reply when it

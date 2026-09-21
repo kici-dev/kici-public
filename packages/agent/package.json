@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/agent",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Customer-deployable agent for the KiCI CI/CD stack. Connects to an orchestrator, clones the workflow repo, executes steps, and streams logs back.",
   "keywords": [
     "ci",
@@ -56,8 +56,8 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-service.mjs && tsgo --emitDeclarationOnly",
-    "typecheck": "tsgo --noEmit",
+    "build": "node ../../scripts/build-service.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/agent --name @kici-dev/agent"
   },
@@ -69,13 +69,13 @@
     "@kici-dev/shared": "workspace:*",
     "archiver": "^8.0.0",
     "dockerode": "^5.0.1",
-    "hono": "^4.13.2",
-    "jose": "^6.2.10",
+    "hono": "^4.13.7",
+    "jose": "^6.2.12",
     "tar": "^7.5.22",
     "winston": "^3.19.0",
     "ws": "^8.21.3",
-    "yaml": "^2.9.0",
-    "zod": "^4.4.3",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5",
     "zx": "^8.8.5"
   },
   "kici": {

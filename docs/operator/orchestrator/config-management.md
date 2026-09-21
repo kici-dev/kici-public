@@ -17,7 +17,7 @@ Shared config is a versioned document stored in the PostgreSQL `config_versions`
 
 **A running orchestrator does not.** It starts from `KICI_*` environment variables, and a reload re-reads the environment and the local YAML file. Neither path consults `config_versions`.
 
-Three surfaces read the document. The `kici-admin config` commands on this page, except `get`, which reports the running config. `kici-admin rotate-key`. And the cluster join flow, which copies `storage` and `secrets.key` into the joining instance's local YAML file.
+Three surfaces read the document. The `kici-admin config` commands on this page, except `get`, which reports the running config. `kici-admin rotate-key`. And `kici-admin join`, which copies `storage` and `secrets.key` into the env file the joining orchestrator boots from (`KICI_STORAGE_*` and `KICI_SECRET_KEY`; `kici-admin orchestrator install --env-file` consumes it).
 
 So this page is about the lifecycle of that stored document: seeding it, inspecting it, versioning it, and rolling it back. To change what a running orchestrator does, see [Changing a running orchestrator](#changing-a-running-orchestrator) below.
 

@@ -97,9 +97,8 @@ describe('evaluateMultiContextGates', () => {
 });
 
 describe('aggregateProtectionParams', () => {
-  it('aggregates trust=max, reviewers=union, waitTimer=max, holdExpiry=min, concurrency=min', () => {
+  it('aggregates trust=declared, reviewers=union, waitTimer=max, holdExpiry=min, concurrency=min', () => {
     const envA = makeEnv({
-      minimumTrust: 'known',
       requiredReviewers: ['a', 'b'],
       waitTimerSeconds: 10,
       holdExpirySeconds: 7200,

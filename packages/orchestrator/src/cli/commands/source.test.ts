@@ -688,10 +688,9 @@ describe('kici-admin source redeliver', () => {
 
   it('posts the normalized window to the redeliver route and prints a per-delivery table', async () => {
     const post = vi.fn().mockResolvedValue(response());
-    const { stdout, exitCode } = await runCommand(
-      ['source', 'redeliver', 'github:42', ...WINDOW],
-      { post } as unknown as Partial<AdminApiClient>,
-    );
+    const { stdout, exitCode } = await runCommand(['source', 'redeliver', 'github:42', ...WINDOW], {
+      post,
+    } as unknown as Partial<AdminApiClient>);
 
     expect(exitCode).toBeNull();
     expect(post).toHaveBeenCalledWith('/api/v1/admin/sources/github%3A42/redeliver', {
@@ -707,22 +706,23 @@ describe('kici-admin source redeliver', () => {
   });
 
   it('sends dryRun and prints the would-send tally', async () => {
-    const post = vi
-      .fn()
-      .mockResolvedValue(
-        response({
-          dryRun: true,
-          redelivered: 0,
-          results: [{ ...response().results[0], outcome: 'would-redeliver' }],
-          matched: 1,
-        }),
-      );
+    const post = vi.fn().mockResolvedValue(
+      response({
+        dryRun: true,
+        redelivered: 0,
+        results: [{ ...response().results[0], outcome: 'would-redeliver' }],
+        matched: 1,
+      }),
+    );
     const { stdout } = await runCommand(
       ['source', 'redeliver', 'github:42', ...WINDOW, '--dry-run'],
       { post } as unknown as Partial<AdminApiClient>,
     );
 
-    expect(post).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ dryRun: true }));
+    expect(post).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ dryRun: true }),
+    );
     expect(stdout).toContain('(dry run)');
     expect(stdout).toContain('would be redelivered');
   });

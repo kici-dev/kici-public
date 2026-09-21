@@ -207,7 +207,6 @@ export function buildRequest(
     ...(extra?.credentialHelperPath ? { credentialHelperPath: extra.credentialHelperPath } : {}),
     ...(extra?.allowInstallScripts ? { allowInstallScripts: true } : {}),
     sourceTarUrl: dispatch.sourceTarUrl,
-    sourceTarHash: dispatch.sourceTarHash,
     sourceTarDigest: dispatch.sourceTarDigest,
     depsUrl: dispatch.depsUrl,
     depsHash: dispatch.depsHash,

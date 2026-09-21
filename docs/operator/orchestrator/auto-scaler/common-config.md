@@ -102,7 +102,7 @@ The scaler accepts three input shapes and normalises them all to the same `{ req
 
 Resource limits cascade through three layers — most specific wins:
 
-1. Per-job `resources` (set in the SDK via `defineJob({ resources: ... })`).
+1. Per-job `resources` (set in the SDK via `job(name, { resources: ... })` — see [Per-job resources](../../../user/sdk/core.md#per-job-resources)).
 2. Per-label-set `resources` in `scalers.yaml`.
 3. Top-level `defaults.resources` in `scalers.yaml`.
 
@@ -171,7 +171,7 @@ Raise it on a fast local registry or a beefy host; lower it if you see registry 
 
 ## Spawn timeout
 
-Each `spawn` (image pull + container create + start) runs under a deadline. If the container runtime or registry wedges — a hung pull against an unreachable registry, a stuck create against a saturated daemon — the spawn would otherwise hold its `maxConcurrentSpawns` slot forever and head-of-line block every spawn queued behind it on that backend. On the deadline, the orchestrator aborts the provision (best-effort removing any container it already created), releases the slot, and frees the reservation so the next queued spawn proceeds.
+Each `spawn` (image pull + container create + start) runs under a deadline. If the container runtime or registry wedges — a hung pull against an unreachable registry, a stuck create against a saturated daemon — the spawn would otherwise hold its `maxConcurrentSpawns` slot forever. It would head-of-line block every spawn queued behind it on that backend. On the deadline, the orchestrator aborts the provision (best-effort removing any container it already created), releases the slot, and frees the reservation so the next queued spawn proceeds.
 
 The cluster-wide default is **300000 ms (5 minutes)** — generous, so a legitimate cold-cache pull of a large agent image never trips it. Set it with the `KICI_SCALER_SPAWN_TIMEOUT_MS` environment variable.
 
@@ -192,7 +192,7 @@ Lower it for a tenant whose registry is fast and local (so a genuine hang is cau
 
 ## At-capacity queueing and re-dispatch
 
-When a job arrives and the scaler is already at a cap (`maxAgents`, `globalMaxAgents`, a `resourceCap`, or a machine pool), the job does not fail — it queues. As soon as capacity frees (an ephemeral agent finishes its job and is destroyed, a spawn fails and releases its reservation, or a machine-pool slot opens), the orchestrator **re-offers the oldest queued jobs to the scaler** so they spawn immediately instead of waiting for their queue TTL to expire.
+When a job arrives and the scaler is already at a cap (`maxAgents`, `globalMaxAgents`, a `resourceCap`, or a machine pool), the job does not fail — it queues. As soon as capacity frees (an ephemeral agent finishes its job and is destroyed, a spawn fails and releases its reservation, or a machine-pool slot opens), the orchestrator **re-offers the oldest queued jobs to the scaler**. They spawn immediately instead of waiting for their queue TTL to expire.
 
 Two mechanisms drive this, and both route through the same spawn path (so the `maxConcurrentSpawns` throttle still bounds the burst):
 

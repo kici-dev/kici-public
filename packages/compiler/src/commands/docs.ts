@@ -3,11 +3,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pc from 'picocolors';
 import open from 'open';
-import { logger, toErrorMessage } from '@kici-dev/core';
+import { docsUrl, logger, toErrorMessage } from '@kici-dev/core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const DOCS_HOME_URL = 'https://kici.dev/docs/';
+const DOCS_HOME_URL = docsUrl('');
 
 export interface DocsOptions {
   /** Open the docs site in the default browser. */

@@ -149,9 +149,7 @@ describeDb('ArtifactStore', () => {
       runId: 'run1',
       jobId: 'job1',
       name: 'bundle',
-      sizeBytes: 100,
       sha256: 'abc',
-      storageKey: grant.storageKey!,
     });
 
     const dl = await s.download({ customerId: 'org1', runId: 'run1', name: 'bundle' });
@@ -193,9 +191,7 @@ describeDb('ArtifactStore', () => {
       runId: 'r',
       jobId: 'j',
       name: 'n',
-      sizeBytes: 10,
       sha256: 'h',
-      storageKey: g.storageKey!,
     });
     const dup = await s.beginUpload({
       customerId: 'o',
@@ -213,9 +209,7 @@ describeDb('ArtifactStore', () => {
       runId: 'r',
       jobId: 'j2',
       name: 'n',
-      sizeBytes: 999,
       sha256: 'h2',
-      storageKey: g.storageKey!,
     });
     const dl = await s.download({ customerId: 'o', runId: 'r', name: 'n' });
     expect(dl.sizeBytes).toBe(10); // first write wins
@@ -243,9 +237,7 @@ describeDb('ArtifactStore', () => {
         runId: 'r',
         jobId: 'j',
         name,
-        sizeBytes: 10,
         sha256: 'h',
-        storageKey: g.storageKey!,
       });
     }
     const r = await s.beginUpload({
@@ -272,9 +264,7 @@ describeDb('ArtifactStore', () => {
       runId: 'r1',
       jobId: 'j',
       name: 'a',
-      sizeBytes: 100,
       sha256: 'h',
-      storageKey: g.storageKey!,
     });
     // A second upload (even in a different run of the same org) that would push
     // the org total past the quota is rejected.
@@ -302,9 +292,7 @@ describeDb('ArtifactStore', () => {
       runId: 'r',
       jobId: 'j',
       name: 'n',
-      sizeBytes: 10,
       sha256: 'h',
-      storageKey: g.storageKey!,
     });
     await new Promise((res) => setTimeout(res, 10));
     const dl = await s.download({ customerId: 'o', runId: 'r', name: 'n' });
@@ -392,9 +380,7 @@ describeDb('ArtifactStore', () => {
       runId: 'r',
       jobId: 'j',
       name: 'a',
-      sizeBytes: 10,
       sha256: 'h',
-      storageKey: g.storageKey!,
     });
     const r = await s.beginUpload({
       customerId: 'tiny',
@@ -421,9 +407,7 @@ describeDb('ArtifactStore', () => {
       runId: 'r',
       jobId: 'j',
       name: 'a',
-      sizeBytes: 10,
       sha256: 'h',
-      storageKey: g.storageKey!,
     });
     const r = await s.beginUpload({
       customerId: 'o',
@@ -453,7 +437,7 @@ describeDb('ArtifactStore', () => {
     expect(r.reason).toBe('size_cap');
   });
 
-  it('ignores a foreign wire storageKey and commits with the server-derived key', async () => {
+  it('commits with the server-derived key', async () => {
     const { s, storage } = store();
     await s.beginUpload({
       customerId: 'org1',
@@ -463,17 +447,15 @@ describeDb('ArtifactStore', () => {
     });
     storage.setObjectSize(artifactStorageKey('run1', 'bundle'), 50); // the honest object
 
-    // A compromised agent echoes a key pointing at ANOTHER run's object. The
-    // server derives the key from its own runId + name, so the row can never
-    // reference an object outside this run's artifacts prefix.
+    // The agent never names the key: the server derives it from its own runId
+    // + name, so the row can never reference an object outside this run's
+    // artifacts prefix.
     await s.completeUpload({
       customerId: 'org1',
       runId: 'run1',
       jobId: 'job1',
       name: 'bundle',
-      sizeBytes: 50,
       sha256: 'abc',
-      storageKey: 'artifacts/other-run/victim.tar.gz',
     });
 
     const row = await db
@@ -515,7 +497,7 @@ describeDb('ArtifactStore', () => {
     expect(artifactStorageKey('run1', 'legacy')).not.toBe(legacyKey);
   });
 
-  it('records the true stat-verified size, not the agent-declared sizeBytes', async () => {
+  it('records the true stat-verified size of the stored object', async () => {
     const { s, storage } = store({ quotaBytes: 100_000, maxBytes: 100_000 });
     await s.beginUpload({
       customerId: 'org1',
@@ -523,16 +505,14 @@ describeDb('ArtifactStore', () => {
       name: 'bundle',
       declaredSizeBytes: 1,
     });
-    storage.setObjectSize(artifactStorageKey('run1', 'bundle'), 4096); // declared 1, uploaded 4096
+    storage.setObjectSize(artifactStorageKey('run1', 'bundle'), 4096); // declared 1 at grant time, uploaded 4096
 
     await s.completeUpload({
       customerId: 'org1',
       runId: 'run1',
       jobId: 'job1',
       name: 'bundle',
-      sizeBytes: 1,
       sha256: 'abc',
-      storageKey: 'artifacts/run1/bundle.tar.gz',
     });
 
     // The real size is what the org-quota sum and the dashboard see.
@@ -559,9 +539,7 @@ describeDb('ArtifactStore', () => {
         runId: 'run1',
         jobId: 'job1',
         name: 'bundle',
-        sizeBytes: 10,
         sha256: 'abc',
-        storageKey: 'artifacts/run1/bundle.tar.gz',
       }),
     ).rejects.toBeInstanceOf(ArtifactObjectMissingError);
 
@@ -633,9 +611,7 @@ describe('ArtifactStore name contract', () => {
         runId: 'run1',
         jobId: 'job1',
         name,
-        sizeBytes: 10,
         sha256: 'deadbeef',
-        storageKey: 'artifacts/run1/whatever.tar.gz',
       }),
     ).rejects.toThrow(ArtifactInvalidNameError);
   });

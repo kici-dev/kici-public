@@ -6,7 +6,7 @@
  * execution_jobs rows, signed with its own long-lived signing key (`Signer`),
  * issued under its own real issuer. Zero hosted-Platform dependency.
  *
- * Anti-forgery is identical to the Platform-minted path and the local dev plane:
+ * Anti-forgery is identical to the local dev plane:
  * every identity claim (run/job/repo/ref/sha/org) is read SERVER-SIDE from the
  * orchestrator's own rows — never from the agent's wire input — and job ownership
  * is resolved from dispatch state, never agent-asserted. The token is never
@@ -18,16 +18,19 @@ import {
   oidcTokenRequestParamsSchema,
   type OidcTokenResult,
 } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+import { createLogger } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import { resolveOrgId } from '../pipeline/processor.js';
 import { buildIdTokenClaims, type IdTokenClaims } from './id-token-claims.js';
 import { signCompactJws } from './jwt.js';
 import type { Signer } from './signer.js';
 
+const logger = createLogger({ prefix: 'orchestrator-mint' });
+
 /** The org anchor stamped when a run has no routing key (sourceless / local plane). */
 export const DEFAULT_ORG_ID = '__default__';
 
-/** ID-token lifetime (seconds). Matches the Platform's 10-minute cap. */
+/** ID-token lifetime (seconds). */
 export const ORCHESTRATOR_ID_TOKEN_TTL_SECONDS = 600;
 
 export class OrchestratorMintRunNotFoundError extends Error {}
@@ -43,14 +46,6 @@ export interface OrchestratorMintDeps {
   ttlSeconds?: number;
   /** Injectable clock (seconds). Defaults to wall-clock. */
   nowSeconds?: () => number;
-  /**
-   * Restore the pre-split pull-request `sub`, from `KICI_OIDC_LEGACY_PR_SUB`.
-   * An escape hatch for an operator whose cloud trust policy breaks mid-
-   * migration; leaves the collision with a same-branch push in place.
-   *
-   * @deprecated Removed at v1.0.0.
-   */
-  legacyPullRequestSubject?: boolean;
 }
 
 export interface OrchestratorMintInput {
@@ -166,7 +161,6 @@ export async function mintOrchestratorIdToken(
       audience: input.audience,
       nowSeconds: now,
       ttlSeconds,
-      ...(deps.legacyPullRequestSubject === true ? { legacyPullRequestSubject: true } : {}),
       ...(input.deferred ? { deferred: input.deferred } : {}),
     },
   );
@@ -199,6 +193,14 @@ export interface OrchestratorOidcTokenHandlerDeps {
   resolveSigner: () => Promise<Signer | null>;
   /** Mint deps except the signer (supplied lazily via `resolveSigner`). */
   mint: Omit<OrchestratorMintDeps, 'signer'>;
+  /**
+   * Test-only fault-injection predicate over the requested OIDC `audience`,
+   * supplied only by the build-time test double. Returning `true` short-circuits
+   * the *initial* mint to a transient defer BEFORE the signer is resolved — it
+   * can only defer, never forge or weaken a signature. Undefined (the shipped
+   * default) means no fault injection.
+   */
+  initialMintFault?: (audience: string) => boolean;
 }
 
 /**
@@ -216,6 +218,15 @@ export function createOrchestratorOidcTokenHandler(
     const owned = deps.dispatcher.resolveOwnedJob(agentId, jobId);
     if (!owned) {
       throw new OrchestratorMintRejectedError(`job ${jobId} not owned by agent ${agentId}`);
+    }
+    // Test-only fault injection: the build-time test double supplies
+    // `initialMintFault` to force the initial agent mint to defer for a marker
+    // audience, so an E2E can exercise the deferred-attestation retry path with
+    // a REAL run. The shipped orchestrator leaves it undefined, so this branch
+    // is never reached.
+    if (deps.initialMintFault?.(audience)) {
+      logger.warn('mint-defer fault-injection ACTIVE via injected policy.', { jobId, audience });
+      return { deferred: true, code: 'unavailable' };
     }
     const signer = await deps.resolveSigner();
     if (!signer) {

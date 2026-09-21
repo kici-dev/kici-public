@@ -70,27 +70,24 @@ export function detectLabelSetOverlaps(
 }
 
 /**
- * The taint gate for one of a scaler's label sets.
- *
- * Prefers the index-aligned `labelSetMandatoryLabels`, falling back to the
- * scaler-wide `mandatoryLabels` when it is absent (a caller that predates the
- * per-label-set gate) or when its length does not match `labelSets` — a
- * mismatched array carries no trustworthy alignment, so indexing into it would
- * apply one label set's gate to another. Falling back to the union is the safe
- * direction: it over-gates, where a wrong index could under-gate and admit a
- * job onto a platform it cannot run on.
+ * The taint gate for one of a scaler's label sets, read from the index-aligned
+ * `labelSetMandatoryLabels`. A scaler that declares no gate at all leaves every
+ * label set ungated. `null` when the array is present but its length does not
+ * match `labelSets` — a mismatched array carries no trustworthy alignment, so
+ * indexing into it would apply one label set's gate to another, and the safe
+ * reading is that no label set of that scaler is routable.
  */
 function gateForLabelSet(
   scaler: {
     labelSets: Array<{ labels: string[] }>;
-    mandatoryLabels?: string[];
     labelSetMandatoryLabels?: string[][];
   },
   index: number,
-): string[] {
+): string[] | null {
   const perSet = scaler.labelSetMandatoryLabels;
-  if (perSet && perSet.length === scaler.labelSets.length) return perSet[index] ?? [];
-  return scaler.mandatoryLabels ?? [];
+  if (perSet === undefined) return [];
+  if (perSet.length !== scaler.labelSets.length) return null;
+  return perSet[index] ?? [];
 }
 
 /**
@@ -114,7 +111,6 @@ export function findBackendForLabels(
   scalers: Array<{
     name: string;
     labelSets: Array<{ labels: string[] }>;
-    mandatoryLabels?: string[];
     labelSetMandatoryLabels?: string[][];
   }>,
   excludeLabels: string[] = [],
@@ -126,7 +122,7 @@ export function findBackendForLabels(
   if (targetLabels.size === 0) {
     for (const scaler of scalers) {
       for (let i = 0; i < scaler.labelSets.length; i++) {
-        if (gateForLabelSet(scaler, i).length === 0) {
+        if (gateForLabelSet(scaler, i)?.length === 0) {
           return { scalerName: scaler.name, labelSetIndex: i };
         }
       }
@@ -143,6 +139,7 @@ export function findBackendForLabels(
       // mixing platforms gates each of its label sets differently — hoisting
       // this to the scaler level tests the union and rejects every set.
       const mandatory = gateForLabelSet(scaler, i);
+      if (mandatory === null) continue;
       if (mandatory.length > 0) {
         const allMandatoryPresent = mandatory.every((m) => targetLabels.has(m.toLowerCase()));
         if (!allMandatoryPresent) continue;

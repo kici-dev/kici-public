@@ -8,7 +8,7 @@
  * headers.
  */
 
-import type { WebhookNormalizer, SimulatedEvent, AccessCacheInvalidation } from '@kici-dev/engine';
+import type { WebhookNormalizer, SimulatedEvent } from '@kici-dev/engine';
 import { githubFilterText } from '../github/commit-message.js';
 
 /**
@@ -147,66 +147,5 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
       payload: p,
       provider: 'local',
     };
-  }
-
-  /**
-   * Map membership-related local-source webhook events to permission-cache
-   * invalidations. See WebhookNormalizer.getAccessCacheInvalidations, which is
-   * deprecated and has no caller.
-   *
-   * Local-source payloads are GitHub-shaped by design, so the mapping
-   * mirrors the GitHub normalizer exactly:
-   *
-   * - `member`: repo-user
-   * - `organization`: user-in-org
-   * - `membership`: user-in-org
-   * - `team` (repo-scoped actions only): repo
-   */
-  getAccessCacheInvalidations(
-    eventType: string,
-    _action: string | null,
-    payload: unknown,
-  ): AccessCacheInvalidation[] {
-    if (payload === null || typeof payload !== 'object') return [];
-    const p = payload as Record<string, unknown>;
-
-    switch (eventType) {
-      case 'member': {
-        const repo = p.repository as { full_name?: string } | undefined;
-        const member = p.member as { login?: string } | undefined;
-        const repoFullName = repo?.full_name;
-        const username = member?.login;
-        if (!repoFullName || !username) return [];
-        return [{ kind: 'repo-user', repoFullName, username }];
-      }
-
-      case 'organization': {
-        const org = p.organization as { login?: string } | undefined;
-        const membership = p.membership as { user?: { login?: string } } | undefined;
-        const orgLogin = org?.login;
-        const username = membership?.user?.login;
-        if (!orgLogin || !username) return [];
-        return [{ kind: 'user-in-org', orgLogin, username }];
-      }
-
-      case 'membership': {
-        const org = p.organization as { login?: string } | undefined;
-        const member = p.member as { login?: string } | undefined;
-        const orgLogin = org?.login;
-        const username = member?.login;
-        if (!orgLogin || !username) return [];
-        return [{ kind: 'user-in-org', orgLogin, username }];
-      }
-
-      case 'team': {
-        const repo = p.repository as { full_name?: string } | undefined;
-        const repoFullName = repo?.full_name;
-        if (!repoFullName) return [];
-        return [{ kind: 'repo', repoFullName }];
-      }
-
-      default:
-        return [];
-    }
   }
 }

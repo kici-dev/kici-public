@@ -4,7 +4,6 @@ import {
   buildClusterPatch,
   buildClusterReset,
   checkVerifiedIssuerPublishes,
-  deprecatedKnobWarnings,
   registerClusterSettingsCommands,
   unpairedEvalTimeoutWarnings,
 } from './cluster-settings.js';
@@ -139,40 +138,45 @@ describe('unpairedEvalTimeoutWarnings', () => {
   });
 });
 
-describe('deprecatedKnobWarnings', () => {
-  it('warns that the contributor-cache TTL is inert', () => {
-    const lines = deprecatedKnobWarnings({ contributorCacheTtlMs: 900_000 });
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('--contributor-cache-ttl-ms');
-    expect(lines[0]).toContain('inert');
-    expect(lines[0]).toContain('removed at v1.0.0');
-  });
-
-  it('says nothing for a live knob or for an empty patch', () => {
-    expect(deprecatedKnobWarnings({ queueMaxDepth: 500 })).toEqual([]);
-    expect(deprecatedKnobWarnings({})).toEqual([]);
-  });
-
-  it('says nothing when the knob is being cleared', () => {
-    // `reset` sends null. Clearing an inert override is exactly what the
-    // operator should do with it, so warning there would be backwards.
-    expect(deprecatedKnobWarnings({ contributorCacheTtlMs: null })).toEqual([]);
-  });
-});
-
-describe('the inert contributor-cache knob stays settable', () => {
-  // Deprecate-then-remove: the column, the route field, and this flag are a
-  // released operator surface, so a `set` must still build a patch rather than
-  // failing. It is the WARNING that tells the operator the value is inert.
-  it('still builds a patch', () => {
-    expect(buildClusterPatch({ contributorCacheTtlMs: '900000' })).toEqual({
-      contributorCacheTtlMs: 900_000,
+describe('the removed contributor-cache knob', () => {
+  // fails-when: the knob is registered in KNOBS again — the patch would then
+  //   carry the field and the CLI would offer the flag.
+  it('is not a patch field', () => {
+    expect(buildClusterPatch({ queueMaxDepth: '42', contributorCacheTtlMs: '900000' })).toEqual({
+      queueMaxDepth: 42,
     });
+    expect(buildClusterReset({ contributorCacheTtlMs: true })).not.toHaveProperty(
+      'contributorCacheTtlMs',
+    );
   });
 
-  it('still clears with reset', () => {
-    expect(buildClusterReset({ contributorCacheTtlMs: true })).toEqual({
-      contributorCacheTtlMs: null,
+  function parseWith(argv: string[]) {
+    const program = new Command();
+    program.exitOverride();
+    program.configureOutput({ writeErr: () => {} });
+    const client = { patch: vi.fn().mockResolvedValue({ settings: {} }) };
+    registerClusterSettingsCommands(program, () => client as unknown as AdminApiClient);
+    return { parse: program.parseAsync(argv, { from: 'user' }), client };
+  }
+
+  it('is an unknown option on set', async () => {
+    await expect(
+      parseWith(['cluster-settings', 'set', '--contributor-cache-ttl-ms', '900000']).parse,
+    ).rejects.toThrow(/unknown option '--contributor-cache-ttl-ms'/);
+  });
+
+  it('is an unknown option on reset', async () => {
+    await expect(
+      parseWith(['cluster-settings', 'reset', '--contributor-cache-ttl-ms']).parse,
+    ).rejects.toThrow(/unknown option '--contributor-cache-ttl-ms'/);
+  });
+
+  // breaks-if-wrong: a live knob still parses and reaches the PATCH.
+  it('leaves the live knobs settable', async () => {
+    const { parse, client } = parseWith(['cluster-settings', 'set', '--queue-max-depth', '42']);
+    await parse;
+    expect(client.patch).toHaveBeenCalledWith('/api/v1/admin/cluster-settings', {
+      queueMaxDepth: 42,
     });
   });
 });
@@ -208,7 +212,7 @@ describe('buildClusterReset', () => {
     // Count guard: a knob added to KNOBS/STRING_KNOBS/BOOLEAN_KNOBS without a
     // reset path (or vice versa) shows up here rather than as a knob an operator
     // cannot clear.
-    expect(Object.keys(patch)).toHaveLength(42);
+    expect(Object.keys(patch)).toHaveLength(41);
   });
 
   it('clears only the check-run tracking TTL when that flag is given', () => {

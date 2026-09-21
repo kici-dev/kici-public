@@ -14,8 +14,6 @@ A run with no ref-based signal is evaluated too. A schedule fire or an internal 
 | `trusted` | any same-repo ref (push or PR) | PR head          | delivered                    | org-shared scope |
 | `unknown` | a pull request from a fork     | base branch      | stripped                     | isolated scope   |
 
-`known` is a third value the vocabulary still carries. Nothing produces it any more. It survives on run rows written by earlier builds, and a context may still declare it as a `minimumTrust` floor. It is removed at v1.0.0 — see [deprecations](../../user/deprecations.md).
-
 ## Trust resolution
 
 Resolution is one comparison, performed locally:
@@ -70,8 +68,6 @@ The organization's trust policy carries one switch, `forkPolicy`, with three val
 | `ignore` | Drops the event before dispatch. No run row, no check runs, nothing a contributor can see. |
 | `hold`   | Holds the run in the security queue and posts a pending `KiCI Security` check.             |
 | `allow`  | Dispatches the run immediately, with the reduced privileges below.                         |
-
-`reject` is a fourth, deprecated value. This build resolves it through the same arm as `ignore`, so a stored `reject` row keeps denying fork pull requests without an operator rewriting it first.
 
 The switch is evaluated once per webhook event, before any dispatch path runs, and the verdict is threaded to every path that could start a job. The dispatch context's verdict field is required, so a path that fails to carry one does not compile. A verdict this build does not recognise resolves to `hold`. The policy columns are plain text, so a newer Platform can emit a value this orchestrator has never seen. For a security control, the safe reading of "I do not understand this" is to hold rather than to pass.
 
@@ -209,9 +205,9 @@ The strict numeric-id policy depends on the stored `provider_user_id` being fill
 
 `ci_trust` is **approval authority**. It decides who may release a security hold. It does not decide how much privilege a run gets — the ref does that.
 
-A member's effective `ci_trust` level comes from their assigned roles: the Owner role always yields `admin`, multiple roles merge with the highest level winning per resource, and no roles defaults to `none`. A per-member override supersedes the role-derived value where one is set; the override is deprecated and is removed at v1.0.0, so grant the level through a role instead.
+A member's effective `ci_trust` level comes from their assigned roles: the Owner role always yields `admin`, multiple roles merge with the highest level winning per resource, and no roles defaults to `none`.
 
-The roles page shows the `ci_trust` value configured on each role. The members page shows the **effective** level after role merging and any override.
+The roles page shows the `ci_trust` value configured on each role. The members page shows the **effective** level after role merging.
 
 ## Trust policy sync
 
@@ -223,15 +219,13 @@ An organization whose policy row was never created receives the push too, carryi
 
 An **independent** orchestrator has no Platform and so receives no push at all. There the operator owns the directory instead, registering each approver's identity link and `ci_trust` level with `kici-admin trust-policy directory-set`. The two writers are mutually exclusive: the admin route refuses a local write wherever a Platform is attached, because the next push would replace the whole directory.
 
-The message is version-gated. `forkPolicy: 'ignore'` requires protocol version 2; an orchestrator that negotiated version 1 receives `reject`, which its own enum carries and which denies dispatch the same way.
-
 The stored policy is read on **both** ingresses — the Platform relay and the orchestrator's own direct GitHub route, which is served in hybrid, independent and observed mode. One stored row therefore governs a pull request whichever way it arrived, so repointing a GitHub App's webhook at the orchestrator does not change the verdict its events get.
 
 ## Data model
 
 ```
 execution_runs
-  + trust_tier           TEXT  -- 'trusted' | 'known' (legacy rows) | 'unknown' | null
+  + trust_tier           TEXT  -- 'trusted' | 'unknown' | null
   + lock_file_source     TEXT  -- 'head' | 'base' | null
   + contributor_username TEXT  -- provider username of the pull request author
 

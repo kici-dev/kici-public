@@ -36,9 +36,7 @@ proposals.
 ## Security reports
 
 **Do not report security issues in public Issues.** See
-[`SECURITY.md`](SECURITY.md) for the disclosure process (or email
-`security@kici.dev` if `SECURITY.md` isn't published yet — it's
-forthcoming).
+[`SECURITY.md`](SECURITY.md) for the disclosure process.
 
 ## Pull requests
 

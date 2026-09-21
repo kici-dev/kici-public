@@ -56,6 +56,7 @@ import type {
   ManualScheduleRequest,
   DashboardRunStructuredRequest,
   DashboardArtifactsListRequest,
+  TrustTier,
 } from '@kici-dev/engine';
 import {
   AccessLogAction as AccessLogActionEnum,
@@ -584,7 +585,7 @@ export class DashboardHandler {
       const trustContext =
         runRow?.trust_tier || runRow?.lock_file_source || runRow?.contributor_username
           ? {
-              trustTier: (runRow.trust_tier as 'trusted' | 'known' | 'unknown' | null) ?? null,
+              trustTier: (runRow.trust_tier as TrustTier | null) ?? null,
               lockFileSource: (runRow.lock_file_source as 'head' | 'base' | null) ?? null,
               contributorUsername: runRow.contributor_username ?? null,
             }
@@ -2820,7 +2821,7 @@ export class DashboardHandler {
    * volume without adding attribution detail.
    *
    * Pacing: a `setImmediate` yield between sends keeps the WS connection
-   * from saturating. For a 5 MB cap (the wishlist's worst case) this means
+   * from saturating. For the 5 MB cap this means
    * ~80 yields per stream — negligible.
    */
   async handleEventLogPayloadStream(msg: DashboardEventLogPayloadStreamRequest): Promise<void> {

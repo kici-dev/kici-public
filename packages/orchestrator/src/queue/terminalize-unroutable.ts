@@ -17,7 +17,7 @@ const logger = createLogger({ prefix: 'terminalize-unroutable' });
  * The predicate is allowed to answer "routable" conservatively: the scaler half
  * matches exact labels only, so a pattern-only `runsOn` reads routable on a
  * scaler-configured orchestrator. That costs precision on the status and on
- * how quickly the job settles, never safety — a job that reads routable simply
+ * how quickly the job settles, never safety — a job that reads routable
  * falls through to the queue-timeout backstop.
  */
 export type CanRouteLabels = (

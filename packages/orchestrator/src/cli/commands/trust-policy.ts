@@ -31,32 +31,23 @@ import {
   ForkPolicy,
   MIN_APPROVAL_EXPIRY_SECONDS,
   SECONDS_PER_HOUR,
-  trustPolicySchema,
 } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
 
 /**
  * The policy shape the admin route returns.
  *
- * The four policy fields are OPTIONAL because a **v0.5.0 independent**
- * orchestrator omits them: there, and only there, no policy row and no attached
- * Platform meant no policy was resolved at all, and it reported
- * `enforcement: 'legacy'` with the fields absent. A v0.5.0 Platform-attached
- * orchestrator with no row still sent the fail-closed values. This build's route
- * always sends them in every mode, so the `unknown` fallbacks below — and the
- * `no policy stored` provenance wording — render only against that older
- * independent orchestrator.
- *
- * The route also sends a deprecated `enforcement` field. Nothing here reads it —
- * on this build it is always `policy` — so it is absent from this shape;
- * `--format json` stringifies the parsed policy object, so the field still
- * reaches the operator verbatim.
+ * The policy fields are OPTIONAL because a **v0.5.0 independent** orchestrator
+ * omits them: there, and only there, no policy row and no attached Platform
+ * meant no policy was resolved at all. A v0.5.0 Platform-attached orchestrator
+ * with no row still sent the fail-closed values. This build's route always sends
+ * them in every mode, so the `unknown` fallbacks below — and the `no policy
+ * stored` provenance wording — render only against that older independent
+ * orchestrator.
  */
 export interface TrustPolicyView {
   customerId: string;
   forkPolicy?: string;
-  unknownContributorPolicy?: string;
-  workflowChangePolicy?: string;
   approvalExpiryHours?: number;
   /**
    * The authoritative hold window. Absent from any orchestrator that predates
@@ -73,59 +64,20 @@ interface PolicyResponse {
   policy: TrustPolicyView;
 }
 
-/** One settable knob: wire field, CLI flag, accepted values, and label. */
-interface PolicyKnob {
-  field: 'forkPolicy' | 'unknownContributorPolicy' | 'workflowChangePolicy';
-  flag: string;
-  label: string;
-  values: readonly string[];
-  /**
-   * Set when the flag is accepted only for compatibility. Its presence turns
-   * the flag into a warning at `set` time and annotates its help text.
-   */
-  deprecated?: string;
-}
-
-/** What a deprecated arm's warning says, and what its help text is suffixed with. */
-const DEAD_ARM_NOTE = 'deprecated: no longer enforced; removed at v1.0.0';
-
-const KNOBS: readonly PolicyKnob[] = [
-  {
-    field: 'forkPolicy',
-    flag: 'fork-policy',
-    label: 'Fork PR policy',
-    // The wire enum itself, so every value the gate honours is settable —
-    // including `ignore`, which is what an orchestrator with no stored row
-    // already applies and therefore has to be expressible.
-    values: ForkPolicy.options,
-  },
-  {
-    field: 'unknownContributorPolicy',
-    flag: 'unknown-contributor-policy',
-    label: 'Unknown contributor policy',
-    // Taken from the wire schema, so the CLI can never offer a value the route
-    // refuses. That schema declares no `allow` member for this arm.
-    values: trustPolicySchema.shape.unknownContributorPolicy.options,
-    deprecated: DEAD_ARM_NOTE,
-  },
-  {
-    field: 'workflowChangePolicy',
-    flag: 'workflow-change-policy',
-    label: 'Workflow change policy',
-    values: trustPolicySchema.shape.workflowChangePolicy.options,
-    deprecated: DEAD_ARM_NOTE,
-  },
-];
-
 /**
- * Render the policy as an aligned table, or as JSON when asked.
- *
- * The two deprecated arms are deliberately absent from the table: no dispatch
- * decision reads either one, so a row claiming `Unknown contributor policy:
- * hold` would assert an enforcement that is not happening. They are still
- * stored and still echoed back, and `--format json` prints the policy object the
- * route returned, so the values remain reachable for anyone who needs them.
+ * The fork switch flag: wire field, CLI flag, accepted values, and label. The
+ * values are the wire enum itself, so every value the gate honours is settable —
+ * including `ignore`, which is what an orchestrator with no stored row already
+ * applies and therefore has to be expressible.
  */
+const FORK_POLICY_KNOB = {
+  field: 'forkPolicy',
+  flag: 'fork-policy',
+  label: 'Fork PR policy',
+  values: ForkPolicy.options,
+} as const;
+
+/** Render the policy as an aligned table, or as JSON when asked. */
 export function formatPolicy(policy: TrustPolicyView, format: string): string {
   if (format === 'json') return JSON.stringify(policy, null, 2);
 
@@ -156,14 +108,11 @@ export function formatPolicy(policy: TrustPolicyView, format: string): string {
  * touched to a policy they never set, so the reader of `trust-policy show`
  * is told outright — with where to look for each individual drop.
  *
- * `reject` is deprecated and resolves through the same arm, so it warns too.
- *
  * Returns the lines rather than printing them so the check is unit-testable,
- * matching `policyDeprecationWarnings` above.
+ * matching `policyExpiryWarnings` below.
  */
 export function forkDropWarnings(policy: TrustPolicyView): string[] {
-  const drops: readonly string[] = [ForkPolicy.enum.ignore, ForkPolicy.enum.reject];
-  if (policy.forkPolicy === undefined || !drops.includes(policy.forkPolicy)) return [];
+  if (policy.forkPolicy !== ForkPolicy.enum.ignore) return [];
 
   const lines = [
     'Warning: this policy drops fork pull requests before dispatch. KiCI creates no run, ' +
@@ -229,14 +178,15 @@ export function buildPolicyPatch(
 ): Record<string, string | number> {
   const patch: Record<string, string | number> = {};
 
-  for (const knob of KNOBS) {
-    const raw = opts[camelFromFlag(knob.flag)];
-    if (raw === undefined) continue;
-    if (!knob.values.includes(raw)) {
-      console.error(`Error: --${knob.flag} must be one of: ${knob.values.join(' | ')}`);
+  const forkPolicy = opts[FORK_POLICY_KNOB.field];
+  if (forkPolicy !== undefined) {
+    if (!(FORK_POLICY_KNOB.values as readonly string[]).includes(forkPolicy)) {
+      console.error(
+        `Error: --${FORK_POLICY_KNOB.flag} must be one of: ${FORK_POLICY_KNOB.values.join(' | ')}`,
+      );
       process.exit(1);
     }
-    patch[knob.field] = raw;
+    patch[FORK_POLICY_KNOB.field] = forkPolicy;
   }
 
   for (const [field, flag, min] of EXPIRY_FLAGS) {
@@ -267,7 +217,7 @@ const EXPIRY_FLAGS = [
  * one that is not applied is named rather than dropped in silence.
  *
  * Returns the lines rather than printing them so the check is unit-testable,
- * matching `policyDeprecationWarnings` below.
+ * matching `forkDropWarnings` above.
  */
 export function policyExpiryWarnings(patch: Record<string, string | number>): string[] {
   if (patch.approvalExpiryHours === undefined || patch.approvalExpirySeconds === undefined) {
@@ -278,45 +228,6 @@ export function policyExpiryWarnings(patch: Record<string, string | number>): st
       `--approval-expiry-seconds ${patch.approvalExpirySeconds} was also given; the more ` +
       `specific value wins.`,
   ];
-}
-
-/**
- * Warn about deprecated flags and deprecated values in an already-built patch.
- *
- * Every one of these still PATCHes through unchanged — the orchestrator stores
- * what it is given, and an older Platform or CLI keeps seeing the value it
- * expects. The warning says what the value does now, which for all three is
- * nothing the fork switch reads.
- *
- * Returns the lines rather than printing them so the check is unit-testable,
- * matching `unpairedEvalTimeoutWarnings` in `cluster-settings.ts`.
- */
-export function policyDeprecationWarnings(patch: Record<string, string | number>): string[] {
-  const warnings: string[] = [];
-
-  if (patch.forkPolicy === ForkPolicy.enum.reject) {
-    warnings.push(
-      `Warning: --fork-policy ${ForkPolicy.enum.reject} is deprecated in favour of ` +
-        `--fork-policy ${ForkPolicy.enum.ignore}, which it already behaves as; removed at ` +
-        `v1.0.0. The value is stored as given.`,
-    );
-  }
-
-  for (const knob of KNOBS) {
-    if (knob.deprecated === undefined) continue;
-    if (patch[knob.field] === undefined) continue;
-    warnings.push(
-      `Warning: --${knob.flag} is ${knob.deprecated}. The value is stored and echoed back, ` +
-        `but no dispatch decision reads it.`,
-    );
-  }
-
-  return warnings;
-}
-
-/** `fork-policy` → `forkPolicy`, matching how commander stores long options. */
-function camelFromFlag(flag: string): string {
-  return flag.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
 }
 
 /** One identity link as the directory route reports it. */
@@ -385,8 +296,8 @@ export function formatDirectoryAge(updatedAt: string, now: number): string {
  * The connected wording is a `Note:` and the disconnected one a `Warning:`,
  * because the two ask for different things: one states a property of the design
  * the reader should know, the other names a condition they should act on. The
- * `Warning:` producers above — `forkDropWarnings`, `policyExpiryWarnings` and
- * `policyDeprecationWarnings` — are all of the second kind.
+ * `Warning:` producers above — `forkDropWarnings` and `policyExpiryWarnings` —
+ * are both of the second kind.
  *
  * Returns the lines rather than printing them so the check is unit-testable,
  * matching `forkDropWarnings` above.
@@ -628,10 +539,10 @@ export function registerTrustPolicyCommands(
     )
     .requiredOption('--customer-id <id>', 'Org / customer id')
     .option('--format <format>', 'Output format: json|table', 'table');
-  for (const knob of KNOBS) {
-    const suffix = knob.deprecated === undefined ? '' : ` [${knob.deprecated}]`;
-    setCmd.option(`--${knob.flag} <value>`, `${knob.label} (${knob.values.join(' | ')})${suffix}`);
-  }
+  setCmd.option(
+    `--${FORK_POLICY_KNOB.flag} <value>`,
+    `${FORK_POLICY_KNOB.label} (${FORK_POLICY_KNOB.values.join(' | ')})`,
+  );
   setCmd.option(
     '--approval-expiry-hours <value>',
     'Security-hold approval expiry, in hours (integer >= 1)',
@@ -648,7 +559,7 @@ export function registerTrustPolicyCommands(
       console.error('Error: at least one policy flag is required');
       process.exit(1);
     }
-    for (const line of [...policyDeprecationWarnings(patch), ...policyExpiryWarnings(patch)]) {
+    for (const line of policyExpiryWarnings(patch)) {
       console.warn(line);
     }
     try {

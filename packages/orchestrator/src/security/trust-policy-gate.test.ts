@@ -21,8 +21,6 @@ import {
 /** A policy whose only meaningful field is the fork switch under test. */
 const policy = (forkPolicy: string): TrustPolicy => ({
   forkPolicy: forkPolicy as TrustPolicy['forkPolicy'],
-  unknownContributorPolicy: 'hold',
-  workflowChangePolicy: 'hold',
   approvalExpiryHours: 72,
 });
 
@@ -47,7 +45,7 @@ describe('evaluateTrustPolicy (fork switch)', () => {
     // has no verdict to receive here — reduced privilege for a non-trusted
     // contributor is derived from the tier further down the pipeline.
     for (const value of ForkPolicy.options) {
-      for (const tier of ['known', 'unknown', undefined] as const) {
+      for (const tier of ['unknown', undefined] as const) {
         expect(evaluateTrustPolicy(policy(value), { tier, isForkPR: false })).toEqual({
           action: 'pass',
         });
@@ -59,8 +57,12 @@ describe('evaluateTrustPolicy (fork switch)', () => {
     expect(evaluateTrustPolicy(policy(ForkPolicy.enum.ignore), FORK)).toEqual({ action: 'ignore' });
   });
 
-  it('treats the deprecated reject as ignore', () => {
-    expect(evaluateTrustPolicy(policy(ForkPolicy.enum.reject), FORK)).toEqual({ action: 'ignore' });
+  it('holds a fork PR under a value it does not recognise, such as the retired reject', () => {
+    // fails-when: a stored `reject` row still resolves through the ignore arm.
+    // The columns are plain TEXT, so an unrecognised value is reachable, and
+    // for a security control the safe reading of "I do not understand this"
+    // is `hold`, not `pass` and not the silent drop.
+    expect(evaluateTrustPolicy(policy('reject'), FORK)).toMatchObject({ action: 'hold' });
   });
 
   it('holds a fork PR under hold, with the policy window', () => {
@@ -123,7 +125,7 @@ describe('evaluateTrustPolicy (fork switch)', () => {
     // The fork switch is the policy's only arm. `context_trust` belongs to the
     // per-context gate, which holds an individual job under its real name.
     for (const value of [...ForkPolicy.options, 'quarantine']) {
-      for (const tier of ['known', 'unknown', undefined] as const) {
+      for (const tier of ['unknown', undefined] as const) {
         for (const isForkPR of [true, false]) {
           const out = evaluateTrustPolicy(policy(value), { tier, isForkPR });
           if (out.action === 'hold' || out.action === 'reject') {
@@ -142,7 +144,7 @@ describe('evaluateTrustPolicy (fork switch)', () => {
     // fourth action is returned from here. `'quarantine'` is the unknown value
     // — the case a newer Platform writing the plain-TEXT policy column produces.
     for (const value of [...ForkPolicy.options, 'quarantine']) {
-      for (const tier of ['known', 'unknown', 'trusted', undefined] as const) {
+      for (const tier of ['unknown', 'trusted', undefined] as const) {
         for (const isForkPR of [true, false]) {
           const out = evaluateTrustPolicy(policy(value), { tier, isForkPR });
           expect(['pass', 'hold', 'ignore']).toContain(out.action);
@@ -268,14 +270,13 @@ describe('forkDropExplanation', () => {
   });
 
   it('names the stored switch value rather than assuming ignore', () => {
-    // `reject` is deprecated and resolves through the same `ignore` arm, so a
-    // message hard-coding `ignore` would misreport what the org actually stored.
+    // A message hard-coding `ignore` would misreport what the org stored.
     const text = forkDropExplanation({
-      policy: ForkPolicy.enum.reject,
+      policy: ForkPolicy.enum.hold,
       source: EffectivePolicySource.enum.stored,
       platformManaged: true,
     });
-    expect(text).toContain(`forkPolicy=${ForkPolicy.enum.reject}`);
+    expect(text).toContain(`forkPolicy=${ForkPolicy.enum.hold}`);
     expect(text).not.toContain(`forkPolicy=${IGNORE}`);
   });
 });
@@ -309,8 +310,6 @@ describe('READ_FAILURE_POLICY', () => {
 
 describe('policy key coverage', () => {
   it('carries every key of the wire policy schema', () => {
-    // The two deprecated keys are still on the wire, so the resolved policy has
-    // to carry them even though no decision reads them.
     expect(Object.keys(FAIL_CLOSED_POLICY).sort()).toEqual(
       Object.keys(trustPolicySchema.shape).sort(),
     );
@@ -322,20 +321,5 @@ describe('policy key coverage', () => {
     expect(evaluateTrustPolicy(policy(ForkPolicy.enum.allow), FORK).action).toBe('pass');
     // `approvalExpiryHours` is consumed by the hold path, asserted above and in
     // dispatch-matched-workflow.test.ts.
-  });
-
-  it('does not read either deprecated key', () => {
-    // The claim the wire schema's `@deprecated` JSDoc makes: these are accepted
-    // and stored, and no decision reads them. Changing both leaves the verdict
-    // identical for every fork-switch value.
-    for (const value of ForkPolicy.options) {
-      const base = policy(value);
-      const flipped: TrustPolicy = {
-        ...base,
-        unknownContributorPolicy: 'reject',
-        workflowChangePolicy: 'allow',
-      };
-      expect(evaluateTrustPolicy(flipped, FORK)).toEqual(evaluateTrustPolicy(base, FORK));
-    }
   });
 });

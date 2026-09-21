@@ -1455,10 +1455,10 @@ describe('resolveJobWorkDir', () => {
   it('in-place + file:// source → uses the decoded repo path, no-op cleanup', async () => {
     const { workDir, inPlace, cleanup } = await resolveJobWorkDir(
       true,
-      'file:///home/op/devel/myci26',
+      'file:///home/op/devel/repo',
     );
     expect(inPlace).toBe(true);
-    expect(workDir).toBe('/home/op/devel/myci26');
+    expect(workDir).toBe('/home/op/devel/repo');
     // Cleanup must be a no-op — never remove the operator's real tree.
     await expect(cleanup()).resolves.toBeUndefined();
   });
@@ -1475,7 +1475,7 @@ describe('resolveJobWorkDir', () => {
     (fsPromises.rm as unknown as Mock).mockClear();
     const { workDir, inPlace, cleanup } = await resolveJobWorkDir(
       false,
-      'file:///home/op/devel/myci26',
+      'file:///home/op/devel/repo',
     );
     expect(inPlace).toBe(false);
     expect(workDir).toBe('/tmp/kici-test123');

@@ -16,10 +16,11 @@ into a portable lock file, and executed by self-hosted agents.
   for the canonical signatures of \`workflow\`, \`job\`, \`step\`, \`pr\`,
   \`push\`, \`schedule\`, \`rule\`, \`dynamicJob\`, etc.
 - Bundled offline reference for coding agents: \`kici docs llm\` prints the
-  full markdown documentation bundle to stdout. \`kici docs llm --index\`
-  prints just the curated link index (llms.txt format).
+  curated link index (llms.txt format); \`kici docs llm full\` prints the
+  complete markdown documentation bundle; \`kici docs llm <topic>\` prints one
+  task bundle (\`sdk\`, \`cli\`, \`patterns\`, …).
 - Online docs:
-  - <https://kici.dev/docs/> — published docs site.
+  - <https://docs.kici.dev/> — published docs site.
   - <https://kici.dev/llms.txt> — curated index for LLM consumers.
   - <https://kici.dev/llms-full.txt> — full markdown bundle.
   - Key pages: \`user/sdk-reference\`, \`user/workflow-patterns\`,
@@ -112,16 +113,17 @@ into a portable lock file, and executed by self-hosted agents.
 | \`pnpm kici compile --check\`     | Validate workflow source without writing.   |
 | \`pnpm kici preview pr:open --debug\` | Preview which workflows match an event.   |
 | \`pnpm kici run push --local\`    | Execute a workflow locally (this machine as an ephemeral agent). |
-| \`pnpm kici docs llm\`            | Print the full LLM documentation bundle.    |
-| \`pnpm kici docs llm --index\`    | Print the curated link index.               |
+| \`pnpm kici docs llm\`            | Print the curated link index (llms.txt).    |
+| \`pnpm kici docs llm full\`       | Print the full LLM documentation bundle.    |
+| \`pnpm kici docs llm sdk\`        | Print one task bundle (also \`cli\`, \`patterns\`, …). |
 
 If \`pnpm kici\` isn't in scripts, fall back to \`npx kici\`.
 
 ## Loop
 
 1. Read the SDK types from \`node_modules/@kici-dev/sdk/dist/index.d.ts\`.
-2. Pipe \`kici docs llm\` into the agent's context if it doesn't already have
-   the full bundle.
+2. Pipe \`kici docs llm sdk\` (or \`kici docs llm full\`) into the agent's context if
+   it doesn't already have the authoring reference.
 3. Edit a workflow under \`.kici/workflows/\`.
 4. Run \`kici compile --check\` (zero exit means valid).
 5. Run \`kici preview <event>\` to preview matching.

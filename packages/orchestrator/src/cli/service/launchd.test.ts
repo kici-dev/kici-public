@@ -413,7 +413,7 @@ describe('launchd service manager', () => {
       // the installing root user, but launchd opens stdout/stderr as the
       // spawned-user identity. Without the chown, the daemon would never
       // spawn (state stays "spawn scheduled", no log output ever).
-      const config = makeConfig({ isUserLevel: false, user: 'cmaster11' });
+      const config = makeConfig({ isUserLevel: false, user: 'alice' });
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
           throw new Error('not loaded');
@@ -424,7 +424,7 @@ describe('launchd service manager', () => {
 
       expect(mockedExecFileSync).toHaveBeenCalledWith(
         'chown',
-        ['-R', 'cmaster11:staff', '/var/log/kici'],
+        ['-R', 'alice:staff', '/var/log/kici'],
         expect.any(Object),
       );
     });

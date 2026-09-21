@@ -63,6 +63,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: true },
@@ -148,6 +149,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 4,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
           },
           {
             agentId: 'agent-2',
@@ -156,6 +158,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'darwin',
             arch: 'arm64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: true, logRoutingOverride: 'direct' },
@@ -206,6 +209,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 1,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
             scalerName: 'stg-container',
           },
           {
@@ -215,6 +219,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 1,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
             // scalerName omitted — legacy / static agent.
           },
         ],
@@ -252,6 +257,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
           },
           {
             agentId: 'agent-2',
@@ -260,6 +266,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: false },
@@ -283,6 +290,7 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: false },
@@ -811,6 +819,7 @@ describe('PeerRegistry', () => {
           ...a,
           platform: 'linux',
           arch: 'x64',
+          mandatoryLabels: [],
         })),
         capabilities: { s3LogAccess: false },
         timestamp: Date.now(),
@@ -952,6 +961,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'x64']],
             maxAgents: 5,
             activeCount: 2,
+            labelSetMandatoryLabels: [[]],
           },
         ],
         timestamp: Date.now(),
@@ -983,6 +993,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'x64']],
             maxAgents: 3,
             activeCount: 3,
+            labelSetMandatoryLabels: [[]],
           },
         ],
         timestamp: Date.now(),
@@ -1013,6 +1024,7 @@ describe('PeerRegistry', () => {
             labelSets: [['darwin', 'arm64']],
             maxAgents: 5,
             activeCount: 0,
+            labelSetMandatoryLabels: [[]],
           },
         ],
         timestamp: Date.now(),
@@ -1035,7 +1047,7 @@ describe('PeerRegistry', () => {
       expect(matches[0].instanceId).toBe('orch-legacy');
     });
 
-    // ── mandatoryLabels gate on peer scaler-capacity entries ────────────
+    // ── per-label-set gate on peer scaler-capacity entries ──────────────
     it('routes to peer with gated scaler when required labels include mandatory', () => {
       registry.addPeer({
         instanceId: 'orch-gpu',
@@ -1056,7 +1068,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'gpu']],
             maxAgents: 5,
             activeCount: 0,
-            mandatoryLabels: ['gpu'],
+            labelSetMandatoryLabels: [['gpu']],
           },
         ],
         timestamp: Date.now(),
@@ -1087,7 +1099,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'gpu']],
             maxAgents: 5,
             activeCount: 0,
-            mandatoryLabels: ['gpu'],
+            labelSetMandatoryLabels: [['gpu']],
           },
         ],
         timestamp: Date.now(),
@@ -1098,7 +1110,7 @@ describe('PeerRegistry', () => {
       expect(matches).toHaveLength(0);
     });
 
-    it('routes to peer when scaler has no mandatoryLabels (backward compat with legacy peers)', () => {
+    it('routes to peer when the scaler advertises an empty gate', () => {
       registry.addPeer({
         instanceId: 'orch-legacy',
         connectionId: 'conn-legacy',
@@ -1118,7 +1130,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'x64']],
             maxAgents: 5,
             activeCount: 0,
-            // mandatoryLabels omitted — legacy peer or no gate.
+            labelSetMandatoryLabels: [[]],
           },
         ],
         timestamp: Date.now(),
@@ -1149,7 +1161,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'gpu']],
             maxAgents: 5,
             activeCount: 0,
-            mandatoryLabels: ['gpu'],
+            labelSetMandatoryLabels: [['gpu']],
           },
         ],
         timestamp: Date.now(),
@@ -1180,7 +1192,7 @@ describe('PeerRegistry', () => {
             labelSets: [['windows', 'bare-metal']],
             maxAgents: 2,
             activeCount: 0,
-            mandatoryLabels: ['windows'],
+            labelSetMandatoryLabels: [['windows']],
           },
         ],
         timestamp: Date.now(),
@@ -1219,7 +1231,7 @@ describe('PeerRegistry', () => {
             labelSets: [['windows-2022', 'bare-metal', 'windows']],
             maxAgents: 2,
             activeCount: 0,
-            mandatoryLabels: ['windows'],
+            labelSetMandatoryLabels: [['windows']],
           },
         ],
         timestamp: Date.now(),
@@ -1331,7 +1343,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'gpu']],
             maxAgents: 5,
             activeCount: 5, // at capacity — irrelevant to findPeersWithLabels
-            mandatoryLabels: ['gpu'],
+            labelSetMandatoryLabels: [['gpu']],
           },
         ],
         timestamp: Date.now(),
@@ -1363,7 +1375,7 @@ describe('PeerRegistry', () => {
             labelSets: [['linux', 'gpu']],
             maxAgents: 5,
             activeCount: 5,
-            mandatoryLabels: ['gpu'],
+            labelSetMandatoryLabels: [['gpu']],
           },
         ],
         timestamp: Date.now(),
@@ -1481,7 +1493,6 @@ describe('PeerRegistry', () => {
           ['linux', 'gpu'],
           ['macos', 'xcode'],
         ],
-        mandatoryLabels: ['gpu', 'macos'],
         labelSetMandatoryLabels: [['gpu'], ['macos']],
       },
     ];
@@ -1498,35 +1509,23 @@ describe('PeerRegistry', () => {
       expect(registry.findPeersWithCapacity([['xcode']])).toHaveLength(0);
     });
 
-    it('old peer → falls back to the scaler-wide union when the field is absent', () => {
-      advertise('orch-old', [
-        {
-          labelSets: [
-            ['linux', 'gpu'],
-            ['macos', 'xcode'],
-          ],
-          mandatoryLabels: ['gpu', 'macos'],
-          // labelSetMandatoryLabels omitted — a peer that predates the field.
-        },
-      ]);
-      // The union gate is applied, exactly as before the field existed.
-      expect(registry.findPeersWithCapacity([['linux', 'gpu']])).toHaveLength(0);
-      expect(registry.findPeersWithLabels([['linux', 'gpu']])).toHaveLength(0);
-    });
-
-    it('falls back to the scaler-wide union when the per-set array is misaligned', () => {
+    it('routes nothing through an entry whose per-set array is misaligned', () => {
+      // fails-when: a misaligned array is indexed into anyway — one entry for
+      // two label sets carries no trustworthy alignment, so applying entry 0 to
+      // set 1 would under-gate the macos set and send a job to a peer that
+      // cannot run it.
       advertise('orch-bad', [
         {
           labelSets: [
             ['linux', 'gpu'],
             ['macos', 'xcode'],
           ],
-          mandatoryLabels: ['gpu', 'macos'],
-          // One entry for two label sets — no trustworthy alignment.
           labelSetMandatoryLabels: [['gpu']],
         },
       ]);
       expect(registry.findPeersWithCapacity([['linux', 'gpu']])).toHaveLength(0);
+      expect(registry.findPeersWithCapacity([['macos', 'xcode']])).toHaveLength(0);
+      expect(registry.findPeersWithLabels([['linux', 'gpu']])).toHaveLength(0);
     });
 
     it('does not admit a peer whose gate and labels come from different label sets', () => {
@@ -1538,7 +1537,6 @@ describe('PeerRegistry', () => {
             // Set 1 satisfies a `gpu` gate but does not supply `linux`.
             ['gpu'],
           ],
-          mandatoryLabels: ['gpu'],
           labelSetMandatoryLabels: [['gpu'], []],
         },
       ]);
@@ -1552,7 +1550,6 @@ describe('PeerRegistry', () => {
       advertise('orch-mixed', [
         {
           labelSets: [['linux', 'gpu'], ['linux']],
-          mandatoryLabels: ['gpu'],
           labelSetMandatoryLabels: [['gpu'], []],
         },
       ]);
@@ -1570,7 +1567,6 @@ describe('PeerRegistry', () => {
           // `findBackendForLabels` lowercases both sides, so it accepts a
           // lowercase `runsOn` — peer selection must reach the same verdict.
           labelSets: [['Linux', 'GPU']],
-          mandatoryLabels: ['GPU'],
           labelSetMandatoryLabels: [['GPU']],
         },
       ]);
@@ -1631,10 +1627,13 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'linux',
             arch: 'x64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: false },
-        scalerCapacity: [{ labelSets: [['linux']], maxAgents: 5, activeCount: 1 }],
+        scalerCapacity: [
+          { labelSets: [['linux']], maxAgents: 5, activeCount: 1, labelSetMandatoryLabels: [[]] },
+        ],
         timestamp: Date.now(),
       });
 
@@ -1681,10 +1680,13 @@ describe('PeerRegistry', () => {
             maxConcurrency: 2,
             platform: 'darwin',
             arch: 'arm64',
+            mandatoryLabels: [],
           },
         ],
         capabilities: { s3LogAccess: true },
-        scalerCapacity: [{ labelSets: [['macos']], maxAgents: 3, activeCount: 2 }],
+        scalerCapacity: [
+          { labelSets: [['macos']], maxAgents: 3, activeCount: 2, labelSetMandatoryLabels: [[]] },
+        ],
         timestamp: Date.now(),
       });
 
@@ -1746,6 +1748,7 @@ describe('PeerRegistry', () => {
           ...a,
           platform: 'linux',
           arch: 'x64',
+          mandatoryLabels: [],
         })),
         capabilities: { s3LogAccess: false },
         scalerCapacity: opts?.scalerCapacity,
@@ -1770,7 +1773,14 @@ describe('PeerRegistry', () => {
 
     it('should find peer with matching scaler backend regardless of capacity', () => {
       addPeerWithAgents('orch-scaler', [], {
-        scalerCapacity: [{ labelSets: [['macos', 'arm64']], maxAgents: 3, activeCount: 3 }],
+        scalerCapacity: [
+          {
+            labelSets: [['macos', 'arm64']],
+            maxAgents: 3,
+            activeCount: 3,
+            labelSetMandatoryLabels: [[]],
+          },
+        ],
       });
 
       // Scaler is at full capacity, but findPeersWithLabels ignores capacity

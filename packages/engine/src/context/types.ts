@@ -27,7 +27,7 @@ export interface Context {
   waitTimerSeconds: number | null;
   holdExpirySeconds: number;
   /** Minimum trust tier required for CI execution in this context. */
-  minimumTrust?: 'known' | 'trusted';
+  minimumTrust?: 'trusted';
   /** Whether this context allows local (no-remote) executions. Default false. */
   allowLocalExecution?: boolean;
   enabled: boolean;
@@ -90,17 +90,21 @@ export interface ContextSourceOverride {
 }
 
 /**
- * Trust tier for CI execution gating (single source of truth).
- *
- * `'known'` is legacy vocabulary: the orchestrator's ref-based trust resolution
- * produces only `'trusted'` (a ref in the base repo) and `'unknown'` (a ref
- * from a fork). It still reaches runtime from a stored
- * `execution_runs.trust_tier` row an internal event inherits, and a context can
- * still declare it as its `minimumTrust` floor. It is slated for removal at
- * v1.0.0, after which trust is a two-value vocabulary.
+ * Trust tier for CI execution gating (single source of truth). Trust is
+ * ref-based: a ref in the base repo is `'trusted'`, a ref from a fork is
+ * `'unknown'`.
  */
-export const TrustTierSchema = z.enum(['trusted', 'known', 'unknown']);
+export const TrustTierSchema = z.enum(['trusted', 'unknown']);
 export type TrustTier = z.infer<typeof TrustTierSchema>;
+
+/**
+ * The one `minimumTrust` requirement a context can carry, as it travels on the
+ * wire and in the row: `'trusted'` sets it, `null` clears it. The trust gate
+ * holds a run whose ref resolved as a fork; a context that sets no requirement
+ * passes every run.
+ */
+export const MinimumTrustSchema = z.literal('trusted').nullable();
+export type MinimumTrust = z.infer<typeof MinimumTrustSchema>;
 
 /** Held run record for protection gate enforcement. */
 export interface HeldRun {

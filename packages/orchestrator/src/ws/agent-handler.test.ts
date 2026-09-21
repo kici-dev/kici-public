@@ -32,6 +32,8 @@ import {
   PRIVILEGED_ROOT_LABEL,
   ArtifactCompleteAckOutcome,
   ORCH_AGENT_CAPABILITIES,
+  PROTOCOL_VERSION,
+  WS_CLOSE_PROTOCOL_ERROR,
 } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
@@ -119,7 +121,7 @@ function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
   return {
     type: 'auth.request' as const,
     token,
-    protocolVersion: 1,
+    protocolVersion: PROTOCOL_VERSION,
   };
 }
 
@@ -663,6 +665,61 @@ describe('createAgentWsHandler', () => {
       expect(authFailure).toBeDefined();
       expect(authFailure!.reason).toContain('Invalid or expired token');
       expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AGENT_AUTH_FAILED, 'Authentication failed');
+    });
+
+    it('refuses an agent below the protocol floor -> auth.failure + WS close 4005, before the token is read', async () => {
+      // The version check runs before the token store, so a valid token does
+      // not rescue an old agent.
+      //
+      // fails-when: MIN_PROTOCOL_VERSION drops below PROTOCOL_VERSION, or the
+      // check moves behind token validation.
+      // breaks-if-wrong: `authRequestMsg()` at PROTOCOL_VERSION still registers
+      // in the 'token mode' positive cases beside this one.
+      const ts = mockTokenStore();
+      const handler = createHandler({ agentAuthMode: 'token', tokenStore: ts });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({ ...authRequestMsg(), protocolVersion: PROTOCOL_VERSION - 1 }),
+        ws as any,
+      );
+
+      const sentCalls = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
+      const authFailure = sentCalls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.failure');
+      expect(authFailure?.reason).toBe('Unsupported protocol version');
+      expect(ws.close).toHaveBeenCalledWith(
+        WS_CLOSE_PROTOCOL_ERROR,
+        'Unsupported protocol version',
+      );
+      expect(ts.validate).not.toHaveBeenCalled();
+    });
+
+    it('refuses protocol version 2, the value every 0.8.x agent sends', async () => {
+      // The literal matters: 0.8.0 already shipped PROTOCOL_VERSION = 2, so a
+      // floor of 2 refuses no published build. A 0.8.x agent let through the
+      // handshake has every `artifacts.upload.complete` refused by the strict
+      // 0.9.0 schema instead of being told at connect.
+      //
+      // fails-when: the floor drops back to 2 — `PROTOCOL_VERSION - 1` above
+      // would then drive 1 and still pass while a real 0.8.x agent connects.
+      const ts = mockTokenStore();
+      const handler = createHandler({ agentAuthMode: 'token', tokenStore: ts });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({ ...authRequestMsg(), protocolVersion: 2 }),
+        ws as any,
+      );
+
+      expect(ws.close).toHaveBeenCalledWith(
+        WS_CLOSE_PROTOCOL_ERROR,
+        'Unsupported protocol version',
+      );
+      expect(ts.validate).not.toHaveBeenCalled();
     });
 
     it('auth timeout (no auth.request within 5s) -> WS close 4002', async () => {
@@ -1713,9 +1770,7 @@ describe('createAgentWsHandler', () => {
         messageId: 'm1',
         jobId: 'job-1',
         name: 'bundle',
-        sizeBytes: 100,
         sha256: 'abc',
-        storageKey: 'artifacts/run-1/bundle.tar.gz',
       };
     }
 
@@ -2136,9 +2191,7 @@ describe('createAgentWsHandler', () => {
           messageId: 'm1',
           jobId: 'job-1',
           name: 'bundle',
-          sizeBytes: 100,
           sha256: 'abc',
-          storageKey: 'artifacts/run-1/bundle.tar.gz',
         }),
         ws as any,
       );
@@ -2148,9 +2201,7 @@ describe('createAgentWsHandler', () => {
         runId: 'run-1',
         jobId: 'job-1',
         name: 'bundle',
-        sizeBytes: 100,
         sha256: 'abc',
-        storageKey: 'artifacts/run-1/bundle.tar.gz',
       });
       expect(sentAck(ws)).toEqual({
         type: 'artifacts.upload.complete.ack',

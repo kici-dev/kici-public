@@ -20,7 +20,7 @@ import type { TrustTier } from '@kici-dev/engine';
  * Select which branch's lock file to fetch.
  *
  * Invariant (customer-isolation): for any pull-request event, an
- * untrusted ref (`tier === 'unknown' | 'known' | undefined`) MUST NOT
+ * untrusted ref (`tier === 'unknown' | undefined`) MUST NOT
  * have its HEAD lock file evaluated by the orchestrator. The
  * base-branch lock — controlled by the project's trusted maintainers —
  * is the source of truth for trigger evaluation, trust-tier-based

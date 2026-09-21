@@ -136,7 +136,7 @@ export async function verifyAttestationCommand(
           pc.bold(
             pc.yellow(
               `  ATTESTATION: deferred — the build facts were sealed at build time; the identity ` +
-                `token was minted later (after a transient Platform outage), bound to the frozen ` +
+                `token was minted later (once the orchestrator's signing key was available), bound to the frozen ` +
                 `statement by hash.`,
             ),
           ),

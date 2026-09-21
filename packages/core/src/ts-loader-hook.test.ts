@@ -8,7 +8,7 @@ import { load } from './ts-loader-hook.js';
 // The runtime `.ts` loader transforms via oxc-transform (Rust), never importing
 // `typescript`, so it is independent of which compiler runs type-check / emit.
 // This test proves the loader still strips modern TS-era syntax and yields the
-// correct runtime value after the type-check/emit toolchain moved to TS7 tsgo.
+// correct runtime value after the type-check/emit toolchain moved to the TS7 native `tsc`.
 
 const neverNextLoad = () => {
   throw new Error('nextLoad must not be called for a .ts URL');

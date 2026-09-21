@@ -943,7 +943,7 @@ describe('buildBwrapArgs', () => {
     // entire workspace root. Without this the runner crashes with
     // `Cannot find package '@kici-dev/shared'`. Regression seen in E2E.
     mockExistsSync.mockImplementation(
-      (p: string) => p === '/home/u/devel/myci26/pnpm-workspace.yaml',
+      (p: string) => p === '/home/u/devel/repo/pnpm-workspace.yaml',
     );
 
     const { buildBwrapArgs } = await import('./fork-runner.js');
@@ -951,14 +951,14 @@ describe('buildBwrapArgs', () => {
       '/tmp/workdir',
       '/usr/bin/node',
       true,
-      '/home/u/devel/myci26/packages/agent/dist/workflow-runner.js',
+      '/home/u/devel/repo/packages/agent/dist/workflow-runner.js',
     );
 
     assertBindInvariant(args);
     const joined = args.join(' ');
-    expect(joined).toContain('--ro-bind /home/u/devel/myci26 /home/u/devel/myci26');
+    expect(joined).toContain('--ro-bind /home/u/devel/repo /home/u/devel/repo');
     // No redundant per-node_modules binds when the workspace root is bound.
-    expect(joined).not.toContain('--ro-bind /home/u/devel/myci26/packages/agent/node_modules');
+    expect(joined).not.toContain('--ro-bind /home/u/devel/repo/packages/agent/node_modules');
   });
 
   it('falls back to per-node_modules walking when no pnpm-workspace.yaml is found', async () => {

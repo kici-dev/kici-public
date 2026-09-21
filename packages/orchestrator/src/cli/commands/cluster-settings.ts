@@ -28,12 +28,6 @@ interface KnobSpec {
    */
   max?: number;
   label: string;
-  /**
-   * Set when the knob is kept only for compatibility and no runtime read
-   * consumes it. Its presence annotates the `show` row and the `set` / `reset`
-   * help text, and turns a `set` into a warning.
-   */
-  deprecated?: string;
 }
 
 /**
@@ -61,12 +55,6 @@ interface BooleanKnobSpec {
   flag: string;
   label: string;
 }
-
-/**
- * What a knob kept only for compatibility says on `show`, in its help text, and
- * in the warning a `set` prints.
- */
-const INERT_KNOB_NOTE = 'deprecated: inert — no code reads it; removed at v1.0.0';
 
 /**
  * The cluster-global knobs. `field` matches the admin route's camelCase
@@ -97,18 +85,6 @@ const KNOBS: KnobSpec[] = [
     flag: 'webhook-dedup-ttl-ms',
     min: 1000,
     label: 'Webhook dedup TTL (ms)',
-  },
-  // Sized the cache of provider contributor-permission lookups. Trust is
-  // resolved from the ref a pull request pushes to, which is server truth on
-  // the webhook payload, so no lookup is made and nothing reads this value. It
-  // stays settable — the column, the route field, and this flag are a released
-  // operator surface — and says so rather than disappearing.
-  {
-    field: 'contributorCacheTtlMs',
-    flag: 'contributor-cache-ttl-ms',
-    min: 1000,
-    label: 'Contributor-cache TTL (ms)',
-    deprecated: INERT_KNOB_NOTE,
   },
   {
     field: 'eventRouterEventTtlSeconds',
@@ -378,11 +354,6 @@ function allKnobs(): AnyKnob[] {
   return [...KNOBS, ...STRING_KNOBS, ...BOOLEAN_KNOBS];
 }
 
-/** The knob's compatibility note, or undefined when it is a live knob. */
-function knobDeprecation(knob: AnyKnob): string | undefined {
-  return 'deprecated' in knob ? knob.deprecated : undefined;
-}
-
 function formatSettings(s: ClusterSettings, format: string): string {
   if (format === 'json') return JSON.stringify(s, null, 2);
   const lines: string[] = [];
@@ -391,12 +362,7 @@ function formatSettings(s: ClusterSettings, format: string): string {
   for (const knob of knobs) {
     const value = s[knob.field];
     const shown = value === null || value === undefined ? '(cluster default)' : String(value);
-    // An inert knob still prints its stored value — the operator set it and is
-    // entitled to see it — with the note that nothing consumes it.
-    const note = knobDeprecation(knob);
-    lines.push(
-      `${(knob.label + ':').padEnd(width)} ${shown}${note === undefined ? '' : ` [${note}]`}`,
-    );
+    lines.push(`${(knob.label + ':').padEnd(width)} ${shown}`);
   }
   return lines.join('\n');
 }
@@ -531,30 +497,6 @@ export function unpairedEvalTimeoutWarnings(patch: PatchBody): string[] {
   return warnings;
 }
 
-/**
- * Warn for every deprecated knob the patch sets.
- *
- * The set still goes through — the column and the route field are a released
- * operator surface and keep accepting writes — so the warning says what the
- * stored value now does, which is nothing.
- *
- * Returns the lines rather than printing them so the check is unit-testable,
- * matching {@link unpairedEvalTimeoutWarnings}.
- */
-export function deprecatedKnobWarnings(patch: PatchBody): string[] {
-  const warnings: string[] = [];
-  for (const knob of allKnobs()) {
-    const note = knobDeprecation(knob);
-    if (note === undefined) continue;
-    if (patch[knob.field] === undefined || patch[knob.field] === null) continue;
-    warnings.push(
-      `Warning: --${knob.flag} is ${note}. The value is stored and reported back by ` +
-        `\`kici-admin cluster-settings show\`, but it changes no behavior.`,
-    );
-  }
-  return warnings;
-}
-
 /** Build the reset PATCH body: all knobs → null, or just the flagged ones. */
 export function buildClusterReset(opts: Record<string, boolean | undefined>): PatchBody {
   const all = allKnobs();
@@ -636,8 +578,7 @@ export function registerClusterSettingsCommands(
   for (const knob of KNOBS) {
     const bounds =
       knob.max === undefined ? `integer >= ${knob.min}` : `integer ${knob.min}-${knob.max}`;
-    const suffix = knob.deprecated === undefined ? '' : ` [${knob.deprecated}]`;
-    setCmd.option(`--${knob.flag} <value>`, `${knob.label} (${bounds})${suffix}`);
+    setCmd.option(`--${knob.flag} <value>`, `${knob.label} (${bounds})`);
   }
   for (const knob of STRING_KNOBS) {
     setCmd.option(`--${knob.flag} <value>`, `${knob.label} (${knob.expects})`);
@@ -648,7 +589,6 @@ export function registerClusterSettingsCommands(
   setCmd.action(async (opts: Record<string, string | undefined>) => {
     const patch = buildClusterPatch(opts);
     for (const line of unpairedEvalTimeoutWarnings(patch)) console.warn(line);
-    for (const line of deprecatedKnobWarnings(patch)) console.warn(line);
     try {
       const updated = await patchSettings(getClient(), patch);
       console.log(formatSettings(updated, opts.format ?? 'table'));
@@ -682,11 +622,7 @@ export function registerClusterSettingsCommands(
     )
     .option('--format <format>', 'Output format: json|table', 'table');
   for (const knob of allKnobs()) {
-    const note = knobDeprecation(knob);
-    resetCmd.option(
-      `--${knob.flag}`,
-      `Clear only ${knob.label}${note === undefined ? '' : ` [${note}]`}`,
-    );
+    resetCmd.option(`--${knob.flag}`, `Clear only ${knob.label}`);
   }
   resetCmd.action(async (opts: Record<string, boolean | string | undefined>) => {
     const patch = buildClusterReset(opts as Record<string, boolean | undefined>);

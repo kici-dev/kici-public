@@ -1,6 +1,7 @@
+import { readFile } from 'node:fs/promises';
 import pc from 'picocolors';
 import open from 'open';
-import { logger, toErrorMessage } from '@kici-dev/core';
+import { docsUrl, logger, toErrorMessage } from '@kici-dev/core';
 
 /** The public tracker. Reports about KiCI itself go here — never customer data. */
 export const FEEDBACK_TRACKER_URL = 'https://github.com/kici-dev/kici-public';
@@ -12,6 +13,15 @@ export const FEEDBACK_NEW_ISSUE_URL = `${FEEDBACK_TRACKER_URL}/issues/new?templa
 
 /** Suspected vulnerabilities go here instead, privately. */
 export const FEEDBACK_SECURITY_ADVISORY_URL = `${FEEDBACK_TRACKER_URL}/security/advisories/new`;
+
+/** How an agent turns its draft into the prefilled form a person reviews and files. */
+export const FEEDBACK_DRAFT_COMMAND = 'kici feedback --draft <file.json> --open';
+
+/** GitHub's practical URL ceiling; a longer draft violates "minimal" anyway. */
+export const FEEDBACK_URL_WARN_BYTES = 6_000;
+
+/** A draft: the issue title plus one string per contract field, keyed by field id. */
+export type FeedbackDraft = Record<string, string>;
 
 export interface FeedbackField {
   id: string;
@@ -32,6 +42,10 @@ export interface FeedbackContract {
   requiredFields: FeedbackField[];
   prohibited: string[];
   privateReportCommand: string;
+  /** The command that turns a JSON draft into the prefilled issue-form URL. */
+  draftCommand: string;
+  /** The keys a draft must carry: `title` plus every required field's id. */
+  draftFields: string[];
 }
 
 /**
@@ -45,7 +59,7 @@ export const FEEDBACK_CONTRACT: FeedbackContract = {
   newIssueUrl: FEEDBACK_NEW_ISSUE_URL,
   template: FEEDBACK_TEMPLATE,
   securityAdvisoryUrl: FEEDBACK_SECURITY_ADVISORY_URL,
-  guideUrl: 'https://kici.dev/docs/user/reporting-discrepancies/',
+  guideUrl: docsUrl('user/reporting-discrepancies/'),
   searchCommand: 'gh issue list --repo kici-dev/kici-public --search "<terms>" --state all',
   approval: {
     required: true,
@@ -85,8 +99,13 @@ export const FEEDBACK_CONTRACT: FeedbackContract = {
     },
     {
       id: 'version',
-      label: 'Version and environment',
-      description: 'Output of `kici --version`, plus Node version and OS.',
+      label: 'KiCI version',
+      description: 'Output of `kici --version`.',
+    },
+    {
+      id: 'environment',
+      label: 'Environment',
+      description: 'Node version and OS.',
     },
     {
       id: 'justification',
@@ -102,13 +121,54 @@ export const FEEDBACK_CONTRACT: FeedbackContract = {
     'Reproduce with a minimal synthetic workflow, never the real one you were working on.',
   ],
   privateReportCommand: 'kici report --run <run-id> --upload',
+  draftCommand: FEEDBACK_DRAFT_COMMAND,
+  draftFields: [
+    'title',
+    'advertised',
+    'observed',
+    'reproduction',
+    'version',
+    'environment',
+    'justification',
+  ],
 };
+
+export function parseFeedbackDraft(
+  raw: unknown,
+): { ok: true; draft: FeedbackDraft } | { ok: false; problems: string[] } {
+  const problems: string[] = [];
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, problems: ['draft must be a JSON object keyed by field id'] };
+  }
+  const input = raw as Record<string, unknown>;
+  const allowed = new Set(FEEDBACK_CONTRACT.draftFields);
+  for (const key of Object.keys(input))
+    if (!allowed.has(key)) problems.push(`unknown field: ${key}`);
+  const draft: FeedbackDraft = {};
+  for (const id of FEEDBACK_CONTRACT.draftFields) {
+    const value = input[id];
+    if (value === undefined) problems.push(`missing required field: ${id}`);
+    else if (typeof value !== 'string' || value.trim() === '')
+      problems.push(`field must be a non-empty string: ${id}`);
+    else draft[id] = value;
+  }
+  return problems.length === 0 ? { ok: true, draft } : { ok: false, problems };
+}
+
+/** The form URL with every draft field prefilled — GitHub reads each query param by field id. */
+export function draftIssueUrl(draft: FeedbackDraft): string {
+  const url = new URL(FEEDBACK_NEW_ISSUE_URL);
+  for (const id of FEEDBACK_CONTRACT.draftFields) url.searchParams.set(id, draft[id] ?? '');
+  return url.toString();
+}
 
 export interface FeedbackOptions {
   /** Open the prefilled issue form in the default browser. */
   open?: boolean;
   /** Emit the contract as JSON on stdout instead of prose. */
   json?: boolean;
+  /** Path to a JSON draft; print (and with --open, open) the prefilled issue-form URL. */
+  draft?: string;
 }
 
 function printContract(): void {
@@ -155,6 +215,9 @@ function printContract(): void {
   logger.info(`  ${c.approval.rule}`);
   logger.info(`  Form: ${c.newIssueUrl}`);
   logger.info(pc.gray(`  Or: kici feedback --open`));
+  logger.info(
+    pc.gray(`  From a draft: ${c.draftCommand} (fields: kici feedback --json → draftFields)`),
+  );
   logger.info('');
   logger.info(pc.gray('Machine-readable: kici feedback --json'));
 }
@@ -166,9 +229,12 @@ function printContract(): void {
  *
  * The command reaches no network and files nothing. `--open` opens the
  * prefilled issue form; `--json` emits the same contract for an agent to
- * consume without parsing prose.
+ * consume without parsing prose; `--draft <file>` builds the issue-form URL
+ * with every field of a JSON draft prefilled.
  */
 export async function feedbackCommand(options: FeedbackOptions = {}): Promise<boolean> {
+  if (options.draft) return draftFromFile(options.draft, options.open === true);
+
   if (options.json) {
     process.stdout.write(`${JSON.stringify(FEEDBACK_CONTRACT, null, 2)}\n`);
     return true;
@@ -177,13 +243,46 @@ export async function feedbackCommand(options: FeedbackOptions = {}): Promise<bo
   printContract();
 
   if (!options.open) return true;
+  return openOrExplain(FEEDBACK_NEW_ISSUE_URL);
+}
 
+/** Read a JSON draft, print its prefilled issue-form URL as the last stdout line, open it on request. */
+async function draftFromFile(file: string, openIt: boolean): Promise<boolean> {
+  let raw: unknown;
   try {
-    await open(FEEDBACK_NEW_ISSUE_URL);
+    raw = JSON.parse(await readFile(file, 'utf8'));
+  } catch (error) {
+    logger.error(pc.red(`Could not read the draft at ${file}: ${toErrorMessage(error)}`));
+    return false;
+  }
+  const parsed = parseFeedbackDraft(raw);
+  if (!parsed.ok) {
+    for (const problem of parsed.problems) logger.error(pc.red(problem));
+    logger.info(
+      pc.gray(`Fields: ${FEEDBACK_CONTRACT.draftFields.join(', ')} — see kici feedback --json`),
+    );
+    return false;
+  }
+  const url = draftIssueUrl(parsed.draft);
+  if (url.length > FEEDBACK_URL_WARN_BYTES) {
+    logger.warn(
+      pc.yellow(
+        `The prefilled URL is ${url.length} bytes; GitHub may truncate it. Shorten the reproduction.`,
+      ),
+    );
+  }
+  process.stdout.write(`${url}\n`);
+  if (!openIt) return true;
+  return openOrExplain(url);
+}
+
+async function openOrExplain(url: string): Promise<boolean> {
+  try {
+    await open(url);
     return true;
   } catch (error) {
     logger.error(pc.red(`Could not open a browser: ${toErrorMessage(error)}`));
-    logger.info(pc.gray(`Open ${FEEDBACK_NEW_ISSUE_URL} manually.`));
+    logger.info(pc.gray(`Open ${url} manually.`));
     return false;
   }
 }

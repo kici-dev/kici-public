@@ -626,18 +626,29 @@ describe('artifactsUploadResponseSchema', () => {
 });
 
 describe('artifactsUploadCompleteSchema', () => {
+  const valid = {
+    type: 'artifacts.upload.complete' as const,
+    messageId: 'm1',
+    jobId: 'j1',
+    name: 'bundle',
+    sha256: 'deadbeef',
+  };
+
   it('parses a well-formed complete', () => {
-    const m = artifactsUploadCompleteSchema.parse({
-      type: 'artifacts.upload.complete',
-      messageId: 'm1',
-      jobId: 'j1',
-      name: 'bundle',
-      sizeBytes: 4096,
-      sha256: 'deadbeef',
-      storageKey: 'artifacts/run1/bundle.tar.gz',
-    });
-    expect(m.sizeBytes).toBe(4096);
+    // breaks-if-wrong: the current shape still parses.
+    const m = artifactsUploadCompleteSchema.parse(valid);
     expect(m.sha256).toBe('deadbeef');
+  });
+
+  it('refuses the removed storageKey and sizeBytes fields (strict object)', () => {
+    // fails-when: either removed field is accepted again — a stale agent echoing
+    // the storage key must be refused, not silently ignored.
+    expect(artifactsUploadCompleteSchema.safeParse({ ...valid, storageKey: 'k' }).success).toBe(
+      false,
+    );
+    expect(artifactsUploadCompleteSchema.safeParse({ ...valid, sizeBytes: 4096 }).success).toBe(
+      false,
+    );
   });
 });
 
@@ -693,9 +704,7 @@ describe('artifacts union discrimination', () => {
       messageId: 'm1',
       jobId: 'j1',
       name: 'bundle',
-      sizeBytes: 10,
       sha256: 'h',
-      storageKey: 'artifacts/run1/bundle.tar.gz',
     };
     expect(agentToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
   });

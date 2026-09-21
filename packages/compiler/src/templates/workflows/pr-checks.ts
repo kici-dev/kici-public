@@ -1,6 +1,6 @@
 // PR Checks -- workflow with rules, dependencies, and multiple jobs
-// Docs: https://kici.dev/docs/sdk-reference
-// Patterns: https://kici.dev/docs/workflow-patterns
+// Docs: https://docs.kici.dev/user/sdk-reference/
+// Patterns: https://docs.kici.dev/user/workflow-patterns/
 
 import { workflow, job, step, pr, rule, skip, isEventType } from '@kici-dev/sdk';
 

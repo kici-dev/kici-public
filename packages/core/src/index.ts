@@ -39,3 +39,4 @@ export {
   type DiagnoseResult,
   type DiagnoseResponse,
 } from './diagnostics-contract.js';
+export { docsUrl } from './docs-url.js';

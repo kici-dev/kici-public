@@ -1,7 +1,6 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import { createLogger, requestContext, getReconnectDelay, toErrorMessage } from '@kici-dev/shared';
-import { OrchRpcRegistry } from './orch-rpc.js';
 import { chunkReplayRuns, REPLAY_BYTE_REFILL_BYTES_PER_SEC } from './replay-chunker.js';
 import { stateReplayBreakerTripsTotal } from '../metrics/prometheus.js';
 import {
@@ -469,12 +468,6 @@ export class PlatformClient {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  /**
-   * Generic orchestrator-initiated RPC correlation (e.g. the provenance OIDC
-   * mint). The orchestrator sends a `requestId`-keyed request over the WS and
-   * awaits the Platform's matching `.response`; rejected on timeout or close.
-   */
-  private readonly orchRpc = new OrchRpcRegistry();
   /**
    * Platform capabilities advertised on this connection (Platform → orchestrator
    * `platform.capabilities` frame). `undefined` means nothing advertised yet —
@@ -1033,25 +1026,6 @@ export class PlatformClient {
   }
 
   /**
-   * Send an orchestrator-initiated request over the Platform WS and await its
-   * typed `.response`. The reverse of the Platform's dashboard-RPC pattern: we
-   * hold the pending map and resolve on the echoed requestId. Rejects on timeout
-   * or connection close; protocol-level errors arrive inside the response body.
-   * The request type is a member of the typed orch->Platform union, so it rides
-   * the validated `send()` path.
-   */
-  sendRequestAndAwait<Res>(
-    type: OrchestratorToPlatformMessage['type'],
-    payload: Record<string, unknown>,
-    timeoutMs = 10_000,
-  ): Promise<Res> {
-    const requestId = randomUUID();
-    const awaited = this.orchRpc.register(requestId, timeoutMs) as Promise<Res>;
-    this.send({ type, requestId, ...payload } as unknown as OrchestratorToPlatformMessage);
-    return awaited;
-  }
-
-  /**
    * Register a new source at runtime (e.g., after config reload adds a new GitHub app).
    * Separate from the post-auth registration which sends all sources at once.
    */
@@ -1295,9 +1269,6 @@ export class PlatformClient {
       this.replaySentOnConnection = false;
       this.connectionProvenStable = false;
       this.rejectPendingSourceRegistrations('Platform connection closed before ack');
-      // Fail any in-flight orchestrator-initiated RPC (e.g. an OIDC mint) fast
-      // instead of letting it hang until its own timeout.
-      this.orchRpc.rejectAll(new Error('platform connection closed'));
 
       if (!this.intentionalDisconnect) {
         this.scheduleReconnect();
@@ -1455,13 +1426,6 @@ export class PlatformClient {
         logger.info('Source deregistration acknowledged', {
           removed: msg.removed,
         });
-        break;
-
-      case 'oidc.mint.response':
-        // Generic orchestrator-initiated RPC response: resolve the pending
-        // request keyed by requestId. Adding a future orch->Platform RPC needs
-        // only a new typed pair + an entry in ORCH_RPC_RESPONSE_TYPES.
-        this.orchRpc.resolve(msg.requestId, msg);
         break;
 
       case 'peer.discover':

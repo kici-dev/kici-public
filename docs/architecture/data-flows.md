@@ -48,7 +48,7 @@ Orchestrator                         Agent                    Sandbox (child pro
     |                                  |                          |
     |-- job.dispatch (WS) ------------>|                          |
     |   (jobConfig, sourceTarUrl,      |                          |
-    |    sourceTarHash, depsUrl,       |-- Create sandbox ------->|
+    |    sourceTarDigest, depsUrl,     |-- Create sandbox ------->|
     |    depsHash)                     |   (container/bare-metal/ |
     |                                  |    firecracker)          |
     |                                  |                          |-- Restore .kici/ source (tarball)
@@ -230,6 +230,8 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 When multiple webhooks trigger simultaneously for the same repository state, the `BuildCoordinator` coalesces concurrent build requests using a combined key (`contentHash:lockfileHash`). Only one build job runs; all waiting dispatches share the result.
 
+The coalescing map is per coordinator. The build job itself sits on the cluster-wide dispatch queue, so an agent connected to a sibling coordinator can claim it. That sibling persists the terminal `job.status` to the shared `execution_jobs` row (`precursor_result`), and the dispatching coordinator's `PendingPrecursorDbWatcher` reads the row back and settles the pending build through `settlePendingPrecursor()`. The local agent socket goes through the same function. See [runs that span coordinators](../operator/orchestrator/clustering.md#runs-that-span-coordinators).
+
 ### Graceful degradation
 
 If cache storage is unavailable or a download fails:
@@ -304,7 +306,7 @@ Agent                         Orchestrator                    S3
   |                                |    for deps integrity)    |
 ```
 
-The two-phase metadata approach (`upload via PUT` then `initMeta via CopyObject`) works around the limitation that S3 pre-signed URLs cannot include custom metadata headers. For dependency tarballs, the agent also reports the SHA-256 content hash in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file alongside the tarball. When dispatching execution jobs, the orchestrator reads this hash and includes it as `depsHash` in `job.dispatch`, enabling agent-side integrity verification on download. Source tarballs do not use a companion `.hash` file — the workflow `contentHash` carried in `sourceTarHash` is used to verify the extracted source against the lock file after extraction, which covers drift end-to-end.
+The two-phase metadata approach (`upload via PUT` then `initMeta via CopyObject`) works around the limitation that S3 pre-signed URLs cannot include custom metadata headers. For dependency tarballs, the agent also reports the SHA-256 content hash in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file alongside the tarball. When dispatching execution jobs, the orchestrator reads this hash and includes it as `depsHash` in `job.dispatch`, enabling agent-side integrity verification on download. Source tarballs carry their own SHA-256 as `sourceTarDigest` in `job.dispatch`, verified before extraction; the workflow `contentHash` is then re-computed against the extracted source to verify it against the lock file, which covers drift end-to-end.
 
 ### URL delivery (downloads)
 
@@ -803,7 +805,7 @@ The compiler processes the workflow definition:
 
 When `kici run <event> --local` runs a workflow:
 
-1. **SDK module resolution:** The runner resolves `setStepOutputsMap` / `setJobOutputsMap` from the same `@kici-dev/sdk` module instance that the workflow uses (ensures the proxy reads from the same map)
+1. **SDK module resolution:** The runner resolves `setStepOutputsMap` / `setJobOutputsMap` from the `@kici-dev/sdk/internal` subpath of the same SDK copy that the workflow uses (ensures the proxy reads from the same map)
 2. **Map injection:** Fresh `OutputsMap` and `StepRefMap` are created and injected via `setStepOutputsMap()` / `setStepRefMap()` before each job
 3. **Step execution:** Each step runs sequentially. If the step returns a value, it is stored in the `OutputsMap` keyed by step name
 4. **Bare function normalization:** Bare functions in the steps array are assigned counter names and registered in the `StepRefMap` (maps function reference to step name)

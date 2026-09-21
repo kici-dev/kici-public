@@ -6,6 +6,7 @@ import pg from 'pg';
 import { createMigrationProvider } from '../db/migration-provider.js';
 import type { Database } from '../db/types.js';
 import { ConcurrencyQueueManager, ConcurrencySlotStatus } from './queue-manager.js';
+import { terminateTestDbBackends } from '../__test-helpers__/test-db.js';
 
 /**
  * Real-Postgres correctness tests for concurrency-slot arbitration.
@@ -73,10 +74,7 @@ describeDb('ConcurrencyQueueManager — DB-arbitrated slots (real Postgres)', ()
     await pool?.end().catch(() => {});
     const admin = new pg.Pool({ connectionString: adminUrl });
     try {
-      await admin.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
-        [TEST_DB],
-      );
+      await terminateTestDbBackends(admin, TEST_DB);
       await admin.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
       await admin.end();

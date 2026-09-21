@@ -464,7 +464,7 @@ Create a commit status trigger. Returns a frozen `StatusTriggerConfig`.
 function status(config?: StatusConfigInput): StatusTriggerConfig;
 ```
 
-**Config options:** `contexts` (picomatch strings like 'ci/\*'), `states` (error/failure/pending/success), `description`
+**Config options:** `contexts` (glob patterns like 'ci/\*'), `states` (error/failure/pending/success), `description`
 
 ```typescript
 status(); // Any status

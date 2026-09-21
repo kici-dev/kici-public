@@ -72,7 +72,7 @@ The per-job heartbeat (60s) is separate from the WebSocket-level heartbeat (30s)
 
 ## Detection flow
 
-`StaleRunDetector` runs a periodic scan at a configurable interval (default 60s). Each scan consists of three sub-scans (A, B, C) followed by two post-scan steps (E, D):
+`StaleRunDetector` runs a periodic scan at a configurable interval (default 60s). Each scan consists of five sub-scans (A, B, C, F, G) followed by two post-scan steps (E, D):
 
 ### Sub-scan A: stale running jobs (heartbeat present)
 
@@ -106,6 +106,26 @@ WHERE status = 'dispatched'
 ```
 
 Detects jobs that were dispatched to an agent but never acknowledged (agent died after dispatch, before starting execution). Both the `dispatch_queue` entry and the corresponding `execution_jobs` row are marked as failed/timed_out_stale, ensuring `dispatch_queue` failures propagate to the execution tables.
+
+### Sub-scan F: runs left behind after every job finished
+
+```sql
+SELECT er.run_id, er.registration_window_instance_id FROM execution_runs er
+WHERE er.status IN ('pending', 'running')
+  AND EXISTS (SELECT 1 FROM execution_jobs ej WHERE ej.run_id = er.run_id)
+  AND NOT EXISTS (SELECT 1 FROM execution_jobs ej WHERE ej.run_id = er.run_id AND ej.status NOT IN (:terminal))
+  AND (SELECT COALESCE(MAX(ej.completed_at), er.started_at) FROM execution_jobs ej WHERE ej.run_id = er.run_id) < :threshold
+```
+
+Finds runs whose every job row is terminal while the run row is not, with the last completion older than the stale threshold so a completion in flight is not raced. A candidate whose `registration_window_instance_id` names a coordinator with a live `cluster_instances` heartbeat is skipped: that coordinator still has jobs to register for the run. The rest are added to the affected set, so post-scan D finishes them from the rows.
+
+This is the backstop for a coordinator that died between its last job finishing and its own completion write, and for a registration-window holder that died after a sibling coordinator deferred to it.
+
+### Sub-scan G: in-memory runs finished elsewhere
+
+Calls `ExecutionTracker.pruneRunsFinishedElsewhere()`: one query over the runs this orchestrator still holds in memory as unfinished, returning those whose `execution_runs` row is terminal. Each is released the way the finalizing path releases its own run: marked complete in memory, per-run state shed, pruned after the grace period. No completion event is emitted and the row is not written, because the finalizer already did both.
+
+In a cluster the last job of a run may report to a sibling coordinator, which finalizes the run and prunes its own state. This orchestrator's copy has no later trigger. Without this sub-scan it would stay in memory for the life of the process.
 
 ### Post-scan E: held run expiry
 

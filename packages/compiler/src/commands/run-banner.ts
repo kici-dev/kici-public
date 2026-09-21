@@ -6,7 +6,7 @@
  *
  * Three variants:
  * - `offline`  — independent plane, local secrets, dev-signed identity.
- * - `attached` — hybrid plane, real Platform-minted OIDC + attestation.
+ * - `attached` — hybrid plane, OIDC + attestation signed by the plane's own key.
  * - `fallback` — wanted attached but the Platform was unreachable, so the run
  *   fell back to offline; a LOUD first line makes the degradation obvious.
  */
@@ -46,7 +46,7 @@ export function renderRunBanner(input: RunBannerInput): string {
       ['plane', 'local dev orchestrator (hybrid, attached)'],
       ['agent', 'this machine (bare-metal)'],
       ['secrets', `REAL scoped${input.orgId ? ` (org: ${input.orgId})` : ''}`],
-      ['identity', 'real Platform OIDC + attestation'],
+      ['identity', `plane-signed OIDC + attestation (iss=${input.planeUrl})`],
       ['control', `kici local status | logs | detach   (${input.planeUrl})`],
       ['force', '--offline (local plane) · --in-place (ambient)'],
     );

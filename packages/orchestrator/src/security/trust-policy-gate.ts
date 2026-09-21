@@ -28,18 +28,6 @@ import type { OrchestratorMode, TrustPolicy, TrustTier } from '@kici-dev/engine'
 import { SecurityHoldReason } from '../contexts/held-runs.js';
 import type { StoredTrustPolicy } from './trust-policy-store.js';
 
-/**
- * The enforcement vocabulary the admin API reports and `kici-admin
- * trust-policy show` renders.
- *
- * @deprecated The route reports `policy` unconditionally: `resolveEffectivePolicy`
- * returns a policy for every input, so there is no state left in which the
- * values are absent. The field and this enum stay so an older `kici-admin`
- * binary keeps parsing the response. Removed at v1.0.0.
- */
-export const TrustPolicyEnforcement = z.enum(['policy', 'legacy']);
-export type TrustPolicyEnforcement = z.infer<typeof TrustPolicyEnforcement>;
-
 /** The per-PR facts the fork switch is evaluated against. */
 export interface TrustPolicySignals {
   /** Resolved contributor tier; undefined when no tier was resolved. */
@@ -121,10 +109,6 @@ export const DEFAULT_FORK_POLICY: ForkPolicy = ForkPolicy.enum.ignore;
  */
 export const FAIL_CLOSED_POLICY: TrustPolicy = Object.freeze({
   forkPolicy: DEFAULT_FORK_POLICY,
-  // Inert: the gate reads neither field. They are carried because the wire
-  // schema still declares them.
-  unknownContributorPolicy: 'hold',
-  workflowChangePolicy: 'hold',
   approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 });
@@ -146,9 +130,6 @@ export const FAIL_CLOSED_POLICY: TrustPolicy = Object.freeze({
  */
 export const READ_FAILURE_POLICY: TrustPolicy = Object.freeze({
   forkPolicy: ForkPolicy.enum.hold,
-  // Inert, exactly as in `FAIL_CLOSED_POLICY`: the gate reads neither field.
-  unknownContributorPolicy: 'hold',
-  workflowChangePolicy: 'hold',
   approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 });
@@ -202,8 +183,6 @@ export function resolveEffectivePolicy(
     return {
       policy: {
         forkPolicy: stored.forkPolicy,
-        unknownContributorPolicy: stored.unknownContributorPolicy,
-        workflowChangePolicy: stored.workflowChangePolicy,
         approvalExpiryHours: stored.approvalExpiryHours,
         approvalExpirySeconds: stored.approvalExpirySeconds,
       },
@@ -297,11 +276,7 @@ export function evaluateTrustPolicy(
       return { action: 'pass' };
     case ForkPolicy.enum.hold:
       return holdForFork(policy);
-    // `reject` is deprecated in favour of `ignore` and behaves as it, so an
-    // orchestrator on this build honours a stored `reject` row without
-    // requiring the operator to rewrite it first.
     case ForkPolicy.enum.ignore:
-    case ForkPolicy.enum.reject:
       return { action: 'ignore' };
     default:
       // The policy columns are plain TEXT so a value written by a newer

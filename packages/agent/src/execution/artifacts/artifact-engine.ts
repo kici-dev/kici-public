@@ -79,12 +79,7 @@ export interface ArtifactTransport {
   /** Request a presigned PUT for `name` at `declaredSizeBytes`; enforced before minting. */
   beginUpload(name: string, declaredSizeBytes: number): Promise<ArtifactBeginUploadResult>;
   /** Confirm the upload finished — records the DB row. */
-  completeUpload(
-    name: string,
-    sizeBytes: number,
-    sha256: string,
-    storageKey: string,
-  ): Promise<void>;
+  completeUpload(name: string, sha256: string): Promise<void>;
   /** Resolve a named artifact of this run to a presigned GET + its size/sha256. */
   download(name: string): Promise<ArtifactDownloadLookup>;
 }
@@ -137,12 +132,12 @@ export function createArtifactsApi(
       // tarball size the enforcement gates evaluate.
       const { tarball, hash } = await packCachePaths(workDir, paths, roots);
       const grant = await transport.beginUpload(name, tarball.length);
-      if (grant.outcome === 'rejected' || !grant.uploadUrl || !grant.storageKey) {
+      if (grant.outcome === 'rejected' || !grant.uploadUrl) {
         throw new Error(rejectionMessage(name, grant.reason, grant.error));
       }
       const { uploadToPresignedUrl } = await import('../download.js');
       await uploadToPresignedUrl(grant.uploadUrl, tarball);
-      await transport.completeUpload(name, tarball.length, hash, grant.storageKey);
+      await transport.completeUpload(name, hash);
       logger.info('artifact uploaded', {
         name,
         sizeBytes: tarball.length,

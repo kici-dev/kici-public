@@ -36,7 +36,6 @@ interface GlobalWorkflowSettings {
   enabled: boolean;
   allowedRepos: RepoPatternEntry[] | null;
   deniedRepos: RepoPatternEntry[] | null;
-  elevatedRepos: RepoPatternEntry[] | null;
   allowHttpNpmRegistries: boolean;
   allowUntrustedDockerfileBuilds: boolean;
   userCacheQuotaBytes: number | null;
@@ -71,7 +70,6 @@ interface PatchBody {
   customerId: string;
   allowedRepos?: RepoPatternEntry[] | null;
   deniedRepos?: RepoPatternEntry[] | null;
-  elevatedRepos?: RepoPatternEntry[] | null;
   allowHttpNpmRegistries?: boolean;
   allowUntrustedDockerfileBuilds?: boolean;
   userCacheQuotaBytes?: number | null;
@@ -94,8 +92,8 @@ interface PatchBody {
   sandboxAllowHostNetwork?: boolean | null;
 }
 
-type ListField = 'allowedRepos' | 'deniedRepos' | 'elevatedRepos';
-type Prefix = 'allow' | 'deny' | 'elevate';
+type ListField = 'allowedRepos' | 'deniedRepos';
+type Prefix = 'allow' | 'deny';
 
 function formatSettings(s: GlobalWorkflowSettings, format: string): string {
   if (format === 'json') return JSON.stringify(s, null, 2);
@@ -107,9 +105,6 @@ function formatSettings(s: GlobalWorkflowSettings, format: string): string {
   );
   lines.push(
     `Denied source repos:   ${s.deniedRepos === null ? '(none)' : formatList(s.deniedRepos)}`,
-  );
-  lines.push(
-    `Elevated authors:      ${s.elevatedRepos === null ? '(none)' : formatList(s.elevatedRepos)}`,
   );
   lines.push(`Allow http registries: ${s.allowHttpNpmRegistries}`);
   lines.push(`Allow untrusted dockerfile builds: ${s.allowUntrustedDockerfileBuilds}`);
@@ -236,7 +231,6 @@ export function registerOrgSettingsCommands(
   // ── list mutators ────────────────────────────────────────────────
   registerListMutators(gw, getClient, 'allow', 'allowedRepos');
   registerListMutators(gw, getClient, 'deny', 'deniedRepos');
-  registerListMutators(gw, getClient, 'elevate', 'elevatedRepos');
 
   // ── dashboard-writes ─────────────────────────────────────────────
   registerDashboardWritesCommands(orgSettings, getClient);
@@ -1300,14 +1294,7 @@ function resolveCustomerId(opts: { customerId?: string; org?: string }): string 
 }
 
 function label(prefix: Prefix): string {
-  if (prefix === 'allow') return 'workflow-author allow-list';
-  if (prefix === 'deny') return 'source-repo deny-list';
-  // The elevated-access list is stored but never consulted — an
-  // organization-wide workflow's job is dispatched with no secret material, so
-  // there is nothing for the list to widen. Say so in the command's own help
-  // text rather than only in the docs, since the CLI is where an operator most
-  // plausibly reaches for it.
-  return 'elevated-access list (DEPRECATED: not enforced, removed at v1.0.0)';
+  return prefix === 'allow' ? 'workflow-author allow-list' : 'source-repo deny-list';
 }
 
 // ─── dashboard-writes ───────────────────────────────────────────────

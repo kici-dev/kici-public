@@ -19,7 +19,7 @@ The settings page (`/orgs/:customerId/settings`) uses a tabbed layout:
 10. **Global workflows** -- org-level security knobs for cross-repo workflows (visible with `org_settings:read` permission)
 11. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
 12. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
-13. **Security** -- dashboard-level session and account security controls for this org (today, the session max age). Every member sees the tab; only an organization owner can change the value
+13. **Security** -- dashboard-level security controls for this org: the session max age (every member sees it; only an organization owner can change it) and the orchestrator token reconciliation report (visible with `members:admin`)
 14. **Orchestrator security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
 15. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
 
@@ -95,7 +95,6 @@ The sources tab shows webhook sources registered by connected orchestrators. Sou
 
 
 
-
 ## Webhooks
 
 
@@ -141,6 +140,18 @@ Dashboard-level security controls for this organization.
 
 ### Session max age
 
+
+### Orchestrator token reconciliation
+
+Your orchestrator authorizes `kici-admin` tokens on its own, so it keeps working when the Platform is unreachable -- and nothing keeps its tokens in step with dashboard roles. This section reads the orchestrator's live admin tokens, joins each one against your organization's membership and roles, and reports where the two disagree. It is shown only to members holding `members:admin`.
+
+A summary strip counts the tokens per category, and a table lists every token that drifts (token label and routing-key scope, orchestrator role, recorded holder, finding):
+
+- **Unlinked** -- the token records no holder. Re-issue it with `kici-admin token create --subject`, then revoke the old one.
+- **Orphaned** -- the recorded holder is not an active member of this organization. Revoke the token.
+- **Over-privileged** -- the token grants more on the orchestrator than its holder has in the dashboard; the row names the missing permissions. Widen the dashboard role, or issue a narrower token.
+
+A token's holder is advisory metadata recorded at creation; the orchestrator never verifies it. When the orchestrator does not answer, the section shows an error rather than an empty report -- no answer is not "no drift". See [RBAC: two layers](../../operator/security/rbac-two-layers.md#reconciling-the-two-layers) for the full model.
 
 ## Orchestrator security
 
