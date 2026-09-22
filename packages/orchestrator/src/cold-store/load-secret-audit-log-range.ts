@@ -103,6 +103,9 @@ export async function loadSecretAuditLogRange(
   const tenantsToScan = routingKey ? [routingKey] : [SYNTHETIC_ORCH_TENANT];
 
   const coldRows: SecretAuditLogRow[] = [];
+  // The cold stream arrives newest-first, so the page is complete once
+  // `coldOffset + remaining` matching rows are in hand; the rest of the
+  // archive is never read.
   try {
     for (const tenant of tenantsToScan) {
       for await (const row of coldStore.fetchRange<SecretAuditLogRow>({
@@ -111,10 +114,12 @@ export async function loadSecretAuditLogRange(
         tenantId: tenant,
         fromTs: coldFromTs,
         toTs: coldToTs,
+        order: 'desc',
       })) {
         if (contextName && row.context_name !== contextName) continue;
         if (action && row.action !== action) continue;
         coldRows.push(row);
+        if (coldRows.length >= coldOffset + remaining) break;
       }
     }
   } catch (err) {
@@ -135,11 +140,6 @@ export async function loadSecretAuditLogRange(
     return hotRows;
   }
 
-  coldRows.sort(
-    (a, b) =>
-      new Date(b.timestamp as unknown as string | Date).getTime() -
-      new Date(a.timestamp as unknown as string | Date).getTime(),
-  );
   const coldSlice = coldRows.slice(coldOffset, coldOffset + remaining);
   return [...hotRows, ...coldSlice];
 }

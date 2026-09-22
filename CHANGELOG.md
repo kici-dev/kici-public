@@ -2,6 +2,13 @@
 
 Release notes for the public KiCI packages.
 
+## v0.9.1 — 2026-09-22
+
+### Fixes
+
+- Orchestrator, Platform and agent HTTP listeners keep an idle keep-alive connection open for 130 s so a reverse proxy (Caddy, nginx, a load balancer) never sends a request into a socket the server is closing; that race answered 502 to a GitHub push webhook, which providers do not redeliver
+- Archived access-log, audit-log and event-log pages read newest-first and stop once the page is full, fetch manifests and chunks up to 16 at a time, and cache manifests in-process; a filtered page over a long archive took 34 s on staging and timed out the kici-admin CLI
+
 ## v0.9.0 — 2026-09-21
 
 ### Features

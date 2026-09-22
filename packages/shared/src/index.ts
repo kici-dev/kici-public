@@ -114,6 +114,12 @@ export {
   type GracefulShutdownOptions,
 } from './graceful-shutdown.js';
 export { validateRequiredTools, type ToolRequirement } from './tool-check.js';
+export {
+  applyProxyKeepAliveTimeouts,
+  PROXY_HEADERS_TIMEOUT_MS,
+  PROXY_KEEP_ALIVE_TIMEOUT_MS,
+  type KeepAliveTimeoutTarget,
+} from './http-server-timeouts.js';
 export { kiciTmpBase, kiciMkdtemp } from './tmp-dir.js';
 export { createS3Client, type CreateS3ClientOptions, type SharedS3Config } from './s3-client.js';
 export {

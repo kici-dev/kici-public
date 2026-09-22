@@ -33,6 +33,7 @@ import {
   toErrorMessage,
   setupGracefulShutdown,
   validateRequiredTools,
+  applyProxyKeepAliveTimeouts,
   type ToolRequirement,
 } from '@kici-dev/shared';
 import type { JobDispatch, JobCancel } from '@kici-dev/engine';
@@ -612,17 +613,19 @@ await guardStartup(logger, async () => {
   app.route('/', healthRoutes);
 
   // 9. Start HTTP server
-  const httpServer = serve(
-    {
-      fetch: app.fetch,
-      port: config.port,
-    },
-    (info) => {
-      logger.info(`Agent started on port ${info.port}`, {
-        port: info.port,
-        agentId: config.agentId,
-      });
-    },
+  const httpServer = applyProxyKeepAliveTimeouts(
+    serve(
+      {
+        fetch: app.fetch,
+        port: config.port,
+      },
+      (info) => {
+        logger.info(`Agent started on port ${info.port}`, {
+          port: info.port,
+          agentId: config.agentId,
+        });
+      },
+    ),
   );
 
   // -- Graceful shutdown --

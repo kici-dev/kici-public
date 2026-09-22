@@ -394,6 +394,10 @@ your-domain.example {
 }
 ```
 
+### Idle connections from the proxy
+
+The orchestrator keeps an idle keep-alive connection open for 130 seconds. That is longer than the idle limit of the common proxies: Caddy pools an upstream connection for 2 minutes, nginx and the AWS load balancers for 1 minute. So the proxy always closes an idle connection first. Keep the proxy's upstream idle limit below 130 seconds. Above it, the proxy can send a request on a connection the orchestrator is closing at that moment. The proxy then answers 502, and the webhook delivery is lost because providers do not redeliver.
+
 ### One port for every source
 
 The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered webhook source (GitHub Apps and generic) is served from that one listener, distinguished by URL path (`/webhook/<orgId>/github`, `/webhook/<orgId>/generic/<sourceId>`) rather than by port number. There is no per-source port option in `kici-admin source add` and no `port` column on the source row. If you need different public URLs / hostnames / TLS certs per source, terminate that mapping at your reverse proxy and have it forward to the orchestrator's single port. See [Multi-provider setup](configuration.md#multi-provider-setup) for the full discussion.

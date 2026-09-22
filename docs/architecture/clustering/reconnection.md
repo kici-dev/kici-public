@@ -107,12 +107,13 @@ The reconnect counter resets to 0 on successful upstream authentication or agent
 
 - WebSocket `close` event (unless intentional disconnect)
 - WebSocket `error` event (closes the connection, then `close` triggers reconnect)
-- Auth failure (server closes connection, reconnect scheduled)
+- Upstream auth failure (the Platform answers `auth.failure`; the orchestrator closes the connection and schedules a reconnect)
 
 **Reconnection does not trigger on:**
 
 - Intentional disconnect (graceful shutdown via `disconnect()`)
 - Normal closure code 1000 initiated by the client
+- Agent auth failure. An `auth.failure` frame from the orchestrator, or a close with code `4010` (`WS_CLOSE_AGENT_AUTH_FAILED` — a revoked or invalid token, or a protocol version below the orchestrator's floor), is permanent: the agent logs `NOT retrying`, never reconnects, and shuts down with a non-zero exit code so a one-shot agent does not hold its runner until the job timeout.
 
 ## Event buffering
 

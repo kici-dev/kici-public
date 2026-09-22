@@ -29,6 +29,12 @@ A peer (worker) that receives a rerouted job:
 3. Reports step-by-step progress back to the coordinator
 4. Reports job completion back to the coordinator
 
+### Runs that span coordinators
+
+Rerouting is the push path. There is also a pull path: the `dispatch_queue` table is cluster-wide, and every coordinator claims from it with `FOR UPDATE SKIP LOCKED`, so an agent connected to any coordinator can claim a job another coordinator queued. Each agent reports to the coordinator it is connected to, and that coordinator writes the job's status to the shared `execution_jobs` row. Between coordinators the shared row is the report; no frame is relayed.
+
+A precursor job — a workflow's `__build__`, `__init__`, or dynamic-eval job — produces a result the dispatching coordinator waits for before it dispatches the real jobs. When a sibling coordinator's agent ran that job, the sibling persists the result to `execution_jobs.precursor_result` alongside the terminal status. The waiting coordinator's `PendingPrecursorDbWatcher` polls the rows it is waiting on and hands each terminal one to `settlePendingPrecursor`. That is the same function the local agent socket goes through, so the two channels cannot disagree on what "finished" means. A pre-run global eval round is not a run and writes no `execution_jobs` row, so it has no shared row to read; its own wait ceiling still bounds it. The operator view of the same mechanism is in [Clustering → Runs that span coordinators](../../operator/orchestrator/clustering.md#runs-that-span-coordinators).
+
 ### Single-orchestrator behavior
 
 When clustering is disabled or no peers are connected, all cluster code is dormant. The coordinator field on the pipeline processor is `undefined`, and the existing direct dispatch path is used. This ensures zero overhead for single-orchestrator deployments.

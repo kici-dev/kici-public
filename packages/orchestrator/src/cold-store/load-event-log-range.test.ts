@@ -58,7 +58,7 @@ function makeColdStoreMock(opts: {
   coldStore: ColdStore;
   fetchRange: ReturnType<typeof vi.fn>;
 } {
-  const fetchRange = vi.fn(() => {
+  const fetchRange = vi.fn((args: { order?: 'asc' | 'desc' }) => {
     if (opts.throwOnFetch) {
       const err = opts.throwOnFetch;
       async function* throwingGen(): AsyncGenerator<EventLogColdStoreRow> {
@@ -67,7 +67,13 @@ function makeColdStoreMock(opts: {
       }
       return throwingGen();
     }
-    const seed = opts.rows ?? [];
+    // Honour `order` the way the real store does: rows are seeded
+    // oldest-first, so a reader that forgets to ask for `desc` gets the
+    // oldest rows and its ordering assertions fail.
+    const seed = [...(opts.rows ?? [])].sort((a, b) => {
+      const d = new Date(a.received_at).getTime() - new Date(b.received_at).getTime();
+      return args.order === 'desc' ? -d : d;
+    });
     async function* gen(): AsyncGenerator<EventLogColdStoreRow> {
       for (const r of seed) yield r;
     }
@@ -206,9 +212,8 @@ describe('loadEventLogRange cold-store error propagation', () => {
   });
 });
 
-// `fetchRange` yields chunks oldest-first; the loader must collect the
-// full cold set, sort `received_at DESC`, then page — never break early
-// (which would surface the oldest rows and hide the newest).
+// The loader must ask `fetchRange` for the newest rows first and stop
+// once the page is full; the mock only orders rows when asked to.
 const COLD_OLD: EventLogColdStoreRow = {
   ...SAMPLE_COLD_1,
   id: 'cold-old',
@@ -230,8 +235,7 @@ const COLD_NEW: EventLogColdStoreRow = {
 
 describe('loadEventLogRange cold ordering + offset', () => {
   it('returns the NEWEST cold rows when the cold set exceeds the page (not the oldest)', async () => {
-    // fetchRange yields oldest-first, as the real cold-store does.
-    const { coldStore } = makeColdStoreMock({ rows: [COLD_OLD, COLD_MID, COLD_NEW] });
+    const { coldStore, fetchRange } = makeColdStoreMock({ rows: [COLD_OLD, COLD_MID, COLD_NEW] });
 
     const result = await loadEventLogRange({
       db: makeMockDb([]),
@@ -242,6 +246,9 @@ describe('loadEventLogRange cold ordering + offset', () => {
       includeArchived: true,
     });
 
+    // fails-when: the reader drops `order: 'desc'` — the mock then yields
+    // oldest-first and the page reads ['cold-old', 'cold-mid'].
+    expect((fetchRange.mock.calls[0][0] as { order?: string }).order).toBe('desc');
     expect(result.map((r) => r.id)).toEqual(['cold-new', 'cold-mid']);
   });
 

@@ -913,6 +913,140 @@ describe('BaseColdStore', () => {
   });
 });
 
+describe('BaseColdStore.fetchRange read-through', () => {
+  /**
+   * Three archived days, two chunks on the middle one, rows deliberately
+   * archived out of timestamp order inside the day so an in-day sort is
+   * observable. Every adapter row lands on its own partition day, which is
+   * the contract the day-by-day walk relies on.
+   */
+  const ROWS: TestRow[] = [
+    { id: 1, org_id: 'org1', created_at: '2026-04-14T09:00:00.000Z', payload: 'd14' },
+    { id: 2, org_id: 'org1', created_at: '2026-04-15T12:00:00.000Z', payload: 'd15-late' },
+    { id: 3, org_id: 'org1', created_at: '2026-04-15T08:00:00.000Z', payload: 'd15-early' },
+    { id: 4, org_id: 'org1', created_at: '2026-04-16T10:00:00.000Z', payload: 'd16' },
+  ];
+  const DAYS = ['2026-04-14', '2026-04-15', '2026-04-16'];
+
+  function makeDayAdapter(): TableAdapter<TestRow> {
+    const { adapter } = makeTestAdapter({
+      rows: ROWS,
+      eligiblePartitions: DAYS.map((partitionDate) => ({ tenantId: 'org1', partitionDate })),
+    });
+    // Bound each partition to its own day, as every real adapter does.
+    adapter.selectEligible = async function* (args) {
+      for (const r of ROWS) if (r.created_at.startsWith(args.partitionDate)) yield r;
+    };
+    return adapter;
+  }
+
+  async function archived(opts?: { gateGets?: boolean }) {
+    const mock = makeMockS3();
+    const inner = mock.client.send;
+    let inFlight = 0;
+    let peakInFlight = 0;
+    if (opts?.gateGets) {
+      // Hold every GET for a tick so overlapping calls are countable.
+      mock.client.send = vi.fn(async (cmd: any) => {
+        if (!(cmd instanceof GetObjectCommand)) return inner(cmd);
+        inFlight += 1;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 2));
+        try {
+          return await inner(cmd);
+        } finally {
+          inFlight -= 1;
+        }
+      });
+    }
+    const store = new TestColdStore({
+      db: 'platform',
+      instanceId: 'a',
+      log: vi.fn(),
+      config: makeConfig(true),
+      s3Client: mock.client,
+    });
+    store.registerAdapterForTests(makeDayAdapter());
+    await store.runArchiveCycle();
+    const manifestKeys = [...mock.objects.keys()].filter((k) => k.endsWith('.manifest.json'));
+    expect(manifestKeys).toHaveLength(3);
+    mock.sends.length = 0;
+    return { mock, store, peak: () => peakInFlight };
+  }
+
+  const RANGE = {
+    db: 'platform' as const,
+    table: 'run_events',
+    tenantId: 'org1',
+    fromTs: new Date('2026-04-01T00:00:00.000Z'),
+    toTs: new Date('2026-05-01T00:00:00.000Z'),
+  };
+
+  it('yields rows ordered by partition timestamp across days and inside a day', async () => {
+    const { store } = await archived();
+    const asc: number[] = [];
+    for await (const r of store.fetchRange<TestRow>(RANGE)) asc.push(r.id);
+    // fails-when: the in-day sort is dropped (3 archived after 2 would surface as [1,2,3,4])
+    expect(asc).toEqual([1, 3, 2, 4]);
+
+    const desc: number[] = [];
+    for await (const r of store.fetchRange<TestRow>({ ...RANGE, order: 'desc' })) desc.push(r.id);
+    // fails-when: order:'desc' only reverses the day walk and not the rows in it
+    expect(desc).toEqual([4, 2, 3, 1]);
+  });
+
+  it('never fetches the manifest of a day outside the requested range', async () => {
+    const { store, mock } = await archived();
+    const out: number[] = [];
+    for await (const r of store.fetchRange<TestRow>({
+      ...RANGE,
+      fromTs: new Date('2026-04-15T00:00:00.000Z'),
+      toTs: new Date('2026-04-16T00:00:00.000Z'),
+    })) {
+      out.push(r.id);
+    }
+    expect(out).toEqual([3, 2]);
+    const manifestGets = mock.sends
+      .filter(
+        (s) => s.name === 'GetObjectCommand' && (s.input.Key as string).endsWith('.manifest.json'),
+      )
+      .map((s) => s.input.Key as string);
+    // fails-when: the key-day prune is removed — the 04-14 and 04-16 manifests
+    // are then fetched only to be rejected by their own min/max bounds.
+    expect(manifestGets).toHaveLength(1);
+    expect(manifestGets[0]).toContain('/2026/04/15/');
+  });
+
+  it('keeps more than one GET in flight over a multi-day range', async () => {
+    const { store, peak } = await archived({ gateGets: true });
+    for await (const _ of store.fetchRange<TestRow>(RANGE)) {
+      // drain
+    }
+    // fails-when: manifests or chunks are fetched one after the other again
+    expect(peak()).toBeGreaterThan(1);
+  });
+
+  it('serves the second read-through from the manifest cache', async () => {
+    const { store, mock } = await archived();
+    const isManifestGet = (s: { name: string; input: any }) =>
+      s.name === 'GetObjectCommand' && (s.input.Key as string).endsWith('.manifest.json');
+    for await (const _ of store.fetchRange<TestRow>(RANGE)) {
+      // drain
+    }
+    const firstPass = mock.sends.filter(isManifestGet).length;
+    expect(firstPass).toBe(3);
+    mock.sends.length = 0;
+    for await (const _ of store.fetchRange<TestRow>(RANGE)) {
+      // drain
+    }
+    // fails-when: getManifestCached is bypassed — three more GETs land here
+    expect(mock.sends.filter(isManifestGet)).toHaveLength(0);
+    // breaks-if-wrong: a cached manifest still lists everything (the LIST is
+    // never cached, so a chunk archived later is still discovered).
+    expect(mock.sends.filter((s) => s.name === 'ListObjectsV2Command')).toHaveLength(1);
+  });
+});
+
 describe('BaseColdStore.warmCutoff', () => {
   const DAY_MS = 86_400_000;
 

@@ -72,6 +72,18 @@ Use these fields to control runtime selection explicitly:
 
 5. **Removal** -- After the job completes and the agent disconnects, the scaler stops and removes the container. `AutoRemove` is set to `false` so the scaler controls the full removal lifecycle.
 
+## Container jobs
+
+A job may name its own container image with the `container` field. On this backend the pool does not nest that image inside an agent container: it spawns the job's image **as** the agent, so one container serves the job.
+
+- The job's image is pulled with the registry credentials the job declares (resolved from the `auth` references in the lock file), not with the host's credential store, and the label set's `imagePullPolicy` does not apply to it — that policy describes the pool's own pinned agent image. A job image that is not on the host is pulled on the first job that uses it.
+- The KiCI runtime — the pinned Node build plus the agent code — is copied once out of the label set's `image` into a named `kici-runtime-*` volume on the host and mounted read-only at `/opt/kici` in the job container. The agent is started from that mount, so the job image needs neither Node nor a KiCI install. The volume is reused by every later spawn from the same agent image.
+- The container carries `KICI_JOB_IMAGE_AGENT=1`, which tells the agent it already runs inside the job's image and must run the steps directly rather than start a second container from it.
+- Because the agent runs inside the job's image, that image must ship `git` and `bash`; the agent refuses to start without them and its error names the missing tool.
+- A ready warm-pool agent runs the pool's agent image and is never reused for such a job; it gets an on-demand spawn of its own (see [Common configuration → Warm pools](./common-config.md#warm-pool)).
+
+See [Container jobs](../../../user/container-jobs.md) for the job-side contract, and the [bare-metal backend](./bare-metal.md#container-jobs) for how a host-process pool handles the same jobs.
+
 ## Resource limit enforcement
 
 Container `limits` are translated into `HostConfig.Memory` (bytes) and `HostConfig.NanoCPUs` (cpus × 1e9) and are always enforced by the runtime. The requests/limits model and the three-layer cascade are described in [Common configuration → Resource limits](./common-config.md#resource-limits).
@@ -93,7 +105,7 @@ scalers:
 
 ## Registry authentication
 
-The scaler leverages the host's Docker/Podman configuration for registry authentication. No registry credentials are stored in the scaler config. Ensure the container runtime has credentials configured for any private registries referenced in `image` fields (via `docker login` / `podman login` or `~/.docker/config.json` / `${XDG_RUNTIME_DIR}/containers/auth.json`).
+The scaler leverages the host's Docker/Podman configuration for registry authentication of the pool's agent images. No registry credentials are stored in the scaler config. Ensure the container runtime has credentials configured for any private registries referenced in label-set `image` fields (via `docker login` / `podman login` or `~/.docker/config.json` / `${XDG_RUNTIME_DIR}/containers/auth.json`). A job's own `container` image is the exception: it is pulled with the credentials the job declares — see [Container jobs](#container-jobs).
 
 ## Container socket sharing — security warning
 

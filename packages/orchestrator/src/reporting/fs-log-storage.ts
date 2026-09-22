@@ -184,7 +184,7 @@ export class FilesystemLogStorage implements LogStorage {
         const s = await stat(this.fullPath(p));
         out.push({ path: p, lastModified: s.mtime });
       } catch (err: unknown) {
-        // A file that vanished between listing and stat is simply not returned.
+        // A file that vanished between listing and stat is not returned.
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
     }

@@ -115,10 +115,9 @@ export async function loadEventLogRange(
   const coldToTs = toTs && toTs < warmCutoff ? toTs : warmCutoff;
   const coldRows: EventLogColdStoreRow[] = [];
 
-  // Collect every matching cold row before sorting. `fetchRange` yields
-  // chunks oldest-first, so breaking early at `remaining` would keep the
-  // OLDEST rows and drop the newest — the opposite of the
-  // `received_at DESC` contract. Sort the full set, then slice.
+  // The cold stream arrives newest-first, so the page is complete once
+  // `coldOffset + remaining` matching rows are in hand; the rest of the
+  // archive is never read.
   try {
     for await (const row of coldStore.fetchRange<EventLogColdStoreRow>({
       db: 'orchestrator',
@@ -126,6 +125,7 @@ export async function loadEventLogRange(
       tenantId: routingKey,
       fromTs: coldFromTs,
       toTs: coldToTs,
+      order: 'desc',
     })) {
       if (orgId !== undefined && row.org_id !== orgId) continue;
       if (event !== undefined && row.event !== event) continue;
@@ -133,6 +133,7 @@ export async function loadEventLogRange(
       if (status !== undefined && row.status !== status) continue;
       if (deliveryId !== undefined && !row.delivery_id.includes(deliveryId)) continue;
       coldRows.push(row);
+      if (coldRows.length >= coldOffset + remaining) break;
     }
   } catch (err) {
     if (hotRows.length === 0) {
@@ -154,13 +155,6 @@ export async function loadEventLogRange(
     return hotRows;
   }
 
-  coldRows.sort((a, b) => {
-    const at =
-      a.received_at instanceof Date ? a.received_at.getTime() : new Date(a.received_at).getTime();
-    const bt =
-      b.received_at instanceof Date ? b.received_at.getTime() : new Date(b.received_at).getTime();
-    return bt - at;
-  });
   return [...hotRows, ...coldRows.slice(coldOffset, coldOffset + remaining)];
 }
 

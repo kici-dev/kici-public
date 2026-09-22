@@ -42,11 +42,12 @@ What it does:
 - **Reclaims ownership first.** On rootless nodes the reaper reclaims ownership of
   each leaked chroot before deleting it, so disk owned by the jailer's subuid is
   actually freed.
-- **Also sweeps container scalers, unconditionally.** Once the health gate has
-  passed, every `container` scaler on the host is swept too, and that sweep
-  removes **every** agent container it manages — there is no per-container
-  liveness check, unlike the Firecracker pass. The health gate is what makes this
-  safe: it only runs when the orchestrator is down.
+- **Also sweeps container scalers.** Once the health gate has passed, every
+  `container` scaler in the config is swept too. That pass removes the stopped
+  containers stamped with the scaler's own `kici-scaler-name` label. A running
+  container is left alone: the standalone command has no orchestrator registry
+  to consult, so it treats every running agent as live. Containers another
+  scaler or another orchestrator stamped are never touched.
 - **No-ops while healthy.** The command probes the local orchestrator health
   endpoint. If the orchestrator is up and healthy, the command prints a notice and
   exits without doing anything — the running orchestrator already reaps its own
@@ -55,9 +56,9 @@ What it does:
 Useful flags:
 
 - `--force` — skip the health gate and reap even if the orchestrator reports
-  healthy. Use it only on a node you know is wedged: it bypasses the one check
-  that protects the unconditional container sweep, so on a healthy node it kills
-  running agent containers.
+  healthy. Use it only on a node you know is wedged: a healthy orchestrator
+  already reaps its own orphans, so a forced run races it for the same stopped
+  containers and dead chroots.
 - `--config <path>` — point at a non-default orchestrator config location (also
   honoured via the `KICI_CONFIG` environment variable).
 - `--json` — emit machine-readable counts, for scripting and host timers.
@@ -90,8 +91,8 @@ Two properties make a periodic run safe:
   removes chroots and TAP devices of dead VMs.
 
 Use `--json` so the timer's journal records what each run freed. Do **not** add
-`--force` to a scheduled run: it skips the health gate, and the container sweep
-behind that gate removes every agent container unconditionally.
+`--force` to a scheduled run: it skips the health gate, and a run that overlaps
+a healthy orchestrator's own sweep does no useful work.
 
 ## See also
 

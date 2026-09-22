@@ -172,7 +172,36 @@ export async function loadAccessLogRange(
   // helper — callers should supply an orgId.
   const tenantToScan = filter.orgId ?? SYNTHETIC_ORCH_TENANT;
 
+  const matches = (row: AccessLogColdRow): boolean => {
+    if (filter.actorType && row.actor_type !== filter.actorType) return false;
+    if (filter.actorId && row.actor_id !== filter.actorId) return false;
+    if (filter.action && row.action !== filter.action) return false;
+    if (filter.source && row.source !== filter.source) return false;
+    if (filter.outcome && row.outcome !== filter.outcome) return false;
+    if (filter.targetType && row.target_type !== filter.targetType) return false;
+    if (filter.targetId && row.target_id !== filter.targetId) return false;
+    if (filter.agentLabel && row.agent_label !== filter.agentLabel) return false;
+    if (filter.agentOnly && row.agent_label == null) return false;
+    if (filter.q && filter.q.length > 0) {
+      const haystack = (row.error_message ?? '').toLowerCase();
+      if (!haystack.includes(filter.q.toLowerCase())) return false;
+    }
+    return true;
+  };
+  const beforeCursor = (it: AccessLogItem): boolean =>
+    !cursor ||
+    cursor.source !== 'cold' ||
+    it.createdAt < cursor.createdAt ||
+    (it.createdAt === cursor.createdAt && it.id < cursor.id);
+
+  // The cold stream arrives newest-first, so the page is complete as soon as
+  // `coldRemaining` rows are in hand and the next row is strictly older than
+  // the last of them — every row that could still tie on `createdAt` has been
+  // seen by then. Stopping there is what keeps a narrow filter from reading
+  // the tenant's whole archive: the earlier collect-everything-then-sort shape
+  // fetched 262 chunks for a five-row page on staging.
   const coldItems: AccessLogItem[] = [];
+  let stoppedEarly = false;
   try {
     for await (const row of coldStore.fetchRange<AccessLogColdRow>({
       db: 'orchestrator',
@@ -180,21 +209,19 @@ export async function loadAccessLogRange(
       tenantId: tenantToScan,
       fromTs: coldFromTs,
       toTs: coldToTs,
+      order: 'desc',
     })) {
-      if (filter.actorType && row.actor_type !== filter.actorType) continue;
-      if (filter.actorId && row.actor_id !== filter.actorId) continue;
-      if (filter.action && row.action !== filter.action) continue;
-      if (filter.source && row.source !== filter.source) continue;
-      if (filter.outcome && row.outcome !== filter.outcome) continue;
-      if (filter.targetType && row.target_type !== filter.targetType) continue;
-      if (filter.targetId && row.target_id !== filter.targetId) continue;
-      if (filter.agentLabel && row.agent_label !== filter.agentLabel) continue;
-      if (filter.agentOnly && row.agent_label == null) continue;
-      if (filter.q && filter.q.length > 0) {
-        const haystack = (row.error_message ?? '').toLowerCase();
-        if (!haystack.includes(filter.q.toLowerCase())) continue;
+      if (!matches(row)) continue;
+      const item = toAccessLogItem(row);
+      if (!beforeCursor(item)) continue;
+      if (
+        coldItems.length >= coldRemaining &&
+        item.createdAt < coldItems[coldRemaining - 1].createdAt
+      ) {
+        stoppedEarly = true;
+        break;
       }
-      coldItems.push(toAccessLogItem(row));
+      coldItems.push(item);
     }
   } catch (err) {
     if (cursor?.source === 'cold') {
@@ -221,20 +248,22 @@ export async function loadAccessLogRange(
     };
   }
 
-  coldItems.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+  // Rows that tie on createdAt arrive in archive order; the cursor compares
+  // (createdAt, id), so settle ties by id before cutting the page.
+  coldItems.sort((a, b) =>
+    a.createdAt < b.createdAt
+      ? 1
+      : a.createdAt > b.createdAt
+        ? -1
+        : a.id < b.id
+          ? 1
+          : a.id > b.id
+            ? -1
+            : 0,
+  );
 
-  // If resuming in cold, drop everything ≥ cursor.
-  let coldStart = 0;
-  if (cursor && cursor.source === 'cold') {
-    coldStart = coldItems.findIndex(
-      (it) =>
-        it.createdAt < cursor.createdAt || (it.createdAt === cursor.createdAt && it.id < cursor.id),
-    );
-    if (coldStart < 0) coldStart = coldItems.length;
-  }
-
-  const coldPage = coldItems.slice(coldStart, coldStart + coldRemaining);
-  const coldHasMore = coldStart + coldRemaining < coldItems.length;
+  const coldPage = coldItems.slice(0, coldRemaining);
+  const coldHasMore = stoppedEarly || coldItems.length > coldRemaining;
 
   const merged = [...hotItems, ...coldPage];
   const nextCursor =

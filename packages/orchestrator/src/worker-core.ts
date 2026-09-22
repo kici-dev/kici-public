@@ -44,7 +44,12 @@ import {
   uptime,
   userInfo,
 } from 'node:os';
-import { createLogger, setupGracefulShutdown, toErrorMessage } from '@kici-dev/shared';
+import {
+  applyProxyKeepAliveTimeouts,
+  createLogger,
+  setupGracefulShutdown,
+  toErrorMessage,
+} from '@kici-dev/shared';
 import { createHealthRoutes as createBaseHealthRoutes } from '@kici-dev/shared';
 import type { AppConfig } from './config.js';
 
@@ -1180,17 +1185,19 @@ export async function bootstrapWorker(
   );
 
   // Start HTTP server
-  const server = serve(
-    { fetch: app.fetch, port: config.port, hostname: config.host, websocket: { server: wss } },
-    (info) => {
-      logger.info(`Worker started on port ${info.port}`, {
-        port: info.port,
-        host: config.host,
-        role: 'worker',
-        coordinatorUrls: coordUrls,
-        instanceId: config.cluster.instanceId,
-      });
-    },
+  const server = applyProxyKeepAliveTimeouts(
+    serve(
+      { fetch: app.fetch, port: config.port, hostname: config.host, websocket: { server: wss } },
+      (info) => {
+        logger.info(`Worker started on port ${info.port}`, {
+          port: info.port,
+          host: config.host,
+          role: 'worker',
+          coordinatorUrls: coordUrls,
+          instanceId: config.cluster.instanceId,
+        });
+      },
+    ),
   );
 
   // 8. Start heartbeat monitor

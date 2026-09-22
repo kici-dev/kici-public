@@ -14,6 +14,8 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { serve } from '@hono/node-server';
 import {
+  applyProxyKeepAliveTimeouts,
+  ChunkLru,
   createLogger,
   getRequestContext,
   parseDatabaseUrl,
@@ -303,6 +305,14 @@ import { JobKind } from './db/types.js';
 import type pg from 'pg';
 
 const logger = createLogger({ prefix: 'core' });
+
+/**
+ * Budget for the read-through cold-store chunk cache. Sized below the
+ * Platform's so a customer-hosted orchestrator on a small box keeps its
+ * memory for job dispatch; a day's access-log chunk is a few kilobytes
+ * gzipped, so this still holds months of a tenant's archive.
+ */
+const COLD_STORE_CHUNK_CACHE_BYTES = 128 * 1024 * 1024;
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
@@ -3158,6 +3168,12 @@ export async function bootstrapOrchestrator(
         config: csConfig,
         instanceId: config.instanceId,
         kdb: db,
+        // Read-through chunk cache: a page walked twice, or two filters over
+        // the same days, must not re-fetch the same archived chunks from S3.
+        chunkCache: new ChunkLru<string, Buffer>({
+          maxBytes: COLD_STORE_CHUNK_CACHE_BYTES,
+          sizeOf: (v) => v.byteLength,
+        }),
         log: (level, msg, extra) => {
           if (level === 'info') logger.info(msg, extra);
           else if (level === 'warn') logger.warn(msg, extra);
@@ -4710,21 +4726,23 @@ export async function bootstrapOrchestrator(
   ingestOverflowReplayer.setReinjectDirect(reinjectDirect);
 
   // 28. Start HTTP server
-  const server = serve(
-    {
-      fetch: app.fetch,
-      port: config.port,
-      hostname: config.host,
-      websocket: { server: wss },
-    },
-    (info) => {
-      logger.info(hooks.startupLogMessage(info.port), {
-        port: info.port,
-        host: config.host,
-        mode: config.mode,
-        environment: config.nodeEnv,
-      });
-    },
+  const server = applyProxyKeepAliveTimeouts(
+    serve(
+      {
+        fetch: app.fetch,
+        port: config.port,
+        hostname: config.host,
+        websocket: { server: wss },
+      },
+      (info) => {
+        logger.info(hooks.startupLogMessage(info.port), {
+          port: info.port,
+          host: config.host,
+          mode: config.mode,
+          environment: config.nodeEnv,
+        });
+      },
+    ),
   );
 
   // 29. Start heartbeat monitor

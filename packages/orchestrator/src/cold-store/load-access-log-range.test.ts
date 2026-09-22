@@ -185,3 +185,113 @@ describe('loadAccessLogRange cold-store error propagation', () => {
     expect(fetchRange).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('loadAccessLogRange cold page early stop', () => {
+  /** Newest-first cold rows, one per day, counting how many the reader pulled. */
+  function makeCountingColdStore(rows: AccessLogColdRow[]): {
+    coldStore: ColdStore;
+    pulled: () => number;
+    lastArgs: () => Record<string, unknown>;
+  } {
+    let pulled = 0;
+    let lastArgs: Record<string, unknown> = {};
+    const fetchRange = vi.fn((args: Record<string, unknown>) => {
+      lastArgs = args;
+      async function* gen(): AsyncGenerator<AccessLogColdRow> {
+        for (const r of rows) {
+          pulled += 1;
+          yield r;
+        }
+      }
+      return gen();
+    });
+    const warmCutoff = vi.fn(() => new Date(Date.now() - 30 * 86_400_000));
+    return {
+      coldStore: { fetchRange, warmCutoff } as unknown as ColdStore,
+      pulled: () => pulled,
+      lastArgs: () => lastArgs,
+    };
+  }
+
+  const dayRow = (n: number, id = `cold-${n}`): AccessLogColdRow =>
+    ({
+      ...SAMPLE_COLD_1,
+      id,
+      created_at: new Date(Date.UTC(2026, 0, 31 - n)),
+    }) as AccessLogColdRow;
+
+  it('asks for the cold stream newest-first and stops after one page plus one row', async () => {
+    const rows = Array.from({ length: 40 }, (_, n) => dayRow(n));
+    const { coldStore, pulled, lastArgs } = makeCountingColdStore(rows);
+
+    const result = await loadAccessLogRange({
+      db: makeHotMockDb([]).db,
+      coldStore,
+      filter: { orgId: 'org-1' },
+      limit: 5,
+    });
+
+    expect(lastArgs().order).toBe('desc');
+    expect(result.items.map((i) => i.id)).toEqual([
+      'cold-0',
+      'cold-1',
+      'cold-2',
+      'cold-3',
+      'cold-4',
+    ]);
+    expect(result.nextCursor).not.toBeNull();
+    // fails-when: the reader collects every cold row before slicing the page
+    // (pulled would read 40) — the 6th row is the one that proves hasMore.
+    expect(pulled()).toBe(6);
+  });
+
+  it('reads through a createdAt tie at the page boundary before stopping', async () => {
+    // Two rows share the boundary timestamp; the second arrives after the
+    // page is nominally full and outranks the first by id.
+    const tieTs = new Date(Date.UTC(2026, 0, 20));
+    const rows = [
+      dayRow(0),
+      { ...SAMPLE_COLD_1, id: 'tie-a', created_at: tieTs } as AccessLogColdRow,
+      { ...SAMPLE_COLD_1, id: 'tie-b', created_at: tieTs } as AccessLogColdRow,
+      dayRow(20),
+      dayRow(21),
+    ];
+    const { coldStore, pulled } = makeCountingColdStore(rows);
+
+    const result = await loadAccessLogRange({
+      db: makeHotMockDb([]).db,
+      coldStore,
+      filter: { orgId: 'org-1' },
+      limit: 2,
+    });
+
+    // fails-when: the stop fires on count alone — tie-b is then never read
+    // and the (createdAt, id) cursor skips it on the next page.
+    expect(result.items.map((i) => i.id)).toEqual(['cold-0', 'tie-b']);
+    expect(pulled()).toBe(4);
+
+    const next = await loadAccessLogRange({
+      db: makeUnusedDb(),
+      coldStore: makeCountingColdStore(rows).coldStore,
+      filter: { orgId: 'org-1' },
+      limit: 2,
+      cursor: result.nextCursor!,
+    });
+    // breaks-if-wrong: the page after the tie resumes at tie-a, not past it.
+    expect(next.items.map((i) => i.id)).toEqual(['tie-a', 'cold-20']);
+  });
+
+  it('reports no further page when the cold stream ends inside the page', async () => {
+    const { coldStore } = makeCountingColdStore([dayRow(0), dayRow(1)]);
+    const result = await loadAccessLogRange({
+      db: makeHotMockDb([]).db,
+      coldStore,
+      filter: { orgId: 'org-1' },
+      limit: 5,
+    });
+    expect(result.items).toHaveLength(2);
+    // breaks-if-wrong: a stream shorter than the page must not mint a cursor
+    // that leads to an empty page.
+    expect(result.nextCursor).toBeNull();
+  });
+});

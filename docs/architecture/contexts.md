@@ -166,7 +166,7 @@ To resolve dynamic fields, the orchestrator uses a two-phase init model:
 Gates are evaluated sequentially. The first non-pass result stops evaluation:
 
 ```
-evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
+evaluateProtectionRules(env, ctx, currentRunningCount, concurrencyGroup, trustTier?)
   |
   1. Context disabled? -> reject
   2. Branch gate:
@@ -179,7 +179,7 @@ evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
      - else -> reject or hold(holdType: 'security')
   4. Concurrency gate:
      - env.concurrencyLimit is null or non-positive -> pass (unlimited)
-     - runningCount < limit -> pass
+     - currentRunningCount < limit -> pass
      - strategy = 'cancel-pending' -> queue(holdType: 'concurrency', reason: 'cancel-pending', caller handles cancellation)
      - strategy = 'queue' -> queue(holdType: 'concurrency')
   5. Reviewer gate:
@@ -193,7 +193,7 @@ evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
   ProtectionGateResult { action, reason, holdType?, holdUntil? }
 ```
 
-The `runningCount` argument is not a plain database count. The caller sums two
+The `currentRunningCount` argument is not a plain database count. The caller sums two
 terms and passes the total. The first term counts the jobs occupying a slot in
 the concurrency group, scoped to the dispatching organization. The second term
 counts the jobs the same dispatch pass has already admitted.

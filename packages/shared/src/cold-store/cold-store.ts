@@ -46,7 +46,7 @@ import {
   tenantDayPrefix,
   type DbKind,
 } from './key.js';
-import type { ChunkLru } from './lru.js';
+import { ChunkLru } from './lru.js';
 import { parseManifest, serializeManifest } from './manifest.js';
 import {
   coldStoreArchiveBytesTotal,
@@ -71,6 +71,49 @@ import type { ArchiveCycleSummary, ChunkManifest, ColdRetention } from './types.
 
 const CONTENT_HASH_META = 'content-hash';
 
+/**
+ * Bound on the S3 GETs a single read-through keeps in flight. A read
+ * over a tenant with one archived chunk per day used to issue one
+ * manifest GET and one data GET per chunk, strictly one after the other:
+ * 262 chunks cost 524 round trips and 34 s on staging, and the
+ * `kici-admin access-log list` client gave up at 30 s.
+ */
+const READ_THROUGH_CONCURRENCY = 16;
+
+/**
+ * Budget for the in-process manifest cache. A manifest is immutable once
+ * written (the chunk it describes is content-addressed), so caching it is
+ * safe for the life of the process, and at ~600 bytes each this budget
+ * holds well over ten thousand of them.
+ */
+const MANIFEST_CACHE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Run `fn` over `items` with at most `limit` calls in flight, preserving
+ * the input order in the result.
+ */
+async function mapConcurrent<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+/** UTC calendar day of an instant as `YYYY-MM-DD`. */
+function utcDay(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
 export interface ColdStoreFetchRangeArgs<TRow> {
   db: DbKind;
   table: string;
@@ -83,6 +126,16 @@ export interface ColdStoreFetchRangeArgs<TRow> {
    */
   toTs?: Date;
   decode?: (line: string) => TRow;
+  /**
+   * Row order by partition timestamp. `'asc'` (default) yields the oldest
+   * row first; `'desc'` yields the newest first, so a paginated reader that
+   * lists newest-first can stop consuming the stream as soon as its page is
+   * full instead of reading every archived chunk. Rows are globally ordered
+   * across chunks when the table has a registered adapter (its
+   * `rowTimestamp` drives the sort); without one the order is per-chunk
+   * (chunks ordered by manifest bounds, rows in archive order).
+   */
+  order?: 'asc' | 'desc';
 }
 
 export interface ColdStoreReplayChunkArgs {
@@ -260,6 +313,10 @@ export abstract class BaseColdStore implements ColdStore {
   protected readonly instanceId: string;
   protected readonly log: BaseColdStoreDeps['log'];
   protected readonly chunkCache: ChunkLru<string, Buffer> | undefined;
+  private readonly manifestCache = new ChunkLru<string, ChunkManifest>({
+    maxBytes: MANIFEST_CACHE_BYTES,
+    sizeOf: (m) => JSON.stringify(m).length,
+  });
   protected readonly s3: S3Client;
   /** Registered table adapters by `table` name. */
   protected readonly adapters: Map<string, TableAdapter<unknown>> = new Map();
@@ -901,6 +958,7 @@ export abstract class BaseColdStore implements ColdStore {
       : null;
 
     const toTs = args.toTs ?? this.warmCutoff(args.table);
+    const order = args.order ?? 'asc';
 
     const manifests = await this.listRelevantManifests({
       db: args.db,
@@ -910,8 +968,22 @@ export abstract class BaseColdStore implements ColdStore {
       toTs,
     });
 
+    // A chunk carries only rows of its own partition day (the adapter's
+    // `selectEligible` is bounded to that day), so days never interleave.
+    // Walking day by day and sorting inside each day therefore yields a
+    // stream ordered across every chunk, which is what lets a newest-first
+    // reader stop after its first page.
+    const days = new Map<string, ChunkManifest[]>();
+    for (const m of manifests) {
+      const list = days.get(m.partitionDate);
+      if (list) list.push(m);
+      else days.set(m.partitionDate, [m]);
+    }
+    const dayOrder = [...days.keys()].sort();
+    if (order === 'desc') dayOrder.reverse();
+
     const label = { db: args.db, table: args.table };
-    for (const manifest of manifests) {
+    const loadChunk = async (manifest: ChunkManifest): Promise<TRow[]> => {
       // v2 manifests live under a bucket subprefix (`<day>/<bucket>/<chunk>`);
       // v1 manifests live at the day root (`<day>/<chunk>`). The schemaVersion
       // gate keeps the v1 read-back compatible.
@@ -929,13 +1001,49 @@ export abstract class BaseColdStore implements ColdStore {
       const gzipped = await this.getChunkData(dataKey, manifest.contentHash);
       coldStoreRehydrateDurationSeconds().record((Date.now() - fetchStart) / 1000, label);
 
+      const rows: TRow[] = [];
       for await (const row of decodeChunk<TRow>({ gzipped, decodeLine })) {
         if (rowTimestamp) {
           const ts = rowTimestamp(row);
           if (ts < args.fromTs || ts >= toTs) continue;
         }
-        yield row;
+        rows.push(row);
       }
+      return rows;
+    };
+    const loadDay = async (day: string): Promise<TRow[]> => {
+      const dayManifests = days.get(day) ?? [];
+      if (order === 'desc') dayManifests.reverse();
+      const perChunk = await mapConcurrent(dayManifests, READ_THROUGH_CONCURRENCY, loadChunk);
+      const rows = perChunk.flat();
+      if (rowTimestamp) {
+        const sign = order === 'desc' ? -1 : 1;
+        rows.sort((a, b) => sign * (rowTimestamp(a).getTime() - rowTimestamp(b).getTime()));
+      }
+      return rows;
+    };
+
+    // Keep a bounded window of days loading ahead of the one being yielded,
+    // so consecutive single-chunk days do not serialise into one round trip
+    // each. A consumer that stops early leaves the window's promises to
+    // settle in the background; the `finally` below keeps a late rejection
+    // from surfacing as an unhandled one.
+    const pending: Array<Promise<TRow[]>> = [];
+    let nextDay = 0;
+    const fill = (): void => {
+      while (pending.length < READ_THROUGH_CONCURRENCY && nextDay < dayOrder.length) {
+        pending.push(loadDay(dayOrder[nextDay++]));
+      }
+    };
+    try {
+      fill();
+      while (pending.length > 0) {
+        const rows = await pending.shift()!;
+        fill();
+        for (const row of rows) yield row;
+      }
+    } finally {
+      for (const p of pending) p.catch(() => undefined);
     }
   }
 
@@ -997,9 +1105,27 @@ export abstract class BaseColdStore implements ColdStore {
       continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
     } while (continuationToken);
 
+    // A key under `<tenant>/<YYYY>/<MM>/<DD>/` names a chunk of that UTC
+    // day, so a day outside [fromTs, toTs) cannot overlap the range and its
+    // manifest is never fetched. Keys with no day segment fall through to
+    // the manifest test.
+    const fromDay = utcDay(args.fromTs);
+    const toDayInclusive = utcDay(new Date(args.toTs.getTime() - 1));
+    const candidateKeys =
+      toDayInclusive < fromDay
+        ? []
+        : manifestKeys.filter((key) => {
+            const m = /^(\d{4})\/(\d{2})\/(\d{2})\//.exec(key.slice(tenantPrefix.length));
+            if (!m) return true;
+            const day = `${m[1]}-${m[2]}-${m[3]}`;
+            return day >= fromDay && day <= toDayInclusive;
+          });
+
+    const fetched = await mapConcurrent(candidateKeys, READ_THROUGH_CONCURRENCY, (key) =>
+      this.getManifestCached(key),
+    );
     const manifests: ChunkManifest[] = [];
-    for (const key of manifestKeys) {
-      const m = await this.getManifest(key);
+    for (const m of fetched) {
       const min = new Date(m.minTimestamp);
       const max = new Date(m.maxTimestamp);
       // Overlap test: [minTs, maxTs] ∩ [fromTs, toTs) ≠ ∅
@@ -1009,6 +1135,19 @@ export abstract class BaseColdStore implements ColdStore {
     }
     manifests.sort((a, b) => (a.minTimestamp < b.minTimestamp ? -1 : 1));
     return manifests;
+  }
+
+  /**
+   * `getManifest` through the in-process cache. Only the read-through uses
+   * this: the archiver and the reconcile paths must observe the object as it
+   * is in S3 right now, not as this process last saw it.
+   */
+  private async getManifestCached(key: string): Promise<ChunkManifest> {
+    const cached = this.manifestCache.get(key);
+    if (cached) return cached;
+    const m = await this.getManifest(key);
+    this.manifestCache.set(key, m);
+    return m;
   }
 
   private async getManifest(key: string): Promise<ChunkManifest> {

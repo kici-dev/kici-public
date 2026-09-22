@@ -453,7 +453,7 @@ smaller value fall outside the widened bound and stop appearing in read-through.
 
 **Per-cycle cost** (per `(table, tenant)` with N rows producing K chunks): `K` × `PutObject` (data) + `K` × `PutObject` (manifest) + 1× `ListObjectsV2` to detect prior chunks + database mutations. Concurrency capped at `KICI_COLD_STORE_S3_CONCURRENCY` (default 4).
 
-**Rehydration cost** (rare, on dashboard archive query or `kici-admin` rehydrate): `ListObjectsV2` to find chunks in date range → `GetObject` for matching `*.manifest.json` files → `GetObject` for selected `*.jsonl.gz` chunks.
+**Rehydration cost** (on a dashboard or `kici-admin` page that reaches past the warm window): 1× `ListObjectsV2` over the tenant prefix. Then `GetObject` for each `*.manifest.json` whose key day falls inside the requested range, up to 16 in flight; a manifest is immutable and cached in the process after its first read. Then `GetObject` for each overlapping `*.jsonl.gz` chunk, newest day first and up to 16 in flight, stopping as soon as the page is full. A narrow filter on a long archive therefore reads a few chunks, not the tenant's whole history.
 
 **Purge schedule**: `cold-store-purge` runs hourly (`15 * * * *` cron) and `DeleteObject`s chunks whose retention bucket has expired (`30d` etc).
 
