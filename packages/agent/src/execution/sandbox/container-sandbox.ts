@@ -49,6 +49,7 @@ import type {
 import { buildRequest } from './fork-runner.js';
 import { runnerLaunchArgv, KICI_RUNTIME_NODE_DIR } from './kici-runtime.js';
 import { assertImageRunnable } from './image-preflight.js';
+import { describeRunnerCrash, MAX_RAW_STDOUT_LINES, pushBounded } from './runner-crash.js';
 import { c as tarCreate } from 'tar';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { buildContainerHardening, type SandboxHardeningOptions } from './container-hardening.js';
@@ -63,6 +64,9 @@ const logger = createLogger({ prefix: 'container-sandbox' });
 
 /** Maximum lines of stderr to keep for crash diagnostics. */
 const MAX_STDERR_LINES = 20;
+
+/** How long (ms) a crash report waits on the exec inspect before reporting an unknown exit code. */
+const CRASH_INSPECT_TIMEOUT_MS = 5_000;
 
 /** Grace period (ms) to wait for graceful abort before killing. */
 const ABORT_GRACE_MS = 10_000;
@@ -169,6 +173,7 @@ interface ContainerSandboxOptions {
  * (so the caller can detach it on cleanup).
  */
 interface ExecStreamContext {
+  exec: Docker.Exec;
   stream: NodeJS.ReadWriteStream;
   stdout: PassThrough;
   stderrLines: string[];
@@ -182,6 +187,10 @@ interface ExecStreamContext {
  */
 interface MutableRunnerState {
   jobStatus: 'success' | 'failed' | 'cancelled';
+  /** The failure reason the runner reported on job.complete. */
+  reportedError: string | undefined;
+  /** Sibling jobs the runner dropped for lock drift, reported on job.complete. */
+  droppedJobs: string[] | undefined;
   jobOutputs: Record<string, Record<string, unknown>> | undefined;
   encryptedSecretOutputs: Record<string, { agentPublicKey: string; encrypted: string }> | undefined;
 }
@@ -193,8 +202,37 @@ interface MutableRunnerState {
 interface RunnerOutcome {
   jobStatus: 'success' | 'failed' | 'cancelled';
   stepResults: SandboxStepResult[];
+  /** Why the runner crashed, when it exited without sending job.complete. */
+  error?: string;
+  /** The failure reason the runner reported on job.complete. */
+  reportedError?: string;
+  /** Sibling jobs the runner dropped for lock drift. */
+  droppedJobs?: string[];
   jobOutputs: Record<string, Record<string, unknown>> | undefined;
   encryptedSecretOutputs: Record<string, { agentPublicKey: string; encrypted: string }> | undefined;
+}
+
+/**
+ * End the demuxed stdout / stderr passthroughs when the hijacked exec stream
+ * ends, closes, or errors. The demuxer only forwards 'data' and never ends its
+ * outputs, so without this a runner that exits without job.complete leaves the
+ * stdout readline open and the job waiting forever.
+ */
+function endOutputsWithStream(
+  stream: NodeJS.ReadWriteStream,
+  stdout: PassThrough,
+  stderr: PassThrough,
+): void {
+  const endOutputs = () => {
+    if (!stdout.writableEnded) stdout.end();
+    if (!stderr.writableEnded) stderr.end();
+  };
+  stream.once('end', endOutputs);
+  stream.once('close', endOutputs);
+  stream.once('error', (err: Error) => {
+    logger.warn('Runner exec stream errored', { error: toErrorMessage(err) });
+    endOutputs();
+  });
 }
 
 /**
@@ -513,6 +551,10 @@ function applyJobComplete(
   options: JobExecutionOptions,
 ): void {
   state.jobStatus = msg.status;
+  // A runner that fails before its first step (clone, deps, compile, rules)
+  // reports the reason only here; carry it so the orchestrator records it.
+  state.reportedError = msg.error;
+  state.droppedJobs = msg.droppedJobs;
 
   // Merge any step results we didn't already see via step.complete
   // (e.g. skipped steps reported in bulk).
@@ -915,6 +957,7 @@ export class ContainerSandbox implements ExecutionSandbox {
       outcome = {
         jobStatus: ExecutionJobStatus.enum.failed,
         stepResults: [],
+        error: toErrorMessage(err),
         jobOutputs: undefined,
         encryptedSecretOutputs: undefined,
       };
@@ -969,6 +1012,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
     this.docker.modem.demuxStream(stream, stdout, stderr);
+    endOutputsWithStream(stream, stdout, stderr);
 
     // Capture stderr for crash diagnostics (last N lines).
     const stderrLines: string[] = [];
@@ -990,7 +1034,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     };
     options.signal.addEventListener('abort', abortHandler, { once: true });
 
-    return { stream, stdout, stderrLines, stderrRl, abortHandler };
+    return { exec, stream, stdout, stderrLines, stderrRl, abortHandler };
   }
 
   /**
@@ -1003,11 +1047,15 @@ export class ContainerSandbox implements ExecutionSandbox {
     options: JobExecutionOptions,
   ): Promise<RunnerOutcome> {
     const { stream, stdout, stderrLines } = streamCtx;
+    /** Non-JSON stdout: the container runtime writes an exec failure there. */
+    const rawStdoutLines: string[] = [];
     const stepResults: SandboxStepResult[] = [];
     /** Track step names from step.start messages (stepIndex -> name). */
     const stepNames = new Map<number, string>();
     const state: MutableRunnerState = {
       jobStatus: ExecutionJobStatus.enum.failed,
+      reportedError: undefined,
+      droppedJobs: undefined,
       jobOutputs: undefined,
       encryptedSecretOutputs: undefined,
     };
@@ -1015,6 +1063,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     return new Promise<RunnerOutcome>((resolve, reject) => {
       // Parse JSON-lines from stdout using readline.
       const rl = createInterface({ input: stdout, crlfDelay: Infinity });
+      let completed = false;
 
       rl.on('line', (line) => {
         let msg: RunnerToAgentMessage;
@@ -1023,13 +1072,17 @@ export class ContainerSandbox implements ExecutionSandbox {
         } catch {
           // Not valid JSON -- treat as raw output, log as warning.
           logger.warn('Non-JSON output from runner', { line: line.slice(0, 200) });
+          pushBounded(rawStdoutLines, line, MAX_RAW_STDOUT_LINES);
           return;
         }
 
         if (this.dispatchRunnerMessage(msg, stream, options, stepNames, stepResults, state)) {
+          completed = true;
           resolve({
             jobStatus: state.jobStatus,
             stepResults,
+            reportedError: state.reportedError,
+            droppedJobs: state.droppedJobs,
             jobOutputs: state.jobOutputs,
             encryptedSecretOutputs: state.encryptedSecretOutputs,
           });
@@ -1039,19 +1092,21 @@ export class ContainerSandbox implements ExecutionSandbox {
       rl.on('close', () => {
         // Readline closed -- exec may have exited.
         // If we haven't received job.complete, this is a crash.
-        if (state.jobStatus === ExecutionJobStatus.enum.failed && stepResults.length === 0) {
-          const stderrTail = stderrLines.join('\n');
-          reject(
-            new Error(
-              `Workflow runner exited without sending job.complete. ` +
-                `stderr (last ${MAX_STDERR_LINES} lines):\n${stderrTail}`,
-            ),
+        if (
+          !completed &&
+          state.jobStatus === ExecutionJobStatus.enum.failed &&
+          stepResults.length === 0
+        ) {
+          void this.describeCrash(streamCtx.exec, rawStdoutLines, stderrLines).then((message) =>
+            reject(new Error(message)),
           );
         } else {
           // We already resolved or have partial results.
           resolve({
             jobStatus: state.jobStatus,
             stepResults,
+            reportedError: state.reportedError,
+            droppedJobs: state.droppedJobs,
             jobOutputs: state.jobOutputs,
             encryptedSecretOutputs: state.encryptedSecretOutputs,
           });
@@ -1061,6 +1116,39 @@ export class ContainerSandbox implements ExecutionSandbox {
       rl.on('error', (err) => {
         reject(new Error(`Stdout readline error: ${err.message}`));
       });
+    });
+  }
+
+  /**
+   * Build the failure message for a runner that exited without job.complete,
+   * from the exec's exit code and the runner's last output lines.
+   */
+  private async describeCrash(
+    exec: Docker.Exec,
+    stdoutTail: string[],
+    stderrTail: string[],
+  ): Promise<string> {
+    let exitCode: number | null | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), CRASH_INSPECT_TIMEOUT_MS);
+    });
+    try {
+      // A daemon that never answers must not turn a crash back into a hang.
+      const info = await Promise.race([exec.inspect(), timedOut]);
+      if (info) exitCode = info.ExitCode;
+      else logger.warn('Timed out inspecting the crashed runner exec');
+    } catch (err) {
+      logger.warn('Could not inspect the crashed runner exec', { error: toErrorMessage(err) });
+    } finally {
+      clearTimeout(timer);
+    }
+    return describeRunnerCrash({
+      image: this.image,
+      runtimeInjected: this.resolvedRuntimeNode !== undefined,
+      exitCode,
+      stdoutTail,
+      stderrTail,
     });
   }
 
@@ -1220,6 +1308,14 @@ export class ContainerSandbox implements ExecutionSandbox {
       status: finalStatus,
       stepResults: outcome.stepResults,
       durationMs: Date.now() - startTime,
+      // A cancelled job's runner also exits without job.complete; that is the
+      // cancellation, not a crash, so only a failed job carries the crash text.
+      ...(finalStatus === ExecutionJobStatus.enum.failed &&
+        outcome.error && { error: outcome.error }),
+      // The runner-reported reason is carried whatever the final status, the
+      // same as the fork backend does.
+      ...(outcome.reportedError && { error: outcome.reportedError }),
+      ...(outcome.droppedJobs?.length && { droppedJobs: outcome.droppedJobs }),
       ...(outcome.jobOutputs && { outputs: outcome.jobOutputs }),
       ...(outcome.encryptedSecretOutputs && { secretOutputs: outcome.encryptedSecretOutputs }),
     };

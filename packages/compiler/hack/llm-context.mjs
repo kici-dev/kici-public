@@ -24,10 +24,17 @@ function docsUrl(slugPath, siteBaseUrl) {
 // repo-relative directory. docs/user/dashboard/ is dashboard UI-usage
 // documentation and docs/user/quickstart/ is install/deploy guidance — both
 // are user-facing but neither is workflow-authoring content, the audience of
-// these bundles. The deepened coverage check in hack/llm-context.test.ts fails
-// the build if a new docs/user path is neither bundled nor excluded here,
-// forcing an explicit decision about whether it belongs in a bundle.
-export const EXCLUDED_FROM_LLM_BUNDLE = new Set(['docs/user/dashboard/', 'docs/user/quickstart/']);
+// these bundles. docs/user/deprecations.md is the customer-facing deprecation
+// ledger (backward-compatibility policy), reference material rather than
+// workflow-authoring content, so it is excluded on the same grounds. The
+// deepened coverage check in hack/llm-context.test.ts fails the build if a new
+// docs/user path is neither bundled nor excluded here, forcing an explicit
+// decision about whether it belongs in a bundle.
+export const EXCLUDED_FROM_LLM_BUNDLE = new Set([
+  'docs/user/dashboard/',
+  'docs/user/quickstart/',
+  'docs/user/deprecations.md',
+]);
 
 // Per-task bundle size budget. A task bundle over this is a signal to split
 // the group — keeping each bundle small enough to drop into an LLM context

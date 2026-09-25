@@ -195,7 +195,7 @@ export interface StepSecretsFileWiring {
  *
  * @param secretsMap - Flat key-value secrets map
  * @param env - Process environment to inject exposed secrets into
- * @param metaMap - Optional metadata map from resolveForJobWithMeta (backend + scope per key)
+ * @param metaMap - Optional metadata map: the backend and scope each secret key resolved from
  * @param fileWiring - Optional file-mount host adapter. When omitted, `mountFile`
  *   and `exposeFile` throw -- callers that don't wire a host can still use the
  *   string-only `get` / `expose` / `has` / `list` surface.

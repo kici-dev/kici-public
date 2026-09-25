@@ -96,6 +96,7 @@ export {
   type RegisterWorkflowManualOpts,
   type RegisterWorkflowManualResult,
 } from './db-admin.js';
+export { depCacheKeyOf, type DepCacheKey } from './dep-cache-key.js';
 export { createMetricsRoutes, type MetricsRoutesDeps } from './routes/metrics.js';
 export { createHealthRoutes, type HealthRoutesDeps } from './routes/health.js';
 export { getReconnectDelay } from './reconnect-delay.js';

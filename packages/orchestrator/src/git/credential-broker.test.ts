@@ -1,10 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import { GitCredentialBroker, type BrokerGateContext } from './credential-broker.js';
 
-const secretResolver = (values: Record<string, string>) =>
+/**
+ * A resolver whose every matched context resolves to `values` through its
+ * bindings. `legacy` answers the direct lookup of the scope named after the
+ * context, which the gate reads when no bound scope carries the key.
+ */
+const secretResolver = (values: Record<string, string>, legacy?: Record<string, string>) =>
   ({
+    resolveForContext: vi.fn(async () => values),
     resolveNamedInternal: vi.fn(
-      async (_org: string, _scope: string, key: string) => values[key] ?? null,
+      async (_org: string, _scope: string, key: string) => legacy?.[key] ?? null,
     ),
   }) as never;
 
@@ -92,9 +98,8 @@ describe('GitCredentialBroker', () => {
       ref: { kind: 'token', tokenSecret: 'prod:FORGE_PAT' },
     });
     expect(
-      (resolver as unknown as { resolveNamedInternal: ReturnType<typeof vi.fn> })
-        .resolveNamedInternal,
-    ).toHaveBeenCalledWith('org-1', 'prod', 'FORGE_PAT', expect.anything());
+      (resolver as unknown as { resolveForContext: ReturnType<typeof vi.fn> }).resolveForContext,
+    ).toHaveBeenCalledWith('org-1', { id: 'ctx-prod', name: 'prod' }, undefined, expect.anything());
   });
 
   it('returns runtime material verbatim through the *Value half', async () => {
@@ -114,8 +119,7 @@ describe('GitCredentialBroker', () => {
     expect(result.secret).toBe('runtime-material');
     // No secret-store lookup happens for material.
     expect(
-      (resolver as unknown as { resolveNamedInternal: ReturnType<typeof vi.fn> })
-        .resolveNamedInternal,
+      (resolver as unknown as { resolveForContext: ReturnType<typeof vi.fn> }).resolveForContext,
     ).not.toHaveBeenCalled();
   });
 
@@ -220,6 +224,30 @@ describe('GitCredentialBroker', () => {
     ).rejects.toThrow(/MISSING_PAT/);
   });
 
+  it("reads an unbound exact context's same-named scope through the gate (deprecated)", async () => {
+    const resolver = secretResolver({}, { FORGE_PAT: 'legacy-pat' });
+    const broker = new GitCredentialBroker({
+      secretResolver: resolver,
+      contextStore: permissiveContexts(),
+      sourceAuth: noSource,
+      mint: vi.fn(),
+    });
+    const result = await broker.resolve({
+      orgId: 'org-1',
+      gate,
+      repositories: ['a/b'],
+      ref: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+      runId: 'run-1',
+      jobId: 'job-1',
+    });
+    // breaks-if-wrong: a git credential stored in an unbound same-named scope stops resolving
+    expect(result.secret).toBe('legacy-pat');
+    expect(
+      (resolver as unknown as { resolveNamedInternal: ReturnType<typeof vi.fn> })
+        .resolveNamedInternal,
+    ).toHaveBeenCalledWith('org-1', 'ci', 'FORGE_PAT', { runId: 'run-1', jobId: 'job-1' });
+  });
+
   it('falls back to the source credential when no ref is supplied', async () => {
     const broker = new GitCredentialBroker({
       secretResolver: secretResolver({}),
@@ -263,8 +291,7 @@ describe('GitCredentialBroker', () => {
       }),
     ).rejects.toThrow(/reserved/);
     expect(
-      (resolver as unknown as { resolveNamedInternal: ReturnType<typeof vi.fn> })
-        .resolveNamedInternal,
+      (resolver as unknown as { resolveForContext: ReturnType<typeof vi.fn> }).resolveForContext,
     ).not.toHaveBeenCalled();
   });
 
@@ -346,8 +373,7 @@ describe('GitCredentialBroker', () => {
       });
       expect(result.secret).toBe('right-source');
       expect(
-        (resolver as unknown as { resolveNamedInternal: ReturnType<typeof vi.fn> })
-          .resolveNamedInternal,
+        (resolver as unknown as { resolveForContext: ReturnType<typeof vi.fn> }).resolveForContext,
       ).not.toHaveBeenCalled();
     });
   });

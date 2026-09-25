@@ -6,6 +6,12 @@ import picomatch from 'picomatch';
 import { formatBytes, sha256, sha256File } from '@kici-dev/core';
 import { makeTempDir } from '@kici-dev/core/tmp';
 import { encryptTarball } from './encryption.js';
+import {
+  classifyOverlayEntries,
+  isGitDirPath,
+  overlaySkipWarnings,
+  SkipContext,
+} from './overlay-links.js';
 
 /**
  * Summary of files included in the overlay tarball.
@@ -36,6 +42,12 @@ export interface OverlayManifest {
   deletions: string[];
   /** SHA256 checksums of each included file */
   checksums: Record<string, string>;
+  /**
+   * Symlinks whose target is a directory: repo-relative path → link text, as
+   * `readlink` returns it. The agent recreates each one. Absent when there is
+   * none, and ignored by an agent that predates it.
+   */
+  symlinks?: Record<string, string>;
 }
 
 /**
@@ -100,11 +112,6 @@ export interface OverlaySelection {
   existingFiles: string[];
   /** Selected files missing on disk (to delete from the clone) */
   deletedFiles: string[];
-}
-
-/** True for repo-relative paths inside the `.git` directory. */
-function isGitDirPath(relPath: string): boolean {
-  return relPath === '.git' || relPath.startsWith('.git/');
 }
 
 /**
@@ -271,7 +278,8 @@ export async function selectOverlayFiles(
  *
  * @param repoRoot - Path to the git repository root
  * @param options - Optional configuration
- * @returns Tarball path, upload summary, and overlay manifest
+ * @returns Tarball path, upload summary, overlay manifest, and a warning per kind of
+ *   selected path the overlay leaves out (submodules, dangling symlinks)
  */
 export async function createOverlayTarball(
   repoRoot: string,
@@ -281,35 +289,47 @@ export async function createOverlayTarball(
   summary: UploadSummary;
   manifest: OverlayManifest;
   hasRemote: boolean;
+  warnings: string[];
 }> {
-  const { sha, hasRemote, existingFiles, deletedFiles } = await selectOverlayFiles(
-    repoRoot,
-    options,
+  const selection = await selectOverlayFiles(repoRoot, options);
+  const { sha, hasRemote } = selection;
+  const kiciIgnore = await loadKiciIgnore(
+    options?.kiciIgnorePath ?? path.join(repoRoot, '.kiciignore'),
   );
+  // Directory symlinks ship as link text, file symlinks bring the in-repo
+  // targets the agent dereferences them to, and paths beneath a symlink are
+  // deletions (git tracks nothing there).
+  const entries = await classifyOverlayEntries(repoRoot, selection, kiciIgnore ?? (() => false));
+  const linkPaths = Object.keys(entries.symlinks);
+  const shipped = new Set([...entries.files, ...linkPaths]);
 
-  // Count untracked (new) vs modified files. `.git/**` is overlay
-  // infrastructure (it makes the extracted workspace a real git repo), not a
-  // working-tree content change, so it's excluded from the new/modified
-  // breakdown the developer sees — though it still counts toward `fileCount`.
+  // Count untracked (new) vs modified files among the developer's own changes.
+  // `.git/**` is overlay infrastructure (it makes the extracted workspace a
+  // real git repo), and a link target shipped alongside a changed link is not
+  // a change either: both are excluded from the new/modified breakdown the
+  // developer sees, though they still count toward `fileCount`.
   const untrackedSet = new Set(gitLines('git ls-files --others --exclude-standard', repoRoot));
-  const workingTreeFiles = existingFiles.filter((f) => !isGitDirPath(f));
+  const workingTreeFiles = selection.existingFiles.filter(
+    (f) => shipped.has(f) && !isGitDirPath(f),
+  );
   const newFiles = workingTreeFiles.filter((f) => untrackedSet.has(f));
   const modifiedFiles = workingTreeFiles.filter((f) => !untrackedSet.has(f));
 
-  // Compute checksums for existing files
+  // Checksum the content entries. A file symlink's checksum covers the file it
+  // points at, which is what the agent reads through it.
   const checksums: Record<string, string> = {};
   await Promise.all(
-    existingFiles.map(async (file) => {
+    entries.files.map(async (file) => {
       const fullPath = path.join(repoRoot, file);
       checksums[file] = await sha256File(fullPath);
     }),
   );
 
-  // Create manifest
   const manifest: OverlayManifest = {
     sha,
-    deletions: deletedFiles,
+    deletions: entries.deletions,
     checksums,
+    ...(linkPaths.length > 0 ? { symlinks: entries.symlinks } : {}),
   };
 
   // Create temp dir for the tarball and manifest. Persist mode: the dir holds
@@ -328,8 +348,9 @@ export async function createOverlayTarball(
   const tarballPath = path.join(tmpDir, 'overlay.tar.gz');
 
   try {
-    // Create tar.gz
-    const filesToInclude = [...existingFiles, path.join(manifestRelDir, 'manifest.json')];
+    // A symlink (file or directory) ships as a link entry: node-tar does not
+    // follow links unless asked to.
+    const filesToInclude = [...shipped, path.join(manifestRelDir, 'manifest.json')];
 
     if (filesToInclude.length > 0) {
       await tarCreate(
@@ -368,15 +389,21 @@ export async function createOverlayTarball(
   }
 
   const summary: UploadSummary = {
-    fileCount: existingFiles.length,
+    fileCount: shipped.size,
     newFiles: newFiles.length,
     modifiedFiles: modifiedFiles.length,
-    deletedFiles: deletedFiles.length,
+    deletedFiles: entries.deletions.length,
     compressedSize,
     sha,
   };
 
-  return { tarballPath, summary, manifest, hasRemote };
+  return {
+    tarballPath,
+    summary,
+    manifest,
+    hasRemote,
+    warnings: overlaySkipWarnings(entries.skipped, SkipContext.RemoteRun),
+  };
 }
 
 /**

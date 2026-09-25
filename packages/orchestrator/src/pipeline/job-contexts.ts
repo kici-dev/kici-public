@@ -1,13 +1,20 @@
 /**
  * Multi-context resolution helpers for the dispatch path.
  *
- * A job binds an ordered list of contexts (`LockJob.contexts`). This
+ * A job binds an ordered list of contexts: the workflow-level names
+ * (`LockWorkflow.contexts`) first, then its own (`LockJob.contexts`). This
  * module resolves that list into concrete context names (static values
  * verbatim; every dynamic element is resolved by the agent's init job) and
  * folds the per-context secrets/variables last-wins. It keeps the heavy fold logic
  * out of `dispatchMatchedWorkflow`, which must stay under the function-length cap.
  */
-import { mergeOrderedMaps, type Context, type HostFacts, type LockJob } from '@kici-dev/engine';
+import {
+  mergeOrderedMaps,
+  type Context,
+  type HostFacts,
+  type LockJob,
+  type LockWorkflow,
+} from '@kici-dev/engine';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { VariableStore } from '../contexts/variable-store.js';
 
@@ -26,15 +33,43 @@ export interface ResolvedJobContexts {
   needsInit: boolean;
 }
 
+/** One bound-context element, as a lock job carries it. */
+export type ContextRef = NonNullable<LockJob['contexts']>[number];
+
 /**
- * Resolve the ordered bound-context names from a lock job. Static elements
+ * The ordered context elements a job binds: the workflow-level names first,
+ * then the job's own. Placing the workflow names first means a job-level
+ * context wins a key collision, since later contexts override earlier ones.
+ *
+ * A workflow-level name the job also binds statically is dropped from the
+ * workflow part, so each context is gated and resolved once, at the job's own
+ * position. Every gating site reads its names through this function, so a
+ * workflow-level context passes the same gates a job-level one does.
+ */
+export function effectiveContextRefs(
+  workflow: Pick<LockWorkflow, 'contexts'>,
+  job: Pick<LockJob, 'contexts'>,
+): ContextRef[] {
+  const own = job.contexts ?? [];
+  const ownStatic = new Set(own.filter((e) => !e.dynamic).map((e) => e.value));
+  const inherited = [...new Set(workflow.contexts ?? [])]
+    .filter((name) => !ownStatic.has(name))
+    .map((value) => ({ value, dynamic: false }));
+  return [...inherited, ...own];
+}
+
+/**
+ * Resolve the ordered bound-context names from a lock job and its workflow. Static elements
  * use their value verbatim; a dynamic element is resolved by the agent's init
  * job and flags `needsInit`.
  */
-export function resolveJobContextNames(lockJob: LockJob): ResolvedJobContexts {
+export function resolveJobContextNames(
+  workflow: Pick<LockWorkflow, 'contexts'>,
+  lockJob: Pick<LockJob, 'contexts'>,
+): ResolvedJobContexts {
   const names: string[] = [];
   let needsInit = false;
-  for (const e of lockJob.contexts ?? []) {
+  for (const e of effectiveContextRefs(workflow, lockJob)) {
     if (!e.dynamic) {
       names.push(e.value);
       continue;
@@ -54,8 +89,13 @@ export function resolveJobContextNames(lockJob: LockJob): ResolvedJobContexts {
  * The deferred-init flow-back overwrites the placeholder once the agent
  * resolves the name. Returns an empty array when the job binds no context.
  */
-export function buildJobContextDisplayNames(lockJob: LockJob): string[] {
-  return (lockJob.contexts ?? []).map((e) => (e.dynamic ? DYNAMIC_ENV_PLACEHOLDER : e.value));
+export function buildJobContextDisplayNames(
+  workflow: Pick<LockWorkflow, 'contexts'>,
+  lockJob: Pick<LockJob, 'contexts'>,
+): string[] {
+  return effectiveContextRefs(workflow, lockJob).map((e) =>
+    e.dynamic ? DYNAMIC_ENV_PLACEHOLDER : e.value,
+  );
 }
 
 /** Merged secrets/variables across an ordered list of resolved contexts. */
@@ -72,7 +112,8 @@ export interface MultiEnvMergedData {
  * then folded in array order so a later context overrides an earlier key.
  * Secrets are also returned namespaced per context so qualified
  * `<env>:<secret>` references still resolve. `entries` carries the matched
- * `Context` for each name (in order); variables resolve by context id.
+ * `Context` for each name (in order); variables and secrets both resolve by the
+ * matched context's id, so a glob context contributes what its own row holds.
  */
 export async function resolveMultiEnvMergedData(args: {
   deps: { variableStore?: VariableStore; secretResolver?: SecretResolverApi };
@@ -96,8 +137,14 @@ export async function resolveMultiEnvMergedData(args: {
   if (deps.secretResolver) {
     const maps: Array<Record<string, string>> = [];
     const namespaced: Record<string, Record<string, string>> = {};
-    for (const { name } of entries) {
-      const resolved = await deps.secretResolver.resolveForJob(orgId, name, hostCtx);
+    for (const { name, env } of entries) {
+      // Resolve through the matched row: for a glob context its name is the
+      // pattern context's own, not the declared `name`.
+      const resolved = await deps.secretResolver.resolveForContext(
+        orgId,
+        { id: env.id, name },
+        hostCtx,
+      );
       maps.push(resolved);
       if (Object.keys(resolved).length > 0) namespaced[name] = resolved;
     }

@@ -45,6 +45,11 @@ const STORES: ReadonlyArray<{
     reEncrypted: (r) => r.reEncryptedSecretOutputs,
     skipped: (r) => r.skippedSecretOutputs,
   },
+  {
+    label: 'stored job secrets',
+    reEncrypted: (r) => r.reEncryptedJobSecrets ?? 0,
+    skipped: (r) => r.skippedJobSecrets ?? 0,
+  },
 ];
 
 type RotateKeyResult = Awaited<ReturnType<AdminApiClient['rotateKey']>>;
@@ -55,7 +60,8 @@ export function registerRotateCommand(program: Command, getClient: () => AdminAp
     .description(
       'Rotate the master encryption key (re-encrypts every master-key-wrapped store: ' +
         'scoped_secrets, config_versions, secret_backends, orchestrator_signing_keys, ' +
-        'dashboard_encryption_keys, run_ephemeral_keys and run_secret_outputs)',
+        'dashboard_encryption_keys, run_ephemeral_keys, run_secret_outputs and the sealed ' +
+        'secrets of queued and waiting jobs)',
     )
     .action(async () => {
       try {

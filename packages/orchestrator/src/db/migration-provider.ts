@@ -149,6 +149,13 @@ import * as m141 from './migrations/141_event_log_shed.js';
 import * as m142 from './migrations/142_sweep_deprecated_columns.js';
 import * as m143 from './migrations/143_execution_jobs_precursor_result.js';
 import * as m144 from './migrations/144_execution_runs_registration_window.js';
+import * as m145 from './migrations/145_execution_runs_workflow_provenance.js';
+import * as m146 from './migrations/146_pending_job_contexts_context_resolution.js';
+import * as m147 from './migrations/147_sealed_job_secrets.js';
+import * as m148 from './migrations/148_cluster_settings_sealed_secrets_retry_backoff_ms.js';
+import * as m149 from './migrations/149_workflow_registrations_dep_cache_key.js';
+import * as m150 from './migrations/150_execution_runs_status_epoch.js';
+import * as m151 from './migrations/151_workflow_registrations_dep_cache_key_sha.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -298,6 +305,13 @@ export function createMigrationProvider(): MigrationProvider {
         '142_sweep_deprecated_columns': m142,
         '143_execution_jobs_precursor_result': m143,
         '144_execution_runs_registration_window': m144,
+        '145_execution_runs_workflow_provenance': m145,
+        '146_pending_job_contexts_context_resolution': m146,
+        '147_sealed_job_secrets': m147,
+        '148_cluster_settings_sealed_secrets_retry_backoff_ms': m148,
+        '149_workflow_registrations_dep_cache_key': m149,
+        '150_execution_runs_status_epoch': m150,
+        '151_workflow_registrations_dep_cache_key_sha': m151,
       };
     },
   };

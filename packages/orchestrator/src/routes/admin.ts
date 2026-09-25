@@ -33,6 +33,7 @@ import { TrustPolicyStore } from '../security/trust-policy-store.js';
 import { TrustDirectoryStore } from '../security/trust-directory-store.js';
 import { createClusterSettingsRoutes } from './admin-cluster-settings.js';
 import { createClusterNameRoutes } from './admin-cluster-name.js';
+import { createAdminSigningKeyRoutes } from './admin-signing-keys.js';
 import { createMaintenanceRoutes } from './admin-maintenance.js';
 import { createOrchestratorDrainRoutes } from './admin-orchestrator-drain.js';
 import type { DrainController } from '../drain/drain-controller.js';
@@ -527,8 +528,9 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       const backendsResult = deps.backendRegistry
         ? await deps.backendRegistry.rotateKey()
         : { reEncrypted: 0, skipped: 0 };
-      // Sweeps four through seven: the provenance signing key, the
-      // dashboard-encryption key, run ephemeral keys and stored secret outputs.
+      // Sweeps four through eight: the provenance signing key, the
+      // dashboard-encryption key, run ephemeral keys, stored secret outputs and
+      // the sealed secrets of stored jobs.
       // Each has its own transaction for the same reason as the three above.
       // Leaving them out is what made the published rotation procedure
       // destructive: dropping the old key stranded every one of them, and for
@@ -543,6 +545,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
               dashboardKeys: { reEncrypted: 0, skipped: 0 },
               ephemeralKeys: { reEncrypted: 0, skipped: 0 },
               secretOutputs: { reEncrypted: 0, skipped: 0 },
+              jobSecrets: { reEncrypted: 0, skipped: 0 },
             };
       await deps.auditLogger.log({
         action: 'rotateKey',
@@ -568,6 +571,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
           skippedEphemeralKeys: wrapped.ephemeralKeys.skipped,
           reEncryptedSecretOutputs: wrapped.secretOutputs.reEncrypted,
           skippedSecretOutputs: wrapped.secretOutputs.skipped,
+          reEncryptedJobSecrets: wrapped.jobSecrets.reEncrypted,
+          skippedJobSecrets: wrapped.jobSecrets.skipped,
         },
       });
       return c.json(
@@ -585,6 +590,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
           skippedEphemeralKeys: wrapped.ephemeralKeys.skipped,
           reEncryptedSecretOutputs: wrapped.secretOutputs.reEncrypted,
           skippedSecretOutputs: wrapped.secretOutputs.skipped,
+          reEncryptedJobSecrets: wrapped.jobSecrets.reEncrypted,
+          skippedJobSecrets: wrapped.jobSecrets.skipped,
         },
         200,
       );
@@ -922,6 +929,12 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       '/api/v1/admin',
       createClusterNameRoutes({ db: deps.db, rbac: deps.rbac, accessLog: deps.accessLog }),
     );
+  }
+
+  // Mount the provenance signing-key listing (optional -- only when db is
+  // provided). Backs `kici-admin signing-key list` over the admin API.
+  if (deps.db) {
+    app.route('/api/v1/admin', createAdminSigningKeyRoutes({ db: deps.db, rbac: deps.rbac }));
   }
 
   // Mount maintenance routes (queue clear, purge-stale, secrets purge).

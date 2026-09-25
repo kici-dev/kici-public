@@ -120,7 +120,7 @@ async function fileExists(target: string): Promise<boolean> {
 }
 
 /** Whether the repo-root package.json declares a non-empty `workspaces` array. */
-async function rootHasWorkspaces(repoRoot: string): Promise<boolean> {
+export async function rootHasWorkspaces(repoRoot: string): Promise<boolean> {
   try {
     const pkg = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as {
       workspaces?: unknown;

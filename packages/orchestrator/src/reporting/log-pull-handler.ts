@@ -11,6 +11,7 @@
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { LogStorage } from './log-storage.js';
+import { stepLogPath } from './step-log-path.js';
 import type { ExecutionTracker } from './execution-tracker.js';
 
 const logger = createLogger({ prefix: 'log-pull' });
@@ -42,7 +43,7 @@ export class LogPullHandler {
 
       // If specific job+step requested
       if (msg.jobName !== undefined && msg.stepIndex !== undefined) {
-        const path = `${prefix}/job-${msg.jobName}/step-${msg.stepIndex}.log`;
+        const path = stepLogPath(msg.executionId, msg.jobName, msg.stepIndex);
         if (!(await this.deps.logStorage.exists(path))) {
           this.deps.send({
             type: 'log.response',
@@ -82,7 +83,8 @@ export class LogPullHandler {
         const files = await this.deps.logStorage.list(jobPrefix);
         const chunks = [];
         for (const file of files) {
-          const stepMatch = file.match(/step-(\d+)\.log$/);
+          // `-?`: a job's workflow-level setup log is step -1 (`step--1.log`).
+          const stepMatch = file.match(/step-(-?\d+)\.log$/);
           if (!stepMatch) continue;
           const result = await this.deps.logStorage.read(file, { limit: msg.limit });
           chunks.push({
@@ -106,7 +108,7 @@ export class LogPullHandler {
       const files = await this.deps.logStorage.list(prefix);
       const chunks = [];
       for (const file of files) {
-        const match = file.match(/job-([^/]+)\/step-(\d+)\.log$/);
+        const match = file.match(/job-([^/]+)\/step-(-?\d+)\.log$/);
         if (!match) continue;
         const result = await this.deps.logStorage.read(file, { limit: msg.limit });
         chunks.push({

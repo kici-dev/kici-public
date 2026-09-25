@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ScalerBackendType } from '@kici-dev/engine';
+import { GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL, ScalerBackendType } from '@kici-dev/engine';
 import type {
   ScalerBackend,
   ManagedAgent,
@@ -13,6 +13,7 @@ import type {
 import type { WarmPoolStats } from './warm-pool.js';
 import { ScalerEventType } from './types.js';
 import { ScalerManager, resolveScalerOrchestratorUrl, buildScalerUsageRows } from './manager.js';
+import { agentMayRefuse, canAgentRunJob, JobContainerNeed, type AgentFitJob } from './agent-fit.js';
 import type { ProvisionBackoffSettings, ScalerManagerDeps } from './manager.js';
 import { normalizeLabelSet } from './label-matcher.js';
 import { EventScalerBackend } from './event-backend.js';
@@ -149,6 +150,41 @@ const WARM_GPU_LABEL_SET: LabelSetConfig = {
 
 /** One cpu and one gibibyte: what {@link WARM_GPU_LABEL_SET} reserves per agent. */
 const WARM_GPU_USAGE = { cpus: 1, memBytes: 1024 * 1024 * 1024 };
+
+/**
+ * `canAgentRunJob` for an agent as `manager` sees it, registered with `labels`.
+ * The registry side is an agent that reports no version, so only the scaler's
+ * record can make it refuse a job.
+ */
+function serves(
+  manager: ScalerManager,
+  agentId: string,
+  labels: string[],
+  job: AgentFitJob,
+): boolean {
+  return canAgentRunJob(
+    {
+      labels: new Set(labels),
+      version: null,
+      scalerManaged: false,
+      scaler: manager.agentView(agentId),
+    },
+    job,
+  );
+}
+
+/** `agentMayRefuse` for an agent as `manager` sees it, registered with `labels`. */
+function mayRefuse(manager: ScalerManager, agentId: string, labels: string[]): boolean {
+  return agentMayRefuse({
+    labels: new Set(labels),
+    version: null,
+    scalerManaged: false,
+    scaler: manager.agentView(agentId),
+  });
+}
+
+/** The labels a warm agent of {@link WARM_GPU_LABEL_SET} registers with: no container runtime. */
+const WARM_AGENT_LABELS = ['linux', 'gpu'];
 
 /**
  * Scaler-level defaults a warm-pool fixture declares when its label sets are
@@ -599,6 +635,161 @@ describe('ScalerManager', () => {
     });
   }
 
+  describe('canAgentRunJob() for the agents a job-bound spawn starts', () => {
+    const IMAGE = { image: 'python:3.12-bookworm' };
+
+    /** Ask for an agent bound to `jobId` and register it with `labels`; returns its id. */
+    async function boundAgent(
+      manager: ScalerManager,
+      spawnLabels: string[],
+      jobId: string,
+      labels: string[],
+      container?: { image: string },
+    ): Promise<string> {
+      await manager.requestScale(spawnLabels, jobId, 'run-1', [], undefined, undefined, container);
+      const spawning = (
+        manager as unknown as { spawningAgents: Map<string, { boundJobId?: string }> }
+      ).spawningAgents;
+      const agentId = [...spawning].find(([, e]) => e.boundJobId === jobId)![0];
+      await manager.onAgentRegistered(agentId, labels);
+      return agentId;
+    }
+
+    it('admits the agent started in a job image to that job, runtime or not', async () => {
+      const manager = createManager();
+      const agentId = await boundAgent(manager, ['linux', 'docker'], 'job-c', ['linux'], IMAGE);
+
+      // breaks-if-wrong: the agent the scaler started inside the job's image
+      // must still run the job it was started for
+      expect(
+        serves(manager, agentId, ['linux'], {
+          jobId: 'job-c',
+          container: JobContainerNeed.Image,
+        }),
+      ).toBe(true);
+    });
+
+    it('refuses every other job to an agent started inside a job image', async () => {
+      const manager = createManager();
+      const agentId = await boundAgent(manager, ['linux', 'docker'], 'job-c', ['linux'], IMAGE);
+
+      // fails-when: an agent started in one job's image drains an unrelated
+      // job, which then runs in an image it never declared
+      expect(
+        serves(manager, agentId, ['linux'], {
+          jobId: 'other',
+          container: JobContainerNeed.None,
+        }),
+      ).toBe(false);
+      // A runtime socket inside the image does not lift it: the job would
+      // still run in the wrong image's filesystem.
+      expect(
+        serves(manager, agentId, ['linux', 'kici:runtime:docker'], {
+          jobId: 'other',
+          container: JobContainerNeed.Image,
+        }),
+      ).toBe(false);
+      expect(mayRefuse(manager, agentId, ['linux', 'kici:runtime:docker'])).toBe(true);
+    });
+
+    it('lets an agent started for a plain job take other work, containers only with a runtime', async () => {
+      const manager = createManager();
+      const agentId = await boundAgent(manager, ['linux', 'docker'], 'job-p', ['linux']);
+      const other = (container: JobContainerNeed) => ({ jobId: 'other', container });
+
+      // breaks-if-wrong: a non-container job still reaches any label match
+      expect(serves(manager, agentId, ['linux'], other(JobContainerNeed.None))).toBe(true);
+      // fails-when: a container job is handed to a pool agent with no socket,
+      // which then fails on `connect ENOENT /var/run/docker.sock`
+      expect(serves(manager, agentId, ['linux'], other(JobContainerNeed.Image))).toBe(false);
+      expect(serves(manager, agentId, ['linux'], other(JobContainerNeed.Dockerfile))).toBe(false);
+      // A build CLI is not a daemon to run the built image on.
+      expect(
+        serves(
+          manager,
+          agentId,
+          ['linux', 'kici:runtime:container-build'],
+          other(JobContainerNeed.Dockerfile),
+        ),
+      ).toBe(false);
+      for (const runtime of ['kici:runtime:docker', 'kici:runtime:podman']) {
+        expect(serves(manager, agentId, ['linux', runtime], other(JobContainerNeed.Image))).toBe(
+          true,
+        );
+      }
+      expect(mayRefuse(manager, agentId, ['linux'])).toBe(true);
+      // Nothing left to refuse: the drain keeps its fast path.
+      expect(mayRefuse(manager, agentId, ['linux', 'kici:runtime:docker'])).toBe(false);
+    });
+
+    it('does not treat a bare-metal binary spawn for an image job as a job-image agent', async () => {
+      const manager = createManager();
+      // The binary label set nests the job's container rather than becoming it.
+      const agentId = await boundAgent(manager, ['linux', 'gpu'], 'job-g', ['linux', 'gpu'], IMAGE);
+
+      expect(
+        serves(manager, agentId, ['linux', 'gpu'], {
+          jobId: 'other',
+          container: JobContainerNeed.None,
+        }),
+      ).toBe(true);
+    });
+
+    it('treats a bare-metal image-only spawn for an image job as a job-image agent', async () => {
+      const imageOnly = createMockBackend({
+        type: 'bare-metal',
+        labelSets: [{ labels: ['linux', 'jobimg'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 3,
+      });
+      const manager = createManager(
+        {
+          scalers: [
+            {
+              name: 'bare-metal-img',
+              type: 'bare-metal' as const,
+              maxAgents: 3,
+              maxConcurrentSpawns: 2,
+              labelSets: [{ labels: ['linux', 'jobimg'], image: 'ghcr.io/org/agent:latest' }],
+            },
+          ],
+        } as never,
+        [{ name: 'bare-metal-img', backend: imageOnly }],
+      );
+      const agentId = await boundAgent(manager, ['linux', 'jobimg'], 'job-i', ['linux'], IMAGE);
+
+      expect(
+        serves(manager, agentId, ['linux'], {
+          jobId: 'other',
+          container: JobContainerNeed.None,
+        }),
+      ).toBe(false);
+    });
+
+    it('leaves a static agent that reports no runtime facts every job its labels match', async () => {
+      const manager = createManager();
+
+      // breaks-if-wrong: an operator's agent that reports no runtime facts is
+      // not refused — its missing runtime label proves nothing
+      expect(
+        serves(manager, 'static-1', ['linux'], {
+          jobId: 'x',
+          container: JobContainerNeed.Image,
+        }),
+      ).toBe(true);
+      expect(mayRefuse(manager, 'static-1', ['linux'])).toBe(false);
+    });
+
+    it('forgets the binding when the agent disconnects', async () => {
+      const manager = createManager();
+      const agentId = await boundAgent(manager, ['linux', 'docker'], 'job-c', ['linux'], IMAGE);
+
+      manager.onAgentDisconnected(agentId);
+
+      // The id now names no scaler agent, so nothing is held against it.
+      expect(mayRefuse(manager, agentId, ['linux'])).toBe(false);
+    });
+  });
+
   describe('requestScale()', () => {
     it('routes to correct backend by label set', async () => {
       const manager = createManager();
@@ -622,6 +813,27 @@ describe('ScalerManager', () => {
 
       expect(result).toEqual({ action: 'skipped', reason: 'draining' });
       expect(containerBackend.spawn).not.toHaveBeenCalled();
+    });
+
+    it('matches a job routed by an agent-feature label its spawned agents self-report', async () => {
+      const manager = createManager();
+
+      // fails-when: the scaler finds no pool for a result-aware global eval round and never spawns
+      const result = await manager.requestScale(
+        ['linux', 'docker', GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL],
+        'job-feature',
+        'run-test',
+      );
+
+      expect(result).toEqual({ action: 'spawning', backendType: 'container' });
+      for (const backend of manager.getStatus().backends) {
+        for (const labels of backend.labelSets) {
+          expect(labels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+        }
+      }
+      // The label is self-reported, never minted into the agent's token-bound label set.
+      const spawnCall = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(JSON.stringify(spawnCall)).not.toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
     });
 
     it('routes to bare-metal backend for gpu labels', async () => {
@@ -1087,12 +1299,12 @@ describe('ScalerManager', () => {
       expect(gpuUsage(manager)?.cpus).toBe(0);
     });
 
-    describe('canPrespawnedAgentServe()', () => {
+    describe('canAgentRunJob() on a warm agent', () => {
       /** Fill the pool and register its agent, returning the manager + agent id. */
       async function readyWarmAgent() {
         const { manager, spawn } = await fillWarmPool();
         const warmId = spawn.mock.calls[0][1] as string;
-        await manager.onAgentRegistered(warmId, ['linux', 'gpu']);
+        await manager.onAgentRegistered(warmId, WARM_AGENT_LABELS);
         return { manager, warmId };
       }
 
@@ -1100,22 +1312,26 @@ describe('ScalerManager', () => {
         const { manager } = await readyWarmAgent();
 
         expect(
-          manager.canPrespawnedAgentServe('static-agent', { hasOwnContainerImage: false }),
+          serves(manager, 'static-agent', WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
+          }),
         ).toBe(true);
       });
 
-      it('refuses a warm agent for a job that brings its own container image', async () => {
+      it('refuses a warm agent with no container runtime for a job that brings its own image', async () => {
         const { manager, warmId } = await readyWarmAgent();
 
-        expect(manager.canPrespawnedAgentServe(warmId, { hasOwnContainerImage: true })).toBe(false);
+        expect(
+          serves(manager, warmId, WARM_AGENT_LABELS, { container: JobContainerNeed.Image }),
+        ).toBe(false);
       });
 
       it('refuses a warm agent for a job asking for a different shape', async () => {
         const { manager, warmId } = await readyWarmAgent();
 
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 8, memory: '16g' } },
           }),
         ).toBe(false);
@@ -1125,8 +1341,8 @@ describe('ScalerManager', () => {
         const { manager, warmId } = await readyWarmAgent();
 
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 1, memory: '1g' } },
           }),
         ).toBe(true);
@@ -1135,7 +1351,9 @@ describe('ScalerManager', () => {
       it('allows a warm agent for a job that declares no resources', async () => {
         const { manager, warmId } = await readyWarmAgent();
 
-        expect(manager.canPrespawnedAgentServe(warmId, { hasOwnContainerImage: false })).toBe(true);
+        expect(
+          serves(manager, warmId, WARM_AGENT_LABELS, { container: JobContainerNeed.None }),
+        ).toBe(true);
       });
 
       it('compares only the fields the job declares', async () => {
@@ -1144,14 +1362,14 @@ describe('ScalerManager', () => {
         // cpus matches the pool and memory is left to the label set, so this
         // job resolves to exactly the shape the agent already has.
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 1 } },
           }),
         ).toBe(true);
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 4 } },
           }),
         ).toBe(false);
@@ -1161,8 +1379,8 @@ describe('ScalerManager', () => {
         const { manager, warmId } = await readyWarmAgent();
 
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { limits: { cpus: 4 } },
           }),
         ).toBe(false);
@@ -1175,8 +1393,8 @@ describe('ScalerManager', () => {
         // admit this job — onto an agent the kernel caps at 1 while the job
         // asked for 8. That is the same defect on the other dimension.
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 1 }, limits: { cpus: 8 } },
           }),
         ).toBe(false);
@@ -1191,15 +1409,15 @@ describe('ScalerManager', () => {
         delete reservations.get(warmId)!.limits;
 
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 1 }, limits: { cpus: 8 } },
           }),
         ).toBe(true);
         // The requests half is still compared — only the limits half went dark.
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 8 }, limits: { cpus: 8 } },
           }),
         ).toBe(false);
@@ -1209,8 +1427,8 @@ describe('ScalerManager', () => {
         const { manager, warmId } = await readyWarmAgent();
 
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { memory: 'not-a-size' } },
           }),
         ).toBe(true);
@@ -1221,8 +1439,8 @@ describe('ScalerManager', () => {
         (manager as unknown as { reservations: Map<string, unknown> }).reservations.delete(warmId);
 
         expect(
-          manager.canPrespawnedAgentServe(warmId, {
-            hasOwnContainerImage: false,
+          serves(manager, warmId, WARM_AGENT_LABELS, {
+            container: JobContainerNeed.None,
             resources: { requests: { cpus: 8 } },
           }),
         ).toBe(true);

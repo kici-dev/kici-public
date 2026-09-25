@@ -66,12 +66,12 @@ the same message.
 
 Categories you may see:
 
-- **Secret context resolution failed** — the workflow's secret contexts couldn't be resolved.
+- **Secret context resolution failed** — the workflow's secret contexts couldn't be resolved. On a dynamically generated job, the job's own contexts couldn't be resolved: only that job fails, and its siblings still run.
 - **Install-secrets resolution rejected** — the .npmrc / install-secrets resolution rejected the dispatch.
 - **Lock-file / dependency resolution failed** — a lock file was present for the repository but could not be parsed or validated, so the orchestrator records the delivery as a failed run instead of silently skipping it. This covers corrupt JSON, a missing schema version, malformed routing labels, and an **out-of-window schema version**: the orchestrator reads a compatibility window of lock schema versions, and a lock below the floor (too old) or requiring a newer reader (too new) is rejected with a clear, actionable message rather than dispatched. A too-old lock is fixed by recompiling with `kici compile` and pushing again; a too-new lock means the orchestrator must be upgraded to the version the error names — never force an out-of-window lock through. A repository with no lock file at all is not an error and produces no run.
 - **Build coordination failed** — the build job dispatch was rejected or the build coordinator timed out.
 - **Rejected by context protection rules** — a protection rule (review / wait timer / branch restriction) rejected the job.
-- **Dynamic / deferred-init evaluation failed** — a dynamic or deferred-init job dispatch failed.
+- **Dynamic / deferred-init evaluation failed** — a dynamic or deferred-init job dispatch failed, or the orchestrator could not build the job config of one dynamically generated job.
 - **No agent available to run this job** — no agent matching the job's `runs-on` labels was reachable.
 - **Matrix expansion failed** — a job's dynamic matrix function threw or timed out while resolving its matrix values, so that job is marked failed before any of its steps run.
 - **Sandbox escape-hatch request not permitted** — the workflow requested a container-sandbox capability or host networking the org's allow-list does not permit.

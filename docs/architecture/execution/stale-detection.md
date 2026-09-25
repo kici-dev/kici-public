@@ -129,7 +129,7 @@ In a cluster the last job of a run may report to a sibling coordinator, which fi
 
 ### Post-scan E: held run expiry
 
-If a `HeldRunStore` is configured, calls `heldRunStore.expireOverdue()` to cancel held jobs whose hold expiry deadline has passed. This is a separate concern from heartbeat-based staleness -- held runs are waiting for reviewer approval, not executing.
+If a `HeldRunStore` is configured, routes every hold whose expiry deadline has passed. A job- or workflow-scoped hold fails its run with an `Approval expired` reason. A step-scoped hold tells the waiting agent to fail the step. It then calls `heldRunStore.expireOverdue()` to mark those holds `expired`. This is a separate concern from heartbeat-based staleness -- held runs are waiting for reviewer approval, not executing.
 
 ### Post-scan D: batch run completion
 

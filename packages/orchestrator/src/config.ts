@@ -22,6 +22,13 @@ import { defineEnv, validateUnknownKiciVars, LOGGER_ENV_VARS } from '@kici-dev/s
 import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX } from './cluster/cluster-identity.js';
 
+/**
+ * Default for `sealed_secrets_retry_backoff_ms`: how long a coordinator stops
+ * offering a queued job it put back because it could not open its seal. The
+ * config default below and the job queue's own fallback both read this.
+ */
+export const DEFAULT_SEALED_SECRETS_RETRY_BACKOFF_MS = 60_000;
+
 /** Human-readable rendering of `PLATFORM_CONNECTED_MODES` for validation messages. */
 const PLATFORM_CONNECTED_MODES_TEXT = `${PLATFORM_CONNECTED_MODES.slice(0, -1).join(', ')}, or ${PLATFORM_CONNECTED_MODES[PLATFORM_CONNECTED_MODES.length - 1]}`;
 
@@ -203,6 +210,15 @@ const baseSchema = z.object({
   // refused, but no ownership violation is recorded against the agent.
   // Fleet-wide override in cluster_settings.ownership_db_check_timeout_ms.
   ownershipDbCheckTimeoutMs: z.coerce.number().int().min(100).default(5_000),
+  // How long a coordinator leaves a queued job alone after it could not open the
+  // job's sealed secrets (sealed with a master key it does not hold), before it
+  // claims the job again and spends another dispatch attempt.
+  // Fleet-wide override in cluster_settings.sealed_secrets_retry_backoff_ms.
+  sealedSecretsRetryBackoffMs: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .default(DEFAULT_SEALED_SECRETS_RETRY_BACKOFF_MS),
   // Webhook-ingest admission controller tunables. Generous defaults → the
   // controller is a no-op under normal load; the event-loop-lag gate is what
   // tightens under real pressure. All are cluster-wide except the per-org
@@ -1005,6 +1021,7 @@ export const envDef = defineEnv({
     concurrencyWaitTimeoutMs: 'KICI_CONCURRENCY_WAIT_TIMEOUT_MS',
     dispatchAckTimeoutMs: 'KICI_DISPATCH_ACK_TIMEOUT_MS',
     ownershipDbCheckTimeoutMs: 'KICI_OWNERSHIP_DB_CHECK_TIMEOUT_MS',
+    sealedSecretsRetryBackoffMs: 'KICI_SEALED_SECRETS_RETRY_BACKOFF_MS',
     ingestMaxConcurrency: 'KICI_INGEST_MAX_CONCURRENCY',
     ingestMaxQueueDepth: 'KICI_INGEST_MAX_QUEUE_DEPTH',
     ingestCodelTargetMs: 'KICI_INGEST_CODEL_TARGET_MS',

@@ -11,7 +11,11 @@
  * `cancelledJobs` counts notified agents plus pending/queued job rows marked
  * cancelled, matching the operator route.
  */
-import { cancelRunWithReason, type CancelRunDeps } from './cancel-run.js';
+import {
+  cancelRunWithReason,
+  HeldRunCancelRefusedError,
+  type CancelRunDeps,
+} from './cancel-run.js';
 
 export function createDashboardCancelHandler(deps: CancelRunDeps) {
   return async (
@@ -26,6 +30,9 @@ export function createDashboardCancelHandler(deps: CancelRunDeps) {
       ...(cancelledBy != null && { cancelledBy }),
       ...(cancelledByAgentLabel != null && { cancelledByAgentLabel }),
     });
+    // The relay answers a thrown cancel with its message, so the dashboard, the
+    // CLI and the MCP tool all report the refusal instead of a cancellation.
+    if (result.decidedBeforeCancel) throw new HeldRunCancelRefusedError(result.decidedBeforeCancel);
     return {
       cancelledJobs: result.agentsNotified + result.pendingCancelled,
       alreadyTerminal: result.alreadyTerminal,

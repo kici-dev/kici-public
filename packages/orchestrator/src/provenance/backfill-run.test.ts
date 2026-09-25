@@ -155,4 +155,11 @@ describe('backfillRunToPlatform workflow repo attribution', () => {
     const status = await statusFrame(runRow({ workflow_repo_identifier: null }));
     expect(status?.workflowRepoIdentifier).toBeUndefined();
   });
+
+  it('forwards the run status generation, and 0 when the row has none', async () => {
+    // fails-when: the backfill drops the generation — the Platform reads the
+    // frame as an older orchestrator's and records no generation for the run.
+    expect((await statusFrame(runRow({ status_epoch: 2 })))?.statusEpoch).toBe(2);
+    expect((await statusFrame(runRow()))?.statusEpoch).toBe(0);
+  });
 });

@@ -13,6 +13,7 @@
  */
 
 import type { LogStorage } from './log-storage.js';
+import { stepLogPath } from './step-log-path.js';
 import { LogStream } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { ObserverRegistry } from '../ws/observer-registry.js';
@@ -120,7 +121,7 @@ export class LogWriter {
   ): Promise<void> {
     if (lines.length === 0) return;
 
-    const path = `executions/${runId}/job-${jobName}/step-${stepIndex}.log`;
+    const path = stepLogPath(runId, jobName, stepIndex);
     let paths = this.runPaths.get(runId);
     if (!paths) {
       paths = new Set();
@@ -174,19 +175,40 @@ export class LogWriter {
       }
     })();
 
+    this.trackPending(runId, appendPromise);
+
+    await appendPromise;
+  }
+
+  /**
+   * Make {@link drain} for `runId` wait for `pending` as it waits for an
+   * append.
+   *
+   * For a caller that still has work to do before it can call
+   * {@link appendChunk} — resolving the job name that names the storage key.
+   * Registering only inside `appendChunk` leaves that work outside the
+   * snapshot: a run that completes while the name is being resolved is drained
+   * first, the chunk's append lands afterwards, and on object storage its
+   * segment is never sealed, so the chunk is never readable. A job whose setup
+   * fails sends its last setup lines immediately before its terminal status,
+   * which is exactly that window.
+   */
+  trackPending(runId: string, pending: Promise<unknown>): void {
+    const tracked = pending.then(
+      () => undefined,
+      () => undefined,
+    );
     let runPending = this.pendingAppends.get(runId);
     if (!runPending) {
       runPending = new Set();
       this.pendingAppends.set(runId, runPending);
     }
-    runPending.add(appendPromise);
-    appendPromise.finally(() => {
+    runPending.add(tracked);
+    void tracked.then(() => {
       const set = this.pendingAppends.get(runId);
       if (!set) return;
-      set.delete(appendPromise);
+      set.delete(tracked);
       if (set.size === 0) this.pendingAppends.delete(runId);
     });
-
-    await appendPromise;
   }
 }

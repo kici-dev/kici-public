@@ -190,6 +190,7 @@ describe('buildClusterReset', () => {
     expect(patch.agentTokenTtlMs).toBeNull();
     expect(patch.dashboardVerifiedIssuer).toBeNull();
     expect(patch.ownershipDbCheckTimeoutMs).toBeNull();
+    expect(patch.sealedSecretsRetryBackoffMs).toBeNull();
     expect(patch.checkRunTrackingTtlDays).toBeNull();
     expect(patch.unroutableGraceMs).toBeNull();
     expect(patch.ingestOverflowClaimTimeoutMs).toBeNull();
@@ -212,7 +213,7 @@ describe('buildClusterReset', () => {
     // Count guard: a knob added to KNOBS/STRING_KNOBS/BOOLEAN_KNOBS without a
     // reset path (or vice versa) shows up here rather than as a knob an operator
     // cannot clear.
-    expect(Object.keys(patch)).toHaveLength(41);
+    expect(Object.keys(patch)).toHaveLength(42);
   });
 
   it('clears only the check-run tracking TTL when that flag is given', () => {

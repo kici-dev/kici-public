@@ -18,8 +18,36 @@ import {
   matcherSatisfiedBy,
   WS_CLOSE_AGENT_AUTH_FAILED,
 } from '@kici-dev/engine';
-import type { WsLike } from '@kici-dev/engine';
+import type { AgentCapabilities, WsLike } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+
+/**
+ * The longest a busy rejection holds an agent out of routing when no evidence
+ * of a free slot lifts the hold first: an `agent.status` capacity report, or a
+ * job on the agent reaching a final status.
+ */
+export const BUSY_HOLD_MAX_MS = 30_000;
+
+/** What {@link AgentRegistry.markBusyHeld} found on the agent. */
+export enum BusyHoldOutcome {
+  /** No hold was on the agent: it last reported an empty slot, or never rejected. */
+  Held = 'held',
+  /** A hold that had run out was still on the agent: it never reported an empty slot. */
+  ReheldAfterExpiry = 'reheld-after-expiry',
+  /** The agent is not in the registry. */
+  NotRegistered = 'not-registered',
+}
+
+/**
+ * Whether an agent can take one more job now: a free slot, and no busy hold
+ * in force ({@link AgentRegistry.markBusyHeld}). Draining is checked by the
+ * callers that route around it.
+ */
+export function agentHasFreeSlot(entry: AgentEntry, now: number = Date.now()): boolean {
+  if (entry.activeJobs >= entry.maxConcurrency) return false;
+  return entry.busyHeldUntil === undefined || now >= entry.busyHeldUntil;
+}
+
 export type { WsLike } from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'agent-registry' });
@@ -111,6 +139,11 @@ export interface AgentEntry {
    * WebSocket close that removes the entry — there is nothing to outlive.
    */
   draining: boolean;
+  /**
+   * Epoch ms until which the agent is held out of routing after it rejected a
+   * dispatch as busy. Unset when no hold is in force. See {@link AgentRegistry.markBusyHeld}.
+   */
+  busyHeldUntil?: number;
   /** Number of jobs currently executing on this agent. */
   activeJobs: number;
   /** Maximum concurrent jobs this agent can handle (default 1). */
@@ -125,6 +158,11 @@ export interface AgentEntry {
   registeredAt: number;
   /** Self-reported agent version (e.g. "0.0.1"). Null if not reported. */
   version: string | null;
+  /**
+   * Optional behaviours the agent advertised on `agent.register`. Null for an
+   * agent that advertised none, which is read as supporting none.
+   */
+  capabilities: AgentCapabilities | null;
   /**
    * The `agent_tokens.id` row used to authenticate this connection, or
    * `null` when auth mode is `none`. Indexed by `tokenIdIndex` so a
@@ -196,6 +234,8 @@ interface AgentMetadata {
    * any operator-declared properties). Undefined ⇒ the agent reported none.
    */
   properties?: Record<string, string | number | boolean>;
+  /** Optional behaviours the agent advertised on `agent.register`. */
+  capabilities?: AgentCapabilities;
 }
 
 /**
@@ -343,6 +383,7 @@ export class AgentRegistry {
       arch,
       registeredAt: Date.now(),
       version: version ?? null,
+      capabilities: metadata?.capabilities ?? null,
       tokenId,
       // Static metadata
       hostname: metadata?.hostname ?? null,
@@ -595,9 +636,7 @@ export class AgentRegistry {
     let candidates: AgentEntry[];
 
     if (required.length === 0) {
-      candidates = [...this.agents.values()].filter(
-        (e) => !e.draining && e.activeJobs < e.maxConcurrency,
-      );
+      candidates = [...this.agents.values()].filter((e) => !e.draining && agentHasFreeSlot(e));
     } else {
       // Start with the set of agents matching the first label (smallest candidate set)
       const firstLabelAgents = this.labelIndex.get(required[0]);
@@ -622,7 +661,7 @@ export class AgentRegistry {
       candidates = [];
       for (const id of candidateIds) {
         const entry = this.agents.get(id)!;
-        if (!entry.draining && entry.activeJobs < entry.maxConcurrency) {
+        if (!entry.draining && agentHasFreeSlot(entry)) {
           candidates.push(entry);
         }
       }
@@ -701,6 +740,12 @@ export class AgentRegistry {
     requiredPatterns: LabelMatcher[] = [],
     excludeLabels: string[] = [],
     excludePatterns: LabelMatcher[] = [],
+    /**
+     * An extra test a label-matching agent must pass: whether it can run the
+     * job at all, which its labels cannot express. An agent that matches but
+     * never could is not a reason to keep the job here rather than reroute it.
+     */
+    canRun: (entry: AgentEntry) => boolean = () => true,
   ): boolean {
     const required = canonicalizeLabels(requiredLabels);
     const excluded = canonicalizeLabels(excludeLabels);
@@ -718,7 +763,7 @@ export class AgentRegistry {
       if (excluded.some((e) => entry.labels.has(e))) return false;
       if (requiredMatchers.some((p) => !matcherSatisfiedBy(p, entry.labels))) return false;
       if (excludeMatchers.some((p) => matcherSatisfiedBy(p, entry.labels))) return false;
-      return satisfiesMandatoryLabels(entry, required);
+      return satisfiesMandatoryLabels(entry, required) && canRun(entry);
     };
 
     if (required.length === 0) {
@@ -878,6 +923,64 @@ export class AgentRegistry {
     if (!entry) return undefined;
     entry.draining = true;
     return entry.activeJobs;
+  }
+
+  /**
+   * Hold an agent out of routing after it rejected a dispatch as busy.
+   *
+   * A busy rejection means the agent still holds the slot of the job it is
+   * tearing down, while the registry already counts that slot free (the
+   * job reported completion first). Without the hold, the requeue re-picks the
+   * same agent at once and each rejection repeats within milliseconds. The hold
+   * lifts on evidence of a free slot ({@link clearBusyHeld}): the agent reports
+   * an empty slot on `agent.status`, or a job tracked to it reaches a final
+   * status. An expired hold is also dropped when the agent accepts a job
+   * ({@link clearExpiredBusyHold}). Otherwise the hold ends after
+   * {@link BUSY_HOLD_MAX_MS}, so a lost status report cannot strand the agent.
+   *
+   * An expired hold keeps its `busyHeldUntil` until that evidence arrives. So a
+   * hold still on the entry here means the agent was re-picked because its last
+   * hold ran out, and has neither reported a free slot nor accepted or finished
+   * a job since — an agent whose job count is stuck. The caller spends an
+   * attempt for that, which keeps such an agent from holding a job pending
+   * forever.
+   */
+  markBusyHeld(agentId: string, now: number = Date.now()): BusyHoldOutcome {
+    const entry = this.agents.get(agentId);
+    if (!entry) return BusyHoldOutcome.NotRegistered;
+    const reheld = entry.busyHeldUntil !== undefined;
+    entry.busyHeldUntil = now + BUSY_HOLD_MAX_MS;
+    return reheld ? BusyHoldOutcome.ReheldAfterExpiry : BusyHoldOutcome.Held;
+  }
+
+  /**
+   * Lift a {@link markBusyHeld} hold: the agent reported an empty slot, or a
+   * job tracked to it reached a final status.
+   */
+  clearBusyHeld(agentId: string): void {
+    const entry = this.agents.get(agentId);
+    if (entry) delete entry.busyHeldUntil;
+  }
+
+  /**
+   * Drop a {@link markBusyHeld} hold that has already run out: the agent
+   * accepted a job since.
+   *
+   * Every dispatch path skips an agent whose hold is in force, so a job the
+   * agent accepts while an expired hold is on its entry was dispatched after
+   * the hold ran out, into a slot that was free. That refutes the stuck job
+   * count the leftover hold stands for. A hold still in force is kept: the
+   * accepted job occupies the slot, so the acceptance says nothing about a
+   * free slot now.
+   */
+  clearExpiredBusyHold(agentId: string, now: number = Date.now()): void {
+    const entry = this.agents.get(agentId);
+    // fails-when: a hold still in force is dropped — the busy agent is routable again at once.
+    // breaks-if-wrong: an expired hold must still be dropped, or the agent's next
+    // teardown-window rejection spends an attempt.
+    if (entry?.busyHeldUntil !== undefined && now >= entry.busyHeldUntil) {
+      delete entry.busyHeldUntil;
+    }
   }
 
   /** Undo {@link markDraining} — a destroy that was rejected leaves the agent alive. */

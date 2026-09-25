@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { compileSafeRegex } from '@kici-dev/engine';
+import { compileSafeRegex, GLOBAL_APPROVAL_MIN_READER } from '@kici-dev/engine';
 import {
   step,
   job,
@@ -83,9 +83,54 @@ describe('generator - schema compatibility window', () => {
   });
 });
 
+describe('generator - global workflow approval raises the reader floor', () => {
+  function lockFor(w: ReturnType<typeof workflow>) {
+    return generateLockFile([makeWorkflowWithSource(w)]);
+  }
+
+  it('stamps GLOBAL_APPROVAL_MIN_READER when a global workflow declares approval', () => {
+    const j = job('deploy', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('org-deploy', {
+      on: [push({ repos: ['myorg/*'] })],
+      jobs: [j],
+      approval: true,
+    });
+    // fails-when: the generator stamps BREAKING_FLOOR unconditionally — a v41
+    // orchestrator would then accept the lock and run the gated job ungated.
+    expect(lockFor(w).minReaderVersion).toBe(GLOBAL_APPROVAL_MIN_READER);
+  });
+
+  it('stamps GLOBAL_APPROVAL_MIN_READER when a static job of a global workflow declares approval', () => {
+    const j = job('deploy', { runsOn: 'linux', run: async () => {}, approval: true });
+    const w = workflow('org-deploy', { on: [pr({ repos: ['myorg/*'] })], jobs: [j] });
+    // fails-when: only the workflow-level approval is inspected.
+    expect(lockFor(w).minReaderVersion).toBe(GLOBAL_APPROVAL_MIN_READER);
+  });
+
+  it('keeps BREAKING_FLOOR on a global workflow without approval', () => {
+    const j = job('lint', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('org-lint', { on: [push({ repos: ['myorg/*'] })], jobs: [j] });
+    // breaks-if-wrong: every global lock would require the newest orchestrator.
+    expect(lockFor(w).minReaderVersion).toBe(BREAKING_FLOOR);
+  });
+
+  it('keeps BREAKING_FLOOR on a per-repository workflow with approval', () => {
+    const j = job('deploy', { runsOn: 'linux', run: async () => {}, approval: true });
+    const w = workflow('deploy', { on: [push()], jobs: [j], approval: true });
+    // breaks-if-wrong: per-repository approval already works on older orchestrators,
+    // so raising the floor here would refuse locks they handle correctly.
+    expect(lockFor(w).minReaderVersion).toBe(BREAKING_FLOOR);
+  });
+});
+
 describe('schemaWindowWarning', () => {
   it('returns null when the floor is below the current version (additive era)', () => {
     expect(schemaWindowWarning(30, 31)).toBeNull();
+  });
+
+  it('warns when the lock requires the current version (a gated global workflow)', () => {
+    const warning = schemaWindowWarning(GLOBAL_APPROVAL_MIN_READER, SCHEMA_VERSION);
+    expect(warning).toContain(`v${SCHEMA_VERSION}`);
   });
 
   it('warns and names the required version when the current version is itself breaking', () => {

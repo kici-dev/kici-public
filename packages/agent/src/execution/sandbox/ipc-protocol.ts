@@ -658,7 +658,7 @@ export interface JobExecutionRequest {
   secrets?: Record<string, string>;
   /** Namespaced secrets by context name for ctx.secrets['context-name'].KEY access. */
   namespacedSecrets?: Record<string, Record<string, string>>;
-  /** Secret metadata from resolveForJobWithMeta (backend + scope per key). */
+  /** Secret metadata: the backend and scope each secret key resolved from. */
   secretMeta?: Record<string, { value: string; backend: string; scope: string }>;
 
   /** Source file path for workflow compilation (relative to repo root). */

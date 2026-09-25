@@ -18,6 +18,7 @@ import { PgSecretStore, SecretScopeExistsError } from '../../secrets/pg-secret-s
 import { AuditLogger } from '../../secrets/audit-logger.js';
 import { loadSecretStoreConfig } from '../../secrets/config.js';
 import { DEFAULT_BACKEND_NAME } from '../../secrets/scope-routing.js';
+import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
   return explicit ?? process.env.KICI_DATABASE_URL ?? null;
@@ -283,6 +284,14 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
             await getClient().setSecret(orgId, scope, key, value);
             console.log(`Secret '${key}' set in scope '${scope}' for org ${orgId}.`);
           }
+          // A scope named after a context is how that context's secrets are
+          // written (the --context sugar form sets scope = context name).
+          await warnIfContextUnbound({
+            orgId,
+            name: scope,
+            dbUrl,
+            client: dbUrl ? undefined : getClient(),
+          });
         } catch (err) {
           console.error(`Error: ${toErrorMessage(err)}`);
           process.exit(1);

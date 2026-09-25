@@ -4,6 +4,9 @@
  * .claude/rules/platform-admin.md).
  *
  *   signing-key list                      List keys (kid / status / created_at).
+ *                                         Reads the database when a database URL
+ *                                         is given (flag or KICI_DATABASE_URL),
+ *                                         otherwise the admin API.
  *   signing-key generate                  Generate the initial db-custody key
  *                                         (no-op if one is already active).
  *   signing-key rotate                    Generate a new db-custody key and
@@ -24,8 +27,12 @@ import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
 import { loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
-import { OrchestratorSigningKeyRepo } from '../../db/repos/signing-keys-repo.js';
+import {
+  OrchestratorSigningKeyRepo,
+  type SigningKeyMetadataRow,
+} from '../../db/repos/signing-keys-repo.js';
 import { DbSigner } from '../../oidc/db-signer.js';
+import type { AdminApiClient } from '../api-client.js';
 
 const logger = createLogger({ prefix: 'kici-admin-signing-key' });
 
@@ -35,6 +42,53 @@ function resolveDatabaseUrl(explicit?: string): string {
     throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
   }
   return url;
+}
+
+/** The database URL `signing-key list` reads from, or null to read over the admin API. */
+function resolveListDatabaseUrl(explicit?: string): string | null {
+  return explicit || process.env.KICI_DATABASE_URL || null;
+}
+
+/** A listed key as the CLI prints it: the metadata, with timestamps as dates. */
+type ListedSigningKey = Pick<
+  SigningKeyMetadataRow,
+  'kid' | 'status' | 'signer_kind' | 'created_at'
+>;
+
+/** Wire shape of `GET /api/v1/admin/signing-keys` (timestamps arrive as ISO strings). */
+interface SigningKeyListResponse {
+  keys: Array<Omit<SigningKeyMetadataRow, 'created_at'> & { created_at: string }>;
+}
+
+async function fetchSigningKeysOverHttp(client: AdminApiClient): Promise<ListedSigningKey[]> {
+  const body = await client.get<SigningKeyListResponse>('/api/v1/admin/signing-keys');
+  return body.keys.map((k) => ({ ...k, created_at: new Date(k.created_at) }));
+}
+
+/** Print the key list; the database and admin-API modes share this output. */
+function printSigningKeys(rows: ListedSigningKey[], json: boolean | undefined): void {
+  if (json) {
+    console.log(
+      JSON.stringify(
+        rows.map((r) => ({
+          kid: r.kid,
+          status: r.status,
+          signerKind: r.signer_kind,
+          createdAt: r.created_at,
+        })),
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  if (rows.length === 0) {
+    process.stderr.write('No signing keys found.\n');
+    return;
+  }
+  for (const r of rows) {
+    console.log(`${r.kid}  ${r.status.padEnd(9)}  ${r.signer_kind.padEnd(8)}  ${r.created_at}`);
+  }
 }
 
 function resolveSecretKey(): string {
@@ -73,6 +127,36 @@ async function withRepo<T>(databaseUrl: string | undefined, fn: WithDb<T>): Prom
   }
 }
 
+/** Outcome of {@link generateInitialSigningKey}. */
+export type InitialSigningKeyOutcome =
+  { created: true; kid: string } | { created: false; activeKid: string };
+
+/**
+ * Generate the initial db-custody key and activate it only while no key is
+ * active. Orchestrator nodes create the key on their own, so a node may win the
+ * race after the command's check; the node's key then stays active, because the
+ * nodes already sign with it, and its kid is returned.
+ */
+export async function generateInitialSigningKey(
+  repo: OrchestratorSigningKeyRepo,
+  secretKey: string,
+): Promise<InitialSigningKeyOutcome> {
+  const g = await DbSigner.generate(secretKey);
+  const outcome = await repo.activateIfCurrent(null, {
+    kid: g.kid,
+    public_jwk: g.publicJwk as unknown as Record<string, unknown>,
+    encrypted_private_jwk: g.encryptedPrivateJwk,
+    alg: g.signer.alg,
+    signer_kind: g.signer.signerKind,
+    key_ref: g.signer.keyRef,
+  });
+  if (outcome.activated) return { created: true, kid: g.kid };
+  if (!outcome.active) {
+    throw new Error('no signing key was activated and none is active; run the command again');
+  }
+  return { created: false, activeKid: outcome.active.kid };
+}
+
 /** Generate a fresh db-custody key and activate it (demoting any prior active). */
 async function generateAndActivate(
   repo: OrchestratorSigningKeyRepo,
@@ -90,43 +174,45 @@ async function generateAndActivate(
   return g.kid;
 }
 
-export function registerSigningKeyCommands(program: Command): void {
+/** Why `list` cannot run: it has neither a database URL nor an admin token. */
+const LIST_NEEDS_A_SOURCE =
+  'signing-key list needs the orchestrator database (--database-url or KICI_DATABASE_URL) ' +
+  'or its admin API (--token or KICI_ADMIN_TOKEN, with --url or KICI_ADMIN_URL)';
+
+/**
+ * Register `kici-admin signing-key`. `tryGetClient` returns null when no admin
+ * token is configured, so `list` can name both of its data sources.
+ */
+export function registerSigningKeyCommands(
+  program: Command,
+  tryGetClient: () => AdminApiClient | null,
+): void {
   const signingKey = program
     .command('signing-key')
-    .description('Orchestrator-owned provenance signing key management (orchestrator DB)');
+    .description(
+      'Orchestrator-owned provenance signing key management (orchestrator DB; list also reads the admin API)',
+    );
 
   signingKey
     .command('list')
     .description('List provenance signing keys (kid / status / created_at)')
-    .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
+    .option(
+      '--database-url <url>',
+      'Orchestrator DB URL (else KICI_DATABASE_URL; with neither, reads over the admin API)',
+    )
     .option('--json', 'Emit raw JSON')
     .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
       try {
-        const rows = await withRepo(opts.databaseUrl, (repo) => repo.listTrusted());
-        if (opts.json) {
-          console.log(
-            JSON.stringify(
-              rows.map((r) => ({
-                kid: r.kid,
-                status: r.status,
-                signerKind: r.signer_kind,
-                createdAt: r.created_at,
-              })),
-              null,
-              2,
-            ),
-          );
-          return;
+        const databaseUrl = resolveListDatabaseUrl(opts.databaseUrl);
+        let rows: ListedSigningKey[];
+        if (databaseUrl) {
+          rows = await withRepo(databaseUrl, (repo) => repo.listTrustedMetadata());
+        } else {
+          const client = tryGetClient();
+          if (!client) throw new Error(LIST_NEEDS_A_SOURCE);
+          rows = await fetchSigningKeysOverHttp(client);
         }
-        if (rows.length === 0) {
-          process.stderr.write('No signing keys found.\n');
-          return;
-        }
-        for (const r of rows) {
-          console.log(
-            `${r.kid}  ${r.status.padEnd(9)}  ${r.signer_kind.padEnd(8)}  ${r.created_at}`,
-          );
-        }
+        printSigningKeys(rows, opts.json);
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
@@ -150,9 +236,15 @@ export function registerSigningKeyCommands(program: Command): void {
               summarize: () =>
                 'Generate a new db-custody ES256 provenance signing key and activate it',
               apply: async () => {
-                const kid = await generateAndActivate(repo, secretKey);
-                logger.info('generated provenance signing key', { kid });
-                process.stderr.write(`Generated active signing key ${kid}.\n`);
+                const outcome = await generateInitialSigningKey(repo, secretKey);
+                if (!outcome.created) {
+                  process.stderr.write(
+                    `Signing key ${outcome.activeKid} became active meanwhile (an orchestrator node created it); nothing generated.\n`,
+                  );
+                  return;
+                }
+                logger.info('generated provenance signing key', { kid: outcome.kid });
+                process.stderr.write(`Generated active signing key ${outcome.kid}.\n`);
               },
             },
             { confirm: confirmInteractive, yes: opts.yes, dryRun: opts.dryRun },

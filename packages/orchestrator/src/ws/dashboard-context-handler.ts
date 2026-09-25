@@ -58,7 +58,7 @@ import {
   assertValidSecretKey,
   normalizePersistedHoldType,
 } from '@kici-dev/engine';
-import { ContextDeleteBlockedError } from '../contexts/context-store.js';
+import { ContextDeleteBlockedError, toContext } from '../contexts/context-store.js';
 import type { ContextStore } from '../contexts/context-store.js';
 import type { VariableStore } from '../contexts/variable-store.js';
 import type { BindingStore } from '../contexts/binding-store.js';
@@ -533,6 +533,8 @@ export class DashboardContextHandler {
           type: env.type,
           globPattern: env.glob_pattern,
           branchRestrictions: env.branch_restrictions ?? null,
+          // Parsed by the same mapper the protection gates read through.
+          repoPatterns: toContext(env).repoPatterns,
           concurrencyLimit: env.concurrency_limit,
           concurrencyStrategy: env.concurrency_strategy as ConcurrencyStrategy | null,
           requiredReviewers: env.required_reviewers != null ? Number(env.required_reviewers) : null,
@@ -577,6 +579,7 @@ export class DashboardContextHandler {
         type: msg.contextType,
         globPattern: msg.globPattern,
         branchRestrictions: msg.branchRestrictions,
+        repoPatterns: msg.repoPatterns,
         concurrencyLimit: msg.concurrencyLimit,
         concurrencyStrategy: msg.concurrencyStrategy,
         requiredReviewers:
@@ -633,6 +636,7 @@ export class DashboardContextHandler {
         // is `.nullable().optional()`), so they are forwarded verbatim —
         // collapsing them makes "turn this off" a silent no-op.
         branchRestrictions: u.branchRestrictions,
+        repoPatterns: u.repoPatterns,
         concurrencyLimit: u.concurrencyLimit,
         concurrencyStrategy: u.concurrencyStrategy,
         // The column stores a JSON array; the wire carries a count. Three-way

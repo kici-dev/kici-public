@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Context } from '@kici-dev/engine';
-import { checkBindingSatisfiable } from './satisfiability.js';
+import { assertWorkflowsSatisfiable, checkBindingSatisfiable } from './satisfiability.js';
 
 function env(name: string, over: Partial<Context> = {}): Context {
   return {
@@ -143,5 +143,46 @@ describe('checkBindingSatisfiable', () => {
     expect(
       checkBindingSatisfiable('deploy', [env('a', { branchRestrictions: ['main'] })], ['a']),
     ).toBeNull();
+  });
+});
+
+describe('assertWorkflowsSatisfiable', () => {
+  const contexts: Record<string, Context> = {
+    main: env('main-only', { branchRestrictions: ['main'] }),
+    develop: env('develop-only', { branchRestrictions: ['develop'] }),
+    both: env('main-or-develop', { branchRestrictions: ['main', 'develop'] }),
+  };
+  const resolve = async (name: string) => contexts[name] ?? null;
+  const job = (...names: string[]) => ({
+    name: 'deploy',
+    contexts: names.map((value) => ({ value, dynamic: false })),
+  });
+
+  it('rejects a workflow-level context that excludes the job-level one', async () => {
+    // fails-when: only the job's own contexts are read, so `develop` is the sole binding
+    await expect(
+      assertWorkflowsSatisfiable([{ contexts: ['main'], jobs: [job('develop')] }], resolve),
+    ).rejects.toThrow(/mutually exclusive branch restrictions/);
+  });
+
+  it('rejects two workflow-level contexts that exclude each other on a context-free job', async () => {
+    // fails-when: a job binding nothing itself is skipped before the workflow names are read
+    await expect(
+      assertWorkflowsSatisfiable([{ contexts: ['main', 'develop'], jobs: [job()] }], resolve),
+    ).rejects.toThrow(/\[main, develop\]/);
+  });
+
+  it('accepts a workflow-level context that overlaps the job-level one', async () => {
+    // breaks-if-wrong: a satisfiable workflow + job binding must still register
+    await expect(
+      assertWorkflowsSatisfiable([{ contexts: ['both'], jobs: [job('develop')] }], resolve),
+    ).resolves.toBeUndefined();
+  });
+
+  it('counts a workflow-level name the job also binds once, at the job position', async () => {
+    // breaks-if-wrong: the duplicate is dropped from the workflow part, not intersected twice
+    await expect(
+      assertWorkflowsSatisfiable([{ contexts: ['main'], jobs: [job('main')] }], resolve),
+    ).resolves.toBeUndefined();
   });
 });

@@ -16,6 +16,7 @@ import {
   createContextTemplateDirect,
   setContextSecretDirect,
   listCheckRunTrackingDirect,
+  registerWorkflowManualDirect,
 } from './db-admin.js';
 
 describe('parseDatabaseUrl', () => {
@@ -440,6 +441,72 @@ describe('seedContextDirect', () => {
     });
     expect(pool.calls[0].params[7]).toBe(900);
   });
+
+  /** The ON CONFLICT clause of the upsert, where a re-run's assignments live. */
+  const conflictClause = (sql: string) => sql.slice(sql.indexOf('ON CONFLICT'));
+
+  // Each policy column, the option that sets it, and an explicit empty value
+  // that must still clear it.
+  const POLICY_COLUMNS: ReadonlyArray<{
+    column: string;
+    supplied: Partial<Parameters<typeof seedContextDirect>[1]>;
+  }> = [
+    { column: 'enabled', supplied: { enabled: false } },
+    { column: 'branch_restrictions', supplied: { branchRestrictions: [] } },
+    { column: 'repo_patterns', supplied: { repoPatterns: [] } },
+    { column: 'required_reviewers', supplied: { requiredReviewers: [] } },
+    { column: 'wait_timer_seconds', supplied: { waitTimerSeconds: null } },
+    { column: 'hold_expiry_seconds', supplied: { holdExpirySeconds: null } },
+    { column: 'minimum_trust', supplied: { minimumTrust: null } },
+  ];
+
+  it.each(POLICY_COLUMNS)(
+    'a re-run without the $column option keeps the stored value',
+    async ({ column }) => {
+      pool = installPoolMock([{ rows: [{ id: 'env-4', inserted: false }], rowCount: 1 }]);
+      await seedContextDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'deploy' });
+      // fails-when: the upsert assigns the column from EXCLUDED, so an omitted flag clears it
+      expect(conflictClause(pool.calls[0].sql)).not.toContain(`${column} =`);
+    },
+  );
+
+  it.each(POLICY_COLUMNS)(
+    'an explicit empty $column value still clears it on conflict',
+    async ({ column, supplied }) => {
+      pool = installPoolMock([{ rows: [{ id: 'env-5', inserted: false }], rowCount: 1 }]);
+      await seedContextDirect('postgresql://u:p@h:5432/d', {
+        orgId: 'org1',
+        name: 'deploy',
+        ...supplied,
+      });
+      // breaks-if-wrong: a supplied [] / null must reach the row, or the rule cannot be cleared
+      expect(conflictClause(pool.calls[0].sql)).toContain(`${column} = EXCLUDED.${column}`);
+    },
+  );
+
+  it('inserts a new context enabled when enabled is omitted', async () => {
+    pool = installPoolMock([{ rows: [{ id: 'env-8', inserted: true }], rowCount: 1 }]);
+    await seedContextDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'fresh' });
+    // breaks-if-wrong: an omitted flag must still create an enabled context
+    expect(pool.calls[0].params[3]).toBeNull();
+    expect(pool.calls[0].sql).toContain('COALESCE($4, true)');
+  });
+
+  it('writes supplied repo patterns, and [] on insert when omitted', async () => {
+    pool = installPoolMock([
+      { rows: [{ id: 'env-6', inserted: true }], rowCount: 1 },
+      { rows: [{ id: 'env-7', inserted: true }], rowCount: 1 },
+    ]);
+    await seedContextDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      name: 'deploy',
+      repoPatterns: ['acme/workflows'],
+    });
+    await seedContextDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'other' });
+    // fails-when: the helper drops repoPatterns, so the rule is never stored
+    expect(pool.calls[0].params[10]).toBe(JSON.stringify(['acme/workflows']));
+    expect(pool.calls[1].params[10]).toBe('[]');
+  });
 });
 
 describe('deleteContextDirect', () => {
@@ -555,6 +622,27 @@ describe('setContextPolicyDirect', () => {
     expect(call.params).toEqual([60, 'verified', 'org1', 'staging']);
   });
 
+  it('sets repo patterns, and an empty list clears them', async () => {
+    pool = installPoolMock([
+      { rows: [], rowCount: 1 },
+      { rows: [], rowCount: 1 },
+    ]);
+    await setContextPolicyDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      contextName: 'deploy',
+      repoPatterns: ['acme/*'],
+    });
+    await setContextPolicyDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      contextName: 'deploy',
+      repoPatterns: [],
+    });
+    // fails-when: repo_patterns is missing from the policy-column allowlist
+    expect(pool.calls[0].sql).toMatch(/repo_patterns = \$1::jsonb/);
+    expect(pool.calls[0].params).toEqual([JSON.stringify(['acme/*']), 'org1', 'deploy']);
+    expect(pool.calls[1].params).toEqual(['[]', 'org1', 'deploy']);
+  });
+
   it('throws when no policy fields are supplied', async () => {
     pool = installPoolMock([]);
     await expect(
@@ -604,6 +692,8 @@ describe('listContextsDirect', () => {
     ]);
     const result = await listContextsDirect('postgresql://u:p@h:5432/d', { orgId: 'org1' });
     expect(result.contexts).toHaveLength(2);
+    // fails-when: the list query omits repo_patterns, so --json output lacks the field
+    expect(pool.calls[0].sql).toMatch(/repo_patterns/);
     expect(pool.calls[0].sql).toMatch(
       /SELECT .* FROM contexts\s+WHERE org_id = \$1\s+ORDER BY name/s,
     );
@@ -681,6 +771,53 @@ describe('createContextTemplateDirect', () => {
     expect(insert).toBeDefined();
     expect(insert!.params[6]).toBeNull();
     expect(insert!.sql).not.toMatch(/86400/);
+  });
+
+  it('a template re-run keeps policy fields it did not supply and clears the ones it did', async () => {
+    pool = installPoolMock([
+      { rows: [{ id: 'tpl-3', inserted: false }], rowCount: 1 },
+      { rows: [{ id: 'tpl-3', inserted: false }], rowCount: 1 },
+    ]);
+    await createContextTemplateDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      templateName: 'standard',
+    });
+    await createContextTemplateDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      templateName: 'standard',
+      branchRestrictions: [],
+      minimumTrust: null,
+    });
+    const [bare, clearing] = pool.calls
+      .filter((c) => /INSERT INTO contexts/.test(c.sql))
+      .map((c) => c.sql.slice(c.sql.indexOf('ON CONFLICT')));
+    // fails-when: a variable-only template call resets the context's protection rules
+    expect(bare).not.toMatch(/branch_restrictions =|required_reviewers =|minimum_trust =/);
+    // breaks-if-wrong: supplied empty values must still clear
+    expect(clearing).toContain('branch_restrictions = EXCLUDED.branch_restrictions');
+    expect(clearing).toContain('minimum_trust = EXCLUDED.minimum_trust');
+    expect(clearing).not.toContain('wait_timer_seconds =');
+  });
+
+  it('never assigns repo_patterns or enabled on a template re-run, whatever the caller object carries', async () => {
+    pool = installPoolMock([{ rows: [{ id: 'tpl-4', inserted: false }], rowCount: 1 }]);
+    // A caller object wider than the template options: the CLI or a script may
+    // spread a context payload into it.
+    const wider = {
+      orgId: 'org1',
+      templateName: 'standard',
+      branchRestrictions: ['main'],
+      repoPatterns: ['org/app'],
+      enabled: false,
+    };
+    await createContextTemplateDirect('postgresql://u:p@h:5432/d', wider);
+    const insert = pool.calls.find((c) => /INSERT INTO contexts/.test(c.sql))!;
+    const onConflict = insert.sql.slice(insert.sql.indexOf('ON CONFLICT'));
+    // fails-when: the upsert reads every supplied policy field, so the insert defaults for
+    // repo_patterns / enabled overwrite an existing template's values
+    expect(onConflict).not.toMatch(/repo_patterns =|enabled =/);
+    // breaks-if-wrong: a supplied template policy field must still be assigned
+    expect(onConflict).toContain('branch_restrictions = EXCLUDED.branch_restrictions');
   });
 
   it('rolls back on failure', async () => {
@@ -898,6 +1035,66 @@ describe('listCheckRunTrackingDirect', () => {
     });
     expect(rows[0].check_run_id).toBe('42');
     expect(rows[0].terminal_sent_at).toBeNull();
+  });
+});
+
+describe('registerWorkflowManualDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  const OPTS = {
+    repoIdentifier: 'org/ci',
+    routingKey: 'github:42',
+    customerId: 'org-1',
+    providerContext: {},
+  };
+  const WORKFLOW = { name: 'org-lint', triggers: [{ _type: 'push', repos: ['org/*'] }] };
+
+  function upsertCall(p: ReturnType<typeof installPoolMock>) {
+    const call = p.calls.find((c) => /INSERT INTO workflow_registrations/.test(c.sql));
+    if (!call) throw new Error('no workflow_registrations upsert was issued');
+    return call;
+  }
+
+  it('writes the lock file dependency-cache key on insert and on update', async () => {
+    // fails-when: the direct upsert keeps a stale key while it replaces the lock entry
+    pool = installPoolMock([
+      { rows: [], rowCount: 1 },
+      { rows: [{ version: 5 }], rowCount: 1 },
+    ]);
+    await registerWorkflowManualDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      commitSha: 'a1',
+      lockFile: {
+        workflows: [WORKFLOW],
+        lockfileHash: 'lock-hash-1',
+        siblingsDigest: 'siblings-1',
+      },
+    });
+
+    const call = upsertCall(pool);
+    expect(call.sql).toMatch(/lockfile_hash = EXCLUDED\.lockfile_hash/);
+    expect(call.sql).toMatch(/siblings_digest = EXCLUDED\.siblings_digest/);
+    // fails-when: the upsert keeps the commit a previous key was written for, so the
+    // orchestrator drops the key it just wrote (or trusts an older one)
+    expect(call.sql).toMatch(/dep_cache_key_sha = EXCLUDED\.dep_cache_key_sha/);
+    expect(call.params.slice(-3)).toEqual(['lock-hash-1', 'siblings-1', 'a1']);
+  });
+
+  it('writes no key when the lock file records none', async () => {
+    // breaks-if-wrong: a lock with no key must clear a stored one, which means binding null
+    pool = installPoolMock([
+      { rows: [], rowCount: 1 },
+      { rows: [{ version: 6 }], rowCount: 1 },
+    ]);
+    await registerWorkflowManualDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      lockFile: { workflows: [WORKFLOW] },
+    });
+
+    const call = upsertCall(pool);
+    expect(call.sql).toMatch(/lockfile_hash/);
+    expect(call.params.slice(-3)).toEqual([null, null, null]);
   });
 });
 

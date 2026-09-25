@@ -1,4 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
+import { HeldRunWithdrawal } from '../cancel/cancel-held-run.js';
+import {
+  HeldRunCancelRefusedError,
+  RUN_RESUMING_AFTER_APPROVAL_MESSAGE,
+} from '../cancel/cancel-run.js';
 import { DashboardHandler } from './handler.js';
 import { groupNeedsByJobName } from './needs-edges.js';
 import type {
@@ -654,6 +659,117 @@ describe('DashboardHandler', () => {
       const third = send.mock.calls[2][0];
       expect(third.lines).toEqual(['e']);
       expect(third.nextCursor).toBeNull();
+    });
+
+    it("serves a job's setup log (step -1), which has no step row", async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const handler = new DashboardHandler({
+        db,
+        logStorage: logStorage as never,
+        send,
+        ...noopCallbacks,
+      });
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_steps: step -1 never has a row
+        .mockResolvedValueOnce({ job_name: 'build' }); // execution_jobs
+      logStorage.exists.mockResolvedValueOnce(true);
+      logStorage.read.mockResolvedValueOnce({
+        data: '[host-checkout] Clone complete\n',
+        cursor: 0,
+        complete: true,
+      });
+
+      await handler.handleStepLogs({
+        type: 'dashboard.step.logs',
+        requestId: 'req-setup',
+        runId: 'run-42',
+        jobId: 'j1',
+        stepIndex: -1,
+        actor: { type: 'user', sub: 'u1' },
+      });
+
+      // fails-when: step -1 goes through the row lookup and answers "Step not
+      // found", so neither the dashboard nor `kici runs logs` shows setup lines.
+      const response = send.mock.calls[0][0];
+      expect(response.error).toBeUndefined();
+      expect(response.lines).toEqual(['[host-checkout] Clone complete']);
+      expect(response.recorded).toBe(true);
+      expect(logStorage.read).toHaveBeenCalledWith('executions/run-42/job-build/step--1.log');
+    });
+
+    it('answers an empty page, not an error, when a job wrote no setup log', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const handler = new DashboardHandler({
+        db,
+        logStorage: logStorage as never,
+        send,
+        ...noopCallbacks,
+      });
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ job_name: 'b' });
+
+      await handler.handleStepLogs({
+        type: 'dashboard.step.logs',
+        requestId: 'req-setup-none',
+        runId: 'run-42',
+        jobId: 'j1',
+        stepIndex: -1,
+        actor: { type: 'user', sub: 'u1' },
+      });
+
+      const response = send.mock.calls[0][0];
+      expect(response.error).toBeUndefined();
+      expect(response.lines).toEqual([]);
+      // fails-when: a job that wrote no setup log reads like one whose log is empty
+      expect(response.recorded).toBe(false);
+      expect(logStorage.read).not.toHaveBeenCalled();
+    });
+
+    it('reports a stored setup log that holds no lines as recorded', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const handler = new DashboardHandler({
+        db,
+        logStorage: logStorage as never,
+        send,
+        ...noopCallbacks,
+      });
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ job_name: 'b' });
+      logStorage.exists.mockResolvedValueOnce(true);
+      logStorage.read.mockResolvedValueOnce({ data: '', cursor: 0, complete: true });
+
+      await handler.handleStepLogs({
+        type: 'dashboard.step.logs',
+        requestId: 'req-setup-empty',
+        runId: 'run-42',
+        jobId: 'j1',
+        stepIndex: -1,
+        actor: { type: 'user', sub: 'u1' },
+      });
+
+      // breaks-if-wrong: an empty stored setup log still answers a page, marked recorded
+      const response = send.mock.calls[0][0];
+      expect(response.error).toBeUndefined();
+      expect(response).toMatchObject({ lines: [], totalLines: 0, recorded: true });
     });
 
     it('returns error when step not found', async () => {
@@ -2087,6 +2203,58 @@ describe('DashboardHandler', () => {
       expect(response.type).toBe('run.cancel.response');
       expect(response.requestId).toBe('req-c3');
       expect(response.error).toBe('Database connection lost');
+    });
+
+    it('records a cancel that lost to an approve as a refusal, not an error', async () => {
+      const { db } = createMockDb();
+      const send = vi.fn();
+      const accessLog = { record: vi.fn() };
+      const handler = new DashboardHandler({
+        db,
+        logStorage: createMockLogStorage() as never,
+        send,
+        accessLog: accessLog as never,
+        ...noopCallbacks,
+        onCancel: vi
+          .fn()
+          .mockRejectedValue(new HeldRunCancelRefusedError(HeldRunWithdrawal.Approved)),
+      });
+
+      await handler.handleCancelRequest({
+        type: 'run.cancel.request',
+        requestId: 'req-race',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-resuming',
+      });
+
+      expect(send.mock.calls[0][0].error).toBe(RUN_RESUMING_AFTER_APPROVAL_MESSAGE);
+      // fails-when: the expected approve/cancel race records outcome 'error'
+      expect(accessLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'run.cancel', outcome: 'allowed' }),
+      );
+    });
+
+    it('still records any other cancel failure as an error', async () => {
+      const { db } = createMockDb();
+      const accessLog = { record: vi.fn() };
+      const handler = new DashboardHandler({
+        db,
+        logStorage: createMockLogStorage() as never,
+        send: vi.fn(),
+        accessLog: accessLog as never,
+        ...noopCallbacks,
+        onCancel: vi.fn().mockRejectedValue(new Error('Database connection lost')),
+      });
+
+      await handler.handleCancelRequest({
+        type: 'run.cancel.request',
+        requestId: 'req-fail',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-fail',
+      });
+
+      // breaks-if-wrong: a genuine failure must not be laundered into 'allowed'
+      expect(accessLog.record).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'error' }));
     });
   });
 

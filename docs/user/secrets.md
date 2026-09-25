@@ -298,7 +298,7 @@ if (ctx.secrets.DEPLOY_TOKEN) { ... }
 if (ctx.secrets.has('DEPLOY_TOKEN')) { ... }
 ```
 
-Note that `get()` is async -- you must `await` the result.
+`get()` is async -- you must `await` the result.
 
 ## Typed secrets
 

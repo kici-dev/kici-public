@@ -1,5 +1,5 @@
 /**
- * Tests for the four master-key rotation sweeps `rotate-key` gained.
+ * Tests for the master-key rotation sweeps `rotate-key` gained.
  *
  * The property under test is the one the published rotation procedure depended
  * on and did not have: after a sweep, a row that was sealed under the OLD key
@@ -13,7 +13,9 @@ import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { DbSigner, unwrapPrivateJwk } from '../oidc/db-signer.js';
 import type { ResolvedMasterKeys } from './config.js';
 import { PRIVATE_KEY_AAD } from './ephemeral-keys.js';
-import { rotateMasterKeyWrappedTables } from './master-key-rotation.js';
+import { JOB_SECRETS_SWEEP_BATCH, rotateMasterKeyWrappedTables } from './master-key-rotation.js';
+import { jobSecretsAad } from './job-secret-seal.js';
+import { TERMINAL_DISPATCH_STATUSES } from '../queue/job-queue.js';
 import { secretOutputAad } from './secret-output-crypto.js';
 
 const CURRENT_MATERIAL = 'a'.repeat(64);
@@ -32,7 +34,8 @@ const RUN_ID = 'run-1';
 /**
  * Queue one result set per sweep, in the order
  * `rotateMasterKeyWrappedTables` reads them: signing keys, dashboard keys,
- * ephemeral keys, secret outputs.
+ * ephemeral keys, secret outputs, then the stored job secrets of the dispatch
+ * queue, pending job contexts and pending workflow contexts.
  */
 function mockDbWith(rowSets: unknown[][]) {
   const { db, mocks } = createMockDb({});
@@ -184,12 +187,90 @@ describe('rotateMasterKeyWrappedTables', () => {
   });
 
   it('reports zeros for every empty store', async () => {
-    const { db } = mockDbWith([[], [], [], []]);
+    const { db } = mockDbWith([[], [], [], [], [], [], []]);
     expect(await rotateMasterKeyWrappedTables(db as never, KEYS, warn)).toEqual({
       signingKeys: { reEncrypted: 0, skipped: 0 },
       dashboardKeys: { reEncrypted: 0, skipped: 0 },
       ephemeralKeys: { reEncrypted: 0, skipped: 0 },
       secretOutputs: { reEncrypted: 0, skipped: 0 },
+      jobSecrets: { reEncrypted: 0, skipped: 0 },
+    });
+  });
+
+  describe('stored job secrets', () => {
+    const sealOld = (runId: string, v: string) =>
+      encrypt(v, KEYS.old!, 1, jobSecretsAad(runId)).data;
+    /** The four earlier sweeps read nothing; the job-secret selects follow in order. */
+    const EARLIER = [[], [], [], []];
+
+    it('re-seals every table under the current key, guarded on the ciphertext it read', async () => {
+      const queued = sealOld('run-q', '{"secrets":{"A":"1"}}');
+      const pendingJob = sealOld('run-p', '{"secrets":{"B":"2"}}');
+      const pendingWorkflow = sealOld('run-w', '{"runWideFlatSecrets":{"C":"3"}}');
+      // Positive control: the rows are unreadable under the current key alone.
+      expect(() =>
+        decrypt({ data: queued, keyVersion: 1 }, KEYS.current, jobSecretsAad('run-q')),
+      ).toThrow();
+
+      const { db, mocks } = mockDbWith([
+        ...EARLIER,
+        [{ id: 'job-1', run_id: 'run-q', sealed_secrets: queued }],
+        [{ run_id: 'run-p', job_name: 'deploy', sealed_secrets: pendingJob }],
+        [{ run_id: 'run-w', sealed_secrets: pendingWorkflow }],
+      ]);
+      const result = await rotateMasterKeyWrappedTables(db as never, KEYS, warn);
+      expect(result.jobSecrets).toEqual({ reEncrypted: 3, skipped: 0 });
+
+      const payloads = setPayloads(mocks).map((p) => p.sealed_secrets as string);
+      expect(
+        decrypt({ data: payloads[0], keyVersion: 1 }, KEYS.current, jobSecretsAad('run-q')),
+      ).toBe('{"secrets":{"A":"1"}}');
+      expect(
+        decrypt({ data: payloads[2], keyVersion: 1 }, KEYS.current, jobSecretsAad('run-w')),
+      ).toBe('{"runWideFlatSecrets":{"C":"3"}}');
+      // fails-when: the UPDATE matches the row by key alone and clobbers a concurrent re-seal
+      for (const old of [queued, pendingJob, pendingWorkflow]) {
+        expect(mocks.updateWhere).toHaveBeenCalledWith('sealed_secrets', '=', old);
+      }
+    });
+
+    it('counts a row neither key opens as skipped and leaves it alone', async () => {
+      const lost = encrypt('{}', deriveKey(OTHER_MATERIAL), 1, jobSecretsAad('run-q')).data;
+      const logWarn = vi.fn();
+      const { db, mocks } = mockDbWith([
+        ...EARLIER,
+        [{ id: 'job-1', run_id: 'run-q', sealed_secrets: lost }],
+        [],
+        [],
+      ]);
+      const result = await rotateMasterKeyWrappedTables(db as never, KEYS, logWarn);
+      expect(result.jobSecrets).toEqual({ reEncrypted: 0, skipped: 1 });
+      expect(mocks.updateSet).not.toHaveBeenCalled();
+      expect(logWarn).toHaveBeenCalledWith(expect.stringContaining('undecryptable'), {
+        table: 'dispatch_queue',
+        jobId: 'job-1',
+      });
+    });
+
+    it('sweeps the queue in bounded batches, paged by id, skipping terminal rows', async () => {
+      const full = Array.from({ length: JOB_SECRETS_SWEEP_BATCH }, (_, i) => ({
+        id: `job-${String(i).padStart(4, '0')}`,
+        run_id: 'run-q',
+        sealed_secrets: sealOld('run-q', '{}'),
+      }));
+      const { db, mocks } = mockDbWith([...EARLIER, full, [], [], []]);
+      const result = await rotateMasterKeyWrappedTables(db as never, KEYS, warn);
+      expect(result.jobSecrets).toEqual({ reEncrypted: JOB_SECRETS_SWEEP_BATCH, skipped: 0 });
+      // fails-when: the whole queue is re-sealed in one transaction holding every row lock
+      expect(mocks.selectLimit).toHaveBeenCalledWith(JOB_SECRETS_SWEEP_BATCH);
+      // A full batch asks for the next page, starting after its last id.
+      expect(mocks.selectWhere).toHaveBeenCalledWith('id', '>', full[full.length - 1].id);
+      // breaks-if-wrong: live rows are swept, terminal rows (scrubbed by the cleanup tick) are not
+      expect(mocks.selectWhere).toHaveBeenCalledWith(
+        'status',
+        'not in',
+        TERMINAL_DISPATCH_STATUSES,
+      );
     });
   });
 });

@@ -83,7 +83,11 @@ import { assertAgentAuthBindSafe } from './storage/loopback-guard.js';
 import { Dispatcher } from './agent/dispatcher.js';
 import { incScalerRedispatch } from './metrics/prometheus.js';
 import { PeerClient, PeerRegistry, PeerAuthCoordinator } from './cluster/index.js';
-import { TERMINAL_JOB_STATES, WS_CLOSE_DISPATCH_ACK_TIMEOUT } from '@kici-dev/engine';
+import {
+  ExecutionJobStatus,
+  TERMINAL_JOB_STATES,
+  WS_CLOSE_DISPATCH_ACK_TIMEOUT,
+} from '@kici-dev/engine';
 import type { PeerLogChunk } from '@kici-dev/engine';
 import { InMemoryExecutionTracker } from './worker/in-memory-execution-tracker.js';
 import { InMemoryJobQueue } from './worker/in-memory-job-queue.js';
@@ -119,6 +123,11 @@ import { AgentHeartbeatMonitor } from './ws/agent-heartbeat.js';
 import { resolveDataDir } from './data-dir.js';
 import { PeerOutbox } from './worker/peer-outbox.js';
 import { buildTerminalJobProgress, replayPending } from './worker/worker-outbox-relay.js';
+import {
+  buildWorkerDispatchMessage,
+  rerouteDispatchRefusal,
+  rerouteJobConfig,
+} from './worker/reroute-dispatch.js';
 import { join } from 'node:path';
 import { createOnErrorHandler } from './app-on-error.js';
 import type {
@@ -294,9 +303,56 @@ async function initializeWorkerScaler(
 }
 
 /**
+ * Fail a rerouted job the worker must not hand to an agent, and report it to
+ * the coordinator that owns the run.
+ *
+ * The reroute is accepted, so the coordinator does not offer the job to another
+ * peer that would refuse it the same way; the job is then projected like any
+ * rerouted job and immediately driven terminal, which forwards the failure and
+ * its reason to the owning coordinator.
+ */
+async function failRefusedReroute(args: {
+  msg: JobReroute;
+  refusal: string;
+  rawUrl: string;
+  client: PeerClient;
+  jobOwnership: Map<string, string>;
+  executionTracker: InMemoryExecutionTracker;
+}): Promise<void> {
+  const { msg, refusal, client, executionTracker } = args;
+  logger.error('Refusing a rerouted job before it reaches an agent', {
+    runId: msg.runId,
+    jobId: msg.jobId,
+    reason: refusal,
+  });
+  args.jobOwnership.set(msg.jobId, args.rawUrl);
+  await executionTracker.onExecutionStarted(
+    msg.runId,
+    msg.workflowName,
+    msg.provider ?? '',
+    '',
+    msg.ref ?? '',
+    msg.sha ?? '',
+    msg.deliveryId,
+    msg.providerContext ?? {},
+    null,
+    [{ jobId: msg.jobId, jobName: msg.jobName }],
+  );
+  client.send({ type: 'job.reroute.ack', messageId: msg.messageId, accepted: true });
+  await executionTracker.onJobStatus(
+    msg.runId,
+    msg.jobId,
+    ExecutionJobStatus.enum.failed,
+    Date.now(),
+    undefined,
+    { error: refusal },
+  );
+}
+
+/**
  * Build the onDispatch callback for worker mode.
  *
- * Workers do NOT re-query DB for provider context. The cloneToken and
+ * Workers do NOT re-query DB for provider context. The clone tokens and
  * providerContext are already included in the job.reroute message and
  * embedded in the job's jobConfig.
  */
@@ -306,79 +362,12 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
     if (!entry) return;
 
     // In worker mode, the job config already contains everything needed:
-    // cloneToken, secrets (pre-resolved), provider context, etc.
+    // the clone tokens, secrets (pre-resolved), provider context, etc.
     // No DB lookup needed -- just forward to the agent.
-    const dispatchSecrets = job.jobConfig.secrets as Record<string, string> | undefined;
-    const dispatchNamespacedSecrets = job.jobConfig.namespacedSecrets as
-      Record<string, Record<string, string>> | undefined;
-    const dispatchRunPublicKey = job.jobConfig.runPublicKey as string | undefined;
-    const dispatchNpmRegistries = job.jobConfig.npmRegistries as
-      Array<Record<string, unknown>> | undefined;
-    const dispatchInstallEnvSecrets = job.jobConfig.installEnvSecrets as
-      Record<string, string> | undefined;
-    const dispatchContainerRegistryAuth = job.jobConfig.containerRegistryAuth as
-      { username: string; password: string; serveraddress: string } | undefined;
-    // The coordinator pre-resolves a clone token in its onJobReroute path
-    // (mintSourceAuth at the dispatch site) and stuffs it into
-    // jobConfig.cloneToken — workers have no provider credentials of their
-    // own to mint a token. Forward it as the dispatch.job `token` field so
-    // the agent's git-clone authenticates against private repos. Without
-    // this propagation the agent attempts an unauthenticated HTTPS clone
-    // and fails with "could not read Username for 'https://github.com'".
-    const dispatchToken = job.jobConfig.cloneToken as string | undefined;
-    const cleanJobConfig = Object.fromEntries(
-      Object.entries(job.jobConfig).filter(
-        ([k]) =>
-          k !== 'secrets' &&
-          k !== 'namespacedSecrets' &&
-          k !== 'runPublicKey' &&
-          k !== 'npmRegistries' &&
-          k !== 'installEnvSecrets' &&
-          k !== 'containerRegistryAuth' &&
-          k !== 'cloneToken',
-      ),
-    );
-
     entry.ws.send(
-      JSON.stringify({
-        type: 'job.dispatch',
-        messageId: randomUUID(),
-        timestamp: Date.now(),
-        runId: job.runId,
-        jobId: job.id,
-        jobName: job.jobName,
-        workflowName: job.workflowName,
-        repoUrl: job.repoUrl,
-        ref: job.ref,
-        sha: job.sha,
-        lockFileUrl: job.jobConfig.lockFileUrl ?? '',
-        jobConfig: cleanJobConfig,
-        // Lift user-cache namespacing from jobConfig to top-level dispatch
-        // fields so the worker's agent-WS handler resolves the cache ref from
-        // the tracked dispatch (matches the coordinator dispatch path).
-        ...(typeof cleanJobConfig.cacheOrgId === 'string' && {
-          orgId: cleanJobConfig.cacheOrgId,
-        }),
-        ...(typeof cleanJobConfig.cacheRepoId === 'string' && {
-          repoId: cleanJobConfig.cacheRepoId,
-        }),
-        ...(typeof cleanJobConfig.cacheRefScope === 'string' && {
-          cacheRefScope: cleanJobConfig.cacheRefScope,
-        }),
-        ...(dispatchToken && { token: dispatchToken }),
-        ...(dispatchSecrets && { secrets: dispatchSecrets }),
-        ...(dispatchNamespacedSecrets && { namespacedSecrets: dispatchNamespacedSecrets }),
-        ...(dispatchRunPublicKey && { runPublicKey: dispatchRunPublicKey }),
-        ...(dispatchNpmRegistries &&
-          dispatchNpmRegistries.length > 0 && { npmRegistries: dispatchNpmRegistries }),
-        ...(dispatchInstallEnvSecrets &&
-          Object.keys(dispatchInstallEnvSecrets).length > 0 && {
-            installEnvSecrets: dispatchInstallEnvSecrets,
-          }),
-        ...(dispatchContainerRegistryAuth && {
-          containerRegistryAuth: dispatchContainerRegistryAuth,
-        }),
-      }),
+      JSON.stringify(
+        buildWorkerDispatchMessage(job, { messageId: randomUUID(), timestamp: Date.now() }),
+      ),
     );
 
     logger.info('Dispatched rerouted job to agent', {
@@ -684,12 +673,7 @@ export async function bootstrapWorker(
             containerSpawn,
           )
       : undefined,
-    canPrespawnedAgentServe: scalerManager
-      ? (agentId, job) => scalerManager.canPrespawnedAgentServe(agentId, job)
-      : undefined,
-    isPrespawnedAgent: scalerManager
-      ? (agentId) => scalerManager.isPrespawnedAgent(agentId)
-      : undefined,
+    scalerAgentView: scalerManager ? (agentId) => scalerManager.agentView(agentId) : undefined,
     // The worker has no DB; the deadline is the cluster-wide default.
     getAckTimeoutMs: async () => config.dispatchAckTimeoutMs,
     onAckTimeout: (agentId, jobId, runId) => {
@@ -855,12 +839,22 @@ export async function bootstrapWorker(
           return;
         }
 
+        const refusal = rerouteDispatchRefusal(msg);
+        if (refusal) {
+          await failRefusedReroute({
+            msg,
+            refusal,
+            rawUrl,
+            client,
+            jobOwnership,
+            executionTracker,
+          });
+          return;
+        }
+
         const flatLabels = msg.runsOnLabels.length > 0 ? msg.runsOnLabels[0] : [];
 
-        const jobConfig = {
-          ...(msg.jobConfig ?? msg.payload),
-          ...(msg.cloneToken && { cloneToken: msg.cloneToken }),
-        };
+        const jobConfig = rerouteJobConfig(msg);
 
         const jobInput = {
           // Honor the sender-allocated jobId so the agent's status updates

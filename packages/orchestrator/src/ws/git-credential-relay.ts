@@ -47,8 +47,17 @@ const logger = createLogger({ prefix: 'git-credential-relay' });
 /** Per-job facts the handler needs. Resolved from server truth, never from params. */
 export interface JobCredentialContext {
   orgId: string;
-  /** The repository this job was dispatched for. */
+  /**
+   * The repository whose code the job checks out — the event's repository.
+   * The write-credential organisation fence is anchored here.
+   */
   sourceRepo: string;
+  /**
+   * The repository whose policy governs the job's credentials: the workflow
+   * repository for a run whose workflow lives in another repository, otherwise
+   * the source repository. A named context's repository restrictions read it.
+   */
+  policyRepo: string;
   /**
    * The `gitCredentials` map this job's lock entry declared, verbatim — a
    * request's ref must equal one of these entries. An empty map means the job
@@ -57,8 +66,12 @@ export interface JobCredentialContext {
   declaredCredentials: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /** The run's resolved contributor trust tier, or undefined when unresolved. */
   trustTier: TrustTier | undefined;
-  /** The branch the run presents, for the named context's branch restrictions. */
-  branch: string;
+  /**
+   * The branch a named context's branch restrictions read: the workflow's
+   * registered branch for a run whose workflow lives in another repository,
+   * otherwise the branch the run presents.
+   */
+  policyBranch: string;
   /** The event type that started the run, for a context's trigger-type filters. */
   triggerType: string;
 }
@@ -195,9 +208,9 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
         jobId: params.jobId,
         gate: {
           dispatchCtx: {
-            branch: job.branch,
+            branch: job.policyBranch,
             triggerType: job.triggerType,
-            repository: job.sourceRepo,
+            repository: job.policyRepo,
             runId: owned.runId,
             jobId: params.jobId,
           },

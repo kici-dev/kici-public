@@ -47,7 +47,7 @@ export interface InitResult {
 export interface FilterEvalInput {
   /** The repo whose event triggered this evaluation. */
   sourceRepo: RepoInfo;
-  /** The repo that registered the workflow — identical to `sourceRepo` here. */
+  /** The repo that registered the workflow — the same repo as `sourceRepo` unless the workflow is global. */
   workflowRepo: RepoInfo;
   changedFiles: string[];
   changedFilesStatus: ChangedFilesStatus;

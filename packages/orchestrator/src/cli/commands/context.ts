@@ -3,7 +3,7 @@
  *
  *   context create         — upsert a context
  *   context bind           — bind a scope pattern to a context
- *   context set-policy     — update policy fields (branch, reviewers, timers, trust)
+ *   context set-policy     — update policy fields (branch, repo patterns, reviewers, timers, trust)
  *   context list           — list contexts for an org
  *   context show           — show a single context with variables + bindings
  *   context delete         — delete a context (cascades bindings, variables, overrides; held-run history survives; pending held runs block with a clear error, resolved holds do not)
@@ -34,6 +34,7 @@ import {
 import type { ContextRow, ShowContextResult, SeedContextResult } from '@kici-dev/shared';
 import { MinimumTrustSchema, type MinimumTrust } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
+import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
   return explicit ?? process.env.KICI_DATABASE_URL ?? null;
@@ -46,6 +47,22 @@ function parseJsonOption(raw: string | undefined, label: string): unknown | unde
   } catch (err) {
     throw new Error(`${label}: invalid JSON — ${toErrorMessage(err)}`);
   }
+}
+
+/**
+ * Parse `--repo-patterns`: a JSON array of `owner/repo` glob strings. Direct-DB
+ * mode writes the column with no route schema in front of it, so the shape is
+ * checked here. `[]` clears the rule.
+ */
+function parseRepoPatternsOption(raw: string | undefined): string[] | undefined {
+  const parsed = parseJsonOption(raw, '--repo-patterns');
+  if (parsed === undefined) return undefined;
+  // fails-when: '"acme/*"' (a bare string) or '[1]' reaches the column
+  // breaks-if-wrong: '[]' (the clear) and '["acme/*"]' must still pass
+  if (!Array.isArray(parsed) || !parsed.every((p) => typeof p === 'string')) {
+    throw new Error(`--repo-patterns: must be a JSON array of strings (got ${raw})`);
+  }
+  return parsed;
 }
 
 function parseCsvOption(raw: string | undefined): string[] | undefined {
@@ -71,6 +88,12 @@ function parseMinimumTrustOption(raw: string | undefined): MinimumTrust | undefi
     );
   }
   return parsed.data;
+}
+
+/** `--enabled`: absent stays undefined (keep the stored flag); only `false` disables. */
+export function parseEnabledOption(raw: string | undefined): boolean | undefined {
+  if (raw === undefined) return undefined;
+  return raw !== 'false';
 }
 
 function parseIntOption(raw: string | undefined, label: string): number | undefined {
@@ -105,6 +128,13 @@ function summarizePolicy(env: ContextRow): string {
         ? JSON.parse(env.branch_restrictions)
         : env.branch_restrictions;
     if (Array.isArray(br) && br.length > 0) parts.push(`branches=${br.join('|')}`);
+  } catch {
+    // ignore parse errors
+  }
+  try {
+    const rp =
+      typeof env.repo_patterns === 'string' ? JSON.parse(env.repo_patterns) : env.repo_patterns;
+    if (Array.isArray(rp) && rp.length > 0) parts.push(`repos=${rp.join('|')}`);
   } catch {
     // ignore parse errors
   }
@@ -179,8 +209,15 @@ export function registerContextCommands(program: Command, getClient: () => Admin
       '--glob-pattern <pattern>',
       'Glob pattern matched against declared context names (required with --type glob)',
     )
-    .option('--enabled <bool>', 'Enabled flag (true|false)', 'true')
+    .option(
+      '--enabled <bool>',
+      'Enabled flag (true|false); a new context is enabled, an existing one keeps its flag',
+    )
     .option('--branch-restrictions <json>', 'JSON array of allowed branches (e.g. \'["main"]\')')
+    .option(
+      '--repo-patterns <json>',
+      "JSON array of owner/repo globs the context is limited to (e.g. '[\"acme/*\"]'; '[]' clears)",
+    )
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs (or empty to clear)')
     .option('--wait-timer <seconds>', 'Wait timer before release (seconds)')
     .option('--hold-expiry <seconds>', 'Hold expiry TTL (seconds)')
@@ -202,14 +239,16 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         const requiredReviewers = parseCsvOption(opts.requiredReviewers);
         const waitTimerSeconds = parseIntOption(opts.waitTimer, '--wait-timer');
         const holdExpirySeconds = parseIntOption(opts.holdExpiry, '--hold-expiry');
-        const enabled = opts.enabled === 'false' ? false : true;
         const payload = {
           orgId: opts.org,
           name: opts.name,
           type: opts.type,
-          enabled,
+          // Sent only when the flag is given, so re-running create on a
+          // disabled context does not re-enable it.
+          enabled: parseEnabledOption(opts.enabled),
           globPattern: opts.globPattern,
           branchRestrictions,
+          repoPatterns: parseRepoPatternsOption(opts.repoPatterns),
           requiredReviewers,
           waitTimerSeconds,
           holdExpirySeconds,
@@ -226,6 +265,12 @@ export function registerContextCommands(program: Command, getClient: () => Admin
             `context create: envId=${result.envId} created=${result.created}${dbUrl ? ' (direct)' : ''}`,
           );
         }
+        await warnIfContextUnbound({
+          orgId: opts.org,
+          name: opts.name,
+          dbUrl,
+          client: dbUrl ? undefined : getClient(),
+        });
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
@@ -279,6 +324,10 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .requiredOption('--org <id>', 'Org ID')
     .requiredOption('--env <name>', 'Context name')
     .option('--branch-restrictions <json>', 'JSON array of allowed branches')
+    .option(
+      '--repo-patterns <json>',
+      "JSON array of owner/repo globs the context is limited to (e.g. '[\"acme/*\"]'; '[]' clears)",
+    )
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs (empty to clear)')
     .option('--wait-timer <seconds>', 'Wait timer before release (seconds)')
     .option('--hold-expiry <seconds>', 'Hold expiry TTL in seconds (empty to clear)')
@@ -302,6 +351,9 @@ export function registerContextCommands(program: Command, getClient: () => Admin
             '--branch-restrictions',
           );
         }
+        if (opts.repoPatterns !== undefined) {
+          payload.repoPatterns = parseRepoPatternsOption(opts.repoPatterns);
+        }
         if (opts.requiredReviewers !== undefined) {
           payload.requiredReviewers = parseCsvOption(opts.requiredReviewers);
         }
@@ -315,7 +367,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           payload.minimumTrust = parseMinimumTrustOption(opts.minimumTrust);
         }
         if (opts.enabled !== undefined) {
-          payload.enabled = opts.enabled === 'false' ? false : true;
+          payload.enabled = parseEnabledOption(opts.enabled);
         }
         if (opts.allowLocalExecution !== undefined) {
           payload.allowLocalExecution = opts.allowLocalExecution === 'false' ? false : true;

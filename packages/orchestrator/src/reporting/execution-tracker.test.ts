@@ -3,10 +3,13 @@ import {
   ExecutionTracker,
   type ExecutionTrackerDeps,
   type ExecutionContext,
+  type WorkflowRepoProvenance,
 } from './execution-tracker.js';
 import { requestContext } from '@kici-dev/shared';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
+import { executionsTotal } from '../metrics/prometheus.js';
+import { STOPPED_RUN_DISPATCH_REASON } from '../queue/job-queue.js';
 import {
   ExecutionJobStatus,
   ExecutionRunStatus,
@@ -86,6 +89,10 @@ function createMockDb() {
       trust_tier?: string | null;
       lock_file_source?: string | null;
       registration_window_instance_id?: string | null;
+      // Read back by the rehydration path: whether a failed run may reopen, and
+      // the status generation a reopen raises.
+      failure_reason?: string | null;
+      status_epoch?: number;
     }
   >();
   /**
@@ -132,6 +139,7 @@ function createMockDb() {
                   // one and hardcoded the other could not express the invariant.
                   repo_identifier: v.repo_identifier as string | undefined,
                   workflow_repo_identifier: v.workflow_repo_identifier as string | undefined,
+                  failure_reason: v.failure_reason as string | null | undefined,
                 });
               }
             }
@@ -266,6 +274,10 @@ function createMockDb() {
                         workflow_repo_identifier:
                           (v.workflow_repo_identifier as string | undefined) ??
                           existing.workflow_repo_identifier,
+                        failure_reason:
+                          (v.failure_reason as string | null | undefined) ??
+                          existing.failure_reason,
+                        status_epoch: existing.status_epoch,
                       });
                     } else {
                       inserts.push({ table, values: v });
@@ -274,6 +286,7 @@ function createMockDb() {
                         workflow_name: v.workflow_name as string | undefined,
                         repo_identifier: v.repo_identifier as string | undefined,
                         workflow_repo_identifier: v.workflow_repo_identifier as string | undefined,
+                        failure_reason: v.failure_reason as string | null | undefined,
                       });
                     }
                   } else {
@@ -373,6 +386,10 @@ function createMockDb() {
                 next.registration_window_instance_id = vals.registration_window_instance_id as
                   string | null;
               }
+              if ('failure_reason' in vals) {
+                next.failure_reason = vals.failure_reason as string | null;
+              }
+              if (typeof vals.status_epoch === 'number') next.status_epoch = vals.status_epoch;
               runRows.set(String(runId), next);
             }
             return 1;
@@ -504,6 +521,8 @@ function createMockDb() {
                     trust_tier: row.trust_tier ?? null,
                     lock_file_source: row.lock_file_source ?? null,
                     registration_window_instance_id: row.registration_window_instance_id ?? null,
+                    failure_reason: row.failure_reason ?? null,
+                    status_epoch: row.status_epoch ?? 0,
                   };
                 }
                 return undefined;
@@ -1315,11 +1334,161 @@ describe('ExecutionTracker', () => {
       );
       await tracker.onJobStatus('run-mono', 'job-1', ExecutionJobStatus.enum.cancelled, Date.now());
 
+      // The stopped-run job cancel that follows a job registration is a guarded
+      // write the mock does not evaluate, so it is told apart by its reason.
       const cancelled = mockDb.updates.filter(
         (u) =>
-          u.table === 'execution_jobs' && u.values.status === ExecutionJobStatus.enum.cancelled,
+          u.table === 'execution_jobs' &&
+          u.values.status === ExecutionJobStatus.enum.cancelled &&
+          u.values.error_message !== STOPPED_RUN_DISPATCH_REASON,
       );
       expect(cancelled).toHaveLength(1);
+    });
+  });
+
+  describe('run status generation (statusEpoch) and the failed-run reopen', () => {
+    /** A tracker whose Platform forwards and completion callbacks are observable. */
+    function epochTracker() {
+      const onStatusChange = vi.fn();
+      const onComplete = vi.fn();
+      const onWfComplete = vi.fn();
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        onExecutionStatusChange: onStatusChange,
+        onExecutionComplete: onComplete,
+        onWorkflowComplete: onWfComplete,
+      });
+      return { t, onStatusChange, onComplete, onWfComplete };
+    }
+
+    const startRun = (t: ExecutionTracker, runId: string) =>
+      t.onExecutionStarted(runId, 'ci', 'github', 'owner/repo', 'main', 'abc', null, {}, null, [
+        { jobId: 'job-1', jobName: 'test' },
+      ]);
+
+    const forgetRun = (t: ExecutionTracker, runId: string) =>
+      (t as unknown as { runs: Map<string, unknown> }).runs.delete(runId);
+
+    /** Run-row updates to `status` recorded after update index `from`. */
+    const runUpdatesTo = (runId: string, status: string, from = 0) =>
+      mockDb.updates
+        .slice(from)
+        .filter(
+          (u) =>
+            u.table === 'execution_runs' &&
+            u.values.status === status &&
+            u.where.some((w) => w[0] === 'run_id' && w[2] === runId),
+        );
+
+    it('reopens a prematurely failed run on a live job report and raises its generation', async () => {
+      const { t, onStatusChange } = epochTracker();
+      await startRun(t, 'run-reopen');
+      await t.onJobStatus('run-reopen', 'job-1', ExecutionJobStatus.enum.running, Date.now());
+      // Failed while its job was already on an agent: memory is dropped, the
+      // job row stays `running`.
+      await t.failRun('run-reopen', 'No agents available to dispatch jobs');
+      forgetRun(t, 'run-reopen');
+      onStatusChange.mockClear();
+      const from = mockDb.updates.length;
+
+      await t.onJobStatus('run-reopen', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+
+      // breaks-if-wrong: a live report for a prematurely failed run must reopen it.
+      const reopen = runUpdatesTo('run-reopen', ExecutionRunStatus.enum.running, from);
+      expect(reopen).toHaveLength(1);
+      expect(reopen[0]!.values.status_epoch).toBe(1);
+      expect(reopen[0]!.values.completed_at).toBeNull();
+      // fails-when: the reopened run's frames keep generation 0 — the Platform
+      // keeps the stale `failed` against them.
+      const final = onStatusChange.mock.calls.at(-1)!;
+      expect(final[1]).toBe(ExecutionRunStatus.enum.success);
+      expect((final[2] as ExecutionContext).statusEpoch).toBe(1);
+      expect(t.getReplayData().find((r) => r.runId === 'run-reopen')?.statusEpoch).toBe(1);
+    });
+
+    it('does not reopen a failed run on a replay of a job frame its row already records', async () => {
+      const { t, onStatusChange, onComplete, onWfComplete } = epochTracker();
+      await startRun(t, 'run-replay');
+      await t.onJobStatus('run-replay', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
+      expect(onComplete).toHaveBeenCalledOnce();
+      expect(onWfComplete).toHaveBeenCalledOnce();
+      // The prune has run; the agent's durable outbox replays the same frame.
+      forgetRun(t, 'run-replay');
+      onStatusChange.mockClear();
+      const from = mockDb.updates.length;
+
+      await t.onJobStatus('run-replay', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
+
+      // fails-when: the rehydration reopens the row before the job-row guard,
+      // so the replay reads the run as live and rolls it up a second time.
+      expect(runUpdatesTo('run-replay', ExecutionRunStatus.enum.running, from)).toHaveLength(0);
+      expect(onStatusChange).not.toHaveBeenCalled();
+      expect(onComplete).toHaveBeenCalledOnce();
+      expect(onWfComplete).toHaveBeenCalledOnce();
+    });
+
+    it('never reopens a run that failed on a build failure', async () => {
+      const { t } = epochTracker();
+      await startRun(t, 'run-build');
+      await t.onJobStatus('run-build', 'job-1', ExecutionJobStatus.enum.running, Date.now());
+      await t.failRun('run-build', 'Build timed out');
+      forgetRun(t, 'run-build');
+      const from = mockDb.updates.length;
+
+      await t.onJobStatus('run-build', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+
+      // breaks-if-wrong: a build failure is intentionally terminal.
+      expect(runUpdatesTo('run-build', ExecutionRunStatus.enum.running, from)).toHaveLength(0);
+    });
+
+    it('forwards generation 0 for a run that never left a terminal status', async () => {
+      const { t, onStatusChange } = epochTracker();
+      await startRun(t, 'run-plain');
+      await t.onJobStatus('run-plain', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+      for (const call of onStatusChange.mock.calls) {
+        expect((call[2] as ExecutionContext).statusEpoch ?? 0).toBe(0);
+      }
+      expect(t.getReplayData().find((r) => r.runId === 'run-plain')?.statusEpoch).toBe(0);
+    });
+
+    const heldArgs = (runId: string) => ({
+      runId,
+      workflowName: 'ci',
+      provider: 'github',
+      repoIdentifier: 'owner/repo',
+      workflowRepoIdentifier: 'owner/repo',
+      ref: 'main',
+      sha: 'abc',
+      deliveryId: null,
+      providerContext: {},
+      routingKey: 'rk',
+      reason: 'registries',
+    });
+
+    it('recordRunHeld forwards held for a live run', async () => {
+      const { t, onStatusChange } = epochTracker();
+      await t.recordRunHeld(heldArgs('run-held-live'));
+      // breaks-if-wrong: a hold on a live run must still reach the Platform.
+      expect(onStatusChange).toHaveBeenCalledWith(
+        'run-held-live',
+        ExecutionRunStatus.enum.held,
+        expect.anything(),
+        0,
+        expect.any(Number),
+      );
+    });
+
+    it('recordRunHeld forwards nothing when its guarded write kept a terminal row', async () => {
+      const { t, onStatusChange } = epochTracker();
+      await startRun(t, 'run-held-done');
+      await t.onJobStatus('run-held-done', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+      onStatusChange.mockClear();
+
+      await t.recordRunHeld(heldArgs('run-held-done'));
+
+      // fails-when: the hold is forwarded although the row stayed terminal — the
+      // Platform's finished run moves back to `held`.
+      expect(onStatusChange).not.toHaveBeenCalled();
     });
   });
 
@@ -2131,6 +2300,8 @@ describe('ExecutionTracker', () => {
         provider: 'github',
         repoIdentifier: 'owner/source-repo',
         workflowRepoIdentifier: 'acme/org-workflows',
+        workflowSha: 'wfsha123',
+        workflowBranch: 'main',
         ref: 'main',
         sha: 'abc',
         deliveryId: 'delivery-1',
@@ -2143,6 +2314,9 @@ describe('ExecutionTracker', () => {
         (i) => i.table === 'execution_runs' && i.values.run_id === 'run-held-global',
       );
       expect(row!.values.workflow_repo_identifier).toBe('acme/org-workflows');
+      // fails-when: the held insert drops the workflow repo's commit or branch
+      expect(row!.values.workflow_sha).toBe('wfsha123');
+      expect(row!.values.workflow_branch).toBe('main');
       expect(row!.values.repo_identifier).toBe('owner/source-repo');
       expect(row!.values.status).toBe(ExecutionRunStatus.enum.held);
 
@@ -2159,6 +2333,8 @@ describe('ExecutionTracker', () => {
         provider: 'github',
         repoIdentifier: 'owner/source-repo',
         workflowRepoIdentifier: 'owner/source-repo',
+        workflowSha: 'wfsha123',
+        workflowBranch: 'main',
         ref: 'main',
         sha: 'abc',
         deliveryId: null,
@@ -2171,8 +2347,74 @@ describe('ExecutionTracker', () => {
         (i) => i.table === 'execution_runs' && i.values.run_id === 'run-held-same',
       );
       expect(row!.values).not.toHaveProperty('workflow_repo_identifier');
+      // breaks-if-wrong: a same-repo hold records no commit or branch even when supplied
+      expect(row!.values).not.toHaveProperty('workflow_sha');
+      expect(row!.values).not.toHaveProperty('workflow_branch');
       const ctx = onStatusChange.mock.calls.at(-1)![2] as ExecutionContext;
       expect(ctx.workflowRepoIdentifier).toBeUndefined();
+    });
+
+    it('recordRunHeld stamps the re-run lineage of a held re-run', async () => {
+      const t = new ExecutionTracker({ db: mockDb.db });
+      await t.recordRunHeld({
+        runId: 'run-held-rerun',
+        workflowName: 'org-ci',
+        provider: 'github',
+        repoIdentifier: 'owner/source-repo',
+        workflowRepoIdentifier: 'acme/org-workflows',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: 'rerun:run-held-rerun',
+        providerContext: {},
+        routingKey: 'rk',
+        reason: 'approval',
+        rerunLineage: { parentRunId: 'run-parent', originalRunId: 'run-root' },
+      });
+
+      const row = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-held-rerun',
+      );
+      // fails-when: a held re-run records no parent, so the run list loses its lineage
+      expect(row!.values.parent_run_id).toBe('run-parent');
+      expect(row!.values.original_run_id).toBe('run-root');
+    });
+
+    it('recordInitFailureRun stamps the re-run lineage and leaves a first run without one', async () => {
+      const t = new ExecutionTracker({ db: mockDb.db });
+      const base = {
+        workflowName: 'org-ci',
+        provider: 'github',
+        repoIdentifier: 'owner/source-repo',
+        workflowRepoIdentifier: 'acme/org-workflows',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        providerContext: {},
+        routingKey: 'rk',
+        initFailure: {
+          scope: 'run' as const,
+          category: InitFailureCategory.enum.secret_resolution,
+          message: 'secret missing',
+        },
+      };
+      await t.recordInitFailureRun({
+        ...base,
+        runId: 'run-init-rerun',
+        rerunLineage: { parentRunId: 'run-parent', originalRunId: 'run-root' },
+      });
+      await t.recordInitFailureRun({ ...base, runId: 'run-init-first' });
+
+      const rerun = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-init-rerun',
+      );
+      expect(rerun!.values.parent_run_id).toBe('run-parent');
+      expect(rerun!.values.original_run_id).toBe('run-root');
+      // breaks-if-wrong: a first run must not gain a lineage column
+      const first = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-init-first',
+      );
+      expect(first!.values).not.toHaveProperty('parent_run_id');
+      expect(first!.values).not.toHaveProperty('original_run_id');
     });
 
     it('a late round-job status does not rehydrate and undo the errored round row', async () => {
@@ -4775,6 +5017,256 @@ describe('ExecutionTracker', () => {
     });
   });
 
+  describe('a held global evaluation round', () => {
+    it('stamps the round marker and the dispatch source on the held row', async () => {
+      // The release and the re-run both branch on the marker, and the release
+      // rebuilds the dispatch pair from the dispatch source.
+      await tracker.recordRunHeld({
+        runId: 'run-held-round',
+        workflowName: '__globaleval__org/ci',
+        provider: 'github',
+        repoIdentifier: 'org/app',
+        workflowRepoIdentifier: 'org/ci',
+        ref: 'main',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        providerContext: {},
+        routingKey: 'github:1',
+        dispatchRoutingKey: 'gitlab:7',
+        reason: 'fork_pr',
+        isGlobalEvalRound: true,
+        heldRoundWorkflows: ['org-scan', 'org-gen'],
+      });
+
+      const insert = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-held-round',
+      );
+      expect(insert!.values).toMatchObject({
+        status: ExecutionRunStatus.enum.held,
+        is_global_eval_round: true,
+        dispatch_routing_key: 'gitlab:7',
+      });
+      // fails-when: the covered workflows are not recorded for the release to check
+      expect(JSON.parse(insert!.values.trigger_decision as string)).toEqual({
+        heldRoundWorkflows: ['org-scan', 'org-gen'],
+      });
+    });
+
+    it('leaves both columns at their defaults on an ordinary held run', async () => {
+      await tracker.recordRunHeld({
+        runId: 'run-held-plain',
+        workflowName: 'wf',
+        provider: 'github',
+        repoIdentifier: 'org/app',
+        workflowRepoIdentifier: 'org/app',
+        ref: 'main',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        providerContext: {},
+        routingKey: 'github:1',
+        reason: 'fork_pr',
+      });
+
+      const insert = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-held-plain',
+      );
+      expect(insert!.values).not.toHaveProperty('is_global_eval_round');
+      expect(insert!.values).not.toHaveProperty('dispatch_routing_key');
+      // breaks-if-wrong: an ordinary held run's decision blob stays null
+      expect(insert!.values.trigger_decision).toBeNull();
+    });
+
+    function settleDb(row: Record<string, unknown> | undefined) {
+      const where = vi.fn();
+      const set = vi.fn();
+      const chain = {
+        where: (...args: unknown[]) => {
+          where(...args);
+          return chain;
+        },
+        returningAll: () => ({ executeTakeFirst: async () => row }),
+      };
+      const db = {
+        updateTable: () => ({
+          set: (values: unknown) => {
+            set(values);
+            return chain;
+          },
+        }),
+      } as unknown as Kysely<Database>;
+      return { db, where, set };
+    }
+
+    const ROUND_ROW = {
+      workflow_name: '__globaleval__org/ci',
+      provider: 'github',
+      repo_identifier: 'org/app',
+      workflow_repo_identifier: 'org/ci',
+      sha: 'abc',
+      routing_key: 'github:1',
+      ref: 'main',
+      started_at: new Date(),
+    };
+
+    it('settles a released round only while its release holds the claim, and forwards the outcome', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const { db, where, set } = settleDb(ROUND_ROW);
+      const t = new ExecutionTracker({ db, onExecutionStatusChange });
+
+      await t.completeReleasedGlobalEvalRound('run-r', {
+        status: ExecutionRunStatus.enum.failed,
+        reason: 'no verdict',
+      });
+
+      // fails-when: a release that did not claim the round settles it
+      expect(where).toHaveBeenCalledWith('status', '=', ExecutionRunStatus.enum.pending);
+      expect(where).toHaveBeenCalledWith('is_global_eval_round', '=', true);
+      expect(set.mock.calls[0][0]).toMatchObject({
+        status: ExecutionRunStatus.enum.failed,
+        failure_reason: 'no verdict',
+      });
+      expect(onExecutionStatusChange.mock.calls[0][1]).toBe(ExecutionRunStatus.enum.failed);
+      expect(onExecutionStatusChange.mock.calls[0][2]).toMatchObject({ isGlobalEvalRound: true });
+    });
+
+    it('counts no execution for a settled success, and marks its frame as a round', async () => {
+      // A round is not an execution: its success frame must not reach the
+      // Platform as an ordinary terminal run, which notifies and fires webhooks.
+      const onExecutionStatusChange = vi.fn();
+      const { db } = settleDb(ROUND_ROW);
+      const t = new ExecutionTracker({ db, onExecutionStatusChange });
+      const counted = vi.mocked(executionsTotal.add);
+      counted.mockClear();
+
+      await t.completeReleasedGlobalEvalRound('run-r', { status: ExecutionRunStatus.enum.success });
+
+      // fails-when: an approved round bumps executions_total{status=success}
+      expect(counted).not.toHaveBeenCalled();
+      expect(onExecutionStatusChange.mock.calls[0][1]).toBe(ExecutionRunStatus.enum.success);
+      expect(onExecutionStatusChange.mock.calls[0][2]).toMatchObject({ isGlobalEvalRound: true });
+    });
+
+    it('marks the held frame of a round as a round', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const t = new ExecutionTracker({ db: mockDb.db as any, onExecutionStatusChange });
+      await t.recordRunHeld({
+        runId: 'run-held-frame',
+        workflowName: '__globaleval__org/ci',
+        provider: 'github',
+        repoIdentifier: 'org/app',
+        workflowRepoIdentifier: 'org/ci',
+        ref: 'main',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        providerContext: {},
+        routingKey: 'github:1',
+        reason: 'fork_pr',
+        isGlobalEvalRound: true,
+      });
+
+      // fails-when: the Platform mirrors the held round as an organization-wide workflow run
+      expect(onExecutionStatusChange.mock.calls[0][2]).toMatchObject({ isGlobalEvalRound: true });
+    });
+
+    it('marks the cancelled frame of a rejected round, and only of a round', async () => {
+      for (const isRound of [true, false]) {
+        const onExecutionStatusChange = vi.fn();
+        const { db } = settleDb({ ...ROUND_ROW, is_global_eval_round: isRound });
+        const t = new ExecutionTracker({ db, onExecutionStatusChange });
+
+        await t.cancelHeldRun('run-r', 'rejected');
+
+        const frame = onExecutionStatusChange.mock.calls[0][2];
+        if (isRound) expect(frame).toMatchObject({ isGlobalEvalRound: true });
+        else expect(frame).not.toHaveProperty('isGlobalEvalRound');
+      }
+    });
+
+    it('claims a held round once', async () => {
+      const where = vi.fn();
+      let updated = 1n;
+      const chain = {
+        where: (...args: unknown[]) => {
+          where(...args);
+          return chain;
+        },
+        executeTakeFirst: async () => {
+          const result = { numUpdatedRows: updated };
+          updated = 0n;
+          return result;
+        },
+      };
+      const db = {
+        updateTable: () => ({
+          set: (values: unknown) => {
+            set(values);
+            return chain;
+          },
+        }),
+      } as unknown as Kysely<Database>;
+      const set = vi.fn();
+      const t = new ExecutionTracker({ db });
+
+      expect(await t.claimHeldGlobalEvalRound('run-r')).toBe(true);
+      // Claimed into `pending`: orphan recovery fails a stale `running` row with no jobs.
+      expect(set).toHaveBeenCalledWith({ status: ExecutionRunStatus.enum.pending });
+      expect(await t.claimHeldGlobalEvalRound('run-r')).toBe(false);
+      // fails-when: the claim is not guarded on the row still being held
+      expect(where).toHaveBeenCalledWith('status', '=', ExecutionRunStatus.enum.held);
+      expect(where).toHaveBeenCalledWith('is_global_eval_round', '=', true);
+    });
+
+    it('cancels a jobless run that is neither terminal nor held and forwards the frame', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const { db, where, set } = settleDb({
+        ...ROUND_ROW,
+        workflow_name: 'ci',
+        workflow_repo_identifier: null,
+        is_global_eval_round: false,
+        failure_reason: 'cancelled by a user',
+      });
+      const t = new ExecutionTracker({ db, onExecutionStatusChange });
+
+      expect(await t.cancelJoblessRun('run-j', 'fallback reason')).toBe(true);
+
+      expect(set.mock.calls[0][0]).toMatchObject({
+        status: ExecutionRunStatus.enum.cancelled,
+        failure_class: RunFailureClass.enum.cancelled,
+      });
+      // fails-when: a held run is cancelled here, leaving its approval request live
+      expect(where).toHaveBeenCalledWith('status', 'not in', [
+        ...TERMINAL_RUN_STATES,
+        ExecutionRunStatus.enum.held,
+      ]);
+      // The no-job-rows guard only a database evaluates is covered against
+      // Postgres in execution-tracker-cancel-jobless.test.ts.
+      expect(where.mock.calls.some((c) => c.length === 1)).toBe(true);
+      expect(onExecutionStatusChange.mock.calls[0][1]).toBe(ExecutionRunStatus.enum.cancelled);
+      expect(onExecutionStatusChange.mock.calls[0][2]).not.toHaveProperty('isGlobalEvalRound');
+      // The reason the cancel already stamped wins.
+      expect(onExecutionStatusChange.mock.calls[0][7]).toBe('cancelled by a user');
+    });
+
+    it('forwards nothing when the jobless cancel matched no row', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const { db } = settleDb(undefined);
+      const t = new ExecutionTracker({ db, onExecutionStatusChange });
+
+      expect(await t.cancelJoblessRun('run-j', 'r')).toBe(false);
+      expect(onExecutionStatusChange).not.toHaveBeenCalled();
+    });
+
+    it('forwards nothing when no held round matched', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const { db } = settleDb(undefined);
+      const t = new ExecutionTracker({ db, onExecutionStatusChange });
+
+      await t.completeReleasedGlobalEvalRound('run-r', { status: ExecutionRunStatus.enum.success });
+
+      expect(onExecutionStatusChange).not.toHaveBeenCalled();
+    });
+  });
+
   describe('failRun with initFailure', () => {
     it('persists init_failure on the run row and forwards it', async () => {
       const onExecutionStatusChange = vi.fn();
@@ -5625,10 +6117,15 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   const WORKFLOW_REPO = 'owner/org-workflows';
   const JOBS = [{ jobId: 'job-1', jobName: 'test' }];
 
+  /** A cross-repo provenance with no commit or branch recorded. */
+  function repoOnly(identifier: string): WorkflowRepoProvenance {
+    return { identifier, sha: null, branch: null };
+  }
+
   function startRun(
     t: ExecutionTracker,
     runId: string,
-    workflowRepoIdentifier: string | null | undefined,
+    workflowRepo: WorkflowRepoProvenance | null | undefined,
   ): Promise<void> {
     return t.onExecutionStarted(
       runId,
@@ -5656,7 +6153,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
       undefined, // triggerActorUserId
       undefined, // triggeredByAgentLabel
       undefined, // prNumber
-      workflowRepoIdentifier,
+      workflowRepo,
     );
   }
 
@@ -5680,7 +6177,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('records and forwards the workflow repo when it differs from the source repo', async () => {
-    await startRun(tracker, 'run-global', WORKFLOW_REPO);
+    await startRun(tracker, 'run-global', repoOnly(WORKFLOW_REPO));
 
     const runInsert = mockDb.inserts.find(
       (i) => i.table === 'execution_runs' && i.values.run_id === 'run-global',
@@ -5694,8 +6191,37 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
     expect(ctx.repoIdentifier).toBe(SOURCE_REPO);
   });
 
+  it('records workflow_sha and workflow_branch for a cross-repo run, and none for a same-repo run', async () => {
+    await startRun(tracker, 'run-global-provenance', {
+      identifier: WORKFLOW_REPO,
+      sha: 'wfsha123',
+      branch: 'main',
+    });
+    const cross = mockDb.inserts.find(
+      (i) => i.table === 'execution_runs' && i.values.run_id === 'run-global-provenance',
+    );
+    // fails-when: the insert drops sha/branch for a cross-repo run
+    expect(cross!.values.workflow_repo_identifier).toBe(WORKFLOW_REPO);
+    expect(cross!.values.workflow_sha).toBe('wfsha123');
+    expect(cross!.values.workflow_branch).toBe('main');
+
+    await startRun(tracker, 'run-same-provenance', {
+      identifier: SOURCE_REPO,
+      sha: 'wfsha123',
+      branch: 'main',
+    });
+    const same = mockDb.inserts.find(
+      (i) => i.table === 'execution_runs' && i.values.run_id === 'run-same-provenance',
+    );
+    // breaks-if-wrong: a same-repo run (identifier === repo) must leave all
+    // three columns to their NULL default, even when a commit and branch are supplied
+    expect(same!.values).not.toHaveProperty('workflow_repo_identifier');
+    expect(same!.values).not.toHaveProperty('workflow_sha');
+    expect(same!.values).not.toHaveProperty('workflow_branch');
+  });
+
   it('keeps forwarding the workflow repo on the terminal frame', async () => {
-    await startRun(tracker, 'run-global-terminal', WORKFLOW_REPO);
+    await startRun(tracker, 'run-global-terminal', repoOnly(WORKFLOW_REPO));
     await tracker.onJobStatus(
       'run-global-terminal',
       'job-1',
@@ -5709,7 +6235,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('carries the workflow repo on the reconnect state replay', async () => {
-    await startRun(tracker, 'run-global-replay', WORKFLOW_REPO);
+    await startRun(tracker, 'run-global-replay', repoOnly(WORKFLOW_REPO));
 
     const replayed = tracker.getReplayData().find((r) => r.runId === 'run-global-replay');
     expect(replayed!.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
@@ -5719,7 +6245,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
     // The load-bearing case: an ordinary per-repository run whose caller passes
     // the same repository for both. Recording it would make "workflow repo
     // present" stop meaning "cross-repo global run".
-    await startRun(tracker, 'run-same', SOURCE_REPO);
+    await startRun(tracker, 'run-same', repoOnly(SOURCE_REPO));
 
     const runInsert = mockDb.inserts.find(
       (i) => i.table === 'execution_runs' && i.values.run_id === 'run-same',
@@ -5796,7 +6322,7 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
       undefined, // triggerActorUserId
       undefined, // triggeredByAgentLabel
       undefined, // prNumber
-      WORKFLOW_REPO,
+      { identifier: WORKFLOW_REPO, sha: null, branch: null },
     );
     // A fresh tracker over the same DB is the restart: `this.runs` is empty, so
     // the next status update must rehydrate from the row above.

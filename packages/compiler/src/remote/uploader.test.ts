@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { list as tarList } from 'tar';
+import { list as tarList, x as tarExtract } from 'tar';
 import {
   createOverlayTarball,
   getSizeWarning,
@@ -50,6 +51,44 @@ async function listTarFiles(tarballPath: string): Promise<string[]> {
     },
   });
   return files;
+}
+
+/** The node-tar entry types an overlay tarball carries. */
+enum TarEntryType {
+  File = 'File',
+  SymbolicLink = 'SymbolicLink',
+}
+
+/** Every tarball entry path mapped to its node-tar entry type. */
+async function listTarEntries(tarballPath: string): Promise<Map<string, string>> {
+  const entries = new Map<string, string>();
+  await tarList({
+    file: tarballPath,
+    onReadEntry: (entry) => {
+      entries.set(entry.path, entry.type);
+    },
+  });
+  return entries;
+}
+
+/** Tarball entries other than the overlay manifest. */
+function contentEntries(entries: Map<string, string>): string[] {
+  return [...entries.keys()].filter((p) => !p.startsWith('.kici-overlay-tmp/')).sort();
+}
+
+function sha256Of(content: string): string {
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/** Stage and commit every change in `dir`. */
+function commitAll(dir: string): void {
+  execSync('git add -A && git commit -qm change', { cwd: dir, stdio: 'ignore' });
+}
+
+/** Point the symlink at `rel` somewhere else. */
+async function relink(dir: string, rel: string, text: string): Promise<void> {
+  await fs.unlink(path.join(dir, rel));
+  await fs.symlink(text, path.join(dir, rel));
 }
 
 describe('overlay tarball creation', () => {
@@ -365,6 +404,283 @@ describe('overlay tarball creation', () => {
       } finally {
         await fs.rm(noRemoteDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('symlinks', () => {
+    const scratch: string[] = [];
+
+    afterEach(async () => {
+      await Promise.all(scratch.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+    });
+
+    async function tempDir(prefix: string): Promise<string> {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+      scratch.push(dir);
+      return dir;
+    }
+
+    /** Extract the tarball the way the agent does, returning the real extraction root. */
+    async function extract(tarballPath: string): Promise<string> {
+      const dir = await tempDir('kici-uploader-extract-');
+      await tarExtract({ file: tarballPath, cwd: dir });
+      return fs.realpath(dir);
+    }
+
+    async function write(rel: string, content: string): Promise<void> {
+      await fs.mkdir(path.dirname(path.join(repoDir, rel)), { recursive: true });
+      await fs.writeFile(path.join(repoDir, rel), content);
+    }
+
+    it('ships the unchanged target of a changed file symlink (overlay mode)', async () => {
+      await write('docs/a.yaml', 'a: 1\n');
+      await write('docs/b.yaml', 'b: 2\n');
+      await fs.mkdir(path.join(repoDir, 'site'));
+      await fs.symlink('../docs/a.yaml', path.join(repoDir, 'site/alerts.yaml'));
+      commitAll(repoDir);
+      await relink(repoDir, 'site/alerts.yaml', '../docs/b.yaml');
+
+      const { tarballPath, manifest, summary } = await createOverlayTarball(repoDir);
+
+      const entries = await listTarEntries(tarballPath);
+      // fails-when: only the changed link ships, and the agent's realpath finds no target
+      expect(entries.get('docs/b.yaml')).toBe(TarEntryType.File);
+      expect(entries.get('site/alerts.yaml')).toBe(TarEntryType.SymbolicLink);
+      expect(contentEntries(entries)).toEqual(['docs/b.yaml', 'site/alerts.yaml']);
+      expect(manifest.checksums['docs/b.yaml']).toBe(sha256Of('b: 2\n'));
+      expect(manifest.checksums['site/alerts.yaml']).toBe(sha256Of('b: 2\n'));
+      // The shipped target is not a change the developer made.
+      expect(summary.modifiedFiles).toBe(1);
+
+      // The agent's precondition: the link resolves to a regular file inside the extraction.
+      const root = await extract(tarballPath);
+      expect(await fs.realpath(path.join(root, 'site/alerts.yaml'))).toBe(
+        path.join(root, 'docs/b.yaml'),
+      );
+    });
+
+    it('ships every in-repository link on the way to the file', async () => {
+      // entry -> hop -> d/file.txt, where d -> real is a directory link.
+      await write('real/file.txt', 'deep\n');
+      await write('other.txt', 'other\n');
+      await fs.symlink('real', path.join(repoDir, 'd'));
+      await fs.symlink('d/file.txt', path.join(repoDir, 'hop'));
+      await fs.symlink('other.txt', path.join(repoDir, 'entry'));
+      commitAll(repoDir);
+      await relink(repoDir, 'entry', 'hop');
+
+      const { tarballPath, manifest } = await createOverlayTarball(repoDir);
+
+      const entries = await listTarEntries(tarballPath);
+      expect(contentEntries(entries)).toEqual(['d', 'entry', 'hop', 'real/file.txt']);
+      expect(entries.get('d')).toBe(TarEntryType.SymbolicLink);
+      expect(manifest.symlinks).toEqual({ d: 'real' });
+      expect(manifest.checksums).toEqual({
+        entry: sha256Of('deep\n'),
+        hop: sha256Of('deep\n'),
+        'real/file.txt': sha256Of('deep\n'),
+      });
+      const root = await extract(tarballPath);
+      expect(await fs.readFile(path.join(root, 'entry'), 'utf-8')).toBe('deep\n');
+    });
+
+    it('does not ship a link target outside the repository', async () => {
+      const outside = await tempDir('kici-uploader-outside-');
+      await fs.writeFile(path.join(outside, 'host.txt'), 'host\n');
+      await write('inside.txt', 'in\n');
+      await fs.symlink('inside.txt', path.join(repoDir, 'abs.txt'));
+      await fs.symlink('inside.txt', path.join(repoDir, 'rel.txt'));
+      commitAll(repoDir);
+      await relink(repoDir, 'abs.txt', path.join(outside, 'host.txt'));
+      await relink(repoDir, 'rel.txt', path.relative(repoDir, path.join(outside, 'host.txt')));
+
+      const { tarballPath, manifest } = await createOverlayTarball(repoDir);
+
+      // breaks-if-wrong: shipping these targets would copy a host file into the upload
+      expect(contentEntries(await listTarEntries(tarballPath))).toEqual(['abs.txt', 'rel.txt']);
+      expect(Object.keys(manifest.checksums).sort()).toEqual(['abs.txt', 'rel.txt']);
+    });
+
+    it('does not ship a link target that .gitignore or .kiciignore excludes', async () => {
+      await write('.gitignore', '.env.local\n');
+      await write('.kiciignore', 'private/**\n');
+      await write('defaults.env', 'A=1\n');
+      await write('private/notes.txt', 'notes\n');
+      await fs.symlink('defaults.env', path.join(repoDir, 'active.env'));
+      await fs.symlink('defaults.env', path.join(repoDir, 'notes.txt'));
+      commitAll(repoDir);
+      await write('.env.local', 'TOKEN=secret\n');
+      await relink(repoDir, 'active.env', '.env.local');
+      await relink(repoDir, 'notes.txt', 'private/notes.txt');
+
+      const { tarballPath } = await createOverlayTarball(repoDir);
+
+      // fails-when: a tracked link carries an ignored file (here a secret) into the upload
+      expect(contentEntries(await listTarEntries(tarballPath))).toEqual([
+        'active.env',
+        'notes.txt',
+      ]);
+    });
+
+    it('omits the symlinks field when no directory symlink ships', async () => {
+      await write('plain.txt', 'plain\n');
+      const { manifest } = await createOverlayTarball(repoDir);
+      expect(manifest).not.toHaveProperty('symlinks');
+    });
+
+    it('ships a directory symlink as its link text (full working tree)', async () => {
+      await write('shared/a.txt', 'a\n');
+      await fs.symlink('shared', path.join(repoDir, 'lib'));
+      commitAll(repoDir);
+
+      // fails-when: the directory behind the link is checksummed (EISDIR)
+      const { tarballPath, manifest } = await createOverlayTarball(repoDir, {
+        fullWorkingTree: true,
+      });
+
+      expect(manifest.symlinks).toEqual({ lib: 'shared' });
+      // An agent that predates `symlinks` reads only checksums and deletions: the
+      // link is absent there, so it skips the link instead of failing on it.
+      expect(manifest.checksums).not.toHaveProperty('lib');
+      expect(manifest.deletions).not.toContain('lib');
+      expect(manifest.checksums['shared/a.txt']).toBe(sha256Of('a\n'));
+      // git tracks nothing beneath a link, and the overlay adds nothing beneath it.
+      expect(Object.keys(manifest.checksums).some((f) => f.startsWith('lib/'))).toBe(false);
+      expect((await listTarEntries(tarballPath)).get('lib')).toBe(TarEntryType.SymbolicLink);
+    });
+
+    it('ships a changed directory symlink as its link text (overlay mode)', async () => {
+      await write('shared/a.txt', 'a\n');
+      await write('shared2/b.txt', 'b\n');
+      await fs.symlink('shared', path.join(repoDir, 'lib'));
+      commitAll(repoDir);
+      await relink(repoDir, 'lib', 'shared2');
+
+      const { manifest, summary } = await createOverlayTarball(repoDir);
+
+      expect(manifest.symlinks).toEqual({ lib: 'shared2' });
+      expect(manifest.checksums).toEqual({});
+      expect(manifest.deletions).toEqual([]);
+      expect(summary.fileCount).toBe(1);
+    });
+
+    it('ships a directory symlink leaving the repository as its text for the agent to refuse', async () => {
+      const outside = await tempDir('kici-uploader-outside-');
+      await write('keep.txt', 'keep\n');
+      await fs.symlink(path.relative(repoDir, outside), path.join(repoDir, 'lib'));
+      commitAll(repoDir);
+
+      const { manifest } = await createOverlayTarball(repoDir, { fullWorkingTree: true });
+
+      expect(manifest.symlinks).toEqual({ lib: path.relative(repoDir, outside) });
+    });
+
+    it('deletes the files of a directory replaced by a symlink', async () => {
+      await write('lib/a.txt', 'a\n');
+      await write('lib/sub/b.txt', 'b\n');
+      // The same names under the link target: read through the new link, they
+      // would look like existing files.
+      await write('shared/a.txt', 'a\n');
+      await write('shared/sub/b.txt', 'b\n');
+      commitAll(repoDir);
+      await fs.rm(path.join(repoDir, 'lib'), { recursive: true });
+      await fs.symlink('shared', path.join(repoDir, 'lib'));
+
+      const { manifest } = await createOverlayTarball(repoDir);
+
+      // fails-when: lib/a.txt is read through the new link and shipped as content
+      expect(manifest.checksums).toEqual({});
+      expect([...manifest.deletions].sort()).toEqual(['lib/a.txt', 'lib/sub/b.txt']);
+      expect(manifest.symlinks).toEqual({ lib: 'shared' });
+    });
+
+    it('deletes a directory symlink replaced by a real directory, and ships its files', async () => {
+      await write('shared/a.txt', 'a\n');
+      await fs.symlink('shared', path.join(repoDir, 'lib'));
+      commitAll(repoDir);
+      await fs.unlink(path.join(repoDir, 'lib'));
+      await write('lib/x.txt', 'x\n');
+
+      for (const fullWorkingTree of [false, true]) {
+        // fails-when: the real directory `lib` is checksummed as a file (EISDIR)
+        const { manifest, warnings } = await createOverlayTarball(repoDir, { fullWorkingTree });
+
+        expect(manifest.deletions).toContain('lib');
+        expect(manifest.checksums['lib/x.txt']).toBe(sha256Of('x\n'));
+        expect(manifest.checksums).not.toHaveProperty('lib');
+        expect(warnings).toEqual([]);
+      }
+    });
+
+    it('skips a submodule and warns that its files are not uploaded', async () => {
+      const subRepo = await tempDir('kici-uploader-sub-');
+      execSync('git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m s', {
+        cwd: subRepo,
+      });
+      execSync(`git -c protocol.file.allow=always submodule -q add ${subRepo} vendor/sub`, {
+        cwd: repoDir,
+        stdio: 'ignore',
+      });
+      commitAll(repoDir);
+
+      // fails-when: the submodule directory is checksummed as a file (EISDIR)
+      const { manifest, warnings } = await createOverlayTarball(repoDir, {
+        fullWorkingTree: true,
+      });
+
+      expect(manifest.checksums).not.toHaveProperty('vendor/sub');
+      expect(manifest.deletions).not.toContain('vendor/sub');
+      expect(manifest.checksums).toHaveProperty('.gitmodules');
+      expect(warnings).toHaveLength(1);
+      expect(warnings).toEqual([
+        'Not uploading the files of these submodules: vendor/sub. ' +
+          'The remote workspace does not contain them.',
+      ]);
+    });
+
+    it('skips an untracked nested repository and warns about it', async () => {
+      execSync('git init -q nested', { cwd: repoDir });
+
+      const { manifest, warnings } = await createOverlayTarball(repoDir, {
+        fullWorkingTree: true,
+      });
+
+      expect(Object.keys(manifest.checksums).some((f) => f.startsWith('nested'))).toBe(false);
+      // fails-when: an untracked nested repository is reported as a submodule
+      expect(warnings).toEqual([
+        'Not uploading the files of these nested git repositories: nested. ' +
+          'The remote workspace does not contain them.',
+      ]);
+    });
+
+    it('keeps a dangling tracked symlink out of the upload and warns about it', async () => {
+      await fs.symlink('missing.txt', path.join(repoDir, 'dangling'));
+      commitAll(repoDir);
+
+      const { tarballPath, manifest, warnings } = await createOverlayTarball(repoDir, {
+        fullWorkingTree: true,
+      });
+
+      expect(contentEntries(await listTarEntries(tarballPath))).not.toContain('dangling');
+      expect(manifest.checksums).not.toHaveProperty('dangling');
+      // fails-when: the link is dropped without telling the developer
+      expect(warnings).toEqual([
+        'Not uploading these symbolic links, whose target does not exist: dangling. ' +
+          'The remote workspace does not contain them.',
+      ]);
+    });
+
+    it('lists a deleted directory symlink as a deletion of the link', async () => {
+      await write('shared/a.txt', 'a\n');
+      await fs.symlink('shared', path.join(repoDir, 'lib'));
+      commitAll(repoDir);
+      await fs.unlink(path.join(repoDir, 'lib'));
+
+      const { manifest } = await createOverlayTarball(repoDir);
+
+      expect(manifest.deletions).toEqual(['lib']);
+      expect(manifest.checksums).toEqual({});
+      expect(manifest).not.toHaveProperty('symlinks');
     });
   });
 

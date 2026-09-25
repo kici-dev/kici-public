@@ -51,7 +51,11 @@ export KICI_SECRET_KEY=a1b2c3d4e5f6...  # 64 hex characters
 
 **Cluster requirement:** All orchestrators in a cluster MUST share the same `KICI_SECRET_KEY`. Secrets encrypted by one orchestrator must be decryptable by all others.
 
+**Stored job secrets:** a job that waits in the orchestrator database carries the secrets resolved for it. This covers a job in the dispatch queue, a job waiting for approval or for its upstream jobs, and a run held before its jobs dispatch. The orchestrator encrypts these fields with `KICI_SECRET_KEY` before it writes them: context and run secrets, install secrets, npm registry tokens, container registry credentials, and the key that opens a `kici run` overlay. Every other field stays readable. After a queued job reaches a final state, the next cleanup pass deletes its encrypted secrets. A stored job whose secrets no configured key opens fails with an error that names the decryption failure. It is never dispatched without its secrets.
+
 **When the key is not set:** the secrets subsystem is disabled and the orchestrator logs a warning at startup. The dashboard's secrets page then lists nothing, and any attempt to set or delete a secret is refused with _"Secrets are unavailable in this deployment: the orchestrator has no secret store configured."_ The refusal is deliberate — a write that appeared to succeed would leave the operator believing a credential is stored (or revoked) when the orchestrator has nowhere to keep it.
+
+Without the key, the secrets of queued and waiting jobs are stored unencrypted. A second startup warning names `KICI_SECRET_KEY` as the setting that encrypts them.
 
 ### KICI_SECRET_KEY_FILE (alternative)
 
@@ -208,6 +212,8 @@ kici-admin context bind --org <org-id> --env production --scope "aws/prod/**"
 ```
 
 (the flag is still spelled `--env`; its value is the context name.)
+
+A context needs at least one binding to deliver secrets. A job whose declared context resolves to a fixed or glob context with no binding receives none of the context's secrets, and `ctx.secrets.get()` throws when a step reads one. `kici-admin context create` and `kici-admin secret set` print a warning on stderr when the fixed or glob context they touch has no binding. The warning names the `context bind` command to run. It does not change the exit code. When the orchestrator dispatches a job that lists such a context, it logs the warning `Job binds a context that has no scope binding; it receives no secrets from it` with the organization, context, run, and job as fields. The job still dispatches.
 
 ```bash
 curl -X POST $KICI_ADMIN_URL/api/v1/admin/contexts/production/bind \
@@ -427,7 +433,7 @@ KiCI supports zero-downtime master key rotation using a dual-key mechanism. Duri
 
 ### What the master key wraps
 
-Seven stores use `KICI_SECRET_KEY`. `rotate-key` sweeps all seven, and each has a dual-key read so it stays available for the whole transition window:
+The stores below use `KICI_SECRET_KEY`. `rotate-key` sweeps every one of them, and each has a dual-key read so it stays available for the whole transition window:
 
 | Store                       | Holds                                     | Losing it costs                                    |
 | --------------------------- | ----------------------------------------- | -------------------------------------------------- |
@@ -438,6 +444,7 @@ Seven stores use `KICI_SECRET_KEY`. `rotate-key` sweeps all seven, and each has 
 | `dashboard_encryption_keys` | the dashboard-encryption private key      | every browser-sealed dashboard write               |
 | `run_ephemeral_keys`        | per-run X25519 private keys               | secret outputs for every run in flight             |
 | `run_secret_outputs`        | values published by `ctx.setSecretOutput` | downstream `needs:` reads and the dashboard reveal |
+| stored job secrets          | the secrets of queued and waiting jobs    | dispatch of every job queued or waiting on its key |
 
 A signing key the orchestrator cannot open does not stop it from starting. The key is loaded on the first mint, so the orchestrator boots and logs `provenance signing key cannot be loaded; mints will defer until fixed` with the recovery text, once. Every provenance mint then defers into the retry queue until the key opens again — the same queue `kici-admin attestations retry` drains. Watch that queue: with signing enabled, a queue that only grows after a rotation is this failure.
 
@@ -477,6 +484,20 @@ Restart orchestrators one at a time. During the restart window, instances with t
 
 The orchestrator logs `Old master key configured — dual-key decrypt and true rotation enabled` when it detects the old key.
 
+A restarted orchestrator encrypts the secrets of the jobs it queues with the **new** key. An orchestrator not yet restarted holds only the old key, so it cannot open them. When such an orchestrator claims one of these jobs, it puts the job back in the queue and logs `Queued job is sealed with a master key this coordinator does not hold`. An orchestrator that holds the new key can then take the job. The orchestrator that put the job back stops offering it for the sealed-secrets back-off (`--sealed-secrets-retry-backoff-ms` in [cluster settings](../orchestrator/cluster-settings.md), 1 minute by default), and then offers it again like any other job. Each hand-back spends one of the job's dispatch attempts, so finish the rolling restart promptly.
+
+If no orchestrator holds the key, the job fails with an error that says to finish the key rotation on every coordinator. An orchestrator with no other coordinator connected fails the job the first time it claims it. It counts a coordinator whose link dropped briefly as still connected, for the reroute flap grace (`--reroute-flap-grace-ms`). In a cluster the job fails after it runs out of dispatch attempts. If its queue timeout comes first after a hand-back, the timeout reports the same error. A job that waits for approval or for its upstream jobs is never handed to another orchestrator. If an orchestrator without the new key releases it, the job fails with the same error.
+
+Plan the rolling restart around the attempt budget of a queued job. A queued job gets 5 dispatch attempts, and each claim by an orchestrator without the new key spends one. A job that only one such orchestrator offers fails at most about four back-offs after its first hand-back: about 4 minutes at the 1-minute default. A job fails sooner when:
+
+- An orchestrator without the new key puts the job back for another reason, such as an agent reject, and then hands it back at once. Each of the two steps spends an attempt.
+- Several orchestrators hold only the old key. Each one keeps its own back-off, so each one can spend an attempt in the same back-off.
+- The job already spent attempts on agent rejects or acknowledgement timeouts.
+
+The Raft leader runs the periodic sweep that offers waiting jobs to the auto-scaler. While the leader holds only the old key, the sweep hands back each job it cannot open. Restart the current leader first: `GET /cluster/health` names it in `leaderId` (see [health endpoints](../orchestrator/clustering.md#health-endpoints)). A restart moves leadership to another orchestrator, which can still hold only the old key. Check the leader again before each restart, and restart it next while it holds only the old key. If the rolling restart can take longer than the budget, raise `--sealed-secrets-retry-backoff-ms` for the rotation. Size it for the number of orchestrators that hold only the old key. With N of them, a job can spend N attempts per back-off, so set the back-off to at least N times the restart time, divided by 4. N is highest after the first restart, when it is the cluster size minus one. Reset it with `kici-admin cluster-settings reset --sealed-secrets-retry-backoff-ms` when the rotation is done.
+
+**Order matters:** restart every orchestrator with both keys before you run step 4, and remove the old key (step 5) only after every orchestrator runs with the new key.
+
 **Step 4: Re-encrypt all secrets with the new key**
 
 Once all instances are running with both keys configured:
@@ -502,9 +523,10 @@ Re-encrypted 1 provenance signing keys.
 Re-encrypted 1 dashboard encryption keys.
 Re-encrypted 3 run ephemeral keys.
 Re-encrypted 5 run secret outputs.
+Re-encrypted 4 stored job secrets.
 ```
 
-Each sweep decrypts with the old key, re-encrypts with the new key, and bumps the row's key version to `max + 1`. Historical rows in `config_versions` are also re-sealed, so subsequent `kici-admin config rollback` calls work after the old key is retired. The two key tables sweep **every** row, not only the active one — a retiring or revoked key must still unwrap for the bundles and writes that were sealed to it.
+Each sweep decrypts with the old key, re-encrypts with the new key, and bumps the row's key version to `max + 1`. The stored job secrets are the exception: they keep a fixed key version, and a read tries the current key and then the old one. Historical rows in `config_versions` are also re-sealed, so subsequent `kici-admin config rollback` calls work after the old key is retired. The two key tables sweep **every** row, not only the active one — a retiring or revoked key must still unwrap for the bundles and writes that were sealed to it.
 
 Each sweep has its own transaction so a problem in one cannot roll back a successful rotation of another. A row that neither key opens is counted and left in place rather than aborting the sweep:
 
@@ -518,13 +540,13 @@ sealed under a key that is no longer configured.
 
 **Step 5: Remove the old key**
 
-First confirm step 4 reported **zero skips across every store**. Then remove `KICI_SECRET_KEY_OLD` (or `KICI_SECRET_KEY_FILE_OLD`) from the configuration and do another rolling restart. All seven stores are now encrypted with the new key only.
+First confirm step 4 reported **zero skips across every store**. Then remove `KICI_SECRET_KEY_OLD` (or `KICI_SECRET_KEY_FILE_OLD`) from the configuration and do another rolling restart. Every store is now encrypted with the new key only.
 
 Verify the restart came up clean: the orchestrator serves `/.well-known/jwks.json` with the same `kid` it served before the rotation, and the log carries no `provenance signing key cannot be loaded` line. A signing key the sweep missed does not fail the boot — the public half still serves, so the JWKS looks right — it defers every mint, and that log line is where it shows.
 
 ### Same-key re-encryption
 
-When `KICI_SECRET_KEY_OLD` is **not** set, `rotate-key` re-encrypts every store with the same master key at an incremented key version (`keyVersion = max + 1`). This is useful for periodic re-encryption without changing the actual key.
+When `KICI_SECRET_KEY_OLD` is **not** set, `rotate-key` re-encrypts every store with the same master key at an incremented key version (`keyVersion = max + 1`). The stored job secrets keep their fixed key version; only their ciphertext changes. This is useful for periodic re-encryption without changing the actual key.
 
 ### Self-heal and stranded-store recovery
 
@@ -569,7 +591,7 @@ A compromise means the attacker can decrypt every current ciphertext — so the 
 
 1. **Rotate the upstream credentials first.** Invalidate the leaked plaintexts at their source: regenerate the Platform token, rotate the orchestrator bootstrap admin token, and rotate any third-party credentials stored in `scoped_secrets` (database passwords, provider API keys, webhook signing keys, etc.). Update the corresponding `scoped_secrets` rows via `kici-admin` with the new plaintext.
 2. **Generate a new `KICI_SECRET_KEY` and set the old one as `KICI_SECRET_KEY_OLD`.** Rolling-restart all orchestrator instances with both keys configured (same as Step 3 of the normal procedure).
-3. **Run `kici-admin rotate-key`.** Verify the output reports non-zero counts for every populated store — all seven lines, not just the first three — and that each matches your expectation. A mismatch, or any non-zero skipped count, is a red flag; do not proceed. A zero for `provenance signing keys` on a deployment with signing enabled means the sweep did not reach the key that the next boot has to unwrap.
+3. **Run `kici-admin rotate-key`.** Verify the output reports non-zero counts for every populated store — every line, not just the first three — and that each matches your expectation. A mismatch, or any non-zero skipped count, is a red flag; do not proceed. A zero for `provenance signing keys` on a deployment with signing enabled means the sweep did not reach the key that the next boot has to unwrap.
 4. **Remove the old key.** Unset `KICI_SECRET_KEY_OLD` / `KICI_SECRET_KEY_FILE_OLD` and rolling-restart again. The leaked key is now retired.
 5. **Audit.** Query the orchestrator audit log over HTTP for the rotation entry and confirm the metadata shows the expected counts:
 
@@ -578,7 +600,7 @@ A compromise means the attacker can decrypt every current ciphertext — so the 
      -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
    ```
 
-   Each entry carries a `reEncrypted*` figure per store — `reEncrypted` / `reEncryptedConfigs` / `reEncryptedBackends` / `reEncryptedSigningKeys` / `reEncryptedDashboardKeys` / `reEncryptedEphemeralKeys` / `reEncryptedSecretOutputs` — and a `skipped*` counterpart for each of them except `scoped_secrets`, whose sweep reports no skip figure. If a count drops to zero unexpectedly on the second pass (step 4 would surface this), or any skipped count is non-zero, investigate before declaring rotation complete.
+   Each entry carries a `reEncrypted*` figure per store — `reEncrypted` / `reEncryptedConfigs` / `reEncryptedBackends` / `reEncryptedSigningKeys` / `reEncryptedDashboardKeys` / `reEncryptedEphemeralKeys` / `reEncryptedSecretOutputs` / `reEncryptedJobSecrets` — and a `skipped*` counterpart for each of them except `scoped_secrets`, whose sweep reports no skip figure. If a count drops to zero unexpectedly on the second pass (step 4 would surface this), or any skipped count is non-zero, investigate before declaring rotation complete.
 
 The critical difference from a scheduled rotation: you rotate the _upstream_ secrets before the master key, because a compromised master key has already leaked every current plaintext — rotating the master key alone only invalidates the ciphertext, not the secrets the ciphertext protected.
 

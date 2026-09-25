@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { handleRerun, settlePendingRoundReevaluations, type RerunDeps } from './rerun.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
@@ -45,6 +45,25 @@ vi.mock('./process-webhook.js', async (importOriginal) => {
     ...actual,
     dispatchGlobalWorkflowsForOtherRepos: (args: Record<string, unknown>) =>
       globalsPass.impl!(args),
+  };
+});
+
+// The shared pipeline is what a cross-repository global re-run dispatches
+// through. Stubbed so the tests observe the context the re-run hands it — the
+// recorded commits, the lineage, the job list — rather than re-testing the
+// pipeline. Unset, every call reaches the real implementation.
+const pipeline = vi.hoisted(() => ({
+  spy: null as null | ((ctx: Record<string, unknown>) => Promise<unknown>),
+}));
+
+vi.mock('./dispatch-matched-workflow.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./dispatch-matched-workflow.js')>();
+  return {
+    ...actual,
+    dispatchMatchedWorkflow: (ctx: Parameters<typeof actual.dispatchMatchedWorkflow>[0]) =>
+      pipeline.spy
+        ? pipeline.spy(ctx as unknown as Record<string, unknown>)
+        : actual.dispatchMatchedWorkflow(ctx),
   };
 });
 
@@ -411,64 +430,365 @@ describe('handleRerun', () => {
     /**
      * `repo_identifier` names the repository the run acted on. For an
      * organization-wide workflow that is the SOURCE repository, while the
-     * workflow itself lives in `workflow_repo_identifier`. Everything below
-     * `loadAndValidateOriginalRun` resolves the workflow out of
-     * `repo_identifier`'s lock file, so a rerun would fetch the wrong repo.
+     * workflow itself lives in `workflow_repo_identifier` at `workflow_sha`.
+     *
+     * The row also carries the `event_log` columns (`org_id`, `event`,
+     * `action`): the mock DB serves this one row to every select whose
+     * predicates it satisfies, including the delivery lookup.
      */
+    const SOURCE_REPO = 'org/app';
+    const WORKFLOW_REPO = 'org/ci';
+    const WORKFLOW_ROUTING_KEY = 'github:ci';
     const GLOBAL_RUN = {
       ...TERMINAL_RUN,
       workflow_name: 'org-ci',
-      repo_identifier: 'owner/source-repo',
-      workflow_repo_identifier: 'owner/org-workflows',
+      repo_identifier: SOURCE_REPO,
+      sha: 's1',
+      workflow_repo_identifier: WORKFLOW_REPO,
+      workflow_sha: 'a1',
+      workflow_branch: 'main',
+      customer_id: 'org-1',
+      org_id: 'org-1',
+      original_run_id: null,
+      event: 'push',
+      action: null,
     };
+    const REG_PROVIDER_CONTEXT = { installationId: 7 };
 
-    it('is refused, naming both repositories', async () => {
+    /** A global workflow's lock entry: one static job and one generator. */
+    function globalEntry(jobName: string) {
+      return {
+        name: 'org-ci',
+        source: { file: '.kici/workflows/org-ci.ts' },
+        hasFilter: true,
+        triggers: [{ _type: 'push', repos: ['org/*'] }],
+        jobs: [
+          {
+            _type: 'static',
+            name: jobName,
+            runsOn: [{ kind: 'exact', value: 'default' }],
+            steps: [{ name: 'run', run: 'true' }],
+            needs: [],
+          },
+          { _type: 'dynamic', name: 'gen', source: '.kici/workflows/org-ci.ts' },
+        ],
+      };
+    }
+
+    let workflowBundle: ReturnType<typeof createMockProviderBundle> & {
+      cloneTokenProvider: { createCloneToken: Mock };
+    };
+    let registration: Record<string, unknown>;
+    let getAllByOrgAndRepo: Mock;
+    let dispatched: Mock<(ctx: Record<string, unknown>) => Promise<unknown>>;
+
+    beforeEach(() => {
+      workflowBundle = {
+        ...createMockProviderBundle(),
+        cloneTokenProvider: { createCloneToken: vi.fn().mockResolvedValue('wf-token') },
+      };
+      workflowBundle.lockFileFetcher.fetchLockFile.mockResolvedValue({
+        version: 2,
+        workflows: [globalEntry('lint-at-a1')],
+      });
+      (deps.providerRegistry as any).getByRoutingKey = vi.fn((key: string) =>
+        key === WORKFLOW_ROUTING_KEY ? workflowBundle : providerBundle,
+      );
+      providerBundle.normalizer.normalizeEvent.mockReturnValue({
+        type: 'push',
+        payload: PAYLOAD,
+        targetBranch: 'main',
+        provider: 'github',
+      });
+      // The workflow repository has moved on to `b2` since the run.
+      registration = {
+        id: 'reg-1',
+        repoIdentifier: WORKFLOW_REPO,
+        workflowName: 'org-ci',
+        lockEntry: globalEntry('lint-at-b2'),
+        triggerTypes: ['push'],
+        routingKey: WORKFLOW_ROUTING_KEY,
+        providerContext: REG_PROVIDER_CONTEXT,
+        disabled: false,
+        isGlobal: true,
+        customerId: 'org-1',
+        commitSha: 'b2',
+        defaultBranch: 'main',
+        sourceFile: '.kici/workflows/org-ci.ts',
+      };
+      getAllByOrgAndRepo = vi.fn(() => [registration]);
+      deps.processingDeps = () => ({ registrationIndex: { getAllByOrgAndRepo } }) as any;
+      dispatched = vi
+        .fn<(ctx: Record<string, unknown>) => Promise<unknown>>()
+        .mockResolvedValue({});
+      pipeline.spy = dispatched;
       deps.db = makeMockDb(GLOBAL_RUN) as any;
+    });
 
-      await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
-        /Cannot re-run an organization-wide workflow: 'org-ci' is defined in owner\/org-workflows but this run executed against owner\/source-repo/,
+    afterEach(() => {
+      pipeline.spy = null;
+    });
+
+    it('re-runs a cross-repo global run against its recorded workflow commit', async () => {
+      // fails-when: re-run is refused, or loads the lock at the registration's current commit
+      const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-g1');
+
+      expect(workflowBundle.lockFileFetcher.fetchLockFile).toHaveBeenCalledWith(
+        WORKFLOW_REPO,
+        'a1',
+        REG_PROVIDER_CONTEXT,
+      );
+      // The source repository's lock file is never read: its same-named
+      // workflow is not the one this run executed.
+      expect(providerBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
+      expect(getAllByOrgAndRepo).toHaveBeenCalledWith('org-1', WORKFLOW_REPO);
+
+      expect(dispatched).toHaveBeenCalledTimes(1);
+      const ctx = dispatched.mock.calls[0][0] as any;
+      expect(ctx.runId).toBe(result.newRunId);
+      expect(ctx.ref).toBe('s1');
+      expect(ctx.repoIdentifier).toBe(SOURCE_REPO);
+      expect(ctx.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
+      expect(ctx.global.workflowSha).toBe('a1');
+      expect(ctx.global.workflowBranch).toBe('main');
+      expect(ctx.global.workflowRoutingKey).toBe(WORKFLOW_ROUTING_KEY);
+      expect(ctx.global.workflowBundle).toBe(workflowBundle);
+      expect(ctx.global.workflowCredentials).toEqual({
+        ...REG_PROVIDER_CONTEXT,
+        token: 'wf-token',
+      });
+      // The recorded version's static job, not the current one's; the
+      // generator and the already-decided filter are not replayed.
+      expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['lint-at-a1']);
+      expect(ctx.workflow.hasFilter).toBeUndefined();
+      expect(ctx.rerunLineage).toEqual({
+        parentRunId: 'original-run-123',
+        originalRunId: 'original-run-123',
+      });
+      expect(ctx.triggerEventOverride).toBe('rerun');
+      expect(ctx.triggeredBy).toBe('user@test.com');
+      expect(ctx.info.deliveryId).toBe(`rerun:${result.newRunId}`);
+      expect(ctx.info.event).toBe('push');
+      expect(ctx.event.sourceRepo).toBe(SOURCE_REPO);
+      expect(ctx.securityDecision).toEqual({ action: 'pass' });
+      expect(logStorage.append).toHaveBeenCalledWith(
+        `executions/${result.newRunId}/webhook-payload.json`,
+        JSON.stringify(PAYLOAD),
+      );
+      expect(eventRouter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({ eventName: 'workflow.rerun' }),
       );
     });
 
-    it('is refused BEFORE anything is fetched, claimed or dispatched', async () => {
-      deps.db = makeMockDb(GLOBAL_RUN) as any;
+    it('uses the registration lock entry without fetching when it is at the recorded commit', async () => {
+      // fails-when: a registration already at the recorded commit is fetched again
+      registration.commitSha = 'a1';
 
-      await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
-        /Cannot re-run an organization-wide workflow/,
+      await handleRerun('original-run-123', null, null, deps, 'req-g2');
+
+      expect(workflowBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
+      const ctx = dispatched.mock.calls[0][0] as any;
+      expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['lint-at-b2']);
+    });
+
+    it('probes the dependency cache with the key of the lock file at the recorded commit', async () => {
+      // fails-when: the re-run keys the dependency cache with the registration's current lock file,
+      //   restoring dependencies built for a commit the re-run does not check out
+      registration.lockfileHash = 'lock-at-b2';
+      registration.siblingsDigest = 'siblings-at-b2';
+      workflowBundle.lockFileFetcher.fetchLockFile.mockResolvedValue({
+        version: 2,
+        lockfileHash: 'lock-at-a1',
+        siblingsDigest: 'siblings-at-a1',
+        workflows: [globalEntry('lint-at-a1')],
+      });
+
+      await handleRerun('original-run-123', null, null, deps, 'req-g20');
+
+      const ctx = dispatched.mock.calls[0][0] as any;
+      expect(ctx.fullLockFile.lockfileHash).toBe('lock-at-a1');
+      expect(ctx.fullLockFile.siblingsDigest).toBe('siblings-at-a1');
+    });
+
+    it('probes with no key when the lock file at the recorded commit records none', async () => {
+      // breaks-if-wrong: a moved-on registration's key must not stand in for a commit that had none
+      registration.lockfileHash = 'lock-at-b2';
+      registration.siblingsDigest = 'siblings-at-b2';
+
+      await handleRerun('original-run-123', null, null, deps, 'req-g21');
+
+      const ctx = dispatched.mock.calls[0][0] as any;
+      expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['lint-at-a1']);
+      expect(ctx.fullLockFile.lockfileHash).toBeUndefined();
+      expect(ctx.fullLockFile.siblingsDigest).toBeUndefined();
+    });
+
+    it("uses the registration's key when it is at the recorded commit", async () => {
+      // fails-when: a registration already at the recorded commit loses its key on re-run
+      registration.commitSha = 'a1';
+      registration.lockfileHash = 'lock-at-a1';
+      registration.siblingsDigest = null;
+
+      await handleRerun('original-run-123', null, null, deps, 'req-g22');
+
+      expect(workflowBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
+      const ctx = dispatched.mock.calls[0][0] as any;
+      expect(ctx.fullLockFile.lockfileHash).toBe('lock-at-a1');
+      expect(ctx.fullLockFile.siblingsDigest).toBeUndefined();
+    });
+
+    it('keeps the pull-request subject event of a re-run of a PR run', async () => {
+      // fails-when: the re-run states no subject event, so its OIDC subject derives from `rerun`
+      deps.db = makeMockDb({ ...GLOBAL_RUN, trigger_event: 'pull_request' }) as any;
+      await handleRerun('original-run-123', null, null, deps, 'req-g10');
+      expect((dispatched.mock.calls[0][0] as any).subjectTriggerEvent).toBe('pull_request');
+
+      // A re-run of that re-run records `rerun` itself but inherits the subject.
+      dispatched.mockClear();
+      deps.db = makeMockDb({
+        ...GLOBAL_RUN,
+        trigger_event: 'rerun',
+        subject_trigger_event: 'pull_request',
+      }) as any;
+      await handleRerun('original-run-123', null, null, deps, 'req-g11');
+      expect((dispatched.mock.calls[0][0] as any).subjectTriggerEvent).toBe('pull_request');
+    });
+
+    it('keeps the lineage root of a re-run of a re-run', async () => {
+      deps.db = makeMockDb({
+        ...GLOBAL_RUN,
+        run_id: 'rerun-2',
+        original_run_id: 'root-run',
+      }) as any;
+
+      await handleRerun('rerun-2', null, null, deps, 'req-g3');
+
+      const ctx = dispatched.mock.calls[0][0] as any;
+      expect(ctx.rerunLineage).toEqual({ parentRunId: 'rerun-2', originalRunId: 'root-run' });
+    });
+
+    it('refuses to re-run a global run whose workflow registration was deleted, naming the repo', async () => {
+      // breaks-if-wrong: must not fall back to any current lock
+      getAllByOrgAndRepo.mockReturnValue([]);
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-g4')).rejects.toThrow(
+        /workflow repository org\/ci no longer registers it/,
       );
-
-      // The whole point of refusing: the lock fetch that would have resolved
-      // the WRONG repository's workflow never happens, so a same-named
-      // workflow in the source repository cannot be run in its place.
-      expect(providerBundle.lockFileFetcher!.fetchLockFile).not.toHaveBeenCalled();
-      expect(dispatcher.dispatch).not.toHaveBeenCalled();
-      expect(executionTracker.onExecutionStarted).not.toHaveBeenCalled();
-      expect(executionTracker.addJobsToRun).not.toHaveBeenCalled();
+      expect(workflowBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
+      expect(providerBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
+      expect(dispatched).not.toHaveBeenCalled();
       expect(eventRouter.emit).not.toHaveBeenCalled();
     });
 
+    it('refuses a workflow that is disabled, saying so', async () => {
+      // fails-when: the lookup cannot see disabled rows and the refusal says the workflow is gone
+      registration.disabled = true;
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-g14')).rejects.toThrow(
+        /it is disabled in workflow repository org\/ci/,
+      );
+      expect(dispatched).not.toHaveBeenCalled();
+    });
+
+    it('re-runs a global run with no recorded workflow_sha by refusing with a clear message', async () => {
+      // fails-when: a run with no recorded workflow commit re-runs at the registration's commit
+      deps.db = makeMockDb({ ...GLOBAL_RUN, workflow_sha: null }) as any;
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-g5')).rejects.toThrow(
+        /no recorded workflow commit/,
+      );
+      expect(dispatched).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the recorded commit has no lock file, instead of using the current one', async () => {
+      // breaks-if-wrong: a force-pushed-away commit must not fall back to the registration's lock entry
+      workflowBundle.lockFileFetcher.fetchLockFile.mockResolvedValue(null);
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-g6')).rejects.toThrow(
+        /org\/ci has no lock file at a1/,
+      );
+      expect(dispatched).not.toHaveBeenCalled();
+    });
+
+    it('refuses a workflow that was not organization-wide at the recorded commit', async () => {
+      // fails-when: global-ness is read from the current registration instead of the recorded entry
+      const { triggers: _global, ...entry } = globalEntry('lint-at-a1');
+      workflowBundle.lockFileFetcher.fetchLockFile.mockResolvedValue({
+        version: 2,
+        workflows: [{ ...entry, triggers: [{ _type: 'push' }] }],
+      });
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-g7')).rejects.toThrow(
+        /at a1 it is not an organization-wide workflow/,
+      );
+      expect(dispatched).not.toHaveBeenCalled();
+    });
+
+    it('judges global-ness from the recorded commit, not the current registration', async () => {
+      // breaks-if-wrong: a workflow global at the recorded commit re-runs whatever its registration says now
+      registration.isGlobal = false;
+
+      await handleRerun('original-run-123', null, null, deps, 'req-g12');
+
+      expect(dispatched).toHaveBeenCalledTimes(1);
+    });
+
+    it('presents no workflow branch when the run recorded none', async () => {
+      // fails-when: the re-run guesses the registration's branch for a run that recorded none
+      deps.db = makeMockDb({ ...GLOBAL_RUN, workflow_branch: null }) as any;
+
+      await handleRerun('original-run-123', null, null, deps, 'req-g13');
+
+      expect((dispatched.mock.calls[0][0] as any).global.workflowBranch).toBeNull();
+    });
+
+    it('refuses when the global workflow policy no longer admits the workflow repository', async () => {
+      deps.processingDeps = () =>
+        ({
+          registrationIndex: { getAllByOrgAndRepo },
+          globalWorkflowPolicy: {
+            isSourceRepoAllowed: vi.fn().mockResolvedValue({ allowed: true }),
+            isWorkflowRepoAllowed: vi
+              .fn()
+              .mockResolvedValue({ allowed: false, reason: 'not allow-listed' }),
+          },
+        }) as any;
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-g8')).rejects.toThrow(
+        /global workflow policy refuses it \(not allow-listed\)/,
+      );
+      expect(dispatched).not.toHaveBeenCalled();
+    });
+
+    it('dispatches once across a failover re-send of the same requestId', async () => {
+      const first = await handleRerun('original-run-123', null, null, deps, 'req-g9');
+      const second = await handleRerun('original-run-123', null, null, deps, 'req-g9');
+
+      expect(second.newRunId).toBe(first.newRunId);
+      expect(dispatched).toHaveBeenCalledTimes(1);
+    });
+
     it("would otherwise have silently run the source repo's same-named workflow", async () => {
-      // The positive control for the refusal above, and the record of what it
-      // prevents: with the marker absent the run is indistinguishable from a
-      // per-repository one, so the source repository's lock file resolves and
-      // its own `org-ci` is what executes.
+      // The record of what routing on the marker prevents: with it absent the
+      // run is indistinguishable from a per-repository one, so the source
+      // repository's lock file resolves and its own workflow is what executes.
       const { workflow_repo_identifier: _dropped, ...unmarked } = GLOBAL_RUN;
       deps.db = makeMockDb({ ...unmarked, workflow_name: 'ci' }) as any;
 
       await handleRerun('original-run-123', null, null, deps, 'req-test');
 
       expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
-        'owner/source-repo',
-        'abc123def',
+        SOURCE_REPO,
+        's1',
         expect.anything(),
       );
+      expect(dispatched).not.toHaveBeenCalled();
       expect(dispatcher.dispatch).toHaveBeenCalled();
     });
 
     it('allows a rerun when the workflow lives in the repository the run acted on', async () => {
-      // A same-repo value is not a cross-repo dispatch and must not be
-      // refused — otherwise the guard would block ordinary reruns the moment
-      // anything started populating the column unconditionally.
+      // A same-repo value is not a cross-repo dispatch: it takes the
+      // per-repository path, as it did before the column was populated.
       deps.db = makeMockDb({
         ...TERMINAL_RUN,
         workflow_repo_identifier: TERMINAL_RUN.repo_identifier,
@@ -476,6 +796,7 @@ describe('handleRerun', () => {
 
       await handleRerun('original-run-123', null, null, deps, 'req-test');
 
+      expect(dispatched).not.toHaveBeenCalled();
       expect(dispatcher.dispatch).toHaveBeenCalled();
     });
   });
@@ -838,6 +1159,12 @@ describe('handleRerun', () => {
       // Scoped to the round's own workflow repository: every other repo's globals
       // already reached their verdict on the original delivery.
       expect(passArgs.onlyWorkflowRepo).toBe(WORKFLOW_REPO);
+      // The repository's candidates that needed no round already dispatched on
+      // the original delivery; re-evaluating them would run them twice.
+      // fails-when: the re-run re-dispatches the workflows the failed round never decided on
+      expect(passArgs.onlyRoundCandidates).toBe(true);
+      // fails-when: a failed round's re-run marks itself a released hold and re-dispatches result-aware-only siblings
+      expect(passArgs.releasedHold).toBeUndefined();
       expect(passArgs.repoIdentifier).toBe(SOURCE_REPO);
       expect(passArgs.ref).toBe('abc123def');
       // No workflow is resolved out of the source repo's lock file — that is the

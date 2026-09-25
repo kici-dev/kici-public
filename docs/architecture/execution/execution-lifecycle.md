@@ -54,11 +54,11 @@ Orchestrator
 Agent
   |
   1. SIGTERM to running step process
-  2. Wait grace period (default: 30s, configurable per-job)
+  2. Wait grace period (default: 30s, requested per-job, capped by the sandbox)
   3. SIGKILL if step hasn't exited
-  4. Run onCancel hook (if defined)
-  5. Run cleanup hook (if defined)
-  6. Report job.status = 'cancelled'
+  4. Run the four cancel hooks inside-out, each if defined:
+     step onCancel -> step cleanup -> job onCancel -> job cleanup
+  5. Report job.status = 'cancelled'
   v
 Orchestrator
   |
@@ -222,16 +222,18 @@ The wait is capped by `KICI_CONCURRENCY_WAIT_TIMEOUT_MS` (default 1 hour), overr
 
 One 30-second bound covers both halves of the handshake: evaluating the group-key function, and then waiting for the orchestrator's first `job.concurrency.ack`. The job fails when either overruns. This bound is fixed, not operator-configurable. The configurable one is the queue-mode wait above (`KICI_CONCURRENCY_WAIT_TIMEOUT_MS`), which bounds how long a job already acked with `wait` holds for its follow-up ack.
 
-## Grace period and hook timeout
+## Grace period and hook timeouts
 
 The total time a cancel can take is bounded by:
 
 ```
-total_cancel_time = gracePeriod + hookTimeout
+total_cancel_time = gracePeriod + (one timeout per cancel-path hook that runs)
 ```
 
-- **gracePeriod**: seconds between SIGTERM and SIGKILL. Configured per-job in the SDK (`gracePeriod: 60`), with an operator-configurable maximum. Default: 30s.
-- **hookTimeout**: maximum time for all hooks to complete. Default: 5 minutes. Configurable per-hook.
+- **gracePeriod**: milliseconds between SIGTERM and SIGKILL. Requested per-job in the SDK (`gracePeriod: 60`), then capped by the sandbox: the effective value is `Math.min(jobGracePeriod, agentMax)`. Both that cap and the value used when a job requests nothing default to 30s on bare-metal and firecracker, and the container sandbox uses 10s — so a job asking for more than the cap silently gets the cap. The cap is a code constant, not an operator setting: no environment variable or config field moves it. The one site that lowers it is the out-of-band cleanup-only re-run, which caps at 5s so an aborted cleanup resolves near its caller's timeout instead of one full grace period later.
+- **hook timeout**: bounds **one** hook, not the cancel path as a whole. Authored as `timeout` on the hook object (`{ run, timeout }`) in milliseconds; 5 minutes when omitted.
+
+The second bullet is why the formula sums rather than adds a single term. The cancel path runs up to four hooks in sequence, inside-out: step `onCancel`, step `cleanup`, job `onCancel`, job `cleanup`. Each carries its own timeout, so the worst case is the grace period plus every hook that is actually declared. A force-abort runs none of them.
 
 Both are enforced by the agent. The orchestrator monitors for stuck jobs via stale detection.
 

@@ -228,6 +228,8 @@ export const jobRerouteSchema = z.object({
   depsHash: z.string().optional(),
   /** Pre-resolved clone token for workers without provider credentials. */
   cloneToken: z.string().optional(),
+  /** Pre-resolved clone token for the workflow repository of an organization-wide job. */
+  workflowCloneToken: z.string().optional(),
   /** Encrypted secrets envelope (AES-256-GCM with session key). */
   encryptedSecrets: z.string().optional(),
   /** Encrypted namespaced secrets envelope. */

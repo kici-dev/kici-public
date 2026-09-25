@@ -412,4 +412,15 @@ describeDb('JobQueue claim — exactly one claimant per job (real Postgres)', ()
       agentId: 'agent-b',
     });
   });
+
+  it('a busy requeue returns the job to pending without spending an attempt', async () => {
+    const id = await queue.enqueue(jobInput());
+    expect(await queue.dequeueForLabels(['linux', 'docker'], [], 'agent-a')).not.toBeNull();
+    expect(await queue.requeue(id)).toBe(1);
+    expect(await queue.dequeueForLabels(['linux', 'docker'], [], 'agent-a')).not.toBeNull();
+
+    // fails-when: the increment ignores countAttempt — the row reads 2.
+    expect(await queue.requeue(id, { countAttempt: false })).toBe(1);
+    expect(await statusOf(id)).toEqual({ status: DispatchQueueStatus.Pending, agentId: null });
+  });
 });

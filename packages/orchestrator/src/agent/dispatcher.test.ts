@@ -1,9 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Dispatcher, containerSpawnFor, type DispatchMetrics } from './dispatcher.js';
-import { AgentRegistry } from './registry.js';
-import type { JobQueue, QueuedJob, QueuedJobInput } from '../queue/job-queue.js';
-import { canonicalizeLabels } from '@kici-dev/engine';
+import { AgentRegistry, BUSY_HOLD_MAX_MS } from './registry.js';
+import type { ScaleResult } from '../scaler/types.js';
+import {
+  DispatchQueueStatus,
+  MAX_DISPATCH_ATTEMPTS,
+  type JobQueue,
+  type QueuedJob,
+  type QueuedJobInput,
+} from '../queue/job-queue.js';
+import { canonicalizeLabels, JobRejectReason } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { JobSecretsUnsealError } from '../secrets/job-secret-seal.js';
 
 function makeJobInput(overrides: Partial<QueuedJobInput> = {}): QueuedJobInput {
   return {
@@ -147,6 +155,10 @@ function mockQueue(
     requeue: vi.fn().mockResolvedValue(1),
     requeueIfAwaitingAck: vi.fn().mockResolvedValue(1),
     getFullJobById: vi.fn().mockResolvedValue(null),
+    // Sealed-secrets back-off: nothing deferred unless a test says so.
+    isDeferredUnopenable: vi.fn().mockReturnValue(false),
+    deferUnopenable: vi.fn().mockResolvedValue(undefined),
+    claimUnopenableById: vi.fn().mockResolvedValue(true),
     setAckDeadline: vi.fn().mockResolvedValue(undefined),
     clearAckDeadline: vi.fn().mockResolvedValue(undefined),
     getDispatchedAwaitingAck: vi.fn().mockResolvedValue([]),
@@ -829,6 +841,44 @@ describe('Dispatcher', () => {
       expect(dispatched).toBe(false);
       expect(queue.dequeueById).not.toHaveBeenCalled();
     });
+
+    it('returns false when it claimed the bound job but its dispatch was refused', async () => {
+      registry.register('scaler-firecracker-1', mockWs(), ['linux']);
+      const boundJob = makeQueuedJob({ id: 'bound-1' });
+      const queue = mockQueue({ dequeueJobs: [boundJob] });
+      const refusing = vi.fn(async () => ({ refused: 'no clone credentials' }));
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: refusing });
+
+      const dispatched = await dispatcher.dispatchBoundJob('scaler-firecracker-1', 'bound-1');
+
+      // fails-when: a claimed job that never reached the agent is reported as dispatched
+      expect(dispatched).toBe(false);
+      expect(queue.markFailed).toHaveBeenCalledWith('bound-1', 'no clone credentials');
+      expect(registry.get('scaler-firecracker-1')!.activeJobs).toBe(0);
+    });
+
+    it('does not scale for a requeued job whose claim was refused rather than sent', async () => {
+      registry.register('a1', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+      const queue = mockQueue({ dequeueJobs: [job] });
+      queue.getFullJobById = vi.fn().mockResolvedValue(job);
+      const onNoMatchingAgent = vi.fn().mockResolvedValue({ action: 'spawning' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch: vi.fn(async () => ({ refused: 'no clone credentials' })),
+        onNoMatchingAgent,
+      });
+
+      await (dispatcher as unknown as { redispatch(jobId: string): Promise<void> }).redispatch(
+        'job-1',
+      );
+
+      // breaks-if-wrong: a claim that failed the job ends the redispatch, with no spawn for it
+      expect(queue.markFailed).toHaveBeenCalledWith('job-1', 'no clone credentials');
+      expect(onNoMatchingAgent).not.toHaveBeenCalled();
+    });
   });
 
   describe('redrivePendingToConnectedAgents (pending safety-net)', () => {
@@ -922,6 +972,21 @@ describe('Dispatcher', () => {
 
       expect(placed).toBe(1);
       expect(onDispatch).toHaveBeenCalledWith('healthy', job);
+    });
+
+    it('does not count a job it claimed but could not send as placed', async () => {
+      registry.register('healthy', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const refusing = vi.fn(async () => ({ refused: 'no clone credentials' }));
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: refusing });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      // fails-when: a refused claim is counted as a placement
+      expect(placed).toBe(0);
+      expect(refusing).toHaveBeenCalledWith('healthy', job);
+      expect(queue.markFailed).toHaveBeenCalledWith('orphan-1', 'no clone credentials');
     });
 
     it('does not dispatch when the pending row was already claimed elsewhere (atomic-claim loser)', async () => {
@@ -1131,9 +1196,15 @@ describe('Dispatcher', () => {
     });
   });
 
-  describe('pre-spawned agent suitability', () => {
+  describe('agent suitability', () => {
+    /** A warm agent's scaler record whose shape check answers `verdict`. */
+    const warmView = (verdict: boolean) => ({
+      prespawned: true,
+      shapeFits: vi.fn().mockReturnValue(verdict),
+    });
+
     /**
-     * One label-matching agent plus a scaler that answers `verdict` for it. The
+     * One label-matching warm agent whose shape check answers `verdict`. The
      * question every case here asks is whether the job reaches that agent or
      * falls through to the scaler.
      */
@@ -1142,16 +1213,16 @@ describe('Dispatcher', () => {
       const onNoMatchingAgent = vi
         .fn()
         .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
-      const canPrespawnedAgentServe = vi.fn().mockReturnValue(verdict);
+      const view = warmView(verdict);
       const dispatcher = new Dispatcher({
         registry,
         queue,
         metrics,
         onDispatch,
         onNoMatchingAgent,
-        canPrespawnedAgentServe,
+        scalerAgentView: (id) => (id === 'warm-1' ? view : undefined),
       });
-      return { dispatcher, onNoMatchingAgent, canPrespawnedAgentServe };
+      return { dispatcher, onNoMatchingAgent, shapeFits: view.shapeFits };
     }
 
     it('skips a pre-spawned agent that cannot serve the job and scales instead', async () => {
@@ -1174,18 +1245,49 @@ describe('Dispatcher', () => {
       expect(onNoMatchingAgent).not.toHaveBeenCalled();
     });
 
-    it("asks the scaler with the job's own resources and image", async () => {
-      const { dispatcher, canPrespawnedAgentServe } = withOneAgent(true);
+    it("checks a warm agent's shape against the job's own resources", async () => {
+      const { dispatcher, shapeFits } = withOneAgent(true);
       const resources = { requests: { cpus: 4, memory: '8g' } };
 
-      await dispatcher.dispatch(
-        makeJobInput({ resources, jobConfig: { container: 'node:22-bookworm' } }),
+      await dispatcher.dispatch(makeJobInput({ resources }));
+
+      expect(shapeFits).toHaveBeenCalledWith(resources);
+    });
+
+    it('scales for an image job rather than hand it to a warm agent with no runtime', async () => {
+      const { dispatcher, onNoMatchingAgent, shapeFits } = withOneAgent(true);
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ jobConfig: { container: 'node:22-bookworm' } }),
       );
 
-      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
-        resources,
-        hasOwnContainerImage: true,
+      // fails-when: the image job lands on a pool agent that cannot start it
+      expect(result.status).toBe('queued');
+      expect(onNoMatchingAgent).toHaveBeenCalled();
+      expect(shapeFits).not.toHaveBeenCalled();
+    });
+
+    it('recognizes a rerouted job by its preassigned id on the agent started for it', async () => {
+      registry.register('image-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue(),
+        metrics,
+        onDispatch,
+        onNoMatchingAgent: vi.fn().mockResolvedValue({ action: 'at-capacity' }),
+        scalerAgentView: () => ({
+          binding: { jobId: 'rerouted-1', jobImage: true },
+          prespawned: false,
+          shapeFits: () => true,
+        }),
       });
+
+      // fails-when: the id is dropped, so the agent started for a rerouted job
+      // no longer recognizes it and refuses it like any other job
+      expect((await dispatcher.dispatch(makeJobInput({ jobId: 'rerouted-1' }))).status).toBe(
+        'dispatched',
+      );
+      expect((await dispatcher.dispatch(makeJobInput({ jobId: 'other-1' }))).status).toBe('queued');
     });
 
     // The typed `resources` field is a convenience mirror the caller may omit:
@@ -1194,30 +1296,16 @@ describe('Dispatcher', () => {
     // mirror reported a job that declares nothing, so the gate admitted a warm
     // agent of the pool's size to a job that asked for another.
     it('reads the declared shape from jobConfig when the typed mirror is absent', async () => {
-      const { dispatcher, canPrespawnedAgentServe } = withOneAgent(true);
+      const { dispatcher, shapeFits } = withOneAgent(true);
       const resources = { requests: { cpus: 8, memory: '16g' } };
 
       await dispatcher.dispatch(makeJobInput({ jobConfig: { resources } }));
 
-      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
-        resources,
-        hasOwnContainerImage: false,
-      });
+      expect(shapeFits).toHaveBeenCalledWith(resources);
     });
 
     it('scales for a jobConfig-only shape when no agent fits', async () => {
-      registry.register('warm-1', mockWs(), ['linux']);
-      const onNoMatchingAgent = vi
-        .fn()
-        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
-      const dispatcher = new Dispatcher({
-        registry,
-        queue: mockQueue(),
-        metrics,
-        onDispatch,
-        onNoMatchingAgent,
-        canPrespawnedAgentServe: vi.fn().mockReturnValue(false),
-      });
+      const { dispatcher, onNoMatchingAgent } = withOneAgent(false);
 
       await dispatcher.dispatch(
         makeJobInput({ jobConfig: { resources: { requests: { cpus: 8 } } } }),
@@ -1230,16 +1318,7 @@ describe('Dispatcher', () => {
 
     it('carries a jobConfig-only shape into the queue drain too', async () => {
       const queue = mockQueue();
-      registry.register('warm-1', mockWs(), ['linux']);
-      const canPrespawnedAgentServe = vi.fn().mockReturnValue(false);
-      const dispatcher = new Dispatcher({
-        registry,
-        queue,
-        metrics,
-        onDispatch,
-        canPrespawnedAgentServe,
-        isPrespawnedAgent: (id) => id === 'warm-1',
-      });
+      const { dispatcher, shapeFits } = withOneAgent(false, queue);
 
       await dispatcher.onAgentAvailable('warm-1');
 
@@ -1251,32 +1330,28 @@ describe('Dispatcher', () => {
       expect(canServe(makeQueuedJob({ jobConfig: { resources: { requests: { cpus: 8 } } } }))).toBe(
         false,
       );
-      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
-        resources: { requests: { cpus: 8 } },
-        hasOwnContainerImage: false,
-      });
+      expect(shapeFits).toHaveBeenCalledWith({ requests: { cpus: 8 } });
     });
 
-    it('reports no own image for a job that only names a dockerfile', async () => {
+    it('treats a dockerfile job as needing a runtime a build CLI does not provide', async () => {
       // A dockerfile job additionally requires the build-capable runtime label,
       // and it runs the pool's agent image nesting a container it builds — so
-      // it does NOT bring its own image.
-      const { dispatcher, canPrespawnedAgentServe } = withOneAgent(true, mockQueue(), [
+      // it needs a runtime socket too, and brings no image a spawn could start.
+      const { dispatcher, onNoMatchingAgent } = withOneAgent(true, mockQueue(), [
         'linux',
         'kici:runtime:container-build',
       ]);
 
-      await dispatcher.dispatch(
+      const result = await dispatcher.dispatch(
         makeJobInput({ jobConfig: { container: { dockerfile: 'Dockerfile' } } }),
       );
 
-      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
-        hasOwnContainerImage: false,
-      });
+      expect(result.status).toBe('queued');
+      expect(onNoMatchingAgent).toHaveBeenCalled();
     });
 
-    it('dispatches to every agent when no scaler is wired', async () => {
-      registry.register('warm-1', mockWs(), ['linux']);
+    it('dispatches to an agent that predates runtime labels when no scaler is wired', async () => {
+      registry.register('static-1', mockWs(), ['linux']);
       const onNoMatchingAgent = vi
         .fn()
         .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
@@ -1288,13 +1363,51 @@ describe('Dispatcher', () => {
         onNoMatchingAgent,
       });
 
-      const result = await dispatcher.dispatch(makeJobInput());
+      // breaks-if-wrong: an agent whose silence proves nothing keeps its jobs
+      const result = await dispatcher.dispatch(
+        makeJobInput({ jobConfig: { container: 'node:22-bookworm' } }),
+      );
 
       expect(result.status).toBe('dispatched');
       expect(onNoMatchingAgent).not.toHaveBeenCalled();
     });
 
-    it('skips an unsuitable pre-spawned agent on the redispatch path too', async () => {
+    it("keeps a container job off an operator's agent that reports no runtime, with no scaler wired", async () => {
+      registry.register('static-1', mockWs(), ['linux'], 'linux', 'x64', '0.10.0');
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      // fails-when: a 0.10.0 agent with no socket takes the job and fails it
+      const container = await dispatcher.dispatch(
+        makeJobInput({ jobConfig: { container: 'node:22-bookworm' } }),
+      );
+      expect(container.status).toBe('queued');
+      expect(onDispatch).not.toHaveBeenCalled();
+
+      // The same agent still takes a plain job.
+      expect((await dispatcher.dispatch(makeJobInput())).status).toBe('dispatched');
+    });
+
+    it('reports no backend when the only label-matching agent cannot run the job', async () => {
+      registry.register('static-1', mockWs(), ['linux'], 'linux', 'x64', '0.10.0');
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue(),
+        metrics,
+        onDispatch,
+        onNoMatchingAgent: vi.fn().mockResolvedValue({ action: 'no-backend', labels: ['linux'] }),
+      });
+
+      // fails-when: the runtime-less agent counts as a match, so the job waits
+      // here instead of being offered to a peer that can run it
+      const result = await dispatcher.dispatch(
+        makeJobInput({ jobConfig: { container: 'node:22-bookworm' } }),
+      );
+
+      expect(result.status).toBe('queued-no-backend');
+    });
+
+    it('skips an unsuitable scaler agent on the redispatch path too', async () => {
       const job = makeQueuedJob({ id: 'requeued-1', status: 'pending' });
       const queue = mockQueue({ dequeueJobs: [job] });
       (queue.getFullJobById as ReturnType<typeof vi.fn>).mockResolvedValue(job);
@@ -1308,18 +1421,9 @@ describe('Dispatcher', () => {
       expect(onNoMatchingAgent).toHaveBeenCalled();
     });
 
-    it('carries the suitability gate into the queue drain for a pre-spawned agent', async () => {
+    it('carries the suitability gate into the queue drain for an agent that may refuse', async () => {
       const queue = mockQueue();
-      registry.register('warm-1', mockWs(), ['linux']);
-      const canPrespawnedAgentServe = vi.fn().mockReturnValue(false);
-      const dispatcher = new Dispatcher({
-        registry,
-        queue,
-        metrics,
-        onDispatch,
-        canPrespawnedAgentServe,
-        isPrespawnedAgent: (id) => id === 'warm-1',
-      });
+      const { dispatcher, shapeFits } = withOneAgent(false, queue);
 
       await dispatcher.onAgentAvailable('warm-1');
 
@@ -1329,22 +1433,25 @@ describe('Dispatcher', () => {
         job: QueuedJob,
       ) => boolean;
       expect(canServe(makeQueuedJob({ resources: { requests: { cpus: 8 } } }))).toBe(false);
-      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
-        resources: { requests: { cpus: 8 } },
-        hasOwnContainerImage: false,
-      });
+      expect(shapeFits).toHaveBeenCalledWith({ requests: { cpus: 8 } });
     });
 
-    it('leaves the queue drain unfiltered for an ordinary agent', async () => {
+    it('leaves the queue drain unfiltered for an agent that runs any job', async () => {
       const queue = mockQueue();
-      registry.register('static-1', mockWs(), ['linux']);
+      registry.register(
+        'static-1',
+        mockWs(),
+        ['linux', 'kici:runtime:docker'],
+        'linux',
+        'x64',
+        '0.10.0',
+      );
       const dispatcher = new Dispatcher({
         registry,
         queue,
         metrics,
         onDispatch,
-        canPrespawnedAgentServe: vi.fn().mockReturnValue(true),
-        isPrespawnedAgent: () => false,
+        scalerAgentView: () => undefined,
       });
 
       await dispatcher.onAgentAvailable('static-1');
@@ -1647,9 +1754,10 @@ describe('Dispatcher', () => {
         unknown,
         { image: string; authconfig?: unknown } | undefined,
       ];
-      // Labels are passed through untouched: KiCI does not add a runtime
-      // requirement, because the orchestrator cannot know whether the host that
-      // ends up running the job has one (see container-routing.ts).
+      // Labels are passed through untouched: the scaler picks a pool by exact
+      // label-set containment, so a runtime label no pool declares would strand
+      // the job. Runtime is judged on registered agents instead (see
+      // container-routing.ts).
       expect(labels).toEqual(['linux']);
       // Assembled from what dispatch already resolved — never re-resolved here.
       expect(containerSpawn?.image).toBe('reg.internal:5000/acme/ci:1.2');
@@ -2354,9 +2462,9 @@ describe('Dispatcher', () => {
       registry.incrementActiveJobs('zzz-rejecter');
       dispatcher.restoreJobForAgent('zzz-rejecter', 'job-1');
 
-      await dispatcher.onJobRejected('zzz-rejecter', 'job-1', 'busy');
+      await dispatcher.onJobRejected('zzz-rejecter', 'job-1', JobRejectReason.enum.busy);
 
-      expect(requeue).toHaveBeenCalledWith('job-1');
+      expect(requeue).toHaveBeenCalledWith('job-1', { countAttempt: false });
       expect(registry.get('zzz-rejecter')?.activeJobs).toBe(0);
       // Redispatched to the idle agent via dispatchBoundJob:
       expect(onDispatch).toHaveBeenCalledWith(
@@ -2376,11 +2484,11 @@ describe('Dispatcher', () => {
         metrics: mockMetrics(),
         onDispatch: vi.fn(),
       });
-      await dispatcher.onJobRejected('a1', 'unknown-job', 'busy');
+      await dispatcher.onJobRejected('a1', 'unknown-job', JobRejectReason.enum.busy);
       expect(requeue).not.toHaveBeenCalled();
     });
 
-    it('fails the job permanently when attempts are exhausted', async () => {
+    it('fails the job permanently when a hard rejection exhausts the attempts', async () => {
       const registry = new AgentRegistry();
       registry.register('a1', mockWs(), ['linux']);
       const markFailed = vi.fn(async () => {});
@@ -2402,7 +2510,7 @@ describe('Dispatcher', () => {
       registry.incrementActiveJobs('a1');
       dispatcher.restoreJobForAgent('a1', 'job-1');
 
-      await dispatcher.onJobRejected('a1', 'job-1', 'busy');
+      await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.draining);
 
       expect(markFailed).toHaveBeenCalledWith('job-1', expect.stringContaining('attempts'));
       expect(onJobFailedPermanently).toHaveBeenCalledWith(
@@ -2438,7 +2546,7 @@ describe('Dispatcher', () => {
       registry.incrementActiveJobs('busy-agent'); // phantom
       dispatcher.restoreJobForAgent('busy-agent', 'job-1');
 
-      await dispatcher.onJobRejected('busy-agent', 'job-1', 'busy');
+      await dispatcher.onJobRejected('busy-agent', 'job-1', JobRejectReason.enum.busy);
 
       expect(onNoMatchingAgent).toHaveBeenCalledWith(
         ['linux'],
@@ -2449,6 +2557,341 @@ describe('Dispatcher', () => {
         undefined,
         undefined,
       );
+    });
+  });
+
+  describe('onJobRejected — busy agent tearing down its previous job', () => {
+    /**
+     * A queue whose requeue counts attempts the way the real one does, so a
+     * burst of rejections shows whether the budget is spent.
+     */
+    function countingQueue(fullJob: QueuedJob) {
+      let attempts = 0;
+      const requeue = vi.fn(async (_id: string, opts: { countAttempt?: boolean } = {}) => {
+        if (opts.countAttempt !== false) attempts++;
+        return attempts;
+      });
+      const markFailed = vi.fn(async () => {});
+      const queue = {
+        ...mockQueue(),
+        requeue,
+        markFailed,
+        getFullJobById: vi.fn(async () => fullJob),
+        dequeueById: vi.fn(async () => fullJob),
+        getDepth: vi.fn(async () => 0),
+      } as unknown as JobQueue;
+      return { queue, requeue, markFailed };
+    }
+
+    it('does not re-pick the busy agent and spends no attempts across normal teardowns', async () => {
+      const registry = new AgentRegistry();
+      registry.register('a1', mockWs(), ['linux']);
+      const fullJob = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+      const { queue, requeue, markFailed } = countingQueue(fullJob);
+      const onDispatch = vi.fn();
+      const onNoMatchingAgent = vi.fn(async (): Promise<ScaleResult> => ({
+        action: 'at-capacity',
+      }));
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics: mockMetrics(),
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      // The agent rejects busy more times than the attempt budget allows, and
+      // reports an empty slot after each teardown (agent.status activeJobs: 0).
+      for (let i = 0; i < MAX_DISPATCH_ATTEMPTS + 1; i++) {
+        if (i > 0) registry.clearBusyHeld('a1');
+        registry.incrementActiveJobs('a1');
+        dispatcher.restoreJobForAgent('a1', 'job-1');
+        await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.busy);
+      }
+
+      // breaks-if-wrong: a busy rejection after a free-slot report spends an
+      // attempt — ordinary teardown races fail the job.
+      expect(markFailed).not.toHaveBeenCalled();
+      expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: false });
+      // fails-when: the busy agent is not held — the redispatch lands on it again.
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(registry.findAvailable(['linux'])).toEqual([]);
+      // With no other agent free, the requeued job goes to the scaler instead.
+      expect(onNoMatchingAgent).toHaveBeenCalled();
+    });
+
+    it('fails the job when an agent with a stuck job count keeps rejecting busy', async () => {
+      vi.useFakeTimers();
+      try {
+        const registry = new AgentRegistry();
+        registry.register('a1', mockWs(), ['linux']);
+        const fullJob = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+        const { queue, requeue, markFailed } = countingQueue(fullJob);
+        const onJobFailedPermanently = vi.fn();
+        const dispatcher = new Dispatcher({
+          registry,
+          queue,
+          metrics: mockMetrics(),
+          onDispatch: vi.fn(),
+          onJobFailedPermanently,
+        });
+        const rejectOnce = async () => {
+          registry.incrementActiveJobs('a1');
+          dispatcher.restoreJobForAgent('a1', 'job-1');
+          await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.busy);
+        };
+
+        // The agent never reports an empty slot, so each hold lifts only by
+        // expiry. The first rejection is free; every one after an expiry counts.
+        await rejectOnce();
+        expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: false });
+        for (let i = 0; i < MAX_DISPATCH_ATTEMPTS; i++) {
+          vi.advanceTimersByTime(BUSY_HOLD_MAX_MS);
+          await rejectOnce();
+          expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: true });
+        }
+
+        // fails-when: a busy rejection after an expired hold spends no attempt —
+        // the stuck agent holds the job pending forever.
+        expect(markFailed).toHaveBeenCalledTimes(1);
+        expect(markFailed).toHaveBeenCalledWith(
+          'job-1',
+          expect.stringContaining('attempts exhausted'),
+        );
+        expect(onJobFailedPermanently).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('routes the requeued job to another idle agent', async () => {
+      const registry = new AgentRegistry();
+      // 'a1-busy' sorts first, so deterministic selection would re-pick it
+      // were it not held.
+      registry.register('a1-busy', mockWs(), ['linux']);
+      registry.register('b2-idle', mockWs(), ['linux']);
+      const fullJob = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+      const { queue } = countingQueue(fullJob);
+      const onDispatch = vi.fn();
+      const dispatcher = new Dispatcher({ registry, queue, metrics: mockMetrics(), onDispatch });
+      registry.incrementActiveJobs('a1-busy');
+      dispatcher.restoreJobForAgent('a1-busy', 'job-1');
+
+      await dispatcher.onJobRejected('a1-busy', 'job-1', JobRejectReason.enum.busy);
+
+      // fails-when: the hold is missing — selection re-picks a1-busy.
+      expect(onDispatch).toHaveBeenCalledTimes(1);
+      expect(onDispatch).toHaveBeenCalledWith('b2-idle', expect.objectContaining({ id: 'job-1' }));
+    });
+
+    it('drains the job onto the agent once it reports a free slot', async () => {
+      const registry = new AgentRegistry();
+      registry.register('a1', mockWs(), ['linux']);
+      const fullJob = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+      const { queue } = countingQueue(fullJob);
+      (queue.dequeueForLabels as ReturnType<typeof vi.fn>).mockResolvedValue(fullJob);
+      const onDispatch = vi.fn();
+      const dispatcher = new Dispatcher({ registry, queue, metrics: mockMetrics(), onDispatch });
+      registry.incrementActiveJobs('a1');
+      dispatcher.restoreJobForAgent('a1', 'job-1');
+      await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.busy);
+
+      // Still held: a drain trigger claims nothing.
+      await dispatcher.onAgentAvailable('a1');
+      expect(onDispatch).not.toHaveBeenCalled();
+
+      // breaks-if-wrong: the agent finished tearing down and reported a free
+      // slot (agent.status lifts the hold); the waiting job must reach it.
+      registry.clearBusyHeld('a1');
+      await dispatcher.onAgentAvailable('a1');
+      expect(onDispatch).toHaveBeenCalledWith('a1', expect.objectContaining({ id: 'job-1' }));
+    });
+
+    it('a hard rejection spends an attempt and does not hold the agent', async () => {
+      const registry = new AgentRegistry();
+      registry.register('a1', mockWs(), ['linux']);
+      const fullJob = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+      const { queue, requeue } = countingQueue(fullJob);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics: mockMetrics(),
+        onDispatch: vi.fn(),
+      });
+      registry.incrementActiveJobs('a1');
+      dispatcher.restoreJobForAgent('a1', 'job-1');
+
+      await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.draining);
+
+      // breaks-if-wrong: the hard-rejection path keeps counting attempts.
+      expect(requeue).toHaveBeenCalledWith('job-1', { countAttempt: true });
+      await expect(requeue.mock.results[0]!.value).resolves.toBe(1);
+      expect(registry.get('a1')?.busyHeldUntil).toBeUndefined();
+    });
+
+    describe('work the agent accepted or finished after its hold was set', () => {
+      /**
+       * One agent `a1` (and optionally a second, busy agent `a2`) behind a
+       * dispatcher whose queue counts attempts. The agent.status that would
+       * lift a hold never arrives in any of these tests.
+       */
+      function setup(opts: { a1MaxConcurrency?: number; withBusyA2?: boolean } = {}) {
+        const registry = new AgentRegistry();
+        registry.register(
+          'a1',
+          mockWs(),
+          ['linux'],
+          'linux',
+          'x64',
+          undefined,
+          opts.a1MaxConcurrency ?? 1,
+        );
+        if (opts.withBusyA2) registry.register('a2', mockWs(), ['linux']);
+        const fullJob = makeQueuedJob({ id: 'job-1', status: DispatchQueueStatus.Pending });
+        const { queue, requeue } = countingQueue(fullJob);
+        const onDispatch = vi.fn();
+        const dispatcher = new Dispatcher({ registry, queue, metrics: mockMetrics(), onDispatch });
+        /** Put a job on an agent the way a dispatch does: one slot, tracked to it. */
+        const occupy = (agentId: string, jobId: string) => {
+          registry.incrementActiveJobs(agentId);
+          dispatcher.restoreJobForAgent(agentId, jobId);
+        };
+        if (opts.withBusyA2) occupy('a2', 'job-a2');
+        const rejectBusy = async () => {
+          occupy('a1', 'job-1');
+          await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.busy);
+        };
+        /** The queue drain that hands `jobId` to `a1` once its hold allows it. */
+        const drainOnto = async (jobId: string) => {
+          (queue.dequeueForLabels as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+            makeQueuedJob({ id: jobId, status: DispatchQueueStatus.Pending }),
+          );
+          await dispatcher.onAgentAvailable('a1');
+          expect(onDispatch).toHaveBeenCalledWith('a1', expect.objectContaining({ id: jobId }));
+        };
+        return { registry, dispatcher, requeue, occupy, rejectBusy, drainOnto };
+      }
+
+      it('a job finishing on the agent after its hold ran out lifts the hold, so the next busy rejection spends no attempt', async () => {
+        vi.useFakeTimers();
+        try {
+          const { registry, dispatcher, requeue, rejectBusy, drainOnto } = setup();
+          await rejectBusy();
+          expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: false });
+          // The agent.status that reports the free slot is lost; the hold runs
+          // out and the drain hands the agent its next job, which it runs.
+          vi.advanceTimersByTime(BUSY_HOLD_MAX_MS);
+          await drainOnto('job-2');
+          dispatcher.onJobComplete('a1', 'job-2');
+          // fails-when: only agent.status lifts a hold — the expired hold stays
+          // on the entry of an agent that just finished a job.
+          expect(registry.get('a1')?.busyHeldUntil).toBeUndefined();
+
+          // The teardown-window rejection after job-2.
+          await rejectBusy();
+          // breaks-if-wrong: a healthy agent is charged an attempt because one
+          // free-slot status was lost.
+          expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: false });
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('a job finishing on a multi-slot agent lifts a hold still in force', async () => {
+        const { registry, dispatcher, requeue, occupy, rejectBusy } = setup({
+          a1MaxConcurrency: 2,
+        });
+        // The agent runs one job at a time: a second dispatch is refused busy.
+        occupy('a1', 'job-running');
+        await rejectBusy();
+        expect(registry.get('a1')?.busyHeldUntil).toBeDefined();
+
+        dispatcher.onJobComplete('a1', 'job-running');
+        // fails-when: the finished job leaves the hold in force — a teardown
+        // longer than the rest of the hold charges the next rejection.
+        expect(registry.get('a1')?.busyHeldUntil).toBeUndefined();
+        await rejectBusy();
+        expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: false });
+      });
+
+      it('a job finishing on another agent leaves the hold, and the expiry still charges an attempt', async () => {
+        vi.useFakeTimers();
+        try {
+          const { registry, dispatcher, requeue, rejectBusy } = setup({ withBusyA2: true });
+          await rejectBusy();
+          dispatcher.onJobComplete('a2', 'job-a2');
+          // fails-when: any completion lifts every hold — a stuck agent is
+          // never charged.
+          expect(registry.get('a1')?.busyHeldUntil).toBeDefined();
+
+          vi.advanceTimersByTime(BUSY_HOLD_MAX_MS);
+          await rejectBusy();
+          // breaks-if-wrong: an agent re-picked only because its hold ran out
+          // still spends an attempt.
+          expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: true });
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('a terminal frame for a job not tracked to the agent leaves the hold', async () => {
+        const { registry, dispatcher, rejectBusy } = setup();
+        await rejectBusy();
+        // A replayed frame for a job already completed, or one never dispatched here.
+        dispatcher.onJobComplete('a1', 'job-not-on-a1');
+        // fails-when: a stray or replayed terminal frame lifts the hold.
+        expect(registry.get('a1')?.busyHeldUntil).toBeDefined();
+      });
+
+      it('an ack for a job dispatched after the hold ran out lifts it', async () => {
+        vi.useFakeTimers();
+        try {
+          const { registry, dispatcher, requeue, rejectBusy, drainOnto } = setup();
+          await rejectBusy();
+          vi.advanceTimersByTime(BUSY_HOLD_MAX_MS);
+          // fails-when: an ack for a job never dispatched to a1 drops its hold.
+          dispatcher.onJobAcked('a1', 'job-not-on-a1');
+          expect(registry.get('a1')?.busyHeldUntil).toBeDefined();
+          await drainOnto('job-2');
+          dispatcher.onJobAcked('a1', 'job-2');
+          // fails-when: an ack leaves the expired hold, so the rejection after
+          // job-2 finishes is charged.
+          expect(registry.get('a1')?.busyHeldUntil).toBeUndefined();
+          await rejectBusy();
+          expect(requeue).toHaveBeenLastCalledWith('job-1', { countAttempt: false });
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('a running status for a job dispatched after the hold ran out lifts it', async () => {
+        vi.useFakeTimers();
+        try {
+          const { registry, dispatcher, rejectBusy, drainOnto } = setup();
+          await rejectBusy();
+          vi.advanceTimersByTime(BUSY_HOLD_MAX_MS);
+          await drainOnto('job-2');
+          // The ack was lost; `job.status: running` stands in for it.
+          dispatcher.markJobStarted('job-2');
+          // fails-when: the running status is not read as accepted work.
+          expect(registry.get('a1')?.busyHeldUntil).toBeUndefined();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('an ack while the hold is in force leaves it: the acked job occupies the slot', async () => {
+        const { registry, dispatcher, occupy, rejectBusy } = setup({ a1MaxConcurrency: 2 });
+        // Accepted before the rejection, but its ack is processed after it.
+        occupy('a1', 'job-running');
+        await rejectBusy();
+        dispatcher.onJobAcked('a1', 'job-running');
+        dispatcher.markJobStarted('job-running');
+        // fails-when: accepted work lifts a hold in force — the busy agent is
+        // re-picked at once.
+        expect(registry.get('a1')?.busyHeldUntil).toBeDefined();
+        expect(registry.findAvailable(['linux'])).toEqual([]);
+      });
     });
   });
 
@@ -2491,7 +2934,7 @@ describe('Dispatcher', () => {
       const failed = await dispatcher.onAgentDisconnect('sc-1');
 
       expect(markRecovering).not.toHaveBeenCalled();
-      expect(requeue).toHaveBeenCalledWith('job-1');
+      expect(requeue).toHaveBeenCalledWith('job-1', { countAttempt: true });
       expect(failed).toEqual([]); // requeued, not failed
     });
 
@@ -2722,7 +3165,7 @@ describe('Dispatcher', () => {
       });
 
       const jobId = dispatchedJobId(await dispatcher.dispatch(makeJobInput()));
-      await dispatcher.onJobRejected('a1', jobId, 'busy');
+      await dispatcher.onJobRejected('a1', jobId, JobRejectReason.enum.busy);
 
       await vi.advanceTimersByTimeAsync(10_000);
 
@@ -2806,7 +3249,7 @@ describe('Dispatcher', () => {
       // only one) disconnects. Triage must requeue and consult the scaler.
       await dispatcher.onAgentDisconnect('a1');
 
-      expect(queue.requeue).toHaveBeenCalledWith(jobId);
+      expect(queue.requeue).toHaveBeenCalledWith(jobId, { countAttempt: true });
       expect(onNoMatchingAgent).toHaveBeenCalled();
       dispatcher.stopRecoveryTimers();
     });
@@ -2998,5 +3441,233 @@ describe('containerSpawnFor', () => {
   it('offers no spawn for a job with no container at all', () => {
     expect(containerSpawnFor({})).toBeUndefined();
     expect(containerSpawnFor(undefined)).toBeUndefined();
+  });
+});
+
+describe('Dispatcher — a refused dispatch', () => {
+  const REASON = 'no clone credentials for the source repository';
+
+  function setup(refuse: boolean, dequeueJobs: QueuedJob[] = [], opts: { peers?: boolean } = {}) {
+    const registry = new AgentRegistry();
+    registry.register('agent-1', mockWs(), ['linux']);
+    const queue = mockQueue({ dequeueJobs });
+    const deferUnopenable = vi.mocked(queue.deferUnopenable);
+    const metrics = mockMetrics();
+    const onJobFailedPermanently = vi.fn();
+    const onDispatch = vi.fn(async () => (refuse ? { refused: REASON } : undefined));
+    const dispatcher = new Dispatcher({
+      registry,
+      queue,
+      metrics,
+      onDispatch,
+      onJobFailedPermanently,
+      ...(opts.peers !== undefined && { hasPeerCoordinators: () => opts.peers! }),
+    });
+    return {
+      dispatcher,
+      registry,
+      queue,
+      metrics,
+      onJobFailedPermanently,
+      onDispatch,
+      deferUnopenable,
+    };
+  }
+
+  it('fails a directly dispatched job the callback refused, instead of awaiting its ack', async () => {
+    // fails-when: a refused job keeps its agent slot and an ack deadline for a message never sent
+    const { dispatcher, registry, queue, metrics, onJobFailedPermanently } = setup(true);
+
+    const result = await dispatcher.dispatch(makeJobInput());
+
+    expect(result.status).toBe('dispatched');
+    const jobId = (result as { jobId: string }).jobId;
+    expect(queue.markFailed).toHaveBeenCalledWith(jobId, REASON);
+    expect(onJobFailedPermanently).toHaveBeenCalledWith('agent-1', jobId, 'run-1', REASON);
+    expect(registry.get('agent-1')!.activeJobs).toBe(0);
+    expect(queue.setAckDeadline).not.toHaveBeenCalled();
+    expect(metrics.incJobsDispatched).not.toHaveBeenCalledWith('dispatched');
+  });
+
+  it('fails a queue-drained job the callback refused', async () => {
+    const job = makeQueuedJob({ id: 'queued-refused' });
+    const { dispatcher, queue, onJobFailedPermanently } = setup(true, [job]);
+
+    await dispatcher.onAgentAvailable('agent-1');
+
+    expect(queue.markFailed).toHaveBeenCalledWith('queued-refused', REASON);
+    expect(onJobFailedPermanently).toHaveBeenCalledWith(
+      'agent-1',
+      'queued-refused',
+      'run-1',
+      REASON,
+    );
+    expect(queue.setAckDeadline).not.toHaveBeenCalled();
+  });
+
+  describe('a queue-drained job whose sealed secrets this coordinator cannot open', () => {
+    const UNSEALED = new JobSecretsUnsealError('run-1', 'bad key').message;
+
+    it('puts the job back pending for a peer coordinator, unsent and not failed', async () => {
+      const job = makeQueuedJob({ id: 'queued-unsealed', secretsUnavailable: UNSEALED });
+      const { dispatcher, registry, queue, onJobFailedPermanently, deferUnopenable } = setup(
+        false,
+        [job],
+        { peers: true },
+      );
+
+      await dispatcher.onAgentAvailable('agent-1');
+
+      // fails-when: a key mismatch during a rolling rotation fails the job permanently
+      expect(queue.requeue).toHaveBeenCalledWith('queued-unsealed', {
+        countAttempt: true,
+        provisioningError: UNSEALED,
+      });
+      expect(deferUnopenable).toHaveBeenCalledWith('queued-unsealed');
+      // The deferral is armed before the row returns to pending.
+      // fails-when: the requeue runs first, so a concurrent drain can re-claim the job inside its back-off
+      expect(deferUnopenable.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(queue.requeue).mock.invocationCallOrder[0],
+      );
+      expect(queue.markFailed).not.toHaveBeenCalled();
+      expect(onJobFailedPermanently).not.toHaveBeenCalled();
+      expect(queue.setAckDeadline).not.toHaveBeenCalled();
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
+    });
+
+    it('fails the job at once when no peer coordinator is connected', async () => {
+      const job = makeQueuedJob({ id: 'queued-unsealed', secretsUnavailable: UNSEALED });
+      const { dispatcher, queue, onJobFailedPermanently, onDispatch } = setup(false, [job]);
+
+      await dispatcher.onAgentAvailable('agent-1');
+
+      // fails-when: a single node puts back a job no coordinator will ever open
+      expect(queue.requeue).not.toHaveBeenCalled();
+      expect(queue.markFailed).toHaveBeenCalledWith('queued-unsealed', UNSEALED);
+      expect(onJobFailedPermanently).toHaveBeenCalledWith(
+        'agent-1',
+        'queued-unsealed',
+        'run-1',
+        UNSEALED,
+      );
+      expect(onDispatch).not.toHaveBeenCalled();
+    });
+
+    it('fails the job once its dispatch attempts run out', async () => {
+      const job = makeQueuedJob({ id: 'queued-unsealed', secretsUnavailable: UNSEALED });
+      const { dispatcher, queue, onJobFailedPermanently } = setup(false, [job], { peers: true });
+      vi.mocked(queue.requeue).mockResolvedValueOnce(MAX_DISPATCH_ATTEMPTS);
+
+      await dispatcher.onAgentAvailable('agent-1');
+
+      // breaks-if-wrong: a job no coordinator can open must not stay pending forever
+      expect(queue.markFailed).toHaveBeenCalledWith(
+        'queued-unsealed',
+        expect.stringContaining(UNSEALED),
+      );
+      expect(onJobFailedPermanently).toHaveBeenCalledWith(
+        'agent-1',
+        'queued-unsealed',
+        'run-1',
+        expect.stringContaining('finish the key rotation on every coordinator'),
+      );
+    });
+  });
+
+  it('sends a job the callback accepted and arms its ack deadline', async () => {
+    // breaks-if-wrong: a callback that returns nothing must still count as sent
+    const { dispatcher, registry, queue, metrics, onJobFailedPermanently } = setup(false);
+
+    await dispatcher.dispatch(makeJobInput());
+
+    expect(queue.markFailed).not.toHaveBeenCalled();
+    expect(onJobFailedPermanently).not.toHaveBeenCalled();
+    expect(registry.get('agent-1')!.activeJobs).toBe(1);
+    expect(queue.setAckDeadline).toHaveBeenCalledTimes(1);
+    expect(metrics.incJobsDispatched).toHaveBeenCalledWith('dispatched');
+  });
+});
+
+describe('Dispatcher — the requeue redispatch and a job inside its sealed-secrets back-off', () => {
+  const UNSEALED = new JobSecretsUnsealError('run-1', 'bad key').message;
+
+  function setup(deferred: boolean, extra: Partial<QueuedJob> = {}) {
+    const registry = new AgentRegistry();
+    registry.register('a1', mockWs(), ['linux']);
+    const fullJob = makeQueuedJob({
+      id: 'job-1',
+      status: DispatchQueueStatus.Pending,
+      runsOnLabels: ['linux'],
+      ...extra,
+    });
+    const queue = {
+      ...mockQueue(),
+      requeue: vi.fn(async () => 1),
+      getFullJobById: vi.fn(async () => fullJob),
+      getDepth: vi.fn(async () => 0),
+      isDeferredUnopenable: vi.fn(() => deferred),
+    } as unknown as JobQueue;
+    const onNoMatchingAgent = vi.fn().mockResolvedValue({ action: 'spawning' });
+    const dispatcher = new Dispatcher({
+      registry,
+      queue,
+      metrics: mockMetrics(),
+      onDispatch: vi.fn(),
+      onNoMatchingAgent,
+      hasPeerCoordinators: () => true,
+    });
+    registry.incrementActiveJobs('a1');
+    dispatcher.restoreJobForAgent('a1', 'job-1');
+    return { dispatcher, queue, onNoMatchingAgent };
+  }
+
+  it('claims a requeued job it cannot open and puts it back, instead of scaling for it', async () => {
+    const { dispatcher, queue, onNoMatchingAgent } = setup(false, {
+      secretsUnavailable: UNSEALED,
+      jobConfig: { container: { image: 'registry.example.com/team/private:1' } },
+    });
+    // The only agent holds its one slot, so an opened job would go to the scaler.
+    await (dispatcher as unknown as { redispatch(jobId: string): Promise<void> }).redispatch(
+      'job-1',
+    );
+
+    // fails-when: the redispatch spawns the private image without the sealed registry credentials
+    expect(onNoMatchingAgent).not.toHaveBeenCalled();
+    expect(queue.claimUnopenableById).toHaveBeenCalledWith('job-1');
+    expect(queue.requeue).toHaveBeenCalledWith('job-1', {
+      countAttempt: true,
+      provisioningError: UNSEALED,
+    });
+  });
+
+  it('still scales for a requeued job it can open when no agent is free', async () => {
+    const { dispatcher, queue, onNoMatchingAgent } = setup(false, {
+      jobConfig: { container: { image: 'registry.example.com/team/private:1' } },
+    });
+
+    await (dispatcher as unknown as { redispatch(jobId: string): Promise<void> }).redispatch(
+      'job-1',
+    );
+
+    // breaks-if-wrong: a requeued job whose secrets opened is scaled for with its image
+    expect(onNoMatchingAgent).toHaveBeenCalledTimes(1);
+    expect(onNoMatchingAgent.mock.calls[0][6]).toEqual({
+      image: 'registry.example.com/team/private:1',
+    });
+    expect(queue.claimUnopenableById).not.toHaveBeenCalled();
+  });
+
+  it('does not re-offer a job this coordinator put back, inside its back-off', async () => {
+    const { dispatcher, queue } = setup(true);
+    await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.draining);
+    // fails-when: the redispatch re-claims a job this coordinator just put back for a peer
+    expect(queue.dequeueById).not.toHaveBeenCalled();
+  });
+
+  it('re-offers the job once its back-off has lapsed', async () => {
+    const { dispatcher, queue } = setup(false);
+    await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.draining);
+    // breaks-if-wrong: a job past its back-off is offered like any other, so it can still fail
+    expect(queue.dequeueById).toHaveBeenCalledWith('job-1', ['linux'], [], 'a1');
   });
 });

@@ -673,6 +673,10 @@ export async function runServer(
               instanceId: sub.config.instanceId,
               cancelJobOnPeer: (peerId, runId, jobId, reason) =>
                 sub.coordinator.cancelJobOnPeer(peerId, runId, jobId, reason),
+              // A held run's cancel withdraws its approval request the way a
+              // reject does, from the live processing-deps bag.
+              rejectHeldWorkflow: (hold, reason, opts) =>
+                rejectWorkflow(hold, buildProcessingDeps(), sub.db, reason, opts),
             }),
           });
 
@@ -787,6 +791,11 @@ export async function runServer(
                     matchContext: (o, n) => contextStore.matchContext(o, n),
                     heldRunStore,
                     accessLogWriter: sub.accessLogWriter,
+                    contextData: () => ({
+                      contextStore,
+                      variableStore,
+                      secretResolver: sub.secretResolver ?? undefined,
+                    }),
                   },
                 );
               },
@@ -1972,6 +1981,7 @@ export async function runServer(
                         'started_at',
                         'completed_at',
                         'duration_ms',
+                        'status_epoch',
                       ])
                       .where('run_id', '=', rid)
                       .executeTakeFirst();
@@ -1991,6 +2001,7 @@ export async function runServer(
                           started_at: row.started_at,
                           completed_at: row.completed_at,
                           duration_ms: row.duration_ms,
+                          status_epoch: row.status_epoch,
                         }
                       : null;
                   },
@@ -2156,6 +2167,11 @@ export async function runServer(
                     matchContext: (o, n) => contextStore.matchContext(o, n),
                     heldRunStore,
                     accessLogWriter: sub.accessLogWriter,
+                    contextData: () => ({
+                      contextStore,
+                      variableStore,
+                      secretResolver: sub.secretResolver ?? undefined,
+                    }),
                   },
                 );
               },

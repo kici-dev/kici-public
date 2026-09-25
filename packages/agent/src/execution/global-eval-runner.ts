@@ -4,7 +4,7 @@
  * One round runs per (event × workflow repo), on an agent that already holds
  * both trees on disk. For each candidate global workflow it runs the workflow's
  * `filter` — deciding whether the workflow applies to the source repo at all —
- * and, for a survivor, its `DynamicJobFn`s, so the orchestrator can dispatch
+ * and, for a survivor, its needs-free `DynamicJobFn`s, so the orchestrator can dispatch
  * generated jobs it could not otherwise see. The round precedes every run row:
  * a `filter` returning `false` means no run is created.
  *
@@ -32,7 +32,7 @@
 
 import type { Workflow, RepoInfo, DynamicJobContext, Logger } from '@kici-dev/sdk';
 import { $ as ambientShell, type $ as Shell } from 'zx';
-import { isDynamicJobFn } from '@kici-dev/sdk';
+import { getDynamicJobNeeds, isDynamicJobFn, type DynamicJobFn } from '@kici-dev/sdk';
 import { createFilterContext, buildKiciApi } from '@kici-dev/sdk/internal';
 import type {
   ChangedFilesStatus,
@@ -140,19 +140,35 @@ async function loadWorkflowCached(
 }
 
 /**
- * Run every `DynamicJobFn` the workflow declares and serialize the result.
+ * True for a generator the round runs: one declared without upstream `needs`.
+ *
+ * A generator declared with `needs` (a result-aware generator) is skipped: it
+ * runs later on the run's deferred path, once its upstreams have produced the
+ * outputs it reads. The test is the one the compiler uses to mark the lock
+ * entry `resultAware`, so the round and the lock file cannot disagree about
+ * which generators belong where.
+ */
+export function isRoundGeneratorFn(generator: DynamicJobFn): boolean {
+  return getDynamicJobNeeds(generator) === undefined;
+}
+
+/**
+ * Run every needs-free `DynamicJobFn` the workflow declares and serialize the
+ * result.
  *
  * The generator context is built through `buildGeneratorContext` with the same
  * repo pair the sandbox re-evaluation gets, so the two calls a generator
  * receives cannot drift apart. Returns `undefined` when the workflow declares
- * no generators, which keeps the `jobs` key off the wire entirely.
+ * no needs-free generator, which keeps the `jobs` key off the wire entirely.
  */
 async function generateDynamicJobs(
   workflow: Workflow,
   shared: RoundState,
 ): Promise<LockJob[] | undefined> {
   const { args } = shared;
-  const generators = workflow.jobs.filter(isDynamicJobFn);
+  // fails-when: a generator declared with `needs` runs in the round, with no upstream outputs
+  // breaks-if-wrong: a needs-free generator must still run in the round
+  const generators = workflow.jobs.filter(isDynamicJobFn).filter(isRoundGeneratorFn);
   if (generators.length === 0) return undefined;
 
   const serializerCtx = {

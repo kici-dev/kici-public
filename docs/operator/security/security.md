@@ -43,9 +43,9 @@ Because the fork run evaluates base-branch definitions, a fork pull request that
 
 ### Organization-wide global workflows
 
-Organization-wide global workflows do not run for a pull request the fork switch holds. Approving the hold releases the pull request's own workflows; it does not retroactively run the organization's global workflows for that event. A separate neutral check, `KiCI: Organization workflows`, reports that they were skipped, so the `KiCI Security` check keeps showing the hold.
+The fork switch applies to organization-wide global workflows the same way it applies to the pull request's own workflows. On `hold`, each global run is held in the security queue next to the pull request's own runs, and approving the hold dispatches it, still untrusted. A global workflow that needs a pre-run evaluation is held as one `__globaleval__<owner>/<repo>` run per workflow repository, and approving it runs the evaluation. On `ignore`, no global run is created.
 
-This matters because a global workflow runs with **organization** credentials against the pull request's head commit. Letting one run for an untrusted event would defeat the policy that held the event in the first place.
+This matters because a global job can bind the workflow repository's contexts and runs against the pull request's head commit. See [Global workflows](../../user/global-workflows.md#holds-approvals-and-pull-requests-from-forks).
 
 The master switch that turns global workflows on at all is **operator-held and fleet-wide** (`cluster_settings.global_workflows_enabled`, set with `kici-admin cluster-settings`). It cannot be flipped from the dashboard — an org admin can tune the per-org authoring and source lists, but only the orchestrator operator can enable the feature for the cluster.
 
@@ -72,7 +72,7 @@ Under `ignore` it prints a warning too, because that value is the one that leave
 
 The policy governs both ingresses: webhooks relayed from the Platform, and those arriving on the orchestrator's own direct GitHub route (served in hybrid, independent and observed mode). One stored row decides the verdict whichever way an event arrived.
 
-On `hold`, the run is parked in the security queue, a pending `KiCI Security` check appears on the commit, and a reviewer releases it with `/kici approve` on the pull request. Releasing it lets the run **execute**; it does not make the contributor trusted. The resumed run keeps the reduced privilege its fork ref earned: the base branch's lock file, no install or registry secrets, and an isolated cache write scope. A hold nobody answers expires after the org's approval window and cancels the run.
+On `hold`, the run is parked in the security queue, a pending `KiCI Security` check appears on the commit, and a reviewer releases it with `/kici approve` on the pull request. Releasing it lets the run **execute**; it does not make the contributor trusted. The resumed run keeps the reduced privilege its fork ref earned: the base branch's lock file, no install or registry secrets, and an isolated cache write scope. A hold nobody answers expires after the org's approval window and fails the run with an expiry reason.
 
 Approving from the dashboard, `kici approve`, or MCP needs a Platform connection, because all three reach the orchestrator over the control-plane connection. On an **independent** orchestrator the two local surfaces are `/kici approve` on the pull request, which covers security holds only, and `kici-admin held-run approve|reject`, which covers every queue. See [Answering a hold on an independent orchestrator](#answering-a-hold-on-an-independent-orchestrator).
 
@@ -140,7 +140,7 @@ Trust is a ref-based, two-value judgement: a ref in the repository is `trusted`,
 
 A run that resolved **no** tier passes the gate — a pull request from a source with no fork model, or an internal run whose inheritance lookup failed. A run whose tier resolved `trusted` passes too.
 
-Configure it per context under **Settings > Environments > [env] > Protection**.
+Configure it per context under **Contexts > [context] > Protection**.
 
 ### Deployment checklist: which contexts need it
 
@@ -175,7 +175,7 @@ Two further values, `workflow_modification` and `unknown_contributor`, still app
 
 **Pull-request comment:** post `/kici approve` or `/kici reject`. The commenter must hold `ci_trust:write` or higher, verified through their identity link and RBAC. The command acts only on the held runs for the pull request (and repo) the comment was posted on — it never releases or rejects holds belonging to other pull requests or repositories.
 
-Approving a `fork_pr` hold dispatches the run, untrusted. Rejecting it cancels the run, and so does expiry. Either way the `KiCI Security` check reaches a terminal state, so branch protection is never left waiting on a hold that already ended.
+Approving a `fork_pr` hold dispatches the run, untrusted. Rejecting it cancels the run; expiry fails it with an expiry reason. Either way the `KiCI Security` check reaches a terminal state, so branch protection is never left waiting on a hold that already ended.
 
 ### A job held twice
 
@@ -185,7 +185,7 @@ From the CLI, `--job` alone cannot separate the two. Pass `kici approve <run-id>
 
 ### Expiry
 
-A `fork_pr` hold covers a whole pull request and is not attached to a context, so it uses the org's **Approval expiry** setting (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour), configurable under **Settings > Environments > [env] > Protection**.
+A `fork_pr` hold covers a whole pull request and is not attached to a context, so it uses the org's **Approval expiry** setting (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour), configurable under **Contexts > [context] > Protection**.
 
 The org's approval expiry is one window that can be written two ways. The dashboard edits it in whole hours. To set a window shorter than an hour, or one that is not a whole number of hours, use seconds:
 
@@ -194,9 +194,9 @@ The org's approval expiry is one window that can be written two ways. The dashbo
 
 Both spellings always move together, so they cannot disagree: setting one recomputes the other. `kici-admin trust-policy show` prints a whole-hour window as hours (`72 h`) and anything finer as seconds (`30 s`).
 
-A job held twice carries **two** expiries, one per hold, and whichever comes first cancels the run. The security half of such a job is a `context_trust` hold, on the context's one-hour default. The reviewer half defaults to the org's `approval_expiry_seconds`, which is 24 hours. So the job is cancelled after an hour unless you raise the context's hold expiry.
+A job held twice carries **two** expiries, one per hold, and whichever comes first ends the hold and fails the run. The security half of such a job is a `context_trust` hold, on the context's one-hour default. The reviewer half defaults to the org's `approval_expiry_seconds`, which is 24 hours. So the run fails after an hour unless you raise the context's hold expiry.
 
-An expired run transitions to `expired`, and its checks are completed with a timeout explanation.
+An expired hold is marked `expired`, its run fails with an expiry reason, and its checks are completed with a timeout explanation.
 
 ## Identity linking
 

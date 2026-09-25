@@ -6,6 +6,7 @@ import {
   canonicalizeLabels,
   canonicalizeLabelSet,
   canonicalizeMatcher,
+  ExecutionJobStatus,
   ExecutionRunStatus,
   type LabelMatcher,
   matcherSatisfiedBy,
@@ -15,6 +16,13 @@ import {
 import { createLogger } from '@kici-dev/shared';
 import type { Database, DispatchQueueItem } from '../db/types.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
+import { JobContainerNeed, jobContainerNeed } from '../scaler/agent-fit.js';
+import { DEFAULT_SEALED_SECRETS_RETRY_BACKOFF_MS } from '../config.js';
+import {
+  JobSecretsUnsealError,
+  sealJobConfig,
+  unsealJobConfig,
+} from '../secrets/job-secret-seal.js';
 import {
   DEFAULT_RECOVERY_GRACE_MS,
   instanceLivenessGraceMs,
@@ -95,6 +103,9 @@ function notTerminalRunSql() {
   )`;
 }
 
+/** Recorded on a job whose direct dispatch was refused because its run stopped. */
+export const STOPPED_RUN_DISPATCH_REASON = 'the run stopped before this job was dispatched';
+
 /** True when the owner is this instance, a connected peer, or a live heartbeat. */
 function ownerIsLiveSql(opts: OwnershipPredicateOptions) {
   const column = opts.ownerColumn ?? OWNER_COLUMN;
@@ -162,6 +173,12 @@ export interface ExpiredJobInfo {
   runsOnPatterns: CanonicalMatcher[];
   excludeLabels: CanonicalLabel[];
   excludePatterns: CanonicalMatcher[];
+  /**
+   * What the job's `container:` asks of the agent that runs it. A container job
+   * reaches only an agent that can start one, so an agent that merely matches
+   * its labels may still be no route at all. Absent reads as no container.
+   */
+  container?: JobContainerNeed;
 }
 
 /**
@@ -183,6 +200,20 @@ interface ExpiryRowShape {
   runs_on_patterns: unknown;
   exclude_labels: unknown;
   exclude_patterns: unknown;
+  job_config: string;
+}
+
+/**
+ * What a stored job config's `container:` asks of the agent. The field is never
+ * sealed. A config that does not parse reads as no container, so one bad row
+ * cannot fail the whole sweep that reads it.
+ */
+function containerNeedOfStoredConfig(jobConfig: string): JobContainerNeed {
+  try {
+    return jobContainerNeed((JSON.parse(jobConfig) as { container?: unknown } | null)?.container);
+  } catch {
+    return JobContainerNeed.None;
+  }
 }
 
 /**
@@ -212,6 +243,7 @@ function rowToExpiredJobInfo(r: ExpiryRowShape): ExpiredJobInfo {
       r.exclude_patterns,
       'exclude_patterns',
     ).map(canonicalizeMatcher),
+    container: containerNeedOfStoredConfig(r.job_config),
   };
 }
 
@@ -250,11 +282,32 @@ export enum DispatchQueueStatus {
   Recovering = 'recovering',
 }
 
+/** Cap on the jobs one process keeps in its sealed-secrets back-off. */
+const MAX_DEFERRED_UNOPENABLE = 1000;
+
+/**
+ * The `dispatch_queue` statuses a row never leaves. `cancelled` is not a
+ * {@link DispatchQueueStatus}, but existing databases hold rows the test-run
+ * cancel stamped with it; those rows are terminal too, so the prune and the
+ * sealed-secrets scrub cover them.
+ */
+export const TERMINAL_DISPATCH_STATUSES: string[] = [
+  DispatchQueueStatus.Completed,
+  DispatchQueueStatus.Failed,
+  DispatchQueueStatus.Expired,
+  'cancelled',
+];
+
 /**
  * Maximum delivery attempts for a single dispatch_queue job. A job whose
  * `dispatch_attempts` reaches this value is failed permanently instead of
  * being requeued again. Bounds requeue loops from repeated job.reject /
- * pre-start agent loss; `expires_at` is the time-based backstop.
+ * pre-start agent loss. A busy job.reject is not counted while the agent keeps
+ * reporting an empty slot between rejections, but is counted once the agent is
+ * re-picked only because its busy hold expired, so this cap still bounds an
+ * agent whose job count is stuck. `expires_at` is no backstop for this: a
+ * job dispatched straight to an agent carries none, and requeue does not set
+ * one.
  */
 export const MAX_DISPATCH_ATTEMPTS = 5;
 
@@ -374,6 +427,12 @@ export interface QueuedJob {
   resources?: ResourceRequest;
   /** For a runsOnAll host-fanout child: the agent this job is pinned to. */
   pinnedAgentId?: string;
+  /**
+   * Set when the row's sealed secret fields could not be decrypted. The
+   * dispatcher never sends such a job: it puts the job back so a coordinator
+   * holding the key can take it, or fails it with this reason when none can.
+   */
+  secretsUnavailable?: string;
 }
 
 /**
@@ -427,6 +486,19 @@ export class JobQueue {
     breakdown: DispatchQueueDepthBreakdown;
     expiresAt: number;
   } | null = null;
+  /**
+   * Jobs this coordinator put back because it could not open their sealed
+   * secrets (sealed with a master key it does not hold), keyed to the time it
+   * may claim them again. Until then every claim path and the re-drive readers
+   * skip them, so during a rolling key rotation a coordinator that holds the
+   * key can take the job in that window. After the back-off this coordinator
+   * can claim the job again, and each claim spends another attempt, so a job
+   * no coordinator can open still reaches {@link MAX_DISPATCH_ATTEMPTS} and
+   * fails. Bounded; an evicted entry only ends its back-off early.
+   */
+  private readonly deferredUnopenable = new Map<string, number>();
+  /** The configured default for `sealed_secrets_retry_backoff_ms`. */
+  private readonly sealedSecretsRetryBackoffMs: number;
 
   constructor(
     db: Kysely<Database>,
@@ -449,9 +521,16 @@ export class JobQueue {
        * recovery grace period.
        */
       ownershipGraceMs?: number;
+      /**
+       * Default back-off before this coordinator claims again a job whose
+       * sealed secrets it could not open; `cluster_settings` overrides it.
+       */
+      sealedSecretsRetryBackoffMs?: number;
     },
   ) {
     this.db = db;
+    this.sealedSecretsRetryBackoffMs =
+      options.sealedSecretsRetryBackoffMs ?? DEFAULT_SEALED_SECRETS_RETRY_BACKOFF_MS;
     this.defaultMaxDepth = options.maxDepth;
     this.defaultTimeoutMs = options.defaultTimeoutMs;
     this.clusterSettings = options.clusterSettings;
@@ -506,7 +585,7 @@ export class JobQueue {
         // The PATTERN columns keep their source verbatim — a regex source cannot
         // be lowercased, so its fold rides on the `i` flag the read forces.
         runs_on_labels: JSON.stringify(canonicalizeLabels(job.runsOnLabels)),
-        job_config: JSON.stringify(job.jobConfig),
+        ...sealedJobConfigColumns(job),
         repo_url: job.repoUrl,
         ref: job.ref,
         sha: job.sha,
@@ -558,12 +637,14 @@ export class JobQueue {
    * @param agentMandatoryLabels Mandatory labels the spawning scaler declared
    *   (empty for static / non-scaler agents).
    * @param canServe Optional extra predicate applied to every candidate row
-   *   before it is claimed. Labels cannot express whether a pre-spawned agent's
-   *   fixed cpu / memory / image fit a job, so a caller that has to answer that
-   *   supplies it here — the row must never be claimed and put back, because a
-   *   claim-then-release both strands it as Dispatched for a window and burns a
-   *   dispatch attempt. Supplying it opts out of the single-statement fast
-   *   path, so pass it only for an agent that actually needs the check.
+   *   before it is claimed. Labels cannot express whether an agent may run a
+   *   job — a pre-spawned agent's fixed shape, a container job on an agent with
+   *   no runtime, an agent started inside another job's image — so a caller
+   *   that has to answer that supplies it here. The row must never be claimed
+   *   and put back, because a claim-then-release both strands it as Dispatched
+   *   for a window and burns a dispatch attempt. Supplying it opts out of the
+   *   single-statement fast path, so pass it only for an agent that actually
+   *   needs the check.
    * @returns The matching job, or null if none found.
    */
   async dequeueForLabels(
@@ -685,7 +766,8 @@ export class JobQueue {
     // whose recorded status already says it stopped. `cancelling` counts: the
     // run is on its way out and its remaining jobs are being torn down.
     query = query.where(notTerminalRunSql());
-    return query;
+    const skipDeferred = this.deferredFilter();
+    return skipDeferred ? query.where(skipDeferred) : query;
   }
 
   /**
@@ -829,12 +911,20 @@ export class JobQueue {
    * also matches jobs pinned to this agent — so a lost race is not a stall.
    */
   async dequeueByPinnedAgent(agentId: string, agentLabels?: string[]): Promise<QueuedJob | null> {
-    const row = await this.db
+    let query = this.db
       .selectFrom('dispatch_queue')
       .selectAll()
       .where('status', '=', DispatchQueueStatus.Pending)
       .where('pinned_agent_id', '=', agentId)
       .where(sql<SqlBool>`(expires_at IS NULL OR expires_at >= now())`)
+      // Same stopped-run guard as the generic drain: a pinned job of a run that
+      // is over stays unclaimed instead of starting an agent for nobody.
+      // fails-when: a pinned job of a cancelled run is claimed and sent to its agent
+      // breaks-if-wrong: a pinned job of a running run must still be claimed
+      .where(notTerminalRunSql());
+    const skipDeferred = this.deferredFilter();
+    if (skipDeferred) query = query.where(skipDeferred);
+    const row = await query
       .orderBy('created_at', 'asc')
       .limit(1)
       .forUpdate()
@@ -907,6 +997,13 @@ export class JobQueue {
     if (canonicalGate.length > 0) {
       query = query.where(sql<SqlBool>`runs_on_labels @> ${sql.lit(mandatoryLabelsJson)}::jsonb`);
     }
+    // Same stopped-run guard as the generic drain: the eager bound claim must
+    // not start an agent on a job whose run already stopped.
+    // fails-when: a bound job of a cancelled run is claimed and sent to the agent spawned for it
+    // breaks-if-wrong: a bound job of a running run must still be claimed
+    query = query.where(notTerminalRunSql());
+    const skipDeferred = this.deferredFilter();
+    if (skipDeferred) query = query.where(skipDeferred);
 
     const row = await query.forUpdate().skipLocked().executeTakeFirst();
     if (!row) return null;
@@ -940,12 +1037,22 @@ export class JobQueue {
    * it can avoid double-dispatching an already-present job. The conflicting row
    * keeps the owner the winning writer recorded.
    *
-   * @returns The job ID and whether a new row was inserted (false = row already existed).
+   * A job whose run has already stopped is refused, with the same stopped-run
+   * guard the queue drain applies (`notTerminalRunSql`). The row is still
+   * written, then settled `expired` in a guarded update — the state a cancel
+   * leaves a queued job of its run in — and the job's `execution_jobs` row, if
+   * one exists yet, is cancelled. `runStopped` tells the caller not to send it.
+   * Checking after the insert rather than before closes the race with a cancel:
+   * a cancel that lands after the check sees the dispatched row and cancels it
+   * through the agent, and one that lands before is seen by the check.
+   *
+   * @returns The job ID, whether a new row was inserted (false = row already
+   *   existed), and whether the dispatch was refused because the run stopped.
    */
   async insertDispatched(
     job: QueuedJobInput,
     agentId: string,
-  ): Promise<{ id: string; inserted: boolean }> {
+  ): Promise<{ id: string; inserted: boolean; runStopped?: boolean }> {
     const id = job.jobId ?? randomUUID();
     const now = new Date().toISOString();
 
@@ -961,7 +1068,7 @@ export class JobQueue {
         // The PATTERN columns keep their source verbatim — a regex source cannot
         // be lowercased, so its fold rides on the `i` flag the read forces.
         runs_on_labels: JSON.stringify(canonicalizeLabels(job.runsOnLabels)),
-        job_config: JSON.stringify(job.jobConfig),
+        ...sealedJobConfigColumns(job),
         repo_url: job.repoUrl,
         ref: job.ref,
         sha: job.sha,
@@ -994,7 +1101,69 @@ export class JobQueue {
       .returning('id')
       .executeTakeFirst();
 
-    return { id, inserted: inserted !== undefined };
+    if (inserted === undefined) return { id, inserted: false };
+    if (await this.expireDispatchOfStoppedRun(id, job.runId)) {
+      logger.info('Direct dispatch refused: the run has stopped', { runId: job.runId, jobId: id });
+      return { id, inserted: true, runStopped: true };
+    }
+    return { id, inserted: true };
+  }
+
+  /**
+   * Settle a claimed row whose run stopped after the claim: expire it and
+   * cancel its pending job row, the way the cancel path ends a stopped run's
+   * work. {@link requeue} refuses a stopped run's row, so a caller that claimed
+   * a job to put it back uses this when that requeue returns null; otherwise
+   * the row stays dispatched to no agent until a sweep finds it. Returns
+   * whether it settled the row: false when the row is no longer dispatched or
+   * its run is still going.
+   */
+  async settleClaimOfStoppedRun(id: string, runId: string): Promise<boolean> {
+    const settled = await this.expireDispatchOfStoppedRun(id, runId);
+    if (settled) {
+      logger.info('Claimed job settled: its run stopped before it was put back', {
+        runId,
+        jobId: id,
+      });
+    }
+    return settled;
+  }
+
+  /**
+   * Settle a dispatched row `expired` when its run has stopped, and cancel the
+   * job's `execution_jobs` row. Returns whether it did.
+   */
+  private async expireDispatchOfStoppedRun(id: string, runId: string): Promise<boolean> {
+    const expired = await this.db
+      .updateTable('dispatch_queue')
+      .set({
+        status: DispatchQueueStatus.Expired,
+        agent_id: null,
+        owner_instance_id: null,
+        dispatched_at: null,
+      })
+      .where('id', '=', id)
+      .where('status', '=', DispatchQueueStatus.Dispatched)
+      // fails-when: a direct dispatch for a cancelled run is left dispatched and sent to an agent
+      // breaks-if-wrong: a direct dispatch for a running run must stay dispatched
+      .where(sql<SqlBool>`NOT (${notTerminalRunSql()})`)
+      .executeTakeFirst();
+    if (Number(expired.numUpdatedRows ?? 0n) === 0) return false;
+    this.depthCache = null;
+    this.breakdownCache = null;
+    await this.db
+      .updateTable('execution_jobs')
+      .set({
+        status: ExecutionJobStatus.enum.cancelled,
+        completed_at: new Date(),
+        error_message: STOPPED_RUN_DISPATCH_REASON,
+        routing_reason: null,
+      })
+      .where('run_id', '=', runId)
+      .where('job_id', '=', id)
+      .where('status', 'in', [ExecutionJobStatus.enum.pending, ExecutionJobStatus.enum.queued])
+      .execute();
+    return true;
   }
 
   /**
@@ -1073,6 +1242,7 @@ export class JobQueue {
         'runs_on_patterns',
         'exclude_labels',
         'exclude_patterns',
+        'job_config',
       ])
       .where('status', '=', DispatchQueueStatus.Pending)
       .where('expires_at', 'is not', null)
@@ -1161,6 +1331,26 @@ export class JobQueue {
   }
 
   /**
+   * Drop the sealed secret fields of every terminal row. A completed, failed or
+   * expired row is never dispatched again (a requeue moves only a dispatched
+   * row), so its secrets have no reader left; the row stays for its retention
+   * window without them.
+   *
+   * @returns Number of rows scrubbed.
+   */
+  async scrubTerminalSealedSecrets(): Promise<number> {
+    const result = await this.db
+      .updateTable('dispatch_queue')
+      .set({ sealed_secrets: null })
+      // fails-when: a terminal row keeps secrets no dispatch will ever read
+      // breaks-if-wrong: a pending or dispatched row keeps the secrets its dispatch needs
+      .where('status', 'in', TERMINAL_DISPATCH_STATUSES)
+      .where('sealed_secrets', 'is not', null)
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows ?? 0);
+  }
+
+  /**
    * Delete terminal dispatch_queue rows older than `retentionDays`.
    *
    * `dispatch_queue` is operational dispatch state; the durable run history
@@ -1180,11 +1370,7 @@ export class JobQueue {
     if (retentionDays <= 0) return 0;
     const result = await this.db
       .deleteFrom('dispatch_queue')
-      .where('status', 'in', [
-        DispatchQueueStatus.Completed,
-        DispatchQueueStatus.Failed,
-        DispatchQueueStatus.Expired,
-      ])
+      .where('status', 'in', TERMINAL_DISPATCH_STATUSES)
       .where('created_at', '<', sql<Date>`now() - make_interval(days => ${retentionDays})`)
       .executeTakeFirst();
     return Number(result.numDeletedRows);
@@ -1562,15 +1748,23 @@ export class JobQueue {
    * job started. Only flips rows still in 'dispatched' — a job that was
    * concurrently completed / failed / cancelled is left untouched.
    *
-   * @returns the post-increment dispatch_attempts, or null when the row
+   * `countAttempt: false` leaves the counter alone — used for a busy rejection
+   * from an agent still tearing down its previous job (see
+   * {@link MAX_DISPATCH_ATTEMPTS} for when a busy rejection does count).
+   *
+   * @returns the dispatch_attempts after the requeue, or null when the row
    *   was not in 'dispatched' state (nothing requeued).
    */
-  async requeue(jobId: string): Promise<number | null> {
+  async requeue(
+    jobId: string,
+    opts: { countAttempt?: boolean; provisioningError?: string } = {},
+  ): Promise<number | null> {
+    const increment = opts.countAttempt === false ? 0 : 1;
     const row = await this.db
       .updateTable('dispatch_queue')
       .set({
         status: DispatchQueueStatus.Pending,
-        dispatch_attempts: sql<number>`dispatch_attempts + 1`,
+        dispatch_attempts: sql<number>`dispatch_attempts + ${increment}`,
         ack_deadline: null,
         ack_agent_id: null,
         agent_id: null,
@@ -1585,6 +1779,11 @@ export class JobQueue {
         // the probe fail a requeued job on its very next tick with no fresh
         // window — the clock must measure a CONTINUOUS unroutable stretch.
         unroutable_since: null,
+        // Why the job went back, when that is what an expiry should report:
+        // `classifyUnroutable` reads it as the job's failure reason.
+        ...(opts.provisioningError !== undefined && {
+          last_provisioning_error: opts.provisioningError,
+        }),
       })
       .where('id', '=', jobId)
       .where('status', '=', DispatchQueueStatus.Dispatched)
@@ -1794,20 +1993,22 @@ export class JobQueue {
    * `markExpired`). Read-only: no `FOR UPDATE`, no claim. Used by both the
    * unbounded `getPendingJobs` drain and the capped `listPending` re-drive.
    */
-  private pendingOldestFirstQuery() {
-    return this.db
+  private pendingOldestFirstQuery(opts: { skipDeferred: boolean }) {
+    const query = this.db
       .selectFrom('dispatch_queue')
       .selectAll()
       .where('status', '=', DispatchQueueStatus.Pending)
       .where(sql<SqlBool>`(expires_at IS NULL OR expires_at >= now())`)
       .orderBy('created_at', 'asc');
+    const skipDeferred = opts.skipDeferred ? this.deferredFilter() : undefined;
+    return skipDeferred ? query.where(skipDeferred) : query;
   }
 
   /**
    * Get all pending jobs in FIFO order (for queue drain on agent connect).
    */
   async getPendingJobs(): Promise<QueuedJob[]> {
-    const rows = await this.pendingOldestFirstQuery().execute();
+    const rows = await this.pendingOldestFirstQuery({ skipDeferred: true }).execute();
     return rows.map((row) => this.rowToQueuedJob(row));
   }
 
@@ -1821,7 +2022,7 @@ export class JobQueue {
    * the re-drive re-runs the normal scale path, which reserves capacity itself.
    */
   async listPending(limit: number): Promise<QueuedJob[]> {
-    const rows = await this.pendingOldestFirstQuery().limit(limit).execute();
+    const rows = await this.pendingOldestFirstQuery({ skipDeferred: true }).limit(limit).execute();
     return rows.map((row) => this.rowToQueuedJob(row));
   }
 
@@ -1834,7 +2035,8 @@ export class JobQueue {
    * not-yet-expired filter the rest of the queue uses.
    */
   async listUnroutableCandidates(limit: number): Promise<UnroutableCandidate[]> {
-    const rows = await this.pendingOldestFirstQuery().limit(limit).execute();
+    // The probe reads every pending job: a deferred one still expires on time.
+    const rows = await this.pendingOldestFirstQuery({ skipDeferred: false }).limit(limit).execute();
     return rows.map((row) => ({
       ...rowToExpiredJobInfo(row as unknown as ExpiryRowShape),
       unroutableSince: row.unroutable_since ? new Date(row.unroutable_since) : null,
@@ -1897,16 +2099,91 @@ export class JobQueue {
     return Number(result.numUpdatedRows ?? 0) > 0;
   }
 
+  /**
+   * Leave a job alone for the sealed-secrets back-off: the dispatcher calls
+   * this when it puts back a job whose sealed secrets this coordinator could not
+   * open. See {@link deferredUnopenable}.
+   */
+  async deferUnopenable(jobId: string): Promise<void> {
+    const backoffMs =
+      (await this.clusterSettings?.getNumber(
+        'sealed_secrets_retry_backoff_ms',
+        this.sealedSecretsRetryBackoffMs,
+      )) ?? this.sealedSecretsRetryBackoffMs;
+    this.deferredUnopenable.delete(jobId);
+    if (this.deferredUnopenable.size >= MAX_DEFERRED_UNOPENABLE) {
+      const oldest = this.deferredUnopenable.keys().next().value;
+      if (oldest !== undefined) this.deferredUnopenable.delete(oldest);
+    }
+    this.deferredUnopenable.set(jobId, Date.now() + backoffMs);
+  }
+
+  /** Whether `jobId` is still inside its sealed-secrets back-off on this coordinator. */
+  isDeferredUnopenable(jobId: string): boolean {
+    const until = this.deferredUnopenable.get(jobId);
+    return until !== undefined && until > Date.now();
+  }
+
+  /**
+   * Claim a specific pending job for no agent: Pending -> Dispatched, with no
+   * `agent_id`. The dispatcher calls this for a job whose sealed secrets this
+   * coordinator cannot open, when a re-drive would otherwise scale for it, so
+   * the job gets the put-back or fail decision a drain claim would give it.
+   *
+   * The guards of the other claim paths apply: the row is still pending and
+   * unexpired, its run has not stopped, and it is outside this coordinator's
+   * sealed-secrets back-off. The `status = Pending` guard is the arbiter, so a
+   * concurrent claimant makes this return false.
+   *
+   * @returns whether this call claimed the row.
+   */
+  async claimUnopenableById(jobId: string): Promise<boolean> {
+    // fails-when: a re-drive claims a job inside its back-off again, spending another attempt
+    // breaks-if-wrong: a job past its back-off, or never put back here, is still claimed
+    if (this.isDeferredUnopenable(jobId)) return false;
+    const claimed = await this.db
+      .updateTable('dispatch_queue')
+      .set(this.claimTransition())
+      .where('id', '=', jobId)
+      .where('status', '=', DispatchQueueStatus.Pending)
+      .where(sql<SqlBool>`(expires_at IS NULL OR expires_at >= now())`)
+      // fails-when: a pending job of a cancelled run is claimed and spends an attempt
+      // breaks-if-wrong: a pending job of a running run must still be claimed
+      .where(notTerminalRunSql())
+      .executeTakeFirst();
+    return (claimed.numUpdatedRows ?? 0n) > 0n;
+  }
+
   // ── Internal ──────────────────────────────────────────────────────
+
+  /**
+   * The query condition that skips jobs still inside their sealed-secrets
+   * back-off, or undefined when none is (the common case adds no predicate).
+   * Expired entries are dropped here, which is what lets a job be claimed again.
+   */
+  private deferredFilter() {
+    if (this.deferredUnopenable.size === 0) return undefined;
+    const now = Date.now();
+    for (const [jobId, until] of this.deferredUnopenable) {
+      // fails-when: a deferred job is never claimed again, so a job no
+      // coordinator opens stays pending
+      if (until <= now) this.deferredUnopenable.delete(jobId);
+    }
+    // breaks-if-wrong: with nothing deferred, every row stays claimable
+    if (this.deferredUnopenable.size === 0) return undefined;
+    // fails-when: a coordinator without the key re-claims the job inside its back-off
+    return sql<SqlBool>`id::text <> ALL(${sql.val([...this.deferredUnopenable.keys()])}::text[])`;
+  }
 
   /**
    * Convert a DB row to a QueuedJob object.
    * Handles both auto-parsed JSONB arrays (from pg driver) and JSON strings (from tests).
    */
   private rowToQueuedJob(row: DispatchQueueItem): QueuedJob {
-    const jobConfig = JSON.parse(row.job_config) as Record<string, unknown>;
+    const { jobConfig, secretsUnavailable } = unsealRowJobConfig(row);
     const resources = resourcesFromJobConfig(jobConfig);
     return {
+      ...(secretsUnavailable && { secretsUnavailable }),
       id: row.id,
       runId: row.run_id,
       workflowName: row.workflow_name,
@@ -1952,6 +2229,38 @@ export class JobQueue {
       routingKey: row.routing_key,
       pinnedAgentId: row.pinned_agent_id ?? undefined,
     };
+  }
+}
+
+/**
+ * The `job_config` and `sealed_secrets` column values for a job: the secret
+ * fields sealed under the master key, every other field in plain JSON. Both
+ * inserts go through here, so no queued row stores a secret field in the clear
+ * while a master key is configured.
+ */
+function sealedJobConfigColumns(job: Pick<QueuedJobInput, 'runId' | 'jobConfig'>): {
+  job_config: string;
+  sealed_secrets: string | null;
+} {
+  const { jobConfig, sealed } = sealJobConfig(job.runId, job.jobConfig);
+  return { job_config: JSON.stringify(jobConfig), sealed_secrets: sealed };
+}
+
+/**
+ * A row's job config with its sealed secret fields merged back. A row whose
+ * seal cannot be opened keeps the plain fields and names the failure, so the
+ * dispatcher fails that one job instead of the whole read throwing.
+ */
+function unsealRowJobConfig(row: DispatchQueueItem): {
+  jobConfig: Record<string, unknown>;
+  secretsUnavailable?: string;
+} {
+  const jobConfig = JSON.parse(row.job_config) as Record<string, unknown>;
+  try {
+    return { jobConfig: unsealJobConfig(row.run_id, jobConfig, row.sealed_secrets) };
+  } catch (err) {
+    if (!(err instanceof JobSecretsUnsealError)) throw err;
+    return { jobConfig, secretsUnavailable: err.message };
   }
 }
 

@@ -24,19 +24,27 @@ import { repoIdentifierFromUrl } from './global-workflow-env.js';
 import { makeStreamingZxLog } from './streaming-zx-log.js';
 import type { FilterEvalInput } from './init-runner.js';
 import type { GlobalEvalRoundJobConfig } from './global-eval-types.js';
+import { globalWorkspaceLayout } from './job-workspace-layout.js';
 
 export const DEFAULT_GLOBAL_EVAL_ROUND_TIMEOUT_MS = 120_000;
 export const DEFAULT_GLOBAL_EVAL_CANDIDATE_TIMEOUT_MS = 20_000;
 
+/** The workflow-repository fields a global workflow's evaluation job carries in its config. */
+export type GlobalWorkflowRepoFields = Pick<
+  GlobalEvalRoundJobConfig,
+  'workflowRepoUrl' | 'workflowRef' | 'workflowSha' | 'workflowRepoIdentifier'
+>;
+
 /**
- * Build the source / workflow repo pair the round hands to every filter and
- * generator. Mirrors the sandbox's own `setupGlobalWorkflowEnv` construction so
+ * Build the source / workflow repo pair a global workflow's evaluation hands to
+ * every filter and generator — in the round and in the run's own evaluation
+ * jobs. Mirrors the sandbox's own `setupGlobalWorkflowEnv` construction so
  * a generator's two evaluations see the same identifiers, refs, and shas — only
  * the absolute paths differ, and those are never compared.
  */
 export function buildRoundRepos(
   dispatch: JobDispatch,
-  config: GlobalEvalRoundJobConfig,
+  config: GlobalWorkflowRepoFields,
   workflowDir: string,
   sourceDir: string,
 ): { sourceRepo: RepoInfo; workflowRepo: RepoInfo } {
@@ -174,6 +182,31 @@ export async function buildInitFilterInput(
     changedFilesStatus: diff.status,
     env: process.env as Record<string, string | undefined>,
     $: await buildEvalShell(sourceDir, emit),
+  };
+}
+
+/**
+ * Build the context a global workflow's `filter` is evaluated against in one of
+ * the run's own evaluation jobs: the same repo pair, diff and shell the round
+ * hands the same filter. The source repository is the checkout under
+ * `source/`, the workflow repository the one under `workflow/`, and the shell
+ * is rooted at the work dir that holds both.
+ */
+export async function buildGlobalFilterInput(
+  dispatch: JobDispatch,
+  config: GlobalWorkflowRepoFields,
+  event: Record<string, unknown>,
+  workDir: string,
+  emit: (line: string, stream: LogStream) => void,
+): Promise<FilterEvalInput> {
+  const { workflowDir, sourceDir } = globalWorkspaceLayout(workDir);
+  const diff = await resolveEvalChangedFiles(dispatch, event, sourceDir);
+  return {
+    ...buildRoundRepos(dispatch, config, workflowDir, sourceDir),
+    changedFiles: diff.files,
+    changedFilesStatus: diff.status,
+    env: process.env as Record<string, string | undefined>,
+    $: await buildEvalShell(workDir, emit),
   };
 }
 

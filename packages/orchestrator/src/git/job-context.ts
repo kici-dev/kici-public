@@ -98,12 +98,52 @@ async function declaredFromDispatchRecord(
   return asDeclaredCredentials((parsed as Record<string, unknown>).gitCredentials);
 }
 
+/** The run-row columns the credential policy is resolved from. */
+interface PolicyRunFacts {
+  repo_identifier: string;
+  ref: string;
+  workflow_repo_identifier: string | null;
+  workflow_branch: string | null;
+}
+
+/**
+ * The repository and branch a named context's restrictions are checked against.
+ *
+ * A run whose workflow lives in another repository (a global workflow) is
+ * governed by that workflow repository: its contexts, and its registered
+ * branch, are what the operator scoped a credential to. The event's repository
+ * and branch only say where the code came from. `workflow_repo_identifier` is
+ * written only for such a run, so a same-repository run keeps its own
+ * repository and the branch it presents. A cross-repository run with no
+ * recorded branch presents an empty branch, which no branch restriction admits.
+ */
+function resolveCredentialPolicy(run: PolicyRunFacts): {
+  policyRepo: string;
+  policyBranch: string;
+} {
+  if (run.workflow_repo_identifier) {
+    return { policyRepo: run.workflow_repo_identifier, policyBranch: run.workflow_branch ?? '' };
+  }
+  // `execution_runs.ref` is the branch the run PRESENTS — the same value
+  // `event.targetBranch` carried into the dispatch-time protection gates,
+  // not a job's checkout ref.
+  return { policyRepo: run.repo_identifier, policyBranch: run.ref };
+}
+
 /** Build the `jobContext` lookup the git credential handler takes. */
 export function createJobCredentialContextReader(db: Kysely<Database>) {
   return async (runId: string, jobId: string): Promise<JobCredentialContext | null> => {
     const run = await db
       .selectFrom('execution_runs')
-      .select(['customer_id', 'repo_identifier', 'ref', 'trigger_event', 'trust_tier'])
+      .select([
+        'customer_id',
+        'repo_identifier',
+        'ref',
+        'trigger_event',
+        'trust_tier',
+        'workflow_repo_identifier',
+        'workflow_branch',
+      ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
 
@@ -136,10 +176,7 @@ export function createJobCredentialContextReader(db: Kysely<Database>) {
       sourceRepo: run.repo_identifier,
       declaredCredentials: declaredCredentials ?? {},
       trustTier: parseTrustTier(run.trust_tier),
-      // `execution_runs.ref` is the branch the run PRESENTS — the same value
-      // `event.targetBranch` carried into the dispatch-time protection gates,
-      // not a job's checkout ref.
-      branch: run.ref,
+      ...resolveCredentialPolicy(run),
       triggerType: run.trigger_event ?? '',
     };
   };

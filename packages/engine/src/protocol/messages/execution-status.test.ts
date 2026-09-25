@@ -24,6 +24,7 @@ import {
   STATE_REPLAY_MAX_RUNS,
   MAX_JOBS_PER_RUN,
   RUNS_ON_LABELS_MAX,
+  STATUS_EPOCH_MAX,
 } from './execution-status.js';
 import { orchestratorToPlatformMessageSchema } from './platform-orchestrator.js';
 
@@ -969,6 +970,71 @@ describe('workflowRepoIdentifier (the repo that defines a global workflow)', () 
       stateReplaySchema.safeParse({
         ...replay,
         runs: [{ ...replayRun, workflowRepoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX + 1) }],
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('statusEpoch (the run status generation)', () => {
+  const status = {
+    type: 'execution.status' as const,
+    messageId: 'm-epoch-1',
+    runId: 'r-epoch-1',
+    workflowName: 'wf',
+    status: ExecutionRunStatus.enum.running,
+    startedAt: 1,
+    timestamp: 2,
+  };
+
+  const replayRun = {
+    runId: 'r-epoch-2',
+    workflowName: 'wf',
+    status: ExecutionRunStatus.enum.running,
+    jobCount: 0,
+    startedAt: 1,
+    jobs: [],
+  };
+
+  it('carries statusEpoch on execution.status and on a state.replay run', () => {
+    expect(executionStatusSchema.parse({ ...status, statusEpoch: 3 }).statusEpoch).toBe(3);
+    const replay = stateReplaySchema.parse({
+      type: 'state.replay',
+      messageId: 'm-epoch-2',
+      runs: [{ ...replayRun, statusEpoch: 0 }],
+      timestamp: 2,
+    });
+    expect(replay.runs[0]!.statusEpoch).toBe(0);
+  });
+
+  it('leaves statusEpoch undefined when an older orchestrator omits it', () => {
+    // breaks-if-wrong: an older orchestrator's frame must still parse, and read as unguarded.
+    expect(executionStatusSchema.parse(status).statusEpoch).toBeUndefined();
+    expect(
+      stateReplaySchema.parse({
+        type: 'state.replay',
+        messageId: 'm-epoch-3',
+        runs: [replayRun],
+        timestamp: 2,
+      }).runs[0]!.statusEpoch,
+    ).toBeUndefined();
+  });
+
+  it('rejects a negative or fractional statusEpoch', () => {
+    // fails-when: the schema accepts an epoch the Platform's integer column cannot hold.
+    expect(executionStatusSchema.safeParse({ ...status, statusEpoch: -1 }).success).toBe(false);
+    expect(executionStatusSchema.safeParse({ ...status, statusEpoch: 1.5 }).success).toBe(false);
+    expect(
+      executionStatusSchema.safeParse({ ...status, statusEpoch: STATUS_EPOCH_MAX + 1 }).success,
+    ).toBe(false);
+    expect(
+      executionStatusSchema.safeParse({ ...status, statusEpoch: STATUS_EPOCH_MAX }).success,
+    ).toBe(true);
+    expect(
+      stateReplaySchema.safeParse({
+        type: 'state.replay',
+        messageId: 'm-epoch-4',
+        runs: [{ ...replayRun, statusEpoch: -1 }],
+        timestamp: 2,
       }).success,
     ).toBe(false);
   });

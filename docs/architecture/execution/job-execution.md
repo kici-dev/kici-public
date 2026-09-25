@@ -73,6 +73,8 @@ Five special job types skip the step sandbox, because they never execute custome
 4. **Bring-up jobs** -- init-runner SSH bring-up. No clone, no child.
 5. **Build-only jobs** -- cache population.
 
+For a global workflow, init-only and DynamicJobFn evaluation jobs use the same dual checkout as the round: the workflow repo under `workflow/`, where the module is loaded from, and the source repo under `source/`.
+
 Four of the five still load a customer workflow module, so they run that load and the evaluation around it in the **eval child** (`eval-runner.js`), forked with a sanitized environment and a narrow IPC surface. The agent process performs the parts that are its own work: materializing the workspace, installing dependencies, packing and uploading a tarball, and reporting status. Only bring-up jobs load nothing.
 
 Each converges on the same teardown path as a standard job.
@@ -307,10 +309,11 @@ When running in container mode, the agent uses the `ContainerSandbox`. The workf
 
 **Container lifecycle:**
 
-1. **Create container** -- `docker create` with the self-contained workflow-runner bundle bind-mounted read-only at `/opt/kici/workflow-runner.js` (and the loader-hook bundle at `/opt/kici/ts-loader-hook.js`), pre-sanitized environment variables, and `sleep infinity` as the entrypoint to keep the container alive. `/workspace` is a container-owned anonymous volume created fresh per job and owned by the container user -- not a host bind -- so clone/install/execute writes work even with all capabilities dropped under rootful container runtimes
-2. **Start container** -- `docker start`
-3. **Execute job** -- `docker exec` runs the workflow runner inside the container; the runner handles clone, deps, workflow loading, and step execution within the container
-4. **Cleanup** -- `docker rm -f` after job completes
+1. **Prepare the workspace on the host** -- the agent clones the repository (or, for a full-repo test run, applies the overlay) and builds the job image when the job declares a Dockerfile. It then installs `.kici/` dependencies into the checkout when lifecycle scripts are disabled, a runtime is injected and the dispatch carries no dependency cache. `.kici/` must also pass the host-install allowlist (`packages/agent/src/execution/host-deps-install.ts`, `host-install-eligibility.ts`), and an npm older than 11.15.0, which runs `npm ci`, needs a lockfile that pins every package to a semver version and a registry tarball (`host-install-lockfile.ts`). The tree is copied into `/workspace` after the container starts. The clone and the install write their progress to the job's workflow-level log (step `-1`), the same log the runner writes its own setup lines to; the image build reports as its own `container:build` step
+2. **Create container** -- `docker create` with the self-contained workflow-runner bundle bind-mounted read-only at `/opt/kici/workflow-runner.js` (and the loader-hook bundle at `/opt/kici/ts-loader-hook.js`), pre-sanitized environment variables, and `sleep infinity` as the entrypoint to keep the container alive. `/workspace` is a container-owned anonymous volume created fresh per job and owned by the container user -- not a host bind -- so clone/install/execute writes work even with all capabilities dropped under rootful container runtimes
+3. **Start container** -- `docker start`
+4. **Execute job** -- `docker exec` runs the workflow runner inside the container; the runner handles workflow loading and step execution, plus the dependency install when the host did not do it
+5. **Cleanup** -- `docker rm -f` after job completes
 
 **Important:** With the sandbox model, the entire workflow runner process (including step TypeScript code and shell commands via `$`) runs inside the container. Agent-internal credentials (`KICI_*`, `KICI_DATABASE_URL`, etc.) never enter the container -- only pre-sanitized environment variables are passed through.
 

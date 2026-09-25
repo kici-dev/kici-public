@@ -8,6 +8,7 @@
 import picomatch from 'picomatch';
 import { sql, type Kysely } from 'kysely';
 import {
+  ContextType,
   DEFAULT_CONCURRENCY_STRATEGY,
   DEFAULT_HOLD_EXPIRY_SECONDS,
   MinimumTrustSchema,
@@ -107,7 +108,7 @@ export function toContext(row: Context): EngineContext {
 /** Fields accepted when creating a context. */
 export interface ContextCreateInput {
   name: string;
-  type?: 'fixed' | 'glob';
+  type?: ContextType;
   globPattern?: string | null;
   branchRestrictions?: string[];
   triggerTypeFilters?: string[];
@@ -137,7 +138,7 @@ export interface ContextCreateInput {
  */
 export interface ContextUpdateInput {
   name?: string;
-  type?: 'fixed' | 'glob';
+  type?: ContextType;
   globPattern?: string | null;
   branchRestrictions?: string[] | null;
   triggerTypeFilters?: string[];
@@ -196,7 +197,7 @@ export class ContextStore {
     const values: NewContext = {
       org_id: orgId,
       name: data.name,
-      type: data.type ?? 'fixed',
+      type: data.type ?? ContextType.enum.fixed,
       glob_pattern: data.globPattern ?? null,
       branch_restrictions: data.branchRestrictions
         ? JSON.stringify(data.branchRestrictions)
@@ -322,7 +323,7 @@ export class ContextStore {
       .selectFrom('contexts')
       .selectAll()
       .where('org_id', '=', orgId)
-      .where('type', '=', 'glob')
+      .where('type', '=', ContextType.enum.glob)
       .orderBy('name', 'asc')
       .execute();
 

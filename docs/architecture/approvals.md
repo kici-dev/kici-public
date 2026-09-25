@@ -58,7 +58,7 @@ Each writes its own `held_runs` row, and **both** must be released before the jo
 
 Two consequences follow from there being two rows rather than one.
 
-The rows carry **independent expiries**, and whichever deadline arrives first cancels the run. The approval row uses the gate's own `timeout`, or the org's `approval_expiry_seconds` when the gate set none. The `context_trust` row uses the context's `hold_expiry_seconds`. Their defaults differ by a factor of 24, so the security row is usually the one that expires first.
+The rows carry **independent expiries**, and whichever deadline arrives first fails the run. The approval row uses the gate's own `timeout`, or the org's `approval_expiry_seconds` when the gate set none. The `context_trust` row uses the context's `hold_expiry_seconds`. Their defaults differ by a factor of 24, so the security row is usually the one that expires first.
 
 The commit still carries **one** `KiCI Security` check run, shared by every hold on that commit. It stays pending until every hold that owns it has ended, so releasing one never turns the check green while the other still gates the job. Its description renders the approval clauses and appends a line naming the trust hold, the permission that clears it, and the `/kici approve` command. Without that line the named approver approves, the job does not run, and the text does not change.
 
@@ -90,7 +90,7 @@ stateDiagram-v2
     pending --> held : gate triggers hold
     held --> queued : approval satisfied
     held --> cancelled : rejection
-    held --> cancelled : expiry
+    held --> failed : expiry
 ```
 
 On full satisfaction the held element is **resumed**, through one path shared by the dashboard and CLI approve flows:
@@ -98,7 +98,7 @@ On full satisfaction the held element is **resumed**, through one path shared by
 - **Job or workflow scope** — the released element is re-dispatched (enqueued for dispatch). A workflow-level hold gates the run's first dispatch; releasing it lets the run's jobs proceed.
 - **Step scope** — the orchestrator signals the waiting agent (see [the round-trip](#step-level-round-trip)) rather than enqueuing anything.
 
-A rejection or an expiry instead drives the held element to `cancelled`, which fails the run. The stale run detector sweeps overdue holds and drives the expiry side.
+A rejection instead drives the held element to `cancelled`. An expiry fails the run with an `Approval expired` reason; for a step-scoped hold, the waiting agent fails the step instead. The stale run detector sweeps overdue holds and drives the expiry side.
 
 A job whose upstream dependencies complete is re-checked against its hold rows before it dispatches, because the dependency scheduler and the approval gate are independent — the scheduler releases a job on its dependencies alone. One job can carry two hold rows at once (an explicit approval gate plus a context security gate), and the check refuses while **any** of them is still pending, so releasing one leaves the other gating. If that check cannot read the hold rows at all, it retries briefly and then refuses: the job stays pending and is re-driven by the next release or by the scheduler recovery pass on the next orchestrator start. A delayed job is recoverable; a job dispatched past an unread approval gate is not.
 

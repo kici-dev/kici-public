@@ -21,7 +21,8 @@ function jobFacts(overrides: Partial<JobCredentialContext> = {}): JobCredentialC
     sourceRepo: 'acme/main',
     declaredCredentials: { default: { ...DECLARED_APP_REF } },
     trustTier: 'trusted',
-    branch: 'main',
+    policyRepo: 'acme/main',
+    policyBranch: 'main',
     triggerType: 'push',
     ...overrides,
   };
@@ -189,6 +190,47 @@ describe('git credential relay handler', () => {
         },
       }),
     );
+  });
+
+  it('gates a global run on the workflow repo while fencing writes on the source repo', async () => {
+    const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
+    const facts = jobFacts({
+      sourceRepo: 'app-org/app',
+      policyRepo: 'ci-org/ci',
+      policyBranch: 'main',
+    });
+    await handlerWith(broker, facts)('agent-1', {
+      jobId: 'job-1',
+      repositories: ['app-org/app'],
+      ref: { ...DECLARED_APP_REF },
+    });
+    // fails-when: the gate reads sourceRepo / the event branch instead of the
+    // workflow repo and its registered branch.
+    expect(broker.resolve).toHaveBeenCalledWith(
+      expect.objectContaining({
+        gate: expect.objectContaining({
+          dispatchCtx: expect.objectContaining({ repository: 'ci-org/ci', branch: 'main' }),
+        }),
+      }),
+    );
+
+    // breaks-if-wrong: the write fence must stay on the SOURCE repo's org — a
+    // write to the source repo is admitted, one to the workflow repo's org is
+    // refused.
+    await expect(
+      handlerWith(broker, facts)('agent-1', {
+        jobId: 'job-1',
+        repositories: ['ci-org/ci'],
+        permissions: { contents: 'write' },
+      }),
+    ).rejects.toThrow(/outside the organisation/);
+    await expect(
+      handlerWith(broker, facts)('agent-1', {
+        jobId: 'job-1',
+        repositories: ['app-org/app'],
+        permissions: { contents: 'write' },
+      }),
+    ).resolves.toMatchObject({ kind: 'basic' });
   });
 
   describe('the lock declaration is the authorization', () => {

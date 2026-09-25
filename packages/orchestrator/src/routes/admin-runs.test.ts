@@ -324,6 +324,65 @@ describe('admin run routes', () => {
       expect(body.jobs).toBeUndefined();
       expect(body.steps).toBeUndefined();
     });
+
+    // The run row records where an organization-wide workflow is defined, and
+    // the rerun path reads those columns; the header is where an operator sees
+    // them without a database session.
+    it('returns the workflow repository provenance of an organization-wide run', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        run_id: 'run-global',
+        workflow_name: 'org-ci',
+        status: 'success',
+        provider: 'github',
+        repo_identifier: 'acme/service',
+        ref: 'refs/heads/main',
+        sha: 'abc1234',
+        started_at: now,
+        completed_at: now,
+        is_test_run: false,
+        created_at: now,
+        workflow_repo_identifier: 'acme/org-workflows',
+        workflow_sha: 'def5678',
+        workflow_branch: 'main',
+      });
+      const res = await request(app, '/run-global', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // fails-when: the route drops any of the three columns from the response
+      expect(body.run.workflowRepoIdentifier).toBe('acme/org-workflows');
+      expect(body.run.workflowSha).toBe('def5678');
+      expect(body.run.workflowBranch).toBe('main');
+    });
+
+    it('returns null workflow provenance for a run whose workflow lives in its own repo', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        run_id: 'run-local',
+        workflow_name: 'ci',
+        status: 'success',
+        provider: 'github',
+        repo_identifier: 'acme/service',
+        ref: 'refs/heads/main',
+        sha: 'abc1234',
+        started_at: now,
+        completed_at: now,
+        is_test_run: false,
+        created_at: now,
+        workflow_repo_identifier: null,
+        workflow_sha: null,
+        workflow_branch: null,
+      });
+      const res = await request(app, '/run-local', { token: validToken });
+      const body = await res.json();
+      // fails-when: an absent value is omitted instead of sent as null, so a
+      // consumer cannot tell "same-repo run" from "field not supported"
+      expect(body.run).toMatchObject({
+        workflowRepoIdentifier: null,
+        workflowSha: null,
+        workflowBranch: null,
+      });
+    });
   });
 
   // ── GET /admin/runs/:runId/jobs ────────────────────────────────
@@ -770,6 +829,47 @@ describe('admin run routes', () => {
         { untrusted: true, value: 'log-b' },
       ]);
       expect(body.totalLines).toBe(2);
+    });
+
+    it('serves the workflow-level log at step -1, which has no step row', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
+        .mockResolvedValueOnce(undefined) // execution_steps: step -1 never has a row
+        .mockResolvedValueOnce({ job_name: 'build' }); // execution_jobs
+      (deps.logStorage!.exists as any).mockResolvedValueOnce(true);
+      (deps.logStorage!.read as any).mockResolvedValueOnce({
+        data: '[host-checkout] Clone complete\n',
+        cursor: 0,
+        complete: true,
+      });
+
+      const res = await request(app, '/run-1/jobs/job-a/steps/-1/logs', { token: validToken });
+
+      // fails-when: the route or the reader treats -1 as "no such step", so
+      // `kici-admin runs logs --step=-1` prints nothing for every job.
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.stepIndex).toBe(-1);
+      expect(body.lines).toEqual([{ untrusted: true, value: '[host-checkout] Clone complete' }]);
+      expect(body.recorded).toBe(true);
+      expect(deps.logStorage!.read).toHaveBeenCalledWith('executions/run-1/job-build/step--1.log');
+    });
+
+    it('reports recorded: false for a job that wrote no setup log', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
+        .mockResolvedValueOnce(undefined) // execution_steps: step -1 never has a row
+        .mockResolvedValueOnce({ job_name: 'build' }); // execution_jobs
+      (deps.logStorage!.exists as any).mockResolvedValueOnce(false);
+
+      const res = await request(app, '/run-1/jobs/job-a/steps/-1/logs', { token: validToken });
+
+      // fails-when: the route drops the reader's flag, so a missing setup log and
+      // an empty one answer the same body
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ lines: [], totalLines: 0, recorded: false });
+      expect(deps.logStorage!.read).not.toHaveBeenCalled();
     });
 
     it('400s on a non-numeric stepIndex', async () => {

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import pg from 'pg';
 import type { MigrationProvider } from 'kysely/migration';
 import { createPool } from './db.js';
+import { depCacheKeyOf } from './dep-cache-key.js';
 
 /**
  * Admin/DB-operations helpers shared between `kici-admin` (orchestrator DB)
@@ -376,8 +377,10 @@ export interface PurgeStaleSourcesResult {
  * DELETE orphan sources + their `__system__`-scoped webhook/private-key
  * secrets, all `generic_webhook_sources` (the table is single-tenant per
  * deployment), and any `workflow_registrations` rows whose routing_key no
- * longer points at an existing source. When `dryRun` is true, only count
- * the rows that would be deleted.
+ * longer points at an existing source. An org's remote source
+ * (`remote:<orgId>`, a `remote_sources` row) is a source the purge never
+ * touches, so the registrations under it are kept. When `dryRun` is true,
+ * only count the rows that would be deleted.
  *
  * Orphan registration cleanup is critical: generic_webhook_sources is wiped
  * wholesale, but workflow_registrations rows previously persisted under those
@@ -409,13 +412,16 @@ export async function purgeStaleSourcesDirect(
       const genericSources = await pool.query<{ count: number }>(
         `SELECT COUNT(*)::int AS count FROM generic_webhook_sources`,
       );
-      // After source cleanup, a registration is orphan when its routing_key
-      // isn't the current test's routing_key and isn't a generic_webhook_sources
-      // row (which gets wiped wholesale below).
+      // The purge keeps only the sources under `routingKey` and the remote
+      // sources, and deletes every generic source, so every other registration,
+      // except one under a remote source, is left pointing at no source and is
+      // deleted.
+      // fails-when: the count skips the generic sources' registrations the purge deletes,
+      // or counts the registrations under a remote source the purge keeps
       const orphanRegistrations = await pool.query<{ count: number }>(
         `SELECT COUNT(*)::int AS count FROM workflow_registrations
           WHERE routing_key != $1
-            AND routing_key NOT IN (SELECT routing_key FROM generic_webhook_sources)`,
+            AND routing_key NOT IN (SELECT routing_key FROM remote_sources)`,
         [routingKey],
       );
       return {
@@ -438,11 +444,16 @@ export async function purgeStaleSourcesDirect(
     const sources = await pool.query(`DELETE FROM sources WHERE routing_key != $1`, [routingKey]);
     const generic = await pool.query(`DELETE FROM generic_webhook_sources`);
     // Wipe registrations whose routing_key no longer resolves — generic rows
-    // are all gone above, real-provider rows survive in `sources` (if any).
+    // are all gone above, real-provider rows survive in `sources` (if any),
+    // and an org's remote source lives in `remote_sources`, which the purge
+    // never touches.
+    // fails-when: a registration under a live remote source (`remote:<orgId>`) is deleted
+    // breaks-if-wrong: a registration under no source at all must still be deleted
     const registrations = await pool.query(
       `DELETE FROM workflow_registrations
         WHERE routing_key != $1
-          AND routing_key NOT IN (SELECT routing_key FROM sources)`,
+          AND routing_key NOT IN (SELECT routing_key FROM sources)
+          AND routing_key NOT IN (SELECT routing_key FROM remote_sources)`,
       [routingKey],
     );
     return {
@@ -529,6 +540,7 @@ export async function purgeContextsDirect(
  */
 const ENV_POLICY_COLUMNS = new Set<string>([
   'branch_restrictions',
+  'repo_patterns',
   'required_reviewers',
   'wait_timer_seconds',
   'hold_expiry_seconds',
@@ -543,11 +555,51 @@ export interface SeedContextOpts {
   type?: string;
   enabled?: boolean;
   branchRestrictions?: unknown;
+  /**
+   * `owner/repo` glob patterns the context is limited to. Omitted leaves an
+   * existing row's patterns unchanged and writes `[]` on insert.
+   */
+  repoPatterns?: string[];
   requiredReviewers?: unknown;
   waitTimerSeconds?: number | null;
   holdExpirySeconds?: number | null;
   minimumTrust?: string | null;
   globPattern?: string | null;
+}
+
+/** Policy fields an upsert writes only when the caller supplied them. */
+interface UpsertPolicyFields {
+  enabled?: boolean;
+  branchRestrictions?: unknown;
+  repoPatterns?: string[];
+  requiredReviewers?: unknown;
+  waitTimerSeconds?: number | null;
+  holdExpirySeconds?: number | null;
+  minimumTrust?: string | null;
+}
+
+const UPSERT_POLICY_COLUMNS: ReadonlyArray<[keyof UpsertPolicyFields, string]> = [
+  ['enabled', 'enabled'],
+  ['branchRestrictions', 'branch_restrictions'],
+  ['repoPatterns', 'repo_patterns'],
+  ['requiredReviewers', 'required_reviewers'],
+  ['waitTimerSeconds', 'wait_timer_seconds'],
+  ['holdExpirySeconds', 'hold_expiry_seconds'],
+  ['minimumTrust', 'minimum_trust'],
+];
+
+/**
+ * `ON CONFLICT` assignments for the policy fields the caller supplied. An
+ * omitted field (`undefined`) keeps the stored value, matching the admin HTTP
+ * upsert; a supplied one — including `[]` or `null` — replaces it, so an
+ * explicit empty value still clears the rule.
+ */
+function suppliedPolicyAssignments(opts: UpsertPolicyFields): string[] {
+  // fails-when: an omitted field is assigned from EXCLUDED, so a re-run without its flag clears it
+  // breaks-if-wrong: a supplied [] / null must still be assigned, or a rule cannot be cleared
+  return UPSERT_POLICY_COLUMNS.filter(([field]) => opts[field] !== undefined).map(
+    ([, column]) => `${column} = EXCLUDED.${column},`,
+  );
 }
 
 export interface SeedContextResult {
@@ -558,7 +610,9 @@ export interface SeedContextResult {
 /**
  * Upsert a context row keyed by (org_id, name). Returns the env id and
  * whether the row was newly inserted. `branchRestrictions` / `requiredReviewers`
- * are JSON-serialised server-side; pass them as plain arrays or objects.
+ * are JSON-serialised server-side; pass them as plain arrays or objects. On
+ * conflict only the supplied policy fields change (see
+ * `suppliedPolicyAssignments`).
  *
  * An omitted `holdExpirySeconds` is written as NULL rather than a literal
  * window: the column carries no DDL default, so "never set" and "cleared" both
@@ -584,17 +638,12 @@ export async function seedContextDirect(
     const result = await pool.query<{ id: string; inserted: boolean }>(
       `INSERT INTO contexts
           (org_id, name, type, enabled, branch_restrictions, required_reviewers,
-           wait_timer_seconds, hold_expiry_seconds, minimum_trust, glob_pattern)
+           wait_timer_seconds, hold_expiry_seconds, minimum_trust, glob_pattern, repo_patterns)
         VALUES ($1, $2, COALESCE($3, 'fixed'), COALESCE($4, true), $5::jsonb, $6::jsonb,
-                $7, $8, $9, $10)
+                $7, $8, $9, $10, $11::jsonb)
         ON CONFLICT (org_id, name) DO UPDATE SET
           type = COALESCE(EXCLUDED.type, contexts.type),
-          enabled = EXCLUDED.enabled,
-          branch_restrictions = EXCLUDED.branch_restrictions,
-          required_reviewers = EXCLUDED.required_reviewers,
-          wait_timer_seconds = EXCLUDED.wait_timer_seconds,
-          hold_expiry_seconds = EXCLUDED.hold_expiry_seconds,
-          minimum_trust = EXCLUDED.minimum_trust,
+          ${suppliedPolicyAssignments(opts).join('\n          ')}
           glob_pattern = COALESCE(EXCLUDED.glob_pattern, contexts.glob_pattern),
           updated_at = now()
         RETURNING id, (xmax = 0) AS inserted`,
@@ -609,6 +658,7 @@ export async function seedContextDirect(
         opts.holdExpirySeconds ?? null,
         opts.minimumTrust ?? null,
         opts.globPattern ?? null,
+        JSON.stringify(opts.repoPatterns ?? []),
       ],
     );
     const row = result.rows[0];
@@ -712,6 +762,8 @@ export interface SetContextPolicyOpts {
   orgId: string;
   contextName: string;
   branchRestrictions?: unknown;
+  /** `owner/repo` glob patterns; `[]` clears the rule. */
+  repoPatterns?: string[];
   requiredReviewers?: unknown;
   waitTimerSeconds?: number | null;
   holdExpirySeconds?: number | null;
@@ -750,6 +802,9 @@ export async function setContextPolicyDirect(
 
   if (opts.branchRestrictions !== undefined) {
     addSet('branch_restrictions', JSON.stringify(opts.branchRestrictions), 'jsonb');
+  }
+  if (opts.repoPatterns !== undefined) {
+    addSet('repo_patterns', JSON.stringify(opts.repoPatterns), 'jsonb');
   }
   if (opts.requiredReviewers !== undefined) {
     addSet(
@@ -793,6 +848,7 @@ export interface ContextRow {
   type: string;
   enabled: boolean;
   branch_restrictions: unknown;
+  repo_patterns: unknown;
   required_reviewers: unknown;
   wait_timer_seconds: number | null;
   hold_expiry_seconds: number | null;
@@ -811,8 +867,8 @@ export async function listContextsDirect(
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
     const result = await pool.query<ContextRow>(
-      `SELECT id, org_id, name, type, enabled, branch_restrictions, required_reviewers,
-              wait_timer_seconds, hold_expiry_seconds, minimum_trust,
+      `SELECT id, org_id, name, type, enabled, branch_restrictions, repo_patterns,
+              required_reviewers, wait_timer_seconds, hold_expiry_seconds, minimum_trust,
               created_at, updated_at
          FROM contexts
         WHERE org_id = $1
@@ -855,8 +911,8 @@ export async function showContextDirect(
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
     const envResult = await pool.query<ContextRow>(
-      `SELECT id, org_id, name, type, enabled, branch_restrictions, required_reviewers,
-              wait_timer_seconds, hold_expiry_seconds, minimum_trust,
+      `SELECT id, org_id, name, type, enabled, branch_restrictions, repo_patterns,
+              required_reviewers, wait_timer_seconds, hold_expiry_seconds, minimum_trust,
               created_at, updated_at
          FROM contexts
         WHERE org_id = $1 AND name = $2`,
@@ -903,6 +959,22 @@ export interface CreateContextTemplateOpts {
 }
 
 /**
+ * The policy fields a template upsert writes. The template INSERT sets neither
+ * `enabled` nor `repo_patterns`, so their `EXCLUDED` values are the insert
+ * defaults: passing either through would reset an existing template's value
+ * whenever a caller's object happened to carry the field.
+ */
+function templatePolicyFields(opts: CreateContextTemplateOpts): UpsertPolicyFields {
+  return {
+    branchRestrictions: opts.branchRestrictions,
+    requiredReviewers: opts.requiredReviewers,
+    waitTimerSeconds: opts.waitTimerSeconds,
+    holdExpirySeconds: opts.holdExpirySeconds,
+    minimumTrust: opts.minimumTrust,
+  };
+}
+
+/**
  * Create (or update) a context template + its seed variables in one
  * transaction. Templates are represented as contexts with `type='template'`
  * by convention. Returns `{ envId, variablesSet }`.
@@ -910,6 +982,7 @@ export interface CreateContextTemplateOpts {
  * An omitted `holdExpirySeconds` is written as NULL rather than a literal
  * window, for the same reason as `seedContextDirect`: the column has no DDL
  * default and every read resolves NULL through `DEFAULT_HOLD_EXPIRY_SECONDS`.
+ * On conflict only the supplied policy fields change, as in `seedContextDirect`.
  */
 export async function createContextTemplateDirect(
   databaseUrl: string,
@@ -929,11 +1002,7 @@ export async function createContextTemplateDirect(
         VALUES ($1, $2, COALESCE($3, 'template'), true, $4::jsonb, $5::jsonb, $6, $7, $8)
         ON CONFLICT (org_id, name) DO UPDATE SET
           type = COALESCE(EXCLUDED.type, contexts.type),
-          branch_restrictions = EXCLUDED.branch_restrictions,
-          required_reviewers = EXCLUDED.required_reviewers,
-          wait_timer_seconds = EXCLUDED.wait_timer_seconds,
-          hold_expiry_seconds = EXCLUDED.hold_expiry_seconds,
-          minimum_trust = EXCLUDED.minimum_trust,
+          ${suppliedPolicyAssignments(templatePolicyFields(opts)).join('\n          ')}
           updated_at = now()
         RETURNING id, (xmax = 0) AS inserted`,
       [
@@ -1530,6 +1599,10 @@ interface MinimalLockEntry {
 
 interface MinimalLockFileShape {
   workflows: readonly MinimalLockEntry[];
+  /** Package-manager lockfile hash; part of the dependency-cache key. */
+  lockfileHash?: unknown;
+  /** In-repo `workspace:` sibling digest; part of the dependency-cache key. */
+  siblingsDigest?: unknown;
 }
 
 export interface RegisterWorkflowManualOpts {
@@ -1592,6 +1665,13 @@ export async function registerWorkflowManualDirect(
     ),
   );
 
+  // Written on every row, like the lock entry it keys: a row never keeps the
+  // dependency-cache key of a lock file it no longer carries the entry of. The
+  // commit is written next to it as the commit the key describes; the
+  // orchestrator uses the key only while that still equals the row's commit.
+  const { lockfileHash, siblingsDigest } = depCacheKeyOf(lockFile);
+  const depCacheKeySha = opts.commitSha ?? null;
+
   const pool = createPool(databaseUrl);
   const client = await pool.connect();
   try {
@@ -1602,8 +1682,9 @@ export async function registerWorkflowManualDirect(
       await client.query(
         `INSERT INTO workflow_registrations (
           repo_identifier, workflow_name, lock_entry, trigger_types,
-          routing_key, provider_context, customer_id, commit_sha, source_file
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          routing_key, provider_context, customer_id, commit_sha, source_file,
+          lockfile_hash, siblings_digest, dep_cache_key_sha
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (routing_key, repo_identifier, workflow_name) DO UPDATE SET
           lock_entry = EXCLUDED.lock_entry,
           trigger_types = EXCLUDED.trigger_types,
@@ -1611,6 +1692,9 @@ export async function registerWorkflowManualDirect(
           customer_id = EXCLUDED.customer_id,
           commit_sha = EXCLUDED.commit_sha,
           source_file = EXCLUDED.source_file,
+          lockfile_hash = EXCLUDED.lockfile_hash,
+          siblings_digest = EXCLUDED.siblings_digest,
+          dep_cache_key_sha = EXCLUDED.dep_cache_key_sha,
           updated_at = NOW()`,
         [
           opts.repoIdentifier,
@@ -1622,6 +1706,9 @@ export async function registerWorkflowManualDirect(
           opts.customerId,
           opts.commitSha ?? null,
           `.kici/workflows/${workflow.name}.ts`,
+          lockfileHash,
+          siblingsDigest,
+          depCacheKeySha,
         ],
       );
     }

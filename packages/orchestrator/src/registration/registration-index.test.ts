@@ -51,6 +51,8 @@ function makeRegistrationRow(overrides: Partial<RegistrationRow> = {}): Registra
     customerId: 'cust-default',
     commitSha: null,
     sourceFile: null,
+    lockfileHash: null,
+    siblingsDigest: null,
     isGlobal: false,
     created_at: new Date('2026-02-25T10:00:00Z'),
     updated_at: new Date('2026-02-25T10:00:00Z'),
@@ -374,6 +376,27 @@ describe('RegistrationIndex', () => {
   });
 
   describe('disabled workflow filtering', () => {
+    it('getAllByOrgAndRepo keeps a disabled workflow that getByOrgAndRepo drops', async () => {
+      // fails-when: the disabled-inclusive lookup filters like the typed ones, so a caller cannot say 'disabled'
+      // breaks-if-wrong: getByOrgAndRepo must still hide a disabled workflow
+      const rows = [
+        makeRegistrationRow({ id: 'reg-1', workflow_name: 'active-wf', disabled: false }),
+        makeRegistrationRow({ id: 'reg-2', workflow_name: 'disabled-wf', disabled: true }),
+      ];
+      const index = new RegistrationIndex(createMockStore({ rows, version: 1 }));
+      await index.loadFromDb();
+
+      expect(
+        index
+          .getAllByOrgAndRepo('cust-default', 'owner/repo')
+          .map((reg) => reg.workflowName)
+          .sort(),
+      ).toEqual(['active-wf', 'disabled-wf']);
+      expect(
+        index.getByOrgAndRepo('cust-default', 'owner/repo').map((reg) => reg.workflowName),
+      ).toEqual(['active-wf']);
+    });
+
     it('should exclude disabled workflows from getByTriggerType', async () => {
       const rows = [
         makeRegistrationRow({
@@ -623,6 +646,26 @@ describe('RegistrationIndex', () => {
       await index.loadFromDb();
 
       expect(index.getById('nonexistent')).toBeUndefined();
+    });
+
+    it('carries the dependency-cache key of the registering lock file', async () => {
+      // fails-when: the index drops the key, so a global run dispatched from it never probes the cache
+      const rows = [
+        makeRegistrationRow({
+          id: 'reg-key',
+          lockfileHash: 'lock-hash-1',
+          siblingsDigest: 'sib-1',
+        }),
+        makeRegistrationRow({ id: 'reg-none' }),
+      ];
+      const index = new RegistrationIndex(createMockStore({ rows, version: 1 }));
+      await index.loadFromDb();
+
+      expect(index.getById('reg-key')).toMatchObject({
+        lockfileHash: 'lock-hash-1',
+        siblingsDigest: 'sib-1',
+      });
+      expect(index.getById('reg-none')).toMatchObject({ lockfileHash: null, siblingsDigest: null });
     });
 
     it('should include disabled registrations', async () => {

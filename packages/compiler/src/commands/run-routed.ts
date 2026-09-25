@@ -162,6 +162,9 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
 
     const workdir = await resolveWorkdir({ inPlace: Boolean(options.inPlace), repoRoot });
     cleanup = workdir.cleanup;
+    // Paths the isolated checkout leaves out (submodules, dangling symlinks). On
+    // stderr, so --json keeps stdout parseable and still shows them.
+    for (const warning of workdir.warnings) process.stderr.write(`${pc.yellow(`⚠ ${warning}`)}\n`);
 
     // Trusted profile: route every job onto the plane's trusted label set by
     // appending the `self-hosted` routing label to the workdir lock the plane

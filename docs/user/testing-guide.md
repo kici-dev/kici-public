@@ -20,7 +20,7 @@ The rest of this guide covers `kici run remote`.
 
 - Run any workflow against your current working tree (including unstaged changes)
 - Get real-time log output streamed back to your terminal
-- Give test runs test-scoped secrets — your local secret files and `--env` values (uploaded encrypted) plus any environment flagged `allowLocalExecution: true` — while production environments stay unreachable
+- Give test runs test-scoped secrets — your local secret files and `--env` values (uploaded encrypted) plus any context flagged `allowLocalExecution: true` — while production contexts stay unreachable
 - Detect test mode in workflow code via `ctx.isTestRun`
 
 The command is remote-only -- all execution happens on the orchestrator and agent. For local-only trigger matching previews, use `kici preview <event>`.
@@ -295,25 +295,30 @@ Press Ctrl+C during a running test to send a cancel signal to the orchestrator. 
 
 When you run `kici run remote`, the CLI:
 
-1. Detects all files differing from HEAD (staged, unstaged, and untracked)
-2. Creates a compressed tarball of changed files
+1. Collects your working tree: every tracked file, every untracked file that `.gitignore` does not exclude, and the `.git` directory
+2. Creates a compressed tarball of those files
 3. Encrypts the tarball using X25519 ECDH key exchange
 4. Uploads the encrypted tarball to storage via a signed URL
 5. Triggers the pipeline with a reference to the upload
 
-The agent clones your repo at HEAD, then applies the overlay tarball on top -- giving you the exact same file state as your local working tree.
+The agent does not clone your repository. It extracts the tarball into an empty workspace, so the job runs on the files of your local working tree, uncommitted changes included. The `.git` directory ships too, so steps that run git commands see your local history and branch.
+
+[`kici run <event> --local`](cli/runs-and-approvals.md#kici-run-event---local) builds its isolated checkout differently: it clones your repository at `HEAD` and copies only your changed files on top.
 
 ### What gets included
 
-- Modified tracked files (staged and unstaged)
+- Tracked files, with your staged and unstaged changes
 - New untracked files (not in `.gitignore`)
-- File deletions (tracked files you deleted locally)
+- The `.git` directory
+- Symbolic links. A link to a file ships with the file it points at, and the agent writes that file's content in place of the link. A link to a directory ships as a link, and the agent recreates it. A link that points outside the repository, or at a file that `.gitignore` or `.kiciignore` excludes, fails the job with an error that names the link.
 
 ### What gets excluded
 
 - Files matching `.gitignore` patterns
-- Files matching `.kiciignore` patterns (additional exclusions)
-- The `.git` directory itself
+- Files matching `.kiciignore` patterns (additional exclusions, never applied to the `.git` directory)
+- Tracked files you deleted locally
+- The files of submodules and of other nested git repositories. The CLI prints a warning that names each one.
+- Symbolic links whose target does not exist. The CLI prints a warning that names each one.
 
 ### `.kiciignore`
 
@@ -373,7 +378,7 @@ Because these values originate on your machine, they are the natural place to pu
 In addition to your uploaded values, the orchestrator resolves test-scoped secrets from its own store for a remote test run:
 
 - The job's own declared `context` contributes its resolved secrets (flat). Static strings and **pure dynamic functions** both participate: a pure `context:` function (see [Dynamic values](dynamic-values.md)) is evaluated against the fixture's simulated event, and the resolved name is gated and resolved like a static one. Impure dynamic functions (those requiring an init job) are not evaluated for test runs — use a fixture `secrets:` mapping (or `--context`) to supply such a job's secrets.
-- Each fixture `secrets: { ctx: envName }` mapping resolves the named context's secrets under the namespaced context `ctx`.
+- Each fixture `secrets: { ctx: envName }` mapping resolves the named context's secrets under the namespaced context `ctx`. `envName` is matched like a job's declared context: a context with exactly that name, or else a glob context whose pattern matches it.
 
 Both paths are restricted to contexts flagged `allowLocalExecution: true`. A production context left at the default `false` is never resolvable for a test run.
 
@@ -395,13 +400,15 @@ step('migrate', async (ctx) => {
 
 When a key exists in both sources, the **CLI-uploaded local value wins** over the orchestrator test-context value. This makes a local override a per-run knob: set `--env KICI_DATABASE_URL=...` (or put it in `.kici/.secrets`) to shadow the test context's value for just that run, without changing anything on the orchestrator.
 
+The same overlay reaches a container job's [private-registry reference](container-jobs.md#private-images). The orchestrator reads `tokenSecret: 'prod:REGISTRY_TOKEN'` through the `prod` context's secrets for the run, with your uploaded values on top. So `--env REGISTRY_TOKEN=...` or `--context prod.REGISTRY_TOKEN=...` replaces that registry token for the run. A flat value replaces the key in every context, so it shadows a reference to any context that names the same key. The named context must still exist, and its protection rules still run first. A [`gitCredentials`](patterns/git-credentials.md) reference is not affected: the agent requests it while the job runs, and the orchestrator reads it from its own secret store.
+
 ### Fail-closed on non-test contexts
 
 Test-run secret resolution is fail-closed:
 
-- If a fixture maps to a context that does not exist, the run is **rejected**.
+- If a fixture maps to a name that matches no context, the run is **rejected**.
 - If a fixture maps to a context whose `allowLocalExecution` is `false`, the run is **rejected**.
-- The `allowLocalExecution` gate applies to **all** remote test runs: a run whose matched workflow targets a context with the flag off is rejected, so a test run can never resolve production secrets.
+- The `allowLocalExecution` gate applies to **all** remote test runs. A context a job binds with the flag off is **skipped** for the run: its variables, secrets and protection rules do not apply, and the run shows a warning that names it. The run is not rejected, but it can never resolve that context's secrets, so a test run never reaches production secrets.
 
 ### The `allowLocalExecution` context flag
 

@@ -13,7 +13,13 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-import { LogStream, agentLogChunkSchema } from '@kici-dev/engine';
+import {
+  AGENT_CAPABILITIES,
+  AgentCapabilityFlag,
+  LogStream,
+  agentLogChunkSchema,
+  hasAgentCapability,
+} from '@kici-dev/engine';
 import {
   createAgentWsHandler,
   isValidLogChunk,
@@ -56,6 +62,9 @@ import {
 import { AgentWsInternalFailure } from './failure-messages.js';
 import { CacheRefScope } from '@kici-dev/engine';
 import { FleetAgentCollector } from './fleet-agent-collector.js';
+import { LogWriter } from '../reporting/log-writer.js';
+import type { LogStorage } from '../reporting/log-storage.js';
+import { createLogChunkSink } from '../reporting/log-chunk-sink.js';
 
 /** Create a mock Dispatcher with controllable methods. */
 function mockDispatcher(): Dispatcher {
@@ -320,6 +329,31 @@ describe('createAgentWsHandler', () => {
       expect(entry).toBeDefined();
       expect(entry!.runningAsUser).toBe('ci-runner');
       expect(entry!.runningAsUid).toBe(1001);
+    });
+
+    it('stores the capabilities the agent advertised, and none when it advertised none', async () => {
+      const handler = createHandler();
+      const flag = AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators;
+      const wsNew = mockWs();
+      handler.onOpen!(new Event('open'), wsNew as any);
+      await handler.onMessage!(
+        makeMessageEvent({
+          ...registerMsg({ agentId: 'agent-new' }),
+          capabilities: AGENT_CAPABILITIES,
+        }),
+        wsNew as any,
+      );
+      const wsOld = mockWs();
+      handler.onOpen!(new Event('open'), wsOld as any);
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ agentId: 'agent-old' })),
+        wsOld as any,
+      );
+
+      // fails-when: the advertised capabilities are dropped between the wire and the registry
+      expect(hasAgentCapability(registry.get('agent-new')!.capabilities, flag)).toBe(true);
+      // breaks-if-wrong: a pre-capability agent must still register, reading as supporting nothing
+      expect(registry.get('agent-old')!.capabilities).toBeNull();
     });
 
     it('stores agentId on WS context for disconnect handling', async () => {
@@ -1018,6 +1052,45 @@ describe('createAgentWsHandler', () => {
 
       // Registry shows capacity (0/1), so the drain fires again (idempotent).
       expect(dispatcher.onAgentAvailable).toHaveBeenCalledTimes(2);
+    });
+
+    it('lifts a busy-rejection hold only when the agent reports a free slot', async () => {
+      const handler = createAgentWsHandler({ registry, dispatcher, agentAuthMode: 'none' });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      registry.markBusyHeld('agent-1');
+      // A multi-slot agent that still enforces one job at a time: one running
+      // job is below maxConcurrency, yet it is the job it rejected busy for.
+      registry.get('agent-1')!.maxConcurrency = 2;
+
+      // The status the agent sends right after its busy rejection: still busy.
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'agent.status',
+          messageId: 'm-2',
+          agentId: 'agent-1',
+          activeJobs: 1,
+        }),
+        ws as any,
+      );
+      // fails-when: a status below maxConcurrency but above zero lifts the hold —
+      // the busy agent is re-picked at once.
+      expect(registry.get('agent-1')?.busyHeldUntil).toBeDefined();
+
+      // Teardown finished: the agent reports its slot free.
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'agent.status',
+          messageId: 'm-3',
+          agentId: 'agent-1',
+          activeJobs: 0,
+        }),
+        ws as any,
+      );
+      // breaks-if-wrong: the freed agent must become routable again.
+      expect(registry.get('agent-1')?.busyHeldUntil).toBeUndefined();
+      expect(registry.findAvailable([])).toHaveLength(1);
     });
   });
 
@@ -2757,6 +2830,69 @@ describe('createAgentWsHandler', () => {
       );
 
       expect(onLogChunk).not.toHaveBeenCalled();
+    });
+
+    it("makes the run's log drain wait for a chunk whose ownership is still being looked up", async () => {
+      // The in-memory ownership check misses (an HA failover), so the chunk
+      // waits on the database lookup while the run completes and is drained.
+      let answerDb!: (result: OwnershipDbResult) => void;
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent: () => false,
+        isJobOwnedByAgentInDb: () => new Promise<OwnershipDbResult>((r) => (answerDb = r)),
+        onDisconnect: vi.fn(),
+      });
+      const finalized: string[] = [];
+      const appended: string[] = [];
+      const logWriter = new LogWriter({
+        logStorage: {
+          appendStreaming: vi.fn(async (path: string) => {
+            appended.push(path);
+          }),
+          finalize: vi.fn(async (path: string) => {
+            finalized.push(path);
+          }),
+        } as unknown as LogStorage,
+      });
+      const sink = createLogChunkSink({
+        source: 'local',
+        logWriter,
+        executionTracker: { resolveJobName: async () => 'build' },
+      });
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        ownershipTracker: tracker,
+        onLogChunk: (_agentId, chunk) => sink(chunk),
+        trackLogChunk: (runId, pending) => logWriter.trackPending(runId, pending),
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const received = handler.onMessage!(
+        makeMessageEvent({
+          type: 'log.chunk',
+          messageId: 'msg-log-drain',
+          runId: 'run-1',
+          jobId: 'job-1',
+          stepIndex: -1,
+          lines: ['[job-setup] Setup failed: boom'],
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+      // The run completes while the lookup is outstanding.
+      await vi.waitFor(() => expect(answerDb).toBeTypeOf('function'));
+      const drained = logWriter.drain('run-1');
+      answerDb('owned');
+      await Promise.all([received, drained]);
+
+      // fails-when: the drain snapshots before the chunk is registered, seals
+      // nothing, and the chunk's segment is never sealed
+      const path = 'executions/run-1/job-build/step--1.log';
+      expect(appended).toEqual([path]);
+      expect(finalized).toEqual([path]);
     });
 
     it('step.status from non-owning agent is silently dropped', async () => {

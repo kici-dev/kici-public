@@ -34,7 +34,7 @@ Activating a row action never navigates to the run — it runs in place and (for
 
 Dropdown filters appear above the table:
 
-- **Status** -- filter by success, failed, running, or cancelled
+- **Status** -- filter by any status present in the org's runs (for example success, failed, running, or cancelled)
 - **Workflow** -- filter by workflow name
 - **Branch** -- filter by git branch
 - **Repository** -- filter by repository
@@ -141,7 +141,8 @@ The left panel shows a tree of jobs and their steps:
 The job tree supports keyboard navigation:
 
 - **Arrow Up/Down** -- move focus through tree items
-- **Enter** -- select a job (show combined logs) or select a step (show step logs)
+- **Arrow Right/Left** -- expand or collapse the focused job or matrix group
+- **Enter** -- select a job (show combined logs), select a step (show step logs), or expand/collapse a matrix group
 - **Escape** -- deselect the current selection and navigate to the first job
 
 ### Tabs

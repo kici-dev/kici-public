@@ -22,6 +22,11 @@ export interface RunClaimSource {
   run_id: string;
   org_id: string;
   repo_identifier: string | null;
+  /**
+   * `owner/repo` of the repository that defines the workflow, when that is not
+   * `repo_identifier` (a global workflow). NULL for a same-repository run.
+   */
+  workflow_repo_identifier: string | null;
   ref: string | null;
   sha: string | null;
   workflow_name: string | null;
@@ -85,6 +90,11 @@ export interface IdTokenClaims extends EventClaims {
   kici_run_id: string;
   kici_job_id: string;
   repository: string | null;
+  /**
+   * The repository that defines the workflow. Equals `repository` for a
+   * same-repository run; names the workflow repository for a global workflow.
+   */
+  workflow_repository: string | null;
   ref: string | null;
   sha: string | null;
   workflow_ref: string | null;
@@ -142,6 +152,7 @@ export function buildIdTokenClaims(
     kici_run_id: run.run_id,
     kici_job_id: job.job_id,
     repository: run.repo_identifier,
+    workflow_repository: run.workflow_repo_identifier ?? run.repo_identifier,
     ref: run.ref,
     sha: run.sha,
     workflow_ref: workflowRef,

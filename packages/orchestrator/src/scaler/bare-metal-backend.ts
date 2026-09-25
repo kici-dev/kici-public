@@ -28,6 +28,7 @@ import {
   injectedAgentCommand,
 } from '@kici-dev/shared/container-runtime';
 import { KICI_RUNTIME_DOCKER_LABEL } from './container-routing.js';
+import { spawnsInJobImage } from './agent-fit.js';
 import {
   ensureIsolatedNetwork,
   ISOLATED_NETWORK_NAME,
@@ -400,7 +401,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
     // The opt-in is the label set's own shape: one that declares an `image`
     // and NO `binaryPath` has no local binary to spawn, so it can only mean
     // job-image mode. An operator who wants the old behaviour changes nothing.
-    const jobImageMode = matchedLabelSet.image !== undefined && !matchedLabelSet.binaryPath;
+    // The scaler reads the same function to know which agents it started
+    // inside a job's image, so the two cannot disagree.
+    const jobImageMode = spawnsInJobImage(this.type, matchedLabelSet);
     if (spawnContext?.container && jobImageMode) {
       return await this.spawnContainerAgent({
         agentId,

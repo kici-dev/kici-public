@@ -51,6 +51,7 @@ function makeDeps(over?: { runStatus?: string; dispatchedJobIds?: string[]; ws?:
     } as unknown as CancelRunDeps['registry'],
     executionTracker: {
       completeRunIfAllJobsTerminal: vi.fn().mockResolvedValue(undefined),
+      cancelJoblessRun: vi.fn().mockResolvedValue(false),
     } as unknown as CancelRunDeps['executionTracker'],
   };
   const ws = entry?.ws as { send?: ReturnType<typeof vi.fn> } | undefined;

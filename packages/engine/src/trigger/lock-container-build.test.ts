@@ -3,8 +3,8 @@ import { SCHEMA_VERSION, BREAKING_FLOOR } from './types.js';
 import type { LockJob } from './types.js';
 
 describe('lock schema container.dockerfile', () => {
-  it('bumped SCHEMA_VERSION for the additive generator git-credential field', () => {
-    expect(SCHEMA_VERSION).toBe(41);
+  it('bumped SCHEMA_VERSION for global-workflow approval enforcement', () => {
+    expect(SCHEMA_VERSION).toBe(42);
   });
 
   it('kept the breaking floor where it was — the bump is additive', () => {

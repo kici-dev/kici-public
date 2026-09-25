@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import type { JobDispatch, AgentToOrchestratorMessage } from '@kici-dev/engine';
+import { ExecutionJobStatus, RuntimeFact } from '@kici-dev/engine';
+import { PackageManager } from '@kici-dev/shared/package-manager';
 import type { AppConfig } from '../config.js';
 import {
   JobRunner,
@@ -63,18 +65,27 @@ vi.mock('@kici-dev/shared', () => {
 // from node:fs/promises, while job-runner still uses the default import — so
 // named and default exports share the same vi.fn instances (assertions read
 // the default export).
-const { mkdtempFn, rmFn, accessFn, writeFileFn } = vi.hoisted(() => ({
+const { mkdtempFn, rmFn, accessFn, writeFileFn, mkdirFn } = vi.hoisted(() => ({
   mkdtempFn: vi.fn().mockResolvedValue('/tmp/kici-test123'),
   rmFn: vi.fn().mockResolvedValue(undefined),
   accessFn: vi.fn().mockResolvedValue(undefined),
   writeFileFn: vi.fn().mockResolvedValue(undefined),
+  // The host checkout of a global workflow creates its workflow/source dirs.
+  mkdirFn: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('node:fs/promises', () => ({
-  default: { mkdtemp: mkdtempFn, rm: rmFn, access: accessFn, writeFile: writeFileFn },
+  default: {
+    mkdtemp: mkdtempFn,
+    rm: rmFn,
+    access: accessFn,
+    writeFile: writeFileFn,
+    mkdir: mkdirFn,
+  },
   mkdtemp: mkdtempFn,
   rm: rmFn,
   access: accessFn,
   writeFile: writeFileFn,
+  mkdir: mkdirFn,
 }));
 
 // Mock dockerode to prevent real Docker connections
@@ -120,6 +131,24 @@ vi.mock('../checkout/git-clone.js', () => ({
   gitClone: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Overlay application and the Dockerfile image build record one shared call
+// order, so a test can assert the workspace is complete before the build reads
+// it as its context.
+const workspaceEvents = vi.hoisted(() => [] as string[]);
+vi.mock('./overlay-applier.js', () => ({
+  applyOverlay: vi.fn(async (cfg: { repoDir: string }) => {
+    workspaceEvents.push(`overlay:${cfg.repoDir}`);
+    return { filesApplied: 1, filesDeleted: 0 };
+  }),
+}));
+vi.mock('./image-build/build-step.js', () => ({
+  CONTAINER_BUILD_STEP_INDEX: 1_000_000,
+  runJobImageBuild: vi.fn(async (args: { workDir: string }) => {
+    workspaceEvents.push(`build:${args.workDir}`);
+    return 'localhost/kici-job-image:test';
+  }),
+}));
+
 // Mock workflow loader (used by build / init / dynamic jobs to load author
 // TS and verify contentHash). The init and dynamic handlers also call
 // extractWorkflow / extractDynamicJobFn; stub them so the unit tests can
@@ -161,16 +190,20 @@ vi.mock('./source-restore.js', () => ({
   restoreSource: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Mock log streamer -- track instances for verifying destroy() calls
+// Mock log streamer -- track instances for verifying destroy() calls. Each
+// instance records the step index it was built for, so a test can find the
+// workflow-level (step -1) streamer among the per-step ones.
 const logStreamerInstances: Array<{
+  stepIndex: number;
   addLine: Mock;
   flush: Mock;
   destroy: Mock;
   getTotalBytes: Mock;
 }> = [];
 vi.mock('./log-streamer.js', () => ({
-  LogStreamer: vi.fn(function () {
+  LogStreamer: vi.fn(function (opts: { stepIndex: number }) {
     const instance = {
+      stepIndex: opts.stepIndex,
       addLine: vi.fn(),
       flush: vi.fn(),
       destroy: vi.fn(),
@@ -184,6 +217,21 @@ vi.mock('./log-streamer.js', () => ({
 // Mock dep-installer (used by build jobs)
 vi.mock('./dep-installer.js', () => ({
   installDeps: vi.fn().mockResolvedValue(undefined),
+}));
+
+// The container host install: the allowlist check and the isolated installer.
+// Their default results are set after the imports below.
+vi.mock('./host-install-eligibility.js', async (importActual) => ({
+  ...(await importActual<typeof import('./host-install-eligibility.js')>()),
+  checkHostInstallEligibility: vi.fn(),
+}));
+vi.mock('./host-isolated-install.js', () => ({
+  resolveHostNpm: vi.fn(),
+  resolvePinnedPnpm: vi.fn(async () => null),
+  runHostIsolatedInstall: vi.fn(async () => undefined),
+}));
+vi.mock('./host-install-lockfile.js', () => ({
+  checkLockedInstall: vi.fn(async () => null),
 }));
 
 // Mock dep-restore (used by init jobs)
@@ -210,6 +258,28 @@ vi.mock('./download.js', () => ({
 // Import mocks after setup
 const { BareMetalSandbox, ContainerSandbox } = await import('./sandbox/index.js');
 const { gitClone } = await import('../checkout/git-clone.js');
+const { checkHostInstallEligibility, HostInstallRefusal } =
+  await import('./host-install-eligibility.js');
+const { runHostIsolatedInstall, resolveHostNpm } = await import('./host-isolated-install.js');
+const { checkLockedInstall } = await import('./host-install-lockfile.js');
+
+const ELIGIBLE_NPM = {
+  eligible: true as const,
+  plan: {
+    packageManager: PackageManager.Npm as const,
+    lockfile: null,
+    registries: [],
+    npmrc: { ini: { decode: () => ({}), encode: () => '' }, operator: {}, repo: {} },
+  },
+};
+const HOST_NPM = {
+  packageManager: PackageManager.Npm as const,
+  nodeExe: '/opt/node/bin/node',
+  script: '/opt/node/lib/node_modules/npm/bin/npm-cli.js',
+  version: '11.19.1',
+};
+vi.mocked(checkHostInstallEligibility).mockResolvedValue(ELIGIBLE_NPM);
+vi.mocked(resolveHostNpm).mockResolvedValue(HOST_NPM);
 const fsPromises = (await import('node:fs/promises')).default;
 
 // --- Helpers ---
@@ -264,6 +334,12 @@ function makeDeps(): JobRunnerDeps & {
     sendJobContext: vi.fn(),
     sendRunEvent: vi.fn(),
     sendConcurrencyReport: vi.fn().mockResolvedValue({ action: 'proceed' }),
+    // A container runtime is present unless a case says otherwise, so no test
+    // depends on which sockets the machine running it happens to have.
+    resolveContainerRuntime: () => ({
+      fact: RuntimeFact.enum.docker,
+      socketPath: '/var/run/docker.sock',
+    }),
     messages,
   };
 }
@@ -513,6 +589,560 @@ describe('JobRunner', () => {
       .calls[0][0] as { workspaceFromHost?: boolean };
     expect(setupArg.workspaceFromHost).toBe(true);
     expect((dispatch.jobConfig as Record<string, unknown>).checkout).toBe(false);
+  });
+
+  it('container mode: a global job clones the workflow repo named in jobConfig on the host', async () => {
+    const { gitClone } = await import('../checkout/git-clone.js');
+    vi.mocked(gitClone).mockClear();
+    const dispatch = makeDispatch({
+      repoUrl: 'https://github.com/org/source.git',
+      ref: 'feature',
+      sha: 'source-sha',
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'python:3.12-slim',
+        isGlobalWorkflow: true,
+        workflowRepoUrl: 'https://github.com/org/ci.git',
+        workflowRef: 'main',
+        workflowSha: 'workflow-sha',
+      },
+    });
+
+    await new JobRunner(makeDeps()).execute(dispatch);
+
+    // fails-when: the host checkout reads the workflow repo from the dispatch
+    // envelope, where it is absent, so the workflow clone gets no URL.
+    expect(gitClone).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoUrl: 'https://github.com/org/ci.git',
+        ref: 'main',
+        sha: 'workflow-sha',
+        workDir: '/tmp/kici-test123/workflow',
+      }),
+    );
+    expect(gitClone).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoUrl: 'https://github.com/org/source.git',
+        ref: 'feature',
+        sha: 'source-sha',
+        workDir: '/tmp/kici-test123/source',
+      }),
+    );
+    expect(gitClone).toHaveBeenCalledTimes(2);
+  });
+
+  it('container mode: a same-repo job clones only its own repo on the host', async () => {
+    // breaks-if-wrong: a per-repository container job must still clone the
+    // dispatch repo into the work dir, once.
+    const { gitClone } = await import('../checkout/git-clone.js');
+    vi.mocked(gitClone).mockClear();
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'python:3.12-slim',
+      },
+    });
+
+    await new JobRunner(makeDeps()).execute(dispatch);
+
+    expect(gitClone).toHaveBeenCalledTimes(1);
+    expect(gitClone).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoUrl: 'https://github.com/org/repo.git',
+        ref: 'main',
+        sha: 'abc123',
+        workDir: '/tmp/kici-test123',
+      }),
+    );
+  });
+
+  describe('container mode: host overlay before the image build', () => {
+    const overlayFields = {
+      tarballUrl: 'https://s3.example.com/overlay.tar.enc',
+      cliPublicKey: 'cli-pub',
+      orchestratorPrivateKey: 'orch-priv',
+    };
+
+    it('a full-repo job clones nothing and applies the overlay before the Dockerfile build', async () => {
+      const { gitClone } = await import('../checkout/git-clone.js');
+      const { applyOverlay } = await import('./overlay-applier.js');
+      vi.mocked(gitClone).mockClear();
+      vi.mocked(applyOverlay).mockClear();
+      workspaceEvents.length = 0;
+      const dispatch = makeDispatch({
+        jobConfig: {
+          name: 'test-job',
+          workflowName: 'test-workflow',
+          runsOn: 'linux',
+          source: { file: '.kici/workflows/ci.ts' },
+          container: { dockerfile: 'Dockerfile' },
+          fullRepo: true,
+          ...overlayFields,
+        },
+      });
+
+      await new JobRunner(makeDeps()).execute(dispatch);
+
+      expect(gitClone).not.toHaveBeenCalled();
+      // fails-when: the overlay is left to the runner inside the container, so
+      // the build reads an empty work dir as its context.
+      expect(workspaceEvents).toEqual(['overlay:/tmp/kici-test123', 'build:/tmp/kici-test123']);
+      // The runner must not apply it again, and the key stays on the host.
+      const cfg = dispatch.jobConfig as Record<string, unknown>;
+      expect(cfg.tarballUrl).toBeUndefined();
+      expect(cfg.orchestratorPrivateKey).toBeUndefined();
+      expect(cfg.checkout).toBe(false);
+      expect(cfg.fullRepo).toBe(true);
+    });
+
+    it('a cloned job with an overlay applies it over the clone, before the build', async () => {
+      // breaks-if-wrong: a non-full-repo container job still clones its repo once.
+      const { gitClone } = await import('../checkout/git-clone.js');
+      vi.mocked(gitClone).mockClear();
+      vi.mocked(gitClone).mockImplementation(async (opts: { workDir: string }) => {
+        workspaceEvents.push(`clone:${opts.workDir}`);
+      });
+      workspaceEvents.length = 0;
+      const dispatch = makeDispatch({
+        jobConfig: {
+          name: 'test-job',
+          workflowName: 'test-workflow',
+          runsOn: 'linux',
+          source: { file: '.kici/workflows/ci.ts' },
+          container: { dockerfile: 'Dockerfile' },
+          ...overlayFields,
+        },
+      });
+
+      try {
+        await new JobRunner(makeDeps()).execute(dispatch);
+      } finally {
+        vi.mocked(gitClone).mockReset().mockResolvedValue(undefined);
+      }
+
+      expect(workspaceEvents).toEqual([
+        'clone:/tmp/kici-test123',
+        'overlay:/tmp/kici-test123',
+        'build:/tmp/kici-test123',
+      ]);
+    });
+
+    it('a container job with no overlay applies none', async () => {
+      const { applyOverlay } = await import('./overlay-applier.js');
+      vi.mocked(applyOverlay).mockClear();
+      const dispatch = makeDispatch({
+        jobConfig: {
+          name: 'test-job',
+          workflowName: 'test-workflow',
+          runsOn: 'linux',
+          source: { file: '.kici/workflows/ci.ts' },
+          container: 'python:3.12-slim',
+        },
+      });
+
+      await new JobRunner(makeDeps()).execute(dispatch);
+
+      expect(applyOverlay).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('container mode: .kici install on the host', () => {
+    const containerJob = (extra: Record<string, unknown> = {}) =>
+      makeDispatch({
+        npmRegistries: [
+          {
+            scope: '@acme',
+            url: 'https://npm.acme.internal/',
+            alwaysAuth: false,
+            token: 'tok-SECRET-1',
+          },
+        ],
+        installEnvSecrets: { ACME_TOKEN: 'install-SECRET-2' },
+        jobConfig: {
+          name: 'test-job',
+          workflowName: 'test-workflow',
+          runsOn: 'linux',
+          source: { file: '.kici/workflows/ci.ts' },
+          container: 'python:3.12-slim',
+          ...extra,
+        },
+      });
+
+    /** An agent that injects its runtime; scripts stay at the disabled default. */
+    const injectingDeps = () => {
+      const deps = makeDeps();
+      deps.config = {
+        ...deps.config,
+        runtimeImage: 'localhost/kici-agent:test',
+        hostInstallRegistries: ['https://npm.acme.internal'],
+      };
+      return deps;
+    };
+
+    const failedStatus = (deps: ReturnType<typeof makeDeps>) =>
+      deps.messages.find(
+        (m) =>
+          m.type === 'job.status' &&
+          (m as { state?: string }).state === ExecutionJobStatus.enum.failed,
+      ) as { data?: Record<string, unknown> } | undefined;
+
+    beforeEach(() => {
+      // `.kici/package.json` exists, `.kici/node_modules` does not.
+      accessFn.mockImplementation(async (p: string) => {
+        if (String(p).endsWith('node_modules')) throw new Error('ENOENT');
+      });
+    });
+
+    afterEach(() => {
+      accessFn.mockReset().mockResolvedValue(undefined);
+      vi.mocked(runHostIsolatedInstall).mockReset().mockResolvedValue(undefined);
+      vi.mocked(checkHostInstallEligibility).mockReset().mockResolvedValue(ELIGIBLE_NPM);
+      mockSandboxInstance.setup.mockReset().mockResolvedValue(undefined);
+    });
+
+    it('installs the checkout .kici through the isolated installer, after the build and before the copy-in', async () => {
+      workspaceEvents.length = 0;
+      vi.mocked(runHostIsolatedInstall).mockImplementation(async (a: { kiciDir: string }) => {
+        workspaceEvents.push(`install:${a.kiciDir}`);
+      });
+      mockSandboxInstance.setup.mockImplementation(async () => {
+        workspaceEvents.push('setup');
+      });
+
+      await new JobRunner(injectingDeps()).execute(
+        containerJob({ container: { dockerfile: 'Dockerfile' } }),
+      );
+
+      const registries = [
+        {
+          scope: '@acme',
+          url: 'https://npm.acme.internal/',
+          alwaysAuth: false,
+          token: 'tok-SECRET-1',
+        },
+      ];
+      // fails-when: the agent's KICI_HOST_INSTALL_REGISTRIES origins are not
+      // handed to the check, so a workflow registry the operator listed falls
+      // back to the container.
+      expect(checkHostInstallEligibility).toHaveBeenCalledWith('/tmp/kici-test123', {
+        workflowRegistries: registries,
+        hostInstallRegistries: ['https://npm.acme.internal'],
+      });
+      // fails-when: the lockfile check is not wired, so an npm that runs npm ci
+      // installs a lockfile that leaves a URL dependency for npm to fetch.
+      expect(checkLockedInstall).toHaveBeenCalledWith(
+        '/tmp/kici-test123/.kici',
+        ELIGIBLE_NPM.plan,
+        HOST_NPM,
+      );
+      expect(runHostIsolatedInstall).toHaveBeenCalledWith({
+        kiciDir: '/tmp/kici-test123/.kici',
+        plan: ELIGIBLE_NPM.plan,
+        tool: HOST_NPM,
+        registries,
+        installEnvSecrets: { ACME_TOKEN: 'install-SECRET-2' },
+        jobIdShort: 'job-1',
+        // The sanitized agent environment, never process.env.
+        baseEnv: { PATH: '/usr/bin', HOME: '/home/user' },
+        signal: expect.any(AbortSignal),
+      });
+      // fails-when: the install runs before the build (node_modules lands in the
+      // Dockerfile build context) or after the copy-in (the container never sees
+      // it).
+      expect(workspaceEvents).toEqual([
+        'build:/tmp/kici-test123',
+        'install:/tmp/kici-test123/.kici',
+        'setup',
+      ]);
+    });
+
+    it('a global job installs the workflow repo checkout', async () => {
+      await new JobRunner(injectingDeps()).execute(
+        containerJob({
+          isGlobalWorkflow: true,
+          workflowRepoUrl: 'https://github.com/org/ci.git',
+          workflowRef: 'main',
+          workflowSha: 'workflow-sha',
+        }),
+      );
+
+      // fails-when: the host install targets the source repo, which carries no
+      // `.kici/` for a global job.
+      expect(checkHostInstallEligibility).toHaveBeenCalledWith(
+        '/tmp/kici-test123/workflow',
+        expect.anything(),
+      );
+      expect(vi.mocked(runHostIsolatedInstall).mock.calls[0]![0].kiciDir).toBe(
+        '/tmp/kici-test123/workflow/.kici',
+      );
+    });
+
+    it('a checkout outside the allowlist installs nothing on the host', async () => {
+      vi.mocked(checkHostInstallEligibility).mockResolvedValue({
+        eligible: false,
+        refusal: HostInstallRefusal.PnpmHooks,
+        detail: '.pnpmfile.cjs is present',
+      });
+
+      await new JobRunner(injectingDeps()).execute(containerJob());
+
+      // breaks-if-wrong: the job still runs, with the install left to the container.
+      expect(runHostIsolatedInstall).not.toHaveBeenCalled();
+      expect(mockSandboxInstance.executeJob).toHaveBeenCalledOnce();
+    });
+
+    it('a dispatch with a dependency cache installs nothing on the host', async () => {
+      const dispatch = containerJob();
+      dispatch.depsUrl = 'https://s3.example.com/deps.tar.gz';
+
+      await new JobRunner(injectingDeps()).execute(dispatch);
+
+      expect(runHostIsolatedInstall).not.toHaveBeenCalled();
+    });
+
+    it('an agent that allows install scripts leaves the install to the container', async () => {
+      const deps = injectingDeps();
+      deps.config = { ...deps.config, allowInstallScripts: true };
+
+      await new JobRunner(deps).execute(containerJob());
+
+      // breaks-if-wrong: lifecycle scripts must never run on the host; with
+      // them allowed the runner installs inside the container, as before.
+      expect(runHostIsolatedInstall).not.toHaveBeenCalled();
+      expect(checkHostInstallEligibility).not.toHaveBeenCalled();
+      const workflowLog = logStreamerInstances.find((s) => s.stepIndex === -1);
+      expect(workflowLog?.addLine).toHaveBeenCalledWith(
+        '[host-install] Install scripts are allowed on this agent, so the job container installs the .kici dependencies',
+      );
+    });
+
+    it('an agent with no injected runtime leaves the install to the container', async () => {
+      await new JobRunner(makeDeps()).execute(containerJob());
+
+      expect(runHostIsolatedInstall).not.toHaveBeenCalled();
+    });
+
+    it('a bare-metal job installs nothing on the host — its runner does', async () => {
+      await new JobRunner(injectingDeps()).execute(makeDispatch());
+
+      expect(runHostIsolatedInstall).not.toHaveBeenCalled();
+    });
+
+    it('a failed host install fails the job with the redacted installer error and tears the sandbox down', async () => {
+      vi.mocked(runHostIsolatedInstall).mockRejectedValue(
+        new Error('npm error 401 for tok-SECRET-1 / install-SECRET-2'),
+      );
+      const deps = injectingDeps();
+
+      await new JobRunner(deps).execute(containerJob({ container: { dockerfile: 'Dockerfile' } }));
+
+      // fails-when: the installer's raw error, which echoes the registry token
+      // and the install secret, reaches job.status.error.
+      expect(failedStatus(deps)?.data?.error).toBe(
+        'npm error 401 for ***REDACTED*** / ***REDACTED***',
+      );
+      // The container never gets a workspace to fall back to an in-container
+      // install with.
+      expect(mockSandboxInstance.setup).not.toHaveBeenCalled();
+      expect(mockSandboxInstance.executeJob).not.toHaveBeenCalled();
+      // fails-when: a sandbox created before the failure is not torn down, so
+      // the image the Dockerfile build tagged is never reclaimed.
+      expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
+
+      const workflowLog = logStreamerInstances.find((s) => s.stepIndex === -1);
+      const lines = workflowLog!.addLine.mock.calls.map(([line]) => line as string);
+      expect(lines).toContain(
+        '[host-install] [error] npm error 401 for ***REDACTED*** / ***REDACTED***',
+      );
+      expect(lines.join('\n')).not.toMatch(/SECRET/);
+      expect(workflowLog?.destroy).toHaveBeenCalled();
+    });
+
+    it('a job cancelled during the host install is cancelled without creating its container', async () => {
+      const deps = injectingDeps();
+      const runner = new JobRunner(deps);
+      vi.mocked(runHostIsolatedInstall).mockImplementation(async (a: { signal?: AbortSignal }) => {
+        runner.cancel('job-1', 'user cancelled');
+        // The real installer's child is killed by the signal and rejects.
+        expect(a.signal?.aborted).toBe(true);
+        throw new Error('The operation was aborted');
+      });
+
+      await runner.execute(containerJob());
+
+      const states = deps.messages
+        .filter((m) => m.type === 'job.status')
+        .map((m) => (m as { state: string }).state);
+      // fails-when: the abort is reported as a failure, or the post-install
+      // abort check is missing and setup creates, starts and fills the container.
+      expect(states).toEqual([ExecutionJobStatus.enum.running, ExecutionJobStatus.enum.cancelled]);
+      expect(mockSandboxInstance.setup).not.toHaveBeenCalled();
+      expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
+    });
+
+    it('a sandbox whose setup throws is still torn down, with the error redacted', async () => {
+      // A container created by setup() must not outlive a job whose setup
+      // failed partway (the copy-in, say).
+      mockSandboxInstance.setup
+        .mockReset()
+        .mockRejectedValue(new Error('copy-in failed tok-SECRET-1'));
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute(containerJob());
+
+      // fails-when: teardown reads only a sandbox whose setup returned, so the
+      // started container outlives the job.
+      expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
+      expect(failedStatus(deps)?.data?.error).toBe('copy-in failed ***REDACTED***');
+    });
+  });
+
+  describe('workflow-level (step -1) setup log', () => {
+    const containerJob = () =>
+      makeDispatch({
+        jobConfig: {
+          name: 'test-job',
+          workflowName: 'test-workflow',
+          runsOn: 'linux',
+          source: { file: '.kici/workflows/ci.ts' },
+          container: 'python:3.12-slim',
+        },
+      });
+
+    it('streams the host checkout of a container job to step -1, on the streamer the runner reuses', async () => {
+      mockSandboxInstance.executeJob.mockReset().mockImplementation(async (opts: unknown) => {
+        const options = opts as { onLogLine: (stepIndex: number, line: string) => void };
+        options.onLogLine(-1, '[workflow-runner] Deps already present');
+        return defaultSuccessResult;
+      });
+
+      await new JobRunner(makeDeps()).execute(containerJob());
+
+      const workflowLogs = logStreamerInstances.filter((s) => s.stepIndex === -1);
+      // One streamer for the whole workflow-level log: a second one would
+      // interleave two independently-flushed buffers into one stored file.
+      expect(workflowLogs).toHaveLength(1);
+      const lines = workflowLogs[0]!.addLine.mock.calls.map(([line]) => line as string);
+      // fails-when: the host checkout logs only to the agent's own logger, so
+      // the run's step -1 log starts at the runner and the clone is invisible.
+      expect(lines).toEqual([
+        '[host-checkout] Cloning https://github.com/org/repo.git ref=main into /tmp/kici-test123',
+        '[host-checkout] Clone complete',
+        '[workflow-runner] Deps already present',
+      ]);
+      expect(workflowLogs[0]!.destroy).toHaveBeenCalled();
+    });
+
+    it('a setup that fails after the host checkout leaves the checkout lines and the error on step -1', async () => {
+      mockSandboxInstance.setup.mockReset().mockRejectedValue(new Error('copy-in failed'));
+      const deps = makeDeps();
+      const send = vi.fn(deps.send);
+      deps.send = send;
+
+      await new JobRunner(deps).execute(containerJob());
+
+      const workflowLogs = logStreamerInstances.filter((s) => s.stepIndex === -1);
+      expect(workflowLogs).toHaveLength(1);
+      // fails-when: the setup error reaches only job.status, so a job that never
+      // started a step has a setup log ending mid-clone with no cause in it
+      expect(workflowLogs[0]!.addLine.mock.calls.map(([line]) => line)).toEqual([
+        '[host-checkout] Cloning https://github.com/org/repo.git ref=main into /tmp/kici-test123',
+        '[host-checkout] Clone complete',
+        '[job-setup] Setup failed: copy-in failed',
+      ]);
+      // The streamer is flushed before the terminal status goes out, so its
+      // lines are on the wire ahead of the status that ends the job.
+      const failedAt = send.mock.calls.findIndex(
+        ([m]) =>
+          m.type === 'job.status' &&
+          (m as { state?: string }).state === ExecutionJobStatus.enum.failed,
+      );
+      expect(failedAt).toBeGreaterThanOrEqual(0);
+      expect(workflowLogs[0]!.destroy.mock.invocationCallOrder[0]).toBeLessThan(
+        send.mock.invocationCallOrder[failedAt]!,
+      );
+    });
+
+    it('a job whose setup succeeds gets no setup-failure line', async () => {
+      await new JobRunner(makeDeps()).execute(containerJob());
+
+      // breaks-if-wrong: a healthy container job's step -1 log is its setup
+      // narration only
+      const lines = logStreamerInstances
+        .filter((s) => s.stepIndex === -1)
+        .flatMap((s) => s.addLine.mock.calls.map(([line]) => line as string));
+      expect(lines.some((l) => l.startsWith('[job-setup]'))).toBe(false);
+    });
+
+    it('a container job on a host with no runtime fails before the clone, naming the runtime and labels', async () => {
+      const { gitClone } = await import('../checkout/git-clone.js');
+      vi.mocked(gitClone).mockClear();
+      const deps = makeDeps();
+      deps.config = { ...deps.config, labels: ['linux', 'kici:agent:container'] };
+      deps.resolveContainerRuntime = () => null;
+
+      await new JobRunner(deps).execute(containerJob());
+
+      const failed = deps.messages.find(
+        (m) =>
+          m.type === 'job.status' &&
+          (m as { state?: string }).state === ExecutionJobStatus.enum.failed,
+      ) as { data?: { error?: string } } | undefined;
+      // fails-when: the job reaches the container client and dies on a bare
+      // `connect ENOENT /var/run/docker.sock`
+      expect(failed?.data?.error).toContain(
+        'This job runs in a container (image python:3.12-slim), but this agent has no container runtime',
+      );
+      expect(failed?.data?.error).toContain('Agent labels: linux, kici:agent:container');
+      expect(failed?.data?.error).toContain('kici:runtime:docker or kici:runtime:podman');
+      // Nothing was cloned, and no container client was built.
+      expect(gitClone).not.toHaveBeenCalled();
+      expect(ContainerSandbox).not.toHaveBeenCalled();
+      const workflowLog = logStreamerInstances.find((s) => s.stepIndex === -1);
+      expect(workflowLog?.addLine).toHaveBeenCalledWith(
+        `[job-setup] Setup failed: ${failed?.data?.error}`,
+      );
+    });
+
+    it('a container job starts its container on the resolved runtime socket', async () => {
+      const Docker = (await import('dockerode')).default;
+      vi.mocked(Docker).mockClear();
+      const deps = makeDeps();
+      deps.resolveContainerRuntime = () => ({
+        fact: RuntimeFact.enum.podman,
+        socketPath: '/run/user/1000/podman/podman.sock',
+      });
+
+      await new JobRunner(deps).execute(containerJob());
+
+      // fails-when: the client is built with no socket and falls back to
+      // /var/run/docker.sock on a host that only runs Podman
+      expect(Docker).toHaveBeenCalledWith({ socketPath: '/run/user/1000/podman/podman.sock' });
+    });
+
+    it('a bare-metal job opens no host-side step -1 streamer — its runner narrates the clone', async () => {
+      // breaks-if-wrong: the runner's own step -1 lines must still reach a
+      // streamer created on demand.
+      mockSandboxInstance.executeJob.mockReset().mockImplementation(async (opts: unknown) => {
+        const options = opts as { onLogLine: (stepIndex: number, line: string) => void };
+        options.onLogLine(-1, '[workflow-runner] Cloning');
+        return defaultSuccessResult;
+      });
+
+      await new JobRunner(makeDeps()).execute(makeDispatch());
+
+      const workflowLogs = logStreamerInstances.filter((s) => s.stepIndex === -1);
+      expect(workflowLogs).toHaveLength(1);
+      expect(workflowLogs[0]!.addLine.mock.calls.map(([line]) => line)).toEqual([
+        '[workflow-runner] Cloning',
+      ]);
+    });
   });
 
   it('bare-metal mode: does NOT clone on the host — the runner still does it', async () => {
@@ -1417,6 +2047,251 @@ describe('JobRunner', () => {
     expect(finalStatus.state).toBe('failed');
     expect(finalStatus.data?.dynamicFailed).toBe(true);
     expect(finalStatus.data?.initFailure).toBeUndefined();
+  });
+
+  /**
+   * An evaluation job of a global workflow loads the workflow module from the
+   * workflow repository (A) and sees the source repository (B) as its source
+   * tree, in the layout every other job of that workflow uses.
+   */
+  describe('global evaluation jobs check out the workflow repository', () => {
+    const WORK_DIR = '/tmp/kici-test123';
+    const WORKFLOW_DIR = `${WORK_DIR}/workflow`;
+    const SOURCE_DIR = `${WORK_DIR}/source`;
+    const SOURCE_AUTH = { kind: 'basic' as const, user: 'x-access-token', secret: 'b-token' };
+    const WORKFLOW_AUTH = { kind: 'basic' as const, user: 'x-access-token', secret: 'a-token' };
+    const GLOBAL_FIELDS = {
+      isGlobalWorkflow: true,
+      workflowRepoUrl: 'https://github.com/org/ci.git',
+      workflowRef: 'main',
+      workflowSha: 'workflow-sha',
+      workflowRepoIdentifier: 'org/ci',
+    };
+    const DEPS = { depsUrl: 'https://cache.example/deps.tgz', depsHash: 'deps-hash' };
+    const PACK = { sourceTarUrl: 'https://cache.example/src.tgz', sourceTarDigest: 'src-digest' };
+
+    /** A global evaluation dispatch for source repo B, with both repos' credentials. */
+    function globalDispatch(base: JobDispatch, extra: Partial<JobDispatch> = {}): JobDispatch {
+      return {
+        ...base,
+        repoUrl: 'https://github.com/org/app.git',
+        ref: 'feature',
+        sha: 'source-sha',
+        sourceAuth: SOURCE_AUTH,
+        workflowAuth: WORKFLOW_AUTH,
+        jobConfig: { ...base.jobConfig, ...GLOBAL_FIELDS },
+        ...extra,
+      };
+    }
+
+    /** The two clones of the global layout: A with A's auth, B with B's. */
+    function expectDualClone(): void {
+      // fails-when: the evaluation job clones only the source repository into the work dir
+      expect(gitClone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repoUrl: 'https://github.com/org/ci.git',
+          ref: 'main',
+          sha: 'workflow-sha',
+          workDir: WORKFLOW_DIR,
+          gitAuth: WORKFLOW_AUTH,
+        }),
+      );
+      expect(gitClone).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repoUrl: 'https://github.com/org/app.git',
+          ref: 'feature',
+          sha: 'source-sha',
+          workDir: SOURCE_DIR,
+          gitAuth: SOURCE_AUTH,
+        }),
+      );
+      expect(gitClone).toHaveBeenCalledTimes(2);
+    }
+
+    function finalState(deps: ReturnType<typeof makeDeps>): string {
+      const statuses = deps.messages.filter((m) => m.type === 'job.status');
+      return (statuses[statuses.length - 1] as { state: string }).state;
+    }
+
+    it("init job with no source pack: loads A's workflow module, B checked out as the source", async () => {
+      const { loadWorkflowSource } = await import('./workflow-loader.js');
+      const { restoreDeps } = await import('./dep-restore.js');
+      const { restoreSource } = await import('./source-restore.js');
+      const { installDeps } = await import('./dep-installer.js');
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute(globalDispatch(makeInitDispatch(), DEPS));
+
+      expectDualClone();
+      // fails-when: the workflow module is loaded from a clone of the source repository
+      expect(loadWorkflowSource).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        '.kici/workflows/ci.ts',
+        'abc123hash',
+        ['asset.txt'],
+      );
+      // fails-when: the workflow repository's dependency tarball lands in the source tree
+      expect(restoreDeps).toHaveBeenCalledWith(WORKFLOW_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(restoreDeps).toHaveBeenCalledTimes(1);
+      expect(restoreSource).not.toHaveBeenCalled();
+      expect(installDeps).not.toHaveBeenCalled();
+      // fails-when: the global path drops the deps-check line Loki keys off
+      expect(loggerMock.info).toHaveBeenCalledWith(
+        'Init job: checking deps',
+        expect.objectContaining({ kiciDir: `${WORKFLOW_DIR}/.kici`, hasPackageJson: true }),
+      );
+      expect(finalState(deps)).toBe('success');
+    });
+
+    it("init job with no dependency tarball installs into A's .kici", async () => {
+      const { installDeps } = await import('./dep-installer.js');
+
+      await new JobRunner(makeDeps()).execute(globalDispatch(makeInitDispatch()));
+
+      expectDualClone();
+      expect(installDeps).toHaveBeenCalledWith(`${WORKFLOW_DIR}/.kici`, expect.anything());
+      expect(installDeps).toHaveBeenCalledTimes(1);
+    });
+
+    it("init job with A's source pack restores it and the deps over A's checkout", async () => {
+      // breaks-if-wrong: a global init job carrying the workflow repository's pack keeps
+      //   evaluating that pack
+      const { loadWorkflowSource } = await import('./workflow-loader.js');
+      const { restoreDeps } = await import('./dep-restore.js');
+      const { restoreSource } = await import('./source-restore.js');
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute(globalDispatch(makeInitDispatch(), { ...DEPS, ...PACK }));
+
+      expectDualClone();
+      expect(restoreDeps).toHaveBeenCalledWith(WORKFLOW_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(restoreSource).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        PACK.sourceTarUrl,
+        PACK.sourceTarDigest,
+      );
+      expect(loadWorkflowSource).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        '.kici/workflows/ci.ts',
+        'abc123hash',
+        ['asset.txt'],
+      );
+      expect(finalState(deps)).toBe('success');
+    });
+
+    it('init job of a same-repo workflow keeps its single checkout', async () => {
+      // breaks-if-wrong: a per-repository init job still clones its own repository into
+      //   the work dir and loads the workflow module from there
+      const { loadWorkflowSource } = await import('./workflow-loader.js');
+      const { restoreDeps } = await import('./dep-restore.js');
+
+      await new JobRunner(makeDeps()).execute({ ...makeInitDispatch(), ...DEPS });
+
+      expect(gitClone).toHaveBeenCalledTimes(1);
+      expect(gitClone).toHaveBeenCalledWith(
+        expect.objectContaining({ repoUrl: 'https://github.com/org/repo.git', workDir: WORK_DIR }),
+      );
+      expect(restoreDeps).toHaveBeenCalledWith(WORK_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(loadWorkflowSource).toHaveBeenCalledWith(
+        WORK_DIR,
+        '.kici/workflows/ci.ts',
+        'abc123hash',
+        ['asset.txt'],
+      );
+    });
+
+    it("init job evaluates its dynamic fields with the global workflow's KICI_* environment", async () => {
+      // fails-when: a dynamic env function of a global workflow reads KICI_SOURCE_REPO_PATH and
+      //   gets nothing, while every step of the same job sees it
+      const { evaluateDynamicFields } = await import('./init-runner.js');
+      let seen: string | undefined;
+      (evaluateDynamicFields as Mock).mockImplementationOnce(async () => {
+        seen = process.env.KICI_SOURCE_REPO_PATH;
+        return {};
+      });
+      delete process.env.KICI_SOURCE_REPO_PATH;
+
+      await new JobRunner(makeDeps()).execute(globalDispatch(makeInitDispatch()));
+
+      expect(seen).toBe(SOURCE_DIR);
+      // The evaluation restores the environment it changed.
+      expect(process.env.KICI_SOURCE_REPO_PATH).toBeUndefined();
+    });
+
+    it('init job with a filter hands it B as the source repo and A as the workflow repo', async () => {
+      const { evaluateDynamicFields } = await import('./init-runner.js');
+
+      await new JobRunner(makeDeps()).execute(
+        globalDispatch(
+          makeInitDispatch({ hasFilter: true, event: { changedFilesStatus: 'fetched' } }),
+        ),
+      );
+
+      const filterInput = (evaluateDynamicFields as Mock).mock.calls.at(-1)![5];
+      // fails-when: the filter of a global workflow sees the source repository under both names
+      expect(filterInput.sourceRepo).toMatchObject({ identifier: 'org/app', path: SOURCE_DIR });
+      expect(filterInput.workflowRepo).toMatchObject({ identifier: 'org/ci', path: WORKFLOW_DIR });
+    });
+
+    it("generator evaluation with no source pack: loads A's module and hands the generator the repo pair", async () => {
+      const { loadWorkflowSource, extractDynamicJobFn } = await import('./workflow-loader.js');
+      let context: { sourceRepo?: { path: string }; workflowRepo?: { path: string } } = {};
+      (extractDynamicJobFn as Mock).mockReturnValueOnce(async (c: typeof context) => {
+        context = c;
+        return [];
+      });
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute(globalDispatch(makeDynamicDispatch(), DEPS));
+
+      expectDualClone();
+      expect(loadWorkflowSource).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        '.kici/workflows/ci.ts',
+        'abc123hash',
+        ['asset.txt'],
+      );
+      // fails-when: the generator's two evaluations disagree about the source repository —
+      //   the sandbox re-evaluation hands it the pair, this one would not
+      expect(context.sourceRepo?.path).toBe(SOURCE_DIR);
+      expect(context.workflowRepo?.path).toBe(WORKFLOW_DIR);
+      expect(finalState(deps)).toBe('success');
+    });
+
+    it('generator evaluation of a same-repo workflow gets no repo pair and one checkout', async () => {
+      // breaks-if-wrong: a per-repository generator keeps its context shape
+      const { extractDynamicJobFn } = await import('./workflow-loader.js');
+      let context: Record<string, unknown> = {};
+      (extractDynamicJobFn as Mock).mockReturnValueOnce(async (c: Record<string, unknown>) => {
+        context = c;
+        return [];
+      });
+
+      await new JobRunner(makeDeps()).execute(makeDynamicDispatch());
+
+      expect(gitClone).toHaveBeenCalledTimes(1);
+      expect(gitClone).toHaveBeenCalledWith(expect.objectContaining({ workDir: WORK_DIR }));
+      expect('sourceRepo' in context).toBe(false);
+    });
+
+    it('global eval round clones both repositories with their own credentials', async () => {
+      const { restoreDeps } = await import('./dep-restore.js');
+      const deps = makeDeps();
+      const round = makeDispatch({
+        jobConfig: {
+          globalEvalRound: true,
+          candidates: [],
+          event: { changedFilesStatus: 'fetched', changedFiles: [] },
+          ...GLOBAL_FIELDS,
+        } as unknown as JobDispatch['jobConfig'],
+      });
+
+      await new JobRunner(deps).execute(globalDispatch(round, DEPS));
+
+      expectDualClone();
+      expect(restoreDeps).toHaveBeenCalledWith(WORKFLOW_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(finalState(deps)).toBe('success');
+    });
   });
 });
 

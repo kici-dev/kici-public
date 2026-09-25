@@ -75,7 +75,7 @@ export class InMemoryJobQueue {
     // of `jobConfig.resources`, and on the DB path only the latter survives the
     // round trip. Not carrying it here left every consumer that reads a drained
     // job's declared shape seeing a job that declares nothing — the
-    // pre-spawned-agent suitability gate (`canPrespawnedAgentServe`) would admit
+    // agent suitability gate (`canAgentRunJob`) would admit
     // any warm agent, and the scaler re-drive would spawn at the label-set
     // default instead of what the job asked for.
     this.jobs.set(id, {
@@ -142,7 +142,7 @@ export class InMemoryJobQueue {
       if (job.status !== DispatchQueueStatus.Pending) continue;
       if (!matchesGate(job, agentLabels, agentMandatoryLabels)) continue;
       // Same extra gate the DB-backed queue applies: labels cannot express
-      // whether a pre-spawned agent's fixed shape or image fits this job.
+      // whether a scaler agent may run this job at all.
       if (canServe && !canServe(job)) continue;
       job.status = DispatchQueueStatus.Dispatched;
       this.jobs.delete(id);
@@ -263,18 +263,28 @@ export class InMemoryJobQueue {
 
   /**
    * Return a dispatched job to pending for re-dispatch, bumping its attempt
-   * counter. Mirrors the DB-backed `JobQueue.requeue`. Returns the new
-   * attempt count, or null when the job is not currently dispatched.
+   * counter unless `countAttempt` is false. Mirrors the DB-backed
+   * `JobQueue.requeue`. Returns the attempt count, or null when the job is
+   * not currently dispatched.
    */
-  async requeue(jobId: string): Promise<number | null> {
+  async requeue(jobId: string, opts: { countAttempt?: boolean } = {}): Promise<number | null> {
     const job = this.dispatched.get(jobId);
     if (!job) return null;
     this.dispatched.delete(jobId);
     job.status = DispatchQueueStatus.Pending;
     this.jobs.set(jobId, job);
-    const count = (this.attempts.get(jobId) ?? 0) + 1;
+    const count = (this.attempts.get(jobId) ?? 0) + (opts.countAttempt === false ? 0 : 1);
     this.attempts.set(jobId, count);
     return count;
+  }
+
+  /**
+   * The sealed-secrets back-off of `JobQueue.isDeferredUnopenable`. A worker's
+   * in-memory jobs are never sealed, so none is ever deferred; the dispatcher's
+   * requeue redispatch asks every queue this.
+   */
+  isDeferredUnopenable(_jobId: string): boolean {
+    return false;
   }
 
   /** Full job lookup across pending and dispatched jobs. */

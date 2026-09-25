@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import crypto from 'node:crypto';
+
+// Capture the module logger so a skipped fixture mapping's warning can be asserted.
+const mockWarn = vi.hoisted(() => vi.fn());
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: () => ({ info: vi.fn(), warn: mockWarn, error: vi.fn(), debug: vi.fn() }),
+  };
+});
+
 import { encryptJson } from '@kici-dev/shared';
 import {
   processTestTrigger,
@@ -699,6 +710,34 @@ describe('processTestTrigger', () => {
     expect(jobConfig.testSecrets).toBeUndefined();
   });
 
+  it('warns when fixture secret mappings are skipped for want of a context store', async () => {
+    mockWarn.mockClear();
+    const lockFile = createMockLockFile([createMockWorkflow('ci')]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+
+    await processTestTrigger(createMockInput({ secrets: { db: 'test-database' } }), deps);
+
+    // fails-when: the mapping is dropped with no trace
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.stringMatching(/no context store/),
+      expect.objectContaining({ mappings: ['db=test-database'] }),
+    );
+  });
+
+  it('does not warn about fixture mappings when the fixture maps none', async () => {
+    mockWarn.mockClear();
+    const lockFile = createMockLockFile([createMockWorkflow('ci')]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+
+    await processTestTrigger(createMockInput(), deps);
+
+    // breaks-if-wrong: a fixture with no `secrets:` mapping logs nothing about one
+    const mappingWarnings = mockWarn.mock.calls.filter(([message]) =>
+      String(message).includes('no context store'),
+    );
+    expect(mappingWarnings).toEqual([]);
+  });
+
   it('rejects when provider has no lockFileFetcher', async () => {
     (deps.providerRegistry.getByRoutingKey as any).mockReturnValue({
       normalizer: {},
@@ -1118,7 +1157,7 @@ describe('processTestTrigger', () => {
     }
 
     /** Env store whose matchContext returns a full row (no protection rules). */
-    function makeTestEnvStore(name: string) {
+    function makeTestEnvStore(name: string, allowLocalExecution = true) {
       return {
         matchContext: vi.fn(async (_org: string, n: string) =>
           n === name
@@ -1138,7 +1177,7 @@ describe('processTestTrigger', () => {
                 wait_timer_seconds: null,
                 hold_expiry_seconds: null,
                 minimum_trust: null,
-                allow_local_execution: true,
+                allow_local_execution: allowLocalExecution,
                 enabled: true,
                 created_at: new Date(),
                 updated_at: new Date(),
@@ -1174,8 +1213,11 @@ describe('processTestTrigger', () => {
         ['test-database', { KICI_DATABASE_URL: 'test://db' }],
       ]);
       deps.db = makeSecretDb({ 'test-database': { allow_local_execution: true } }) as any;
+      deps.contextStore = makeTestEnvStore('test-database');
       deps.secretResolver = {
-        resolveForJob: vi.fn(async (_org: string, env: string) => perEnv.get(env) ?? {}),
+        resolveForContext: vi.fn(
+          async (_org: string, context: { name: string }) => perEnv.get(context.name) ?? {},
+        ),
       } as any;
       const getJobConfig = captureDispatchedJobConfig(deps);
 
@@ -1189,6 +1231,43 @@ describe('processTestTrigger', () => {
 
       expect(result.status).toBe('accepted');
       expect(getJobConfig().namespacedSecrets.db.KICI_DATABASE_URL).toBe('test://db');
+    });
+
+    it('resolves a fixture mapping through a glob-matched context row', async () => {
+      const lockFile = createMockLockFile([createMockWorkflow('ci')]);
+      deps.db = makeSecretDb({}) as any;
+      // 'preview-7' matches the glob context 'preview-*'; the store answers
+      // with that glob row, whose id is not derived from the declared name.
+      const globStore = makeTestEnvStore('preview-7');
+      const globRow = await globStore.matchContext(TEST_ORG, 'preview-7');
+      globStore.matchContext.mockResolvedValue({
+        ...globRow,
+        id: 'env-preview-glob',
+        name: 'preview-*',
+      });
+      deps.contextStore = globStore;
+      const resolveForContext = vi.fn(async (_org: string, context: { id: string }) =>
+        context.id === 'env-preview-glob' ? { KICI_DATABASE_URL: 'preview://db' } : {},
+      );
+      deps.secretResolver = { resolveForContext } as any;
+      const getJobConfig = captureDispatchedJobConfig(deps);
+
+      const result = await processTestTrigger(
+        createMockInput({
+          inlineLockFile: JSON.stringify(lockFile),
+          routingKey: 'github:42',
+          secrets: { db: 'preview-7' },
+        }),
+        deps,
+      );
+
+      // fails-when: the fixture gate or the resolution looks the context up by exact name
+      expect(result.status).toBe('accepted');
+      expect(getJobConfig().namespacedSecrets.db.KICI_DATABASE_URL).toBe('preview://db');
+      expect(resolveForContext).toHaveBeenCalledWith(TEST_ORG, {
+        id: 'env-preview-glob',
+        name: 'preview-7',
+      });
     });
 
     it('CLI-uploaded secrets override test-env values', async () => {
@@ -1210,7 +1289,9 @@ describe('processTestTrigger', () => {
       deps.db = makeSecretDb({ 'test-database': { allow_local_execution: true } }) as any;
       deps.contextStore = makeTestEnvStore('test-database');
       deps.secretResolver = {
-        resolveForJob: vi.fn(async (_org: string, env: string) => perEnv.get(env) ?? {}),
+        resolveForContext: vi.fn(
+          async (_org: string, context: { name: string }) => perEnv.get(context.name) ?? {},
+        ),
       } as any;
       const getJobConfig = captureDispatchedJobConfig(deps);
 
@@ -1241,8 +1322,9 @@ describe('processTestTrigger', () => {
     it('rejects when a fixture maps to a non-test-allowed context', async () => {
       const lockFile = createMockLockFile([createMockWorkflow('ci')]);
       deps.db = makeSecretDb({ production: { allow_local_execution: false } }) as any;
+      deps.contextStore = makeTestEnvStore('production', false);
       deps.secretResolver = {
-        resolveForJob: vi.fn(async () => ({})),
+        resolveForContext: vi.fn(async () => ({})),
       } as any;
 
       const input = createMockInput({
@@ -1351,7 +1433,7 @@ describe('processTestTrigger', () => {
       db.updateTable = makeUpdateTableMock(undefined, (payload) => executed.push(payload));
       deps.db = db as any;
       deps.contextStore = makeContextEnvStore('test-db');
-      deps.secretResolver = { resolveForJob: vi.fn(async () => ({ DB_URL: 'x' })) } as any;
+      deps.secretResolver = { resolveForContext: vi.fn(async () => ({ DB_URL: 'x' })) } as any;
 
       const input = createMockInput({
         routingKey: 'github:42',
@@ -1406,8 +1488,8 @@ describe('processTestTrigger', () => {
       };
       deps.db = mockDb as any;
 
-      const resolveForJob = vi.fn(async () => ({}));
-      deps.secretResolver = { resolveForJob } as any;
+      const resolveForContext = vi.fn(async () => ({}));
+      deps.secretResolver = { resolveForContext } as any;
 
       const input = createMockInput({
         routingKey: 'github:42',
@@ -1420,8 +1502,8 @@ describe('processTestTrigger', () => {
       expect(result.status).toBe('accepted');
       // No context gate query happened for the impure job.
       expect(envQueries).toEqual([]);
-      // resolveForJob was never called with a context for this job.
-      expect(resolveForJob).not.toHaveBeenCalled();
+      // resolveForContext was never called with a context for this job.
+      expect(resolveForContext).not.toHaveBeenCalled();
     });
   });
 

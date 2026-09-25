@@ -15,17 +15,97 @@
 import { sql, type Kysely } from 'kysely';
 import { TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
+import {
+  JobSecretsUnsealError,
+  SEALED_JOB_CONFIG_KEYS,
+  sealJobSecretValue,
+  unsealJobSecretValue,
+} from '../secrets/job-secret-seal.js';
 import type { WorkflowDispatchContext } from './dispatch-matched-workflow.js';
+import {
+  toSerializableGlobalIdentity,
+  type SerializableGlobalDispatchIdentity,
+} from './global-dispatch-identity.js';
 
 /**
  * The serializable subset of a `WorkflowDispatchContext` — everything except
  * the live `deps` and `bundle`, which are rebuilt on resume. Every field here
  * is JSON-safe (the event, payload, and lock file already ride the WS protocol
- * as JSON).
+ * as JSON). A global run's identity is stored without its workflow bundle and
+ * credentials, which the resume re-derives.
  */
-export type SerializableWorkflowDispatchInputs = Omit<WorkflowDispatchContext, 'deps' | 'bundle'>;
+export type SerializableWorkflowDispatchInputs = Omit<
+  WorkflowDispatchContext,
+  'deps' | 'bundle' | 'global'
+> & { global?: SerializableGlobalDispatchIdentity };
 
-const pendingWorkflowContexts = new Map<string, SerializableWorkflowDispatchInputs>();
+/** Stored inputs as a read returns them. */
+export type LoadedWorkflowDispatchInputs = SerializableWorkflowDispatchInputs & {
+  /**
+   * Set when the row's sealed secret fields could not be decrypted; the
+   * inputs then carry none of them, and the resume abandons the run.
+   */
+  secretsUnavailable?: string;
+};
+
+const pendingWorkflowContexts = new Map<string, LoadedWorkflowDispatchInputs>();
+
+/** The secret fields of stored inputs: the run-wide CLI secrets and the test-run job-config secrets. */
+interface WorkflowInputSecrets {
+  runWideFlatSecrets?: Record<string, string>;
+  extraJobConfig?: Record<string, unknown>;
+}
+
+/**
+ * Split stored inputs into what the `context` column keeps and the sealed
+ * secret fields. With nothing to seal, or no master key, the inputs are
+ * returned as is.
+ */
+function sealInputs(inputs: SerializableWorkflowDispatchInputs): {
+  context: SerializableWorkflowDispatchInputs;
+  sealed: string | null;
+} {
+  const { runWideFlatSecrets, extraJobConfig, ...rest } = inputs;
+  const extraSecret: Record<string, unknown> = {};
+  const extraPlain: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(extraJobConfig ?? {})) {
+    if ((SEALED_JOB_CONFIG_KEYS as readonly string[]).includes(key)) extraSecret[key] = value;
+    else extraPlain[key] = value;
+  }
+  const secret: WorkflowInputSecrets = {
+    ...(runWideFlatSecrets && { runWideFlatSecrets }),
+    ...(Object.keys(extraSecret).length > 0 && { extraJobConfig: extraSecret }),
+  };
+  if (Object.keys(secret).length === 0) return { context: inputs, sealed: null };
+  const sealed = sealJobSecretValue(inputs.runId, secret);
+  // breaks-if-wrong: an orchestrator with no master key keeps storing the inputs in plaintext
+  if (sealed === null) return { context: inputs, sealed: null };
+  return {
+    context: { ...rest, ...(extraJobConfig && { extraJobConfig: extraPlain }) },
+    sealed,
+  };
+}
+
+/** Stored inputs with their sealed secret fields merged back. */
+function unsealInputs(
+  context: SerializableWorkflowDispatchInputs,
+  sealed: string | null | undefined,
+): LoadedWorkflowDispatchInputs {
+  if (sealed == null) return context;
+  try {
+    const secret = unsealJobSecretValue(context.runId, sealed) as WorkflowInputSecrets;
+    return {
+      ...context,
+      ...(secret.runWideFlatSecrets && { runWideFlatSecrets: secret.runWideFlatSecrets }),
+      ...(secret.extraJobConfig && {
+        extraJobConfig: { ...context.extraJobConfig, ...secret.extraJobConfig },
+      }),
+    };
+  } catch (err) {
+    if (!(err instanceof JobSecretsUnsealError)) throw err;
+    return { ...context, secretsUnavailable: err.message };
+  }
+}
 
 /** Extract the serializable inputs from a live dispatch context. */
 export function toSerializableInputs(
@@ -40,9 +120,10 @@ export function toSerializableInputs(
     deps: _deps,
     bundle: _bundle,
     dispatchWindowTokenHeld: _dispatchWindowTokenHeld,
+    global,
     ...rest
   } = ctx;
-  return rest;
+  return global ? { ...rest, global: toSerializableGlobalIdentity(global) } : rest;
 }
 
 /** Persist the pending workflow context to the in-memory Map and the DB. */
@@ -52,11 +133,19 @@ export async function storePendingWorkflowContext(
 ): Promise<void> {
   pendingWorkflowContexts.set(inputs.runId, inputs);
   if (db) {
-    const serialized = JSON.stringify(inputs);
+    const { context, sealed } = sealInputs(inputs);
+    const serialized = JSON.stringify(context);
     await db
       .insertInto('pending_workflow_contexts')
-      .values({ run_id: inputs.runId, org_id: inputs.resolvedOrgId, context: serialized })
-      .onConflict((oc) => oc.column('run_id').doUpdateSet({ context: serialized }))
+      .values({
+        run_id: inputs.runId,
+        org_id: inputs.resolvedOrgId,
+        context: serialized,
+        sealed_secrets: sealed,
+      })
+      .onConflict((oc) =>
+        oc.column('run_id').doUpdateSet({ context: serialized, sealed_secrets: sealed }),
+      )
       .execute();
   }
 }
@@ -65,7 +154,7 @@ export async function storePendingWorkflowContext(
 export async function loadPendingWorkflowContext(
   db: Kysely<Database> | undefined,
   runId: string,
-): Promise<SerializableWorkflowDispatchInputs | null> {
+): Promise<LoadedWorkflowDispatchInputs | null> {
   const mem = pendingWorkflowContexts.get(runId);
   if (mem) return mem;
   if (!db) return null;
@@ -74,7 +163,9 @@ export async function loadPendingWorkflowContext(
     .selectAll()
     .where('run_id', '=', runId)
     .executeTakeFirst();
-  return row ? (row.context as unknown as SerializableWorkflowDispatchInputs) : null;
+  return row
+    ? unsealInputs(row.context as unknown as SerializableWorkflowDispatchInputs, row.sealed_secrets)
+    : null;
 }
 
 /** Delete the pending workflow context from the in-memory Map and the DB. */
@@ -114,7 +205,10 @@ export async function restorePendingWorkflowContexts(db: Kysely<Database>): Prom
   for (const row of rows) {
     pendingWorkflowContexts.set(
       row.run_id,
-      row.context as unknown as SerializableWorkflowDispatchInputs,
+      unsealInputs(
+        row.context as unknown as SerializableWorkflowDispatchInputs,
+        row.sealed_secrets,
+      ),
     );
     restored++;
   }

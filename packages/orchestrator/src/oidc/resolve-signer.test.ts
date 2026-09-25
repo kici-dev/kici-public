@@ -43,6 +43,20 @@ describe('createBoundedSignerResolver', () => {
     expect(sleep).toHaveBeenCalledTimes(5);
   });
 
+  it('a call can wait on a smaller attempt budget than the default', async () => {
+    // fails-when: the per-call budget is ignored — the mint path would poll for
+    // the full boot budget after it has already answered the agent.
+    const reconcile = vi.fn(async () => null);
+    const { resolve, sleep } = build(reconcile);
+    await expect(resolve({ maxAttempts: 2 })).resolves.toBeNull();
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    // breaks-if-wrong: a call without a budget keeps the configured default.
+    reconcile.mockClear();
+    await resolve();
+    expect(reconcile).toHaveBeenCalledTimes(5);
+  });
+
   it('stops on the first thrown reconcile instead of retrying it, and names the cause', async () => {
     // fails-when: the loop swallows the throw and keeps going — reconcile would
     // be called 5 times and sleep 5 times, exactly the 30-second stall this

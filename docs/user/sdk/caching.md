@@ -120,6 +120,8 @@ Each cache entry is scoped to your organization and to the ref's trust level:
 
 No tenant can read another tenant's cache; the org boundary is enforced in the cache key namespace.
 
+A run of an [organization-wide workflow](../global-workflows.md) against another repository uses its own shared scope for the pair of repositories: the one that defines the workflow and the one whose event started the run. So one source repository's runs cannot write a cache entry that another source repository's runs of the same workflow restore.
+
 ## Eviction
 
 Cache storage is bounded per organization. Two mechanisms keep it bounded:

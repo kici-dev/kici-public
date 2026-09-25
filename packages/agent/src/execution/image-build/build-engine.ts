@@ -15,6 +15,7 @@ import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { JobImageBuildSpec } from './resolve-build-spec.js';
+import type { ContainerRuntimeEndpoint } from './runtime-facts.js';
 
 /** The build CLIs an agent host may provide. */
 export const ContainerBuildCli = z.enum(['docker', 'podman']);
@@ -36,16 +37,16 @@ export function binaryOnPath(bin: string): boolean {
 }
 
 /**
- * The container socket the SANDBOX will use.
+ * The daemon address a build is pointed at: the runtime the SANDBOX will start
+ * the built image on (`resolveContainerRuntime`).
  *
- * Mirrors what dockerode's `new Docker()` resolves, and exists so build and run
- * provably agree. A host with both runtimes whose sandbox socket points at
- * podman would otherwise build with docker and then start the job container on
- * a daemon that has never heard of that image — a failure that surfaces as
- * "no such image" and names nothing.
+ * Build and run have to provably agree. A host with both runtimes whose
+ * sandbox runs on podman would otherwise build with docker and then start the
+ * job container on a daemon that has never heard of that image — a failure
+ * that surfaces as "no such image" and names nothing.
  */
-export function sandboxSocketPath(): string {
-  return process.env.DOCKER_HOST ?? '/var/run/docker.sock';
+export function runtimeAddress(runtime: ContainerRuntimeEndpoint): string {
+  return 'socketPath' in runtime ? runtime.socketPath : runtime.host;
 }
 
 export function resolveBuildCli(args: {

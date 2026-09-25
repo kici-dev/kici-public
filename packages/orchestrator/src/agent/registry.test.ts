@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { AgentRegistry } from './registry.js';
+import { AgentRegistry, BUSY_HOLD_MAX_MS, BusyHoldOutcome } from './registry.js';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { hasContainerRuntime } from '../scaler/agent-fit.js';
 
 // ── Tests ───────────────────────────────────────────────────────
 
@@ -250,6 +251,85 @@ describe('AgentRegistry', () => {
     });
   });
 
+  describe('busy hold', () => {
+    it('excludes a busy-held agent from findAvailable on both lookup paths', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.register('agent-2', mockWs(), ['linux']);
+      registry.markBusyHeld('agent-1');
+
+      // fails-when: findAvailable ignores the hold on the label-indexed path.
+      expect(registry.findAvailable(['linux']).map((a) => a.agentId)).toEqual(['agent-2']);
+      // fails-when: the no-labels path ignores the hold.
+      expect(registry.findAvailable([]).map((a) => a.agentId)).toEqual(['agent-2']);
+    });
+
+    it('lifts the hold on clearBusyHeld', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.markBusyHeld('agent-1');
+      registry.clearBusyHeld('agent-1');
+      // breaks-if-wrong: a cleared agent is routable again.
+      expect(registry.findAvailable(['linux'])).toHaveLength(1);
+    });
+
+    it('expires the hold after BUSY_HOLD_MAX_MS so a lost status cannot strand the agent', () => {
+      vi.useFakeTimers();
+      try {
+        registry.register('agent-1', mockWs(), ['linux']);
+        registry.markBusyHeld('agent-1');
+        vi.advanceTimersByTime(BUSY_HOLD_MAX_MS - 1);
+        expect(registry.findAvailable(['linux'])).toHaveLength(0);
+        vi.advanceTimersByTime(1);
+        // fails-when: the hold has no ceiling — the agent stays unroutable forever.
+        expect(registry.findAvailable(['linux'])).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reports NotRegistered for an unregistered agent', () => {
+      expect(registry.markBusyHeld('ghost')).toBe(BusyHoldOutcome.NotRegistered);
+    });
+
+    it('reports a re-hold only when no free-slot report cleared the previous hold', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      expect(registry.markBusyHeld('agent-1', 0)).toBe(BusyHoldOutcome.Held);
+      // fails-when: an expired hold is dropped from the entry — a stuck agent
+      // reads as freshly held and never spends an attempt.
+      expect(registry.markBusyHeld('agent-1', BUSY_HOLD_MAX_MS)).toBe(
+        BusyHoldOutcome.ReheldAfterExpiry,
+      );
+      // breaks-if-wrong: a free-slot report resets it to a fresh hold.
+      registry.clearBusyHeld('agent-1');
+      expect(registry.markBusyHeld('agent-1', 2 * BUSY_HOLD_MAX_MS)).toBe(BusyHoldOutcome.Held);
+    });
+
+    it('clearExpiredBusyHold keeps a hold still in force', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.markBusyHeld('agent-1', 0);
+      registry.clearExpiredBusyHold('agent-1', BUSY_HOLD_MAX_MS - 1);
+      // fails-when: accepted work lifts a hold still in force — the agent is
+      // routable while it holds the slot the hold covers.
+      expect(registry.get('agent-1')?.busyHeldUntil).toBe(BUSY_HOLD_MAX_MS);
+    });
+
+    it('clearExpiredBusyHold drops a hold that ran out, so the next rejection is a fresh hold', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.markBusyHeld('agent-1', 0);
+      registry.clearExpiredBusyHold('agent-1', BUSY_HOLD_MAX_MS);
+      // breaks-if-wrong: an agent that accepted work after its hold ran out is
+      // charged an attempt on its next teardown-window rejection.
+      expect(registry.get('agent-1')?.busyHeldUntil).toBeUndefined();
+      expect(registry.markBusyHeld('agent-1', BUSY_HOLD_MAX_MS + 1)).toBe(BusyHoldOutcome.Held);
+    });
+
+    it('clearExpiredBusyHold is a no-op for an agent with no hold or no entry', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.clearExpiredBusyHold('agent-1', 0);
+      registry.clearExpiredBusyHold('ghost', 0);
+      expect(registry.get('agent-1')?.busyHeldUntil).toBeUndefined();
+    });
+  });
+
   describe('draining', () => {
     // A warm-pool destroy takes seconds (a container `stop({ t: 5 })`, or a
     // Firecracker SendCtrlAltDel plus its grace) while the registry entry
@@ -280,6 +360,23 @@ describe('AgentRegistry', () => {
 
       registry.markDraining('agent-1');
       expect(registry.hasMatchingAgent(['linux'])).toBe(false);
+    });
+
+    it('counts only the label-matching agents that can run the job, when asked', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.register('agent-2', mockWs(), ['linux', 'kici:runtime:docker']);
+
+      // breaks-if-wrong: without a test, every label match still counts
+      expect(registry.hasMatchingAgent(['linux'])).toBe(true);
+      // fails-when: an agent that can never run the job keeps it from rerouting
+      expect(
+        registry.hasMatchingAgent(['linux'], [], [], [], (entry) => entry.agentId === 'agent-3'),
+      ).toBe(false);
+      expect(
+        registry.hasMatchingAgent(['linux'], [], [], [], (entry) =>
+          hasContainerRuntime(entry.labels),
+        ),
+      ).toBe(true);
     });
 
     it('reports the active-job count at the moment of the mark', () => {

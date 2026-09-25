@@ -34,6 +34,14 @@ import {
 } from '../cluster/instance-heartbeat.js';
 import type { AgentRegistry } from '../agent/registry.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import type { HeldRun } from '../db/types.js';
+import { HeldRunStatus } from '../contexts/held-runs.js';
+import {
+  cancelHeldRunWithReason,
+  HeldRunWithdrawal,
+  type HeldRunDecidedFirst,
+  type RejectHeldWorkflowOptions,
+} from './cancel-held-run.js';
 
 const logger = createLogger({ prefix: 'cancel-run' });
 
@@ -55,6 +63,17 @@ export interface CancelRunDeps {
   cancelJobOnPeer?: (peerId: string, runId: string, jobId: string, reason: string) => boolean;
   /** How stale a `cluster_instances` heartbeat may be and still read as live. */
   ownershipGraceMs?: number;
+  /**
+   * Reject a held run's workflow-scoped hold: `rejectWorkflow` bound to the live
+   * processing deps. A cancel of a `held` run goes through it so the approval
+   * request is withdrawn with the run. Undefined where no provider wiring
+   * exists; the held run is then still cancelled and its holds rejected.
+   */
+  rejectHeldWorkflow?: (
+    hold: HeldRun,
+    reason: string,
+    opts?: RejectHeldWorkflowOptions,
+  ) => Promise<boolean>;
 }
 
 export interface CancelRunOptions {
@@ -83,6 +102,47 @@ export interface CancelRunResult {
    * no-op: no agent was notified and no row was written.
    */
   alreadyTerminal: boolean;
+  /**
+   * Set when the run was `held` and a decision reached its holds first — an
+   * approve, a reject or an expiry — so the cancel wrote nothing. Entry points
+   * refuse the cancel with {@link heldRunCancelRefusal}.
+   */
+  decidedBeforeCancel?: HeldRunDecidedFirst;
+}
+
+/** Why a cancel of a held run whose hold an approve already released is refused. */
+export const RUN_RESUMING_AFTER_APPROVAL_MESSAGE =
+  'Run is resuming after approval; cancel it again once it is running';
+
+/** Why a cancel of a held run whose hold a reject already decided is refused. */
+export const RUN_REJECTED_BEFORE_CANCEL_MESSAGE =
+  'Run was rejected before the cancel reached it; the rejection ends it';
+
+/** Why a cancel of a held run whose hold already expired is refused. */
+export const RUN_EXPIRED_BEFORE_CANCEL_MESSAGE =
+  'Run approval request expired before the cancel reached it; the expiry ends it';
+
+const REFUSAL_MESSAGES: Record<HeldRunDecidedFirst, string> = {
+  [HeldRunWithdrawal.Approved]: RUN_RESUMING_AFTER_APPROVAL_MESSAGE,
+  [HeldRunWithdrawal.Rejected]: RUN_REJECTED_BEFORE_CANCEL_MESSAGE,
+  [HeldRunWithdrawal.Expired]: RUN_EXPIRED_BEFORE_CANCEL_MESSAGE,
+};
+
+/** The message a refused cancel of a held run answers with, naming the decision that won. */
+export function heldRunCancelRefusal(decision: HeldRunDecidedFirst): string {
+  return REFUSAL_MESSAGES[decision];
+}
+
+/**
+ * Thrown by an entry point that refuses a cancel because a decision reached
+ * the held run first. An expected race, not a failure: callers answer it as a
+ * refusal rather than logging an error.
+ */
+export class HeldRunCancelRefusedError extends Error {
+  constructor(readonly decision: HeldRunDecidedFirst) {
+    super(heldRunCancelRefusal(decision));
+    this.name = 'HeldRunCancelRefusedError';
+  }
 }
 
 /**
@@ -123,6 +183,44 @@ export async function cancelRunWithReason(
     logger.info('Cancel ignored: run already terminal', { runId, status: runRow.status });
     return { agentsNotified: 0, unreachable: 0, pendingCancelled: 0, alreadyTerminal: true };
   }
+
+  // A held run has no job to cancel; what it has is an approval request, and a
+  // cancel withdraws it the way a reject does. When a decision reached the
+  // holds first, the cancel writes nothing and reports that decision instead of
+  // claiming a cancellation: an approve leaves the run resuming, and a reject
+  // or an expiry ends it on its own.
+  if (runRow?.status === ExecutionRunStatus.enum.held) {
+    const withdrawal = await cancelHeldRunWithReason(
+      { db, executionTracker, rejectHeldWorkflow: deps.rejectHeldWorkflow },
+      runId,
+      reason,
+    );
+    // fails-when: a cancel that lost to a decision stamps attribution and reports success
+    // breaks-if-wrong: a withdrawn held run must still be cancelled and attributed
+    if (withdrawal !== HeldRunWithdrawal.Withdrawn) {
+      logger.info('Cancel refused: a decision reached the held run first', {
+        runId,
+        decision: withdrawal,
+      });
+      return {
+        agentsNotified: 0,
+        unreachable: 0,
+        pendingCancelled: 0,
+        alreadyTerminal: false,
+        decidedBeforeCancel: withdrawal,
+      };
+    }
+    await stampWithdrawnAttribution(db, runId, options);
+    logger.info('Cancelled held run', { runId });
+    return { agentsNotified: 0, unreachable: 0, pendingCancelled: 0, alreadyTerminal: false };
+  }
+
+  // A run that is not `held` can still carry an open approval request: a hold
+  // raised at dispatch (a workflow `approval` block, a context reviewer) keeps
+  // the run `pending`/`running` with a placeholder job. Cancelling only the
+  // jobs would leave that request pending, and a later approve would still
+  // release it, so every pending hold is withdrawn first.
+  await withdrawPendingHoldsOfActiveRun(deps, runId, reason);
 
   // Notify the agents running this run's jobs so in-flight work unwinds
   // (graceful hooks unless force).
@@ -211,19 +309,7 @@ export async function cancelRunWithReason(
   // the status read above narrows the window, these predicates close it.
   // failure_reason is additionally clobber-guarded so a more specific cause
   // already recorded wins.
-  if (options.cancelledBy) {
-    await db
-      .updateTable('execution_runs')
-      .set({
-        cancelled_by: options.cancelledBy,
-        ...(options.cancelledByAgentLabel != null && {
-          cancelled_by_agent_label: options.cancelledByAgentLabel,
-        }),
-      })
-      .where('run_id', '=', runId)
-      .where('status', 'not in', [...TERMINAL_RUN_STATES])
-      .execute();
-  }
+  await stampCancelAttribution(db, runId, options);
   await db
     .updateTable('execution_runs')
     .set({ failure_reason: reason })
@@ -275,6 +361,11 @@ export async function cancelRunWithReason(
       .execute();
     orphansCancelled = Number(orphanResult[0]?.numUpdatedRows ?? 0);
     await executionTracker.completeRunIfAllJobsTerminal(runId);
+    // A run with no job rows has nothing whose completion drives it terminal,
+    // so the job-driven completion above leaves it in its status. Answering
+    // "cancelled" while the row keeps `pending` is what this closes: the
+    // cancel writes the terminal row itself. A run with jobs is untouched.
+    await executionTracker.cancelJoblessRun(runId, reason);
   }
 
   logger.info('Cancelled run', {
@@ -286,6 +377,95 @@ export async function cancelRunWithReason(
     force,
   });
   return { agentsNotified, unreachable, pendingCancelled, alreadyTerminal: false };
+}
+
+/**
+ * Reject every pending approval request of a run that is not `held`, the way a
+ * cancel of a held run does. The run itself is left to the job cancellation
+ * that follows: the hold rejection's own terminal write only moves a `held`
+ * run, so the placeholder and any running job still drive the run terminal.
+ */
+async function withdrawPendingHoldsOfActiveRun(
+  deps: CancelRunDeps,
+  runId: string,
+  reason: string,
+): Promise<void> {
+  const pendingHold = await deps.db
+    .selectFrom('held_runs')
+    .select(['id'])
+    .where('run_id', '=', runId)
+    .where('status', '=', HeldRunStatus.Pending)
+    .execute();
+  // fails-when: a cancel of a running run with a dispatch-time hold leaves the hold pending
+  // breaks-if-wrong: a run with no hold must take the plain job cancellation untouched
+  if (pendingHold.length === 0) return;
+  // The run is not `held`, so the job cancellation that follows ends it; the
+  // withdrawal settles the holds and their checks and writes no run row.
+  //
+  // A withdraw that loses to a decision is deliberately not refused, unlike
+  // the held-run branch: an approve re-dispatches work onto a run that is
+  // already live, and the job path below cancels that work the same way it
+  // cancels every other job of the run.
+  const withdrawal = await cancelHeldRunWithReason(
+    {
+      db: deps.db,
+      executionTracker: deps.executionTracker,
+      rejectHeldWorkflow: deps.rejectHeldWorkflow,
+    },
+    runId,
+    reason,
+    { terminalWrite: false },
+  );
+  logger.info('Withdrew the pending approval requests of a cancelled run', {
+    runId,
+    withdrawn: withdrawal === HeldRunWithdrawal.Withdrawn,
+    ...(withdrawal !== HeldRunWithdrawal.Withdrawn && { decision: withdrawal }),
+  });
+}
+
+/** Record who cancelled the run, while it is still non-terminal. */
+async function stampCancelAttribution(
+  db: Kysely<Database>,
+  runId: string,
+  options: CancelRunOptions,
+): Promise<void> {
+  if (!options.cancelledBy) return;
+  await db
+    .updateTable('execution_runs')
+    .set({
+      cancelled_by: options.cancelledBy,
+      ...(options.cancelledByAgentLabel != null && {
+        cancelled_by_agent_label: options.cancelledByAgentLabel,
+      }),
+    })
+    .where('run_id', '=', runId)
+    .where('status', 'not in', [...TERMINAL_RUN_STATES])
+    .execute();
+}
+
+/**
+ * Record who cancelled a held run the cancel just withdrew. The run is already
+ * `cancelled` here, so the non-terminal guard of {@link stampCancelAttribution}
+ * would skip it; this one is guarded on the cancelled row carrying no attribution.
+ */
+async function stampWithdrawnAttribution(
+  db: Kysely<Database>,
+  runId: string,
+  options: CancelRunOptions,
+): Promise<void> {
+  if (!options.cancelledBy) return;
+  await db
+    .updateTable('execution_runs')
+    .set({
+      cancelled_by: options.cancelledBy,
+      ...(options.cancelledByAgentLabel != null && {
+        cancelled_by_agent_label: options.cancelledByAgentLabel,
+      }),
+    })
+    .where('run_id', '=', runId)
+    .where('status', '=', ExecutionRunStatus.enum.cancelled)
+    .where('cancelled_by', 'is', null)
+    .execute();
 }
 
 /** One dispatched job, with the cancel routing decision already made for it. */

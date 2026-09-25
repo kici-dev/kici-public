@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import { RuntimeFact } from '@kici-dev/engine';
 import {
   buildArgv,
   buildJobImage,
   makeLineSplitter,
   resolveBuildCli,
+  runtimeAddress,
   ContainerBuildCli,
 } from './build-engine.js';
 import type { JobImageBuildSpec } from './resolve-build-spec.js';
@@ -151,5 +153,26 @@ describe('buildJobImage abort', () => {
         signal: ac.signal,
       }),
     ).rejects.toThrow(/job cancelled/);
+  });
+});
+
+describe('runtimeAddress', () => {
+  it('points the build at the socket the sandbox runs the image on', () => {
+    // fails-when: the build lands on one daemon and the job container starts
+    // on another, which has never heard of the built image
+    const address = runtimeAddress({
+      fact: RuntimeFact.enum.podman,
+      socketPath: '/run/user/1000/podman/podman.sock',
+    });
+    expect(address).toBe('/run/user/1000/podman/podman.sock');
+    expect(buildArgv({ cli: ContainerBuildCli.enum.docker, spec, socketPath: address })).toContain(
+      'unix:///run/user/1000/podman/podman.sock',
+    );
+  });
+
+  it('passes a remote DOCKER_HOST through as it was given', () => {
+    expect(runtimeAddress({ fact: RuntimeFact.enum.docker, host: 'tcp://10.0.0.5:2375' })).toBe(
+      'tcp://10.0.0.5:2375',
+    );
   });
 });

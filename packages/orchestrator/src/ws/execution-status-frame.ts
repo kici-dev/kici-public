@@ -47,7 +47,7 @@ export function buildExecutionStatusFrame(args: ExecutionStatusFrameArgs): Execu
       workflowRepoIdentifier: context.workflowRepoIdentifier,
     }),
     // Present only for a global evaluation round's own run row, which the
-    // Platform's re-run refusal reads to admit a round's re-evaluation.
+    // Platform mirrors to tell a round from a workflow run.
     ...(context.isGlobalEvalRound === true && { isGlobalEvalRound: true }),
     ...(context.provider && { repoProvider: context.provider }),
     ...(context.localWorkingTree && { localWorkingTree: true }),
@@ -78,5 +78,9 @@ export function buildExecutionStatusFrame(args: ExecutionStatusFrameArgs): Execu
     ...(args.logBytes !== undefined && { logBytes: args.logBytes }),
     ...(args.initFailure && { initFailure: args.initFailure }),
     ...(context.failureClass && { failureClass: context.failureClass }),
+    // Always sent: the Platform applies its keep-terminal rule only to a frame
+    // that carries a generation, and reads one without it as an older
+    // orchestrator's. 0 is a run that never left a terminal status.
+    statusEpoch: context.statusEpoch ?? 0,
   };
 }

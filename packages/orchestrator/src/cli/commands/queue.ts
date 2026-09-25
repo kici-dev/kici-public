@@ -64,10 +64,7 @@ export function registerQueueCommands(program: Command, getClient: () => AdminAp
     .command('list')
     .description('List dispatch_queue entries (read-only)')
     .option('--status <s>', 'Filter by exact status (pending|dispatched|...)')
-    .option(
-      '--status-not-in <csv>',
-      'Filter status NOT IN (CSV; e.g. "completed,failed,cancelled")',
-    )
+    .option('--status-not-in <csv>', 'Filter status NOT IN (CSV; e.g. "completed,failed,expired")')
     .option('--job-name-prefix <p>', 'Filter by job_name prefix')
     .option('--job-name <name>', 'Filter by exact job_name match')
     .option('--job-name-not-like <pattern>', 'Exclude job_name LIKE pattern (e.g. "__build__%")')

@@ -48,12 +48,15 @@ export function parseLockDocument(raw: string, repoIdentifier: string, ref: stri
  * `schemaVersion` is at or above this codebase's `BREAKING_FLOOR` and whose
  * required reader version is at or below this orchestrator's `SCHEMA_VERSION`.
  * Both out-of-window cases throw a `LockFileParseError` (the established
- * corrupt-lock signal) carrying operator-actionable guidance.
+ * corrupt-lock signal) carrying operator-actionable guidance. `readerVersion`
+ * is the schema version this orchestrator reads, overridable so a test can pose
+ * as an older orchestrator.
  */
 export function assertLockFileSchemaCompatible(
   lockFile: LockFile,
   repoIdentifier: string,
   ref: string,
+  readerVersion: number = SCHEMA_VERSION,
 ): void {
   // Too old: the lock predates a breaking change this codebase relies on. An
   // older SDK emitted a shape (e.g. pre-v20 string-array runsOn) that this
@@ -70,12 +73,12 @@ export function assertLockFileSchemaCompatible(
   // Pre-window locks omit minReaderVersion; fall back to schemaVersion so a
   // newer lock without the field keeps exact-match strictness (safe default).
   const minReader = lockFile.minReaderVersion ?? lockFile.schemaVersion;
-  if (SCHEMA_VERSION < minReader) {
+  if (readerVersion < minReader) {
     throw new LockFileParseError(
       repoIdentifier,
       ref,
       `Lock file requires orchestrator schema >= v${minReader} but this orchestrator ` +
-        `understands <= v${SCHEMA_VERSION} — upgrade the orchestrator to a newer version.`,
+        `understands <= v${readerVersion} — upgrade the orchestrator to a newer version.`,
     );
   }
 }

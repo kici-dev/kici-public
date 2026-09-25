@@ -25,7 +25,10 @@ import { CacheRefScope } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import { deriveCacheRefScope, type WorkflowDispatchContext } from './dispatch-matched-workflow.js';
 import { toSerializableInputs } from './pending-workflow-context.js';
-import { rebuildWorkflowDispatchContext } from './resume-workflow.js';
+import {
+  rebuildWorkflowDispatchContext,
+  type RebuiltWorkflowDispatchContext,
+} from './resume-workflow.js';
 import { resolveInstallSecrets } from './install-secrets-resolver.js';
 import type { ProcessingDeps } from './processor.js';
 
@@ -68,7 +71,7 @@ const LIVE_DEPS = {
 } as unknown as ProcessingDeps;
 
 /** Replay the persisted hold context exactly as `resumeWorkflow` does. */
-function replay(trustResolution: TrustResolution): WorkflowDispatchContext {
+function replay(trustResolution: TrustResolution): RebuiltWorkflowDispatchContext {
   const stored = toSerializableInputs(heldContext(trustResolution));
   // The `pending_workflow_contexts` row is `JSON.stringify`d, so anything that
   // does not survive a JSON round trip is gone by the time a release reads it.

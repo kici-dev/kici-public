@@ -268,6 +268,19 @@ describe('InMemoryJobQueue', () => {
       expect(attempts2).toBe(2);
     });
 
+    it('requeues without bumping the count when countAttempt is false', async () => {
+      const queue = new InMemoryJobQueue();
+      const id = await queue.enqueue(makeInput());
+      await queue.dequeueForLabels(['linux', 'docker']);
+      expect(await queue.requeue(id)).toBe(1);
+      await queue.dequeueForLabels(['linux', 'docker']);
+
+      // fails-when: countAttempt is ignored — the busy requeue reads 2.
+      expect(await queue.requeue(id, { countAttempt: false })).toBe(1);
+      // The job is still requeued: it is dequeueable again.
+      expect((await queue.dequeueForLabels(['linux', 'docker']))?.id).toBe(id);
+    });
+
     it('returns null when requeueing an unknown or non-dispatched job', async () => {
       const queue = new InMemoryJobQueue();
       expect(await queue.requeue('nope')).toBeNull();

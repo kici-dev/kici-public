@@ -2,9 +2,10 @@
  * Secret resolver for dispatch-time secret resolution.
  *
  * Uses context bindings + scope resolver to match secrets from multiple backends.
- * When a job dispatches with a context name, the resolver:
- * 1. Looks up the context by name
- * 2. Gets bindings for that context
+ * When a job dispatches through a context, the resolver:
+ * 1. Takes the context row the dispatch path already matched (a fixed context
+ *    by exact name, or a glob context whose pattern matched the declared name)
+ * 2. Gets bindings for that row
  * 3. Queries ALL registered backend stores for secrets
  * 4. Prefixes each secret's scope with the backend name (e.g., pg:aws/prod)
  * 5. Uses resolveSecretsWithProvenance to match bindings against prefixed secrets
@@ -26,13 +27,24 @@ import type { Logger } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
 /**
- * Minimal context store interface (subset needed by resolver).
+ * The context a job's secrets resolve through.
+ *
+ * `id` is the row the dispatch path matched — which, for a glob context, is not
+ * the row whose name equals the declared one — so the resolver reads that row's
+ * bindings and never matches a name again: a second match could land on a
+ * different row than the one the caller's protection rules and held-run
+ * checks ran against. `name` is the name the job declared; it labels the audit
+ * entry and keys per-context namespacing.
  */
-export interface ContextStoreLike {
-  getByName(
-    orgId: string,
-    name: string,
-  ): Promise<{ id: string; name: string; orgId: string } | null>;
+export interface MatchedContextRef {
+  id: string;
+  name: string;
+}
+
+/** The run and job a resolution is recorded against in the secret audit log. */
+export interface SecretResolutionAttribution {
+  runId?: string;
+  jobId?: string;
 }
 
 /**
@@ -58,7 +70,6 @@ export interface SecretStoreLike {
  * Dependencies for the SecretResolver.
  */
 export interface SecretResolverDeps {
-  contextStore: ContextStoreLike;
   bindingStore: BindingStoreLike;
   /** Map of backend name to store. Replaces single secretStore. */
   backendStores: Map<string, SecretStoreLike>;
@@ -80,10 +91,11 @@ export interface ResolvedSecretMeta {
  * can flow through `ProcessingDeps.secretResolver`.
  */
 export interface SecretResolverApi {
-  resolveForJob(
+  resolveForContext(
     orgId: string,
-    contextName: string,
+    context: MatchedContextRef,
     hostCtx?: HostFacts,
+    attribution?: SecretResolutionAttribution,
   ): Promise<Record<string, string>>;
   /**
    * System-scoped direct lookup — no context binding, no protection rule, no
@@ -96,11 +108,16 @@ export interface SecretResolverApi {
     key: string,
     opts?: { store?: string; runId?: string; jobId?: string },
   ): Promise<string | null>;
-  resolveForJobWithMeta(
+  resolveForContextWithMeta(
     orgId: string,
-    contextName: string,
+    context: MatchedContextRef,
     hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>>;
+  /**
+   * How many scope bindings the context row `contextId` has. A context with
+   * none resolves no secret; the dispatch path reads this to say so in its log.
+   */
+  countContextBindings?(contextId: string): Promise<number>;
 }
 
 /**
@@ -113,14 +130,12 @@ export interface SecretResolverApi {
  * stripping the backend prefix.
  */
 export class SecretResolver implements SecretResolverApi {
-  private readonly contextStore: ContextStoreLike;
   private readonly bindingStore: BindingStoreLike;
   private readonly backendStores: Map<string, SecretStoreLike>;
   private readonly auditLogger: AuditLogger;
   private readonly logger: Logger;
 
   constructor(deps: SecretResolverDeps) {
-    this.contextStore = deps.contextStore;
     this.bindingStore = deps.bindingStore;
     this.backendStores = deps.backendStores;
     this.auditLogger = deps.auditLogger;
@@ -131,26 +146,24 @@ export class SecretResolver implements SecretResolverApi {
    * Resolve secrets for a job dispatch.
    *
    * @param orgId - Organization ID
-   * @param contextName - Context name to resolve secrets for
+   * @param context - The matched context row and the name the job declared
    * @param hostCtx - Optional fan-out child identity for per-host resolution.
    *   When supplied, each binding is gated by its `host_pattern` and its
    *   `scope_pattern` is templated per-child; when omitted, only fleet-wide
    *   (`'**'`) non-templated bindings contribute.
+   * @param attribution - The run and job the audit entry names, when the
+   *   caller resolves on behalf of one.
    * @returns Flat map of decrypted secret key-value pairs
    */
-  async resolveForJob(
+  async resolveForContext(
     orgId: string,
-    contextName: string,
+    context: MatchedContextRef,
     hostCtx?: HostFacts,
+    attribution?: SecretResolutionAttribution,
   ): Promise<Record<string, string>> {
-    // 1. Look up context by name
-    const env = await this.contextStore.getByName(orgId, contextName);
-    if (!env) {
-      return {};
-    }
-
-    // 2. Get bindings for this context
-    const bindings = await this.bindingStore.getByContextId(env.id);
+    const contextName = context.name;
+    // 1-2. Bindings of the matched row. A row deleted since the match has none.
+    const bindings = await this.bindingStore.getByContextId(context.id);
     if (bindings.length === 0) {
       return {};
     }
@@ -190,8 +203,8 @@ export class SecretResolver implements SecretResolverApi {
         routingKey: null,
         secretKeys: Object.keys(resolved),
         outcome: 'allowed',
-        runId: null,
-        jobId: null,
+        runId: attribution?.runId ?? null,
+        jobId: attribution?.jobId ?? null,
         userId: null,
         role: null,
         metadata: {
@@ -220,18 +233,20 @@ export class SecretResolver implements SecretResolverApi {
    *
    * A JOB-ORIGINATED reference goes through `resolveJobQualifiedSecret`
    * (`secrets/job-secret-gate.ts`) instead, which runs the named context's
-   * protection rules and the trust-tier strip before reaching this method. The
-   * `Internal` suffix is the enforcement: this method's doc comment already
-   * warned that it bypassed context bindings, and three call sites took it
-   * anyway — a warning is not a boundary, but a name shows up in a grep of
-   * callers.
+   * protection rules and the trust-tier strip, then reads the value through
+   * that context's bindings with `resolveForContext`. It calls this method in
+   * one deprecated case only, after its own checks pass: a non-glob context
+   * matched by its exact name, whose bound scopes do not carry the key, reads
+   * the scope named after the context (removal planned for v1.0.0). The `Internal` suffix marks the
+   * boundary: a warning in a doc comment is not one, but a name shows up in a
+   * grep of callers.
    *
    * When `store` is omitted, backends are tried in Map iteration order (the
    * order they were registered) and the first hit wins. An explicit `store`
    * restricts the lookup to that one backend and returns null on miss.
    *
    * Audit-log: writes one `resolve_named` entry on success. Throws when the
-   * named store is requested but doesn't exist, mirroring `resolveForJob`'s
+   * named store is requested but doesn't exist, mirroring `resolveForContext`'s
    * fail-fast policy — the caller asked for a specific backend and
    * it's gone.
    */
@@ -276,7 +291,7 @@ export class SecretResolver implements SecretResolverApi {
       try {
         secrets = await store.getSecrets(orgId, scope);
       } catch (err) {
-        // Skip unreachable backends — unlike resolveForJob, named lookups do
+        // Skip unreachable backends — unlike resolveForContext, named lookups do
         // NOT cause job failure on a missed backend. The caller can re-ask
         // with an explicit `store` if they need to pin to one.
         this.logger.warn('Secret backend unreachable during resolveNamedInternal', {
@@ -308,20 +323,23 @@ export class SecretResolver implements SecretResolverApi {
     return null;
   }
 
+  /** How many scope bindings the context row `contextId` has. */
+  async countContextBindings(contextId: string): Promise<number> {
+    return (await this.bindingStore.getByContextId(contextId)).length;
+  }
+
   /**
    * Resolve secrets with metadata (per, for secrets.getMeta).
    *
    * Returns the secret value along with which backend and scope provided it.
    */
-  async resolveForJobWithMeta(
+  async resolveForContextWithMeta(
     orgId: string,
-    contextName: string,
+    context: MatchedContextRef,
     hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>> {
-    const env = await this.contextStore.getByName(orgId, contextName);
-    if (!env) return {};
-
-    const bindings = await this.bindingStore.getByContextId(env.id);
+    const contextName = context.name;
+    const bindings = await this.bindingStore.getByContextId(context.id);
     if (bindings.length === 0) return {};
 
     const { secrets: allPrefixedSecrets, failedBackends } = await this.collectAllSecrets(orgId);

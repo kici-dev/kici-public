@@ -183,9 +183,14 @@ job('build', {
 });
 ```
 
-Store the secrets first with `kici-admin secret set`. Pasting a token straight
-into the workflow is rejected when the workflow is defined, because a token
-written into `.kici/` would be committed to your repository.
+Store the secrets first with `kici-admin secret set`, in a scope bound to the
+named context (`kici-admin context bind`). A `prod:` reference is read through
+the bindings of the `prod` context, the same way a job's context secrets are.
+If no scope bound to a context named exactly `prod` carries the secret, the
+reference still reads the scope named `prod`, but that fallback is
+[deprecated](deprecations.md) and logs a warning. Pasting a token straight into the workflow is rejected when the workflow is
+defined, because a token written into `.kici/` would be committed to your
+repository.
 
 The named context's protection rules run before the secret is read, exactly as
 they do for [git credentials](patterns/git-credentials.md#what-a-job-may-ask-for).
@@ -193,6 +198,11 @@ A `prod:` reference from a branch the `prod` context restricts is refused, and
 the job is dispatched with no registry credentials — so a private image fails to
 pull rather than being pulled from a branch the context does not allow. The rule
 that refused it is named in your orchestrator's log, not in the run.
+
+A job that one of its own contexts held (required reviewers, a wait timer)
+gets its registry credentials when the hold is released. The approval stands for
+that context, so its rules are not run again. A reference to any other context
+is still checked against that context's rules at release.
 
 **An untrusted ref receives no registry credentials.** A fork pull request is
 dispatched without them, so a private base image fails to pull and a public one
@@ -242,9 +252,18 @@ auth: { username: 'AWS', tokenValue: fetchedAtRuntime }
 
 ## Where container jobs run
 
-A container job needs a container runtime on the host that runs it. KiCI does
-not check that for you: your orchestrator cannot see what a given agent host
-has installed.
+A container job needs a container runtime on the host that runs it. Each agent
+reports whether its host has one, as the `kici:runtime:docker` or
+`kici:runtime:podman` label.
+
+KiCI checks that label for you. A `container:` job runs only on the agent the
+auto-scaler started for it, or on an agent that reports a runtime. When no
+running agent fits, the auto-scaler starts one for the job. An agent started
+inside a job's own image runs only that job.
+
+An agent older than KiCI 0.10.0 can run container jobs through a remote
+`DOCKER_HOST` without reporting a runtime label, so its missing label proves
+nothing. KiCI does not keep container jobs off such an agent.
 
 The host also needs a copy of the KiCI runtime to mount in. Every pool your
 auto-scaler provisions gets one automatically, from the agent image the pool is
@@ -253,8 +272,7 @@ configured with. An agent you start by hand needs `KICI_RUNTIME_IMAGE` set to a
 [Agent configuration](../operator/agent/configuration.md). Without it, the job
 runs on the image's own `node`, so the image must ship one.
 
-If some of your pools have a runtime and some do not, label them and say so on
-the job:
+If some of your hosts have a runtime and some do not, say so on the job:
 
 ```typescript
 job('build', {
@@ -264,8 +282,70 @@ job('build', {
 });
 ```
 
-A job that reaches a host with no runtime fails with an error naming what is
-missing, rather than running incorrectly.
+A job that reaches a host with no runtime fails before it clones anything. The
+error names the missing runtime and the agent's labels.
+
+## Where your `.kici` dependencies install
+
+An agent that stays outside your image can install your `.kici/` dependencies
+on its own host. It installs them into the checkout before it copies the tree
+into the container. Your npm registry then needs to be reachable from the agent
+host only, not from the job's network. This is what lets a container job use a
+private registry, or one that only the agent host can resolve.
+
+A container job's host install runs no code from your repository. The agent
+installs on its host only when all of these are true:
+
+- **Install scripts are disabled on the agent**, which is the default. An agent
+  with `KICI_ALLOW_INSTALL_SCRIPTS=true` leaves the install to the container.
+- **The agent injects the KiCI runtime.** The steps then run on the KiCI runtime,
+  in a glibc image on the same CPU architecture as the host, so the modules the
+  host installs load in the container.
+- **The run has no cached dependencies.** When the orchestrator sends a cached
+  dependency tarball, the container restores it.
+- **`.kici/` is a plain npm or pnpm project** with registry dependencies only. A
+  yarn project, a workspace, a pnpm hook (a `.pnpmfile.cjs` or a `pnpmfile`
+  setting), a git, file, link or URL dependency or override, or a symlinked
+  `.kici` file leaves the install to the container. So does a registry in your
+  `registries:` block or `.kici/.npmrc`, or a lockfile URL, outside the
+  registries the operator allows, or an `.npmrc` with CRLF line endings or
+  another control character.
+- **The agent has its own npm or pnpm to run the install.**
+- **With an agent npm older than 11.15.0, `.kici/` has a lockfile that pins
+  every package to a registry tarball.** That npm cannot refuse a URL
+  dependency itself, so the agent runs `npm ci`. Commit the
+  `package-lock.json` that `npm install` writes, and keep it in step with
+  `package.json`. Each locked package needs its `resolved` URL, so do not set
+  `omit-lockfile-registry-resolved`.
+
+The agent runs its own npm or pnpm in a separate directory, not in your
+checkout. The install reads only the registry and registry-auth keys of your
+`.kici/.npmrc`, plus the registries the job's `registries:` resolved. Naming a
+registry in your workflow does not let the host install contact it. Each
+registry must be the public npm registry, one the agent's own npm configuration
+names, or one the operator lists in `KICI_HOST_INSTALL_REGISTRIES`. An install
+secret reaches the host install only when a registry-auth value in your
+`.kici/.npmrc` references it. TLS and
+proxy settings come from the agent's own configuration. The install runs with the
+agent's install environment, not your job's `env`. See
+[Agent configuration](../operator/agent/configuration.md#where-kici-dependencies-install)
+for the exact allowlist.
+
+When the install runs inside the container, the registry must be reachable from
+the job's network. A failed install on the host fails the job with the
+installer's error. The job's setup log records the host checkout and the host
+install. `kici runs logs <run-id>` prints it under a `<job> › (setup)` heading, the
+dashboard shows it as the job's Setup section, and
+`kici-admin runs logs <run-id> --job <job-id> --step=-1` prints it on its own.
+
+All of this applies to a container job's own install. The jobs that prepare
+your workflow run on the agent host. The `__build__`, `__init__`,
+`__dynamic__` and `__globaleval__` jobs install `.kici/` with your project's
+own package manager, and all of them except `__build__` also import your
+workflow module there. `__globaleval__` is the pre-run evaluation of an
+[organization-wide workflow](global-workflows.md).
+An agent runs those jobs too unless its operator set `KICI_ROLES` to leave them to dedicated agents. See
+[Agent configuration](../operator/agent/configuration.md#agent-roles).
 
 ## Limits worth knowing
 

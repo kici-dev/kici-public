@@ -170,6 +170,18 @@ export async function runCleanup(
       });
     }
 
+    // 2c'. Drop the sealed secrets of terminal dispatch_queue rows: nothing
+    // dispatches a terminal row again, so they have no reader left.
+    try {
+      const scrubbed = await queue.scrubTerminalSealedSecrets();
+      if (scrubbed > 0)
+        logger.info('Scrubbed sealed secrets of terminal dispatch_queue rows', { scrubbed });
+    } catch (err) {
+      logger.error('Failed to scrub sealed secrets of terminal dispatch_queue rows', {
+        error: toErrorMessage(err),
+      });
+    }
+
     // 2d. Prune expired step-log objects (S3 backend only; the filesystem
     // backend's lifecycle is customer-managed).
     if (extras.logStorage && extras.logStorageIsS3) {

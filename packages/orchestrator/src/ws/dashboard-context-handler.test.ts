@@ -221,6 +221,57 @@ describe('DashboardContextHandler', () => {
       expect(resp.contextId).toBe('env-new');
     });
 
+    it('forwards repo patterns on create and update, including the [] clear', async () => {
+      await handler.handleMessage({
+        type: 'dashboard.contexts.create',
+        requestId: 'req-rp-1',
+        name: 'deploy',
+        contextType: 'fixed',
+        repoPatterns: ['acme/workflows'],
+      } as DashboardPlatformToOrchMessage);
+      await handler.handleMessage({
+        type: 'dashboard.contexts.update',
+        requestId: 'req-rp-2',
+        contextId: 'env-1',
+        updates: { repoPatterns: [] },
+      } as unknown as DashboardPlatformToOrchMessage);
+
+      // fails-when: the handler drops repoPatterns, so the dashboard input saves nothing
+      expect(deps.contextStore.create).toHaveBeenCalledWith(
+        'org-1',
+        expect.objectContaining({ repoPatterns: ['acme/workflows'] }),
+      );
+      expect((deps.contextStore.update as any).mock.calls[0][2].repoPatterns).toEqual([]);
+    });
+
+    it('returns stored repo patterns on get, parsed from the JSONB column', async () => {
+      const base = await (deps.contextStore.get as any)();
+      (deps.contextStore.get as any).mockResolvedValue({
+        ...base,
+        repo_patterns: '["acme/workflows"]',
+      });
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.get',
+        requestId: 'req-rp-3',
+        contextId: 'env-1',
+      } as DashboardPlatformToOrchMessage);
+
+      const resp = deps.sent[0] as any;
+      // fails-when: the response omits the field or passes the raw JSON string through
+      expect(resp.context.repoPatterns).toEqual(['acme/workflows']);
+    });
+
+    it('returns an empty repo pattern list for a context that sets none', async () => {
+      await handler.handleMessage({
+        type: 'dashboard.contexts.get',
+        requestId: 'req-rp-4',
+        contextId: 'env-1',
+      } as DashboardPlatformToOrchMessage);
+
+      expect((deps.sent[0] as any).context.repoPatterns).toEqual([]);
+    });
+
     it('returns error when store throws', async () => {
       (deps.contextStore.list as any).mockRejectedValue(new Error('DB error'));
 

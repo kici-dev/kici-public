@@ -8,7 +8,7 @@
 
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { createLogger } from '@kici-dev/shared';
+import { createLogger, depCacheKeyOf } from '@kici-dev/shared';
 import type { RegistrationStore } from '../registration/registration-store.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { TokenManager } from '../secrets/token-manager.js';
@@ -192,7 +192,7 @@ export function createAdminRegistrationRoutes(
       const denied = enforceRoutingKeyScope(c, parsed.routingKey);
       if (denied) return denied;
 
-      let lockFile: { workflows: unknown[] };
+      let lockFile: { workflows: unknown[]; lockfileHash?: unknown; siblingsDigest?: unknown };
       try {
         lockFile = JSON.parse(parsed.lockFileContents);
       } catch (err) {
@@ -232,6 +232,7 @@ export function createAdminRegistrationRoutes(
         {
           customerId: parsed.customerId,
           commitSha: parsed.commitSha,
+          depCacheKey: depCacheKeyOf(lockFile),
         },
       );
       const registryVersion = await deps.registrationStore.bumpVersion();

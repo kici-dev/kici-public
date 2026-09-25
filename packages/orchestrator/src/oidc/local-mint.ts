@@ -69,6 +69,7 @@ export async function mintLocalIdToken(
     .select([
       'run_id',
       'repo_identifier',
+      'workflow_repo_identifier',
       'ref',
       'sha',
       'workflow_name',
@@ -99,6 +100,7 @@ export async function mintLocalIdToken(
       run_id: run.run_id,
       org_id: LOCAL_ORG_ID,
       repo_identifier: run.repo_identifier,
+      workflow_repo_identifier: run.workflow_repo_identifier,
       ref: run.ref,
       sha: run.sha,
       workflow_name: run.workflow_name,

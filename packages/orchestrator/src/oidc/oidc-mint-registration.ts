@@ -50,6 +50,8 @@ export interface OidcMintRegistrationInput {
    * first mint (leader-election-race-safe).
    */
   resolveOrchestratorSigner?: () => Promise<Signer | null>;
+  /** Whether this node is the Raft leader; named when a mint defers for want of a key. */
+  isLeader?: () => boolean;
   /** The orchestrator's own provenance issuer identity (config.provenanceSigningIssuer). */
   provenanceSigningIssuer?: string;
   dispatcher: LocalMintOwnershipResolver & {
@@ -77,6 +79,7 @@ export function selectOidcMintRegistration(
       handler: createOrchestratorOidcTokenHandler({
         dispatcher: input.dispatcher,
         resolveSigner: input.resolveOrchestratorSigner,
+        ...(input.isLeader ? { isLeader: input.isLeader } : {}),
         mint: {
           db: input.db,
           issuer: input.provenanceSigningIssuer,

@@ -25,7 +25,7 @@ import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
 import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { ContextDeleteErrorCode, MinimumTrustSchema } from '@kici-dev/engine';
+import { ContextDeleteErrorCode, ContextType, MinimumTrustSchema } from '@kici-dev/engine';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import { ContextStore, ContextDeleteBlockedError } from '../contexts/context-store.js';
 import { BindingStore } from '../contexts/binding-store.js';
@@ -51,6 +51,12 @@ type AdminEnvEnv = {
 
 // ── Zod schemas for request validation ─────────────────────────────
 
+/**
+ * `owner/repo` glob patterns a context is limited to. Same shape as
+ * `branchRestrictions`; an empty array clears the rule.
+ */
+const repoPatternsSchema = z.array(z.string());
+
 const createContextSchema = z.object({
   orgId: z.string().min(1),
   name: z.string().min(1),
@@ -58,6 +64,7 @@ const createContextSchema = z.object({
   globPattern: z.string().min(1).optional(),
   enabled: z.boolean().optional(),
   branchRestrictions: z.array(z.string()).optional(),
+  repoPatterns: repoPatternsSchema.optional(),
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
   holdExpirySeconds: z.number().int().positive().nullable().optional(),
@@ -78,6 +85,7 @@ const setPolicySchema = z.object({
   orgId: z.string().min(1),
   contextName: z.string().min(1),
   branchRestrictions: z.array(z.string()).optional(),
+  repoPatterns: repoPatternsSchema.optional(),
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
   holdExpirySeconds: z.number().int().positive().nullable().optional(),
@@ -137,10 +145,11 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       const existing = await envStore.getByName(body.orgId, body.name);
       if (existing) {
         const updated = await envStore.update(body.orgId, existing.id, {
-          type: body.type as 'fixed' | 'glob' | undefined,
+          type: body.type as ContextType | undefined,
           globPattern: body.globPattern,
           enabled: body.enabled,
           branchRestrictions: body.branchRestrictions,
+          repoPatterns: body.repoPatterns,
           requiredReviewers: body.requiredReviewers ?? undefined,
           waitTimerSeconds: body.waitTimerSeconds ?? undefined,
           holdExpirySeconds: body.holdExpirySeconds ?? undefined,
@@ -153,10 +162,11 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
 
       const created = await envStore.create(body.orgId, {
         name: body.name,
-        type: (body.type as 'fixed' | 'glob') ?? 'fixed',
+        type: (body.type as ContextType | undefined) ?? ContextType.enum.fixed,
         globPattern: body.globPattern,
         enabled: body.enabled ?? true,
         branchRestrictions: body.branchRestrictions,
+        repoPatterns: body.repoPatterns,
         requiredReviewers: body.requiredReviewers ?? undefined,
         waitTimerSeconds: body.waitTimerSeconds ?? undefined,
         holdExpirySeconds: body.holdExpirySeconds ?? undefined,
@@ -229,6 +239,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       const updates: Parameters<ContextStore['update']>[2] = {};
       if (body.branchRestrictions !== undefined)
         updates.branchRestrictions = body.branchRestrictions;
+      if (body.repoPatterns !== undefined) updates.repoPatterns = body.repoPatterns;
       if (body.requiredReviewers !== undefined) updates.requiredReviewers = body.requiredReviewers;
       if (body.waitTimerSeconds !== undefined) updates.waitTimerSeconds = body.waitTimerSeconds;
       if (body.holdExpirySeconds !== undefined) updates.holdExpirySeconds = body.holdExpirySeconds;
@@ -382,7 +393,8 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
         // helper which bypasses the CHECK. For HTTP callers, we coerce to
         // 'fixed' to avoid a 500 — the semantics are equivalent for seeding.
         const rawType = body.type ?? 'template';
-        const safeType: 'fixed' | 'glob' = rawType === 'glob' ? 'glob' : 'fixed';
+        const safeType: ContextType =
+          rawType === ContextType.enum.glob ? ContextType.enum.glob : ContextType.enum.fixed;
         const row = await envStore.create(body.orgId, {
           name: body.templateName,
           type: safeType,

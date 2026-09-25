@@ -57,6 +57,8 @@ import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderBundle } from '../provider-registry.js';
 import { ProviderRegistry } from '../provider-registry.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { resolveDispatchCloneAuth } from '../git/dispatch-git-auth.js';
+import { makeGateTracker } from './dispatch-matched-workflow.test-helpers.js';
 import { HeldRunStatus } from '../contexts/held-runs.js';
 
 // -- Mock helpers --
@@ -1369,7 +1371,7 @@ describe('processWebhook', () => {
       undefined, // triggerActorUserId (no sender in the test PR fixture)
       undefined, // triggeredByAgentLabel (webhook-triggered, not agent)
       null, // prNumber (no PR number in the test fixture)
-      undefined, // workflowRepoIdentifier (per-repository dispatch)
+      undefined, // workflowRepo (per-repository dispatch)
       // Pull-request head context. The fixture is a `pull_request` whose
       // payload carries no head or base repository, so the fork question
       // genuinely has no answer and `isFork` stays null — which every claim
@@ -1763,14 +1765,16 @@ describe('processWebhook', () => {
 
   // -- Secret resolution failure tests --
 
-  it('skips workflow dispatch when secret resolution fails', async () => {
+  it('resolves no workflow-level context secret outside the per-job context gates', async () => {
+    // fails-when: the workflow-level contexts are resolved once per run with no protection gate
     const mockSecretResolver = {
-      resolveForJob: vi.fn().mockRejectedValue(new Error('Decryption key not found')),
+      resolveForContext: vi.fn().mockResolvedValue({ PROD_TOKEN: 'sekrit' }),
     };
 
     const mockDispatcher = createMockDispatcher();
 
-    // Lock file with contexts declared to trigger secret resolution
+    // Workflow-level contexts are gated per job, which needs a context store;
+    // with none wired, no job may be handed the context's secrets.
     const lockFile = {
       schemaVersion: 1,
       source: { file: '.kici/workflows/ci.ts', export: '#default' },
@@ -1809,14 +1813,13 @@ describe('processWebhook', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Dispatcher should NOT be called (workflow skipped due to secret resolution failure)
-    expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
+    expect(mockSecretResolver.resolveForContext).not.toHaveBeenCalled();
+    expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+    expect(mockDispatcher.dispatch.mock.calls[0][0].jobConfig).not.toHaveProperty('secrets');
   });
 
-  it('records init-failure run when secret resolution rejects', async () => {
-    const mockSecretResolver = {
-      resolveForJob: vi.fn().mockRejectedValue(new Error('Decryption key not found')),
-    };
+  it('records an init-failure run when a workflow names contexts and secrets are not configured', async () => {
+    // fails-when: a workflow naming contexts dispatches with no secrets subsystem
     const mockDispatcher = createMockDispatcher();
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
@@ -1863,7 +1866,6 @@ describe('processWebhook', () => {
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
-      secretResolver: mockSecretResolver as any,
       dispatcher: mockDispatcher as any,
       executionTracker: mockTracker as any,
     });
@@ -1882,7 +1884,7 @@ describe('processWebhook', () => {
       scope: 'run',
       category: InitFailureCategory.enum.secret_resolution,
     });
-    expect(call.initFailure.message).toContain('Decryption key not found');
+    expect(call.initFailure.message).toContain('secrets subsystem is not configured');
   });
 
   it('records a lock_resolution init-failure run when the inbound lock is corrupt', async () => {
@@ -2868,11 +2870,7 @@ describe('processWebhook', () => {
     }
   });
 
-  it('does not record execution on secret resolution failure when executionTracker is not provided', async () => {
-    const mockSecretResolver = {
-      resolveForJob: vi.fn().mockRejectedValue(new Error('Not authorized')),
-    };
-
+  it('skips a workflow naming contexts with no secrets subsystem when executionTracker is not provided', async () => {
     const mockDispatcher = createMockDispatcher();
 
     const lockFile = {
@@ -2907,7 +2905,6 @@ describe('processWebhook', () => {
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
-      secretResolver: mockSecretResolver as any,
       executionTracker: undefined,
       dispatcher: mockDispatcher as any,
     });
@@ -3132,9 +3129,8 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     expect(call.routingKey).toBe('github:42');
     expect(call.deliveryId).toBe('generic:kiciStg00001:stg-generic:delivery-1:reg-1');
     expect(call.provider).toBe('github');
-    // providerContext is the registration's context (with token if issued)
-    expect(call.providerContext.installationId).toBe(7);
-    expect(call.providerContext.token).toBe('token-from-reg-bundle');
+    // providerContext is the registration's context; the clone token is minted at dispatch
+    expect(call.providerContext).toEqual({ installationId: 7 });
     // repoUrl built from the REGISTRATION's repo via the registered bundle
     expect(call.repoUrl).toBe('https://github.com/orgA/repo1.git');
     // jobConfig carries the cross-source provenance fields
@@ -3787,7 +3783,16 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
       'forgejo.example.com/kici-ci/shared-pipelines',
       reg.providerContext,
     );
-    expect(call.providerContext.token).toBe('forgejo-pat-secret');
+    // The token is not carried on the persisted credentials: the dispatch
+    // mints the clone auth the agent receives, through the same bundle.
+    expect(JSON.stringify(call)).not.toContain('forgejo-pat-secret');
+    const cloneAuth = await resolveDispatchCloneAuth({
+      providerRegistry: registry,
+      bundle: registry.getByRoutingKey(call.routingKey),
+      repoIdentifier: 'forgejo.example.com/kici-ci/shared-pipelines',
+      job: { id: 'job-1', ...call },
+    });
+    expect(cloneAuth).toMatchObject({ auth: { token: 'forgejo-pat-secret' } });
 
     // Clone URL built by the universal-git bundle (forgejo host, not GitHub).
     expect(call.repoUrl).toBe(
@@ -3806,7 +3811,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     );
   });
 
-  it('CS-14: clone token + credentials propagate from registration bundle TOKEN-FROM-REG-BUNDLE', async () => {
+  it('CS-14: clone auth comes from the registration bundle at dispatch, and is never persisted', async () => {
     const registeredBundle = createRegisteredBundle('TOKEN-FROM-REG-BUNDLE');
     const reg = makeWebhookRegistration({
       id: 'reg-cs14',
@@ -3817,13 +3822,19 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
       events: ['foo'],
     });
 
+    const gateTracker = makeGateTracker();
+    // Every tracker write (the run row's provider_context among them) is recorded.
+    const executionTracker = new Proxy(gateTracker as unknown as Record<string, unknown>, {
+      get: (target, prop: string) => (target[prop] ??= vi.fn().mockResolvedValue(undefined)),
+    });
     const deps = makeCrossSourceDeps({
       registrations: [reg],
       registeredBundle,
+      executionTracker,
     });
     await processWebhook(baseGenericInfo(), deps);
 
-    // Clone token was issued via the REGISTRATION's bundle with the
+    // The issuance check ran through the REGISTRATION's bundle with the
     // registration's providerContext.
     expect(registeredBundle.cloneTokenProvider!.createCloneToken).toHaveBeenCalledTimes(1);
     expect(registeredBundle.cloneTokenProvider!.createCloneToken).toHaveBeenCalledWith(
@@ -3839,12 +3850,30 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     )!;
     expect(genericBundle.cloneTokenProvider).toBeUndefined();
 
-    // The dispatched job's providerContext carries BOTH the registration's
-    // installationId AND the token from the registered bundle.
+    // The dispatched job carries the registration's installationId, and the
+    // token appears nowhere a store persists: not on the queued job input
+    // (dispatch_queue / pending_job_contexts), not on a run-row write.
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(1);
     const call = (deps.dispatcher.dispatch as any).mock.calls[0][0];
-    expect(call.providerContext.installationId).toBe(7); // from makeWebhookRegistration default
-    expect(call.providerContext.token).toBe('TOKEN-FROM-REG-BUNDLE');
+    expect(call.providerContext).toEqual({ installationId: 7 }); // makeWebhookRegistration default
+    // fails-when: the cross-source credentials carry the minted clone token into a persisted store
+    expect(JSON.stringify(call)).not.toContain('TOKEN-FROM-REG-BUNDLE');
+    const trackerWrites = Object.values(gateTracker as unknown as Record<string, unknown>).flatMap(
+      (fn) => (fn as ReturnType<typeof vi.fn>).mock?.calls ?? [],
+    );
+    // Positive control: the run-row write does carry the provider context.
+    expect(JSON.stringify(trackerWrites)).toContain('"installationId":7');
+    expect(JSON.stringify(trackerWrites)).not.toContain('TOKEN-FROM-REG-BUNDLE');
+
+    // breaks-if-wrong: the agent dispatch still gets working clone auth for the repository
+    const registry = deps.providerRegistry as ProviderRegistry;
+    const cloneAuth = await resolveDispatchCloneAuth({
+      providerRegistry: registry,
+      bundle: registry.getByRoutingKey(call.routingKey),
+      repoIdentifier: 'orgA/repo-creds',
+      job: { id: 'job-1', ...call },
+    });
+    expect(cloneAuth).toMatchObject({ auth: { token: 'TOKEN-FROM-REG-BUNDLE' } });
   });
 });
 
@@ -4279,7 +4308,7 @@ describe('processWebhook — context integration', () => {
       created_by: null,
     });
     const mockSecretResolver = {
-      resolveForJob: vi.fn().mockResolvedValue({ NPM_TOKEN: 'tok' }),
+      resolveForContext: vi.fn().mockResolvedValue({ NPM_TOKEN: 'tok' }),
     };
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),

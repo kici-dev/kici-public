@@ -1716,3 +1716,43 @@ describe('dashboard.admin-tokens.list', () => {
     expect(JSON.stringify(res)).not.toContain('deadbeef');
   });
 });
+
+describe('context repoPatterns', () => {
+  const baseCreate = {
+    type: 'dashboard.contexts.create' as const,
+    requestId: 'r1',
+    actor: testActor,
+    name: 'ctx',
+    contextType: 'fixed' as const,
+  };
+
+  const update = (updates: Record<string, unknown>) =>
+    contextUpdateRequestSchema.safeParse({
+      type: 'dashboard.contexts.update',
+      requestId: 'r2',
+      actor: testActor,
+      contextId: 'c1',
+      updates,
+    });
+
+  it('carries repo patterns on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, repoPatterns: ['acme/*'] });
+    // fails-when: the schema lacks the field and strips it, so the patterns never reach the store
+    expect(r.success && r.data.repoPatterns).toEqual(['acme/*']);
+  });
+
+  it('carries repo patterns on update, and an empty array (the clear)', () => {
+    const set = update({ repoPatterns: ['acme/workflows'] });
+    const cleared = update({ repoPatterns: [] });
+    expect(set.success && set.data.updates.repoPatterns).toEqual(['acme/workflows']);
+    expect(cleared.success && cleared.data.updates.repoPatterns).toEqual([]);
+  });
+
+  it('rejects repo patterns that are not an array of strings', () => {
+    // fails-when: a bare string reaches the gate, which would match it character by character
+    // breaks-if-wrong: the array forms above must still parse
+    expect(update({ repoPatterns: 'acme/*' }).success).toBe(false);
+    expect(update({ repoPatterns: [1] }).success).toBe(false);
+    expect(update({ repoPatterns: null }).success).toBe(false);
+  });
+});

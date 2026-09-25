@@ -1,35 +1,27 @@
 /**
- * An organization-wide workflow's job is dispatched with no secret material.
+ * A global job binds its own `contexts:`, checked against the workflow
+ * repository, and a sibling job that binds none receives nothing.
  *
- * The per-repository dispatch path resolves the workflow's declared `contexts`
- * and writes `secrets` / `namespacedSecrets` / `runPublicKey` into every job
- * config (`dispatch-matched-workflow.ts`, `makeBuildJobConfig`). The
- * organization-wide path builds its job configs directly and resolves nothing —
- * it records the run with `dispatchedContexts: undefined` precisely because "this
- * path binds no secret contexts".
- *
- * This test pins that: it fails the moment secret material starts reaching a
- * global job, which is when the question of which repository's secrets such a
- * job may read has to be answered before anything ships.
+ * The secrets a global job binds belong to the repository that defines the
+ * workflow, so a context's `repoPatterns` rule is checked against that
+ * repository — never against the repository the event came from, which the
+ * workflow's author does not control.
  *
  * The fixture shape mirrors `process-webhook-globals-payload.test.ts`.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { ContextGateRejectReason } from '@kici-dev/engine';
 import { processWebhook } from './process-webhook.js';
+import { makeJobContextRow } from './dispatch-matched-workflow.test-helpers.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
+const CONTEXT_NAME = 'deploy';
+const SECRET_VALUE = 'super-secret';
 
 /** Every job-config key by which secret material reaches an agent. */
-const SECRET_BEARING_KEYS = [
-  'secrets',
-  'namespacedSecrets',
-  'runWideFlatSecrets',
-  'installEnvSecrets',
-  'runPublicKey',
-  'runPublicKeyBase64',
-] as const;
+const SECRET_BEARING_KEYS = ['secrets', 'namespacedSecrets'] as const;
 
 function makeInfo(): WebhookInfo {
   return {
@@ -42,44 +34,42 @@ function makeInfo(): WebhookInfo {
   } as unknown as WebhookInfo;
 }
 
+/** A global workflow whose `publish` job binds `deploy` and whose `scan` job binds nothing. */
 function makeGlobalRegistration() {
+  const job = (name: string) => ({
+    _type: 'static',
+    name,
+    runsOn: [{ kind: 'exact', value: 'default' }],
+    needs: [],
+    steps: [{ name, hasOutputs: false }],
+  });
   return {
     id: 'reg-global-1',
     routingKey: 'github:1',
     repoIdentifier: GLOBAL_REPO,
     commitSha: 'globalsha',
+    defaultBranch: 'main',
     sourceFile: '.kici/workflows/org.ts',
     lockEntry: {
       name: 'org-guard',
       contentHash: 'ghash',
       compileSchemaVersion: 1,
-      // The workflow declares a secret context. The per-repository path would
-      // resolve it; this path does not look at it at all.
-      contexts: ['prod'],
       triggers: [
         { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
       ],
       jobs: [
-        {
-          _type: 'static',
-          name: 'scan',
-          runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
-          steps: [{ name: 'scan', hasOutputs: false }],
-        },
+        { ...job('publish'), contexts: [{ value: CONTEXT_NAME, dynamic: false }] },
+        job('scan'),
       ],
     },
   };
 }
 
-function makeDeps(): {
-  deps: Parameters<typeof processWebhook>[1];
-  dispatch: ReturnType<typeof vi.fn>;
-  resolveForJob: ReturnType<typeof vi.fn>;
-} {
-  const dispatch = vi.fn().mockResolvedValue({ status: 'queued' });
-  // A resolver that would hand out a secret if anything asked it to.
-  const resolveForJob = vi.fn().mockResolvedValue({ PROD_TOKEN: 'super-secret' });
+/** Deps whose `deploy` context admits only the repositories in `repoPatterns`. */
+function makeDeps(repoPatterns: string[]) {
+  const dispatch = vi.fn().mockResolvedValue({ status: 'queued', jobId: 'job-1' });
+  const onJobStatus = vi.fn().mockResolvedValue(undefined);
+  const resolveForContext = vi.fn().mockResolvedValue({ PROD_TOKEN: SECRET_VALUE });
 
   const bundle = {
     normalizer: {
@@ -100,9 +90,8 @@ function makeDeps(): {
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
-      postGlobalWorkflowsSkippedCheck: vi.fn().mockResolvedValue(undefined),
     },
-    repoUrlBuilder: { buildCloneUrl: () => 'https://example.invalid/repo.git' },
+    repoUrlBuilder: { buildCloneUrl: (repo: string) => `https://example.invalid/${repo}.git` },
   };
 
   const deps = {
@@ -115,12 +104,23 @@ function makeDeps(): {
       getByRepo: () => [],
       getByOrgAndEvent: () => [],
     },
-    // Both are wired so a resolution attempt would be observable rather than
-    // failing on an absent dependency.
+    contextStore: {
+      matchContext: async (_org: string, name: string) =>
+        name === CONTEXT_NAME
+          ? makeJobContextRow(name, {} as never, { repo_patterns: repoPatterns })
+          : null,
+    },
     secretResolver: {
-      resolveForJob,
-      resolveNamedInternal: vi.fn(),
-      resolveForJobWithMeta: vi.fn(),
+      resolveForContext,
+      resolveNamedInternal: vi.fn(async () => null),
+      resolveForContextWithMeta: resolveForContext,
+    },
+    executionTracker: {
+      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      onJobStatus,
+      holdRunForPendingJobs: vi.fn().mockReturnValue(true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
     },
     globalWorkflowPolicy: {
       isWorkflowRepoAllowed: vi.fn(async () => ({ allowed: true })),
@@ -130,29 +130,54 @@ function makeDeps(): {
     lockFileCache: { get: vi.fn(async () => null) },
   } as unknown as Parameters<typeof processWebhook>[1];
 
-  return { deps, dispatch, resolveForJob };
+  /** The dispatched job config of `name`, or undefined when it was not dispatched. */
+  const jobConfigOf = (name: string) =>
+    dispatch.mock.calls.map((c) => c[0]).find((input) => input.jobName === name)?.jobConfig as
+      Record<string, unknown> | undefined;
+  return { deps, dispatch, onJobStatus, jobConfigOf };
 }
 
-describe('an organization-wide workflow job carries no secret material', () => {
-  it('writes no secret-bearing key into the dispatched job config', async () => {
-    const { deps, dispatch } = makeDeps();
+describe('an organization-wide workflow job binds its own contexts', () => {
+  it('a job binding a context the workflow repository may use receives its secrets', async () => {
+    // fails-when: a global job's contexts are ignored, so the job runs with no secrets
+    const { deps, jobConfigOf } = makeDeps([GLOBAL_REPO]);
 
     await processWebhook(makeInfo(), deps);
 
-    expect(dispatch).toHaveBeenCalled();
-    const jobConfig = dispatch.mock.calls[0][0].jobConfig as Record<string, unknown>;
-    expect(jobConfig.isGlobalWorkflow).toBe(true);
+    const publish = jobConfigOf('publish');
+    expect(publish?.isGlobalWorkflow).toBe(true);
+    expect(publish?.secrets).toMatchObject({ PROD_TOKEN: SECRET_VALUE });
+  });
+
+  it('a sibling job that binds no context receives no secret material', async () => {
+    // fails-when: a context bound by one job leaks into a sibling that bound none
+    const { deps, jobConfigOf } = makeDeps([GLOBAL_REPO]);
+
+    await processWebhook(makeInfo(), deps);
+
+    const scan = jobConfigOf('scan');
+    // Positive control: the sibling really was dispatched, from the same run.
+    expect(scan).toBeDefined();
     for (const key of SECRET_BEARING_KEYS) {
-      expect(jobConfig).not.toHaveProperty(key);
+      expect(scan).not.toHaveProperty(key);
     }
   });
 
-  it('never asks the secret resolver for the workflow declared contexts', async () => {
-    const { deps, dispatch, resolveForJob } = makeDeps();
+  it('a context whose repoPatterns name only the source repository refuses the job', async () => {
+    // fails-when: the context's repository rule is checked against the source repo
+    // breaks-if-wrong: the same context naming the workflow repo must bind (case above)
+    const { deps, jobConfigOf, onJobStatus } = makeDeps([SOURCE_REPO]);
 
     await processWebhook(makeInfo(), deps);
 
-    expect(dispatch).toHaveBeenCalled();
-    expect(resolveForJob).not.toHaveBeenCalled();
+    expect(jobConfigOf('publish')).toBeUndefined();
+    // The sibling that binds nothing still runs.
+    expect(jobConfigOf('scan')).toBeDefined();
+    const rejection = onJobStatus.mock.calls.find((call) =>
+      String(call[1]).startsWith('rejected-'),
+    );
+    const message = (rejection?.[5] as { initFailure?: { message: string } } | undefined)
+      ?.initFailure?.message;
+    expect(message).toContain(ContextGateRejectReason.enum.repo_unmatched);
   });
 });

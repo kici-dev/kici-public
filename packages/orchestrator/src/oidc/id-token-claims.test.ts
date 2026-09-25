@@ -13,6 +13,7 @@ const BASE: RunClaimSource = {
   run_id: 'run-1',
   org_id: 'org-1',
   repo_identifier: 'acme/app',
+  workflow_repo_identifier: null,
   ref: 'main',
   sha: 'deadbeef',
   workflow_name: 'deploy',
@@ -159,6 +160,28 @@ describe('buildIdTokenClaims — subject', () => {
         legacyPullRequestSubject: true,
       }).sub,
     ).toBe('repo:acme/app:pull_request');
+  });
+});
+
+describe('buildIdTokenClaims — workflow repository', () => {
+  it('names the workflow repository; equals repository for a same-repo run', () => {
+    // fails-when: workflow_repository is derived from repo_identifier for a
+    // run whose workflow lives in another repository.
+    const global = buildIdTokenClaims(
+      { ...push, repo_identifier: 'org/app', workflow_repo_identifier: 'org/ci' },
+      JOB,
+      OPTS,
+    );
+    expect(global.workflow_repository).toBe('org/ci');
+    expect(global.repository).toBe('org/app');
+    // breaks-if-wrong: a same-repo run must carry workflow_repository === repository.
+    const sameRepo = buildIdTokenClaims(
+      { ...push, repo_identifier: 'org/app', workflow_repo_identifier: null },
+      JOB,
+      OPTS,
+    );
+    expect(sameRepo.workflow_repository).toBe('org/app');
+    expect(sameRepo.workflow_repository).toBe(sameRepo.repository);
   });
 });
 

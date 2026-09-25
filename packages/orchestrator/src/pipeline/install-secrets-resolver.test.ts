@@ -65,7 +65,9 @@ function makeContextStore(envs: Map<string, DbContext>): ContextStore {
 
 function makeSecretResolver(perEnv: Map<string, Record<string, string>>): SecretResolver {
   return {
-    resolveForJob: vi.fn(async (_orgId: string, envName: string) => perEnv.get(envName) ?? {}),
+    resolveForContext: vi.fn(
+      async (_orgId: string, context: { name: string }) => perEnv.get(context.name) ?? {},
+    ),
   } as unknown as SecretResolver;
 }
 
@@ -184,6 +186,52 @@ describe('resolveInstallSecrets', () => {
     });
     expect(r.decision).toBe('reject');
     if (r.decision === 'reject') expect(r.reason).toMatch(/qualified <context>:<secret-name>/);
+  });
+
+  it('resolves a registry token through a glob-matched context row', async () => {
+    // 'deploy-prod' matches the glob context 'deploy-*' (row env-glob); no
+    // context row is named 'deploy-prod', so a lookup by name finds nothing.
+    const globRow = makeEnvRow({ id: 'env-glob', name: 'deploy-*', type: 'glob' });
+    const resolveForContext = vi.fn(async (_orgId: string, context: { id: string }) =>
+      context.id === 'env-glob' ? { NPM_TOKEN: 'glob-token' } : {},
+    );
+    const r = await resolveInstallSecrets({
+      registries: [{ url: 'https://npm.example.com/', tokenSecret: 'deploy-prod:NPM_TOKEN' }],
+      installEnv: undefined,
+      allowHttpNpmRegistries: false,
+      resolvedOrgId: 'org-1',
+      trustResolution: trusted,
+      contextStore: makeContextStore(new Map([['deploy-prod', globRow]])),
+      secretResolver: { resolveForContext } as unknown as SecretResolver,
+      protectionContext: baseProtectionContext,
+    });
+    // fails-when: the token is resolved by the declared name instead of the matched row
+    expect(r.decision).toBe('pass');
+    if (r.decision === 'pass') expect(r.npmRegistries?.[0]?.token).toBe('glob-token');
+    expect(resolveForContext).toHaveBeenCalledWith('org-1', {
+      id: 'env-glob',
+      name: 'deploy-prod',
+    });
+  });
+
+  it('resolves through the glob-matched row on the resume path too (skipProtectionGate)', async () => {
+    const globRow = makeEnvRow({ id: 'env-glob', name: 'deploy-*', type: 'glob' });
+    const resolveForContext = vi.fn(async (_orgId: string, context: { id: string }) =>
+      context.id === 'env-glob' ? { CARGO_TOKEN: 'c' } : {},
+    );
+    const r = await resolveInstallSecrets({
+      registries: undefined,
+      installEnv: ['deploy-prod:CARGO_TOKEN'],
+      allowHttpNpmRegistries: false,
+      resolvedOrgId: 'org-1',
+      trustResolution: trusted,
+      contextStore: makeContextStore(new Map([['deploy-prod', globRow]])),
+      secretResolver: { resolveForContext } as unknown as SecretResolver,
+      protectionContext: baseProtectionContext,
+      skipProtectionGate: true,
+    });
+    expect(r.decision).toBe('pass');
+    if (r.decision === 'pass') expect(r.installEnvSecrets).toEqual({ CARGO_TOKEN: 'c' });
   });
 
   it('rejects on missing context', async () => {
@@ -306,7 +354,7 @@ describe('resolveInstallSecrets', () => {
     }
   });
 
-  it('skipProtectionGate bypasses the gate and resolves secrets to pass', async () => {
+  it('a released hold skips the gate for the context its approval covered', async () => {
     const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', required_reviewers: JSON.stringify(['alice']) })],
     ]);
@@ -320,6 +368,7 @@ describe('resolveInstallSecrets', () => {
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 'secret-value' }]])),
       protectionContext: baseProtectionContext,
       skipProtectionGate: true,
+      releasedHold: { held: [{ name: 'prod', id: 'env-prod' }], admitted: [] },
     });
     expect(r.decision).toBe('pass');
     if (r.decision === 'pass') {
@@ -406,6 +455,185 @@ describe('resolveInstallSecrets', () => {
   it('exercises ProtectionGateResult shape', () => {
     const dummy: ProtectionGateResult = { action: 'pass' };
     expect(dummy.action).toBe('pass');
+  });
+});
+
+describe('resolveInstallSecrets — every install context is gated', () => {
+  // Two contexts named by one workflow: `a` from the registry token, `b` from
+  // installEnv. Their rows carry real rule columns, so the real protection
+  // pipeline decides each verdict.
+  const A_REVIEWED = makeEnvRow({
+    id: 'env-a',
+    name: 'a',
+    required_reviewers: JSON.stringify(['alice']),
+  });
+  const B_OPEN = makeEnvRow({ id: 'env-b', name: 'b' });
+  // The dispatch presents branch `main`; this restriction does not admit it.
+  const B_BRANCH_RESTRICTED = makeEnvRow({
+    id: 'env-b',
+    name: 'b',
+    branch_restrictions: JSON.stringify(['release/*']),
+  });
+  const B_REVIEWED = makeEnvRow({
+    id: 'env-b',
+    name: 'b',
+    required_reviewers: JSON.stringify(['bob']),
+  });
+  const SECRETS = new Map<string, Record<string, string>>([
+    ['a', { NPM_TOKEN: 'a-token' }],
+    ['b', { CARGO_TOKEN: 'b-token' }],
+  ]);
+
+  function resolveWith(
+    rows: DbContext[],
+    extra: Partial<Parameters<typeof resolveInstallSecrets>[0]> = {},
+  ) {
+    const secretResolver = makeSecretResolver(SECRETS);
+    const result = resolveInstallSecrets({
+      registries: [{ url: 'https://npm.example.com/', tokenSecret: 'a:NPM_TOKEN' }],
+      installEnv: ['b:CARGO_TOKEN'],
+      allowHttpNpmRegistries: false,
+      resolvedOrgId: 'org-1',
+      trustResolution: trusted,
+      contextStore: makeContextStore(new Map(rows.map((r) => [r.name, r]))),
+      secretResolver,
+      protectionContext: baseProtectionContext,
+      ...extra,
+    });
+    return { result, resolveForContext: secretResolver.resolveForContext };
+  }
+
+  it('rejects when one context holds and a later one rejects, delivering nothing', async () => {
+    const { result, resolveForContext } = resolveWith([A_REVIEWED, B_BRANCH_RESTRICTED]);
+    const r = await result;
+    // fails-when: the gate stops at the first context that holds and never evaluates `b`
+    expect(r.decision).toBe('reject');
+    if (r.decision === 'reject') expect(r.reason).toMatch(/context 'b' install gate reject/);
+    expect(resolveForContext).not.toHaveBeenCalled();
+  });
+
+  it('holds when one context holds and the other passes, recording both', async () => {
+    const r = await resolveWith([A_REVIEWED, B_OPEN]).result;
+    expect(r.decision).toBe('hold');
+    if (r.decision !== 'hold') return;
+    expect(r.envName).toBe('a');
+    expect(r.contextId).toBe('env-a');
+    expect(r.requirement.clauses).toEqual([{ user: 'alice' }]);
+    // fails-when: the hold does not say which contexts its approval covers
+    expect(r.record).toEqual({
+      held: [{ name: 'a', id: 'env-a' }],
+      admitted: [{ name: 'b', id: 'env-b' }],
+    });
+  });
+
+  it('delivers both contexts once the hold is released', async () => {
+    const held = await resolveWith([A_REVIEWED, B_OPEN]).result;
+    if (held.decision !== 'hold') throw new Error('expected a hold');
+    const r = await resolveWith([A_REVIEWED, B_OPEN], {
+      skipProtectionGate: true,
+      releasedHold: held.record,
+    }).result;
+    // breaks-if-wrong: the approved context must not be held again by its stateless reviewer rule
+    expect(r.decision).toBe('pass');
+    if (r.decision !== 'pass') return;
+    expect(r.npmRegistries?.[0]?.token).toBe('a-token');
+    expect(r.installEnvSecrets).toEqual({ CARGO_TOKEN: 'b-token' });
+  });
+
+  it('fails closed on release when an admitted context now rejects', async () => {
+    const held = await resolveWith([A_REVIEWED, B_OPEN]).result;
+    if (held.decision !== 'hold') throw new Error('expected a hold');
+    const { result, resolveForContext } = resolveWith([A_REVIEWED, B_BRANCH_RESTRICTED], {
+      skipProtectionGate: true,
+      releasedHold: held.record,
+    });
+    const r = await result;
+    // fails-when: the release skips the gate for `b`, which the approval never covered
+    expect(r.decision).toBe('reject');
+    if (r.decision === 'reject') expect(r.reason).toMatch(/context 'b' install gate reject/);
+    expect(resolveForContext).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on release when an admitted context now holds', async () => {
+    const held = await resolveWith([A_REVIEWED, B_OPEN]).result;
+    if (held.decision !== 'hold') throw new Error('expected a hold');
+    const { result, resolveForContext } = resolveWith([A_REVIEWED, B_REVIEWED], {
+      skipProtectionGate: true,
+      releasedHold: held.record,
+    });
+    const r = await result;
+    // fails-when: `b`'s new reviewer requirement is satisfied by `a`'s approval
+    expect(r.decision).toBe('reject');
+    if (r.decision === 'reject') {
+      expect(r.reason).toMatch(/context 'b' install gate hold/);
+      expect(r.reason).toMatch(/did not cover/);
+    }
+    expect(resolveForContext).not.toHaveBeenCalled();
+  });
+
+  it('holds once for two held contexts, requiring every reviewer', async () => {
+    const r = await resolveWith([A_REVIEWED, B_REVIEWED]).result;
+    expect(r.decision).toBe('hold');
+    if (r.decision !== 'hold') return;
+    // The clause list is an AND list: bob must approve for `b` as well.
+    // fails-when: the hold carries only the first context's reviewers
+    expect(r.requirement.clauses).toEqual([{ user: 'alice' }, { user: 'bob' }]);
+    expect(r.record.held).toEqual([
+      { name: 'a', id: 'env-a' },
+      { name: 'b', id: 'env-b' },
+    ]);
+    const released = await resolveWith([A_REVIEWED, B_REVIEWED], {
+      skipProtectionGate: true,
+      releasedHold: r.record,
+    }).result;
+    expect(released.decision).toBe('pass');
+  });
+
+  it('refuses a release when a held context now matches a different row', async () => {
+    const held = await resolveWith([A_REVIEWED, B_OPEN]).result;
+    if (held.decision !== 'hold') throw new Error('expected a hold');
+    // `a` was deleted and recreated while held: same name, new row, no reviewers.
+    const replaced = makeEnvRow({ id: 'env-a-new', name: 'a' });
+    const { result, resolveForContext } = resolveWith([replaced, B_OPEN], {
+      skipProtectionGate: true,
+      releasedHold: held.record,
+    });
+    const r = await result;
+    // fails-when: the release resolves whichever row matches now instead of the approved one
+    expect(r.decision).toBe('reject');
+    if (r.decision === 'reject') expect(r.reason).toMatch(/context 'a' was removed or replaced/);
+    expect(resolveForContext).not.toHaveBeenCalled();
+  });
+
+  it('refuses a release when an admitted context now matches a different row', async () => {
+    const held = await resolveWith([A_REVIEWED, B_OPEN]).result;
+    if (held.decision !== 'hold') throw new Error('expected a hold');
+    const replaced = makeEnvRow({ id: 'env-b-new', name: 'b' });
+    const r = await resolveWith([A_REVIEWED, replaced], {
+      skipProtectionGate: true,
+      releasedHold: held.record,
+    }).result;
+    expect(r.decision).toBe('reject');
+    if (r.decision === 'reject') expect(r.reason).toMatch(/context 'b' was removed or replaced/);
+  });
+
+  it('gates every context again when the released hold recorded nothing', async () => {
+    const { result, resolveForContext } = resolveWith([A_REVIEWED, B_OPEN], {
+      skipProtectionGate: true,
+    });
+    const r = await result;
+    // fails-when: a release with no record of what its approval covered skips the gate for all
+    expect(r.decision).toBe('reject');
+    if (r.decision === 'reject') expect(r.reason).toMatch(/context 'a' install gate hold/);
+    expect(resolveForContext).not.toHaveBeenCalled();
+  });
+
+  it('treats a malformed stored record as recording nothing', async () => {
+    const r = await resolveWith([A_REVIEWED, B_OPEN], {
+      skipProtectionGate: true,
+      releasedHold: { held: 'a' } as never,
+    }).result;
+    expect(r.decision).toBe('reject');
   });
 });
 

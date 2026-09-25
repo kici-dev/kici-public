@@ -326,12 +326,54 @@ export function runtimeLabel(name: string): string {
  *   build a job's image from a Dockerfile. Distinct from the two above: a host
  *   reachable only through a mounted socket can RUN containers but not BUILD
  *   one, because the build shells out to the CLI.
+ * - `job-image` — the agent runs inside one job's own container image, started
+ *   for that job. Any other job would run in an image it never declared, so the
+ *   orchestrator gives such an agent no other work. The fact only ever
+ *   restricts the agent reporting it, so taking it on the agent's word grants
+ *   nothing.
  */
-export const RuntimeFact = z.enum(['docker', 'podman', 'container-build']);
+export const RuntimeFact = z.enum(['docker', 'podman', 'container-build', 'job-image']);
 export type RuntimeFact = z.infer<typeof RuntimeFact>;
 
 /** The label a job's `runsOn` names to require a host that can build an image. */
 export const CONTAINER_BUILD_RUNTIME_LABEL = runtimeLabel(RuntimeFact.enum['container-build']);
+
+/** The label an agent running inside a job's own image registers with. */
+export const JOB_IMAGE_RUNTIME_LABEL = runtimeLabel(RuntimeFact.enum['job-image']);
+
+/**
+ * Agent-feature label prefix — `kici:agent-feature:<name>` states a behaviour
+ * the agent BUILD implements. Like `kici:runtime:`, it is a fact, not a
+ * privilege: it lets the orchestrator route work that depends on the behaviour
+ * to an agent that has it, and asserting it grants nothing.
+ */
+export const AGENT_FEATURE_LABEL_PREFIX = 'kici:agent-feature:';
+
+/**
+ * Behaviours an agent build reports at registration.
+ *
+ * - `global-eval-skips-result-aware` — the pre-run global eval round runs only
+ *   the needs-free generators and skips every generator declared with `needs`.
+ */
+export const AgentFeature = z.enum(['global-eval-skips-result-aware']);
+export type AgentFeature = z.infer<typeof AgentFeature>;
+
+/** Build a `kici:agent-feature:<name>` label. */
+export function agentFeatureLabel(feature: AgentFeature): string {
+  return `${AGENT_FEATURE_LABEL_PREFIX}${feature}`;
+}
+
+/** The label a global eval round carries when it must skip result-aware generators. */
+export const GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL = agentFeatureLabel(
+  AgentFeature.enum['global-eval-skips-result-aware'],
+);
+
+/**
+ * Every agent-feature label this build implements: what the agent self-reports
+ * at registration, and what a scaler adds to the label sets of the agents it
+ * spawns so it matches the same jobs.
+ */
+export const AGENT_FEATURE_LABELS: readonly string[] = AgentFeature.options.map(agentFeatureLabel);
 
 /**
  * The `kici:init` lifecycle label carried by a temporary init-runner agent
@@ -448,6 +490,9 @@ export const SELF_REPORTED_LABEL_PREFIXES = [
   // that is the agent's own discovery, which is exactly why gating on an
   // orchestrator-side probe stranded container jobs before.
   RUNTIME_LABEL_PREFIX,
+  // Behaviour facts about the agent build (`kici:agent-feature:`), not a
+  // privilege: asserting one only routes to the agent work it claims to handle.
+  AGENT_FEATURE_LABEL_PREFIX,
 ] as const;
 
 /**

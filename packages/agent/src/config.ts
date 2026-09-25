@@ -8,6 +8,7 @@ import {
   validateNoReservedLabels,
 } from '@kici-dev/engine';
 import { ContainerBuildCli } from './execution/image-build/build-engine.js';
+import { parseHostInstallRegistries } from './execution/host-install-origins.js';
 
 /** Execution mode for the agent's sandbox backend. Mirrors the runtime enum. */
 export const ExecutionMode = z.enum(['container', 'bare-metal', 'firecracker']);
@@ -171,6 +172,30 @@ const configSchema = z.object({
     .string()
     .default('false')
     .transform((s) => s === 'true'),
+  // Registry origins a container job's `.kici/` install on the agent host may
+  // contact, beyond the public npm registry and the agent user's own
+  // `~/.npmrc` registries: comma-separated origins such as
+  // `http://verdaccio.local:4873`, matched exactly after URL normalization.
+  // The host install runs outside the job network's egress filter, so a
+  // registry a workflow or repository names qualifies only when its origin is
+  // listed here. Read only here, never from a dispatch payload or a workflow.
+  // An entry that is not an http(s) origin refuses startup.
+  hostInstallRegistries: z
+    .string()
+    .default('')
+    .transform((raw, ctx) => {
+      const { origins, invalid } = parseHostInstallRegistries(raw);
+      // `invalid` entries carry no credentials, and neither does the issue: the
+      // raw setting may hold a password in another entry.
+      for (const { entry, reason } of invalid) {
+        ctx.addIssue({
+          code: 'custom',
+          input: entry,
+          message: `KICI_HOST_INSTALL_REGISTRIES entry ${JSON.stringify(entry)} ${reason}`,
+        });
+      }
+      return invalid.length > 0 ? z.NEVER : origins;
+    }),
   // cgroup caps for the job container. Defaults mirror the operator-visible
   // constants in container-hardening.ts (512 pids / 2 GiB / 2 CPUs). Raise
   // these for heavy builds; they bound fork-bomb / memory / CPU DoS on the host.
@@ -323,6 +348,7 @@ export const envDef = defineEnv({
     runnerDebugStdio: 'KICI_RUNNER_DEBUG_STDIO',
     sandboxNetworkIsolation: 'KICI_SANDBOX_NETWORK_ISOLATION',
     allowInstallScripts: 'KICI_ALLOW_INSTALL_SCRIPTS',
+    hostInstallRegistries: 'KICI_HOST_INSTALL_REGISTRIES',
     sandboxPidsLimit: 'KICI_SANDBOX_PIDS_LIMIT',
     sandboxMemoryBytes: 'KICI_SANDBOX_MEMORY_BYTES',
     sandboxNanoCpus: 'KICI_SANDBOX_NANO_CPUS',
@@ -379,6 +405,7 @@ export const envDef = defineEnv({
  * - KICI_SCALER_PENDING_DISPATCH_TIMEOUT (ms, default 60000) — extended idle window when register.ack signals a queued bound job
  * - KICI_RUNNER_USER (optional, uid | uid:gid | name) — run the bare-metal runner child as a dedicated user instead of the agent's own
  * - KICI_ALLOW_INSTALL_SCRIPTS (default: false) — re-enable package lifecycle scripts during the `.kici/` dependency install
+ * - KICI_HOST_INSTALL_REGISTRIES (optional, comma-separated http(s) origins) — registry origins a container job's `.kici/` install on the agent host may contact, beyond the public npm registry and the agent user's `~/.npmrc`
  * - KICI_SANDBOX_NETWORK_ISOLATION (default: true) — RFC1918 + cloud-metadata egress filtering for nested job containers
  * - KICI_RUNNER_DEBUG_STDIO (default: false) — echo the runner child's raw stdio onto the agent's stderr
  * - KICI_EXECUTION_MODE (optional, options: container | bare-metal | firecracker) — override the runner's mode-pick logic

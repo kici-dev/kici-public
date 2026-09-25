@@ -105,7 +105,9 @@ GET /api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs?cursor=&limit=
 Returns a page of a step's log lines, **every line enveloped untrusted** (log output is
 user/process-controlled). Pagination is line-based: `cursor` is a line offset, `limit`
 defaults to 500 and is capped at 2000. `nextCursor` is the offset to fetch the next page,
-or `null` when the last line has been returned.
+or `null` when the last line has been returned. `recorded` tells an empty page apart: `false`
+when the step never wrote a log, `true` when a log is stored, even one with no lines. Step
+`-1` is the job's setup log: the clone, the dependency install and the workflow module load.
 
 ```json
 {
@@ -114,7 +116,8 @@ or `null` when the last line has been returned.
   "stepIndex": 0,
   "totalLines": 1200,
   "lines": [{ "untrusted": true, "value": "Running tests..." }],
-  "nextCursor": "500"
+  "nextCursor": "500",
+  "recorded": true
 }
 ```
 

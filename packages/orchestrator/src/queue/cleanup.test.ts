@@ -5,6 +5,7 @@ import type { JobQueue, ExpiredJobInfo } from './job-queue.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
+import { JobContainerNeed } from '../scaler/agent-fit.js';
 
 /**
  * An `ExpiredJobInfo` as `markExpired()` returns it. Defaults to a job whose
@@ -563,7 +564,10 @@ describe('runCleanup', () => {
       canRouteLabels,
     });
 
-    expect(canRouteLabels).toHaveBeenCalledWith(['linux'], [], [], []);
+    expect(canRouteLabels).toHaveBeenCalledWith(['linux'], [], [], [], {
+      jobId: 'q-1',
+      container: JobContainerNeed.None,
+    });
     expect(extras.executionTracker.forwardJobTerminalStatus).toHaveBeenCalledWith(
       'run-1',
       'j-1',

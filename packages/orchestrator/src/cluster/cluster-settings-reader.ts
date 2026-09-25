@@ -36,6 +36,7 @@ export type ClusterNumberColumn =
   | 'concurrency_wait_timeout_ms'
   | 'agent_token_ttl_ms'
   | 'ownership_db_check_timeout_ms'
+  | 'sealed_secrets_retry_backoff_ms'
   | 'unroutable_grace_ms'
   | 'ingest_overflow_claim_timeout_ms'
   | 'scaler_reap_interval_ms'

@@ -1,11 +1,19 @@
 import type { LockWorkflow } from '@kici-dev/engine';
 
+import type { DepCacheKey } from '@kici-dev/shared';
+
 import type { RegistrationStore, RegistrationRow } from './registration-store.js';
 
 /**
  * A registered workflow entry with typed fields for fast in-memory lookup.
+ *
+ * Its `lockfileHash` / `siblingsDigest` are the dependency-cache key of the
+ * lock file that registered it, so a run dispatched from the registration uses
+ * the dependency cache the way a run dispatched from a fetched lock file does.
+ * Both are null unless the key was written for the registration's current
+ * commit, so a run never restores an older lock file's dependencies.
  */
-export interface RegisteredWorkflow {
+export interface RegisteredWorkflow extends DepCacheKey {
   id: string;
   repoIdentifier: string;
   workflowName: string;
@@ -276,6 +284,14 @@ export class RegistrationIndex {
   }
 
   /**
+   * {@link getByOrgAndRepo} with disabled entries included, for a caller that
+   * must tell a disabled workflow from one that is no longer registered.
+   */
+  getAllByOrgAndRepo(customerId: string, repoIdentifier: string): RegisteredWorkflow[] {
+    return [...(this.byOrgAndRepo.get(`${customerId}|${repoIdentifier}`) ?? [])];
+  }
+
+  /**
    * Get global workflows matching a trigger type within a routing key.
    * Used by the webhook processor for dual-query (per-repo + global).
    */
@@ -356,5 +372,7 @@ function rowToRegistered(row: RegistrationRow): RegisteredWorkflow {
     commitSha: row.commitSha,
     defaultBranch: row.defaultBranch,
     sourceFile: row.sourceFile,
+    lockfileHash: row.lockfileHash,
+    siblingsDigest: row.siblingsDigest,
   };
 }

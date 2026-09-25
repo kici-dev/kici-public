@@ -170,6 +170,12 @@ const KNOBS: KnobSpec[] = [
     label: 'Ownership DB check timeout (ms)',
   },
   {
+    field: 'sealedSecretsRetryBackoffMs',
+    flag: 'sealed-secrets-retry-backoff-ms',
+    min: 1000,
+    label: 'Sealed-secrets retry back-off (ms)',
+  },
+  {
     field: 'unroutableGraceMs',
     flag: 'unroutable-grace-ms',
     min: 0,

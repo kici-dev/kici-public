@@ -10,7 +10,12 @@ import {
   orchAgentCapabilitiesSchema,
   ORCH_AGENT_CAPABILITIES,
   hasOrchAgentCapability,
+  agentCapabilitiesSchema,
+  AGENT_CAPABILITIES,
+  AgentCapabilityFlag,
+  hasAgentCapability,
 } from './capabilities.js';
+import { agentRegisterSchema } from './orchestrator-agent.js';
 
 describe('OrchRole', () => {
   it('has coordinator and worker values', () => {
@@ -189,5 +194,38 @@ describe('orchAgentCapabilitiesSchema', () => {
       false,
     );
     expect(hasOrchAgentCapability({ artifactCompleteAck: true }, 'artifactCompleteAck')).toBe(true);
+  });
+});
+
+describe('agentCapabilitiesSchema', () => {
+  const flag = AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators;
+
+  it('defaults advertise globalEvalSkipsResultAwareGenerators', () => {
+    // fails-when: the agent build stops advertising that its round skips result-aware generators
+    expect(hasAgentCapability(AGENT_CAPABILITIES, flag)).toBe(true);
+    expect(agentCapabilitiesSchema.parse(AGENT_CAPABILITIES)).toEqual(AGENT_CAPABILITIES);
+  });
+
+  it('preserves unknown flags (passthrough)', () => {
+    const parsed = agentCapabilitiesSchema.parse({ [flag]: true, futureFlag: true });
+    expect((parsed as Record<string, unknown>).futureFlag).toBe(true);
+  });
+
+  it('hasAgentCapability is false for null / undefined / missing / false', () => {
+    // fails-when: a pre-capability agent (no capabilities) reads as supporting the flag
+    expect(hasAgentCapability(undefined, flag)).toBe(false);
+    expect(hasAgentCapability(null, flag)).toBe(false);
+    expect(hasAgentCapability({}, flag)).toBe(false);
+    expect(hasAgentCapability({ [flag]: false }, flag)).toBe(false);
+    expect(hasAgentCapability({ [flag]: true }, flag)).toBe(true);
+  });
+
+  it('agent.register carries capabilities and still parses without them', () => {
+    const base = { type: 'agent.register', messageId: 'm', agentId: 'a', labels: [] };
+    // breaks-if-wrong: a pre-capability agent's register (no field) must still parse
+    expect(agentRegisterSchema.parse(base).capabilities).toBeUndefined();
+    expect(
+      agentRegisterSchema.parse({ ...base, capabilities: AGENT_CAPABILITIES }).capabilities,
+    ).toEqual(AGENT_CAPABILITIES);
   });
 });

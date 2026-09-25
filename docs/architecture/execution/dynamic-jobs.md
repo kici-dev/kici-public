@@ -339,6 +339,10 @@ If a `dynamicJob()` returns `[]` (zero generated jobs), static downstreams that 
 
 When an executing agent re-evaluates a DynamicJobFn and produces fewer jobs than the original eval, the dropped jobs transition to `drift_dropped` (a terminal failure state). Any downstream jobs that depend on the dropped job (directly or via group membership) are skipped with a drift error. The run fails.
 
+### A generated job the orchestrator cannot resolve
+
+The orchestrator resolves each generated job on its own before dispatch: it runs the job's contexts through their gates and builds its job config. When either step throws, only that job is dropped. The orchestrator records it on the run as a failed job with a job-scoped init failure: `secret_resolution` when its context gate failed, `dynamic_eval` when its job config could not be built. Its siblings still dispatch. A job that `needs` the failed job is skipped, and the run fails.
+
 ## Result-aware generation
 
 An event-only DynamicJobFn is evaluated during webhook processing, before any job in the run executes, so its only deterministic input is `ctx.event`. A **result-aware** generator instead declares `needs` on upstream jobs/groups, is deferred until those upstreams complete, and receives their frozen runtime outputs as `ctx.needs` — letting it fan out follow-up jobs from what an earlier job actually produced (e.g. job A discovers a list of targets at runtime → generate one `report-<target>` job per target).

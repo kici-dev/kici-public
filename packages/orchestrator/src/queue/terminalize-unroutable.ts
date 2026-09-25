@@ -6,13 +6,27 @@ import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
 import { reportJobCheckRunCompletion } from '../reporting/job-check-run-completion.js';
 import type { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
+import type { AgentRegistry } from '../agent/registry.js';
+import {
+  canAgentRunJob,
+  CONTAINER_RUNTIME_LABELS,
+  fitAgentFor,
+  JobContainerNeed,
+  type AgentFitJob,
+  type ScalerAgentView,
+} from '../scaler/agent-fit.js';
 import type { ExpiredJobInfo } from './job-queue.js';
 
 const logger = createLogger({ prefix: 'terminalize-unroutable' });
 
 /**
  * Whether ANYTHING could ever run a job with these selectors — a registered
- * agent (regardless of capacity) or a scaler backend able to spawn one.
+ * agent (regardless of capacity) that can run it, or a scaler backend able to
+ * spawn one.
+ *
+ * `job`, when given, is what the agent must be able to do beyond its labels:
+ * above all start the job's container (`canAgentRunJob`). Absent, any
+ * label-matching agent counts.
  *
  * The predicate is allowed to answer "routable" conservatively: the scaler half
  * matches exact labels only, so a pattern-only `runsOn` reads routable on a
@@ -25,13 +39,40 @@ export type CanRouteLabels = (
   requiredPatterns: LabelMatcher[],
   excludeLabels: string[],
   excludePatterns: LabelMatcher[],
+  job?: AgentFitJob,
 ) => boolean;
+
+/**
+ * The one routability predicate, built on the registry and the scaler: the
+ * unroutable probe and the queue-expiry sweep both ask it.
+ */
+export function makeCanRouteLabels(deps: {
+  registry: Pick<AgentRegistry, 'hasMatchingAgent'>;
+  scaler?: {
+    hasBackendForLabels(labels: string[], excludeLabels: string[]): boolean;
+    agentView(agentId: string): ScalerAgentView | undefined;
+  };
+}): CanRouteLabels {
+  const scalerAgentView = deps.scaler
+    ? (agentId: string) => deps.scaler!.agentView(agentId)
+    : undefined;
+  return (labels, patterns, excludeLabels, excludePatterns, job) =>
+    deps.registry.hasMatchingAgent(
+      labels,
+      patterns,
+      excludeLabels,
+      excludePatterns,
+      job ? (entry) => canAgentRunJob(fitAgentFor(entry, scalerAgentView), job) : undefined,
+    ) ||
+    (deps.scaler?.hasBackendForLabels(labels, excludeLabels) ?? false);
+}
 
 /** The routing facts a verdict is computed from. */
 export type JobRoutingFacts = Pick<
   ExpiredJobInfo,
   'lastProvisioningError' | 'runsOnLabels' | 'runsOnPatterns' | 'excludeLabels' | 'excludePatterns'
->;
+> &
+  Partial<Pick<ExpiredJobInfo, 'id' | 'container'>>;
 
 /** Everything {@link terminalizeUnroutableJob} needs to settle a job. */
 export interface TerminalizeDeps {
@@ -55,6 +96,22 @@ export interface TerminalizeDeps {
 
 const GENERIC_MESSAGE = 'Queue timeout expired (job was never dispatched to an agent)';
 
+/** Why nothing can run a job. */
+export enum UnroutableCause {
+  /** No agent or scaler backend matches its labels. */
+  NoMatch = 'no-match',
+  /**
+   * Agents match its labels, but it is a container job and none of them can
+   * start a container.
+   */
+  NoContainerRuntime = 'no-container-runtime',
+  /**
+   * Agents match its labels, but each was started inside another job's image
+   * and runs only that job.
+   */
+  OnlyOtherJobImageAgents = 'only-other-job-image-agents',
+}
+
 /**
  * The operator-facing reason a job is `unroutable`, naming the exact selectors
  * that went unmatched. Regex matchers are rendered as their source so the
@@ -64,9 +121,26 @@ function renderMatcher(m: LabelMatcher): string {
   return m.kind === 'exact' ? m.value : `/${m.source}/${m.flags}`;
 }
 
-export function unroutableMessage(job: JobRoutingFacts): string {
+export function unroutableMessage(job: JobRoutingFacts, cause = UnroutableCause.NoMatch): string {
   const required = [...job.runsOnLabels, ...job.runsOnPatterns.map(renderMatcher)];
   const excluded = [...job.excludeLabels, ...job.excludePatterns.map(renderMatcher)];
+  const matching =
+    (required.length > 0 ? `the agents that match runsOn [${required.join(', ')}]` : 'the agents') +
+    (excluded.length > 0 ? ` excluding [${excluded.join(', ')}]` : '');
+  if (cause === UnroutableCause.NoContainerRuntime) {
+    return (
+      `No connected agent can start this job's container: ${matching} ` +
+      `report neither ${CONTAINER_RUNTIME_LABELS.join(' nor ')}, and no scaler backend ` +
+      `matches — the job was never dispatched`
+    );
+  }
+  if (cause === UnroutableCause.OnlyOtherJobImageAgents) {
+    return (
+      `No connected agent can take this job: ${matching} were each started inside ` +
+      `another job's image and run only that job, and no scaler backend matches — ` +
+      `the job was never dispatched`
+    );
+  }
   // `currently`, and both halves of the probe, because the same verdict covers a
   // fleet that is merely empty right now — a lone static agent that dropped off
   // for the whole window reaches this line too, and a message asserting the
@@ -102,10 +176,24 @@ export function classifyUnroutable(
   //
   // Without the probe wired in, every job keeps its historical
   // `timed_out_stale`.
+  const container = job.container ?? JobContainerNeed.None;
+  const routes = (need: JobContainerNeed): boolean =>
+    canRouteLabels!(job.runsOnLabels, job.runsOnPatterns, job.excludeLabels, job.excludePatterns, {
+      ...(job.id !== undefined ? { jobId: job.id } : {}),
+      container: need,
+    });
   const unroutable =
-    job.lastProvisioningError === null &&
-    canRouteLabels !== undefined &&
-    !canRouteLabels(job.runsOnLabels, job.runsOnPatterns, job.excludeLabels, job.excludePatterns);
+    job.lastProvisioningError === null && canRouteLabels !== undefined && !routes(container);
+  const cause = unroutable
+    ? unroutableCause(container, routes, () =>
+        canRouteLabels!(
+          job.runsOnLabels,
+          job.runsOnPatterns,
+          job.excludeLabels,
+          job.excludePatterns,
+        ),
+      )
+    : UnroutableCause.NoMatch;
 
   return {
     unroutable,
@@ -115,9 +203,37 @@ export function classifyUnroutable(
     // An unroutable job has no provisioning error by construction (see the
     // guard above), so the two branches never contend.
     errorMessage: unroutable
-      ? unroutableMessage(job)
+      ? unroutableMessage(job, cause)
       : (job.lastProvisioningError ?? GENERIC_MESSAGE),
   };
+}
+
+/**
+ * Why nothing can run a job no agent or scaler backend can take.
+ *
+ * `routes` asks whether some agent could run the job with a given container
+ * need; `labelsMatch` asks only whether a connected agent carries its labels.
+ * When agents match the labels, the job is told apart from one whose labels
+ * match nothing, because its fix is not its `runsOn`.
+ */
+function unroutableCause(
+  container: JobContainerNeed,
+  routes: (need: JobContainerNeed) => boolean,
+  labelsMatch: () => boolean,
+): UnroutableCause {
+  // A container job the matching agents could run, were it not one: its fix is
+  // a host with a container runtime.
+  // fails-when: the job waits out its grace with a message blaming its labels
+  if (container !== JobContainerNeed.None && routes(JobContainerNeed.None)) {
+    return UnroutableCause.NoContainerRuntime;
+  }
+  // Agents carry the labels and none may take even a plain job. Probed without
+  // a declared shape, `canAgentRunJob` refuses a plain job only on an agent
+  // started inside another job's image.
+  // fails-when: a job whose only matching agents run other jobs' images blames its labels
+  // breaks-if-wrong: a job whose labels match no connected agent keeps the label message
+  if (labelsMatch()) return UnroutableCause.OnlyOtherJobImageAgents;
+  return UnroutableCause.NoMatch;
 }
 
 /**

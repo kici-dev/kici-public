@@ -77,3 +77,18 @@ describe('buildExecutionStatusFrame', () => {
     expect(built.jobCount).toBe(2);
   });
 });
+
+describe('buildExecutionStatusFrame statusEpoch', () => {
+  it('carries the run status generation from the context', () => {
+    expect(frame(context({ statusEpoch: 2 })).statusEpoch).toBe(2);
+  });
+
+  it('always sends statusEpoch, as 0 when the context has none', () => {
+    // fails-when: the field is omitted at 0 — the Platform reads the frame as an
+    // older orchestrator's and applies it unguarded, so a late frame reopens a
+    // finished run.
+    const built = frame(context());
+    expect('statusEpoch' in built).toBe(true);
+    expect(built.statusEpoch).toBe(0);
+  });
+});

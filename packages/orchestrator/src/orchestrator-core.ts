@@ -40,7 +40,11 @@ import { HostRosterStore } from './agent/host-roster.js';
 import { HostRosterReaper } from './agent/host-roster-reaper.js';
 import { JobQueue, DispatchQueueStatus, type QueuedJob } from './queue/job-queue.js';
 import { createCleanupHandler } from './queue/cleanup.js';
-import { type CanRouteLabels, terminalizeUnroutableJob } from './queue/terminalize-unroutable.js';
+import {
+  type CanRouteLabels,
+  makeCanRouteLabels,
+  terminalizeUnroutableJob,
+} from './queue/terminalize-unroutable.js';
 import {
   createUnroutableProbeHandler,
   DEFAULT_UNROUTABLE_GRACE_MS,
@@ -149,8 +153,16 @@ import {
   type ProvenanceTrustRoot,
 } from './provenance/trust-root.js';
 import { OrchestratorSigningKeyRepo } from './db/repos/signing-keys-repo.js';
-import { reconcileOrchestratorSigningKey } from './oidc/reconcile-signing-key.js';
-import { createBoundedSignerResolver } from './oidc/resolve-signer.js';
+import {
+  createKeyCreationGate,
+  NON_LEADER_KEY_CREATE_GRACE_MS,
+  reconcileOrchestratorSigningKey,
+} from './oidc/reconcile-signing-key.js';
+import {
+  createBoundedSignerResolver,
+  type ResolveSignerCallBudget,
+} from './oidc/resolve-signer.js';
+import { ORCHESTRATOR_MINT_SIGNER_WAIT_MS } from './oidc/orchestrator-mint.js';
 import { DashboardEncryptionKeyRepo } from './db/repos/dashboard-encryption-keys-repo.js';
 import {
   reconcileDashboardEncryptionKey,
@@ -245,6 +257,8 @@ import {
   createOrphanSecretCleanupHandler,
 } from './secrets/index.js';
 import { BackendRegistry } from './secrets/backend-registry.js';
+import { configureJobSecretSealing } from './secrets/job-secret-seal.js';
+import { hasLiveCoordinatorPeer } from './cluster/live-coordinator-peer.js';
 import { loadRoutableStores } from './secrets/scope-routing.js';
 import { BackendHealthChecker } from './secrets/backend-health.js';
 import { BackendSyncManager } from './secrets/backend-sync.js';
@@ -302,6 +316,7 @@ import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import type { Kysely } from 'kysely';
 import type { Database } from './db/types.js';
 import { JobKind } from './db/types.js';
+import { resolveDispatchCloneAuth } from './git/dispatch-git-auth.js';
 import type pg from 'pg';
 
 const logger = createLogger({ prefix: 'core' });
@@ -1179,8 +1194,6 @@ async function initializeSecrets(
 
 // ── onDispatch callback builder ─────────────────────────────────────────────
 
-type ProviderBundle = ReturnType<ProviderRegistry['getByRoutingKey']>;
-
 /**
  * Normalize a lock job's `needs` array (strings, NeedsEntry objects, or
  * NeedsGroupEntry objects) to the set of upstream BASE job names. Group entries
@@ -1546,98 +1559,6 @@ export async function mergeUpstreamOutputs(
   return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses, upstreamInvokeResults };
 }
 
-/**
- * Mint structured `sourceAuth` (and a backward-compat `token`) for the
- * source-repo clone. Providers that implement `issueGitAuth()` return the
- * auth `kind` (basic vs ssh) directly; the GitHub path falls through to
- * `createCloneToken()` and we synthesize a basic-auth envelope so
- * `sourceAuth` is always populated when auth is available.
- */
-async function mintSourceAuth(
-  bundle: NonNullable<ProviderBundle>,
-  repoIdentifier: string,
-  providerContext: unknown,
-): Promise<{
-  token: string | null;
-  structuredAuth: import('@kici-dev/engine').ProviderGitAuth | null;
-}> {
-  const provider = bundle.cloneTokenProvider;
-  let structuredAuth: import('@kici-dev/engine').ProviderGitAuth | null = null;
-  if (provider?.issueGitAuth) {
-    structuredAuth = await provider.issueGitAuth(repoIdentifier, providerContext);
-  }
-  let token: string | null = null;
-  if (structuredAuth?.kind === 'basic') {
-    token = structuredAuth.secret;
-  } else if (!structuredAuth && provider?.createCloneToken) {
-    token = await provider.createCloneToken(repoIdentifier, providerContext);
-    if (token) {
-      structuredAuth = { kind: 'basic', user: 'x-access-token', secret: token };
-    }
-  }
-  return { token, structuredAuth };
-}
-
-/**
- * Mint `workflowAuth` for cross-provider global workflows (Phase 4 Option B).
- * When the registration's routing key differs from the inbound, the
- * workflow-repo bundle is separate from the source-repo bundle and needs
- * its own auth envelope. Returns `null` if same-bundle, no separate
- * workflow context is provided, or auth minting fails.
- */
-async function mintCrossProviderWorkflowAuth(
-  providerRegistry: ProviderRegistry,
-  jobConfig: Record<string, unknown>,
-  cleanJobConfig: Record<string, unknown>,
-  jobRoutingKey: string,
-  jobId: string,
-): Promise<import('@kici-dev/engine').ProviderGitAuth | null> {
-  if (cleanJobConfig.isGlobalWorkflow !== true) return null;
-
-  const workflowRoutingKey = jobConfig.workflowRoutingKey as string | undefined;
-  const workflowRepoIdentifier = cleanJobConfig.workflowRepoIdentifier as string | undefined;
-  const workflowProviderContext = (jobConfig.workflowProviderContext ?? {}) as Record<
-    string,
-    unknown
-  >;
-  if (!workflowRoutingKey || !workflowRepoIdentifier || workflowRoutingKey === jobRoutingKey) {
-    return null;
-  }
-
-  const workflowBundle = providerRegistry.getByRoutingKey(workflowRoutingKey);
-  if (!workflowBundle) {
-    logger.error('Cross-provider global workflow: no bundle registered for workflow routing key', {
-      workflowRoutingKey,
-      jobId,
-    });
-    return null;
-  }
-
-  try {
-    const wfProvider = workflowBundle.cloneTokenProvider;
-    let wfAuth: import('@kici-dev/engine').ProviderGitAuth | null = null;
-    if (wfProvider?.issueGitAuth) {
-      wfAuth = await wfProvider.issueGitAuth(workflowRepoIdentifier, workflowProviderContext);
-    }
-    if (!wfAuth && wfProvider?.createCloneToken) {
-      const wfToken = await wfProvider.createCloneToken(
-        workflowRepoIdentifier,
-        workflowProviderContext,
-      );
-      if (wfToken) {
-        wfAuth = { kind: 'basic', user: 'x-access-token', secret: wfToken };
-      }
-    }
-    return wfAuth;
-  } catch (err) {
-    logger.warn('Failed to mint workflowAuth for cross-provider global workflow', {
-      error: toErrorMessage(err),
-      workflowRoutingKey,
-    });
-    return null;
-  }
-}
-
 function buildOnDispatch(
   config: AppConfig,
   db: Kysely<Database>,
@@ -1782,37 +1703,18 @@ function buildOnDispatch(
       ...(upstreamInvokeResults && { upstreamInvokeResults }),
     };
 
-    if (bundle) {
-      try {
-        const { token, structuredAuth } = await mintSourceAuth(
-          bundle,
-          repoIdentifier,
-          job.providerContext,
-        );
-        if (token) dispatchMsg.token = token;
-        if (structuredAuth) {
-          dispatchMsg.sourceAuth = structuredAuth;
-          // Default to mirroring sourceAuth for same-bundle globals.
-          // Cross-provider globals override this below.
-          if (cleanJobConfig.isGlobalWorkflow === true) {
-            dispatchMsg.workflowAuth = structuredAuth;
-          }
-        }
-      } catch (err) {
-        logger.warn('Failed to generate clone token, agent will attempt unauthenticated clone', {
-          error: toErrorMessage(err),
-        });
-      }
-    }
-
-    const wfAuth = await mintCrossProviderWorkflowAuth(
-      providerRegistryRef.current,
-      job.jobConfig,
-      cleanJobConfig,
-      job.routingKey,
-      job.id,
-    );
-    if (wfAuth) dispatchMsg.workflowAuth = wfAuth;
+    // Source clone auth through the job's own bundle; for a global job, the
+    // workflow repository's auth through the bundle that owns it. A global job
+    // that would send the workflow repository's credentials to another git host
+    // is refused here and failed by the dispatcher.
+    const cloneAuth = await resolveDispatchCloneAuth({
+      providerRegistry: providerRegistryRef.current,
+      bundle,
+      repoIdentifier,
+      job,
+    });
+    if ('refused' in cloneAuth) return { refused: cloneAuth.refused };
+    Object.assign(dispatchMsg, cloneAuth.auth);
 
     if (job.sourceTarUrl) dispatchMsg.sourceTarUrl = job.sourceTarUrl;
     if (job.sourceTarDigest) dispatchMsg.sourceTarDigest = job.sourceTarDigest;
@@ -2730,6 +2632,7 @@ export async function bootstrapOrchestrator(
       config.agentMaxReconnectDelayMs * 2,
       config.clusterInstanceHeartbeatMs,
     ),
+    sealedSecretsRetryBackoffMs: config.sealedSecretsRetryBackoffMs,
   });
 
   // 8b. Create dedup cache (cleanup scheduler started later after execution tracker)
@@ -3202,9 +3105,15 @@ export async function bootstrapOrchestrator(
   // (the backstop). A registered agent means the labels route regardless of
   // capacity; a scaler backend means one could be spawned, which is what keeps
   // a scale-from-zero pool out of the unroutable bucket.
-  const canRouteLabels: CanRouteLabels = (labels, patterns, excludeLabels, excludePatterns) =>
-    agentRegistry.hasMatchingAgent(labels, patterns, excludeLabels, excludePatterns) ||
-    (scalerManager?.hasBackendForLabels(labels, excludeLabels) ?? false);
+  //
+  // An agent counts only when it can run the job (`canAgentRunJob`): a
+  // container job whose matching agents cannot start a container reads
+  // unroutable, with a reason naming the missing runtime, instead of waiting
+  // silently for the queue timeout.
+  const canRouteLabels: CanRouteLabels = makeCanRouteLabels({
+    registry: agentRegistry,
+    ...(scalerManager ? { scaler: scalerManager } : {}),
+  });
 
   const scheduledJobHandles: OrchestratorScheduledJobHandle[] = bootstrapOrchestratorScheduledJobs(
     { db, instanceId: config.instanceId },
@@ -3321,6 +3230,9 @@ export async function bootstrapOrchestrator(
   // 13. Initialize secrets subsystem
   const { secretResolver, adminDeps, pgSecretStore, auditLogger, masterKeys } =
     await initializeSecrets(config, db, tokenStore, hooks);
+  // Every store a job waits in (the dispatch queue, pending job and workflow
+  // contexts) seals its secret fields under this key from here on.
+  configureJobSecretSealing(masterKeys);
 
   // Late-bind the agent registry into admin route deps so the
   // DELETE /api/v1/agent-tokens/:id route can synchronously kick every
@@ -3656,6 +3568,7 @@ export async function bootstrapOrchestrator(
   // namespace server-side. Constructed before the dispatcher so buildOnDispatch
   // can capture it.
   const dispatchCacheRefs = new DispatchCacheRefTracker();
+  const peerCoordinatorsRef: { current: (() => Promise<boolean>) | null } = { current: null };
   const dispatcher = new Dispatcher({
     registry: agentRegistry,
     queue,
@@ -3685,13 +3598,10 @@ export async function bootstrapOrchestrator(
             containerSpawn,
           )
       : undefined,
-    canPrespawnedAgentServe: scalerManager
-      ? (agentId, job) => scalerManager!.canPrespawnedAgentServe(agentId, job)
-      : undefined,
-    isPrespawnedAgent: scalerManager
-      ? (agentId) => scalerManager!.isPrespawnedAgent(agentId)
-      : undefined,
+    scalerAgentView: scalerManager ? (agentId) => scalerManager!.agentView(agentId) : undefined,
     isDraining: () => drainController.isDraining(),
+    // Late-bound: the peer registry is built with the cluster, after the dispatcher.
+    hasPeerCoordinators: async () => (await peerCoordinatorsRef.current?.()) ?? false,
     maxReconnectDelayMs: config.agentMaxReconnectDelayMs,
     onJobFailedPermanently: (agentId, jobId, runId, reason) => {
       logger.warn('Job permanently failed before/outside agent execution', {
@@ -3861,6 +3771,15 @@ export async function bootstrapOrchestrator(
     logWriter,
     hooks.forwardLogChunk,
   );
+  // A link blip between two healthy coordinators during a rolling restart must
+  // not read as "no peer": that would fail, at once, the jobs a peer that holds
+  // the new master key could open. Same flap grace the rerouted-job guard uses.
+  peerCoordinatorsRef.current = async () =>
+    hasLiveCoordinatorPeer(
+      cluster.peerRegistry,
+      Date.now(),
+      await clusterSettings.getNumber('reroute_flap_grace_ms', config.rerouteFlapGraceMs),
+    );
   if (scalerManager) {
     const manager = scalerManager;
     // A fresh handle rather than a plumbed one: the store is a stateless
@@ -3992,19 +3911,26 @@ export async function bootstrapOrchestrator(
   // from the Platform `auth.success`; the config/env value seeds the CLI path.
   // For the local dev plane, serve the in-process signer's JWKS directly under
   // the `kici-local` issuer (not a URL, so no discovery/fetch).
-  // Orchestrator-owned provenance signing (Phase 1 root of trust). When
+  // Orchestrator-owned provenance signing (the root of trust). When
   // KICI_ORCHESTRATOR_PROVENANCE_ISSUER is set, the orchestrator holds its own
   // ES256 key: it mints + signs identity tokens locally, serves its own JWKS,
   // and verifies at ingest against its own keys. The signer is resolved LAZILY
   // (memoized) on first use so the Raft leader-election race at boot never
-  // blocks or crash-loops — the key is reconciled when the first agent requests
-  // a token (by which point the cluster has a leader and the key exists).
+  // blocks or crash-loops — the key is reconciled at boot and again on the
+  // first agent token request.
   const provenanceSigningEnabled = isProvenanceSigningEnabled({
     provenanceSigningIssuer: config.provenanceSigningIssuer,
   });
   const orchestratorSigningRepo = provenanceSigningEnabled
     ? new OrchestratorSigningKeyRepo(db)
     : undefined;
+  // Any signing-enabled node creates the db-custody key when none is active; the
+  // Raft leader gets the first chance so a healthy cluster creates it once.
+  const isRaftLeader = (): boolean => cluster.raft?.isLeader() ?? true;
+  const mayCreateSigningKey = createKeyCreationGate({
+    isLeader: isRaftLeader,
+    graceMs: NON_LEADER_KEY_CREATE_GRACE_MS,
+  });
   const reconcileSignerOnce = (): Promise<{ signer: Signer } | null> =>
     reconcileOrchestratorSigningKey({
       repo: orchestratorSigningRepo!,
@@ -4017,7 +3943,7 @@ export async function bootstrapOrchestrator(
         provenanceKmsSecretAccessKey: config.provenanceKmsSecretAccessKey,
         provenanceSignerCommand: config.provenanceSignerCommand,
       },
-      isLeader: () => cluster.raft?.isLeader() ?? true,
+      mayCreateKey: mayCreateSigningKey,
       secretKey: masterKeys?.material,
       oldSecretKey: masterKeys?.materialOld,
       // Boot self-heal: a key still sealed under the old master key is
@@ -4034,21 +3960,30 @@ export async function bootstrapOrchestrator(
     });
   // Resolve the signer, WAITING (bounded) for the key to be provisioned rather
   // than immediately deferring. This closes the security-critical mint-in-boot-
-  // window race: a mint that arrives before the leader has generated the key
+  // window race: a mint that arrives before any node has generated the key
   // must NOT fall back to the Platform relay (which would produce an intermittent
   // Platform-signed bundle that fails verification against the orchestrator trust
   // root). Once provisioned (eager reconcile at boot, or the first mint), the
   // signer is memoized and returned immediately. Only a not-ready reconcile is
   // waited out; a reconcile that throws (a stranded key, no master key) ends the
   // wait at once and is logged, since it cannot resolve itself within the window.
-  const resolveOrchestratorSigner: () => Promise<Signer | null> = orchestratorSigningRepo
-    ? createBoundedSignerResolver({
-        reconcile: reconcileSignerOnce,
-        maxAttempts: 60,
-        delayMs: 500,
-        logError: (message, meta) => logger.error(message, meta),
-      })
-    : async () => null;
+  const signerPollMs = 500;
+  const resolveOrchestratorSigner: (budget?: ResolveSignerCallBudget) => Promise<Signer | null> =
+    orchestratorSigningRepo
+      ? createBoundedSignerResolver({
+          reconcile: reconcileSignerOnce,
+          maxAttempts: 60,
+          delayMs: signerPollMs,
+          logError: (message, meta) => logger.error(message, meta),
+        })
+      : async () => null;
+  // The agent mint path polls only as long as it waits before answering the
+  // agent, so its poll loop ends when the handler defers; the eager boot
+  // provisioning and the attestation retrier keep the full budget above.
+  const resolveOrchestratorSignerForMint = (): Promise<Signer | null> =>
+    resolveOrchestratorSigner({
+      maxAttempts: Math.max(1, Math.floor(ORCHESTRATOR_MINT_SIGNER_WAIT_MS / signerPollMs)),
+    });
 
   // Dashboard-encryption (X25519) key: the trust root for browser-sealed
   // dashboard writes under the `encrypted` posture. Available whenever the
@@ -4299,6 +4234,8 @@ export async function bootstrapOrchestrator(
         matchContext: gateMatchContext,
         heldRunStore: gateHeldRunStore,
         accessLogWriter,
+        // Read at release time: `createApp` populates the deps bag later.
+        contextData: () => requireProcessingDeps(processingDepsRef)(),
       };
     }
   }
@@ -4312,7 +4249,8 @@ export async function bootstrapOrchestrator(
   // Eagerly provision the provenance signing key once leadership settles, so the
   // public JWKS endpoint is populated shortly after boot instead of only on the
   // first agent token request. Fire-and-forget with a bounded retry (the resolve
-  // is memoized + leader-gated for db custody, so a non-leader just waits).
+  // is memoized; for db custody a non-leader waits out the leader grace, then
+  // creates the key itself if none appeared).
   if (provenanceSigningEnabled) {
     void (async () => {
       for (let i = 0; i < 120; i++) {
@@ -4627,8 +4565,9 @@ export async function bootstrapOrchestrator(
       ? {
           provenanceSigning: {
             issuer: config.provenanceSigningIssuer as string,
-            resolveSigner: resolveOrchestratorSigner,
+            resolveSigner: resolveOrchestratorSignerForMint,
             repo: orchestratorSigningRepo,
+            isLeader: isRaftLeader,
           },
         }
       : {}),

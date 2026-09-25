@@ -430,6 +430,19 @@ describe('jobRerouteSchema', () => {
     expect(() => jobRerouteSchema.parse(rest)).toThrow();
   });
 
+  it('carries a workflow clone token next to the source clone token', () => {
+    // fails-when: the schema drops workflowCloneToken, so a rerouted global job loses the workflow repo's token
+    const msg = { ...valid, cloneToken: 'src-tok', workflowCloneToken: 'wf-tok' };
+    expect(jobRerouteSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('parses a reroute from a coordinator that sends no workflow clone token', () => {
+    // breaks-if-wrong: an older coordinator's message must still parse, with the field absent
+    const parsed = jobRerouteSchema.parse({ ...valid, cloneToken: 'src-tok' });
+    expect(parsed).not.toHaveProperty('workflowCloneToken');
+    expect(parsed.cloneToken).toBe('src-tok');
+  });
+
   it('round-trips through JSON serialization', () => {
     const roundTripped = JSON.parse(JSON.stringify(valid));
     expect(jobRerouteSchema.parse(roundTripped)).toEqual(valid);

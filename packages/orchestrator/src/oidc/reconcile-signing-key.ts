@@ -3,10 +3,13 @@
  * one `active` key exists and returns a live `Signer` bound to it.
  *
  *  - `db` custody: the private key is a random keypair generated + persisted
- *    (master-key-wrapped) in the DB. Generation is LEADER-GATED so an HA cluster
- *    never races two active keys; every node then loads the one active row. A
- *    non-leader that finds no active row yet returns null this tick and is
- *    retried on the next leadership/boot cycle.
+ *    (master-key-wrapped) in the DB. Any node with signing enabled may create it
+ *    when no key of any custody is active; the leader gets the first chance (see
+ *    `createKeyCreationGate`). The write is an atomic compare-and-activate, so
+ *    nodes that race converge on the one key that won and every node signs with
+ *    that key. An active key of another custody kind is never replaced here:
+ *    the node refuses to sign, and `kici-admin signing-key rotate` is the
+ *    explicit move to db custody.
  *  - `aws-kms` / `command` custody: the key lives outside KiCI, so every node
  *    resolves the SAME kid and `upsertActive` is idempotent across the fleet.
  */
@@ -21,12 +24,48 @@ import {
   resolveSignerKind,
 } from './orchestrator-signer-factory.js';
 import type { Signer } from './signer.js';
+import type { OrchestratorSigningKeyRow } from '../db/types.js';
 import type { OrchestratorSigningKeyRepo } from '../db/repos/signing-keys-repo.js';
 
-export interface ReconcileSigningKeyDeps {
-  repo: Pick<OrchestratorSigningKeyRepo, 'getActiveRow' | 'upsertActive'>;
-  config: OrchestratorSignerConfig;
+/**
+ * How long a non-leader leaves key creation to the Raft leader before it
+ * creates the key itself. Kept well under the mint's signer wait so the first
+ * mint on a non-leader of a cluster whose leader has signing disabled still
+ * gets a token instead of a deferral.
+ */
+export const NON_LEADER_KEY_CREATE_GRACE_MS = 2_000;
+
+/**
+ * Decide whether this node may create the db-custody key right now. The leader
+ * always may. A non-leader may once `graceMs` has passed since it first asked,
+ * so a cluster whose leader never creates the key (signing disabled on it, or
+ * no leader elected) still gets one.
+ */
+export function createKeyCreationGate(opts: {
   isLeader: () => boolean;
+  graceMs: number;
+  now?: () => number;
+}): () => boolean {
+  const now = opts.now ?? Date.now;
+  let firstAskedAt: number | undefined;
+  return () => {
+    if (opts.isLeader()) return true;
+    const t = now();
+    firstAskedAt ??= t;
+    // fails-when: a non-leader is refused forever (grace never elapses).
+    // breaks-if-wrong: inside the grace the leader must keep the first chance.
+    return t - firstAskedAt >= opts.graceMs;
+  };
+}
+
+export interface ReconcileSigningKeyDeps {
+  repo: Pick<OrchestratorSigningKeyRepo, 'getActiveRow' | 'upsertActive' | 'activateIfCurrent'>;
+  config: OrchestratorSignerConfig;
+  /**
+   * Whether this node may create the db-custody key now that none is usable.
+   * Consulted only by `db` custody; see `createKeyCreationGate`.
+   */
+  mayCreateKey: () => boolean;
   /** The orchestrator master key (`KICI_SECRET_KEY`), for `db` custody wrapping. */
   secretKey: string | undefined;
   /**
@@ -77,44 +116,16 @@ async function reconcileDbCustody(
   }
   const existing = await deps.repo.getActiveRow();
   if (existing?.encrypted_private_jwk) {
-    let unwrapped: { privateJwk: JWK; usedOldKey: boolean };
-    try {
-      unwrapped = unwrapPrivateJwkWithKeyAge(
-        existing.encrypted_private_jwk,
-        deps.secretKey,
-        deps.oldSecretKey,
-      );
-    } catch {
-      // Loud and recovery-pointing rather than a bare AES-GCM auth failure:
-      // this throw is what an operator sees when a rotation stranded the key,
-      // and the boot path has no catch for it.
-      throw strandedKeyError('the provenance signing key');
-    }
-    if (unwrapped.usedOldKey && deps.selfHeal) {
-      await deps
-        .selfHeal({ kid: existing.kid, key_version: existing.key_version }, unwrapped.privateJwk)
-        .then(() =>
-          deps.logWarn?.(
-            'provenance signing key was sealed under the old master key — re-encrypted under the current key (self-heal)',
-            { kid: existing.kid },
-          ),
-        )
-        .catch((err: unknown) =>
-          deps.logWarn?.('provenance signing key self-heal failed; key stays stranded', {
-            kid: existing.kid,
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-    }
-    const signer = await DbSigner.fromPrivateJwk(unwrapped.privateJwk);
-    return { signer };
+    return signerFromActiveRow(existing, existing.encrypted_private_jwk, deps, deps.secretKey);
   }
-  if (!deps.isLeader()) {
-    // A non-leader must not generate a fresh random key (would race the leader).
-    return null;
-  }
+  // fails-when: a db-custody node replaces an active KMS or command key with a software key
+  // breaks-if-wrong: with no active key at all, a node allowed to create still creates one
+  if (existing) throw custodyMismatchError(existing);
+  if (!deps.mayCreateKey()) return null;
   const generated = await DbSigner.generate(deps.secretKey);
-  const activatedNew = await deps.repo.upsertActive({
+  // Activate only if no key is active still. A node that lost that race writes
+  // nothing and signs with the key that won.
+  const outcome = await deps.repo.activateIfCurrent(null, {
     kid: generated.kid,
     public_jwk: generated.publicJwk as unknown as Record<string, unknown>,
     encrypted_private_jwk: generated.encryptedPrivateJwk,
@@ -122,14 +133,68 @@ async function reconcileDbCustody(
     signer_kind: generated.signer.signerKind,
     key_ref: generated.signer.keyRef,
   });
-  if (activatedNew) {
+  if (outcome.activated) {
     await deps.audit({
       kid: generated.kid,
       signerKind: generated.signer.signerKind,
       keyRef: generated.signer.keyRef,
     });
+    return { signer: generated.signer };
   }
-  return { signer: generated.signer };
+  const winner = outcome.active;
+  if (!winner?.encrypted_private_jwk) return null;
+  return signerFromActiveRow(winner, winner.encrypted_private_jwk, deps, deps.secretKey);
+}
+
+/**
+ * The error a db-custody node raises for an active key it holds no private key
+ * for: one of another custody kind (`aws-kms`, `command`). The node cannot sign
+ * with it, and replacing it would silently move the cluster's custody, so it
+ * names the two ways out instead.
+ */
+function custodyMismatchError(active: OrchestratorSigningKeyRow): Error {
+  return new Error(
+    `the active provenance signing key ${active.kid} is held in '${active.signer_kind}' custody, ` +
+      `but this node is configured for 'db' custody (KICI_ORCHESTRATOR_SIGNER_KIND); it does not ` +
+      `replace that key and signs nothing. Give every node the same custody, or run ` +
+      `'kici-admin signing-key rotate' to move the cluster to db custody.`,
+  );
+}
+
+/** Unwrap the active db-custody row and build its signer, self-healing an old-key seal. */
+async function signerFromActiveRow(
+  row: OrchestratorSigningKeyRow,
+  encryptedPrivateJwk: string,
+  deps: ReconcileSigningKeyDeps,
+  secretKey: string,
+): Promise<{ signer: Signer }> {
+  let unwrapped: { privateJwk: JWK; usedOldKey: boolean };
+  try {
+    unwrapped = unwrapPrivateJwkWithKeyAge(encryptedPrivateJwk, secretKey, deps.oldSecretKey);
+  } catch {
+    // Loud and recovery-pointing rather than a bare AES-GCM auth failure:
+    // this throw is what an operator sees when a rotation stranded the key,
+    // and the boot path has no catch for it.
+    throw strandedKeyError('the provenance signing key');
+  }
+  if (unwrapped.usedOldKey && deps.selfHeal) {
+    await deps
+      .selfHeal({ kid: row.kid, key_version: row.key_version }, unwrapped.privateJwk)
+      .then(() =>
+        deps.logWarn?.(
+          'provenance signing key was sealed under the old master key — re-encrypted under the current key (self-heal)',
+          { kid: row.kid },
+        ),
+      )
+      .catch((err: unknown) =>
+        deps.logWarn?.('provenance signing key self-heal failed; key stays stranded', {
+          kid: row.kid,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+  }
+  const signer = await DbSigner.fromPrivateJwk(unwrapped.privateJwk);
+  return { signer };
 }
 
 async function reconcileExternalCustody(

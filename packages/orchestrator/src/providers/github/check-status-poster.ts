@@ -4,12 +4,11 @@
  * Posts check statuses to GitHub PRs using the Checks API for:
  * - Security holds (pending): "KiCI Security" — "Held for approval"
  * - Workflow modifications (neutral): "KiCI: Workflow changes"
- * - Org globals skipped by the trust policy (neutral): "KiCI: Organization workflows"
  * - Org global evaluation failed (failure): "KiCI: Organization workflow evaluation"
  * - Approved runs (success) / Rejected/expired runs (failure)
  *
- * `postWorkflowModificationCheck`, `postGlobalWorkflowsSkippedCheck`, and
- * `postGlobalEvalFailedCheck` are interface-backed (the `CheckStatusPoster`
+ * `postWorkflowModificationCheck` and `postGlobalEvalFailedCheck` are
+ * interface-backed (the `CheckStatusPoster`
  * contract in `@kici-dev/engine`) and post on their own check names so none of
  * them overwrites the security-hold check.
  *
@@ -30,9 +29,6 @@ const SECURITY_CHECK_NAME = 'KiCI Security';
 
 /** Check run name for workflow modification informational checks. */
 const WORKFLOW_CHANGES_CHECK_NAME = 'KiCI: Workflow changes';
-
-/** Check run name for the "org global workflows were skipped" informational check. */
-const GLOBAL_WORKFLOWS_CHECK_NAME = 'KiCI: Organization workflows';
 
 /** Check run name for the "org global workflow evaluation failed" check. */
 const GLOBAL_EVAL_CHECK_NAME = 'KiCI: Organization workflow evaluation';
@@ -179,54 +175,11 @@ export class GitHubCheckStatusPoster implements CheckStatusPoster {
   }
 
   /**
-   * Post the informational check recording that the org's global workflows were
-   * skipped because the trust policy held or rejected the event.
-   *
-   * Uses a separate check name ("KiCI: Organization workflows") so it never
-   * overwrites the security-hold check: that one is a single named run per
-   * commit which the hold posts as pending and approve / reject later complete,
-   * so writing this notice onto it would resolve the hold's check to neutral
-   * while the run is still held. Always posted as neutral/completed.
-   */
-  async postGlobalWorkflowsSkippedCheck(
-    repoIdentifier: string,
-    commitSha: string,
-    summary: string,
-    credentials: unknown,
-  ): Promise<void> {
-    const octokit = this.getOctokit(credentials);
-    const [owner, repo] = repoIdentifier.split('/');
-
-    try {
-      await octokit.checks.create({
-        owner,
-        repo,
-        name: GLOBAL_WORKFLOWS_CHECK_NAME,
-        head_sha: commitSha,
-        status: 'completed',
-        conclusion: 'neutral',
-        completed_at: new Date().toISOString(),
-        output: {
-          title: 'Organization workflows skipped',
-          summary,
-        },
-      });
-    } catch (err) {
-      logger.error('Failed to post global-workflows-skipped check', {
-        repoIdentifier,
-        commitSha,
-        error: toErrorMessage(err),
-      });
-      throw err;
-    }
-  }
-
-  /**
    * Post the check recording that the pre-run evaluation of the organization's
    * global workflows failed, so none of the workflows it was deciding on ran.
    *
-   * Its own check name ("KiCI: Organization workflow evaluation") for the same
-   * reason as the notice above: the security-hold check is a single named run
+   * Its own check name ("KiCI: Organization workflow evaluation") because the
+   * security-hold check is a single named run
    * per commit which a hold posts as pending and approve / reject later
    * complete, so writing this through `postCheckStatus` would resolve a
    * still-held run's check and unblock a branch protection rule that requires

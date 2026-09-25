@@ -1,13 +1,17 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { decodeJwt, importJWK } from 'jose';
 import type { Kysely } from 'kysely';
+import { AGENT_API_REQUEST_TIMEOUT_MS } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { DbSigner } from './db-signer.js';
 import {
   createOrchestratorOidcTokenHandler,
   mintOrchestratorIdToken,
+  ORCHESTRATOR_MINT_SIGNER_WAIT_MS,
   OrchestratorMintJobNotActiveError,
 } from './orchestrator-mint.js';
+import { NON_LEADER_KEY_CREATE_GRACE_MS } from './reconcile-signing-key.js';
+import type { Signer } from './signer.js';
 
 const KEY = '0'.repeat(64);
 const ISSUER = 'https://orch.example';
@@ -259,5 +263,65 @@ describe('mintOrchestratorIdToken', () => {
     // breaks-if-wrong: an audience the predicate does not name still mints.
     const minted = await handler('agent-x', { jobId: 'job-1', audience: 'kici-provenance' });
     expect('token' in minted && minted.token).toBeTruthy();
+  });
+});
+
+describe('mint signer wait', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const ownedJobDb = () =>
+    fakeDb({
+      run: RUN,
+      job: { run_id: 'run-1', job_id: 'job-1', status: 'running' },
+      sourceCustomerId: 'org-acme',
+    });
+
+  it('is sized well inside the agent.api timeout, and past the non-leader key grace', () => {
+    // fails-when: the wait is set from a number of its own that reaches the
+    // agent timeout, so the agent gives up before the deferred answer lands.
+    expect(ORCHESTRATOR_MINT_SIGNER_WAIT_MS).toBeLessThanOrEqual(AGENT_API_REQUEST_TIMEOUT_MS / 2);
+    // fails-when: the grace outlasts the wait, so the first mint on a non-leader
+    // of a cluster whose leader has signing disabled always defers.
+    expect(NON_LEADER_KEY_CREATE_GRACE_MS).toBeLessThan(ORCHESTRATOR_MINT_SIGNER_WAIT_MS);
+  });
+
+  it('answers deferred at the wait bound when the signer never resolves', async () => {
+    vi.useFakeTimers();
+    const handler = createOrchestratorOidcTokenHandler({
+      dispatcher: { resolveOwnedJob: () => ({ runId: 'run-1' }) },
+      resolveSigner: () => new Promise<Signer | null>(() => {}),
+      mint: { db: ownedJobDb(), issuer: ISSUER, orchestratorId: 'orch-1' },
+    });
+    let result: unknown;
+    void handler('agent-x', { jobId: 'job-1', audience: 'kici-provenance' }).then((r) => {
+      result = r;
+    });
+    await vi.advanceTimersByTimeAsync(ORCHESTRATOR_MINT_SIGNER_WAIT_MS - 1);
+    expect(result).toBeUndefined();
+    // fails-when: the handler awaits the resolver with no deadline — it never
+    // answers, and the agent sees its own timeout instead of a deferral.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(result).toEqual({ deferred: true, code: 'unavailable' });
+  });
+
+  it('still mints with a signer that arrives inside the wait', async () => {
+    // breaks-if-wrong: a key provisioned a few seconds into the wait must mint.
+    const { signer } = await DbSigner.generate(KEY);
+    vi.useFakeTimers();
+    const handler = createOrchestratorOidcTokenHandler({
+      dispatcher: { resolveOwnedJob: () => ({ runId: 'run-1' }) },
+      resolveSigner: () =>
+        new Promise<Signer | null>((resolve) =>
+          setTimeout(() => resolve(signer), ORCHESTRATOR_MINT_SIGNER_WAIT_MS - 100),
+        ),
+      mint: { db: ownedJobDb(), issuer: ISSUER, orchestratorId: 'orch-1' },
+    });
+    const pending = handler('agent-x', { jobId: 'job-1', audience: 'kici-provenance' });
+    await vi.advanceTimersByTimeAsync(ORCHESTRATOR_MINT_SIGNER_WAIT_MS - 100);
+    vi.useRealTimers();
+    const result = await pending;
+    expect('token' in result && result.token).toBeTruthy();
   });
 });

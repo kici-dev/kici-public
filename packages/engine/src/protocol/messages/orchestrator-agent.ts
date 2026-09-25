@@ -4,7 +4,7 @@ import { LogStream } from './log-stream.js';
 import { approverClauseSchema, approvalTimeoutSecondsSchema } from '../../approval/types.js';
 import { dsseEnvelopeSchema } from '../../provenance/dsse.js';
 import { provenanceContextSchema } from '../../provenance/id-token-event-claims.js';
-import { orchAgentCapabilitiesSchema } from './capabilities.js';
+import { agentCapabilitiesSchema, orchAgentCapabilitiesSchema } from './capabilities.js';
 import {
   ExecutionJobStatus,
   ExecutionStepStatus,
@@ -368,6 +368,12 @@ export const agentRegisterSchema = z.object({
    * `host_properties` (agent-reported keys win). Optional — omitted ⇒ none.
    */
   properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+  /**
+   * Optional agent behaviours this agent build implements (absent on
+   * pre-capability agents, which the orchestrator treats as supporting none).
+   * The orchestrator reads it to route work that depends on one of them.
+   */
+  capabilities: agentCapabilitiesSchema.optional(),
 });
 
 /** Periodic agent status update. */
@@ -1085,6 +1091,14 @@ export const agentAuthFailureSchema = z.object({
 // --- Agent private API (request-response over WS) ---
 // Generic envelope for typed API calls. New methods are registered in AgentApiRegistry
 // on the orchestrator side — no protocol schema changes needed per method.
+
+/**
+ * How long an agent waits for the `agent.api.response` to one
+ * `agent.api.request` before it fails the call. An orchestrator handler that
+ * can wait on something slow (the provenance signer) answers within a fraction
+ * of this, so the step receives the handler's answer instead of a timeout.
+ */
+export const AGENT_API_REQUEST_TIMEOUT_MS = 15_000;
 
 /** API request sent by agent to orchestrator (e.g., infrastructure.list). */
 export const agentApiRequestSchema = z.object({

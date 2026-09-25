@@ -1,7 +1,7 @@
 import type { Kysely } from 'kysely';
 
 import type { LockWorkflow } from '@kici-dev/engine';
-import { createLogger } from '@kici-dev/shared';
+import { createLogger, type DepCacheKey } from '@kici-dev/shared';
 
 import type { Database, WorkflowRegistration } from '../db/types.js';
 
@@ -12,7 +12,7 @@ const logger = createLogger({ prefix: 'registration-store' });
  * DB stores lock_entry as JSON string and trigger_types as TEXT[],
  * but this interface exposes them as typed objects.
  */
-export interface RegistrationRow {
+export interface RegistrationRow extends DepCacheKey {
   id: string;
   repo_identifier: string;
   workflow_name: string;
@@ -70,6 +70,14 @@ interface ReplaceAllOptions {
    */
   defaultBranch?: string | null;
   sourceFile?: string;
+  /**
+   * The dependency-cache key of the lock file the workflows come from. Written
+   * on every row, like the lock entry it belongs to: an omitted key, or a lock
+   * file that records none, stores no key, so a row never keeps the key of a
+   * lock file it no longer carries the entry of. `commitSha` is written next to
+   * it as the commit the key describes.
+   */
+  depCacheKey?: DepCacheKey;
   /** Set of workflow names that should be marked as global */
   globalWorkflowNames?: Set<string>;
 }
@@ -161,6 +169,11 @@ export class RegistrationStore {
       }
 
       const globalNames = options.globalWorkflowNames ?? new Set<string>();
+      const depCacheKey = {
+        lockfile_hash: options.depCacheKey?.lockfileHash ?? null,
+        siblings_digest: options.depCacheKey?.siblingsDigest ?? null,
+        dep_cache_key_sha: options.commitSha ?? null,
+      };
 
       // 2. For each incoming workflow: UPDATE if exists, INSERT if new
       for (const w of workflows) {
@@ -187,6 +200,7 @@ export class RegistrationStore {
                 default_branch: options.defaultBranch,
               }),
               source_file: options.sourceFile ?? `.kici/workflows/${w.name}.ts`,
+              ...depCacheKey,
               is_global: isGlobal,
               updated_at: new Date(),
             })
@@ -207,6 +221,7 @@ export class RegistrationStore {
               commit_sha: options.commitSha ?? null,
               default_branch: options.defaultBranch ?? null,
               source_file: options.sourceFile ?? `.kici/workflows/${w.name}.ts`,
+              ...depCacheKey,
               is_global: isGlobal,
             })
             .execute();
@@ -378,7 +393,33 @@ function parseRow(row: WorkflowRegistration): RegistrationRow {
     commitSha: row.commit_sha ?? null,
     defaultBranch: row.default_branch ?? null,
     sourceFile: row.source_file ?? null,
+    ...commitBoundDepCacheKey(row),
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+/** The key a registration row carries when its dependency-cache key cannot be trusted. */
+const NO_DEP_CACHE_KEY: DepCacheKey = { lockfileHash: null, siblingsDigest: null };
+
+/**
+ * The row's dependency-cache key, or no key unless it was written for the row's
+ * current commit.
+ *
+ * Every writer that knows the key columns writes `dep_cache_key_sha` with them,
+ * as the commit they describe. A writer that does not know them (an orchestrator
+ * or `kici-admin` from before them, during a rolling upgrade or after a
+ * downgrade) moves `commit_sha` and `lock_entry` and leaves an older lock
+ * file's key behind. Using that key would restore the older lock file's
+ * dependencies for the newer lock entry, so the run installs them on the agent
+ * instead. A row with no commit uses no key either: nothing ties its key to the
+ * lock entry the row carries.
+ */
+function commitBoundDepCacheKey(row: WorkflowRegistration): DepCacheKey {
+  const sha = row.dep_cache_key_sha ?? null;
+  // fails-when: a writer that predates the key columns moved commit_sha to a1 and kept the
+  // key written at a0, and the run restores a0's dependencies
+  // breaks-if-wrong: a key written with the row's current commit is still used
+  if (sha === null || sha !== row.commit_sha) return NO_DEP_CACHE_KEY;
+  return { lockfileHash: row.lockfile_hash ?? null, siblingsDigest: row.siblings_digest ?? null };
 }

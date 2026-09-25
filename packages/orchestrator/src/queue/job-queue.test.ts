@@ -7,6 +7,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { JobQueue, DispatchQueueStatus, type QueuedJobInput } from './job-queue.js';
+import { JobContainerNeed } from '../scaler/agent-fit.js';
 
 // ── Mock helpers ────────────────────────────────────────────────
 
@@ -712,8 +713,9 @@ describe('JobQueue', () => {
       const result = await queue.dequeueById('bound-1', ['linux', 'docker']);
 
       expect(result).not.toBeNull();
-      // id-where (1) + status (2) + expiry (3) + agentLabels @> runsOn (4) + NOT EXISTS (5).
-      expect(db._mocks.where).toHaveBeenCalledTimes(5);
+      // id-where (1) + status (2) + expiry (3) + agentLabels @> runsOn (4) + NOT EXISTS
+      // exclude (5) + stopped-run guard (6).
+      expect(db._mocks.where).toHaveBeenCalledTimes(6);
     });
 
     it('adds the gate predicate when agentMandatoryLabels is non-empty', async () => {
@@ -724,8 +726,8 @@ describe('JobQueue', () => {
       const result = await queue.dequeueById('bound-gated', ['linux', 'gpu'], ['gpu']);
 
       expect(result).not.toBeNull();
-      // 5 baseline + 1 gate predicate = 6.
-      expect(db._mocks.where).toHaveBeenCalledTimes(6);
+      // 6 baseline + 1 gate predicate = 7.
+      expect(db._mocks.where).toHaveBeenCalledTimes(7);
     });
 
     it('returns null when the gate predicate excludes the bound jobId', async () => {
@@ -1085,6 +1087,7 @@ describe('JobQueue', () => {
         runsOnPatterns: [],
         excludeLabels: [],
         excludePatterns: [],
+        container: JobContainerNeed.None,
         unroutableSince: null,
       });
       // A stamped clock comes back as a Date, and the selectors parse
@@ -1215,6 +1218,7 @@ describe('JobQueue', () => {
         runsOnPatterns: [],
         excludeLabels: [],
         excludePatterns: [],
+        container: JobContainerNeed.None,
       });
       expect(result[1]).toEqual({
         id: 'q-2',
@@ -1225,6 +1229,7 @@ describe('JobQueue', () => {
         runsOnPatterns: [],
         excludeLabels: [],
         excludePatterns: [],
+        container: JobContainerNeed.None,
       });
       expect(result[2]).toEqual({
         id: 'q-3',
@@ -1235,8 +1240,44 @@ describe('JobQueue', () => {
         runsOnPatterns: [],
         excludeLabels: [],
         excludePatterns: [],
+        container: JobContainerNeed.None,
       });
       expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
+    });
+
+    it("reads each expired job's container need from its stored config", async () => {
+      const rows = [
+        {
+          id: 'q-1',
+          run_id: 'r',
+          job_name: 'img',
+          job_config: '{"container":"python:3.12"}',
+          ...expirable,
+        },
+        {
+          id: 'q-2',
+          run_id: 'r',
+          job_name: 'df',
+          job_config: '{"container":{"dockerfile":"Dockerfile"}}',
+          ...expirable,
+        },
+        { id: 'q-3', run_id: 'r', job_name: 'plain', job_config: '{"timeout":300}', ...expirable },
+        // A config that does not parse reads as no container, never a throw.
+        { id: 'q-4', run_id: 'r', job_name: 'bad', job_config: '{not json', ...expirable },
+      ];
+      const db = createMockDb({ selectRows: rows as any });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      const result = await queue.markExpired();
+
+      // fails-when: the sweep cannot tell a container job, so it blames the
+      // job's labels when its matching agents only lack a runtime
+      expect(result.map((r) => r.container)).toEqual([
+        JobContainerNeed.Image,
+        JobContainerNeed.Dockerfile,
+        JobContainerNeed.None,
+        JobContainerNeed.None,
+      ]);
     });
 
     it('degrades a malformed selector column to empty instead of stranding the batch', async () => {
@@ -1789,10 +1830,12 @@ describe('JobQueue', () => {
       expect(db.deleteFrom).toHaveBeenCalledWith('dispatch_queue');
       // Only the terminal statuses are eligible — a still-active run's
       // Pending/Dispatched/Recovering rows must never be swept.
+      // `cancelled` is the off-enum terminal status existing databases hold from the test-run cancel.
       expect(db._mocks.deleteWhere).toHaveBeenCalledWith('status', 'in', [
         DispatchQueueStatus.Completed,
         DispatchQueueStatus.Failed,
         DispatchQueueStatus.Expired,
+        'cancelled',
       ]);
       // And the age cutoff is applied (both predicates must hold).
       expect(db._mocks.deleteWhere).toHaveBeenCalledWith('created_at', '<', expect.anything());

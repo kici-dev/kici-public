@@ -42,6 +42,11 @@
  *   sibling closure the deps tarball carries, which no package-manager lock file moves).
  * Schema version 41 (additive): adds LockDynamicJobFn.gitCredentials (named git credential
  *   refs declared by a dynamicJob generator and inherited by every job it generates).
+ * Schema version 42 (additive, conditional reader floor): approval enforced on
+ *   organization-wide workflows. The lock shape is unchanged, but a v41 reader dispatches a
+ *   global workflow without consulting its `approval`, so a lock whose global workflow (or
+ *   one of its static jobs) declares `approval` stamps `minReaderVersion` =
+ *   `GLOBAL_APPROVAL_MIN_READER`. Every other lock keeps `minReaderVersion` = `BREAKING_FLOOR`.
  */
 
 import { z } from 'zod';
@@ -57,7 +62,7 @@ import { isFailureStatus } from '../status/presentation.js';
  * schema change (additive or breaking); the bump-history comment above records
  * which. See `BREAKING_FLOOR` for the compatibility-window semantics.
  */
-export const SCHEMA_VERSION = 41 as const;
+export const SCHEMA_VERSION = 42 as const;
 
 /**
  * Oldest lock schema version this codebase can still read correctly — the lower
@@ -75,6 +80,17 @@ export const SCHEMA_VERSION = 41 as const;
  * reads correctly.
  */
 export const BREAKING_FLOOR = 30 as const;
+
+/**
+ * Reader version a lock must require when an organization-wide workflow in it
+ * (a workflow with a trigger carrying `repos:`), or one of that workflow's
+ * static jobs, declares `approval`. Readers below this version run a global
+ * workflow's jobs without holding them for approval, so they must refuse such a
+ * lock rather than dispatch it ungated. Not a `BREAKING_FLOOR` move: the lock
+ * shape is unchanged, and locks without a gated global workflow stay readable by
+ * every orchestrator down to the floor.
+ */
+export const GLOBAL_APPROVAL_MIN_READER = 42 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler
@@ -999,8 +1015,8 @@ export type LockJobOrFactory = LockJob | LockDynamicJobFn;
 /**
  * Private npm registry declaration in the lock file.
  * Carries the URL/scope/secret-reference but NOT the resolved token —
- * the orchestrator resolves the token at dispatch time via the per-context
- * secretResolver.resolveForJob path.
+ * the orchestrator resolves the token at dispatch time through the named
+ * context's secret bindings.
  */
 export interface LockRegistry {
   readonly url: string;
@@ -1030,7 +1046,11 @@ export interface LockWorkflow {
   readonly hashFiles?: string[];
   /** Resolved paths (relative to repo root) used to compute contentHash. Enables agent to verify hash without re-discovering workflow. Optional. */
   readonly resolvedHashFiles?: string[];
-  /** Secret contexts declared by the workflow. Orchestrator validates access before dispatch. Optional. */
+  /**
+   * Context names bound by every job of the workflow, gated per job like job-level
+   * contexts. They come before each job's own contexts, so a job-level context wins
+   * a key collision. Optional.
+   */
   readonly contexts?: readonly string[];
   /**
    * Private npm registries the agent should authenticate against before `npm install`.
@@ -1083,9 +1103,11 @@ export interface LockWorkflow {
 export interface LockFile {
   readonly schemaVersion: typeof SCHEMA_VERSION;
   /**
-   * The newest breaking schema version at emit time (the compiler stamps
-   * `BREAKING_FLOOR`). A reader whose own `SCHEMA_VERSION` is below this value
-   * predates a breaking change the lock relies on and must reject it. Absent on
+   * The oldest reader schema version that handles this lock correctly. The
+   * compiler stamps `BREAKING_FLOOR`, or `GLOBAL_APPROVAL_MIN_READER` when an
+   * organization-wide workflow in the lock declares `approval`. A reader whose
+   * own `SCHEMA_VERSION` is below this value would mis-handle the lock and must
+   * reject it. Absent on
    * pre-window locks, in which case the reader falls back to exact-match
    * strictness (see `assertLockFileSchemaCompatible`).
    */

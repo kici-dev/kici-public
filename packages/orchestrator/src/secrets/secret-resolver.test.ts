@@ -1,7 +1,7 @@
 /**
  * Tests for SecretResolver (context-binding-based resolution).
  *
- * The resolver takes an org + context name, looks up bindings,
+ * The resolver takes an org + the matched context row, reads that row's bindings,
  * matches them against scoped secrets via resolveSecretsWithProvenance,
  * decrypts matching secrets, and returns a flat key-value map.
  *
@@ -17,10 +17,6 @@ import type { Logger } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
 // ── Mock stores ────────────────────────────────────────────────
-
-interface MockContextStore {
-  getByName: ReturnType<typeof vi.fn>;
-}
 
 interface MockBindingStore {
   getByContextId: ReturnType<typeof vi.fn>;
@@ -73,14 +69,12 @@ function makeLogger(): Logger {
 }
 
 describe('SecretResolver', () => {
-  let envStore: MockContextStore;
   let bindingStore: MockBindingStore;
   let secretStore: MockSecretStore;
   let auditLogger: AuditLogger;
   let logger: Logger;
 
   beforeEach(() => {
-    envStore = { getByName: vi.fn() };
     bindingStore = { getByContextId: vi.fn() };
     secretStore = {
       getAllSecrets: vi.fn(),
@@ -98,7 +92,6 @@ describe('SecretResolver', () => {
       }
     }
     return new SecretResolver({
-      contextStore: envStore as any,
       bindingStore: bindingStore as any,
       backendStores,
       auditLogger,
@@ -107,7 +100,6 @@ describe('SecretResolver', () => {
   }
 
   it('resolves secrets for context with matching bindings', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
@@ -126,35 +118,100 @@ describe('SecretResolver', () => {
     );
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'production');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     expect(result).toEqual({ DB_PASSWORD: 'dbpw', API_KEY: 'apikey' });
   });
 
-  it('returns empty secrets when no context is found', async () => {
-    envStore.getByName.mockResolvedValue(null);
+  it('resolves a glob context through its own row, not through the declared name', async () => {
+    // A job declares 'deploy-prod'; the dispatch path matched the glob
+    // context 'deploy-*' (row env-glob), which holds the binding. No context
+    // is named 'deploy-prod', so any name lookup would find nothing.
+    bindingStore.getByContextId.mockImplementation(async (contextId: string) =>
+      contextId === 'env-glob' ? [makeBinding({ contextId, scopePattern: 'pg:deploy/**' })] : [],
+    );
+    secretStore.getAllSecrets.mockResolvedValue([
+      makeScopedSecret({ scope: 'deploy/prod', key: 'DEPLOY_TOKEN', encryptedValue: 'enc:tok' }),
+    ]);
+    secretStore.decrypt.mockImplementation((s: ScopedSecret) =>
+      s.encryptedValue.replace('enc:', ''),
+    );
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'nonexistent');
+    const result = await resolver.resolveForContext('org-1', {
+      id: 'env-glob',
+      name: 'deploy-prod',
+    });
+
+    // fails-when: the resolver looks the context up by the declared name again
+    expect(result).toEqual({ DEPLOY_TOKEN: 'tok' });
+    expect(bindingStore.getByContextId).toHaveBeenCalledWith('env-glob');
+    // The audit entry names the context the job declared.
+    expect(auditLogger.log).toHaveBeenCalledWith(
+      expect.objectContaining({ contextName: 'deploy-prod' }),
+    );
+  });
+
+  it('records the run and job a resolution is attributed to', async () => {
+    bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'pg:ci/**' })]);
+    secretStore.getAllSecrets.mockResolvedValue([
+      makeScopedSecret({ scope: 'ci/forge', key: 'FORGE_PAT', encryptedValue: 'enc:pat' }),
+    ]);
+    secretStore.decrypt.mockImplementation((s: ScopedSecret) =>
+      s.encryptedValue.replace('enc:', ''),
+    );
+
+    const resolver = createResolver();
+    await resolver.resolveForContext('org-1', { id: 'env-ci', name: 'ci' }, undefined, {
+      runId: 'run-1',
+      jobId: 'build',
+    });
+    await resolver.resolveForContext('org-1', { id: 'env-ci', name: 'ci' });
+
+    const [attributed, unattributed] = vi.mocked(auditLogger.log).mock.calls.map((c) => c[0]);
+    // fails-when: a job's qualified reference is audited with no run or job
+    expect(attributed).toMatchObject({ runId: 'run-1', jobId: 'build' });
+    // breaks-if-wrong: a dispatch-path resolution keeps its null attribution
+    expect(unattributed).toMatchObject({ runId: null, jobId: null });
+  });
+
+  it('returns empty secrets when the matched row no longer has bindings', async () => {
+    // A row deleted between the match and the resolution has no bindings left.
+    bindingStore.getByContextId.mockResolvedValue([]);
+
+    const resolver = createResolver();
+    const result = await resolver.resolveForContext('org-1', { id: 'env-gone', name: 'x' });
 
     expect(result).toEqual({});
+    expect(secretStore.getAllSecrets).not.toHaveBeenCalled();
+  });
+
+  it('counts the bindings of the context row', async () => {
+    bindingStore.getByContextId.mockImplementation(async (contextId: string) =>
+      contextId === 'env-bound' ? [makeBinding(), makeBinding({ id: 'b-2' })] : [],
+    );
+
+    const resolver = createResolver();
+
+    // fails-when: the count reads another row's bindings, or a constant
+    expect(await resolver.countContextBindings('env-bound')).toBe(2);
+    expect(await resolver.countContextBindings('env-unbound')).toBe(0);
+    expect(bindingStore.getByContextId).toHaveBeenCalledWith('env-unbound');
   });
 
   it('returns empty secrets when context has no bindings', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'staging', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([]);
     secretStore.getAllSecrets.mockResolvedValue([
       makeScopedSecret({ scope: 'aws/prod/db', key: 'DB_PASSWORD' }),
     ]);
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'staging');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'staging' });
 
     expect(result).toEqual({});
   });
 
   it('merges with longest-path-wins when multiple bindings match', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:**' }),
       makeBinding({ id: 'bind-2', scopePattern: 'pg:aws/prod/**' }),
@@ -174,14 +231,13 @@ describe('SecretResolver', () => {
     );
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'production');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     // aws/prod/db (3 segments) beats aws/shared (2 segments) for DB_HOST
     expect(result).toEqual({ DB_HOST: 'prod-host' });
   });
 
   it('returns empty when binding patterns do not match any secrets', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'staging', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:gcp/staging/**' }),
     ]);
@@ -190,13 +246,12 @@ describe('SecretResolver', () => {
     ]);
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'staging');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'staging' });
 
     expect(result).toEqual({});
   });
 
   it('decrypts all matched secrets', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
@@ -220,25 +275,23 @@ describe('SecretResolver', () => {
     );
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'production');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     expect(result).toEqual({ KEY_A: 'aaa', KEY_B: 'bbb', KEY_C: 'ccc' });
     expect(secretStore.decrypt).toHaveBeenCalledTimes(3);
   });
 
   it('throws when a referenced backend store is unreachable', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'pg:**' })]);
     secretStore.getAllSecrets.mockRejectedValue(new Error('Connection refused'));
 
     const resolver = createResolver();
-    await expect(resolver.resolveForJob('org-1', 'production')).rejects.toThrow(
-      /Secret backend 'pg' is unreachable.*Connection refused/,
-    );
+    await expect(
+      resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' }),
+    ).rejects.toThrow(/Secret backend 'pg' is unreachable.*Connection refused/);
   });
 
   it('succeeds when unreferenced vault backend is down but PG bindings are satisfied', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     // Binding only references pg secrets
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
@@ -259,7 +312,7 @@ describe('SecretResolver', () => {
     };
 
     const resolver = createResolver(new Map([['vault-prod', vaultStore]]));
-    const result = await resolver.resolveForJob('org-1', 'production');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     // Should succeed — vault-prod being down doesn't affect pg-only bindings
     expect(result).toEqual({ DB_PASSWORD: 'pw' });
@@ -273,7 +326,6 @@ describe('SecretResolver', () => {
   });
 
   it('fails when vault backend is down and binding could match it', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     // Binding explicitly references vault-prod
     bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'vault-prod:**' })]);
 
@@ -289,13 +341,12 @@ describe('SecretResolver', () => {
     };
 
     const resolver = createResolver(new Map([['vault-prod', vaultStore]]));
-    await expect(resolver.resolveForJob('org-1', 'production')).rejects.toThrow(
-      /Secret backend 'vault-prod' is unreachable.*Connection refused/,
-    );
+    await expect(
+      resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' }),
+    ).rejects.toThrow(/Secret backend 'vault-prod' is unreachable.*Connection refused/);
   });
 
-  it('resolveForJobWithMeta also applies scoped failure logic', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
+  it('resolveForContextWithMeta also applies scoped failure logic', async () => {
     bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'vault-prod:**' })]);
 
     secretStore.getAllSecrets.mockResolvedValue([]);
@@ -306,13 +357,12 @@ describe('SecretResolver', () => {
     };
 
     const resolver = createResolver(new Map([['vault-prod', vaultStore]]));
-    await expect(resolver.resolveForJobWithMeta('org-1', 'production')).rejects.toThrow(
-      /Secret backend 'vault-prod' is unreachable/,
-    );
+    await expect(
+      resolver.resolveForContextWithMeta('org-1', { id: 'env-1', name: 'production' }),
+    ).rejects.toThrow(/Secret backend 'vault-prod' is unreachable/);
   });
 
   it('all backends healthy works as before (regression)', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
@@ -324,7 +374,7 @@ describe('SecretResolver', () => {
     );
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJob('org-1', 'production');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     expect(result).toEqual({ DB_PASSWORD: 'pw' });
     // No warning should be logged when all backends are healthy
@@ -332,7 +382,6 @@ describe('SecretResolver', () => {
   });
 
   it('resolves secrets from multiple backends', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:**' }),
       makeBinding({ id: 'bind-2', scopePattern: 'vault-prod:**' }),
@@ -360,7 +409,7 @@ describe('SecretResolver', () => {
     };
 
     const resolver = createResolver(new Map([['vault-prod', vaultStore]]));
-    const result = await resolver.resolveForJob('org-1', 'production');
+    const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     expect(result).toEqual({
       DB_PASSWORD: 'pg-pw',
@@ -369,7 +418,6 @@ describe('SecretResolver', () => {
   });
 
   it('audit log only includes backends that contributed resolved secrets', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     // Binding only matches pg secrets (not vault-prod)
     bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
@@ -397,7 +445,7 @@ describe('SecretResolver', () => {
     };
 
     const resolver = createResolver(new Map([['vault-prod', vaultStore]]));
-    await resolver.resolveForJob('org-1', 'production');
+    await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     // Audit log should only list 'pg', NOT 'vault-prod'
     const logCall = (auditLogger as any).log.mock.calls[0]?.[0];
@@ -405,8 +453,7 @@ describe('SecretResolver', () => {
     expect(logCall.metadata.backends).toEqual(['pg']);
   });
 
-  it('resolveForJobWithMeta returns backend metadata per ', async () => {
-    envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
+  it('resolveForContextWithMeta returns backend metadata per ', async () => {
     bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'pg:**' })]);
     secretStore.getAllSecrets.mockResolvedValue([
       makeScopedSecret({ scope: 'aws/prod', key: 'DB_PASSWORD', encryptedValue: 'enc:pw' }),
@@ -416,7 +463,10 @@ describe('SecretResolver', () => {
     );
 
     const resolver = createResolver();
-    const result = await resolver.resolveForJobWithMeta('org-1', 'production');
+    const result = await resolver.resolveForContextWithMeta('org-1', {
+      id: 'env-1',
+      name: 'production',
+    });
 
     expect(result.DB_PASSWORD).toBeDefined();
     expect(result.DB_PASSWORD.value).toBe('pw');
@@ -528,7 +578,6 @@ describe('SecretResolver', () => {
 
   describe('per-host resolution (hostCtx)', () => {
     function seedHostScopedEnv() {
-      envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
       bindingStore.getByContextId.mockResolvedValue([
         makeBinding({ scopePattern: 'pg:prod/shared/**', hostPattern: '**' }),
         makeBinding({
@@ -560,16 +609,24 @@ describe('SecretResolver', () => {
     it('resolves a different per-host value for the same key via one templated binding', async () => {
       seedHostScopedEnv();
       const resolver = createResolver();
-      const r2 = await resolver.resolveForJob('org-1', 'production', {
-        agentId: 'box-00002',
-        host: 'box-00002',
-        labels: [],
-      });
-      const r3 = await resolver.resolveForJob('org-1', 'production', {
-        agentId: 'box-00003',
-        host: 'box-00003',
-        labels: [],
-      });
+      const r2 = await resolver.resolveForContext(
+        'org-1',
+        { id: 'env-1', name: 'production' },
+        {
+          agentId: 'box-00002',
+          host: 'box-00002',
+          labels: [],
+        },
+      );
+      const r3 = await resolver.resolveForContext(
+        'org-1',
+        { id: 'env-1', name: 'production' },
+        {
+          agentId: 'box-00003',
+          host: 'box-00003',
+          labels: [],
+        },
+      );
       expect(r2).toEqual({ REPL: 'shared', WG: 'wg-2' });
       expect(r3).toEqual({ REPL: 'shared', WG: 'wg-3' });
     });
@@ -577,18 +634,22 @@ describe('SecretResolver', () => {
     it('without hostCtx, the templated binding is skipped (only ** non-templated resolves)', async () => {
       seedHostScopedEnv();
       const resolver = createResolver();
-      const result = await resolver.resolveForJob('org-1', 'production');
+      const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
       expect(result).toEqual({ REPL: 'shared' });
     });
 
-    it('resolveForJobWithMeta threads hostCtx and reports the host-scoped backend/scope', async () => {
+    it('resolveForContextWithMeta threads hostCtx and reports the host-scoped backend/scope', async () => {
       seedHostScopedEnv();
       const resolver = createResolver();
-      const meta = await resolver.resolveForJobWithMeta('org-1', 'production', {
-        agentId: 'box-00002',
-        host: 'box-00002',
-        labels: [],
-      });
+      const meta = await resolver.resolveForContextWithMeta(
+        'org-1',
+        { id: 'env-1', name: 'production' },
+        {
+          agentId: 'box-00002',
+          host: 'box-00002',
+          labels: [],
+        },
+      );
       expect(meta.WG?.value).toBe('wg-2');
       expect(meta.WG?.scope).toBe('pg:prod/hosts/box-00002');
     });

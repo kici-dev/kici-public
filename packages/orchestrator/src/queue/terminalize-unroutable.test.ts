@@ -8,11 +8,15 @@ import {
 import {
   classifyUnroutable,
   type JobRoutingFacts,
+  makeCanRouteLabels,
   terminalizeUnroutableJob,
   unroutableMessage,
   type TerminalizeDeps,
 } from './terminalize-unroutable.js';
 import { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
+import { AgentRegistry } from '../agent/registry.js';
+import { JobContainerNeed } from '../scaler/agent-fit.js';
+import { mockWs } from '../__test-helpers__/mock-ws.js';
 
 /**
  * The routing facts as `rowToExpiredJobInfo` produces them: selectors are given
@@ -99,6 +103,141 @@ describe('classifyUnroutable', () => {
     );
     expect(r.errorMessage).toContain('/gpu-.*/i');
     expect(r.errorMessage).not.toContain('[object Object]');
+  });
+});
+
+describe('a container job nothing can start', () => {
+  /**
+   * Labels route for a plain job and not for a container one: the agents that
+   * match cannot start a container.
+   */
+  const labelsOnly = (
+    _l: string[],
+    _p: LabelMatcher[],
+    _e: string[],
+    _x: LabelMatcher[],
+    job?: {
+      container: JobContainerNeed;
+    },
+  ) => (job?.container ?? JobContainerNeed.None) === JobContainerNeed.None;
+
+  it('is unroutable, and says the matching agents lack a container runtime', () => {
+    const verdict = classifyUnroutable(
+      { ...facts({ runsOnLabels: ['linux'] }), id: 'q-1', container: JobContainerNeed.Image },
+      labelsOnly,
+    );
+
+    // fails-when: the job waits out the queue timeout as timed_out_stale, or
+    // fails with a message telling its author to fix a correct runsOn
+    expect(verdict.status).toBe(ExecutionJobStatus.enum.unroutable);
+    expect(verdict.errorMessage).toBe(
+      "No connected agent can start this job's container: the agents that match runsOn " +
+        '[linux] report neither kici:runtime:docker nor kici:runtime:podman, and no scaler ' +
+        'backend matches — the job was never dispatched',
+    );
+  });
+
+  it('keeps the label message when no agent matches the labels either', () => {
+    const verdict = classifyUnroutable(
+      { ...facts({ runsOnLabels: ['linux'] }), container: JobContainerNeed.Image },
+      () => false,
+    );
+    expect(verdict.errorMessage).toContain(
+      'No connected agent or scaler backend currently matches',
+    );
+  });
+
+  it('leaves a plain job on the same fleet routable', () => {
+    // breaks-if-wrong: an agent that cannot start containers still routes plain jobs
+    const verdict = classifyUnroutable(
+      { ...facts({ runsOnLabels: ['linux'] }), container: JobContainerNeed.None },
+      labelsOnly,
+    );
+    expect(verdict.unroutable).toBe(false);
+  });
+});
+
+describe("a job whose only matching agents run other jobs' images", () => {
+  /**
+   * An agent carries the labels, and refuses every job it is asked to fit: the
+   * shape of a fleet whose only matching agents were each started inside
+   * another job's image.
+   */
+  const labelsMatchNoFit = (
+    _l: string[],
+    _p: LabelMatcher[],
+    _e: string[],
+    _x: LabelMatcher[],
+    job?: { container: JobContainerNeed },
+  ) => job === undefined;
+
+  const IMAGE_AGENTS_MESSAGE =
+    'No connected agent can take this job: the agents that match runsOn [linux] were each ' +
+    "started inside another job's image and run only that job, and no scaler backend " +
+    'matches — the job was never dispatched';
+
+  it('is unroutable, and says the matching agents run other jobs', () => {
+    const verdict = classifyUnroutable(
+      { ...facts({ runsOnLabels: ['linux'] }), id: 'q-1', container: JobContainerNeed.None },
+      labelsMatchNoFit,
+    );
+
+    // fails-when: the job is told no agent matches its correct runsOn
+    expect(verdict.status).toBe(ExecutionJobStatus.enum.unroutable);
+    expect(verdict.errorMessage).toBe(IMAGE_AGENTS_MESSAGE);
+  });
+
+  it('says the same of a container job, which those agents refuse as well', () => {
+    const verdict = classifyUnroutable(
+      { ...facts({ runsOnLabels: ['linux'] }), id: 'q-1', container: JobContainerNeed.Image },
+      labelsMatchNoFit,
+    );
+    expect(verdict.errorMessage).toBe(IMAGE_AGENTS_MESSAGE);
+  });
+
+  it('keeps the label message when no connected agent carries the labels', () => {
+    // breaks-if-wrong: a runsOn that matches nothing must still be named as the cause
+    const verdict = classifyUnroutable(
+      { ...facts({ runsOnLabels: ['linux'] }), container: JobContainerNeed.None },
+      () => false,
+    );
+    expect(verdict.errorMessage).toContain(
+      'No connected agent or scaler backend currently matches runsOn [linux]',
+    );
+  });
+});
+
+describe('makeCanRouteLabels', () => {
+  const imageJob = { jobId: 'q-1', container: JobContainerNeed.Image };
+
+  it('counts only an agent that can start the container, with no scaler', () => {
+    const registry = new AgentRegistry();
+    registry.register('static-1', mockWs(), ['linux'], 'linux', 'x64', '0.10.0');
+    const canRoute = makeCanRouteLabels({ registry });
+
+    // fails-when: a runtime-less 0.10.0 agent counts as a route for a container job
+    expect(canRoute(['linux'], [], [], [], imageJob)).toBe(false);
+    // breaks-if-wrong: the same agent routes a plain job, and routes labels alone
+    expect(canRoute(['linux'], [], [], [], { container: JobContainerNeed.None })).toBe(true);
+    expect(canRoute(['linux'], [], [], [])).toBe(true);
+
+    registry.register(
+      'static-2',
+      mockWs(),
+      ['linux', 'kici:runtime:docker'],
+      'linux',
+      'x64',
+      '0.10.0',
+    );
+    expect(canRoute(['linux'], [], [], [], imageJob)).toBe(true);
+  });
+
+  it('reads a matching scaler backend as a route, since it can start an agent for the job', () => {
+    const canRoute = makeCanRouteLabels({
+      registry: new AgentRegistry(),
+      scaler: { hasBackendForLabels: () => true, agentView: () => undefined },
+    });
+    expect(canRoute(['linux'], [], [], [], imageJob)).toBe(true);
   });
 });
 

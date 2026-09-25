@@ -1,13 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture the module logger so the unresolvable-bundle test can assert WHICH
-// routing key the failure names. No other test in this file inspects logging.
+// routing key the failure names, and the re-fired release tests which level
+// they log at.
 const mockError = vi.hoisted(() => vi.fn());
+const mockWarn = vi.hoisted(() => vi.fn());
+const mockInfo = vi.hoisted(() => vi.fn());
 vi.mock('@kici-dev/shared', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@kici-dev/shared')>();
   return {
     ...actual,
-    createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: mockError, debug: vi.fn() }),
+    createLogger: () => ({ info: mockInfo, warn: mockWarn, error: mockError, debug: vi.fn() }),
   };
 });
 
@@ -18,8 +21,15 @@ vi.mock('./dispatch-matched-workflow.js', () => ({
   dispatchMatchedWorkflow: (...args: unknown[]) => dispatchMatchedWorkflow(...args),
 }));
 
-import { resumeWorkflow, rejectWorkflow } from './resume-workflow.js';
 import {
+  resumeWorkflow,
+  rejectWorkflow,
+  rebuildWorkflowDispatchContext,
+  withWorkflowRepoCredentials,
+} from './resume-workflow.js';
+import type { WorkflowDispatchContext } from './dispatch-matched-workflow.js';
+import {
+  toSerializableInputs,
   storePendingWorkflowContext,
   loadPendingWorkflowContext,
   clearPendingWorkflowContextsMap,
@@ -28,6 +38,7 @@ import {
 import type { ReleaseSignal } from '../contexts/held-runs.js';
 import {
   CheckRunConclusion,
+  ExecutionRunStatus,
   HoldScope,
   HoldType,
   INSTALL_JOB_ID_PREFIX,
@@ -37,6 +48,7 @@ import {
 } from '@kici-dev/engine';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 import type { SecurityCheckHold } from './security-hold-check.js';
+import { JobSecretsUnsealError } from '../secrets/job-secret-seal.js';
 
 /** The `held_runs.job_id` a workflow install-gate hold carries. */
 const INSTALL_GATE_JOB_ID = installGateJobId('CI');
@@ -61,6 +73,26 @@ const RUN_ROW = {
  */
 function makeDb(runRow: unknown = RUN_ROW, contenders: unknown[] = []) {
   return createMockDb({ selectFirstRow: runRow, selectRows: contenders }).db;
+}
+
+/**
+ * A database answering `executeTakeFirst` per table: the run row, and the first
+ * job row (or none). The shared mock answers every table with one row.
+ */
+function makeRunAndJobsDb(runRow: unknown, jobRow: unknown) {
+  const byTable: Record<string, unknown> = { execution_runs: runRow, execution_jobs: jobRow };
+  return {
+    selectFrom: (table: string) => {
+      const chain = {
+        select: () => chain,
+        selectAll: () => chain,
+        where: () => chain,
+        limit: () => chain,
+        executeTakeFirst: async () => byTable[table],
+      };
+      return chain;
+    },
+  } as unknown as Parameters<typeof resumeWorkflow>[2];
 }
 
 /** A database in which the hold's run row is gone, so no commit can be named. */
@@ -174,6 +206,166 @@ const signal: ReleaseSignal = {
   triggerSource: TriggerSource.enum.context,
 };
 
+/** Routing keys of the global-resume tests: the inbound source and the workflow repository's. */
+enum GlobalKey {
+  Source = 'github:1',
+  Workflow = 'github:ci',
+}
+
+/** The identity a global run was held with: the workflow repository at commit `a1`. */
+const HELD_GLOBAL = {
+  workflowRepoIdentifier: 'org/ci',
+  workflowSha: 'a1',
+  workflowBranch: 'main',
+  workflowRoutingKey: GlobalKey.Workflow,
+  workflowProviderContext: { installationId: 7 },
+};
+
+/** Stored inputs of a held global run, after the JSON round trip the DB column performs. */
+function heldGlobalInputs(base = makeInputs()): SerializableWorkflowDispatchInputs {
+  const live = {
+    ...base,
+    deps: {},
+    bundle: {},
+    workflowRepoIdentifier: 'org/ci',
+    global: {
+      ...HELD_GLOBAL,
+      // Stripped when stored: a live bundle and a token minted at hold time.
+      workflowBundle: { normalizer: { provider: 'github' } },
+      workflowCredentials: { installationId: 7, token: 'held-token' },
+    },
+  };
+  return JSON.parse(JSON.stringify(toSerializableInputs(live as never)));
+}
+
+/**
+ * Deps whose workflow bundle mints `fresh-token`, and whose registration index
+ * reports the workflow repository at `sha` — the live registration, which a
+ * resume must not read.
+ */
+function depsWithRegistrationAt(sha: string, mint = vi.fn().mockResolvedValue('fresh-token')) {
+  const workflowBundle = {
+    normalizer: { provider: 'github' },
+    cloneTokenProvider: { createCloneToken: mint },
+  };
+  const liveReg = { ...HELD_GLOBAL, repoIdentifier: 'org/ci', commitSha: sha };
+  return makeDeps({
+    providerRegistry: {
+      getByRoutingKey: vi.fn((key: string) =>
+        key === GlobalKey.Workflow ? workflowBundle : key === GlobalKey.Source ? bundle : undefined,
+      ),
+    },
+    registrationIndex: {
+      getByOrgAndRepo: vi.fn().mockReturnValue(liveReg),
+      getGlobalByTriggerType: vi.fn().mockReturnValue([liveReg]),
+    },
+  });
+}
+
+describe('resuming a held global run', () => {
+  beforeEach(() => {
+    clearPendingWorkflowContextsMap();
+    dispatchMatchedWorkflow.mockClear();
+    mockError.mockClear();
+  });
+
+  it('stores the global identity without its bundle or credentials', () => {
+    const stored = heldGlobalInputs();
+    // fails-when: the stored identity carries the live bundle or the hold-time token
+    expect(stored.global).toEqual(HELD_GLOBAL);
+  });
+
+  it('resume after hold dispatches the held workflow_sha, not the current registration', () => {
+    // fails-when: resume rebuilds ctx.global from the live registration (new sha 'b2')
+    // breaks-if-wrong: a held same-repo run must resume exactly as today (no global)
+    const deps = depsWithRegistrationAt('b2');
+    const ctx = rebuildWorkflowDispatchContext(heldGlobalInputs(), deps);
+    expect(ctx!.global!.workflowSha).toBe('a1');
+    expect(ctx!.global!.workflowBranch).toBe('main');
+    expect(ctx!.workflowRepoIdentifier).toBe('org/ci');
+    expect(ctx!.global!.workflowBundle).toBe(
+      deps.providerRegistry.getByRoutingKey(GlobalKey.Workflow),
+    );
+    expect(ctx!.bundle).toBe(bundle);
+  });
+
+  it('rebuilds a held global run as a context the dispatch cannot take before the mint', async () => {
+    const deps = depsWithRegistrationAt('b2', vi.fn().mockResolvedValue('fresh-token'));
+    const rebuilt = rebuildWorkflowDispatchContext(heldGlobalInputs(), deps)!;
+    // fails-when: the rebuilt context is a WorkflowDispatchContext, so this assignment typechecks
+    // and a caller can dispatch a global run with no clone token
+    // @ts-expect-error -- a rebuilt global identity carries no workflow-repository credentials
+    const unminted: WorkflowDispatchContext = rebuilt;
+    expect(unminted.global).not.toHaveProperty('workflowCredentials');
+    // breaks-if-wrong: the mint turns the same context into one the dispatch takes
+    const minted: WorkflowDispatchContext = await withWorkflowRepoCredentials(rebuilt);
+    expect(minted.global?.workflowCredentials).toEqual({ installationId: 7, token: 'fresh-token' });
+  });
+
+  it('rebuilds a held same-repo run with no global identity', () => {
+    // breaks-if-wrong: the same-repo control — nothing global appears on a per-repo resume
+    const ctx = rebuildWorkflowDispatchContext(makeInputs(), depsWithRegistrationAt('b2'));
+    expect(ctx!.global).toBeUndefined();
+    expect(ctx!.workflowRepoIdentifier).toBe('a/b');
+  });
+
+  it('re-mints the workflow repository credentials before the resumed dispatch', async () => {
+    await storePendingWorkflowContext(undefined, heldGlobalInputs());
+    const mint = vi.fn().mockResolvedValue('fresh-token');
+    const deps = depsWithRegistrationAt('b2', mint);
+
+    await resumeWorkflow(signal, deps, undefined);
+
+    expect(dispatchMatchedWorkflow).toHaveBeenCalledTimes(1);
+    const [ctx] = dispatchMatchedWorkflow.mock.calls[0];
+    expect(mint).toHaveBeenCalledWith('org/ci', { installationId: 7 });
+    // fails-when: the resumed dispatch carries no token, or the one stored at hold time
+    expect(ctx.global.workflowCredentials).toEqual({ installationId: 7, token: 'fresh-token' });
+    expect(ctx.global.workflowSha).toBe('a1');
+  });
+
+  it("fails the run when the workflow repository's source is gone", async () => {
+    await storePendingWorkflowContext(undefined, heldGlobalInputs());
+    const deps = makeDeps({
+      providerRegistry: {
+        getByRoutingKey: vi.fn((key: string) => (key === GlobalKey.Source ? bundle : undefined)),
+      },
+    });
+
+    await resumeWorkflow(signal, deps, undefined);
+
+    expect(dispatchMatchedWorkflow).not.toHaveBeenCalled();
+    expect(deps.executionTracker.failRun).toHaveBeenCalledWith(
+      'run1',
+      expect.stringContaining('provider bundle unresolvable'),
+      expect.anything(),
+    );
+    const unresolvable = mockError.mock.calls.find(
+      (c) => c[0] === 'Workflow hold resume: provider bundle unresolvable',
+    );
+    expect(unresolvable?.[1]).toMatchObject({ workflowRoutingKey: GlobalKey.Workflow });
+    expect(await loadPendingWorkflowContext(undefined, 'run1')).toBeNull();
+  });
+
+  it('fails the run and closes its checks when the credential mint fails', async () => {
+    await storePendingWorkflowContext(undefined, heldGlobalInputs(makeInputsWithJobs()));
+    const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
+    const deps = depsWithRegistrationAt('b2', vi.fn().mockRejectedValue(new Error('revoked')));
+    deps.checkRunReporter = { completeUndispatchedCheckRuns };
+
+    await resumeWorkflow(signal, deps, undefined);
+
+    expect(dispatchMatchedWorkflow).not.toHaveBeenCalled();
+    expect(deps.executionTracker.failRun).toHaveBeenCalledWith(
+      'run1',
+      expect.stringContaining('workflow repository credentials unavailable'),
+      expect.anything(),
+    );
+    expect(completeUndispatchedCheckRuns).toHaveBeenCalledTimes(1);
+    expect(await loadPendingWorkflowContext(undefined, 'run1')).toBeNull();
+  });
+});
+
 describe('resumeWorkflow', () => {
   beforeEach(() => {
     clearPendingWorkflowContextsMap();
@@ -231,6 +423,25 @@ describe('resumeWorkflow', () => {
     expect(dispatchMatchedWorkflow.mock.calls[0][0].bundle).toBe(registrationBundle);
   });
 
+  it('abandons a held run whose stored secrets cannot be decrypted', async () => {
+    await storePendingWorkflowContext(undefined, {
+      ...makeInputsWithJobs(),
+      secretsUnavailable: new JobSecretsUnsealError('run1', 'bad key').message,
+    } as SerializableWorkflowDispatchInputs);
+    const deps = makeDeps();
+
+    await resumeWorkflow(signal, deps, undefined);
+
+    // fails-when: the run resumes without the CLI and test-run secrets it was held with
+    expect(dispatchMatchedWorkflow).not.toHaveBeenCalled();
+    expect(deps.executionTracker.failRun).toHaveBeenCalledWith(
+      'run1',
+      expect.stringContaining('finish the key rotation on every coordinator'),
+      expect.anything(),
+    );
+    expect(await loadPendingWorkflowContext(undefined, 'run1')).toBeNull();
+  });
+
   it('fails the run loudly when the pending context is lost', async () => {
     const deps = makeDeps();
     await resumeWorkflow(signal, deps, undefined);
@@ -239,6 +450,67 @@ describe('resumeWorkflow', () => {
       'run1',
       expect.stringContaining('pending context lost'),
       expect.objectContaining({ scope: 'run', category: 'install_secrets' }),
+    );
+  });
+
+  it('leaves a run another release already resumed alone when its context is gone', async () => {
+    // fails-when: a re-fired release fails the run the first release resumed
+    const deps = makeDeps();
+    await resumeWorkflow(
+      signal,
+      deps,
+      makeDb({ ...RUN_ROW, status: ExecutionRunStatus.enum.pending }),
+    );
+    expect(dispatchMatchedWorkflow).not.toHaveBeenCalled();
+    expect(deps.executionTracker.failRun).not.toHaveBeenCalled();
+  });
+
+  it('warns when the run another release claimed has no jobs', async () => {
+    mockWarn.mockClear();
+    mockInfo.mockClear();
+    const deps = makeDeps();
+    await resumeWorkflow(
+      signal,
+      deps,
+      makeRunAndJobsDb({ ...RUN_ROW, status: ExecutionRunStatus.enum.pending }, undefined),
+    );
+    // fails-when: a pending row with no job rows (a stranded claim) is logged at info
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.stringContaining('has no jobs'),
+      expect.objectContaining({ runId: 'run1', status: ExecutionRunStatus.enum.pending }),
+    );
+    expect(deps.executionTracker.failRun).not.toHaveBeenCalled();
+  });
+
+  it('logs at info when the run another release claimed already has jobs', async () => {
+    // breaks-if-wrong: a re-fired release racing a live resume is routine, not a warning
+    mockWarn.mockClear();
+    mockInfo.mockClear();
+    const deps = makeDeps();
+    await resumeWorkflow(
+      signal,
+      deps,
+      makeRunAndJobsDb({ ...RUN_ROW, status: ExecutionRunStatus.enum.pending }, { job_id: 'j1' }),
+    );
+    expect(mockWarn).not.toHaveBeenCalled();
+    expect(mockInfo).toHaveBeenCalledWith(
+      expect.stringContaining('already resumed by another release'),
+      expect.objectContaining({ runId: 'run1' }),
+    );
+  });
+
+  it('still fails a run that is held and lost its context', async () => {
+    // breaks-if-wrong: a genuinely lost context on a held run must still fail the run
+    const deps = makeDeps();
+    await resumeWorkflow(
+      signal,
+      deps,
+      makeDb({ ...RUN_ROW, status: ExecutionRunStatus.enum.held }),
+    );
+    expect(deps.executionTracker.failRun).toHaveBeenCalledWith(
+      'run1',
+      expect.stringContaining('pending context lost'),
+      expect.anything(),
     );
   });
 
@@ -329,8 +601,8 @@ describe('resumeWorkflow', () => {
      *
      * This pins the derivation, NOT a withheld secret. On this path the flag
      * changes nothing: `resolveInstallSecrets` strips an untrusted
-     * contributor's secrets and returns before `fireProtectionRulesPerEnv`, the
-     * only reader of `skipProtectionGate`, and a trust-policy hold always
+     * contributor's secrets and returns before the install gate, whose release
+     * path is all `skipProtectionGate` selects, and a trust-policy hold always
      * carries a non-trusted tier. The case the derivation actually covers is a
      * run with NO tier, which `isUntrustedTier` reads leniently — see
      * `skipsInstallGate`.

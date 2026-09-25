@@ -1,7 +1,7 @@
 /**
- * Master-key rotation sweeps for the four wrapped stores `rotate-key` did not
+ * Master-key rotation sweeps for the wrapped stores `rotate-key` did not
  * cover: the provenance signing key, the dashboard-encryption key, run
- * ephemeral keys, and stored secret outputs.
+ * ephemeral keys, stored secret outputs, and the sealed secrets of stored jobs.
  *
  * Each sweep runs in its own transaction with the same skip-and-count
  * discipline as `BackendRegistry.rotateKey` — a row neither key opens is
@@ -18,6 +18,8 @@ import { unwrapPrivateJwk, wrapPrivateJwk } from '../oidc/db-signer.js';
 import type { ResolvedMasterKeys } from './config.js';
 import { PRIVATE_KEY_AAD } from './ephemeral-keys.js';
 import { secretOutputAad } from './secret-output-crypto.js';
+import { JOB_SECRETS_KEY_VERSION, jobSecretsAad } from './job-secret-seal.js';
+import { TERMINAL_DISPATCH_STATUSES } from '../queue/job-queue.js';
 
 /** One store's rotation outcome. Mirrors the three existing sweeps' shape. */
 export interface SweepResult {
@@ -31,6 +33,8 @@ export interface MasterKeyRotationResult {
   dashboardKeys: SweepResult;
   ephemeralKeys: SweepResult;
   secretOutputs: SweepResult;
+  /** `sealed_secrets` of `dispatch_queue`, `pending_job_contexts` and `pending_workflow_contexts`. */
+  jobSecrets: SweepResult;
 }
 
 /** Try the current key, then the old one. Null when neither opens the value. */
@@ -237,7 +241,151 @@ async function sweepSecretOutputs(
 }
 
 /**
- * Run all four sweeps, each in its own transaction so a bug in one cannot roll
+ * Re-seal one stored job's `sealed_secrets` under the current key. Returns the
+ * new ciphertext, or null (and warns) when neither key opens it.
+ */
+function resealJobSecrets(
+  runId: string,
+  sealed: string,
+  keys: ResolvedMasterKeys,
+  warn: Warn,
+  where: Record<string, unknown>,
+): string | null {
+  const aad = jobSecretsAad(runId);
+  const plaintext = openWithEitherKey(sealed, JOB_SECRETS_KEY_VERSION, aad, keys);
+  if (plaintext === null) {
+    warn(
+      'stored job secrets undecryptable under both master keys — skipped during rotation',
+      where,
+    );
+    return null;
+  }
+  return encrypt(plaintext, keys.current, JOB_SECRETS_KEY_VERSION, aad).data;
+}
+
+/** Rows of `dispatch_queue` one rotation transaction re-seals. */
+export const JOB_SECRETS_SWEEP_BATCH = 500;
+
+/** A sweep's running counts, and the one place a re-seal outcome is tallied. */
+function jobSecretsTally(): {
+  result: SweepResult;
+  counted: (next: string | null) => next is string;
+} {
+  const result: SweepResult = { reEncrypted: 0, skipped: 0 };
+  const counted = (next: string | null): next is string => {
+    if (next === null) result.skipped++;
+    else result.reEncrypted++;
+    return next !== null;
+  };
+  return { result, counted };
+}
+
+/**
+ * Re-seal the live rows of `dispatch_queue`, in batches of
+ * {@link JOB_SECRETS_SWEEP_BATCH}, each in its own transaction, so the sweep
+ * never holds the row locks of a busy queue for the whole pass. Terminal rows
+ * are skipped: the cleanup tick drops their seals. Pages by id, so a skipped
+ * row is not read again.
+ */
+async function sweepQueuedJobSecrets(
+  db: Kysely<Database>,
+  keys: ResolvedMasterKeys,
+  warn: Warn,
+  counted: (next: string | null) => next is string,
+): Promise<void> {
+  let afterId: string | undefined;
+  for (;;) {
+    const batch = await db.transaction().execute(async (trx) => {
+      let query = trx
+        .selectFrom('dispatch_queue')
+        .select(['id', 'run_id', 'sealed_secrets'])
+        .where('sealed_secrets', 'is not', null)
+        .where('status', 'not in', TERMINAL_DISPATCH_STATUSES);
+      if (afterId !== undefined) query = query.where('id', '>', afterId);
+      const rows = await query.orderBy('id').limit(JOB_SECRETS_SWEEP_BATCH).execute();
+      for (const row of rows) {
+        const next = resealJobSecrets(row.run_id, row.sealed_secrets!, keys, warn, {
+          table: 'dispatch_queue',
+          jobId: row.id,
+        });
+        if (!counted(next)) continue;
+        // fails-when: a row a concurrent write re-sealed is overwritten with the ciphertext read here
+        // breaks-if-wrong: a row nothing touched since the read is re-sealed
+        await trx
+          .updateTable('dispatch_queue')
+          .set({ sealed_secrets: next })
+          .where('id', '=', row.id)
+          .where('sealed_secrets', '=', row.sealed_secrets)
+          .execute();
+      }
+      return rows;
+    });
+    if (batch.length < JOB_SECRETS_SWEEP_BATCH) return;
+    afterId = batch[batch.length - 1].id;
+  }
+}
+
+/**
+ * Re-seal `sealed_secrets` in the three tables a stored job waits in. Each
+ * UPDATE matches the ciphertext it read, so a row a concurrent write replaced
+ * is left to that write rather than clobbered. The queue is swept in bounded
+ * batches; the pending job and workflow contexts, which hold only jobs that
+ * wait, each in one transaction.
+ */
+async function sweepJobSecrets(
+  db: Kysely<Database>,
+  keys: ResolvedMasterKeys,
+  warn: Warn,
+): Promise<SweepResult> {
+  const { result, counted } = jobSecretsTally();
+  await sweepQueuedJobSecrets(db, keys, warn, counted);
+  await db.transaction().execute(async (trx) => {
+    const pendingJobs = await trx
+      .selectFrom('pending_job_contexts')
+      .select(['run_id', 'job_name', 'sealed_secrets'])
+      .where('sealed_secrets', 'is not', null)
+      .execute();
+    for (const row of pendingJobs) {
+      const next = resealJobSecrets(row.run_id, row.sealed_secrets!, keys, warn, {
+        table: 'pending_job_contexts',
+        runId: row.run_id,
+        jobName: row.job_name,
+      });
+      if (!counted(next)) continue;
+      await trx
+        .updateTable('pending_job_contexts')
+        .set({ sealed_secrets: next })
+        .where('run_id', '=', row.run_id)
+        .where('job_name', '=', row.job_name)
+        .where('sealed_secrets', '=', row.sealed_secrets)
+        .execute();
+    }
+  });
+  await db.transaction().execute(async (trx) => {
+    const pendingWorkflows = await trx
+      .selectFrom('pending_workflow_contexts')
+      .select(['run_id', 'sealed_secrets'])
+      .where('sealed_secrets', 'is not', null)
+      .execute();
+    for (const row of pendingWorkflows) {
+      const next = resealJobSecrets(row.run_id, row.sealed_secrets!, keys, warn, {
+        table: 'pending_workflow_contexts',
+        runId: row.run_id,
+      });
+      if (!counted(next)) continue;
+      await trx
+        .updateTable('pending_workflow_contexts')
+        .set({ sealed_secrets: next })
+        .where('run_id', '=', row.run_id)
+        .where('sealed_secrets', '=', row.sealed_secrets)
+        .execute();
+    }
+  });
+  return result;
+}
+
+/**
+ * Run all the sweeps, each in its own transaction so a bug in one cannot roll
  * back a good rotation of another. Order is least-to-most volume, so the
  * singleton key tables — the two whose loss brings the orchestrator down — move
  * first.
@@ -252,6 +400,7 @@ export async function rotateMasterKeyWrappedTables(
     dashboardKeys: await sweepDashboardKeys(db, keys, warn),
     ephemeralKeys: await sweepEphemeralKeys(db, keys, warn),
     secretOutputs: await sweepSecretOutputs(db, keys, warn),
+    jobSecrets: await sweepJobSecrets(db, keys, warn),
   };
 }
 

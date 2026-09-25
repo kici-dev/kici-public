@@ -82,7 +82,9 @@ The container backend provides the strongest practical isolation for most deploy
 
 - Agent runs on the host (or in its own container)
 - Each job gets a disposable Docker/Podman container
-- The entire job lifecycle (git clone, dependency install, compile, step execution) runs inside the container
+- The agent clones the repository on the host and copies the tree in, so clone credentials stay on the host
+- Every workflow step runs inside the container. The job's own `.kici/` dependency install runs on the host only for an allowlisted npm or pnpm project, outside the checkout, with lifecycle scripts, hooks and git dependencies disabled. It contacts only the registries the operator allows (`KICI_HOST_INSTALL_REGISTRIES`); otherwise it runs inside the container too (see [Where `.kici/` dependencies install](../agent/configuration.md#where-kici-dependencies-install))
+- The `__build__`, `__init__`, `__dynamic__` and `__globaleval__` jobs are not container jobs. An agent with the `builder` and `init-runner` roles, the default when `KICI_ROLES` is unset, runs them on its host. They install `.kici/` there with the project's own package manager, and all of them except `__build__` also import the workflow module there. Set `KICI_ROLES=` on the agents that run container jobs to keep that work on dedicated agents (see [Agent roles](../agent/configuration.md#agent-roles))
 - Agent credentials never enter the container environment
 - Container is torn down after each job
 
@@ -372,30 +374,20 @@ To make custom environment variables available to workflow steps:
 
 ### Isolation and containment options
 
-| Variable                         | Default | What it does                                                                                                                                                                                                                                                                                                                         |
-| -------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `KICI_RUNNER_USER`               | unset   | Run the bare-metal runner child under a dedicated uid (`uid`, `uid:gid`, or a user name), instead of the agent's own. The job workdir is chowned to it before the child starts. An unresolvable value fails the job rather than silently falling back.                                                                               |
-| `KICI_SANDBOX_NETWORK_ISOLATION` | `true`  | Apply the nftables filtering to nested job containers: RFC1918 and cloud-metadata drops on what they reach through the host, and a host-access filter that leaves DNS on the bridge gateway as the only reachable host service. Needs `NET_ADMIN` and `nft`; without them the agent warns and the container keeps unfiltered egress. |
-| `KICI_ALLOW_INSTALL_SCRIPTS`     | `false` | Re-enable package lifecycle scripts during the `.kici/` dependency install. Off by default on every package manager, because a `postinstall` in a committed `package.json` is customer code executed by whichever process runs the install.                                                                                          |
-| `KICI_RUNNER_DEBUG_STDIO`        | `false` | Echo the runner child's raw stdout and stderr onto the agent's own stderr. Off by default: for a scaler-spawned agent that stream is copied into the orchestrator's journal, where it is readable without the `runs:read` check that guards the run log and with no per-org scoping. The masked run log is the log.                  |
+| Variable                         | Default | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_RUNNER_USER`               | unset   | Run the bare-metal runner child under a dedicated uid (`uid`, `uid:gid`, or a user name), instead of the agent's own. The job workdir is chowned to it before the child starts. An unresolvable value fails the job rather than silently falling back.                                                                                                                                                                                                                                                                                |
+| `KICI_SANDBOX_NETWORK_ISOLATION` | `true`  | Apply the nftables filtering to nested job containers: RFC1918 and cloud-metadata drops on what they reach through the host, and a host-access filter that leaves DNS on the bridge gateway as the only reachable host service. Needs `NET_ADMIN` and `nft`; without them the agent warns and the container keeps unfiltered egress.                                                                                                                                                                                                  |
+| `KICI_ALLOW_INSTALL_SCRIPTS`     | `false` | Re-enable package lifecycle scripts during the `.kici/` dependency install. Off by default on every package manager, because a `postinstall` in a committed `package.json` is customer code executed by whichever process runs the install. Enabling it also moves a container job's install from the agent host into the job container, so a container job's lifecycle scripts never run on the host. The `builder` and `init-runner` role jobs still install on the agent host, and run lifecycle scripts there once it is enabled. |
+| `KICI_HOST_INSTALL_REGISTRIES`   | unset   | Comma-separated registry origins a container job's `.kici/` install on the agent host may contact, besides the public npm registry and the agent user's own `~/.npmrc` registries. The host install runs outside the job network's egress filter, so a registry a workflow or its `.kici/.npmrc` names qualifies only when its origin is listed here; otherwise the job container installs instead. See [Registries the host install may contact](../agent/configuration.md#registries-the-host-install-may-contact).                 |
+| `KICI_RUNNER_DEBUG_STDIO`        | `false` | Echo the runner child's raw stdout and stderr onto the agent's own stderr. Off by default: for a scaler-spawned agent that stream is copied into the orchestrator's journal, where it is readable without the `runs:read` check that guards the run log and with no per-org scoping. The masked run log is the log.                                                                                                                                                                                                                   |
 
 Each is read from agent config only, never from a dispatch payload or a
 workflow, so a pull request cannot turn one on for itself.
 
 ## Container image requirements
 
-When using the container backend, the container image must have:
-
-- **Node.js** installed (v24 or later recommended)
-- **git** installed (for repository cloning)
-- Standard POSIX utilities (sh, mkdir, rm, etc.)
-
-The workflow runner and its TypeScript loader hook are bind-mounted read-only into the container at `/opt/kici/workflow-runner.js` and `/opt/kici/ts-loader-hook.js` -- neither needs to be baked into the image. Both are self-contained bundles, so the image only needs Node.js, git, and standard POSIX utilities (above); the runner clones the repository, installs dependencies, compiles, and runs each step inside the container.
-
-Recommended base images:
-
-- `node:24-alpine` -- Lightweight, includes Node.js and git
-- `node:24-slim` -- Debian-based, smaller than full image
+The workflow runner and its TypeScript loader hook are bind-mounted read-only into the container at `/opt/kici/workflow-runner.js` and `/opt/kici/ts-loader-hook.js` -- neither needs to be baked into the image. The agent clones the repository on the host, and with an injected runtime (`KICI_RUNTIME_IMAGE` or `KICI_RUNTIME_NODE_SOURCE`) it also mounts its own Node build. The image then needs only glibc and `/bin/sh`. Without an injected runtime the image supplies its own `node`. See [What a job image must provide](../agent/configuration.md#what-a-job-image-must-provide) for the full table.
 
 ## Bubblewrap (Bare-Metal)
 

@@ -20,6 +20,8 @@ WORKDIR /app
 # ("Permission denied") when invoked directly. Restore +x after activation.
 # Retry corepack prepare: the pnpm tarball download (fetchUrlStream) can fail on
 # a transient registry hiccup, which would otherwise fail the whole image build.
+# COREPACK_HOME matches the runtime stage, where the cache location matters.
+ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable \
   && { n=0; until corepack prepare pnpm@11.3.0 --activate; do \
          n=$((n+1)); [ "$n" -ge 5 ] && { echo "corepack prepare pnpm failed after $n attempts" >&2; exit 1; }; \
@@ -140,7 +142,9 @@ RUN rm -f .npmrc \
 #   it never needs a bump). Berry (v2+) is per-repo version-pinned via the repo's
 #   `packageManager` field; corepack auto-fetches that version on demand at
 #   install time (no baked berry version possible), so the agent needs network
-#   egress when installing a berry project's deps.
+#   egress when installing a berry project's deps. The fetched version lands in
+#   the agent user's own corepack cache, or next to the baked ones in
+#   /opt/corepack for a process that inherits the agent's COREPACK_HOME.
 # - @kici-dev/shared/ts-loader-hook: TS transform on import (uses oxc-transform,
 #   a native N-API binding; pre-baked in the builder stage and copied verbatim)
 # Optional host-level tools (not included, operator installs): bwrap, docker/podman.
@@ -226,6 +230,19 @@ RUN apt-get update \
 # ("Permission denied") when invoked directly. Restore +x after activation.
 # Retry each corepack prepare: the tarball download (fetchUrlStream) can fail on
 # a transient registry hiccup, which would otherwise fail the whole image build.
+#
+# The baked versions live in /opt/corepack, owned by root, so the agent (uid
+# 1000 `node`) finds them without a download and can never modify them. The
+# agent's host install runs /opt/corepack/v1/pnpm/11.3.0 directly and checks no
+# hash, so the `node` user must not be able to write those files. The three
+# directories that hold versions are sticky and world-writable (1777) on
+# purpose: a repository that pins another version (yarn berry, another pnpm)
+# must keep working, so corepack must be able to add that version there. The
+# sticky bit keeps the pinned files root-owned: `node` cannot rename or remove
+# root's entries.
+# COREPACK_DEFAULT_TO_LATEST=0 stops corepack from rewriting the root-owned
+# lastKnownGood.json after it adds a newer version of the same major.
+ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable \
   && { n=0; until corepack prepare pnpm@11.3.0 --activate; do \
          n=$((n+1)); [ "$n" -ge 5 ] && { echo "corepack prepare pnpm failed after $n attempts" >&2; exit 1; }; \
@@ -235,7 +252,12 @@ RUN corepack enable \
          n=$((n+1)); [ "$n" -ge 5 ] && { echo "corepack prepare yarn failed after $n attempts" >&2; exit 1; }; \
          echo "corepack prepare yarn failed (attempt $n), retrying in 5s..." >&2; sleep 5; \
        done; } \
-  && chmod a+x /usr/lib/nodejs/corepack/dist/*.js
+  && chmod a+x /usr/lib/nodejs/corepack/dist/*.js \
+  && chown -R root:root "$COREPACK_HOME" \
+  && chmod -R u=rwX,go=rX "$COREPACK_HOME" \
+  && chmod 1777 "$COREPACK_HOME/v1" "$COREPACK_HOME/v1/pnpm" "$COREPACK_HOME/v1/yarn" \
+  && test -f "$COREPACK_HOME/v1/pnpm/11.3.0/bin/pnpm.cjs"
+ENV COREPACK_DEFAULT_TO_LATEST=0
 
 # KiCI-provisioned portable Node runtime, mounted read-only into a job's own
 # container at /opt/kici/node.

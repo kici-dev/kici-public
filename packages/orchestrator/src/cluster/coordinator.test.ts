@@ -1858,6 +1858,31 @@ describe('RunCoordinator', () => {
       const sentMsg = peerClient.sendAndWaitAck.mock.calls[0][0];
       expect(sentMsg.cloneToken).toBe('ghs_test_token_123');
     });
+
+    it("includes the workflow repo's clone token in the reroute message when the RunContext carries one", async () => {
+      async function sent(runCtx: ReturnType<typeof makeRunContext>) {
+        const peer = makePeerInfo({ instanceId: 'peer-1' });
+        const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
+        const { coordinator, deps } = createCoordinator();
+        deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+        deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
+        deps.getPeerClient.mockReturnValue(peerClient);
+        await coordinator.routeJobs(runCtx, [makeJobToRoute({ jobName: 'build' })]);
+        return peerClient.sendAndWaitAck.mock.calls[0][0];
+      }
+      // fails-when: buildRerouteMessage drops workflowCloneToken, so the worker clones the workflow repo with the source token
+      const globalMsg = await sent({
+        ...makeRunContext(),
+        cloneToken: 'src-tok',
+        workflowCloneToken: 'wf-tok',
+      });
+      expect(globalMsg.cloneToken).toBe('src-tok');
+      expect(globalMsg.workflowCloneToken).toBe('wf-tok');
+      // breaks-if-wrong: a same-repository run must send no workflow clone token
+      const sameRepoMsg = await sent({ ...makeRunContext(), cloneToken: 'src-tok' });
+      expect(sameRepoMsg.workflowCloneToken).toBeUndefined();
+      expect(sameRepoMsg.cloneToken).toBe('src-tok');
+    });
   });
 
   describe('hasConnectedPeers', () => {

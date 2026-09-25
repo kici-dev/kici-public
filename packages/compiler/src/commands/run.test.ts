@@ -147,6 +147,7 @@ const overlay = {
   },
   manifest: { sha: 'abc123', deletions: [], checksums: {} },
   hasRemote: true,
+  warnings: [] as string[],
 };
 
 describe('kici run command', () => {
@@ -714,6 +715,23 @@ describe('kici run command', () => {
       const infoCalls = vi.mocked(logger.info).mock.calls.map((c) => String(c[0]));
       expect(infoCalls.some((line) => line.includes('local working tree'))).toBe(true);
       expect(infoCalls.some((line) => line.includes('git steps work'))).toBe(true);
+    });
+
+    it('prints each overlay warning on stderr, also under --json', async () => {
+      const warning = 'Not uploading the files of these submodules: vendor/sub.';
+      createOverlayTarball.mockResolvedValue({ ...overlay, warnings: [warning] });
+      const stderr: string[] = [];
+      const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+        stderr.push(String(chunk));
+        return true;
+      });
+      try {
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false, json: true });
+      } finally {
+        spy.mockRestore();
+      }
+      // fails-when: a warning is only logged through the stdout logger, which --json silences
+      expect(stderr.some((line) => line.includes(warning))).toBe(true);
     });
   });
 });

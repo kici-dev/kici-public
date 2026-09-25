@@ -159,25 +159,27 @@ This separation means the secrets subsystem focuses on storage and encryption, w
 
 ## Secret resolution at dispatch time
 
-The `SecretResolver` orchestrates the full resolution flow. It resolves secrets for a job by matching context bindings against scoped secrets:
+The `SecretResolver` orchestrates the full resolution flow. It resolves the secrets of one context row by matching that row's bindings against scoped secrets:
 
 ```typescript
-resolveForJob(
+resolveForContext(
   orgId: string,
-  contextName: string,
+  context: MatchedContextRef, // { id, name }
   hostCtx?: HostFacts,
+  attribution?: SecretResolutionAttribution, // { runId?, jobId? }
 ): Promise<Record<string, string>>
 ```
 
+The resolver never looks a context up by name. The dispatch path matches the name the job declared, exact name first and then a glob context whose pattern matches, and runs that row's protection rules. It then hands the resolver the matched row's `id` together with the declared `name`, so the secrets come from the same row the rules ran against. The `name` labels the audit entry and keys the per-context namespace.
+
 Resolution steps:
 
-1. Look up the context by name in the org
-2. Get secret scope bindings for that context
-3. Load all scoped secrets for the org (across every registered backend, each scope prefixed with its backend name)
-4. Match and merge by the precedence tuple `(host specificity, scope depth)` -- a per-host binding beats a fleet-wide one, then longest scope path wins (via the engine's `resolveSecretsForContext`, which delegates precedence to `resolveSecretsWithProvenance`)
-5. Return a flat `Record<string, string>` of decrypted secrets
+1. Get the secret scope bindings of the matched row (`id`)
+2. Load all scoped secrets for the org (across every registered backend, each scope prefixed with its backend name)
+3. Match and merge by the precedence tuple `(host specificity, scope depth)` -- a per-host binding beats a fleet-wide one, then longest scope path wins (via the engine's `resolveSecretsForContext`, which delegates precedence to `resolveSecretsWithProvenance`)
+4. Return a flat `Record<string, string>` of decrypted secrets
 
-The optional `hostCtx` carries a fan-out child's identity. When supplied, each binding is gated by its `host_pattern` and its `scope_pattern` is templated per-child (`${agentId}` / `${host}` / `${label:NAME}`); when omitted, only fleet-wide (`'**'`) non-templated bindings contribute. `resolveForJobWithMeta` returns the same resolution with per-key provenance instead of bare values.
+The optional `hostCtx` carries a fan-out child's identity. When supplied, each binding is gated by its `host_pattern` and its `scope_pattern` is templated per-child (`${agentId}` / `${host}` / `${label:NAME}`); when omitted, only fleet-wide (`'**'`) non-templated bindings contribute. `resolveForContextWithMeta` returns the same resolution with per-key provenance instead of bare values. The optional `attribution` names the run and job in the audit entry; the dispatch path leaves it unset.
 
 `hostCtx` carries the hostname and the labels in canonical (lowercase) form, and the agent ID verbatim. `host_pattern` matching follows that split: the agent ID compares exactly, so a binding written for `prod-01` cannot reach an agent named `PROD-01`, while the hostname and the labels compare case-insensitively.
 
@@ -185,8 +187,8 @@ The same fold reaches `scope_pattern` templating: `${host}` and `${label:NAME}` 
 
 ## Job-originated qualified references
 
-`resolveForJob` covers a job's **bound** contexts — the ones its `contexts:`
-list names. Two features let a workflow name a secret directly instead, in
+A job's **bound** contexts — the ones its `contexts:` list names — resolve at
+dispatch as above. Two features let a workflow name a secret directly instead, in
 qualified `<context>:<secret-name>` form: a job's `gitCredentials` map and a
 container job's registry `auth`. The reference names its own context, which by
 design need not be one the job binds — the published examples for both features
@@ -210,10 +212,23 @@ It runs four checks before reading anything:
    lands. Container-registry references come from the lock by construction, and
    for an untrusted pull request from the **base** branch's lock.
 
-The direct lookup that applies none of these is
+The value is then read through the bindings of the context row the protection
+rules ran against (`resolveForContext`), the same resolution a bound context's
+secrets take. For a name only a glob context matches, that is the glob row. The
+audit entry records the run and job the reference was resolved for.
+
+One deprecated fallback remains until v1.0.0. It applies when the bound
+resolution lacks the key, and the matched row carries the exact referenced name
+and is not a glob context. The row may bind no scope, or bind scopes that do not
+carry the key. The scope named after the context is then read instead, and the
+orchestrator logs a deprecation warning naming the org, context, run and job. A
+glob-matched row never reads a scope that merely shares its name.
+
+The direct lookup that applies none of these checks is
 `SecretResolverApi.resolveNamedInternal`. Its name says so: it is for
-system-scoped callers resolving the orchestrator's own credentials, and a
-job-originated reference never reaches it except through the gate above.
+system-scoped callers resolving the orchestrator's own credentials. A
+job-originated reference reaches it only through the deprecated fallback above,
+after every check of the gate has passed.
 
 ### Reserved namespaces
 

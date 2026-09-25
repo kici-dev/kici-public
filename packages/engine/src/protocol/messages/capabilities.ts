@@ -177,3 +177,52 @@ export function hasOrchAgentCapability(
 ): boolean {
   return (capabilities as Record<string, unknown> | undefined)?.[flag] === true;
 }
+
+/**
+ * Agent -> Orchestrator capabilities, advertised on `agent.register`. Same
+ * evolution contract as the other directions: every field optional, absent =
+ * unsupported, `.passthrough()` preserves a newer agent's unknown flags. Lets
+ * the orchestrator route work that depends on an optional agent behaviour only
+ * to agents that implement it.
+ */
+export const agentCapabilitiesSchema = z
+  .object({
+    /**
+     * In a pre-run global eval round the agent runs only the needs-free
+     * `DynamicJobFn`s and skips every generator declared with upstream `needs`
+     * (a result-aware generator). Such a generator runs later, on the run's
+     * deferred path, with its upstream outputs. An agent without this flag runs
+     * every generator in the round — including a result-aware one, which then
+     * sees no upstream outputs and produces the wrong jobs — so the
+     * orchestrator sends a round containing a result-aware generator only to an
+     * agent that advertises it.
+     */
+    globalEvalSkipsResultAwareGenerators: z.boolean().optional(),
+  })
+  .passthrough();
+
+/** Flag names of {@link agentCapabilitiesSchema}, for {@link hasAgentCapability} lookups. */
+export const AgentCapabilityFlag = z.enum(['globalEvalSkipsResultAwareGenerators']);
+export type AgentCapabilityFlag = z.infer<typeof AgentCapabilityFlag>;
+
+/** Inferred type for agent -> orchestrator capabilities. */
+export type AgentCapabilities = z.infer<typeof agentCapabilitiesSchema>;
+
+/** Default agent -> orchestrator capabilities advertised on agent.register. */
+export const AGENT_CAPABILITIES = Object.freeze({
+  globalEvalSkipsResultAwareGenerators: true,
+} satisfies AgentCapabilities);
+
+/**
+ * Check whether an agent advertises a specific capability flag.
+ *
+ * Takes `string` (not `keyof`) because a newer agent may advertise flags this
+ * orchestrator build doesn't know about. Returns false if capabilities is
+ * undefined (pre-capability agent) or the flag is missing/false.
+ */
+export function hasAgentCapability(
+  capabilities: AgentCapabilities | null | undefined,
+  flag: string,
+): boolean {
+  return (capabilities as Record<string, unknown> | null | undefined)?.[flag] === true;
+}

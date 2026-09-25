@@ -35,7 +35,7 @@ const sampleRun = {
   parentRunId: null,
   triggeredBy: null,
   failureReason: null,
-  environment: null,
+  context: null,
   trustTier: null,
   createdAt: '2026-04-07T10:00:00.000Z',
 };
@@ -426,6 +426,81 @@ describe('kici-admin runs CLI commands', () => {
 
       expect(stdout).toContain('No jobs.');
     });
+
+    it('R-15: an organization-wide run shows where its workflow is defined', async () => {
+      mockGetRun.mockResolvedValue({
+        run: {
+          ...sampleRunDetail,
+          workflowRepoIdentifier: 'acme/org-workflows',
+          workflowSha: 'def5678def5678',
+          workflowBranch: 'main',
+        },
+      });
+      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+
+      // fails-when: the header omits any of the three provenance lines
+      expect(stdout).toContain('Defined in:  acme/org-workflows (organization-wide workflow)');
+      expect(stdout).toContain('Workflow SHA: def5678def5678');
+      expect(stdout).toContain('Workflow branch: main');
+    });
+
+    it('R-16: a run of the repository own workflow prints no provenance lines', async () => {
+      mockGetRun.mockResolvedValue({
+        run: {
+          ...sampleRunDetail,
+          workflowRepoIdentifier: null,
+          workflowSha: null,
+          workflowBranch: null,
+        },
+      });
+      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+
+      // fails-when: a null provenance still prints a "Defined in:" line
+      // breaks-if-wrong: the ordinary header lines must still print
+      expect(stdout).not.toContain('Defined in:');
+      expect(stdout).not.toContain('Workflow SHA:');
+      expect(stdout).not.toContain('Workflow branch:');
+      expect(stdout).toContain('Repo:        owner/repo');
+    });
+
+    it('R-17: a provenance naming the run own repo prints no "Defined in" line', async () => {
+      mockGetRun.mockResolvedValue({
+        run: { ...sampleRunDetail, workflowRepoIdentifier: 'owner/repo' },
+      });
+      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+
+      // fails-when: the line is gated on "set" alone, unlike the dashboard,
+      // which shows "Defined in" only when the two repositories differ
+      expect(stdout).not.toContain('Defined in:');
+    });
+
+    it('R-18: --json carries the workflow provenance fields', async () => {
+      mockGetRun.mockResolvedValue({
+        run: {
+          ...sampleRunDetail,
+          workflowRepoIdentifier: 'acme/org-workflows',
+          workflowSha: 'def5678',
+          workflowBranch: 'main',
+        },
+      });
+      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123', '--json'], client);
+
+      // fails-when: the --json path filters the run object down to known keys
+      expect(JSON.parse(stdout).run).toMatchObject({
+        workflowRepoIdentifier: 'acme/org-workflows',
+        workflowSha: 'def5678',
+        workflowBranch: 'main',
+      });
+    });
+
+    it('R-19: the run context prints on its own line', async () => {
+      mockGetRun.mockResolvedValue({ run: { ...sampleRunDetail, context: 'production' } });
+      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+
+      // fails-when: the header reads a field the route does not send
+      // (`environment`), so the context line never prints
+      expect(stdout).toContain('Context:     production');
+    });
   });
 
   describe('runs jobs', () => {
@@ -651,6 +726,76 @@ describe('kici-admin runs CLI commands', () => {
 
       expect(mockGet).not.toHaveBeenCalled();
       expect(stderr).toContain('--job');
+    });
+
+    const EMPTY_PAGE = { runId: 'r', jobId: 'j', totalLines: 0, nextCursor: null, lines: [] };
+
+    it('R-54: --step=-1 with no setup log recorded says so on stderr', async () => {
+      mockGet.mockResolvedValue({ ...EMPTY_PAGE, stepIndex: -1, recorded: false });
+
+      const { stdout, stderr } = await runCommand(
+        ['runs', 'logs', 'r', '--job', 'j', '--step=-1'],
+        client,
+      );
+
+      // fails-when: a job that never wrote a setup log prints nothing at all,
+      // exactly like one whose setup log is empty
+      expect(stdout).toBe('');
+      expect(stderr).toBe('(no setup log recorded for this job)');
+    });
+
+    it('R-55: --step=-1 with an empty stored setup log says it is empty', async () => {
+      mockGet.mockResolvedValue({ ...EMPTY_PAGE, stepIndex: -1, recorded: true });
+
+      const { stdout, stderr } = await runCommand(
+        ['runs', 'logs', 'r', '--job', 'j', '--step=-1'],
+        client,
+      );
+
+      expect(stdout).toBe('');
+      expect(stderr).toBe('(the setup log for this job is empty)');
+    });
+
+    it('R-56: a regular step names its index in the empty-log note', async () => {
+      mockGet.mockResolvedValue({ ...EMPTY_PAGE, stepIndex: 2, recorded: false });
+
+      const { stderr } = await runCommand(
+        ['runs', 'logs', 'r', '--job', 'j', '--step', '2'],
+        client,
+      );
+
+      expect(stderr).toBe('(no log recorded for step 2)');
+    });
+
+    it('R-57: no note when the orchestrator does not report recorded, or the step has lines', async () => {
+      // breaks-if-wrong: an older orchestrator's empty page keeps the silent output
+      mockGet.mockResolvedValueOnce({ ...EMPTY_PAGE, stepIndex: -1 });
+      const older = await runCommand(['runs', 'logs', 'r', '--job', 'j', '--step=-1'], client);
+      expect(older.stderr).toBe('');
+
+      mockGet.mockResolvedValueOnce({
+        ...EMPTY_PAGE,
+        stepIndex: -1,
+        totalLines: 1,
+        lines: [{ untrusted: true, value: '[host-checkout] Clone complete' }],
+        recorded: true,
+      });
+      const withLines = await runCommand(['runs', 'logs', 'r', '--job', 'j', '--step=-1'], client);
+      expect(withLines.stdout).toBe('[host-checkout] Clone complete');
+      expect(withLines.stderr).toBe('');
+    });
+
+    it('R-58: --json prints the response and no note', async () => {
+      const response = { ...EMPTY_PAGE, stepIndex: -1, recorded: false };
+      mockGet.mockResolvedValue(response);
+
+      const { stdout, stderr } = await runCommand(
+        ['runs', 'logs', 'r', '--job', 'j', '--step=-1', '--json'],
+        client,
+      );
+
+      expect(JSON.parse(stdout)).toEqual(response);
+      expect(stderr).toBe('');
     });
 
     it('R-53: an API error is reported and exits 1', async () => {

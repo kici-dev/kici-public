@@ -280,7 +280,7 @@ async function recordExecutionStart(args: {
     undefined, // triggerActorUserId
     triggeredByAgentLabel, // triggeredByAgentLabel
     undefined, // prNumber
-    undefined, // workflowRepoIdentifier
+    undefined, // workflowRepo
     // A manual schedule is a registration-driven dispatch with no pull request
     // anywhere in its provenance, so `false` is its true resolved fork state —
     // the same reasoning a push follows. Leaving it unresolved would make the

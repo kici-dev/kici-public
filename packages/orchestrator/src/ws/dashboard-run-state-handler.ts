@@ -59,6 +59,7 @@ export async function handleRunState(
       'triggered_by_agent_label',
       'failure_reason',
       'failure_class',
+      'status_epoch',
     ])
     .where('run_id', '=', req.runId)
     .executeTakeFirst();
@@ -100,6 +101,7 @@ export async function handleRunState(
     startedAt: row.started_at.getTime(),
     ...(row.completed_at && { completedAt: row.completed_at.getTime() }),
     ...(row.duration_ms !== null && { durationMs: row.duration_ms }),
+    statusEpoch: row.status_epoch ?? 0,
     jobs,
   };
 

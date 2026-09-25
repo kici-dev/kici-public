@@ -115,13 +115,9 @@ This means an operator on `allow` does not get a hold when a fork pull request e
 
 ### Organization-wide global workflows
 
-Organization-wide global workflows do not run for a pull request the fork switch holds. A neutral informational check on its own check name (`KiCI: Organization workflows`) records that they were skipped, so it never writes over the `KiCI Security` check the hold owns.
+The fork switch holds a pull request's organization-wide global runs together with its own runs. Each global run is held in the security queue with its own pending checks, and approving the hold dispatches it under the same untrusted tier and reductions. A global workflow that needs a pre-run evaluation is held as one evaluation run per workflow repository (`__globaleval__<owner>/<repo>`); approving it runs the evaluation at the workflow repository commit recorded with the hold. Rejecting a hold cancels the held global run like any other; an expired hold fails it with an expiry reason.
 
-When the repository has no lock file of its own there is no dispatch path and no run to hold, so the event produces only the neutral skipped notice. Nothing is dispatched either way; the difference is only in how much the pull request is told.
-
-A skipped global workflow has no run row and therefore no held run, so approving the event's hold releases the pull request's own workflows only. It does not retroactively run the organization's global workflows for that event.
-
-This gate exists because a global workflow runs with **organization** credentials against the event's head commit. Running one for an event the policy refused would hand an untrusted contributor exactly the capability the policy was protecting.
+The evaluation is held rather than dispatched because it runs the workflow repository's `filter` and generators next to the pull request's head commit. A global job can bind the workflow repository's contexts, so running either for an untrusted event before approval would hand the contributor exactly the capability the policy was protecting.
 
 ## Security approval queue
 
@@ -139,13 +135,13 @@ Security holds are stored in the `held_runs` table with `queue_type = 'security'
 
 Two further values, `workflow_modification` and `unknown_contributor`, remain in the stored vocabulary and are no longer raised. Rows written by earlier builds still carry them, so the queue renders them.
 
-A `fork_pr` hold is workflow-scoped and stores a resume context. Approving it replays the dispatch with the same trust resolution, so the workflow actually runs — untrusted. Rejecting it cancels the run. Expiry cancels it too.
+A `fork_pr` hold is workflow-scoped and stores a resume context. Approving it replays the dispatch with the same trust resolution, so the workflow actually runs — untrusted. Rejecting it cancels the run. Expiry fails it with an expiry reason.
 
 ### Two holds on one job
 
 A job can be gated by a reviewer approval and by a security trust hold at the same time. Each writes its own `held_runs` row, and **both must be released** before the job runs. That is the point of the split: releasing a reviewer hold takes `contexts:write` plus clause eligibility, while releasing the trust hold takes `ci_trust:write`, and a job held for both reasons must satisfy both requirements.
 
-The two rows carry independent expiries, and whichever comes first cancels the run. The reviewer row uses the gate's own `timeout` if the workflow set one, otherwise the org's `approval_expiry_seconds` (default 24 hours). The `context_trust` row uses the context's `hold_expiry_seconds` (default one hour), so it is usually the shorter of the two.
+The two rows carry independent expiries, and whichever comes first ends the hold and fails the run. The reviewer row uses the gate's own `timeout` if the workflow set one, otherwise the org's `approval_expiry_seconds` (default 24 hours). The `context_trust` row uses the context's `hold_expiry_seconds` (default one hour), so it is usually the shorter of the two.
 
 The commit carries one `KiCI Security` check run, shared by every hold on that commit. It stays pending until every hold that owns it has ended, so releasing one hold never turns the check green while another still gates the job. The check's description names the reviewer clauses. It adds a line naming the trust hold, the permission that clears it, and the `/kici approve` command. So an approver is never left with a satisfied requirement and no statement of what remains.
 
@@ -160,19 +156,18 @@ An approve posts the terminal provider status before it resumes the run, so the 
 
 ### Approval expiry
 
-A security hold expires on a deadline set when it is created. A `fork_pr` hold covers a whole pull request and is not attached to any context, so it uses the organization's approval expiry (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour). An expired run transitions to `expired`, and its checks are completed with a timeout explanation.
+A security hold expires on a deadline set when it is created. A `fork_pr` hold covers a whole pull request and is not attached to any context, so it uses the organization's approval expiry (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour). An expired hold is marked `expired`, its run fails with an expiry reason, and its checks are completed with a timeout explanation.
 
 ## Check runs
 
-| Event                        | Check name                     | Status  | Title                          |
-| ---------------------------- | ------------------------------ | ------- | ------------------------------ |
-| Security hold created        | `KiCI Security`                | pending | Held for approval              |
-| Security hold approved       | `KiCI Security`                | success | Approved                       |
-| Security hold rejected       | `KiCI Security`                | failure | Rejected                       |
-| Workflow modifications       | `KiCI: Workflow changes`       | neutral | Workflow changes detected      |
-| Organization globals skipped | `KiCI: Organization workflows` | neutral | Organization workflows skipped |
+| Event                  | Check name               | Status  | Title                     |
+| ---------------------- | ------------------------ | ------- | ------------------------- |
+| Security hold created  | `KiCI Security`          | pending | Held for approval         |
+| Security hold approved | `KiCI Security`          | success | Approved                  |
+| Security hold rejected | `KiCI Security`          | failure | Rejected                  |
+| Workflow modifications | `KiCI: Workflow changes` | neutral | Workflow changes detected |
 
-Security holds use the fixed check name `KiCI Security` so the run is updated in place as the hold progresses. The two informational checks each use their own name, so neither can overwrite it. That matters concretely. The security check is a single run per commit: a hold posts it as pending, and an approve or reject later completes it. An informational write onto it would resolve a still-held run's check, and release whatever branch protection waits on it.
+Security holds use the fixed check name `KiCI Security` so the run is updated in place as the hold progresses. The informational check uses its own name, so it cannot overwrite it. That matters concretely. The security check is a single run per commit: a hold posts it as pending, and an approve or reject later completes it. An informational write onto it would resolve a still-held run's check, and release whatever branch protection waits on it.
 
 ### A run that never dispatches still completes its checks
 

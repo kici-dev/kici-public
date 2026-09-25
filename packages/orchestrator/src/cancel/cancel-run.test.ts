@@ -86,9 +86,11 @@ function makeDeps(
   deps: CancelRunDeps;
   mock: ReturnType<typeof createMockDb>;
   completeSpy: ReturnType<typeof vi.fn>;
+  joblessSpy: ReturnType<typeof vi.fn>;
 } {
   const mock = dbOverride ?? createMockDb();
   const completeSpy = vi.fn().mockResolvedValue(undefined);
+  const joblessSpy = vi.fn().mockResolvedValue(false);
   const dispatchedJobs =
     over?.dispatchedJobs ??
     (over?.dispatchedJobIds ?? []).map((jobId) => ({
@@ -107,11 +109,12 @@ function makeDeps(
     } as unknown as CancelRunDeps['registry'],
     executionTracker: {
       completeRunIfAllJobsTerminal: completeSpy,
+      cancelJoblessRun: joblessSpy,
     } as unknown as CancelRunDeps['executionTracker'],
     ...(over?.instanceId === undefined ? {} : { instanceId: over.instanceId }),
     ...(over?.cancelJobOnPeer === undefined ? {} : { cancelJobOnPeer: over.cancelJobOnPeer }),
   };
-  return { deps, mock, completeSpy };
+  return { deps, mock, completeSpy, joblessSpy };
 }
 
 describe('cancelRunWithReason', () => {
@@ -409,5 +412,40 @@ describe('cancelRunWithReason', () => {
     await cancelRunWithReason(deps, 'run-1', 'run cancelled via API');
 
     expect(mock.deletes).toEqual([]);
+  });
+
+  describe('a run with no job rows', () => {
+    it('terminalizes a jobless pending run itself, after the job-driven completion', async () => {
+      // No job will ever report a terminal status for it, so without this the
+      // cancel answers "cancelled" while the row keeps `pending`.
+      // fails-when: a cancelled run with no jobs keeps its non-terminal status
+      const { deps, completeSpy, joblessSpy } = makeDeps(
+        createMockDb({ runStatus: ExecutionRunStatus.enum.pending }),
+      );
+
+      const result = await cancelRunWithReason(deps, 'run-jobless', 'cancelled by a user');
+
+      expect(result.alreadyTerminal).toBe(false);
+      expect(joblessSpy).toHaveBeenCalledWith('run-jobless', 'cancelled by a user');
+      expect(joblessSpy.mock.invocationCallOrder[0]).toBeGreaterThan(
+        completeSpy.mock.invocationCallOrder[0]!,
+      );
+    });
+
+    it('leaves a run whose jobs an agent is unwinding to those jobs', async () => {
+      // breaks-if-wrong: a run with a live job must still be driven terminal by the job, as before
+      const sent: unknown[] = [];
+      const { deps, completeSpy, joblessSpy } = makeDeps(undefined, {
+        dispatchedJobIds: ['job-1'],
+        agentIdForJob: 'agent-1',
+        ws: { readyState: 1, send: (m: unknown) => sent.push(m) },
+      });
+
+      const result = await cancelRunWithReason(deps, 'run-with-jobs', 'cancelled by a user');
+
+      expect(result.agentsNotified).toBe(1);
+      expect(completeSpy).not.toHaveBeenCalled();
+      expect(joblessSpy).not.toHaveBeenCalled();
+    });
   });
 });

@@ -33,9 +33,14 @@ job('release', {
 });
 ```
 
-Store the secrets first with `kici-admin secret set`. Pasting a private key
-straight into the workflow is rejected when the workflow is defined, naming the
-field — a key written into `.kici/` would be committed to your repository.
+Store the secrets first with `kici-admin secret set`, in a scope bound to the
+context the reference names (`kici-admin context bind`). A `ci:` reference is
+read through the bindings of the `ci` context, the same way a job's context
+secrets are. If no scope bound to a context named exactly `ci` carries the
+secret, the reference still reads the scope named `ci`, but that fallback is
+[deprecated](../deprecations.md) and logs a warning. Pasting a private key straight into the workflow is rejected when the
+workflow is defined, naming the field — a key written into `.kici/` would be
+committed to your repository.
 
 ## Push
 
@@ -169,6 +174,10 @@ one:
    request — gets no declared credential at all. It still clones with the
    source credential, so the build runs; only the declared credentials are
    withheld. The reduced-privilege note on the run says so.
+
+For a job of an [organization-wide workflow](../global-workflows.md#secrets-come-from-the-workflow-repository),
+the context's repository and branch rules check the workflow repository and the
+branch its workflow was registered from, not the source repository.
 
 The context in a reference does **not** have to appear in the job's `contexts:`
 list. The reference names its own context, and that context's rules are what

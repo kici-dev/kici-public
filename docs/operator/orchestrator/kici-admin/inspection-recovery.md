@@ -97,7 +97,7 @@ kici-admin attestations retry [--run-id <id>] [--all-pending] [--include-rejecte
   `include_rejected`, the target run, and the `minted` / `still_pending` /
   `rejected` counts — so a re-arm of a terminal rejection is never silent.
 
-### signing-key -- provenance signing key lifecycle (direct DB)
+### signing-key -- provenance signing key lifecycle
 
 ```bash
 kici-admin signing-key list [--database-url <url>] [--json]
@@ -108,9 +108,10 @@ kici-admin signing-key revoke <kid> --reason <reason> [--database-url <url>] [--
 kici-admin signing-key export --public [--out <file>] [--database-url <url>]
 ```
 
-Manages the orchestrator's own ES256 provenance signing key — the trust root that signs build-attestation identity tokens and backs the JWKS your orchestrator publishes. Talks to the orchestrator database directly, so it works before the orchestrator is up.
+Manages the orchestrator's own ES256 provenance signing key — the trust root that signs build-attestation identity tokens and backs the JWKS your orchestrator publishes. Every subcommand except `list` talks to the orchestrator database directly, so it works before the orchestrator is up.
 
-- `generate` mints the initial key and is a no-op when one is already active; `rotate` mints a new active key and moves the old one to `retiring`.
+- `list` reads the database when `--database-url` or `KICI_DATABASE_URL` is set. Otherwise it reads the orchestrator admin API (`GET /api/v1/admin/signing-keys`) with the global `--url` / `--token` (`KICI_ADMIN_URL` / `KICI_ADMIN_TOKEN`). The admin API needs an **unscoped** token with the `secret.read` permission, and returns key metadata only, never key material. Both modes print the same table (or the same `--json` array).
+- `generate` mints the initial key and is a no-op when one is already active. When an orchestrator node activates a key while the command runs, `generate` keeps that key, prints its `kid`, and writes nothing. `rotate` mints a new active key and moves the old one to `retiring`.
 - `retire <kid>` moves a retiring key to `retired`. It **stays in the JWKS**, so bundles it already signed keep verifying — this is the normal end of a rotation.
 - `revoke <kid>` is the compromise path: the key is **removed from the JWKS** and everything it signed becomes distrusted. `--reason` is required and recorded for audit.
 - `export --public` writes the `{ issuer, jwks }` artifact containing **public halves only** (the private half is non-exportable, and the flag is the explicit confirmation of that). It doubles as the offline trust root for `kici verify-attestation --trust-root` and as the public-JWKS backup.
@@ -700,7 +701,7 @@ Synopsis: `kici-admin inspect-bundle <path>`
 
 ### `kici-admin signing-key`
 
-Orchestrator-owned provenance signing key management (orchestrator DB)
+Orchestrator-owned provenance signing key management (orchestrator DB; list also reads the admin API)
 
 Synopsis: `kici-admin signing-key`
 
@@ -740,10 +741,10 @@ Synopsis: `kici-admin signing-key list [options]`
 
 **Options**
 
-| Option                 | Default | Description                                  |
-| ---------------------- | ------- | -------------------------------------------- |
-| `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL) |
-| `--json`               |         | Emit raw JSON                                |
+| Option                 | Default | Description                                                                          |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL; with neither, reads over the admin API) |
+| `--json`               |         | Emit raw JSON                                                                        |
 
 ### `kici-admin signing-key retire`
 

@@ -228,7 +228,7 @@ Positive dispatch acknowledgment. Sent the moment the agent receives a `job.disp
 
 #### job.reject
 
-Explicit dispatch rejection. Sent when the agent cannot accept a `job.dispatch` — it is already running a job (`busy`) or is draining (`draining`). Every `job.dispatch` is answered: accepted with `job.ack` (a `job.status` with state `running` also resolves the deadline) or refused with this message. On receiving it the orchestrator undoes its dispatch accounting and requeues the job for another agent. An unanswered dispatch is recovered by the dispatch-ack deadline (below) and by disconnect-time triage.
+Explicit dispatch rejection. Sent when the agent cannot accept a `job.dispatch` — it is already running a job (`busy`) or is draining (`draining`). Every `job.dispatch` is answered: accepted with `job.ack` (a `job.status` with state `running` also resolves the deadline) or refused with this message. On receiving it the orchestrator undoes its dispatch accounting and requeues the job for another agent. A `draining` rejection spends one of the job's dispatch attempts. A `busy` rejection does not, because the agent is still tearing down its previous job. The orchestrator holds that agent out of routing until an `agent.status` reports zero running jobs or a job on that agent reports a final `job.status`, or for at most 30 seconds. The job goes to another agent or waits for this one. If the agent is picked again only because its hold ran out, its next `busy` rejection spends an attempt, so an agent that stays busy still fails the job. A `job.ack` or `running` status from the agent after the hold ran out cancels that charge: the agent took a job into a free slot. An unanswered dispatch is recovered by the dispatch-ack deadline (below) and by disconnect-time triage.
 
 | Field     | Type           | Required | Description                   |
 | --------- | -------------- | -------- | ----------------------------- |
@@ -961,8 +961,27 @@ Structured execution status update sent by the orchestrator when an execution ru
 | logBytes               | number               | No       | Total raw log bytes accumulated across all jobs of this run; only set on terminal run states                                                                                                                                                                  |
 | initFailure            | object               | No       | Structured init-failure signal (`scope`, `category`, `message`, optional `jobName`) set when the run never executed a single step; only present when status is `failed`                                                                                       |
 | failureClass           | enum                 | No       | Why a terminal run failed: `never_started`, `timed_out`, `dead_orchestrator`, `step_failure`, `cancelled` (only present for failed/cancelled runs)                                                                                                            |
+| statusEpoch            | integer              | No       | The run's status generation. It starts at 0 and rises by one each time the run leaves a terminal status to continue. See "Late status frames" below                                                                                                           |
 
 > Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `executionStatusSchema`
+
+#### Late status frames
+
+Frames for one run can reach KiCI out of order: a `running` frame sent before the run finished can arrive after its `success`. KiCI compares each frame's `statusEpoch` with the generation already recorded for the run:
+
+- A frame of an older generation never changes the run's status, completion time, failure reason or failure class.
+- A non-terminal frame of the same generation does not replace a terminal status. KiCI keeps a finished run finished.
+- A non-terminal frame of a newer generation moves a finished run back and clears its completion time.
+- One terminal status of the same or a newer generation can still replace another.
+- A frame of a newer generation over a finished run clears the failure reason and failure class unless it carries its own. A reopened run that later succeeds does not keep the failure it left.
+
+A frame whose status KiCI keeps out is not sent on to the dashboard, to notifications or to outbound webhooks. That includes a frame of an older generation that carries the run's current status. The rest of the frame, such as `jobCount`, still applies.
+
+A run leaves a terminal status in one case: it failed before a job it had already dispatched reported in (for example "No agents available"), and that job then reports progress. The orchestrator then moves the run back to `running`, clears its failure reason and failure class, and raises its generation, so the frames that follow move the run. A run that failed on a build failure is never reopened. When two orchestrator nodes try to reopen the same run, only one reopen applies. The other node reads the run's new generation from the database and sends its later frames at that generation.
+
+KiCI can also mark a run finished on its own, for example when the orchestrator stops reporting. That status ranks below every generation, so the orchestrator's next frame for the run always applies.
+
+An orchestrator always sends `statusEpoch`, as 0 for a run that never left a terminal status. A frame without the field is applied as it arrives. Frames of one run on one connection are applied in the order they arrived.
 
 ### step.status.forward
 
@@ -1048,6 +1067,7 @@ Each RunSnapshot:
 | originalRunId          | string or null | No       | Root ancestor run ID (first run in the chain)                                |
 | triggeredBy            | string or null | No       | User identity that triggered this re-run                                     |
 | failureReason          | string         | No       | Human-readable reason why the run failed (only present for failed runs)      |
+| statusEpoch            | integer        | No       | The run's status generation, with the same meaning as on `execution.status`  |
 | jobs                   | JobSnapshot[]  | Yes      | Array of job snapshots within the run                                        |
 
 Each JobSnapshot:

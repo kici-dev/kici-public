@@ -158,6 +158,7 @@ async function buildDeferredClaims(
       'run_id',
       'routing_key',
       'repo_identifier',
+      'workflow_repo_identifier',
       'ref',
       'sha',
       'workflow_name',

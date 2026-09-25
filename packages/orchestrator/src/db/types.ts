@@ -7,6 +7,7 @@ import type {
   StepApprovalPayload,
 } from '@kici-dev/engine';
 import type { PrecursorResult } from '../cache/precursor-result.js';
+import type { DeferredContextResolution } from '../pipeline/held-context-data.js';
 
 /**
  * Job kind stored in `execution_jobs.job_kind`. `Standard` runs steps on an
@@ -258,8 +259,15 @@ export interface DispatchQueueTable {
   /** JSONB array of runs-on labels for agent matching.
    *  Insert: JSON.stringify(labels), Select: auto-parsed by pg driver. */
   runs_on_labels: string;
-  /** JSON-encoded Record of the full job configuration */
+  /** JSON-encoded Record of the job configuration, without the fields in `sealed_secrets` */
   job_config: string;
+  /**
+   * The secret fields of the stored job, AES-256-GCM encrypted under the
+   * orchestrator master key (`secrets/job-secret-seal.ts`). NULL when there is
+   * nothing to seal, when no master key is configured, and on a row written
+   * before the column existed: those rows keep the fields in the plain column.
+   */
+  sealed_secrets: ColumnType<string | null, string | null | undefined, string | null>;
   /** Repository clone URL */
   repo_url: string;
   /** Git ref (branch/tag) */
@@ -543,6 +551,13 @@ export interface ExecutionRunTable {
    * cancelled and for one that entered `cancelling` before the column existed.
    */
   cancelling_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
+  /**
+   * The run's status generation (migration 150). Starts at 0 and rises by one
+   * each time the run leaves a terminal status to continue. Forwarded on every
+   * `execution.status` frame as `statusEpoch`, so the Platform can tell a
+   * reopen from a frame that arrives late after the run finished.
+   */
+  status_epoch: Generated<number>;
   /** Total execution duration in milliseconds */
   duration_ms: number | null;
   /**
@@ -664,6 +679,18 @@ export interface ExecutionRunTable {
    * repository that defines it rather than from the one it ran against.
    */
   workflow_repo_identifier: string | null;
+  /**
+   * Commit of the workflow repository the run dispatched, when the workflow is
+   * defined in another repository (`workflow_repo_identifier` set). A re-run
+   * dispatches this exact commit. NULL on every per-repository run.
+   */
+  workflow_sha: string | null;
+  /**
+   * The workflow repository's registered branch, when the workflow is defined
+   * in another repository. The git-credential relay checks context branch rules
+   * against it. NULL on every per-repository run.
+   */
+  workflow_branch: string | null;
   /**
    * True when this row records a global evaluation round rather than a
    * workflow.
@@ -1752,6 +1779,31 @@ export interface WorkflowRegistrationsTable {
   default_branch: ColumnType<string | null, string | null | undefined, string | null>;
   /** Source file path for this workflow (e.g. ".kici/workflows/deploy.ts") */
   source_file: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * `lockfileHash` of the lock file that last registered this workflow: the
+   * package-manager lockfile hash that keys the dependency cache. A run dispatched
+   * from the registration probes the dependency cache with it.
+   *
+   * NULL when that lock file records none, and on rows written before migration
+   * 149. NULL means the run installs its dependencies on the agent.
+   */
+  lockfile_hash: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * `siblingsDigest` of the lock file that last registered this workflow: the
+   * in-repo `workspace:` sibling closure, part of the dependency-cache key next to
+   * `lockfile_hash`. NULL when that lock file records none.
+   */
+  siblings_digest: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * The `commit_sha` written together with `lockfile_hash` and `siblings_digest`.
+   * The key is used only while this equals `commit_sha`: a writer that does not
+   * know the key columns moves `commit_sha` without them, and the key it leaves
+   * behind belongs to an older lock file.
+   *
+   * NULL on rows written before migration 151 and on rows registered with no
+   * commit; such a row uses no key.
+   */
+  dep_cache_key_sha: ColumnType<string | null, string | null | undefined, string | null>;
   /** Whether this is a global workflow (triggers across all repos under same routing key) */
   is_global: ColumnType<boolean, boolean | undefined, boolean>;
   /**
@@ -2422,6 +2474,16 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
+   * How long a coordinator leaves a queued job alone after it could not open the
+   * job's sealed secrets, before claiming it again. NULL ⇒ the orchestrator's
+   * configured default.
+   */
+  sealed_secrets_retry_backoff_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
    * Verified-tier origin the dashboard fetches the orchestrator's X25519
    * dashboard-encryption public key from (and always displays) under the
    * `encrypted` dashboard-write posture. The tier is explicit opt-in: NULL ⇒ it
@@ -2461,6 +2523,25 @@ export interface PendingJobContextsTable {
    * instead of dispatching to an agent. NULL for every ordinary job.
    */
   invoke_config: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * For a job bound to a context, what the dispatch of the stored job resolves
+   * the job's context variables and secrets from (context names, org, routing
+   * key, host facts, registry-auth inputs) as JSONB. Never a secret value. NULL
+   * for a job with no bound context, and for a row stored before the column
+   * existed, whose `job_input` still carries its resolved context data.
+   */
+  context_resolution: ColumnType<
+    DeferredContextResolution | null,
+    string | null | undefined,
+    string | null
+  >;
+  /**
+   * The secret fields of the stored job, AES-256-GCM encrypted under the
+   * orchestrator master key (`secrets/job-secret-seal.ts`). NULL when there is
+   * nothing to seal, when no master key is configured, and on a row written
+   * before the column existed: those rows keep the fields in the plain column.
+   */
+  sealed_secrets: ColumnType<string | null, string | null | undefined, string | null>;
   /** When this context was stored */
   created_at: Generated<Date>;
 }
@@ -2482,6 +2563,13 @@ export interface PendingWorkflowContextsTable {
   org_id: string;
   /** Serializable WorkflowDispatchContext inputs as JSONB */
   context: ColumnType<Record<string, unknown>, string, string>;
+  /**
+   * The secret fields of the stored job, AES-256-GCM encrypted under the
+   * orchestrator master key (`secrets/job-secret-seal.ts`). NULL when there is
+   * nothing to seal, when no master key is configured, and on a row written
+   * before the column existed: those rows keep the fields in the plain column.
+   */
+  sealed_secrets: ColumnType<string | null, string | null | undefined, string | null>;
   /** When this context was stored */
   created_at: Generated<Date>;
 }

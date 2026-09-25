@@ -13,7 +13,8 @@
 
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
-import { TERMINAL_RUN_STATES, stringifyActor } from '@kici-dev/engine';
+import { ExecutionRunStatus, TERMINAL_RUN_STATES, stringifyActor } from '@kici-dev/engine';
+import { DispatchQueueStatus } from '../queue/job-queue.js';
 import type {
   TestRelayRequest,
   TestRelayUploadsInitRequest,
@@ -270,8 +271,11 @@ export interface TestRunLogsPayload {
   done: boolean;
 }
 
-/** Match `executions/<runId>/job-<name>/step-<index>.log`. */
-const LOG_PATH_RE = /job-([^/]+)\/step-(\d+)\.log$/;
+/**
+ * Match `executions/<runId>/job-<name>/step-<index>.log`, including a job's
+ * workflow-level setup log, step -1, which sorts ahead of the job's steps.
+ */
+const LOG_PATH_RE = /job-([^/]+)\/step-(-?\d+)\.log$/;
 
 /**
  * Return the next chunk of a run's logs from a monotonic line-offset cursor
@@ -388,7 +392,7 @@ export async function handleTestCancel(
     .selectFrom('dispatch_queue')
     .select(['id', 'status'])
     .where('run_id', '=', runId)
-    .where('status', 'in', ['pending', 'dispatched'])
+    .where('status', 'in', [DispatchQueueStatus.Pending, DispatchQueueStatus.Dispatched])
     .execute();
 
   for (const job of jobs) {
@@ -408,18 +412,20 @@ export async function handleTestCancel(
     }
   }
 
-  const pendingIds = jobs.filter((j) => j.status === 'pending').map((j) => j.id);
+  const pendingIds = jobs.filter((j) => j.status === DispatchQueueStatus.Pending).map((j) => j.id);
   if (pendingIds.length > 0) {
+    // `expired` is the terminal status a cancelled queue row takes, the one
+    // `JobQueue.cancelByRunId` writes, so the prune and the scrub cover it.
     await deps.db
       .updateTable('dispatch_queue')
-      .set({ status: 'cancelled' })
+      .set({ status: DispatchQueueStatus.Expired })
       .where('id', 'in', pendingIds)
       .execute();
   }
 
   await deps.db
     .updateTable('execution_runs')
-    .set({ status: 'cancelled' })
+    .set({ status: ExecutionRunStatus.enum.cancelled })
     .where('run_id', '=', runId)
     .execute();
 

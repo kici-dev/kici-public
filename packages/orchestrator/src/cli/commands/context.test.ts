@@ -25,6 +25,8 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
 });
 
 const { registerContextCommands } = await import('./context.js');
+const { unboundContextWarning } = await import('./shared/unbound-context-warning.js');
+const { ContextType } = await import('@kici-dev/engine');
 
 interface MockClient {
   get: ReturnType<typeof vi.fn>;
@@ -120,12 +122,13 @@ describe('kici-admin context CLI', () => {
           orgId: 'org-1',
           name: 'staging',
           type: 'fixed',
-          enabled: true,
           branchRestrictions: ['main'],
           requiredReviewers: ['user-1', 'user-2'],
           waitTimerSeconds: 60,
         }),
       );
+      // fails-when: create defaults --enabled, so a re-run re-enables a disabled context
+      expect(mockSeedContextDirect.mock.calls[0][1].enabled).toBeUndefined();
       expect(stdout).toContain('envId=env-123');
       expect(stdout).toContain('created=true');
       expect(stdout).toContain('(direct)');
@@ -146,6 +149,85 @@ describe('kici-admin context CLI', () => {
       expect(mockSeedContextDirect).not.toHaveBeenCalled();
       expect(stdout).toContain('envId=env-abc');
       expect(stdout).not.toContain('(direct)');
+      // fails-when: the HTTP body carries enabled without --enabled, re-enabling the context
+      // (an undefined field is dropped when the client serialises the body)
+      expect(JSON.parse(JSON.stringify(client.post.mock.calls[0][1]))).not.toHaveProperty(
+        'enabled',
+      );
+    });
+
+    it('sends enabled only when --enabled is given (both modes)', async () => {
+      const client = makeMockClient();
+      client.post.mockResolvedValue({ envId: 'env-abc', created: false });
+      await runCommand(
+        ['context', 'create', '--org', 'org-1', '--name', 'production', '--enabled', 'false'],
+        client,
+      );
+      // breaks-if-wrong: an explicit --enabled must still reach the orchestrator
+      expect(client.post.mock.calls[0][1]).toMatchObject({ enabled: false });
+      mockSeedContextDirect.mockResolvedValue({ envId: 'env-1', created: false });
+      await runCommand([
+        'context',
+        'create',
+        '--org',
+        'org-1',
+        '--name',
+        'production',
+        '--enabled',
+        'true',
+        '--database-url',
+        'postgres://localhost/test',
+      ]);
+      expect(mockSeedContextDirect.mock.calls[0][1]).toMatchObject({ enabled: true });
+    });
+
+    // A fixed context's secrets reach a job only through its bindings, so a
+    // create that leaves a fixed context unbound warns; the exit code stays 0.
+    it('warns on stderr when the created context has no binding (direct-DB)', async () => {
+      mockSeedContextDirect.mockResolvedValue({ envId: 'env-1', created: true });
+      mockListContextsDirect.mockResolvedValue({
+        contexts: [{ name: 'staging', type: ContextType.enum.fixed }],
+      });
+      mockShowContextDirect.mockResolvedValue({
+        context: { name: 'staging', type: ContextType.enum.fixed },
+        variables: [],
+        bindings: [],
+      });
+      const { stderr, exitCode } = await runCommand([
+        'context',
+        'create',
+        '--org',
+        'org-1',
+        '--name',
+        'staging',
+        '--database-url',
+        'postgres://localhost/test',
+      ]);
+      // fails-when: create leaves a bindingless fixed context without a warning
+      expect(stderr).toContain(unboundContextWarning('org-1', 'staging', ContextType.enum.fixed));
+      expect(exitCode).toBeNull();
+    });
+
+    it('prints no warning when an updated context is already bound (HTTP)', async () => {
+      const client = makeMockClient();
+      client.post.mockResolvedValue({ envId: 'env-1', created: false });
+      client.get.mockImplementation(async (path: string) =>
+        path.startsWith('/api/v1/admin/contexts?')
+          ? { contexts: [{ name: 'staging', type: ContextType.enum.fixed }] }
+          : {
+              context: { name: 'staging', type: ContextType.enum.fixed },
+              variables: [],
+              bindings: [{ scope_pattern: 'staging', host_pattern: '**' }],
+            },
+      );
+      // breaks-if-wrong: a bound context must be created or updated silently
+      const { stderr, exitCode } = await runCommand(
+        ['context', 'create', '--org', 'org-1', '--name', 'staging'],
+        client,
+      );
+      expect(client.get).toHaveBeenCalledWith('/api/v1/admin/contexts/staging?orgId=org-1');
+      expect(stderr).not.toContain('has no binding');
+      expect(exitCode).toBeNull();
     });
 
     it('fails when direct-DB helper throws', async () => {
@@ -812,6 +894,173 @@ describe('kici-admin context CLI', () => {
         '/api/v1/admin/contexts/templates',
         expect.objectContaining({ orgId: 'o', templateName: 't' }),
       );
+    });
+  });
+
+  describe('--repo-patterns', () => {
+    const DB = ['--database-url', 'postgres://local'];
+
+    it('create passes the parsed patterns in direct-DB mode', async () => {
+      mockSeedContextDirect.mockResolvedValue({ envId: 'env-1', created: true });
+      const { exitCode } = await runCommand([
+        'context',
+        'create',
+        '--org',
+        'o',
+        '--name',
+        'deploy',
+        '--repo-patterns',
+        '["acme/workflows","acme/*"]',
+        ...DB,
+      ]);
+      expect(exitCode).toBeNull();
+      expect(mockSeedContextDirect).toHaveBeenCalledWith(
+        'postgres://local',
+        expect.objectContaining({ repoPatterns: ['acme/workflows', 'acme/*'] }),
+      );
+    });
+
+    it('create sends the patterns over HTTP', async () => {
+      const client = makeMockClient();
+      client.post.mockResolvedValue({ envId: 'env-2', created: true });
+      const { exitCode } = await runCommand(
+        ['context', 'create', '--org', 'o', '--name', 'deploy', '--repo-patterns', '["acme/*"]'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.post).toHaveBeenCalledWith(
+        '/api/v1/admin/contexts',
+        expect.objectContaining({ repoPatterns: ['acme/*'] }),
+      );
+    });
+
+    it('create leaves the patterns unset when the option is omitted', async () => {
+      mockSeedContextDirect.mockResolvedValue({ envId: 'env-3', created: false });
+      await runCommand(['context', 'create', '--org', 'o', '--name', 'deploy', ...DB]);
+      // fails-when: an omitted option is sent as [] and an upsert wipes the stored rule
+      expect(mockSeedContextDirect.mock.calls[0][1].repoPatterns).toBeUndefined();
+    });
+
+    it('rejects invalid JSON', async () => {
+      const { stderr, exitCode } = await runCommand([
+        'context',
+        'create',
+        '--org',
+        'o',
+        '--name',
+        'deploy',
+        '--repo-patterns',
+        'acme/*',
+        ...DB,
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('--repo-patterns');
+      expect(stderr.toLowerCase()).toContain('invalid json');
+      expect(mockSeedContextDirect).not.toHaveBeenCalled();
+    });
+
+    it.each(['"acme/*"', '[1]', '{"a":"b"}'])(
+      'rejects %s, which is not an array of strings',
+      async (raw) => {
+        const { stderr, exitCode } = await runCommand([
+          'context',
+          'set-policy',
+          '--org',
+          'o',
+          '--env',
+          'deploy',
+          '--repo-patterns',
+          raw,
+          ...DB,
+        ]);
+        // fails-when: the CLI forwards a non-array to direct-DB mode, which has no schema in front
+        // breaks-if-wrong: '["acme/*"]' and '[]' (below) must still pass
+        expect(exitCode).toBe(1);
+        expect(stderr).toContain('--repo-patterns: must be a JSON array of strings');
+        expect(mockSetContextPolicyDirect).not.toHaveBeenCalled();
+      },
+    );
+
+    it('set-policy sets the patterns and an empty array clears them', async () => {
+      mockSetContextPolicyDirect.mockResolvedValue(undefined);
+      await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'deploy',
+        '--repo-patterns',
+        '["acme/workflows"]',
+        ...DB,
+      ]);
+      await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'deploy',
+        '--repo-patterns',
+        '[]',
+        ...DB,
+      ]);
+      expect(mockSetContextPolicyDirect).toHaveBeenNthCalledWith(
+        1,
+        'postgres://local',
+        expect.objectContaining({ repoPatterns: ['acme/workflows'] }),
+      );
+      expect(mockSetContextPolicyDirect).toHaveBeenNthCalledWith(
+        2,
+        'postgres://local',
+        expect.objectContaining({ repoPatterns: [] }),
+      );
+    });
+
+    it('set-policy sends the patterns over HTTP', async () => {
+      const client = makeMockClient();
+      client.patch.mockResolvedValue({ updated: true });
+      const { exitCode } = await runCommand(
+        ['context', 'set-policy', '--org', 'o', '--env', 'deploy', '--repo-patterns', '["a/b"]'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.patch).toHaveBeenCalledWith(
+        '/api/v1/admin/contexts/deploy/policy',
+        expect.objectContaining({ repoPatterns: ['a/b'] }),
+      );
+    });
+
+    it('show prints the patterns and --json carries the field', async () => {
+      const context = {
+        id: 'env-1',
+        org_id: 'o',
+        name: 'deploy',
+        type: 'fixed',
+        enabled: true,
+        branch_restrictions: [],
+        repo_patterns: ['acme/workflows'],
+        required_reviewers: null,
+        wait_timer_seconds: null,
+        hold_expiry_seconds: null,
+        minimum_trust: null,
+        created_at: '2026-01-01',
+        updated_at: '2026-01-01',
+      };
+      mockShowContextDirect.mockResolvedValue({ context, variables: [], bindings: [] });
+      const table = await runCommand(['context', 'show', '--org', 'o', '--name', 'deploy', ...DB]);
+      expect(table.stdout).toContain('repos=acme/workflows');
+      const json = await runCommand([
+        'context',
+        'show',
+        '--org',
+        'o',
+        '--name',
+        'deploy',
+        ...DB,
+        '--json',
+      ]);
+      expect(JSON.parse(json.stdout).context.repo_patterns).toEqual(['acme/workflows']);
     });
   });
 });

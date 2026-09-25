@@ -49,28 +49,11 @@ export interface CheckStatusPoster {
     credentials: unknown,
   ): Promise<void>;
   /**
-   * Post an informational (neutral) check recording that the organization's
-   * global workflows were skipped because the org trust policy held or rejected
-   * the event.
-   *
-   * Its own check name, for the same reason as the workflow-modification check:
-   * the security-hold check is a single named run per commit, so posting this
-   * notice through `postCheckStatus` would UPDATE that run and replace the
-   * pending "Held for approval" state with a completed neutral conclusion —
-   * unblocking a branch protection rule that requires the security check.
-   */
-  postGlobalWorkflowsSkippedCheck(
-    repoIdentifier: string,
-    commitSha: string,
-    summary: string,
-    credentials: unknown,
-  ): Promise<void>;
-  /**
    * Post a failing check recording that the pre-run evaluation of the
    * organization's global workflows could not be completed, so none of the
    * workflows it was deciding on ran for this commit.
    *
-   * Its own check name, for the same reason as the two notices above: the
+   * Its own check name, for the same reason as the notice above: the
    * security-hold check is a single named run per commit, so posting this
    * through `postCheckStatus` would UPDATE that run and replace a pending
    * "Held for approval" state with a completed conclusion.

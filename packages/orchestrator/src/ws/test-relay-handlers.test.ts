@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ActorPrincipal } from '@kici-dev/engine';
+import { ExecutionRunStatus, type ActorPrincipal } from '@kici-dev/engine';
+import { DispatchQueueStatus } from '../queue/job-queue.js';
 import {
   handleTestUploadsInit,
   handleTestTrigger,
@@ -326,6 +327,27 @@ describe('handleTestRunLogs', () => {
     expect(result).toEqual({ lines: ORDERED, nextCursor: ORDERED.length, done: true });
   });
 
+  it("includes each job's setup log (step -1) ahead of its steps", async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'success', is_test_run: true },
+    });
+    const logStorage = logStorageStub({
+      ...FILES,
+      'executions/run-1/job-build/step--1.log': 'b-setup',
+    });
+    const result = await handleTestRunLogs(
+      { type: 'test.relay.run.logs', requestId: 'r', actor: ACTOR, runId: 'run-1', cursor: 0 },
+      { db, logStorage } as unknown as TestRelayHandlerDeps,
+    );
+    // fails-when: the path match skips `step--1.log`, so `kici run remote`
+    // never prints the host checkout and install lines.
+    expect(result).toEqual({
+      lines: ['b-setup', ...ORDERED],
+      nextCursor: ORDERED.length + 1,
+      done: true,
+    });
+  });
+
   it('never drops a line across two sequential polls of a live run', async () => {
     const { db } = makeDbMock({
       runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
@@ -437,7 +459,7 @@ describe('handleTestRunLogs', () => {
 });
 
 describe('handleTestCancel', () => {
-  it('cancels dispatched jobs, marks pending + run cancelled, returns cancelled=true', async () => {
+  it('cancels dispatched jobs, expires pending queue rows, marks the run cancelled', async () => {
     const send = vi.fn();
     const { db, update } = makeDbMock({
       runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
@@ -460,8 +482,11 @@ describe('handleTestCancel', () => {
 
     expect(result).toEqual({ cancelled: true });
     expect(send).toHaveBeenCalledTimes(1); // only the dispatched job got a job.cancel
-    // update was called for both dispatch_queue pending and execution_runs.
-    expect(update.execute).toHaveBeenCalled();
+    // fails-when: the pending row is stamped with the off-enum `cancelled` the prune and scrub skip
+    expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
+    expect(update.set).toHaveBeenCalledWith({ status: DispatchQueueStatus.Expired });
+    expect(db.updateTable).toHaveBeenCalledWith('execution_runs');
+    expect(update.set).toHaveBeenCalledWith({ status: ExecutionRunStatus.enum.cancelled });
   });
 
   it('returns cancelled=false for an already-terminal run', async () => {

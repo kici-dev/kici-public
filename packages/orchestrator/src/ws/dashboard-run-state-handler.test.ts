@@ -71,6 +71,7 @@ describe('handleRunState (dashboard.run.state system read)', () => {
           triggered_by_agent_label: null,
           failure_reason: null,
           failure_class: null,
+          status_epoch: 1,
         },
       },
       jobs: { 'run-1': [{ job_id: 'j1', job_name: 'build', status: 'success' }] },
@@ -84,6 +85,9 @@ describe('handleRunState (dashboard.run.state system read)', () => {
     expect(resp.run?.startedAt).toBe(1_700_000_000_000);
     expect(resp.run?.completedAt).toBe(1_700_000_005_000);
     expect(resp.run?.jobs).toEqual([{ jobId: 'j1', jobName: 'build', status: 'success' }]);
+    // fails-when: the pull drops the generation — the Platform reads the run as
+    // an older orchestrator's and applies it unguarded.
+    expect(resp.run?.statusEpoch).toBe(1);
   });
 
   it('returns run: null for an unknown run id', async () => {

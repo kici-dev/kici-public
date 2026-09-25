@@ -92,7 +92,7 @@ kici-admin source purge-stale --routing-key <key> --dry-run
 kici-admin source purge-stale --routing-key <key> --confirm
 ```
 
-Counts (`--dry-run`) or deletes (`--confirm`) orphan `sources` rows, their scoped webhook/private-key secrets, and all `generic_webhook_sources` rows. `generic_webhook_sources` is single-tenant per deployment so it's cleared wholesale. Pair with `source add` / `source update` to re-seed the current deployment's sources afterward.
+Counts (`--dry-run`) or deletes (`--confirm`) orphan `sources` rows, their scoped webhook/private-key secrets, all `generic_webhook_sources` rows, and the workflow registrations left pointing at no source. `generic_webhook_sources` is single-tenant per deployment so it's cleared wholesale. The command does not touch the org's [remote source](#remote-source----remote-run-org-anchor-inspection) (routing key `remote:<orgId>`). A registration under that routing key still has its source, so the command keeps it and does not count it. Pair with `source add` / `source update` to re-seed the current deployment's sources afterward.
 
 ### remote-source -- remote-run org anchor inspection
 

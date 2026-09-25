@@ -428,6 +428,9 @@ export class AdminApiClient {
     skippedEphemeralKeys: number;
     reEncryptedSecretOutputs: number;
     skippedSecretOutputs: number;
+    /** Absent from an orchestrator that predates sealed job secrets. */
+    reEncryptedJobSecrets?: number;
+    skippedJobSecrets?: number;
   }> {
     return this.request<{
       reEncrypted: number;
@@ -443,6 +446,8 @@ export class AdminApiClient {
       skippedEphemeralKeys: number;
       reEncryptedSecretOutputs: number;
       skippedSecretOutputs: number;
+      reEncryptedJobSecrets?: number;
+      skippedJobSecrets?: number;
     }>('POST', '/api/v1/admin/rotate-key');
   }
 

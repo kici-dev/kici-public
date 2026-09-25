@@ -222,6 +222,66 @@ describe('bootstrapWorker', () => {
     });
   });
 
+  describe('a rerouted global job carrying only the workflow repo clone token', () => {
+    /** Drive one reroute of a global job whose source clone token could not be minted. */
+    async function rerouteGlobal(sourceRepoUrl: string) {
+      const { mkdtemp } = await import('node:fs/promises');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const dataDir = await mkdtemp(join(tmpdir(), 'kici-worker-refusal-'));
+      const { bootstrapWorker } = await import('./worker-core.js');
+      const subsystems = await bootstrapWorker(
+        createWorkerConfig({ dataDir } as Partial<AppConfig>),
+      );
+      const peerClient = subsystems.peerClient as unknown as MockPeerClient;
+      const onJobReroute = peerClient.options.onJobReroute as (msg: unknown) => Promise<void>;
+      const dispatch = vi
+        .spyOn(subsystems.dispatcher, 'dispatch')
+        .mockResolvedValue({ status: 'dispatched', agentId: 'a1', jobId: 'reroute-job-2' });
+      mockPeerClientSend.mockClear();
+      await onJobReroute({
+        type: 'job.reroute',
+        messageId: 'm-2',
+        jobId: 'reroute-job-2',
+        runId: 'run-2',
+        workflowName: 'ci',
+        jobName: 'build',
+        runsOnLabels: [['linux']],
+        deliveryId: 'd-2',
+        routingKey: 'github:42',
+        repoUrl: sourceRepoUrl,
+        workflowCloneToken: 'wf-tok',
+        jobConfig: {
+          isGlobalWorkflow: true,
+          workflowRepoIdentifier: 'org/ci',
+          workflowRepoUrl: 'https://github.com/org/ci.git',
+        },
+      });
+      const sent = mockPeerClientSend.mock.calls.map((c) => c[0] as Record<string, any>);
+      return { dispatch, sent };
+    }
+
+    it('fails the job with an error naming both repos when the source is on another host', async () => {
+      // fails-when: the job reaches an agent, which would clone org/app with the org/ci token
+      const { dispatch, sent } = await rerouteGlobal('https://git.forge.example/org/app.git');
+
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(sent).toContainEqual({ type: 'job.reroute.ack', messageId: 'm-2', accepted: true });
+      const failed = sent.find((m) => m.type === 'job.progress' && m.state === 'failed');
+      expect(failed?.jobId).toBe('reroute-job-2');
+      expect(String(failed?.data?.error)).toContain('org/app');
+      expect(String(failed?.data?.error)).toContain('org/ci');
+    });
+
+    it('dispatches the job when both repos share a host', async () => {
+      // breaks-if-wrong: a same-host global job with only the workflow token must still run
+      const { dispatch, sent } = await rerouteGlobal('https://github.com/org/app.git');
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(sent.some((m) => m.type === 'job.progress')).toBe(false);
+    });
+  });
+
   it('throws when role is not worker', async () => {
     const config = createWorkerConfig({
       cluster: {

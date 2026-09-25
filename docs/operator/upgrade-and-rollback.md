@@ -38,6 +38,13 @@ across a floor change (0.8.x → 0.9.0) every not-yet-upgraded agent stays
 disconnected until its own upgrade, so upgrade the agents right after the
 orchestrator.
 
+**Upgrade the coordinators of one cluster together.** A release can change how
+the orchestrator stores queued jobs, and an older coordinator cannot read what a
+newer one wrote. For example, a coordinator from before queued job secrets were
+encrypted dispatches the jobs a newer coordinator queued without their secrets.
+Upgrade every coordinator in the same maintenance window, and do not leave an
+older one running next to a newer one.
+
 ## Drain before upgrading
 
 Restarting an orchestrator to upgrade it severs the WebSocket connection to any
@@ -123,6 +130,14 @@ command reference.
   removed every earlier tag and its manifest from `quay.io`, so a version below
   0.8.0 does not pull. Such an image is available only from a copy you still hold:
   your local image store or your own registry mirror.
+
+Roll the agents back before the orchestrator. Newer agents self-report
+`kici:agent-feature:` labels, such as
+`kici:agent-feature:global-eval-skips-result-aware`. An orchestrator older than
+those agents does not know the prefix, so it treats the label as one the agent's
+token must allow. An agent token scoped to a label set then refuses the agent's
+registration. If you must roll back the orchestrator alone, register the newer
+agents with unscoped tokens until you roll them back too.
 
 Rolling the software back does not roll the database schema back. Migrations are
 forward-only, so an older orchestrator running against a newer schema is

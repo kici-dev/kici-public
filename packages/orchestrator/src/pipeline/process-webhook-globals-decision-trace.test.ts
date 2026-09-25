@@ -99,7 +99,6 @@ function makeDeps(): {
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
-      postGlobalWorkflowsSkippedCheck: vi.fn().mockResolvedValue(undefined),
     },
     lockFileFetcher: { fetchLockFile: vi.fn() },
     repoUrlBuilder: { buildCloneUrl: () => 'https://example.invalid/repo.git' },

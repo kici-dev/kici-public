@@ -245,7 +245,7 @@ A pool with `size: 0` — the default — starts nothing, and releases any agent
 
 A warm pool needs declared resources — on the label set, or on the scaler defaults. The orchestrator starts a ready agent before any job exists, so it must know what size to make it. A label set with no declared resources gets no warm pool, and the orchestrator logs which scaler and label set it skipped.
 
-A ready agent has the size the pool declares and runs the pool's agent image. Both are set when the agent starts and cannot change afterwards. So a job that asks for different resources, or brings its own container image, gets its own new agent instead of a ready one. The ready agent stays ready for the next job that fits it.
+A ready agent has the size the pool declares and runs the pool's agent image. Both are set when the agent starts and cannot change afterwards. So a job that asks for different resources gets its own new agent instead of a ready one. So does a job that brings its own container image, unless the ready agent can start that container itself: it reports `kici:runtime:docker` or `kici:runtime:podman`. The ready agent stays ready for the next job that fits it.
 
 ### Configuration
 
@@ -279,7 +279,7 @@ A ready agent also reserves its declared resources, so it counts toward `resourc
 
 If a cap is reached, the pool stops filling and jobs queue as usual (see [At-capacity queueing and re-dispatch](#at-capacity-queueing-and-re-dispatch)).
 
-A ready agent holds its slot until a job takes it. Some jobs cannot use a ready agent: a job that asks for different resources, or one that brings its own container image. Such a job needs a slot of its own. If you set `size` to the same value as a cap, there is no slot left, and the job queues until it expires. The orchestrator does not destroy a ready agent to make room. So leave room below every cap for these jobs, the same way you leave room for on-demand spawns.
+A ready agent holds its slot until a job takes it. Some jobs cannot use a ready agent: a job that asks for different resources, or one that brings its own container image when the ready agent has no container runtime. Such a job needs a slot of its own. If you set `size` to the same value as a cap, there is no slot left, and the job queues until it expires. The orchestrator does not destroy a ready agent to make room. So leave room below every cap for these jobs, the same way you leave room for on-demand spawns.
 
 `size` counts agents **per orchestrator**, the same way `maxAgents` does. Each orchestrator keeps its own `size` agents ready, so a fleet of three orchestrators with `size: 5` keeps 15 agents ready in total. Set `size` against what one orchestrator should hold, not the fleet.
 

@@ -78,9 +78,10 @@ A job may name its own container image with the `container` field. On this backe
 
 - The job's image is pulled with the registry credentials the job declares (resolved from the `auth` references in the lock file), not with the host's credential store, and the label set's `imagePullPolicy` does not apply to it — that policy describes the pool's own pinned agent image. A job image that is not on the host is pulled on the first job that uses it.
 - The KiCI runtime — the pinned Node build plus the agent code — is copied once out of the label set's `image` into a named `kici-runtime-*` volume on the host and mounted read-only at `/opt/kici` in the job container. The agent is started from that mount, so the job image needs neither Node nor a KiCI install. The volume is reused by every later spawn from the same agent image.
-- The container carries `KICI_JOB_IMAGE_AGENT=1`, which tells the agent it already runs inside the job's image and must run the steps directly rather than start a second container from it.
+- The container carries `KICI_JOB_IMAGE_AGENT=1`, which tells the agent it already runs inside the job's image and must run the steps directly rather than start a second container from it. The agent reports this at registration as `kici:runtime:job-image`.
 - Because the agent runs inside the job's image, that image must ship `git` and `bash`; the agent refuses to start without them and its error names the missing tool.
-- A ready warm-pool agent runs the pool's agent image and is never reused for such a job; it gets an on-demand spawn of its own (see [Common configuration → Warm pools](./common-config.md#warm-pool)).
+- An agent started in the job's image runs only that job. If another agent took the job first, or once the job ends, it takes no other work and exits when it goes idle.
+- Any other agent the scaler started takes such a job only when it reports `kici:runtime:docker` or `kici:runtime:podman`, that is, when it can start the job's container itself. A pool agent without `containerSocket` reports neither, so the job gets an on-demand spawn of its own. The same holds for a ready warm-pool agent (see [Common configuration → Warm pools](./common-config.md#warm-pool)).
 
 See [Container jobs](../../../user/container-jobs.md) for the job-side contract, and the [bare-metal backend](./bare-metal.md#container-jobs) for how a host-process pool handles the same jobs.
 

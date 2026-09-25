@@ -313,7 +313,7 @@ if any expected host is down) keep the window moving.
 ### Narrowing the roster at run time with `--target`
 
 A `runsOnAll` predicate is authored once in the workflow, but you can narrow it for a
-single run with `kici run --target <selector>` — an Ansible-`--limit`-style runtime
+single run with `kici run remote --target <selector>` — an Ansible-`--limit`-style runtime
 filter. The effective host set becomes `runsOnAll ∩ target`: the selector can only
 _remove_ hosts from the matched roster, never add them. The narrowing is **run-global**
 (it applies to every `runsOnAll` job) and **`runsOnAll`-only** (single `runsOn`-pinned

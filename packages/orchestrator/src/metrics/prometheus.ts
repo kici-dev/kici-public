@@ -1745,7 +1745,7 @@ export const containerRegistryAuthContributorStrippedTotal = lazyCounter(
 );
 
 /**
- * Per-environment latency of `secretResolver.resolveForJob` calls in the
+ * Per-environment latency of `secretResolver.resolveForContext` calls in the
  * install-secrets path. Buckets mirror `triggerMatchDurationSeconds`:
  * 1ms → 5s covers fast Postgres reads through pathological Vault timeouts.
  *

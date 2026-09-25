@@ -323,29 +323,30 @@ write one.
 
 ### The claim set
 
-| Claim                         | Value                                                                                                                             |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `iss`                         | Your orchestrator's provenance issuer                                                                                             |
-| `aud`                         | The audience you asked for                                                                                                        |
-| `sub`                         | The build identity — see the two shapes below                                                                                     |
-| `repository`                  | `owner/repo` the run acted on                                                                                                     |
-| `ref`                         | The branch or tag the run PRESENTS. For a pull request this is the **base** branch, not the contributor's branch                  |
-| `base_ref`                    | The same value as `ref`, named the way GitHub Actions names it                                                                    |
-| `head_ref`                    | The pull request's HEAD branch; `''` for a non-PR run                                                                             |
-| `head_repository`             | `owner/repo` of the pull-request HEAD — the contributor's fork for a fork PR; `''` for a non-PR run                               |
-| `is_fork`                     | `'true'`, `'false'`, or `'unresolved'`                                                                                            |
-| `event_name`                  | The event that started the run (`push`, `pull_request:opened`, `schedule`, …)                                                     |
-| `trust_tier`                  | The resolved trust tier of the triggering actor, or `'unresolved'`                                                                |
-| `actor`                       | Provider login of the triggering actor                                                                                            |
-| `sha`                         | The run's commit                                                                                                                  |
-| `workflow_ref`                | `<workflow name>@<sha>`                                                                                                           |
-| `kici_run_id` / `kici_job_id` | The run and job this token was minted for                                                                                         |
-| `org_id`                      | Your organization id                                                                                                              |
-| `orchestrator_id`             | The orchestrator that ran the job                                                                                                 |
-| `provider`                    | The source provider the run came from (`github`, `gitlab`, …)                                                                     |
-| `source_origin`               | `triggered` for a webhook-driven run; `run-remote` when the run executed an uploaded working tree (`kici run remote`)             |
-| `attestation_origin`          | `live` when the token was minted during the job; `deferred` or `offline-backfill` when it was minted later for a frozen statement |
-| `statement_hash`              | The hash of the frozen statement a deferred token is bound to; `null` for a live token                                            |
+| Claim                         | Value                                                                                                                                                                         |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `iss`                         | Your orchestrator's provenance issuer                                                                                                                                         |
+| `aud`                         | The audience you asked for                                                                                                                                                    |
+| `sub`                         | The build identity — see the two shapes below                                                                                                                                 |
+| `repository`                  | `owner/repo` the run acted on                                                                                                                                                 |
+| `workflow_repository`         | `owner/repo` that defines the workflow. For an organization-wide workflow, `repository` names the repository whose event started the run instead. Otherwise the two are equal |
+| `ref`                         | The branch or tag the run PRESENTS. For a pull request this is the **base** branch, not the contributor's branch                                                              |
+| `base_ref`                    | The same value as `ref`, named the way GitHub Actions names it                                                                                                                |
+| `head_ref`                    | The pull request's HEAD branch; `''` for a non-PR run                                                                                                                         |
+| `head_repository`             | `owner/repo` of the pull-request HEAD — the contributor's fork for a fork PR; `''` for a non-PR run                                                                           |
+| `is_fork`                     | `'true'`, `'false'`, or `'unresolved'`                                                                                                                                        |
+| `event_name`                  | The event that started the run (`push`, `pull_request:opened`, `schedule`, …)                                                                                                 |
+| `trust_tier`                  | The resolved trust tier of the triggering actor, or `'unresolved'`                                                                                                            |
+| `actor`                       | Provider login of the triggering actor                                                                                                                                        |
+| `sha`                         | The run's commit                                                                                                                                                              |
+| `workflow_ref`                | `<workflow name>@<sha>`                                                                                                                                                       |
+| `kici_run_id` / `kici_job_id` | The run and job this token was minted for                                                                                                                                     |
+| `org_id`                      | Your organization id                                                                                                                                                          |
+| `orchestrator_id`             | The orchestrator that ran the job                                                                                                                                             |
+| `provider`                    | The source provider the run came from (`github`, `gitlab`, …)                                                                                                                 |
+| `source_origin`               | `triggered` for a webhook-driven run; `run-remote` when the run executed an uploaded working tree (`kici run remote`)                                                         |
+| `attestation_origin`          | `live` when the token was minted during the job; `deferred` or `offline-backfill` when it was minted later for a frozen statement                                             |
+| `statement_hash`              | The hash of the frozen statement a deferred token is bound to; `null` for a live token                                                                                        |
 
 Every claim in the table is **always present**. A value the run did not resolve
 is `''`, `'unresolved'` or `null`, never omitted and never guessed. That matters: an
@@ -364,6 +365,15 @@ pull request's `ref` is its base branch. So a ref-bearing subject would be
 identical for a fork pull request targeting `main` and a trusted push to `main`.
 A policy pinning that subject would hand your cloud role to any contributor who
 opened a pull request running the same workflow.
+
+For an [organization-wide workflow](./global-workflows.md), `sub` names the
+repository whose event started the run, not the repository that defines the
+workflow. For any other event, the `:workflow:` segment carries only the workflow name,
+so a source repository with a same-named workflow of its own presents the same
+`sub`. For a pull request, `sub` carries no workflow segment at all, so every
+pull-request workflow of the source repository presents the same `sub`. A
+trust policy that must tell the workflow's code apart from the source
+repository's code should also condition on `workflow_repository`.
 
 **A re-run keeps the shape of the run it repeats.** Re-running a pull-request
 run presents `repo:<owner/repo>:pull_request`, because it rebuilds the same

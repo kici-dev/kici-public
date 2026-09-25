@@ -58,7 +58,6 @@ import { normalizeCacheSpecs, normalizeApproval } from '@kici-dev/sdk/internal';
 import type { ApprovalConfig } from '@kici-dev/sdk';
 import {
   SCHEMA_VERSION,
-  BREAKING_FLOOR,
   type LockFile,
   type LockSource,
   type LockWorkflow,
@@ -107,22 +106,26 @@ import {
 } from '../errors/index.js';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { resolveHashFiles } from './hash-files.js';
+import { lockMinReaderVersion } from './min-reader.js';
 
 /**
  * Courtesy compatibility warning for `kici compile`.
  *
- * When the current schema version is itself a breaking version
- * (`floor === version`), locks emitted now stamp `minReaderVersion = version`
- * and cannot be read by orchestrators older than that version — return a
- * one-line heads-up naming the required orchestrator schema. When the floor sits
- * below the current version (`floor < version`) the emitted lock is additive
- * over older readers down to the floor, so no warning is warranted (return
- * null). The orchestrator remains the authoritative reject; this is informational.
+ * `minReader` is the emitted lock's `minReaderVersion`: `BREAKING_FLOOR`, or
+ * `GLOBAL_APPROVAL_MIN_READER` for a lock whose global workflow declares
+ * `approval`. `version` is the schema version the compiler emits
+ * (`SCHEMA_VERSION`). When `minReader` reaches `version`, which happens only
+ * while that constant is the newest schema version, orchestrators older than
+ * `version` cannot read the lock, so return a one-line heads-up naming the
+ * required orchestrator schema. When it sits below `version` the lock is
+ * readable by older orchestrators down to it, so no warning is warranted
+ * (return null). The orchestrator remains the authoritative reject; this is
+ * informational.
  */
-export function schemaWindowWarning(floor: number, version: number): string | null {
-  if (floor < version) return null;
+export function schemaWindowWarning(minReader: number, version: number): string | null {
+  if (minReader < version) return null;
   return (
-    `This lock uses schema v${version}, a breaking schema version — orchestrators ` +
+    `This lock requires orchestrator schema v${version} or newer — orchestrators ` +
     `older than v${version} cannot read it. Upgrade the orchestrator to schema ` +
     `v${version} or newer before it can dispatch from this lock.`
   );
@@ -286,10 +289,12 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
   // Compute top-level content hash from the full lock file content (excluding the hash itself).
   // This hash changes only when workflows, triggers, jobs, or bundle hashes change.
   // minReaderVersion stamps the newest breaking version at emit time so a reader
-  // that predates a breaking change rejects the lock instead of mis-parsing it.
+  // that predates a breaking change rejects the lock instead of mis-parsing it,
+  // raised when a global workflow's approval gate needs a reader that enforces it.
+  const minReaderVersion = lockMinReaderVersion(workflows);
   const partial = {
     schemaVersion: SCHEMA_VERSION,
-    minReaderVersion: BREAKING_FLOOR,
+    minReaderVersion,
     source: topLevelSource,
     workflows,
   };
@@ -297,7 +302,7 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
 
   return {
     schemaVersion: SCHEMA_VERSION,
-    minReaderVersion: BREAKING_FLOOR,
+    minReaderVersion,
     source: topLevelSource,
     contentHash,
     ...(lockfileHash && { lockfileHash }),

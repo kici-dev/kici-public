@@ -10,9 +10,18 @@ import {
 } from '../queue/job-queue.js';
 import type { ScaleResult, ScalerRedispatchTrigger } from '../scaler/types.js';
 import type { ResolvedContainerSpawn } from '../scaler/types.js';
-import { canonicalizeLabels, canonicalizeMatcher } from '@kici-dev/engine';
+import {
+  agentMayRefuse,
+  canAgentRunJob,
+  fitAgentFor,
+  jobContainerNeed,
+  type AgentFitJob,
+  type FitAgent,
+  type ScalerAgentView,
+} from '../scaler/agent-fit.js';
+import { canonicalizeLabels, canonicalizeMatcher, JobRejectReason } from '@kici-dev/engine';
 import type { ResourceRequest, RunsOnPick } from '@kici-dev/engine';
-import type { AgentEntry } from './registry.js';
+import { agentHasFreeSlot, BusyHoldOutcome, type AgentEntry } from './registry.js';
 import { requestContext, createLogger, toErrorMessage } from '@kici-dev/shared';
 import { dispatchOwnershipSkippedTotal } from '../metrics/prometheus.js';
 
@@ -37,6 +46,23 @@ export enum AgentDrainDecline {
   RebootPending = 'reboot-pending',
   /** Nothing in the queue matched this agent's labels or pin. */
   NoMatchingJob = 'no-matching-job',
+}
+
+/**
+ * What claiming one specific queued job for an agent came to.
+ *
+ * `NotSent` is a claim that did not reach the agent: the dispatch was refused
+ * and the job failed, or this coordinator could not open the job's sealed
+ * secrets and put the job back or failed it. The claim dealt with the job, so a
+ * caller must neither scale for it nor count it as placed.
+ */
+enum BoundClaimOutcome {
+  /** Claimed and sent to the agent. */
+  Sent = 'sent',
+  /** Claimed, then refused or put back rather than sent. */
+  NotSent = 'not-sent',
+  /** Nothing claimed: the agent is gone, full or draining, or the job is no longer claimable. */
+  NotClaimed = 'not-claimed',
 }
 
 /**
@@ -99,6 +125,10 @@ export interface HostRosterRebootStore {
  * released and onDispatch is NOT called). The reroute caller should treat the
  * job as already handled. Only reachable on a reroute re-dispatch — first-
  * dispatch paths use a fresh UUID that can never collide.
+ *
+ * `queued` also answers a direct dispatch refused because the job's run has
+ * stopped: the queue row is recorded `expired` and the job cancelled, the
+ * state a cancel leaves a queued job of its run in.
  */
 type DispatchResult =
   | { status: 'dispatched'; agentId: string; jobId: string }
@@ -168,11 +198,26 @@ export function containerSpawnFor(jobConfig: Record<string, unknown> | undefined
   return { image, ...(authconfig ? { authconfig } : {}) };
 }
 
+/**
+ * What an `onDispatch` callback returns when it refuses to put a job on the
+ * wire. The dispatcher fails the job permanently with `refused` as the reason
+ * instead of arming an ack deadline for a message that was never sent.
+ */
+export interface DispatchRefusal {
+  refused: string;
+}
+
+/** The callback that sends a dispatched job to its agent. */
+export type OnDispatch = (
+  agentId: string,
+  job: QueuedJob,
+) => void | DispatchRefusal | Promise<void | DispatchRefusal>;
+
 export class Dispatcher {
   private readonly registry: AgentRegistry;
   private readonly queue: JobQueue;
   private readonly metrics: DispatchMetrics;
-  private readonly onDispatch: (agentId: string, job: QueuedJob) => void | Promise<void>;
+  private readonly onDispatch: OnDispatch;
   private readonly onNoMatchingAgent?:
     | ((
         labels: string[],
@@ -186,15 +231,7 @@ export class Dispatcher {
     | undefined;
 
   /** See the constructor dep of the same name. */
-  private readonly canPrespawnedAgentServe?:
-    | ((
-        agentId: string,
-        job: { resources?: ResourceRequest; hasOwnContainerImage: boolean },
-      ) => boolean)
-    | undefined;
-
-  /** See the constructor dep of the same name. */
-  private readonly isPrespawnedAgent?: ((agentId: string) => boolean) | undefined;
+  private readonly scalerAgentView?: ((agentId: string) => ScalerAgentView | undefined) | undefined;
 
   /**
    * Single-flight guard for `retryPendingScaleRequests`. The capacity-freed
@@ -324,11 +361,14 @@ export class Dispatcher {
    *  dispatching. Defaults to never-draining. */
   private readonly isDraining: () => boolean;
 
+  /** Whether another coordinator is live. Defaults to none (a single node). */
+  private readonly hasPeerCoordinators: () => boolean | Promise<boolean>;
+
   constructor(deps: {
     registry: AgentRegistry;
     queue: JobQueue;
     metrics: DispatchMetrics;
-    onDispatch: (agentId: string, job: QueuedJob) => void | Promise<void>;
+    onDispatch: OnDispatch;
     /** Optional hook called when no agent matches the job's labels.
      *  When set, receives the per-job `resources` so the scaler can apply
      *  per-scaler / per-orchestrator / per-machine caps before spawning. */
@@ -347,26 +387,14 @@ export class Dispatcher {
       containerSpawn?: ResolvedContainerSpawn,
     ) => Promise<ScaleResult>;
     /**
-     * Optional scaler predicate: may this pre-spawned (warm) agent serve this
-     * job? A warm agent is generic — started before the job existed, at the
-     * pool's shape and running the pool's image, both of which are fixed when
-     * it starts. When the predicate returns false the agent is skipped and the
-     * job falls through to `onNoMatchingAgent`, which spawns one that fits.
-     * Absent (no scaler) means every agent is eligible.
+     * What the scaler knows about an agent it started
+     * (`ScalerManager.agentView`), or undefined for one it did not. It feeds
+     * `canAgentRunJob`: the job the agent was started for, whether it runs in
+     * that job's image, and a warm agent's fixed shape. Absent when no scaler
+     * is configured; the predicate then judges every agent on its own
+     * registration.
      */
-    canPrespawnedAgentServe?: (
-      agentId: string,
-      job: { resources?: ResourceRequest; hasOwnContainerImage: boolean },
-    ) => boolean;
-    /**
-     * Whether this scaler pre-spawned the agent, i.e. whether
-     * `canPrespawnedAgentServe` can ever answer false for it. The queue drain
-     * (agent asks for work, rather than job looks for an agent) uses it to
-     * decide whether the suitability predicate is worth carrying into the
-     * claim: for every ordinary agent it is not, and the drain keeps its
-     * single-statement fast path.
-     */
-    isPrespawnedAgent?: (agentId: string) => boolean;
+    scalerAgentView?: (agentId: string) => ScalerAgentView | undefined;
     /** Max reconnection delay from agent config (default 60s). Used to derive grace period. */
     maxReconnectDelayMs?: number;
     /** Callback fired when a job is permanently failed before/outside agent execution. */
@@ -394,15 +422,22 @@ export class Dispatcher {
      *  Pending and onAgentAvailable() claims nothing — jobs already on agents
      *  finish. Defaults to never-draining. */
     isDraining?: () => boolean;
+    /**
+     * Whether another coordinator is live: connected, or disconnected for less
+     * than the peer flap grace. A job whose sealed secrets this coordinator
+     * cannot open is put back for such a peer; with none, no coordinator can
+     * open it, so it fails at once. Defaults to none.
+     */
+    hasPeerCoordinators?: () => boolean | Promise<boolean>;
   }) {
     this.registry = deps.registry;
     this.queue = deps.queue;
     this.metrics = deps.metrics;
     this.onDispatch = deps.onDispatch;
     this.onNoMatchingAgent = deps.onNoMatchingAgent;
-    this.canPrespawnedAgentServe = deps.canPrespawnedAgentServe;
-    this.isPrespawnedAgent = deps.isPrespawnedAgent;
+    this.scalerAgentView = deps.scalerAgentView;
     this.isDraining = deps.isDraining ?? (() => false);
+    this.hasPeerCoordinators = deps.hasPeerCoordinators ?? (() => false);
     this.maxReconnectDelayMs = deps.maxReconnectDelayMs ?? 60_000;
     this.onJobFailedPermanently = deps.onJobFailedPermanently;
     this.onRecoveryStarted = deps.onRecoveryStarted;
@@ -462,13 +497,20 @@ export class Dispatcher {
     // set — the job then queues (held) until the host reboots back and the
     // reconnect clears the flag, at which point onAgentAvailable drains it.
     //
-    // Suitability gate: a warm agent whose fixed-at-spawn shape or image does
-    // not fit this job is dropped too, so the job falls through to the scale
-    // path below and gets an agent that does fit.
-    const available = this.filterUnsuitablePrespawned(
-      await this.filterRebootPending(availableRaw),
-      job,
-    );
+    // Suitability gate: a scaler agent that cannot run this job — one started
+    // inside another job's image, one with no container runtime for a
+    // container job, a warm agent of another shape — is dropped too, so the
+    // job falls through to the scale path below and gets an agent that fits.
+    const notRebooting = await this.filterRebootPending(availableRaw);
+    const available = this.filterUnservableAgents(notRebooting, job, job.jobId);
+    if (available.length === 0 && notRebooting.length > 0) {
+      logger.info('Label-matching agents cannot run this job', {
+        runId: job.runId,
+        jobName: job.jobName,
+        container: jobContainerNeed(job.jobConfig?.container),
+        refusedAgents: notRebooting.map((a) => a.agentId),
+      });
+    }
 
     if (available.length > 0) {
       // Select per the job's runsOn.pick policy (deterministic-by-agentId by
@@ -477,7 +519,7 @@ export class Dispatcher {
 
       // Claim the slot before the async insert (same race as onAgentAvailable).
       this.registry.incrementActiveJobs(agent.agentId);
-      let insertResult: { id: string; inserted: boolean };
+      let insertResult: { id: string; inserted: boolean; runStopped?: boolean };
       try {
         // Persist the job in dispatch_queue with status='dispatched' for:
         // - Audit trail of all dispatched jobs
@@ -502,6 +544,9 @@ export class Dispatcher {
           jobName: job.jobName,
         });
         return { status: 'duplicate', jobId: insertResult.id };
+      }
+      if (insertResult.runStopped) {
+        return this.refuseStoppedRunDispatch(agent.agentId, job, insertResult.id);
       }
       const jobId = insertResult.id;
 
@@ -537,11 +582,12 @@ export class Dispatcher {
       };
 
       this.trackJobForAgent(agent.agentId, jobId, queuedJob.runId);
-      await this.onDispatch(agent.agentId, queuedJob);
       // Arm the ack deadline only after the dispatch is actually sent, so the
       // deadline doesn't include the secret-merge / token-mint prep above.
-      await this.armAckDeadline(agent.agentId, queuedJob);
-      this.metrics.incJobsDispatched('dispatched');
+      if (await this.deliver(agent.agentId, queuedJob)) {
+        await this.armAckDeadline(agent.agentId, queuedJob);
+        this.metrics.incJobsDispatched('dispatched');
+      }
 
       return { status: 'dispatched', agentId: agent.agentId, jobId };
     }
@@ -583,6 +629,11 @@ export class Dispatcher {
         containerSpawn,
       );
 
+      // An agent that matches the labels but can never run the job (a
+      // container job on an agent with no runtime) does not count.
+      // fails-when: a container job whose only matching agents report no
+      // runtime stays queued here instead of being offered to a peer
+      const fit = this.agentFitFor(job, job.jobId);
       if (
         scaleResult.action === 'no-backend' &&
         !this.registry.hasMatchingAgent(
@@ -590,6 +641,7 @@ export class Dispatcher {
           job.runsOnPatterns ?? [],
           job.excludeLabels ?? [],
           job.excludePatterns ?? [],
+          (entry) => canAgentRunJob(this.fitAgentFor(entry), fit),
         )
       ) {
         // No backend AND no registered agent. Job stays queued (will expire on
@@ -632,6 +684,9 @@ export class Dispatcher {
    * overlapping hook+sweep cannot double-offer the same jobs. Bounded by
    * `maxJobs` so one free event cannot storm the scaler.
    *
+   * A job whose sealed secrets this coordinator cannot open is never scaled
+   * for: it is settled instead ({@link settleUnopenablePending}).
+   *
    * @returns the number of jobs that entered `spawning`.
    */
   async retryPendingScaleRequests(
@@ -644,6 +699,12 @@ export class Dispatcher {
       const pending = await this.queue.listPending(maxJobs);
       let redriven = 0;
       for (const job of pending) {
+        // fails-when: the re-drive spawns a job's private image without its sealed registry credentials
+        // breaks-if-wrong: a job whose secrets opened is still offered to the scaler
+        if (job.secretsUnavailable) {
+          await this.settleUnopenablePending(job, job.secretsUnavailable);
+          continue;
+        }
         const containerSpawn = containerSpawnFor(job.jobConfig);
         const result = await this.onNoMatchingAgent(
           job.runsOnLabels,
@@ -671,6 +732,28 @@ export class Dispatcher {
     } finally {
       this.redriveInFlight = false;
     }
+  }
+
+  /**
+   * Release the slot claimed for a direct dispatch the queue refused because
+   * the job's run has stopped. Nothing is sent to the agent. The queue already
+   * recorded the row `expired` and cancelled the job, so the job reads as a
+   * queued job of the run that the cancel expired, and the caller tracks it
+   * under `queued` exactly as it would that one.
+   */
+  private refuseStoppedRunDispatch(
+    agentId: string,
+    job: QueuedJobInput,
+    jobId: string,
+  ): DispatchResult {
+    this.registry.decrementActiveJobs(agentId);
+    logger.info('Direct dispatch not sent: the run has stopped', {
+      runId: job.runId,
+      jobId,
+      jobName: job.jobName,
+      agentId,
+    });
+    return { status: 'queued', jobId };
   }
 
   /**
@@ -705,11 +788,11 @@ export class Dispatcher {
         job.excludeLabels ?? [],
         job.excludePatterns ?? [],
       ) &&
-      agent.activeJobs < agent.maxConcurrency;
+      agentHasFreeSlot(agent);
 
     if (dispatchable) {
       this.registry.incrementActiveJobs(agentId);
-      let insertResult: { id: string; inserted: boolean };
+      let insertResult: { id: string; inserted: boolean; runStopped?: boolean };
       try {
         insertResult = await this.queue.insertDispatched(job, agentId);
       } catch (err) {
@@ -725,6 +808,9 @@ export class Dispatcher {
           pinnedAgentId: agentId,
         });
         return { status: 'duplicate', jobId: insertResult.id };
+      }
+      if (insertResult.runStopped) {
+        return this.refuseStoppedRunDispatch(agentId, job, insertResult.id);
       }
       const jobId = insertResult.id;
       const queuedJob: QueuedJob = {
@@ -759,9 +845,10 @@ export class Dispatcher {
         pinnedAgentId: agentId,
       };
       this.trackJobForAgent(agentId, jobId, queuedJob.runId);
-      await this.onDispatch(agentId, queuedJob);
-      await this.armAckDeadline(agentId, queuedJob);
-      this.metrics.incJobsDispatched('dispatched');
+      if (await this.deliver(agentId, queuedJob)) {
+        await this.armAckDeadline(agentId, queuedJob);
+        this.metrics.incJobsDispatched('dispatched');
+      }
       return { status: 'dispatched', agentId, jobId };
     }
 
@@ -810,19 +897,27 @@ export class Dispatcher {
    * still pending and the agent's labels still satisfy it), marks it
    * dispatched, and sends it to the agent.
    *
-   * Returns true if dispatched, false if the bound job was already claimed
-   * elsewhere, expired, or the agent isn't registered. The caller falls
-   * back to the generic onAgentAvailable() drain in either case.
+   * Returns true only when the job was sent to the agent. False when nothing
+   * was claimed (the bound job was already claimed elsewhere, expired, or the
+   * agent isn't registered, is full or the coordinator is draining), and also
+   * when the claimed job was not sent: its dispatch was refused and it failed,
+   * or this coordinator could not open its sealed secrets. The caller falls
+   * back to the generic onAgentAvailable() drain in every false case.
    */
   async dispatchBoundJob(agentId: string, jobId: string): Promise<boolean> {
+    return (await this.claimBoundJob(agentId, jobId)) === BoundClaimOutcome.Sent;
+  }
+
+  /** {@link dispatchBoundJob}, reporting whether the job was claimed apart from whether it was sent. */
+  private async claimBoundJob(agentId: string, jobId: string): Promise<BoundClaimOutcome> {
     const agent = this.registry.get(agentId);
-    if (!agent) return false;
-    if (agent.activeJobs >= agent.maxConcurrency) return false;
+    if (!agent) return BoundClaimOutcome.NotClaimed;
+    if (!agentHasFreeSlot(agent)) return BoundClaimOutcome.NotClaimed;
 
     // Coordinator draining: do not claim a scaler-bound job onto a freshly
     // registered agent. The job stays Pending and the fresh coordinator
     // re-dispatches it after the upgrade restart.
-    if (this.isDraining()) return false;
+    if (this.isDraining()) return BoundClaimOutcome.NotClaimed;
 
     // Claim the slot before the async dequeue (same race as onAgentAvailable).
     this.registry.incrementActiveJobs(agentId);
@@ -837,23 +932,21 @@ export class Dispatcher {
     } finally {
       if (!job) this.registry.decrementActiveJobs(agentId);
     }
-    if (!job) return false;
+    if (!job) return BoundClaimOutcome.NotClaimed;
 
     await this.queue.markDispatched(job.id, agentId);
     this.trackJobForAgent(agentId, job.id, job.runId);
 
-    if (job.requestId) {
-      await requestContext.run({ requestId: job.requestId, runId: job.runId }, () =>
-        this.onDispatch(agentId, job),
-      );
-    } else {
-      await this.onDispatch(agentId, job);
+    const sent = await this.deliverInRequestContext(agentId, job);
+    if (sent) {
+      await this.armAckDeadline(agentId, job);
+      this.metrics.incJobsDispatched('dispatched');
     }
-    await this.armAckDeadline(agentId, job);
-    this.metrics.incJobsDispatched('dispatched');
     await this.updateQueueDepthMetric();
 
-    return true;
+    // fails-when: a claimed job that was refused or put back reads as sent, and counts as a placement
+    // breaks-if-wrong: a claimed job that reached the agent still reads as sent
+    return sent ? BoundClaimOutcome.Sent : BoundClaimOutcome.NotSent;
   }
 
   /**
@@ -879,28 +972,36 @@ export class Dispatcher {
   }
 
   /**
-   * Drop pre-spawned (warm) agents that cannot serve this job. Sibling of
+   * Drop the agents that cannot run this job (`canAgentRunJob`). Sibling of
    * {@link filterRebootPending}: both remove candidates `findAvailable` matched
    * on labels but that are unusable for a reason labels cannot express.
    *
-   * A warm agent's cpu, memory and container image are all set when it starts
-   * and cannot change afterwards, so a job asking for something else has to get
-   * an agent of its own. Dropping the candidate here is what sends it down the
-   * ordinary `onNoMatchingAgent` scale path. No-op when no scaler is wired.
+   * The reasons: an agent started inside another job's image, a container job
+   * on an agent that reports no container runtime, a warm agent of another
+   * shape. Dropping the candidate here is what sends the job down the ordinary
+   * `onNoMatchingAgent` scale path.
+   *
+   * `jobId` is the job's queue id when it has one: it is how the agent started
+   * for the job recognizes it.
    */
-  private filterUnsuitablePrespawned<T extends { agentId: string }>(
+  private filterUnservableAgents<T extends AgentEntry>(
     agents: T[],
     job: { resources?: ResourceRequest; jobConfig?: Record<string, unknown> | undefined },
+    jobId: string | undefined,
   ): T[] {
-    const predicate = this.canPrespawnedAgentServe;
-    if (!predicate || agents.length === 0) return agents;
-    const fit = this.prespawnedFitFor(job);
-    return agents.filter((a) => predicate(a.agentId, fit));
+    if (agents.length === 0) return agents;
+    const fit = this.agentFitFor(job, jobId);
+    return agents.filter((a) => canAgentRunJob(this.fitAgentFor(a), fit));
+  }
+
+  /** The registration facts, and the scaler's record, `canAgentRunJob` judges an agent on. */
+  private fitAgentFor(agent: AgentEntry): FitAgent {
+    return fitAgentFor(agent, this.scalerAgentView);
   }
 
   /**
-   * The fit question for one job: the shape it declares, and whether it brings
-   * its own container image.
+   * The fit question for one job: its queue id, the shape it declares, and
+   * what its `container:` asks of the agent's host.
    *
    * The shape comes from `jobConfig.resources` when the typed `resources`
    * mirror is absent, because the mirror is optional and several dispatch paths
@@ -910,29 +1011,30 @@ export class Dispatcher {
    * declares nothing, which admits it onto a pre-spawned agent of some other
    * size — the exact mismatch this gate exists to refuse.
    */
-  private prespawnedFitFor(job: {
-    resources?: ResourceRequest;
-    jobConfig?: Record<string, unknown> | undefined;
-  }): { resources?: ResourceRequest; hasOwnContainerImage: boolean } {
+  private agentFitFor(
+    job: { resources?: ResourceRequest; jobConfig?: Record<string, unknown> | undefined },
+    jobId: string | undefined,
+  ): AgentFitJob {
     const declared = job.resources ?? resourcesFromJobConfig(job.jobConfig);
     return {
+      ...(jobId !== undefined ? { jobId } : {}),
       ...(declared ? { resources: declared } : {}),
-      hasOwnContainerImage: containerSpawnFor(job.jobConfig) !== undefined,
+      container: jobContainerNeed(job.jobConfig?.container),
     };
   }
 
   /**
-   * The queue-drain half of {@link filterUnsuitablePrespawned}: a per-job
+   * The queue-drain half of {@link filterUnservableAgents}: a per-job
    * predicate for one agent, or undefined when this agent needs no check.
    *
-   * Undefined is the common answer — an ordinary agent is not pre-spawned, so
-   * the predicate could only ever say yes, and returning one would cost the
-   * drain its single-statement fast path for nothing.
+   * Undefined is the common answer for an agent that runs any job: the
+   * predicate could only ever say yes, and returning one would cost the drain
+   * its single-statement fast path for nothing.
    */
-  private prespawnedFitFilterFor(agentId: string): ((job: QueuedJob) => boolean) | undefined {
-    const predicate = this.canPrespawnedAgentServe;
-    if (!predicate || !this.isPrespawnedAgent?.(agentId)) return undefined;
-    return (job) => predicate(agentId, this.prespawnedFitFor(job));
+  private agentFitFilterFor(agent: AgentEntry): ((job: QueuedJob) => boolean) | undefined {
+    const fitAgent = this.fitAgentFor(agent);
+    if (!agentMayRefuse(fitAgent)) return undefined;
+    return (job) => canAgentRunJob(fitAgent, this.agentFitFor(job, job.id));
   }
 
   /**
@@ -1003,7 +1105,7 @@ export class Dispatcher {
     // not on the brief still-connected window after the restart job completes.
     const rebootPending = (await this.rosterStore?.isRebootPending(agentId, Date.now())) ?? false;
 
-    if (agent.activeJobs >= agent.maxConcurrency) return AgentDrainDecline.NoCapacity;
+    if (!agentHasFreeSlot(agent)) return AgentDrainDecline.NoCapacity;
     if (rebootPending) return AgentDrainDecline.RebootPending;
 
     // Claim the slot before the async dequeue. Drain triggers fire
@@ -1020,10 +1122,11 @@ export class Dispatcher {
       // The generic drain is the mirror of `dispatch()`: this agent asks for
       // any label-matching job rather than a job looking for an agent, so the
       // same suitability gate has to apply — an `agent.status` tick would
-      // otherwise hand a pre-spawned agent the very job `dispatch()` just
-      // refused it. It is carried into the claim rather than checked after,
-      // because a claimed-then-released row is stranded Dispatched for a window
-      // and burns one of the job's bounded dispatch attempts.
+      // otherwise hand a scaler agent the very job `dispatch()` just refused
+      // it, and an agent started inside one job's image would drain unrelated
+      // jobs. It is carried into the claim rather than checked after, because a
+      // claimed-then-released row is stranded Dispatched for a window and burns
+      // one of the job's bounded dispatch attempts.
       //
       // The pinned drain is deliberately NOT gated: a pin is authoritative and
       // was resolved against the roster when the child was materialized, so
@@ -1034,7 +1137,7 @@ export class Dispatcher {
           agentLabels,
           agentMandatoryLabels,
           agentId,
-          this.prespawnedFitFilterFor(agentId),
+          this.agentFitFilterFor(agent),
         ));
     } finally {
       if (!job) this.registry.decrementActiveJobs(agentId);
@@ -1046,23 +1149,180 @@ export class Dispatcher {
     this.trackJobForAgent(agentId, job.id, job.runId);
 
     // Notify caller to send to agent -- restore request context for queue-drained jobs
-    if (job.requestId) {
-      await requestContext.run({ requestId: job.requestId, runId: job.runId }, () =>
-        this.onDispatch(agentId, job),
-      );
-    } else {
-      await this.onDispatch(agentId, job);
+    if (await this.deliverInRequestContext(agentId, job)) {
+      await this.armAckDeadline(agentId, job);
+      this.metrics.incJobsDispatched('dispatched');
     }
-    await this.armAckDeadline(agentId, job);
-    this.metrics.incJobsDispatched('dispatched');
     return null;
+  }
+
+  /** {@link deliver} inside the job's own request context, restored for a queue-drained job. */
+  private async deliverInRequestContext(agentId: string, job: QueuedJob): Promise<boolean> {
+    if (!job.requestId) return this.deliver(agentId, job);
+    return requestContext.run({ requestId: job.requestId, runId: job.runId }, () =>
+      this.deliver(agentId, job),
+    );
+  }
+
+  /**
+   * Hand a tracked job to `onDispatch`. Returns false when the job was not sent:
+   * either the callback refused it, and the job is failed permanently since the
+   * refusal is a fact about the job and another agent would refuse it too; or
+   * this coordinator cannot open its sealed secrets, and the job is put back so
+   * a coordinator holding the key can take it, or failed when none can
+   * ({@link releaseUnopenableDispatch}).
+   */
+  private async deliver(agentId: string, job: QueuedJob): Promise<boolean> {
+    // fails-when: a queued job whose sealed secrets cannot be decrypted is sent without them
+    // breaks-if-wrong: a job whose secrets decrypted, or that had none, must still be sent
+    if (job.secretsUnavailable) {
+      await this.releaseUnopenableDispatch(agentId, job, job.secretsUnavailable);
+      return false;
+    }
+    const outcome = await this.onDispatch(agentId, job);
+    if (!outcome) return true;
+    // fails-when: a refused job is left dispatched with an ack deadline, or requeued
+    // breaks-if-wrong: a callback returning nothing must still count as sent
+    await this.failRefusedDispatch(agentId, job, outcome.refused);
+    return false;
+  }
+
+  /**
+   * Handle a claimed job whose sealed secrets this coordinator cannot open: it
+   * was sealed with a master key this coordinator does not hold.
+   *
+   * With another coordinator live this is not a permanent refusal: during a
+   * rolling master-key rotation that peer may already hold the new key, and if
+   * it does, its own drains can take the job. The row returns to pending,
+   * spending one dispatch attempt and recording the reason as the job's
+   * provisioning error (what an expiry reports), and this coordinator stops
+   * offering the job for the sealed-secrets back-off. Once the back-off lapses
+   * its drains and periodic re-drives offer the job again like any other, so a
+   * job no coordinator can open is claimed again and fails with the reason once
+   * {@link MAX_DISPATCH_ATTEMPTS} is reached. With no other coordinator live
+   * nobody can open it, so it fails at once.
+   *
+   * `agentId` is the agent the job was claimed for, or undefined when a re-drive
+   * claimed it for no agent ({@link settleUnopenablePending}).
+   */
+  private async releaseUnopenableDispatch(
+    agentId: string | undefined,
+    job: QueuedJob,
+    reason: string,
+  ): Promise<void> {
+    // fails-when: a single node keeps a job it can never open pending until it expires
+    // breaks-if-wrong: with a peer coordinator connected, the job is put back for it
+    if (!(await this.hasPeerCoordinators())) {
+      await this.failRefusedDispatch(agentId, job, reason);
+      return;
+    }
+    this.releaseClaimAccounting(agentId, job.id);
+    // Armed before the row returns to pending: a drain racing the requeue would
+    // otherwise find the job claimable inside its back-off.
+    // fails-when: a concurrent drain re-claims the job between the requeue and the deferral
+    await this.queue.deferUnopenable(job.id);
+    const attempts = await this.queue.requeue(job.id, {
+      countAttempt: true,
+      provisioningError: reason,
+    });
+    if (attempts === null) {
+      // The requeue refuses the row of a run that stopped after the claim, and
+      // nothing dispatches that row again: settle it here rather than leave it
+      // dispatched to no agent until a sweep finds it.
+      // fails-when: a run cancelled between the claim and the put-back leaves the row dispatched
+      // breaks-if-wrong: a row that already moved on, or whose run is going, is left as it is
+      await this.queue.settleClaimOfStoppedRun(job.id, job.runId);
+      return;
+    }
+    // fails-when: the attempt cap is not checked, so a job no coordinator opens waits for expiry
+    if (attempts >= MAX_DISPATCH_ATTEMPTS) {
+      const failure = `Job failed after ${attempts} dispatch attempts: ${reason}`;
+      logger.error('No coordinator could open the queued job secrets; failing the job', {
+        agentId,
+        jobId: job.id,
+        runId: job.runId,
+        attempts,
+      });
+      await this.queue.markFailed(job.id, failure);
+      this.onJobFailedPermanently?.(agentId ?? '', job.id, job.runId, failure);
+      return;
+    }
+    logger.warn(
+      'Queued job is sealed with a master key this coordinator does not hold; leaving it for a coordinator that holds the key',
+      { agentId, jobId: job.id, runId: job.runId, attempts, error: reason },
+    );
+    await this.updateQueueDepthMetric();
+  }
+
+  /**
+   * Settle a pending job whose sealed secrets this coordinator cannot open,
+   * found by a re-drive that would otherwise scale for it.
+   *
+   * Scaling for the job is wrong twice over. The registry credentials of a
+   * private image are sealed with the job's other secrets, so a spawn of that
+   * image pulls without them and fails before any agent registers: the job is
+   * never claimed, never spends an attempt, and every re-drive spawns again.
+   * And any agent a spawn does start is one this coordinator would hand the job
+   * back from. So the job is claimed by id for no agent and gets the decision a
+   * drain that claimed it would give it ({@link releaseUnopenableDispatch}). A
+   * claim lost to another coordinator, or refused inside the back-off, leaves
+   * the job alone.
+   */
+  private async settleUnopenablePending(job: QueuedJob, reason: string): Promise<void> {
+    if (!(await this.queue.claimUnopenableById(job.id))) return;
+    await this.releaseUnopenableDispatch(undefined, job, reason);
+  }
+
+  /**
+   * Undo the dispatch accounting of a refused job and fail it with the refusal
+   * reason. `agentId` is undefined for a job claimed for no agent.
+   */
+  private async failRefusedDispatch(
+    agentId: string | undefined,
+    job: QueuedJob,
+    reason: string,
+  ): Promise<void> {
+    logger.error('Dispatch refused before reaching the agent; failing the job', {
+      agentId,
+      jobId: job.id,
+      runId: job.runId,
+      reason,
+    });
+    this.releaseClaimAccounting(agentId, job.id);
+    await this.queue.markFailed(job.id, reason);
+    this.onJobFailedPermanently?.(agentId ?? '', job.id, job.runId, reason);
+  }
+
+  /** Free the slot and tracking a claim took on its agent; a claim for no agent took none. */
+  private releaseClaimAccounting(agentId: string | undefined, jobId: string): void {
+    if (agentId === undefined) return;
+    if (this.registry.get(agentId)) this.registry.decrementActiveJobs(agentId);
+    this.untrackJob(agentId, jobId);
   }
 
   /** Record that a job began executing on its agent. */
   markJobStarted(jobId: string): void {
     // `job.status: running` doubles as an ack in case the ack itself was lost.
     this.resolvePendingAck(jobId);
-    if (this.jobToAgent.has(jobId)) this.startedJobs.add(jobId);
+    const agentId = this.jobToAgent.get(jobId);
+    if (agentId === undefined) return;
+    this.startedJobs.add(jobId);
+    this.noteJobAccepted(agentId, jobId);
+  }
+
+  /**
+   * The agent accepted `jobId` (a `job.ack`, or the `running` status that stands
+   * in for a lost one). Drop a busy hold that already ran out: a job accepted
+   * while it sits on the entry was dispatched after it expired, into a free
+   * slot, so the agent's job count is not stuck and its next teardown-window
+   * rejection must not spend an attempt. A hold still in force is kept — see
+   * {@link AgentRegistry.clearExpiredBusyHold}.
+   */
+  private noteJobAccepted(agentId: string, jobId: string): void {
+    // fails-when: a frame for a job not dispatched to this agent drops its hold.
+    // breaks-if-wrong: an ack for a job tracked to the agent must still drop an expired hold.
+    if (this.jobToAgent.get(jobId) !== agentId) return;
+    this.registry.clearExpiredBusyHold(agentId);
   }
 
   /**
@@ -1133,6 +1393,7 @@ export class Dispatcher {
 
   /** Handle an explicit dispatch acknowledgment (`job.ack`) from an agent. */
   onJobAcked(agentId: string, jobId: string): void {
+    this.noteJobAccepted(agentId, jobId);
     const entry = this.pendingAcks.get(jobId);
     if (!entry) {
       // The ack beat the arming of its deadline (the agent answered faster
@@ -1225,9 +1486,21 @@ export class Dispatcher {
       });
       return;
     }
+    // A busy agent still holds the slot of the job it is tearing down. Hold it
+    // out of routing until it shows a free slot, so the requeue below cannot
+    // re-pick it at once. The first busy rejection after such evidence (an
+    // empty-slot report, a job on it finishing, or a job it accepted after the
+    // hold ran out) spends no attempt: the agent refused for a moment. A
+    // rejection from an agent re-picked only because its last hold expired,
+    // with no such evidence since, does spend one, so an agent whose job count
+    // is stuck still fails the job after MAX_DISPATCH_ATTEMPTS instead of
+    // holding it pending forever.
+    const busy = reason === JobRejectReason.enum.busy;
+    const hold = busy ? this.registry.markBusyHeld(agentId) : undefined;
+    const countAttempt = !busy || hold === BusyHoldOutcome.ReheldAfterExpiry;
     this.registry.decrementActiveJobs(agentId);
     this.untrackJob(agentId, jobId);
-    await this.requeueOrFail(agentId, jobId, `agent rejected dispatch (${reason})`);
+    await this.requeueOrFail(agentId, jobId, `agent rejected dispatch (${reason})`, countAttempt);
     await this.updateQueueDepthMetric();
   }
 
@@ -1249,14 +1522,17 @@ export class Dispatcher {
   /**
    * Requeue a dispatched job for re-delivery, or fail it permanently when
    * its attempt budget is exhausted. Returns the outcome so disconnect
-   * triage can surface failed job IDs to the caller.
+   * triage can surface failed job IDs to the caller. `countAttempt: false`
+   * requeues without spending the budget (a busy rejection).
    */
   private async requeueOrFail(
     agentId: string,
     jobId: string,
     context: string,
+    countAttempt: boolean = true,
   ): Promise<'requeued' | 'failed' | 'gone'> {
-    return this.finishRequeue(agentId, jobId, context, await this.queue.requeue(jobId));
+    const attempts = await this.queue.requeue(jobId, { countAttempt });
+    return this.finishRequeue(agentId, jobId, context, attempts);
   }
 
   /**
@@ -1298,13 +1574,24 @@ export class Dispatcher {
   private async redispatch(jobId: string): Promise<void> {
     const job = await this.queue.getFullJobById(jobId);
     if (!job || job.status !== DispatchQueueStatus.Pending) return;
+    // A job this coordinator just put back for a peer is not re-offered from here
+    // inside its back-off; after it, the job is offered again like any other.
+    // fails-when: a job put back for a peer is re-claimed here at once, spending the budget
+    if (this.queue.isDeferredUnopenable(job.id)) return;
+    // fails-when: a requeued job this coordinator cannot open is scaled for without its registry credentials
+    // breaks-if-wrong: a requeued job whose secrets opened still goes to an agent or the scaler
+    if (job.secretsUnavailable) {
+      await this.settleUnopenablePending(job, job.secretsUnavailable);
+      return;
+    }
 
     // Label-routed, exactly like `dispatch()`: the candidates here are idle
-    // agents that merely match, not the agent this job was bound to. So the
-    // same suitability gate applies — an unsuitable warm agent is dropped and
-    // the job falls through to the scaler below. A job-bound agent is never a
-    // pre-spawned one, so its own agent can never be filtered out from under it.
-    const available = this.filterUnsuitablePrespawned(
+    // agents that merely match, not necessarily the agent this job was bound
+    // to. So the same suitability gate applies — an unsuitable scaler agent is
+    // dropped and the job falls through to the scaler below. The agent started
+    // for this job always passes it, so its own agent is never filtered out
+    // from under it.
+    const available = this.filterUnservableAgents(
       this.registry.findAvailable(
         matchLabelsFor(job),
         job.runsOnPatterns ?? [],
@@ -1312,13 +1599,18 @@ export class Dispatcher {
         job.excludePatterns ?? [],
       ),
       job,
+      job.id,
     );
     if (available.length > 0) {
-      const dispatched = await this.dispatchBoundJob(
+      const outcome = await this.claimBoundJob(
         selectAgent(available, job.jobConfig).agentId,
         jobId,
       );
-      if (dispatched) return;
+      // A claimed job is dealt with whether or not it was sent: scaling for one
+      // that was refused or put back would start an agent for nothing.
+      // fails-when: a claimed job that was refused or put back is also scaled for
+      // breaks-if-wrong: a job no idle agent claimed must still reach the scaler below
+      if (outcome !== BoundClaimOutcome.NotClaimed) return;
     }
     if (this.onNoMatchingAgent) {
       // A requeued container job needs its spawn context too — without it the
@@ -1361,6 +1653,9 @@ export class Dispatcher {
    * It never consults the scaler (that is `retryPendingScaleRequests`) and never
    * spawns: it only places jobs onto agents already connected here.
    *
+   * Returns the number of jobs sent. A job it claims but does not send (its
+   * dispatch refused, or its sealed secrets unopenable here) is not counted.
+   *
    * A failure propagates to the caller rather than being swallowed here — the
    * per-coord interval wrapper is the single error-log site, matching the
    * sibling recovery/ack sweeps that share its cadence. The `finally` only
@@ -1373,14 +1668,19 @@ export class Dispatcher {
       if ((await this.queue.getDepth()) === 0) return 0;
       const pending = await this.queue.listPending(maxJobs);
       let placed = 0;
+      // Claimed but refused or put back: each is logged where it is decided.
+      let notSent = 0;
       for (const job of pending) {
         const target = await this.selectConnectedTargetForPending(job);
         if (!target) continue;
-        if (await this.dispatchBoundJob(target, job.id)) placed++;
+        const outcome = await this.claimBoundJob(target, job.id);
+        if (outcome === BoundClaimOutcome.Sent) placed++;
+        else if (outcome === BoundClaimOutcome.NotSent) notSent++;
       }
       if (placed > 0) {
         logger.info('Re-drove pending jobs onto connected idle agents', {
           placed,
+          notSent,
           scanned: pending.length,
         });
       }
@@ -1406,7 +1706,7 @@ export class Dispatcher {
   private async selectConnectedTargetForPending(job: QueuedJob): Promise<string | null> {
     if (job.pinnedAgentId) {
       const agent = this.registry.get(job.pinnedAgentId);
-      if (!agent || agent.activeJobs >= agent.maxConcurrency) return null;
+      if (!agent || !agentHasFreeSlot(agent)) return null;
       if ((await this.rosterStore?.isRebootPending(job.pinnedAgentId, Date.now())) ?? false) {
         return null;
       }
@@ -1418,9 +1718,10 @@ export class Dispatcher {
       job.excludeLabels ?? [],
       job.excludePatterns ?? [],
     );
-    const available = this.filterUnsuitablePrespawned(
+    const available = this.filterUnservableAgents(
       await this.filterRebootPending(availableRaw),
       job,
+      job.id,
     );
     if (available.length === 0) return null;
     return selectAgent(available, job.jobConfig).agentId;
@@ -1598,6 +1899,17 @@ export class Dispatcher {
   onJobComplete(agentId: string, jobId: string): void {
     // Completion bypasses untrackJob, so clear any pending ack here too.
     this.resolvePendingAck(jobId);
+    // A job tracked to the agent reached a final status: the agent is releasing
+    // that job's slot, so its job count is not stuck. Lift any busy hold on it,
+    // even one still in force. A teardown-window rejection that follows
+    // re-holds the agent fresh and spends no attempt; left in force, a teardown
+    // that outlasts the rest of the hold would be re-picked on expiry and
+    // charged.
+    // fails-when: a replayed terminal frame, or one for another agent's job, lifts the hold.
+    // breaks-if-wrong: a job finishing on the held agent must lift its hold.
+    if (this.agentJobs.get(agentId)?.has(jobId) === true) {
+      this.registry.clearBusyHeld(agentId);
+    }
     this.registry.decrementActiveJobs(agentId);
     this.jobToAgent.delete(jobId);
     this.jobRunIds.delete(jobId);

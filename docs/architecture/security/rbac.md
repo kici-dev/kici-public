@@ -85,15 +85,22 @@ the patterns are checked against.
 
 **A run of an organization-wide workflow belongs to two repositories.** Such a
 workflow lives in one repository and fires on events from many others, so its
-runs carry both: the repository the run acted on, and the repository that
-defines the workflow. A member scoped to **either** repository reaches the run —
+runs carry both: the **source** repository, whose event started the run, and
+the **defining** repository, which holds the workflow. A member scoped to **either** repository reaches the run —
 the team that triggered it and the team that authored the workflow both see it,
 in the run list, the filter dropdown (which offers both repositories), the
 `?repository=` filter, every run sub-resource, and the equivalent MCP tools.
 Cancelling is granted on the same either-repository rule, so the team whose
-workflow is running can always stop it. Releasing a **held** run is the one
-exception: approving or rejecting a hold permits code to execute against the
-repository the run acts on, so it stays with a member scoped to that repository.
+workflow is running can always stop it. **Re-running** goes the other way. A re-run of such a
+run executes the defining repository's workflow again, with that repository's
+contexts and credentials, so it requires the member's scope to cover the
+**defining** repository; a member scoped only to the source repository
+is refused, on the dashboard and through the MCP `rerun_run` tool alike. A global evaluation round is the exception: its
+re-run re-evaluates the source repository's event, so it stays on the source
+repository's scope. Releasing a **held** run is narrowed the other
+way, to the source repository alone: approving or rejecting a hold lets the
+defining repository's workflow run against the source repository's code, so
+the release stays with a member scoped to the source repository.
 The held-runs **list** is scoped the same narrow way, so it keeps agreeing with
 the approve and reject routes — a member scoped only to the defining repository
 sees the run itself but not its hold, rather than seeing a hold they would then

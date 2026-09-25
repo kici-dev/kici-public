@@ -37,7 +37,7 @@ To stop using GitHub to sign in:
    remove your only sign-in method, so you must have another one first.
 2. In your account console, remove the GitHub sign-in method.
 
-Your account, organizations, and data are unaffected — you simply sign in a
+Your account, organizations, and data are unaffected — you sign in a
 different way afterward.
 
 ## Linked accounts vs sign-in methods

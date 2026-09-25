@@ -2,12 +2,10 @@
  * Org global workflows route through the Tier-2 eval round instead of dropping
  * their dynamic jobs.
  *
- * The defect this suite guards: `buildGlobalWorkflowJobInputs` used to compute
- * its own job list as `globalWorkflow.jobs.filter(isLockStaticJob)`, so a global
- * workflow whose jobs were produced by a `DynamicJobFn` dispatched nothing at
- * all — no error, no skipped job, no trace. A workflow-level `filter` was
- * ignored just as silently, so a global that had declared it applies to no
- * source repo ran anyway.
+ * The defect this suite guards: a global workflow whose jobs a `DynamicJobFn`
+ * produces must dispatch those jobs, not nothing at all — no error, no skipped
+ * job, no trace. A workflow-level `filter` must be evaluated, or a global that
+ * declared it applies to no source repo runs anyway.
  *
  * Both org-global paths are covered, because they are separate call sites that
  * have diverged before: `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock
@@ -20,8 +18,24 @@ import { dispatchGlobalWorkflowsForOtherRepos, processWebhook } from './process-
 import { ROUND_JOB_PREFIX } from './global-eval-round.js';
 import { webhookPayloadPath } from './webhook-payload-store.js';
 import type { WebhookInfo } from '../webhook/handler.js';
-import { TraceCheck } from '@kici-dev/engine';
+import { ExecutionRunStatus, HoldScope, TraceCheck, TriggerSource } from '@kici-dev/engine';
+import { resumeWorkflow, rejectWorkflow } from './resume-workflow.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { cancelRunWithReason } from '../cancel/cancel-run.js';
+import { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { GlobalEvalRoundResult, LockJob } from '@kici-dev/engine';
+import { AgentCapabilityFlag, GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL } from '@kici-dev/engine';
+import { dispatchGlobalCandidateViaPipeline } from './global-dispatch.js';
+
+// A pass-through spy: every global dispatch still runs the real pipeline, and a
+// test can read the exact job list a candidate handed it.
+vi.mock('./global-dispatch.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./global-dispatch.js')>();
+  return {
+    ...actual,
+    dispatchGlobalCandidateViaPipeline: vi.fn(actual.dispatchGlobalCandidateViaPipeline),
+  };
+});
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -60,6 +74,24 @@ function dynamicEntry() {
   return { _type: 'dynamic' as const, source: { file: '.kici/workflows/org.ts', index: 0 } };
 }
 
+/** A result-aware `DynamicJobFn` entry: deferred until `build` completes. */
+function resultAwareEntry() {
+  return {
+    _type: 'dynamic' as const,
+    source: { file: '.kici/workflows/org.ts', index: 1 },
+    needs: ['build'],
+    resultAware: true,
+  };
+}
+
+/** The job list handed to the pipeline, one entry per global candidate, in order. */
+function pipelineWorkflows(): Array<{ name: string; jobs: Array<Record<string, unknown>> }> {
+  return vi.mocked(dispatchGlobalCandidateViaPipeline).mock.calls.map((call) => ({
+    name: call[0].resolved.candidate.lockEntry.name,
+    jobs: [...call[0].resolved.jobs] as unknown as Array<Record<string, unknown>>,
+  }));
+}
+
 /**
  * A global workflow registration in ANOTHER repo, triggering on push.
  *
@@ -81,12 +113,19 @@ function makeGlobalRegistration(over: {
   routingKey?: string;
   /** The repository that defines the workflow. */
   repoIdentifier?: string;
+  /** Disabled in the dashboard; the index filters it like the real one. */
+  disabled?: boolean;
 }) {
   return {
     id: over.id ?? 'reg-global-1',
     routingKey: over.routingKey ?? 'github:1',
     repoIdentifier: over.repoIdentifier ?? GLOBAL_REPO,
+    workflowName: over.name ?? GLOBAL_WORKFLOW,
+    triggerTypes: ['push'],
+    isGlobal: true,
+    disabled: over.disabled ?? false,
     commitSha: 'globalsha',
+    defaultBranch: 'trunk',
     sourceFile: '.kici/workflows/org.ts',
     lockEntry: {
       name: over.name ?? GLOBAL_WORKFLOW,
@@ -301,7 +340,6 @@ function makeDeps(over: {
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn(),
-      postGlobalWorkflowsSkippedCheck: vi.fn(),
       postGlobalEvalFailedCheck,
     },
     lockFileFetcher: over.withLockFile ? { fetchLockFile: vi.fn() } : undefined,
@@ -320,7 +358,12 @@ function makeDeps(over: {
     orchestratorMode: 'platform',
     registrationIndex: {
       refreshIfNeeded: vi.fn(async () => undefined),
-      getGlobalByOrgAndTriggerType: () => over.registrations,
+      // Filters disabled rows the way the real index does.
+      getGlobalByOrgAndTriggerType: () => over.registrations.filter((reg) => !reg.disabled),
+      getByOrgAndRepo: (_org: string, repo: string) =>
+        over.registrations.filter((reg) => reg.repoIdentifier === repo && !reg.disabled),
+      getAllByOrgAndRepo: (_org: string, repo: string) =>
+        over.registrations.filter((reg) => reg.repoIdentifier === repo),
       getByRepo: () => [],
       getByOrgAndEvent: () => [],
     },
@@ -925,16 +968,15 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 /**
  * An admitted cross-repo global workflow is a run, and must be visible as one.
  *
- * The defect this suite guards: `dispatchBuiltGlobalCandidate` minted a run id
- * and went straight to `dispatcher.dispatch()`, so the jobs executed while no
- * `execution_runs` row was ever written. Nothing keyed on a run could see them
- * — not `runs list`, not `runs jobs`, not the dashboard, not cancel — and
- * `ExecutionTracker.onJobStatus` discarded every status they reported, because
- * `execution_jobs` carries a foreign key onto `execution_runs`.
+ * The defect this suite guards: jobs that execute while no `execution_runs` row
+ * exists. Nothing keyed on a run could see them — not `runs list`, not `runs
+ * jobs`, not the dashboard, not cancel — and `ExecutionTracker.onJobStatus`
+ * discards every status they report, because `execution_jobs` carries a foreign
+ * key onto `execution_runs`.
  *
- * Both dispatch paths are covered, because `dispatchBuiltGlobalCandidate` is
- * shared: the immediate path (a candidate the lock file fully describes) and
- * the round-cleared path (a candidate a `filter` or a generator decided on).
+ * Both dispatch paths are covered, because both go through the shared pipeline:
+ * the immediate path (a candidate the lock file fully describes) and the
+ * round-cleared path (a candidate a `filter` or a generator decided on).
  */
 describe('an admitted cross-repo global workflow creates its run row', () => {
   /** Positional argument names of `ExecutionTracker.onExecutionStarted`. */
@@ -949,7 +991,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     triggerDecision: 8,
     jobs: 9,
     routingKey: 10,
-    workflowRepoIdentifier: 25,
+    workflowRepo: 25,
   } as const;
 
   it('records the run against the SOURCE repo before dispatching its jobs', async () => {
@@ -987,19 +1029,25 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     // The repo that DEFINES the workflow — the one piece of the global
     // dispatch that `repo_identifier` cannot express, and the only thing a
     // rerun can use to tell this run from a per-repository one.
-    expect(call[ARG.workflowRepoIdentifier]).toBe(GLOBAL_REPO);
-    expect(call[ARG.workflowRepoIdentifier]).not.toBe(call[ARG.repoIdentifier]);
+    // fails-when: the workflow repo's identifier, registered commit, or
+    // registered default branch is dropped
+    expect(call[ARG.workflowRepo]).toEqual({
+      identifier: GLOBAL_REPO,
+      sha: 'globalsha',
+      branch: 'trunk',
+    });
+    expect(call[ARG.workflowRepo].identifier).not.toBe(call[ARG.repoIdentifier]);
 
     // Ordering is the whole point of registering with an empty job list — a
     // status arriving before the row exists is dropped and never retried. The
     // pending-jobs token brackets the dispatch window: taken once the row
     // exists, released once every job is registered.
     expect(h.callOrder).toEqual(['run-start', 'hold', 'dispatch:scan', 'add-jobs', 'release']);
-    expect(h.addJobsToRun.mock.calls[0]).toEqual([
-      h.workJobs()[0].runId,
-      // `baseJobName` equals the job name for an unexpanded job; it is the
-      // wave scheduler's grouping key and must be present either way.
-      [{ jobId: 'job-scan', jobName: 'scan', baseJobName: 'scan', runsOnLabels: ['default'] }],
+    expect(h.addJobsToRun.mock.calls[0][0]).toBe(h.workJobs()[0].runId);
+    // The same row shape a per-repository run registers: an unexpanded job
+    // carries no `baseJobName` (a materialized child does, see below).
+    expect(h.addJobsToRun.mock.calls[0][1]).toEqual([
+      { jobId: 'job-scan', jobName: 'scan', runsOnLabels: ['default'] },
     ]);
   });
 
@@ -1050,7 +1098,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     expect(h.callOrder.filter((c) => c === 'run-start')).toEqual(['run-start']);
     expect(h.callOrder.indexOf('run-start')).toBeLessThan(h.callOrder.indexOf('dispatch:gen-a'));
     expect(h.addJobsToRun.mock.calls[0][1]).toEqual([
-      { jobId: 'job-gen-a', jobName: 'gen-a', baseJobName: 'gen-a', runsOnLabels: ['default'] },
+      { jobId: 'job-gen-a', jobName: 'gen-a', runsOnLabels: ['default'] },
     ]);
   });
 
@@ -1746,7 +1794,92 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
       expect(outcome.decidedWorkflowRepos).toEqual([]);
     });
 
-    it('names no repository when the trust policy did not admit the event', async () => {
+    it("a failed round's re-run does not dispatch a result-aware-only sibling a second time", async () => {
+      vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+      const h = makeDeps({
+        registrations: [
+          makeGlobalRegistration({
+            jobs: [dynamicEntry()],
+            name: GLOBAL_WORKFLOW,
+            id: 'reg-round',
+          }),
+          makeGlobalRegistration({
+            jobs: [staticJob('build'), resultAwareEntry()],
+            name: 'org-deferred',
+            id: 'reg-deferred',
+          }),
+        ],
+        roundFails: true,
+      });
+
+      // The delivery: the round fails, the result-aware-only sibling dispatches.
+      await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+      // The Re-run of that failed round, as rerun.ts drives it.
+      const rerun = passArgs(h, GLOBAL_REPO) as unknown as Record<string, unknown>;
+      rerun.onlyRoundCandidates = true;
+      await dispatchGlobalWorkflowsForOtherRepos(
+        rerun as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0],
+      );
+
+      // fails-when: the re-run dispatches the sibling the delivery already dispatched for this commit
+      expect(pipelineWorkflows().filter((w) => w.name === 'org-deferred')).toHaveLength(1);
+      // Positive control: the re-run did re-drive the round.
+      expect(h.track.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('releasing an approved hold dispatches a result-aware-only sibling once', async () => {
+      // breaks-if-wrong: the held round's release is the one re-drive that must dispatch it
+      vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+      const h = makeDeps({
+        registrations: [
+          makeGlobalRegistration({
+            jobs: [staticJob('build'), resultAwareEntry()],
+            name: 'org-deferred',
+            id: 'reg-deferred',
+          }),
+        ],
+      });
+      const release = passArgs(h, GLOBAL_REPO) as unknown as Record<string, unknown>;
+      release.onlyRoundCandidates = true;
+      release.releasedHold = true;
+      await dispatchGlobalWorkflowsForOtherRepos(
+        release as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0],
+      );
+
+      expect(pipelineWorkflows().map((w) => w.name)).toEqual(['org-deferred']);
+    });
+
+    it.each([
+      { name: 'a result-aware-only workflow is held with the round', deferred: true },
+      { name: 'a static-only workflow is held on its own', deferred: false },
+    ])('under a held event, $name', async ({ deferred }) => {
+      vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+      const h = makeDeps({
+        registrations: [
+          makeGlobalRegistration({
+            jobs: deferred ? [staticJob('build'), resultAwareEntry()] : [staticJob('scan')],
+          }),
+        ],
+      });
+      const args = passArgs(h, GLOBAL_REPO) as unknown as Record<string, unknown>;
+      args.securityDecision = { action: 'hold', reason: 'untrusted contributor' };
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(
+        args as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0],
+      );
+
+      // fails-when: a result-aware-only workflow takes its own hold instead of the round's, so releasing the round drops it
+      // breaks-if-wrong: a static-only workflow still takes its own hold through the pipeline
+      expect(pipelineWorkflows()).toHaveLength(deferred ? 0 : 1);
+      expect(outcome.matchedCount).toBe(1);
+      expect(h.workJobs()).toEqual([]);
+    });
+
+    it('names no repository whose run a held event parked in the security queue', async () => {
+      // A held event decided nothing about the workflows it holds: they run, or
+      // do not, when an approver answers. Counting the repository as decided
+      // would let a re-run post the round-succeeded check on a held event.
+      // fails-when: a held event counts its workflow repository as decided, or dispatches the global job
       const h = makeDeps({
         registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
       });
@@ -1758,6 +1891,682 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
       );
 
       expect(outcome.decidedWorkflowRepos).toEqual([]);
+      expect(outcome.matchedCount).toBe(1);
+      expect(h.workJobs()).toEqual([]);
     });
   });
+});
+
+/**
+ * Approving the security hold of a held evaluation round runs that round.
+ *
+ * Driven through `resumeWorkflow`, the release every approval surface reaches,
+ * with the real organization-wide pass behind it: the round job must dispatch
+ * for the held workflow repository and the jobs it admits must follow.
+ */
+describe('releasing a held evaluation round', () => {
+  /** `repos` on a trigger is what makes a workflow organization-wide. */
+  const ANY_REPO: Array<{ type: 'glob'; pattern: string }> = [{ type: 'glob', pattern: '**' }];
+  const HELD_RUN_ID = 'held-round-1';
+  const HELD_ROW = {
+    run_id: HELD_RUN_ID,
+    routing_key: 'github:1',
+    workflow_name: `${ROUND_JOB_PREFIX}${GLOBAL_REPO}`,
+    status: ExecutionRunStatus.enum.held,
+    provider: 'github',
+    repo_identifier: SOURCE_REPO,
+    ref: 'main',
+    sha: 'headsha',
+    delivery_id: 'd-held',
+    customer_id: 'org-1',
+    workflow_repo_identifier: GLOBAL_REPO,
+    // The commit and branch the hold recorded: the registrations' own.
+    workflow_sha: 'globalsha',
+    workflow_branch: 'trunk',
+    dispatch_routing_key: null,
+    is_global_eval_round: true,
+    provider_context: JSON.stringify({ token: 'src-token' }),
+    // The delivery's `event_log` columns: the mock serves one row to every
+    // select whose predicates it satisfies.
+    org_id: 'org-1',
+    event: 'push',
+    action: null,
+  };
+  const SIGNAL = {
+    holdId: 'hold-1',
+    runId: HELD_RUN_ID,
+    jobId: 'security',
+    scope: HoldScope.enum.workflow,
+    stepIndex: null,
+    triggerSource: TriggerSource.enum.context,
+  };
+
+  function releaseHarness(
+    over: {
+      row?: Record<string, unknown>;
+      payload?: string | null;
+      extraRegistrations?: ReturnType<typeof makeGlobalRegistration>[];
+      /** Replaces the default registrations the index returns. */
+      registrations?: ReturnType<typeof makeGlobalRegistration>[];
+    } = {},
+  ) {
+    const h = makeDeps({
+      registrations: over.registrations ?? [
+        makeGlobalRegistration({
+          jobs: [dynamicEntry()],
+          name: GLOBAL_WORKFLOW,
+          id: 'reg-round',
+          repos: ANY_REPO,
+        }),
+        makeGlobalRegistration({
+          jobs: [staticJob('scan')],
+          name: 'org-static',
+          id: 'reg-static',
+          repos: ANY_REPO,
+        }),
+        ...(over.extraRegistrations ?? []),
+      ],
+      roundResult: {
+        candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [staticJob('gen-a')] }],
+      } as GlobalEvalRoundResult,
+      withExecutionTracker: true,
+    });
+    const complete = vi.fn(async () => undefined);
+    const payload = over.payload === undefined ? JSON.stringify({ repository: {} }) : over.payload;
+    const deps = h.deps as unknown as Record<string, any>;
+    deps.executionTracker.completeReleasedGlobalEvalRound = complete;
+    // The row every read of the run sees, moved by the guarded held → pending
+    // claim: only the first release finds it held.
+    const row: Record<string, unknown> = { ...(over.row ?? HELD_ROW) };
+    const claim = vi.fn(async () => {
+      if (row.status !== ExecutionRunStatus.enum.held) return false;
+      row.status = ExecutionRunStatus.enum.pending;
+      return true;
+    });
+    deps.executionTracker.claimHeldGlobalEvalRound = claim;
+    deps.logStorage.read = vi.fn(async () => ({ data: payload ?? '', cursor: 0, complete: true }));
+    deps.db = createMockDb({ selectFirstRow: row }).db;
+    return { h, complete, claim, row, deps: h.deps };
+  }
+
+  it('dispatches the round for the held workflow repository, then the jobs it admits', async () => {
+    // fails-when: approving the round's hold replays nothing, or replays it as a workflow dispatch
+    const { h, complete, deps } = releaseHarness();
+
+    await resumeWorkflow(SIGNAL, deps, deps.db);
+
+    expect(h.track).toHaveBeenCalledTimes(1);
+    const round = h.dispatched().find((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+    expect(round?.jobConfig.workflowRepoIdentifier).toBe(GLOBAL_REPO);
+    // The workflow that needed no round was held and released on its own, so
+    // the round's release must not dispatch it a second time.
+    expect(h.workJobs().map((d) => d.jobName)).toEqual(['gen-a']);
+    expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, { status: ExecutionRunStatus.enum.success });
+  });
+
+  it('dispatches a result-aware-only workflow held with the round when the round is released', async () => {
+    // A held event holds every candidate carrying a generator with its repository's
+    // round — including one recorded before result-aware generators stopped
+    // needing the round — so approving that hold must dispatch it.
+    const { h, deps } = releaseHarness({
+      extraRegistrations: [
+        makeGlobalRegistration({
+          jobs: [staticJob('build'), resultAwareEntry()],
+          name: 'org-deferred',
+          id: 'reg-deferred',
+          repos: ANY_REPO,
+        }),
+      ],
+    });
+    vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+
+    await resumeWorkflow(SIGNAL, deps, deps.db);
+
+    // fails-when: the release partition drops the result-aware-only workflow it held
+    expect(
+      pipelineWorkflows()
+        .map((w) => w.name)
+        .sort(),
+    ).toEqual([GLOBAL_WORKFLOW, 'org-deferred'].sort());
+    // breaks-if-wrong: the static-only workflow was held on its own and must not dispatch again
+    expect(pipelineWorkflows().map((w) => w.name)).not.toContain('org-static');
+    // It needs no round, so the round still carries only the round candidate.
+    const round = h.dispatched().find((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+    expect(
+      round?.jobConfig.candidates.map((c: { workflowName: string }) => c.workflowName),
+    ).toEqual([GLOBAL_WORKFLOW]);
+  });
+
+  it('runs the round once when the release signal fires twice', async () => {
+    // fails-when: a second release of the same hold dispatches the round and its admitted jobs again
+    const { h, claim, complete, deps } = releaseHarness();
+
+    await Promise.all([
+      resumeWorkflow(SIGNAL, deps, deps.db),
+      resumeWorkflow(SIGNAL, deps, deps.db),
+    ]);
+
+    expect(claim).toHaveBeenCalledTimes(2);
+    expect(h.track).toHaveBeenCalledTimes(1);
+    expect(
+      h.dispatched().filter((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX)),
+    ).toHaveLength(1);
+    expect(h.workJobs().map((d) => d.jobName)).toEqual(['gen-a']);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A database whose `execution_runs` writes apply to `row` when their plain
+   * `status` guards hold, so a real cancel moves the row the release re-reads.
+   * Raw-SQL guards are not evaluated: the round row has no job rows, which is
+   * what the one raw guard on the cancel path (NOT EXISTS execution_jobs) asks.
+   */
+  function runRowDb(row: Record<string, unknown>) {
+    const base = createMockDb({ selectFirstRow: row }).db as unknown as Record<string, any>;
+    const holds = (column: unknown, op: unknown, value: unknown): boolean => {
+      if (column === 'run_id') return value === row.run_id;
+      if (column !== 'status') return true;
+      if (op === '=') return row.status === value;
+      if (op === 'in') return (value as unknown[]).includes(row.status);
+      if (op === 'not in') return !(value as unknown[]).includes(row.status);
+      return true;
+    };
+    return new Proxy(base, {
+      get(target, prop) {
+        if (prop !== 'updateTable') return target[prop as string];
+        return (table: string) => {
+          if (table !== 'execution_runs') return target.updateTable(table);
+          let values: Record<string, unknown> = {};
+          const guards: unknown[][] = [];
+          const apply = () => {
+            if (!guards.every((g) => g.length !== 3 || holds(g[0], g[1], g[2]))) return undefined;
+            for (const [k, v] of Object.entries(values)) {
+              if (v === null || typeof v !== 'object' || v instanceof Date) row[k] = v;
+            }
+            return { ...row };
+          };
+          const chain: Record<string, any> = {
+            set: (v: Record<string, unknown>) => ((values = v), chain),
+            where: (...args: unknown[]) => (guards.push(args), chain),
+            returningAll: () => chain,
+            execute: async () => [{ numUpdatedRows: apply() ? 1n : 0n }],
+            executeTakeFirst: async () => apply(),
+          };
+          return chain;
+        };
+      },
+    });
+  }
+
+  it('dispatches nothing the round admitted once its run was cancelled mid-round', async () => {
+    // Cancelled through the real cancel path: the round row has no job rows,
+    // so it is the cancel itself that has to move it off `pending`.
+    // fails-when: a round whose run a user cancelled while it ran still dispatches its admitted jobs
+    const { h, row, deps } = releaseHarness();
+    const db = runRowDb(row);
+    (deps as unknown as Record<string, unknown>).db = db;
+    const forwarded = vi.fn();
+    const tracker = new ExecutionTracker({ db: db as never, onExecutionStatusChange: forwarded });
+    vi.spyOn(tracker, 'completeRunIfAllJobsTerminal').mockResolvedValue(undefined);
+    h.track.mockImplementation(async () => {
+      const cancelled = await cancelRunWithReason(
+        {
+          db: db as never,
+          jobQueue: {
+            getDispatchedJobOwnersByRunId: async () => [],
+            cancelByRunId: async () => 0,
+          } as never,
+          registry: { get: () => undefined } as never,
+          executionTracker: tracker,
+        },
+        HELD_RUN_ID,
+        'cancelled by a user',
+      );
+      expect(cancelled.alreadyTerminal).toBe(false);
+      return {
+        candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [staticJob('gen-a')] }],
+      };
+    });
+
+    await resumeWorkflow(SIGNAL, deps, db as never);
+
+    expect(h.track).toHaveBeenCalledTimes(1);
+    expect(row.status).toBe(ExecutionRunStatus.enum.cancelled);
+    expect(forwarded.mock.calls[0][1]).toBe(ExecutionRunStatus.enum.cancelled);
+    expect(h.workJobs()).toEqual([]);
+  });
+
+  it('dispatches nothing and settles nothing when the claim itself fails', async () => {
+    const { h, claim, complete, deps } = releaseHarness();
+    claim.mockRejectedValueOnce(new Error('connection reset'));
+
+    await expect(resumeWorkflow(SIGNAL, deps, deps.db)).resolves.toBeUndefined();
+
+    expect(h.dispatch).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('fails the held round with the reason when its payload was not stored', async () => {
+    const { h, complete, deps } = releaseHarness({ payload: null });
+
+    await resumeWorkflow(SIGNAL, deps, deps.db);
+
+    expect(h.dispatch).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+      status: ExecutionRunStatus.enum.failed,
+      reason: expect.stringContaining('webhook payload was not stored'),
+    });
+  });
+
+  it('fails the held round when the released round reaches no verdict', async () => {
+    const { h, complete, deps } = releaseHarness();
+    h.track.mockImplementation(async () => {
+      throw new Error('agent gone');
+    });
+
+    await resumeWorkflow(SIGNAL, deps, deps.db);
+
+    expect(h.workJobs()).toEqual([]);
+    expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+      status: ExecutionRunStatus.enum.failed,
+      reason: expect.stringContaining('reached no verdict'),
+    });
+  });
+
+  describe('against the commit the hold recorded', () => {
+    const HELD_SHA = 'heldsha';
+    /** The workflow as the hold saw it: its filter sent it to the round. */
+    const heldEntry = {
+      ...makeGlobalRegistration({
+        jobs: [staticJob('scan')],
+        hasFilter: true,
+        repos: [{ type: 'glob', pattern: '**' }],
+      }).lockEntry,
+    };
+
+    /**
+     * A release whose registration moved on from the held commit: at
+     * `globalsha` the filter is gone, so today's registration alone would not
+     * send the workflow to the round.
+     */
+    function driftedRelease(lockFileAtHeldSha: unknown = { workflows: [heldEntry] }) {
+      const harness = releaseHarness({
+        row: { ...HELD_ROW, workflow_sha: HELD_SHA },
+        registrations: [
+          makeGlobalRegistration({
+            jobs: [staticJob('scan')],
+            repos: [{ type: 'glob', pattern: '**' }],
+            id: 'reg-drifted',
+          }),
+        ],
+      });
+      harness.h.track.mockImplementation(async () => ({
+        candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true }],
+      }));
+      const fetchLockFile = vi.fn(async () => lockFileAtHeldSha);
+      (harness.h.bundle as Record<string, unknown>).lockFileFetcher = { fetchLockFile };
+      vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+      return { ...harness, fetchLockFile };
+    }
+
+    it("runs the held version's round and dispatches it once after the filter was removed", async () => {
+      // fails-when: the release evaluates the registration's current entry, whose missing filter drops the workflow
+      const { h, complete, deps, fetchLockFile } = driftedRelease();
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(fetchLockFile).toHaveBeenCalledWith(GLOBAL_REPO, HELD_SHA, undefined);
+      const rounds = h.dispatched().filter((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+      expect(rounds).toHaveLength(1);
+      expect(rounds[0].jobConfig.workflowSha).toBe(HELD_SHA);
+      expect(
+        rounds[0].jobConfig.candidates.map((c: { workflowName: string }) => c.workflowName),
+      ).toEqual([GLOBAL_WORKFLOW]);
+      const calls = vi.mocked(dispatchGlobalCandidateViaPipeline).mock.calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0].resolved.candidate.reg.commitSha).toBe(HELD_SHA);
+      expect(calls[0][0].resolved.candidate.lockEntry.hasFilter).toBe(true);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.success,
+      });
+    });
+
+    it('fails the held round, naming the workflow repository, when its registrations were deleted', async () => {
+      // breaks-if-wrong: a deleted registration must not fall back to any other lock
+      const { h, complete, deps, fetchLockFile } = driftedRelease();
+      (deps as unknown as Record<string, any>).registrationIndex.getAllByOrgAndRepo = () => [];
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(fetchLockFile).not.toHaveBeenCalled();
+      expect(h.track).not.toHaveBeenCalled();
+      expect(h.dispatched()).toEqual([]);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining(`workflow repository ${GLOBAL_REPO} no longer registers`),
+      });
+    });
+
+    it('fails the held round, naming the workflow, when one of two covered registrations was deleted', async () => {
+      // fails-when: the surviving workflow's round runs and the deleted one is silently dropped
+      // breaks-if-wrong: the release must not dispatch part of the round it covered
+      const secondEntry = { ...heldEntry, name: 'org-second' };
+      const { h, complete, deps, fetchLockFile } = driftedRelease({
+        workflows: [heldEntry, secondEntry],
+      });
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(fetchLockFile).toHaveBeenCalledWith(GLOBAL_REPO, HELD_SHA, undefined);
+      expect(h.track).not.toHaveBeenCalled();
+      expect(h.dispatched()).toEqual([]);
+      expect(vi.mocked(dispatchGlobalCandidateViaPipeline)).not.toHaveBeenCalled();
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining(
+          `workflow repository ${GLOBAL_REPO} can no longer run org-second (no longer registered)`,
+        ),
+      });
+    });
+
+    it('fails the held round when a covered registration no longer subscribes to the event', async () => {
+      const { h, complete, deps } = driftedRelease();
+      const index = (deps as unknown as Record<string, any>).registrationIndex;
+      const [reg] = index.getAllByOrgAndRepo('org-1', GLOBAL_REPO);
+      index.getAllByOrgAndRepo = () => [{ ...reg, triggerTypes: ['pr'] }];
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(h.track).not.toHaveBeenCalled();
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining(
+          `can no longer run ${GLOBAL_WORKFLOW} (no longer subscribed)`,
+        ),
+      });
+    });
+
+    it('fails the held round when the held commit has no lock file, rather than using the current one', async () => {
+      // fails-when: a lock file gone from the held commit falls back to the registration's entry
+      const { h, complete, deps } = driftedRelease(null);
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(h.track).not.toHaveBeenCalled();
+      expect(h.dispatched()).toEqual([]);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining(`${GLOBAL_REPO} has no lock file at ${HELD_SHA}`),
+      });
+    });
+
+    it('leaves out a workflow the held commit does not define as organization-wide', async () => {
+      // A workflow added to the repository after the hold was not part of the held round.
+      const { h, complete, deps } = driftedRelease({ workflows: [] });
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(h.track).not.toHaveBeenCalled();
+      expect(vi.mocked(dispatchGlobalCandidateViaPipeline)).not.toHaveBeenCalled();
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining('reached no verdict'),
+      });
+    });
+  });
+
+  describe('against the workflows the hold recorded', () => {
+    /** A round-covered workflow registered at the held commit. */
+    function covered(name: string, over: { disabled?: boolean } = {}) {
+      return makeGlobalRegistration({
+        jobs: [dynamicEntry()],
+        name,
+        id: `reg-${name}`,
+        repos: ANY_REPO,
+        ...over,
+      });
+    }
+
+    /** A release of a round whose hold recorded `recorded`, at the registrations' commit. */
+    function recordedRelease(
+      recorded: string[],
+      registrations: ReturnType<typeof makeGlobalRegistration>[],
+      row: Record<string, unknown> = {},
+    ) {
+      const harness = releaseHarness({
+        row: {
+          ...HELD_ROW,
+          trigger_decision: JSON.stringify({ heldRoundWorkflows: recorded }),
+          ...row,
+        },
+        registrations,
+      });
+      harness.h.track.mockImplementation(async () => ({
+        candidates: recorded.map((workflowName) => ({
+          workflowName,
+          run: true,
+          jobs: [staticJob(`gen-${workflowName}`)],
+        })),
+      }));
+      return harness;
+    }
+
+    it('fails naming a covered workflow disabled while its siblings stayed at the held commit', async () => {
+      // fails-when: the disabled workflow is absent from the index and the rest of the round runs
+      const { h, complete, deps } = recordedRelease(
+        [GLOBAL_WORKFLOW, 'org-second'],
+        [covered(GLOBAL_WORKFLOW), covered('org-second', { disabled: true })],
+      );
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(h.track).not.toHaveBeenCalled();
+      expect(h.dispatched()).toEqual([]);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining(
+          `workflow repository ${GLOBAL_REPO} can no longer run org-second (disabled)`,
+        ),
+      });
+    });
+
+    it('fails naming a covered workflow deleted at an unchanged commit', async () => {
+      const { h, complete, deps } = recordedRelease(
+        [GLOBAL_WORKFLOW, 'org-second'],
+        [covered(GLOBAL_WORKFLOW)],
+      );
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(h.track).not.toHaveBeenCalled();
+      expect(h.dispatched()).toEqual([]);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.failed,
+        reason: expect.stringContaining('org-second (no longer registered)'),
+      });
+    });
+
+    it('releases when a workflow disabled before the hold is not in the recorded set', async () => {
+      // breaks-if-wrong: a workflow the hold never covered must not fail the release
+      const { h, complete, deps } = recordedRelease(
+        [GLOBAL_WORKFLOW],
+        [covered(GLOBAL_WORKFLOW), covered('org-second', { disabled: true })],
+      );
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      const round = h.dispatched().find((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+      expect(
+        round?.jobConfig.candidates.map((c: { workflowName: string }) => c.workflowName),
+      ).toEqual([GLOBAL_WORKFLOW]);
+      expect(h.workJobs().map((d) => d.jobName)).toEqual([`gen-${GLOBAL_WORKFLOW}`]);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.success,
+      });
+    });
+
+    it('releases the recorded workflows from a drifted commit', async () => {
+      const { h, complete, deps } = recordedRelease([GLOBAL_WORKFLOW], [covered(GLOBAL_WORKFLOW)], {
+        workflow_sha: 'heldsha',
+      });
+      const fetchLockFile = vi.fn(async () => ({
+        workflows: [covered(GLOBAL_WORKFLOW).lockEntry, covered('added-later').lockEntry],
+      }));
+      (h.bundle as Record<string, unknown>).lockFileFetcher = { fetchLockFile };
+
+      await resumeWorkflow(SIGNAL, deps, deps.db);
+
+      expect(fetchLockFile).toHaveBeenCalledWith(GLOBAL_REPO, 'heldsha', undefined);
+      const round = h.dispatched().find((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+      expect(round?.jobConfig.workflowSha).toBe('heldsha');
+      expect(
+        round?.jobConfig.candidates.map((c: { workflowName: string }) => c.workflowName),
+      ).toEqual([GLOBAL_WORKFLOW]);
+      expect(complete).toHaveBeenCalledWith(HELD_RUN_ID, {
+        status: ExecutionRunStatus.enum.success,
+      });
+    });
+  });
+
+  it('replays a held workflow run through its stored context, not as a round', async () => {
+    // breaks-if-wrong: a held run without the round marker must keep its own resume path
+    const { h, complete, deps } = releaseHarness({
+      row: { ...HELD_ROW, is_global_eval_round: false },
+    });
+
+    await resumeWorkflow(SIGNAL, deps, deps.db);
+
+    expect(h.track).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('cancels the held round on rejection and runs no round', async () => {
+    const { h, deps } = releaseHarness();
+    const cancelHeldRun = vi.fn(async () => undefined);
+    (deps as unknown as Record<string, any>).executionTracker.cancelHeldRun = cancelHeldRun;
+
+    await rejectWorkflow(
+      { run_id: HELD_RUN_ID, job_id: 'security' } as unknown as Parameters<
+        typeof rejectWorkflow
+      >[0],
+      deps,
+      deps.db,
+      'not this one',
+    );
+
+    expect(cancelHeldRun).toHaveBeenCalledWith(HELD_RUN_ID, 'not this one');
+    expect(h.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('result-aware generators in an organization-wide workflow', () => {
+  /** One registered, idle init-runner, advertising the capability or not. */
+  function oneAgentFleet(capable: boolean) {
+    return {
+      findAvailable: () => [{ platform: 'linux', arch: 'x64', version: '0.9.3' }],
+      getAllEntries: () => [
+        {
+          labels: new Set([
+            'kici:role:init-runner',
+            ...(capable ? [GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL] : []),
+          ]),
+          platform: 'linux',
+          arch: 'x64',
+          version: '0.9.3',
+          capabilities: capable
+            ? { [AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators]: true }
+            : null,
+        },
+      ],
+    };
+  }
+
+  it('dispatches a result-aware-only workflow straight to the pipeline with its generator intact', async () => {
+    vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [staticJob('build'), resultAwareEntry()] })],
+    });
+
+    await processWebhook(makeInfo(), h.deps);
+
+    // fails-when: a workflow whose only generator is result-aware is sent to the round
+    expect(h.track).not.toHaveBeenCalled();
+    // breaks-if-wrong: the result-aware entry must reach the pipeline intact (resultAware + needs)
+    const [workflow] = pipelineWorkflows();
+    expect(workflow.jobs).toEqual([staticJob('build'), resultAwareEntry()]);
+    expect(h.workJobs().map((d) => d.jobName)).toEqual(['build']);
+  });
+
+  it('a needs-free generator returning zero jobs still produces no run', async () => {
+    vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundResult: {
+        candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [] }],
+      } as GlobalEvalRoundResult,
+      withExecutionTracker: true,
+    });
+
+    await processWebhook(makeInfo(), h.deps);
+
+    // Positive control: the round really ran and cleared the candidate.
+    expect(h.track).toHaveBeenCalledTimes(1);
+    // The cleared candidate carries nothing to dispatch: no static job, no
+    // generated job, no result-aware generator.
+    expect(pipelineWorkflows()).toEqual([{ name: GLOBAL_WORKFLOW, jobs: [] }]);
+    // fails-when: a cleared candidate with no static, generated or result-aware job creates a run
+    expect(h.onExecutionStarted).not.toHaveBeenCalled();
+    expect(h.workJobs()).toHaveLength(0);
+  });
+
+  it('dispatches a result-aware generator on the deferred path next to what the round generated', async () => {
+    vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+    const h = makeDeps({
+      registrations: [
+        makeGlobalRegistration({ jobs: [staticJob('build'), dynamicEntry(), resultAwareEntry()] }),
+      ],
+      roundResult: {
+        candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [staticJob('gen-a')] }],
+      } as GlobalEvalRoundResult,
+    });
+    (h.deps as unknown as Record<string, unknown>).agentRegistry = oneAgentFleet(true);
+
+    await processWebhook(makeInfo(), h.deps);
+
+    const round = h.dispatched().find((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+    // fails-when: the round can reach an agent that has not advertised skipping result-aware generators
+    expect(round?.runsOnLabels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+    const [workflow] = pipelineWorkflows();
+    // breaks-if-wrong: the round-generated job and the deferred generator must both reach the pipeline
+    expect(workflow.jobs).toEqual([staticJob('build'), staticJob('gen-a'), resultAwareEntry()]);
+  });
+
+  it.each([
+    { name: 'no registered agent advertises the capability', capable: false },
+    { name: 'the registered agent advertises the capability', capable: true },
+  ])(
+    'records the unsupported-fleet failure for a mixed workflow only when $name',
+    async ({ capable }) => {
+      vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [dynamicEntry(), resultAwareEntry()] })],
+        roundResult: {
+          candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [staticJob('gen-a')] }],
+        } as GlobalEvalRoundResult,
+        withExecutionTracker: true,
+      });
+      (h.deps as unknown as Record<string, unknown>).agentRegistry = oneAgentFleet(capable);
+
+      await processWebhook(makeInfo(), h.deps);
+
+      const rounds = h.dispatched().filter((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+      // fails-when: the round is sent to a fleet whose every agent would run the result-aware generator
+      expect(rounds).toHaveLength(capable ? 1 : 0);
+      // Positive control: the same fixture with the flag present dispatches the admitted workflow.
+      expect(pipelineWorkflows()).toHaveLength(capable ? 1 : 0);
+      // The same visible record an unsupported fleet produces: one errored run and one check.
+      expect(h.recordRoundFailure).toHaveBeenCalledTimes(capable ? 0 : 1);
+      expect(h.postGlobalEvalFailedCheck).toHaveBeenCalledTimes(capable ? 0 : 1);
+    },
+  );
 });

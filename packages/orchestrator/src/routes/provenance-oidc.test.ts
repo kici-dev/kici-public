@@ -51,6 +51,7 @@ describe('buildOpenidConfiguration', () => {
         run_id: 'run-1',
         org_id: 'org-1',
         repo_identifier: 'acme/app',
+        workflow_repo_identifier: null,
         ref: 'main',
         sha: 'abc',
         workflow_name: 'deploy',

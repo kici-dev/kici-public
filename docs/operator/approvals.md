@@ -97,7 +97,15 @@ The consequence itself can take a few more seconds. Releasing a workflow-scoped 
 
 A consequence that fails is recorded, not lost. It appears as a `held_run.approve` or `held_run.reject` entry in the access log with the outcome `error` and the failure message — readable in the dashboard activity view and with `kici-admin access-log`. A resume that cannot rebuild its dispatch also fails the run itself and completes the status checks it was blocking, so the pull request never sits behind a check that can no longer clear.
 
-A job can also be held by a [security hold](security/security.md#security-approval-queue) at the same time — that one takes `ci_trust:write`, not `contexts:write`. Both holds must be released before the job runs, and each carries its own expiry, so the first deadline to arrive cancels the run. From the CLI, `--job` names both, so pass `--hold-type reviewer` or `--hold-type security` to pick one.
+A job can also be held by a [security hold](security/security.md#security-approval-queue) at the same time — that one takes `ci_trust:write`, not `contexts:write`. Both holds must be released before the job runs, and each carries its own expiry, so the first deadline to arrive fails the run. From the CLI, `--job` names both, so pass `--hold-type reviewer` or `--hold-type security` to pick one.
+
+### Cancelling a held run
+
+Cancelling a run that waits in `held` — from the dashboard, `kici runs cancel`, or the admin API — withdraws its approval request the way a reject does. Each pending hold of the run is rejected with the cancel reason, the run is cancelled, and the status checks the held dispatch posted, including the pending `KiCI Security` check, close as cancelled. A later approve finds the hold already resolved and starts nothing.
+
+If an approve released the hold before the cancel arrived, the run is already resuming, so the cancel is refused and changes nothing. The admin API answers `409`, and the dashboard, `kici runs cancel`, and the MCP tool report "Run is resuming after approval; cancel it again once it is running". Cancel the run again once it is running.
+
+If a reject decided the hold before the cancel arrived, the cancel is refused the same way. The rejection ends the run, and the refusal reports "Run was rejected before the cancel reached it; the rejection ends it". A hold that expired first ends the run the same way, and the refusal names the expiry.
 
 ## Agent occupancy during step-level holds
 

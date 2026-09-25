@@ -3,9 +3,9 @@
  *
  * The per-repository dispatch path writes the normalized event envelope into
  * every job config (`dispatch-matched-workflow.ts`, `envelopeEvent`), and the
- * agent reads it back as `ctx.event`. The organization-wide dispatch path built
- * its job configs directly and never wrote the field, so `ctx.event` was `{}`
- * for a global job — an SDK-typed payload that was never there, with no error.
+ * agent reads it back as `ctx.event`. A global job goes through the same
+ * pipeline, so it must carry the field too; without it `ctx.event` is `{}` — an
+ * SDK-typed payload that is not there, with no error.
  *
  * Both global paths are covered because they are separate call sites:
  * `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock file resolves) and
@@ -13,8 +13,8 @@
  * `sourceRepo` assertions are the load-bearing ones: it is the only field
  * naming the repo the event came from, so it is what an author needs to scope a
  * concurrency group (see `workflow-runner.test.ts`,
- * `buildConcurrencyGroupContext`) and what the Phase F path did not carry even
- * for trigger matching's own copy of the event.
+ * `buildConcurrencyGroupContext`), and the Phase F path must stamp it on trigger
+ * matching's own copy of the event as well.
  *
  * The fixture shape mirrors `process-webhook-globals-payload.test.ts`.
  */
@@ -91,7 +91,6 @@ function makeDeps(over: { withLockFile?: boolean } = {}): {
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
-      postGlobalWorkflowsSkippedCheck: vi.fn().mockResolvedValue(undefined),
     },
     lockFileFetcher: over.withLockFile ? { fetchLockFile: vi.fn() } : undefined,
     repoUrlBuilder: { buildCloneUrl: () => 'https://example.invalid/repo.git' },

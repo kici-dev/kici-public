@@ -3,6 +3,7 @@ import {
   LockFileParseError,
   SCHEMA_VERSION,
   BREAKING_FLOOR,
+  GLOBAL_APPROVAL_MIN_READER,
   type LockFile,
 } from '@kici-dev/engine';
 import {
@@ -106,6 +107,28 @@ describe('assertLockFileSchemaCompatible (compatibility window)', () => {
     expect(() => assertLockFileSchemaCompatible(future, REPO, REF)).toThrow(
       /upgrade the orchestrator/i,
     );
+  });
+
+  it('a v41 orchestrator refuses a lock whose global workflow declares approval', () => {
+    // The compiler stamps GLOBAL_APPROVAL_MIN_READER on such a lock; a v41
+    // reader would otherwise dispatch the global workflow without its gate.
+    const gatedGlobal = baseLock({ minReaderVersion: GLOBAL_APPROVAL_MIN_READER });
+    const V41 = GLOBAL_APPROVAL_MIN_READER - 1;
+    // fails-when: the reader compares against a version it does not actually read.
+    expect(() => assertLockFileSchemaCompatible(gatedGlobal, REPO, REF, V41)).toThrow(
+      /requires orchestrator schema >= v42 .* upgrade the orchestrator/i,
+    );
+    // breaks-if-wrong: this orchestrator (at or above the reader floor) must accept it,
+    // and a v41 orchestrator must still accept a lock stamped at the breaking floor.
+    expect(() => assertLockFileSchemaCompatible(gatedGlobal, REPO, REF)).not.toThrow();
+    expect(() =>
+      assertLockFileSchemaCompatible(
+        baseLock({ minReaderVersion: BREAKING_FLOOR }),
+        REPO,
+        REF,
+        V41,
+      ),
+    ).not.toThrow();
   });
 
   it('missing minReaderVersion falls back to exact-match strictness for newer locks', () => {

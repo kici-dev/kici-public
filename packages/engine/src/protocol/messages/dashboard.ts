@@ -276,6 +276,12 @@ export const dashboardStepLogsResponseSchema = z.object({
   totalLines: z.number(),
   /** Next line-offset cursor, or null when the page reached the end. */
   nextCursor: z.string().nullable().optional(),
+  /**
+   * Whether a log is stored for the step: `false` when none was ever written,
+   * `true` when one is, even if it holds no lines. Absent when the orchestrator
+   * does not report it.
+   */
+  recorded: z.boolean().optional(),
   error: z.string().optional(),
 });
 
@@ -1192,7 +1198,13 @@ const dashboardEventDlqDiscardResponseSchema = z.object({
 
 // --- Context CRUD request/response (REST-over-WS proxy) ---
 
-const contextTypeSchema = z.enum(['fixed', 'glob']);
+/**
+ * The kinds of context a job's declared context name resolves through: a
+ * `fixed` context matches its exact name, a `glob` context any name its
+ * pattern matches.
+ */
+export const ContextType = z.enum(['fixed', 'glob']);
+export type ContextType = z.infer<typeof ContextType>;
 
 // -- Contexts --
 
@@ -1227,7 +1239,7 @@ const contextListResponseSchema = z.object({
       z.object({
         id: z.string(),
         name: z.string(),
-        type: contextTypeSchema,
+        type: ContextType,
         globPattern: z.string().nullable(),
         enabled: z.boolean(),
         allowLocalExecution: z.boolean(),
@@ -1245,6 +1257,12 @@ const contextListResponseSchema = z.object({
   error: z.string().optional(),
 });
 
+/**
+ * `owner/repo` glob patterns a context is limited to. An empty array means the
+ * context applies to every repository, so it is also how the rule is cleared.
+ */
+const ContextRepoPatternsSchema = z.array(z.string());
+
 /** Get a single context by ID. */
 export const contextGetRequestSchema = z.object({
   type: z.literal('dashboard.contexts.get'),
@@ -1260,9 +1278,12 @@ const contextGetResponseSchema = z.object({
     .object({
       id: z.string(),
       name: z.string(),
-      type: contextTypeSchema,
+      type: ContextType,
       globPattern: z.string().nullable(),
       branchRestrictions: z.array(z.string()).nullable(),
+      // Optional so a response from an orchestrator that predates the field
+      // still parses; the dashboard reads a missing value as "no patterns".
+      repoPatterns: ContextRepoPatternsSchema.optional(),
       concurrencyLimit: z.number().nullable(),
       concurrencyStrategy: ConcurrencyStrategy.nullable(),
       requiredReviewers: z.number().nullable(),
@@ -1283,9 +1304,10 @@ export const contextCreateRequestSchema = z.object({
   requestId: z.string(),
   actor: actorPrincipalSchema,
   name: z.string(),
-  contextType: contextTypeSchema,
+  contextType: ContextType,
   globPattern: z.string().optional(),
   branchRestrictions: z.array(z.string()).optional(),
+  repoPatterns: ContextRepoPatternsSchema.optional(),
   // A concurrency limit must be a positive integer; `null`/omitted means
   // unlimited. `0` (or a negative / fractional value) is rejected here because
   // it wedges the workflow-install concurrency gate into an unreleasable hold.
@@ -1317,9 +1339,11 @@ export const contextUpdateRequestSchema = z.object({
   contextId: z.string(),
   updates: z.object({
     name: z.string().optional(),
-    contextType: contextTypeSchema.optional(),
+    contextType: ContextType.optional(),
     globPattern: z.string().nullable().optional(),
     branchRestrictions: z.array(z.string()).nullable().optional(),
+    // `[]` clears the rule; the column holds a JSON array and has no null state.
+    repoPatterns: ContextRepoPatternsSchema.optional(),
     // Positive integer, or `null` for unlimited. `0`/negative/fractional is
     // rejected — see the create-request schema above for why.
     concurrencyLimit: z.number().int().positive().nullable().optional(),
@@ -2958,6 +2982,12 @@ export const dashboardStepLogsApiResponseSchema = z.object({
   totalLines: z.number(),
   /** Next line-offset cursor, or null when the page reached the end. */
   nextCursor: z.string().nullable().optional(),
+  /**
+   * Whether a log is stored for the step: `false` when none was ever written,
+   * `true` when one is, even if it holds no lines. Absent when the orchestrator
+   * does not report it.
+   */
+  recorded: z.boolean().optional(),
 });
 
 /**

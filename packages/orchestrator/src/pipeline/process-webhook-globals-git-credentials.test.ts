@@ -88,7 +88,6 @@ function makeDeps(): {
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
-      postGlobalWorkflowsSkippedCheck: vi.fn().mockResolvedValue(undefined),
     },
     repoUrlBuilder: { buildCloneUrl: () => 'https://example.invalid/repo.git' },
   };

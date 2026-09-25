@@ -734,15 +734,15 @@ Acknowledge a triggered run.
 
 A run-status snapshot.
 
-| Field     | Type                               | Required | Description                                                            |
-| --------- | ---------------------------------- | -------- | ---------------------------------------------------------------------- |
-| type      | `"test.relay.run.status.response"` | Yes      | Message discriminator                                                  |
-| requestId | string                             | Yes      | ID of the request being responded to                                   |
-| runId     | string                             | No       | Execution run ID                                                       |
-| status    | string                             | No       | Run status                                                             |
-| jobs      | array                              | No       | Per-job status: `{ jobId, jobName, status, exitCode?, errorMessage? }` |
-| done      | boolean                            | No       | Whether the run has reached a terminal state                           |
-| error     | string                             | No       | Failure reason                                                         |
+| Field     | Type                               | Required | Description                                                                                                                                                                                       |
+| --------- | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type      | `"test.relay.run.status.response"` | Yes      | Message discriminator                                                                                                                                                                             |
+| requestId | string                             | Yes      | ID of the request being responded to                                                                                                                                                              |
+| runId     | string                             | No       | Execution run ID                                                                                                                                                                                  |
+| status    | string                             | No       | Run status                                                                                                                                                                                        |
+| jobs      | array                              | No       | Per-job status: `{ jobId, jobName, status, exitCode?, errorMessage?, durationMs? }`. `durationMs` is the job's duration in milliseconds; when it is absent, the CLI shows the duration as unknown |
+| done      | boolean                            | No       | Whether the run has reached a terminal state                                                                                                                                                      |
+| error     | string                             | No       | Failure reason                                                                                                                                                                                    |
 
 #### test.relay.run.logs.response
 
@@ -844,9 +844,9 @@ The `app.service` field identifies which KiCI tier produced a log line (values: 
 
 ## Capability negotiation
 
-The set of `dashboard.*` request types is the de-facto feature contract between the dashboard, the relay, and the orchestrator. Because each tier can be on a different version (the dashboard and relay are centrally deployed and always current; a customer's orchestrator upgrades on the customer's own schedule), a dashboard request for a feature a particular orchestrator predates would otherwise come back as a confusing "invalid payload" — indistinguishable from a genuinely malformed body.
+The set of `dashboard.*` request types is the de-facto feature contract between the dashboard, the relay, and the orchestrator. Each tier can be on a different version: the dashboard and relay are centrally deployed and always current, and a customer's orchestrator upgrades on the customer's own schedule. Without the manifest below, a dashboard request for a feature a particular orchestrator predates would come back as a confusing "invalid payload" — indistinguishable from a genuinely malformed body.
 
-To make version mismatches explicit, the orchestrator advertises a **capability manifest** in its connection handshake: `supportedDashboardRequests`, the list of every `dashboard.*` request type that build understands. The list is derived directly from the orchestrator's own protocol schema, so it can never drift from what the build actually handles.
+To make version mismatches explicit, the orchestrator advertises a **capability manifest** in its connection handshake: `supportedDashboardRequests`, the list of every dashboard request type that build understands: the `dashboard.*` family plus the proxied `run.*` and `test.relay.*` requests. The list is derived directly from the orchestrator's own protocol schema, so it can never drift from what the build actually handles.
 
 The manifest drives three behaviors:
 
@@ -854,6 +854,6 @@ The manifest drives three behaviors:
 - **Reactive classification (orchestrator).** When a request does reach the orchestrator and fails schema validation, the orchestrator distinguishes a request type it has never heard of (version mismatch → `unsupported_request_type`, "upgrade the orchestrator") from a known type with a malformed body (`invalid_payload`, a genuine client error). The error response frame carries the structured `code` and the orchestrator version.
 - **Proactive UI signalling (dashboard).** The dashboard reads each orchestrator's manifest from the org-scoped orchestrators listing and greys out — with an "upgrade required" banner naming the connected version — any orchestrator-backed write action whose request types the connected orchestrator does not advertise. When the manifest is unknown, the action stays enabled and the reactive `501` handles a real mismatch. Only orchestrator-backed surfaces are gated; tenant-plane actions handled entirely by the relay are never gated on orchestrator capability.
 
-The net effect: a feature the connected orchestrator is too old to handle produces a clear "upgrade your orchestrator (connected vX)" signal instead of a misleading malformed-payload error, and the system self-heals after the orchestrator is upgraded.
+The net effect: a feature the connected orchestrator is too old to handle produces a clear "upgrade your orchestrator (connected vX)" signal instead of a misleading malformed-payload error. The system self-heals once the operator upgrades the orchestrator.
 
 ## See also

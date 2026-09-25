@@ -68,20 +68,29 @@ import type {
   ResolvedSandboxGrant,
 } from '@kici-dev/engine';
 import { HostStatus, type MatchedHost, type HostRosterStore } from '../agent/host-roster.js';
-import { resolveContainerRegistryAuth } from '../scaler/resolve-container-auth.js';
 import { resolveSandboxGrant } from './resolve-sandbox-grant.js';
 import type { SandboxAllowList } from './sandbox-allowlist-reader.js';
 import { flattenLockSteps } from './flatten-lock-steps.js';
 import { storeWebhookPayload } from './webhook-payload-store.js';
 import type { Database, HeldRun } from '../db/types.js';
+import type { RerunLineage } from '../reporting/execution-tracker.js';
 import { JobKind } from '../db/types.js';
 import { NEEDS_PENDING_JOB_ID_PREFIX } from '../db/synthetic-job-ids.js';
-import { resolveRunEventContext } from './run-event-context.js';
+import { resolveRunEventContext, type RunEventContext } from './run-event-context.js';
 import { isInvokeGate, invokeParamsFromLockJob, type InvokeGateParams } from './invoke-gate.js';
 import { parseOutputsCell, gatherInvokeResults } from '../orchestrator-core.js';
 import { AgentJobFailedError } from '../cache/agent-job-failed-error.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderBundle } from '../provider-registry.js';
+import {
+  cacheRepoIdFor,
+  globalJobConfigFor,
+  policyRoutingKey,
+  policyBranch,
+  policyRepo,
+  workflowRepoProvenance,
+  type GlobalDispatchIdentity,
+} from './global-dispatch-identity.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { RunContext, JobToRoute } from '../cluster/coordinator.js';
@@ -100,13 +109,16 @@ import {
   buildEffectiveContext,
   formatMultiContextRejection,
 } from '../contexts/protection/aggregate.js';
+import { buildJobContextDisplayNames, resolveJobContextNames } from './job-contexts.js';
 import {
-  buildJobContextDisplayNames,
-  resolveJobContextNames,
-  resolveMultiEnvMergedData,
-} from './job-contexts.js';
+  contextDataConfigFields,
+  resolveContextJobData,
+  withoutContextData,
+  type DeferredContextResolution,
+} from './held-context-data.js';
 import { toContext } from '../contexts/context-store.js';
 import { resolveInstallSecrets, type NpmRegistrySpec } from './install-secrets-resolver.js';
+import type { InstallGateRecord } from './install-gate.js';
 import { storePendingWorkflowContext, toSerializableInputs } from './pending-workflow-context.js';
 import { generateRunKeyPair, encryptPrivateKey } from '../secrets/ephemeral-keys.js';
 import {
@@ -120,10 +132,7 @@ import {
   depCacheHitsTotal,
   depCacheMissesTotal,
   buildDurationSeconds,
-  containerRegistryAuthContributorStrippedTotal,
 } from '../metrics/prometheus.js';
-import { isUntrustedTier } from '../security/trust-tier.js';
-import { resolveJobQualifiedSecret } from '../secrets/job-secret-gate.js';
 import {
   storePendingJobContext,
   summarizeDecision,
@@ -200,6 +209,38 @@ async function mintCloneTokenForReroute(args: {
   }
 }
 
+/**
+ * The clone tokens a job routed to a cluster peer carries: the source
+ * repository's, and for a global workflow the workflow repository's too,
+ * minted by its own bundle with its own credentials. Returned as the
+ * RunContext fields to spread; a token that could not be minted is absent.
+ */
+async function mintRerouteCloneTokens(
+  ctx: WorkflowDispatchContext,
+): Promise<{ cloneToken?: string; workflowCloneToken?: string }> {
+  const { bundle, repoIdentifier, credentials, runId, workflow } = ctx;
+  const cloneToken = await mintCloneTokenForReroute({
+    bundle,
+    repoIdentifier,
+    credentials,
+    runId,
+    workflowName: workflow.name,
+  });
+  const workflowCloneToken = ctx.global
+    ? await mintCloneTokenForReroute({
+        bundle: ctx.global.workflowBundle,
+        repoIdentifier: ctx.global.workflowRepoIdentifier,
+        credentials: ctx.global.workflowCredentials,
+        runId,
+        workflowName: workflow.name,
+      })
+    : undefined;
+  return {
+    ...(cloneToken && { cloneToken }),
+    ...(workflowCloneToken && { workflowCloneToken }),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -229,23 +270,21 @@ export interface WorkflowDispatchContext {
   payload: unknown;
   repoIdentifier: string;
   /**
-   * The repository that DEFINES the workflow being dispatched. `repoIdentifier`
-   * is the repository the run acts on; for an organization-wide workflow the
-   * two are different repositories, and every run row this dispatch writes has
-   * to say which one defined it.
+   * The repository that defines the workflow. Equals `repoIdentifier` unless
+   * `global` is set.
    *
    * REQUIRED, for the same reason `securityDecision` is: a dispatch path that
    * does not state it must not compile. Left optional, a new caller omits it
    * silently and every row it records claims the workflow lives in the
    * repository the run acted on — a null marker is read as that fact, not as
    * "unknown" (`registration/registration-run-match.ts`).
-   *
-   * Every caller today states `repoIdentifier` or a value equal to it, because
-   * no cross-repository global dispatch enters this function — the global path
-   * builds its job inputs directly and dispatches them itself. The recording
-   * sites narrow, so stating the acted-on repository records nothing.
    */
   workflowRepoIdentifier: string;
+  /**
+   * Set when the workflow is defined in another repository; `repoIdentifier`
+   * is then the event's source repository.
+   */
+  global?: GlobalDispatchIdentity;
   credentials: Record<string, unknown>;
   event: SimulatedEvent;
   eventWithFiles: SimulatedEvent;
@@ -298,6 +337,19 @@ export interface WorkflowDispatchContext {
   triggeredBy?: string | null;
   /** Agent provenance label when the run was initiated through an agent credential. */
   triggeredByAgentLabel?: string | null;
+  /**
+   * Re-run lineage for `execution_runs.parent_run_id` / `original_run_id`: the
+   * run this one re-runs and the root of its re-run chain. Set by the re-run of
+   * an organization-wide run; absent for every first run.
+   */
+  rerunLineage?: RerunLineage;
+  /**
+   * The trigger event the run's OIDC subject derives from, when it is not the
+   * run's own `triggerEvent`. A re-run records `rerun` as its trigger event,
+   * which carries no pull-request dimension, so it states the original run's
+   * event here to keep the subject a re-run of a fork pull request presents.
+   */
+  subjectTriggerEvent?: string;
   /** True only when invoked from the cross-source dispatch shell. */
   crossSource: boolean;
   /**
@@ -470,6 +522,14 @@ export interface WorkflowDispatchContext {
    * exposes them as `ctx.dispatchInputs`. Undefined for webhook runs.
    */
   dispatchInputs?: Record<string, unknown>;
+  /**
+   * What the workflow install gate recorded when it held this dispatch: the
+   * contexts that held, which the hold's approval covers, and the ones it
+   * admitted. Stored with the held dispatch and read by its release, which
+   * gates every context the approval did not cover. Unset on any other
+   * dispatch.
+   */
+  installGateRecord?: InstallGateRecord;
 }
 
 /**
@@ -570,13 +630,27 @@ async function stampChainDepth(ctx: WorkflowDispatchContext): Promise<void> {
  * where `0` normalizes away (see `inheritedChainDepth`), so that decision lives
  * in one place instead of being re-made at every layer.
  */
+/** The event context a run row records: the head context, plus a stated subject event. */
+function runEventContextFor(
+  ctx: WorkflowDispatchContext,
+  event: SimulatedEvent,
+): RunEventContext & { subjectTriggerEvent?: string } {
+  return {
+    ...resolveRunEventContext(event),
+    // fails-when: a re-run of a pull-request run records no subject event and presents a push identity
+    ...(ctx.subjectTriggerEvent !== undefined && { subjectTriggerEvent: ctx.subjectTriggerEvent }),
+  };
+}
+
 function preDispatchRunProvenance(ctx: WorkflowDispatchContext): {
   chainDepth?: number;
   dispatchedByFailureLifecycle?: boolean;
+  rerunLineage?: RerunLineage;
 } {
   return {
     ...(ctx.chainDepth !== undefined && { chainDepth: ctx.chainDepth }),
     ...(ctx.dispatchedByFailureLifecycle && { dispatchedByFailureLifecycle: true }),
+    ...(ctx.rerunLineage && { rerunLineage: ctx.rerunLineage }),
   };
 }
 
@@ -706,8 +780,6 @@ interface BuildPrepResult {
 }
 
 interface SecretBundle {
-  resolvedSecrets: Record<string, string> | undefined;
-  resolvedNamespacedSecrets: Record<string, Record<string, string>> | undefined;
   declaredContexts: readonly string[];
   runPublicKeyBase64: string | undefined;
   /** Resolved private npm registries (token bytes already filled in). Undefined = none. */
@@ -737,6 +809,13 @@ interface JobEnvData {
    */
   containerRegistryAuth?: { username: string; password: string; serveraddress: string };
   held?: boolean;
+  /**
+   * Set when the job's bound contexts admitted its reject rules: what a later
+   * dispatch resolves the context data from when the job is stored as a
+   * pending dispatch context (held, waiting on upstream jobs, or outside its
+   * wave window) instead of dispatching now. Carries no secret value.
+   */
+  contextResolution?: DeferredContextResolution;
   /**
    * Pending approval hold for this job, set when a context policy or
    * explicit lock `approval` requires human sign-off. The dispatch loop turns
@@ -919,6 +998,7 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
       repo,
       sha: ref,
       workflowName: workflow.name,
+      ...(ctx.global && { workflowRepoIdentifier: ctx.global.workflowRepoIdentifier }),
       jobNames,
       installationId: (credentials as { installationId?: number }).installationId,
       routingKey: info.routingKey,
@@ -975,8 +1055,21 @@ function chooseTargetPlatform(
 }
 
 /**
+ * Whether the repository the workflow source comes from can be built into a
+ * cached source pack. A cross-source dispatch always clones and installs. A
+ * global run builds from its workflow repository, which needs the registration's
+ * commit: without one there is no commit to pack, so it installs agent-side.
+ */
+function buildableWorkflowRepo(ctx: WorkflowDispatchContext): boolean {
+  // fails-when: a global run with workflowSha null or '' reaches the cache probe or the build
+  // breaks-if-wrong: a same-repo run and a global run with a registered commit must still build
+  return !ctx.crossSource && (!ctx.global || !!ctx.global.workflowSha);
+}
+
+/**
  * Probe source + dep caches and forward stats to Platform.
- * Cross-source dispatch always clones-and-installs, so caches are bypassed.
+ * A dispatch whose workflow repository is not buildable always clones and
+ * installs, so caches are bypassed.
  */
 async function probeCaches(
   ctx: WorkflowDispatchContext,
@@ -986,7 +1079,8 @@ async function probeCaches(
   targetPlatform: string,
   targetArch: string,
 ): Promise<{ sourceHit: boolean; depHit: boolean }> {
-  const { deps, workflow, crossSource } = ctx;
+  const { deps, workflow } = ctx;
+  const buildable = buildableWorkflowRepo(ctx);
   let sourceHit = false;
   let depHit = false;
   // Local-repo runs (no bundle) carry their source as a working-tree overlay,
@@ -1009,7 +1103,7 @@ async function probeCaches(
     });
     return { sourceHit, depHit };
   }
-  if (!crossSource && contentHash && deps.sourceCache) {
+  if (buildable && contentHash && deps.sourceCache) {
     sourceHit = await deps.sourceCache.has(ctx.resolvedOrgId, contentHash);
     if (sourceHit) {
       sourceCacheHitsTotal.add(1);
@@ -1020,7 +1114,7 @@ async function probeCaches(
     }
     deps.platformClient?.send({ type: 'cache.stats', cacheType: 'source', hit: sourceHit });
   }
-  if (!crossSource && lockfileHash && deps.depCache) {
+  if (buildable && lockfileHash && deps.depCache) {
     depHit = await deps.depCache.has(
       lockfileHash,
       targetPlatform,
@@ -1088,7 +1182,7 @@ function buildBuildJobInput(args: {
   depHit: boolean;
 }): QueuedJobInput {
   const { ctx, setup, buildJobName } = args;
-  const { workflow, fullLockFile, bundle, repoIdentifier, credentials, event, ref } = ctx;
+  const { workflow, fullLockFile } = ctx;
   return {
     runId: ctx.runId,
     workflowName: workflow.name,
@@ -1120,14 +1214,48 @@ function buildBuildJobInput(args: {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
     },
-    repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
-    ref: event.sourceBranch ?? event.targetBranch,
-    sha: ref,
+    ...buildCloneTarget(ctx, setup),
     deliveryId: setup.effectiveDeliveryId,
-    provider: setup.info.provider,
-    providerContext: credentials as Record<string, unknown>,
-    routingKey: setup.info.routingKey,
     requestId: getRequestContext().requestId,
+  };
+}
+
+/**
+ * The repository a `__build__` job clones to pack the workflow source. A global
+ * run packs the workflow repository at its registered commit, with that
+ * repository's credentials and source; every other run packs the event's own
+ * repository at the event commit.
+ */
+function buildCloneTarget(
+  ctx: WorkflowDispatchContext,
+  setup: DispatchSetup,
+): Pick<QueuedJobInput, 'repoUrl' | 'ref' | 'sha' | 'provider' | 'providerContext' | 'routingKey'> {
+  const g = ctx.global;
+  if (g) {
+    // fails-when: a global build is requested with no registered commit (null or '')
+    // breaks-if-wrong: a global run with a registered commit must build at that commit
+    if (!g.workflowSha) {
+      throw new Error(
+        `Cannot build the global workflow pack from ${g.workflowRepoIdentifier}: ` +
+          `the registration records no commit`,
+      );
+    }
+    return {
+      repoUrl: g.workflowBundle?.repoUrlBuilder?.buildCloneUrl(g.workflowRepoIdentifier) ?? '',
+      ref: g.workflowBranch ?? '',
+      sha: g.workflowSha,
+      provider: g.workflowBundle?.normalizer.provider ?? setup.info.provider,
+      providerContext: g.workflowCredentials,
+      routingKey: g.workflowRoutingKey,
+    };
+  }
+  return {
+    repoUrl: ctx.bundle?.repoUrlBuilder?.buildCloneUrl(ctx.repoIdentifier) ?? '',
+    ref: ctx.event.sourceBranch ?? ctx.event.targetBranch,
+    sha: ctx.ref,
+    provider: setup.info.provider,
+    providerContext: ctx.credentials as Record<string, unknown>,
+    routingKey: setup.info.routingKey,
   };
 }
 
@@ -1303,9 +1431,9 @@ async function runBuildJob(args: {
             undefined,
             dispatchTriggerEvent(ctx),
             extractCommitMessage(setup.info.event, setup.info.payload),
-            undefined, // parentRunId
+            ctx.rerunLineage?.parentRunId, // parentRunId
             triggeredBy,
-            undefined, // originalRunId
+            ctx.rerunLineage?.originalRunId, // originalRunId
             setup.workflowConcurrency,
             setup.workflowTimeoutMs,
             setup.checkMode,
@@ -1314,10 +1442,10 @@ async function runBuildJob(args: {
             event.senderUserId ?? undefined,
             triggeredByAgentLabel, // triggeredByAgentLabel
             event.prNumber ?? null,
-            undefined, // workflowRepoIdentifier — per-repository dispatch
+            workflowRepoProvenance(ctx),
             // Where the code came from, which `event.targetBranch` above
             // deliberately does not say.
-            resolveRunEventContext(event),
+            runEventContextFor(ctx, event),
           );
           await stampChainDepth(ctx);
           await deps.executionTracker.failRun(runId, reason, {
@@ -1346,9 +1474,9 @@ async function runBuildJob(args: {
           undefined,
           dispatchTriggerEvent(ctx),
           extractCommitMessage(setup.info.event, setup.info.payload),
-          undefined, // parentRunId
+          ctx.rerunLineage?.parentRunId, // parentRunId
           triggeredBy,
-          undefined, // originalRunId
+          ctx.rerunLineage?.originalRunId, // originalRunId
           setup.workflowConcurrency,
           setup.workflowTimeoutMs,
           setup.checkMode,
@@ -1357,10 +1485,10 @@ async function runBuildJob(args: {
           event.senderUserId ?? undefined,
           triggeredByAgentLabel, // triggeredByAgentLabel
           event.prNumber ?? null,
-          undefined, // workflowRepoIdentifier — per-repository dispatch
+          workflowRepoProvenance(ctx),
           // Where the code came from, which `event.targetBranch` above
           // deliberately does not say.
-          resolveRunEventContext(event),
+          runEventContextFor(ctx, event),
         );
         await stampChainDepth(ctx);
         // The run is registered here rather than by `startRunBeforeDispatch`,
@@ -1953,7 +2081,7 @@ async function prepareCacheAndBuild(
   ctx: WorkflowDispatchContext,
   setup: DispatchSetup,
 ): Promise<BuildPrepResult> {
-  const { deps, workflow, fullLockFile, crossSource, localWorkingTree } = ctx;
+  const { deps, workflow, fullLockFile, localWorkingTree } = ctx;
   const contentHash = workflow.contentHash;
   const lockfileHash = fullLockFile.lockfileHash;
   const hasDynamicEntries = workflow.jobs.some(isLockDynamicJobFn);
@@ -1992,7 +2120,7 @@ async function prepareCacheAndBuild(
   // its KICI_IN_PLACE profile — no clone, no source-restore), so packing a
   // source tarball is both wasteful and wrong (it would carry a dist-less clone).
   const cacheInfraAvailable =
-    !crossSource &&
+    buildableWorkflowRepo(ctx) &&
     !localWorkingTree &&
     !!ctx.bundle &&
     deps.buildCoordinator &&
@@ -2179,44 +2307,22 @@ async function prepareCacheAndBuild(
 async function resolveWorkflowSecretsAndKey(
   ctx: WorkflowDispatchContext,
 ): Promise<SecretBundle | { skipDispatch: true; reason: string }> {
-  const { deps, workflow, runId, resolvedOrgId } = ctx;
-  let resolvedSecrets: Record<string, string> | undefined;
-  let resolvedNamespacedSecrets: Record<string, Record<string, string>> | undefined;
+  const { deps, workflow, runId } = ctx;
+  // Workflow-level contexts are not resolved here: every job binds them ahead of
+  // its own, and each job resolves them only after their protection gates admit
+  // it (see effectiveContextRefs). A workflow that names contexts still needs
+  // the secrets subsystem, so its absence fails the dispatch up front.
   const declaredContexts = workflow.contexts ?? [];
-
-  if (declaredContexts.length > 0) {
-    if (!deps.secretResolver) {
-      const reason =
-        'Workflow declares secret contexts but secrets subsystem is not configured (KICI_SECRET_KEY missing)';
-      logger.error(reason, {
-        workflow: workflow.name,
-        contexts: declaredContexts,
-      });
-      return { skipDispatch: true, reason };
-    }
-    try {
-      const mergedSecrets: Record<string, string> = {};
-      const mergedNamespaced: Record<string, Record<string, string>> = {};
-      for (const envName of declaredContexts) {
-        const envSecrets = await deps.secretResolver.resolveForJob(resolvedOrgId, envName);
-        Object.assign(mergedSecrets, envSecrets);
-        mergedNamespaced[envName] = envSecrets;
-      }
-      if (Object.keys(mergedSecrets).length > 0) {
-        resolvedSecrets = mergedSecrets;
-        resolvedNamespacedSecrets = mergedNamespaced;
-      }
-    } catch (err: unknown) {
-      const errMessage = toErrorMessage(err);
-      logger.error('Secret resolution failed, skipping workflow', {
-        workflow: workflow.name,
-        error: errMessage,
-      });
-      return {
-        skipDispatch: true,
-        reason: `Secret resolution failed: ${errMessage}`,
-      };
-    }
+  // fails-when: a workflow names contexts and KICI_SECRET_KEY is unset — dispatch is refused
+  // breaks-if-wrong: a workflow with no workflow-level contexts must dispatch without a resolver
+  if (declaredContexts.length > 0 && !deps.secretResolver) {
+    const reason =
+      'Workflow declares secret contexts but secrets subsystem is not configured (KICI_SECRET_KEY missing)';
+    logger.error(reason, {
+      workflow: workflow.name,
+      contexts: declaredContexts,
+    });
+    return { skipDispatch: true, reason };
   }
 
   let runPublicKeyBase64: string | undefined;
@@ -2243,8 +2349,6 @@ async function resolveWorkflowSecretsAndKey(
   }
 
   return {
-    resolvedSecrets,
-    resolvedNamespacedSecrets,
     declaredContexts,
     runPublicKeyBase64,
     npmRegistries: undefined,
@@ -2275,6 +2379,8 @@ interface InstallGateHold {
   holdType: string;
   queueType: 'context' | 'security';
   requirement: ApprovalRequirement;
+  /** Which contexts held and which were admitted; stored for the release. */
+  record: InstallGateRecord;
 }
 
 async function resolveWorkflowInstallSecrets(
@@ -2286,7 +2392,7 @@ async function resolveWorkflowInstallSecrets(
   | { skipDispatch: false }
   | { held: true; hold: InstallGateHold }
 > {
-  const { deps, workflow, runId, resolvedOrgId, repoIdentifier, event, trustResolution } = ctx;
+  const { deps, workflow, runId, resolvedOrgId, event, trustResolution } = ctx;
   const hasRegistries = workflow.registries && workflow.registries.length > 0;
   const hasInstallEnv = workflow.installEnv && workflow.installEnv.length > 0;
   if (!hasRegistries && !hasInstallEnv) return { skipDispatch: false };
@@ -2310,9 +2416,9 @@ async function resolveWorkflowInstallSecrets(
   }
 
   const protectionContext: JobDispatchContext = {
-    branch: event.targetBranch,
+    branch: policyBranch(ctx),
     triggerType: event.type,
-    repository: repoIdentifier,
+    repository: policyRepo(ctx),
     runId,
     // Workflow-level install has no per-job id; surface a deterministic
     // synthetic id so audit logs make the workflow scope visible.
@@ -2320,6 +2426,15 @@ async function resolveWorkflowInstallSecrets(
     internallyTriggered: ctx.internallyTriggered === true,
   };
 
+  if (skipProtectionGate && !ctx.installGateRecord) {
+    logger.warn(
+      'Released install hold recorded no contexts; every install context is gated again',
+      {
+        runId,
+        workflow: workflow.name,
+      },
+    );
+  }
   const result = await resolveInstallSecrets({
     registries: workflow.registries,
     installEnv: workflow.installEnv,
@@ -2330,6 +2445,7 @@ async function resolveWorkflowInstallSecrets(
     secretResolver: deps.secretResolver,
     protectionContext,
     skipProtectionGate,
+    ...(skipProtectionGate && { releasedHold: ctx.installGateRecord }),
   });
 
   if (result.decision === 'hold') {
@@ -2339,6 +2455,8 @@ async function resolveWorkflowInstallSecrets(
       action: result.action,
       env: result.envName,
       holdType: result.holdType,
+      heldContexts: result.record.held.map((c) => c.name),
+      admittedContexts: result.record.admitted.map((c) => c.name),
     });
     return {
       held: true,
@@ -2349,6 +2467,7 @@ async function resolveWorkflowInstallSecrets(
         holdType: result.holdType,
         queueType: result.queueType,
         requirement: result.requirement,
+        record: result.record,
       },
     };
   }
@@ -2406,6 +2525,32 @@ function buildDeferredInitJob(args: {
   const lockJob = mat.lockJob;
   const { workflow, fullLockFile, bundle, repoIdentifier, credentials, event, ref, runId } = ctx;
   const initJobName = `__init__${workflow.name}__${mat.expandedName}`;
+  const jobConfig: Record<string, unknown> = {
+    initOnly: true,
+    // The init job resolves dynamic fields against the BASE job definition in
+    // source; for a dynamic matrix the base name is what findJobByName needs.
+    targetJobName: mat.baseName,
+    // A non-global workflow's `filter` gets no eval round of its own — the
+    // init job evaluates it before this job's dynamic fields, and a `false`
+    // verdict suppresses the dispatch. Omitted (never `false`) when the
+    // workflow declares none, matching how the lock file records it.
+    ...(workflow.hasFilter === true && { hasFilter: true }),
+    workflowName: workflow.name,
+    source: workflow.source?.file ?? fullLockFile.source.file,
+    dynamicContext: (lockJob.contexts ?? []).some((e) => e.dynamic),
+    dynamicEnv: lockJob.dynamicEnv ?? false,
+    dynamicConcurrencyGroup: lockJob.dynamicConcurrencyGroup ?? false,
+    dynamicMatrix: mat.pendingDynamicMatrix === true,
+    event,
+    timeoutMs: 60_000,
+    ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
+    ...(workflow.resolvedHashFiles?.length && {
+      resolvedHashFiles: workflow.resolvedHashFiles,
+    }),
+    // A global workflow's init job checks out the workflow repository and the
+    // source repository, as its other jobs do.
+    ...globalJobConfigFor(ctx),
+  };
   const initJobInput: QueuedJobInput = {
     runId,
     workflowName: workflow.name,
@@ -2415,29 +2560,7 @@ function buildDeferredInitJob(args: {
       `kici:os:${buildPrep.targetPlatform}`,
       `kici:arch:${buildPrep.targetArch}`,
     ],
-    jobConfig: {
-      initOnly: true,
-      // The init job resolves dynamic fields against the BASE job definition in
-      // source; for a dynamic matrix the base name is what findJobByName needs.
-      targetJobName: mat.baseName,
-      // A non-global workflow's `filter` gets no eval round of its own — the
-      // init job evaluates it before this job's dynamic fields, and a `false`
-      // verdict suppresses the dispatch. Omitted (never `false`) when the
-      // workflow declares none, matching how the lock file records it.
-      ...(workflow.hasFilter === true && { hasFilter: true }),
-      workflowName: workflow.name,
-      source: workflow.source?.file ?? fullLockFile.source.file,
-      dynamicContext: (lockJob.contexts ?? []).some((e) => e.dynamic),
-      dynamicEnv: lockJob.dynamicEnv ?? false,
-      dynamicConcurrencyGroup: lockJob.dynamicConcurrencyGroup ?? false,
-      dynamicMatrix: mat.pendingDynamicMatrix === true,
-      event,
-      timeoutMs: 60_000,
-      ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
-      ...(workflow.resolvedHashFiles?.length && {
-        resolvedHashFiles: workflow.resolvedHashFiles,
-      }),
-    },
+    jobConfig,
     repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
@@ -2448,6 +2571,8 @@ function buildDeferredInitJob(args: {
     requestId: getRequestContext().requestId,
     sourceTarUrl: buildPrep.sourceTarUrl,
     sourceTarDigest: buildPrep.sourceTarDigest,
+    // A global job restores the tarball into the workflow repository's checkout,
+    // with or without a source pack.
     depsUrl: buildPrep.depsUrl,
     depsHash: buildPrep.depsHash,
   };
@@ -3043,9 +3168,16 @@ async function applyContextRulesAndSecrets(args: {
    * must stay out of the in-pass admission tally. Defaults to `true`.
    */
   dispatchesThisPass?: boolean;
+  /**
+   * Whether to resolve the job's container registry credentials. A generated
+   * job's config carries no container, so it passes `false` rather than
+   * resolving credentials nothing reads. Defaults to `true`.
+   */
+  resolveRegistryAuth?: boolean;
 }): Promise<ContextGateHandle | undefined> {
   const { ctx, lockJob, expandedName, contextNames, concurrencyGroup, jobEnvData, hostCtx } = args;
-  const { deps, repoIdentifier, event, runId, workflow, resolvedOrgId } = ctx;
+  const resolveRegistryAuth = args.resolveRegistryAuth ?? true;
+  const { deps, event, runId, workflow, resolvedOrgId } = ctx;
   const { trustResolution } = ctx;
   if (!deps.contextStore) return undefined;
 
@@ -3064,9 +3196,9 @@ async function applyContextRulesAndSecrets(args: {
   // held job.
   const jobId = expandedName;
   const dispatchCtx: JobDispatchContext = {
-    branch: event.targetBranch,
+    branch: policyBranch(ctx),
     triggerType: event.type,
-    repository: repoIdentifier,
+    repository: policyRepo(ctx),
     runId,
     jobId,
     internallyTriggered: ctx.internallyTriggered === true,
@@ -3112,74 +3244,40 @@ async function applyContextRulesAndSecrets(args: {
     }),
   });
 
-  if (!jobEnvData.rejected && !jobEnvData.held) {
+  const registryAuth =
+    resolveRegistryAuth && lockJob.container && typeof lockJob.container === 'object'
+      ? {
+          container: lockJob.container,
+          dispatchCtx,
+          ...(trustResolution?.tier && { trustTier: trustResolution.tier as TrustTier }),
+        }
+      : undefined;
+
+  if (jobEnvData.rejected) return gateHandle;
+  // Recorded for every admitted job, not only a held one: a job the static
+  // approval gate holds next, or one that waits on upstream jobs, is stored as a
+  // pending dispatch context without its context data and resolves it from this
+  // record when it is dispatched.
+  jobEnvData.contextResolution = {
+    contexts: present.map((p) => ({ name: p.name, id: p.env.id })),
+    orgId: resolvedOrgId,
+    routingKey: policyRoutingKey(ctx),
+    resolvesSecrets: deps.secretResolver != null,
+    ...(hostCtx && { hostCtx: { ...hostCtx, labels: [...hostCtx.labels] } }),
+    ...(registryAuth && { registryAuth }),
+  };
+  if (!jobEnvData.held) {
     try {
-      const merged = await resolveMultiEnvMergedData({
-        deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
+      await resolveContextJobData({
+        deps,
         orgId: resolvedOrgId,
         entries: present,
         hostCtx,
-        routingKey: ctx.info.routingKey,
+        routingKey: policyRoutingKey(ctx),
+        registryAuth,
+        log: { runId, workflow: workflow.name, job: lockJob.name },
+        into: jobEnvData,
       });
-      if (merged.contextVars) jobEnvData.contextVars = merged.contextVars;
-      if (merged.jobSecrets) jobEnvData.jobSecrets = merged.jobSecrets;
-      if (merged.jobNamespacedSecrets)
-        jobEnvData.jobNamespacedSecrets = merged.jobNamespacedSecrets;
-
-      // Private-registry credentials for the job's container image. Resolved
-      // HERE, orchestrator-side: the lock carries `<context>:<secret-name>`
-      // references and the agent never resolves a secret itself. The reference
-      // names its own context, so it goes through the job secret gate — which
-      // runs that context's protection rules — rather than a direct lookup.
-      // The same rule `gitCredentials` follows.
-      const resolver = deps.secretResolver;
-      const authContextStore = deps.contextStore;
-      if (
-        resolver &&
-        authContextStore &&
-        lockJob.container &&
-        typeof lockJob.container === 'object'
-      ) {
-        // Strip before resolving when the contributor is untrusted, exactly as
-        // install secrets are stripped: the pull fails naturally on the first
-        // private image and no token bytes leave the orchestrator. The refs
-        // themselves come from the base-branch lock for a fork pull request, so
-        // there is no forgery here — the exposure is that the resolved
-        // `{username, password}` lands in `jobConfig`, which the job's own
-        // process reads.
-        if (isUntrustedTier(trustResolution?.tier as TrustTier | undefined)) {
-          containerRegistryAuthContributorStrippedTotal.add(1, {
-            trust_tier: trustResolution?.tier ?? 'unknown',
-          });
-          logger.info('Container registry auth withheld from an untrusted contributor', {
-            runId,
-            workflow: workflow.name,
-            job: lockJob.name,
-            trustTier: trustResolution?.tier ?? 'unknown',
-          });
-        } else {
-          // The AUTH resolver, not the spawn resolver: a job that builds its
-          // image has no spawn (the image does not exist yet) but still needs
-          // credentials for the Dockerfile's own `FROM` base.
-          jobEnvData.containerRegistryAuth = await resolveContainerRegistryAuth(lockJob.container, {
-            resolveSecret: (ref) => {
-              const idx = ref.indexOf(':');
-              if (idx <= 0) return Promise.resolve(undefined);
-              return resolveJobQualifiedSecret({
-                resolver,
-                contextStore: authContextStore,
-                orgId: resolvedOrgId,
-                runId,
-                jobId,
-                context: ref.slice(0, idx),
-                key: ref.slice(idx + 1),
-                dispatchCtx,
-                trustTier: trustResolution?.tier as TrustTier | undefined,
-              });
-            },
-          });
-        }
-      }
     } catch (err) {
       logger.error('Per-job secret resolution failed', {
         runId,
@@ -3190,7 +3288,8 @@ async function applyContextRulesAndSecrets(args: {
       });
     }
   }
-
+  // A held job resolves nothing now: the release path resolves the same data
+  // from the record above once the hold is released.
   return gateHandle;
 }
 
@@ -3214,10 +3313,13 @@ export async function evaluateJobContexts(args: {
   for (const mat of buildPrep.materializedJobs) {
     const lockJob = mat.lockJob;
     const jobEnvData: JobEnvData = {};
-    const { names: contextNames, needsInit: envNeedsInit } = resolveJobContextNames(lockJob);
+    const { names: contextNames, needsInit: envNeedsInit } = resolveJobContextNames(
+      workflow,
+      lockJob,
+    );
     // Ordered display list persisted on the job row (placeholder for unresolved
     // dynamic elements; the deferred-init flow-back overwrites it once resolved).
-    const displayEnvNames = buildJobContextDisplayNames(lockJob);
+    const displayEnvNames = buildJobContextDisplayNames(workflow, lockJob);
     if (displayEnvNames.length > 0) jobEnvData.contextNames = displayEnvNames;
     // A dynamic field cannot be evaluated here AT ALL — its value is only known
     // once the agent has run the workflow module — so the whole per-job block
@@ -3409,8 +3511,6 @@ function makeBuildJobConfig(args: {
   workflow: LockWorkflow;
   fullLockFile: WorkflowDispatchContext['fullLockFile'];
   jobContextData: Map<string, JobEnvData>;
-  resolvedSecrets: Record<string, string> | undefined;
-  resolvedNamespacedSecrets: Record<string, Record<string, string>> | undefined;
   runPublicKeyBase64: string | undefined;
   npmRegistries: NpmRegistrySpec[] | undefined;
   installEnvSecrets: Record<string, string> | undefined;
@@ -3457,8 +3557,6 @@ function makeBuildJobConfig(args: {
     workflow,
     fullLockFile,
     jobContextData,
-    resolvedSecrets,
-    resolvedNamespacedSecrets,
     runPublicKeyBase64,
     npmRegistries,
     installEnvSecrets,
@@ -3475,19 +3573,6 @@ function makeBuildJobConfig(args: {
   return (mat: MaterializedJob): Record<string, unknown> => {
     const lockJob = mat.lockJob;
     const envData = jobContextData.get(mat.expandedName);
-    // Run-wide CLI flat secrets are spread LAST so they win on a key collision
-    // with the per-job env-resolved set, and so they reach an env-less job too.
-    const mergedSecrets = {
-      ...resolvedSecrets,
-      ...(envData?.jobSecrets ?? {}),
-      ...(runWideFlatSecrets ?? {}),
-    };
-    const mergedNamespaced = {
-      ...resolvedNamespacedSecrets,
-      ...(envData?.jobNamespacedSecrets ?? {}),
-    };
-    const hasSecrets = Object.keys(mergedSecrets).length > 0;
-    const hasNamespaced = Object.keys(mergedNamespaced).length > 0;
     return {
       source: workflow.source ?? fullLockFile.source,
       workflowName: workflow.name,
@@ -3538,16 +3623,13 @@ function makeBuildJobConfig(args: {
       ...(workflow.resolvedHashFiles?.length && {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
-      ...(hasSecrets && { secrets: mergedSecrets }),
-      ...(hasNamespaced && { namespacedSecrets: mergedNamespaced }),
       ...(runPublicKeyBase64 && { runPublicKey: runPublicKeyBase64 }),
       ...(npmRegistries && npmRegistries.length > 0 && { npmRegistries }),
       ...(installEnvSecrets && Object.keys(installEnvSecrets).length > 0 && { installEnvSecrets }),
       ...(envData?.contextName && { context: envData.contextName }),
-      ...(envData?.containerRegistryAuth && {
-        containerRegistryAuth: envData.containerRegistryAuth,
-      }),
-      ...(envData?.contextVars && { contextVars: envData.contextVars }),
+      // Run-wide CLI flat secrets win a key collision with the context secrets,
+      // and reach a job with no context too.
+      ...contextDataConfigFields(envData, runWideFlatSecrets),
       ...(envData?.jobEnv && { jobEnv: envData.jobEnv }),
       ...(lockJob.resources && { resources: lockJob.resources }),
       // Job-level wall-clock timeout (ms). The agent reads jobConfig.timeout in
@@ -3598,7 +3680,7 @@ function buildExecutionJobInput(args: {
     // which does NOT re-apply the dispatcher wrapper's extraJobConfig merge.
     // Without this, a test run's overlay/`fullRepo` provenance would be lost on
     // the downstream and the agent would try to clone an empty repoUrl.
-    jobConfig: { ...buildJobConfig(mat), ...ctx.extraJobConfig },
+    jobConfig: { ...buildJobConfig(mat), ...globalJobConfigFor(ctx), ...ctx.extraJobConfig },
     repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
@@ -3670,7 +3752,7 @@ export const PENDING_CHECK_MARK_ATTEMPTS = 3;
 /** Backoff between mark attempts, multiplied by the attempt number. */
 const PENDING_CHECK_MARK_RETRY_BASE_MS = 25;
 
-async function postPendingHoldCheck(args: {
+export async function postPendingHoldCheck(args: {
   poster: NonNullable<NonNullable<WorkflowDispatchContext['bundle']>['checkStatusPoster']>;
   store: NonNullable<ProcessingDeps['heldRunStore']>;
   orgId: string;
@@ -3738,10 +3820,80 @@ async function holdJobForApproval(args: {
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
   const { ctx, setup, buildPrep, buildJobConfig, mat, envData, dispatchedJobs } = args;
-  const lockJob = mat.lockJob;
+  const selectors = runsOnSelectorsForLockJob(mat.lockJob);
+  await persistJobHold({
+    ctx,
+    jobName: mat.expandedName,
+    envData,
+    runsOnLabels: selectors.runsOnLabels,
+    buildJobInput: () =>
+      buildExecutionJobInput({ ctx, setup, buildPrep, buildJobConfig, mat, selectors }),
+    placeholder: {
+      jobName: mat.expandedName,
+      ...(mat.variantValues && { matrixValues: mat.variantValues }),
+      // A held matrix / host child keeps its variant identity. Without these the
+      // row carries a null `base_job_name`, which the rolling-wave scheduler keys
+      // on — so the wave would never fire for a child that was held.
+      ...variantTrackingFields(mat),
+      ...gitCredentialFields(mat.lockJob),
+      runsOnLabels: selectors.runsOnLabels,
+    },
+    dispatchedJobs,
+  });
+}
+
+/**
+ * Store a job as a pending dispatch context, to be dispatched later by
+ * `dispatchReadyJob`.
+ *
+ * A job bound to a context is stored WITHOUT its context data and WITH the
+ * record its later dispatch resolves that data from, so no context secret is
+ * kept at rest while the job waits. A job with no record stores its input as
+ * built: it carries no context data, only the run-wide secrets.
+ */
+async function storeDeferredJobContext(args: {
+  ctx: WorkflowDispatchContext;
+  /** The executor to write through: the dispatch's own db, or a transaction. */
+  db: Parameters<typeof storePendingJobContext>[0];
+  jobName: string;
+  jobInput: QueuedJobInput;
+  runsOnLabels: string[];
+  invoke?: InvokeGateParams;
+  resolution: DeferredContextResolution | undefined;
+}): Promise<void> {
+  const { ctx, db, jobName, jobInput, runsOnLabels, invoke, resolution } = args;
+  await storePendingJobContext(db, ctx.runId, jobName, {
+    // fails-when: a bound job is stored with the input dispatch built, context secrets included
+    // breaks-if-wrong: the run-wide secrets of a job with no bound context must stay on its input
+    jobInput: resolution ? withoutContextData(jobInput, ctx.runWideFlatSecrets) : jobInput,
+    runsOnLabels,
+    ...(invoke && { invoke }),
+    ...(resolution && { contextResolution: resolution }),
+  });
+}
+
+/**
+ * Write a held job's `held_runs` row(s) and its pending dispatch context in one
+ * transaction, audit each row, register its `needs-pending-` placeholder, and
+ * post the pending commit check. Shared by lock-defined jobs
+ * ({@link holdJobForApproval}) and the jobs a dynamic generator produces
+ * ({@link holdGeneratedJobs}), which build their dispatch input differently but
+ * resume through the same `dispatchReadyJob` path.
+ */
+async function persistJobHold(args: {
+  ctx: WorkflowDispatchContext;
+  /** The expanded job name — `held_runs.job_id` and the pending-context key. */
+  jobName: string;
+  envData: JobEnvData;
+  runsOnLabels: string[];
+  /** Built only once the hold is known to persist. */
+  buildJobInput: () => QueuedJobInput;
+  /** The run row registered while the job waits; its id is minted here. */
+  placeholder: Omit<DispatchedJob, 'jobId'>;
+  dispatchedJobs: DispatchedJob[];
+}): Promise<void> {
+  const { ctx, jobName, envData, runsOnLabels, placeholder, dispatchedJobs } = args;
   const { deps, workflow, runId } = ctx;
-  const selectors = runsOnSelectorsForLockJob(lockJob);
-  const runsOnLabels = selectors.runsOnLabels;
   const hold = envData.approvalHold;
   const nonApproval = envData.nonApprovalHold;
   // `approvalHold` no longer gates whether a resume path is persisted — it only
@@ -3755,19 +3907,12 @@ async function holdJobForApproval(args: {
     logger.info('Job held by protection rules (not persisted — no hold data or no store)', {
       runId,
       workflow: workflow.name,
-      job: mat.expandedName,
+      job: jobName,
     });
     return;
   }
 
-  const jobInput = buildExecutionJobInput({
-    ctx,
-    setup,
-    buildPrep,
-    buildJobConfig,
-    mat,
-    selectors,
-  });
+  const jobInput = args.buildJobInput();
 
   // The held_runs row keys the resume by (run_id, job_id) where job_id is the
   // expanded job *name* — release() consumes the pending context by the same name.
@@ -3795,7 +3940,7 @@ async function holdJobForApproval(args: {
           ctx.resolvedOrgId,
           {
             runId,
-            jobId: mat.expandedName,
+            jobId: jobName,
             scope: hold.scope,
             triggerSource: hold.triggerSource,
             requirement: hold.requirement,
@@ -3820,7 +3965,14 @@ async function holdJobForApproval(args: {
         holdType: nonApproval.holdType,
       });
     }
-    await storePendingJobContext(trx, runId, mat.expandedName, { jobInput, runsOnLabels });
+    await storeDeferredJobContext({
+      ctx,
+      db: trx,
+      jobName,
+      jobInput,
+      runsOnLabels,
+      resolution: envData.contextResolution,
+    });
     return rows;
   });
   // Audit each hold creation. The orchestrator's dispatch subsystem creates the
@@ -3840,7 +3992,7 @@ async function holdJobForApproval(args: {
       outcome: 'allowed',
       meta: {
         runId,
-        jobId: mat.expandedName,
+        jobId: jobName,
         holdScope: written.scope,
         triggerSource: written.triggerSource,
         holdType: written.holdType,
@@ -3851,23 +4003,13 @@ async function holdJobForApproval(args: {
   // while the job awaits approval. Uses the same `needs-pending-` prefix as the
   // needs scheduler so release() can resume through dispatchReadyJob, which
   // swaps this placeholder for the real dispatched job id.
-  const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${mat.expandedName}-${randomUUID()}`;
-  dispatchedJobs.push({
-    jobId: syntheticId,
-    jobName: mat.expandedName,
-    ...(mat.variantValues && { matrixValues: mat.variantValues }),
-    // A held matrix / host child keeps its variant identity. Without these the
-    // row carries a null `base_job_name`, which the rolling-wave scheduler keys
-    // on — so the wave would never fire for a child that was held.
-    ...variantTrackingFields(mat),
-    ...gitCredentialFields(mat.lockJob),
-    runsOnLabels,
-  });
+  const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${jobName}-${randomUUID()}`;
+  dispatchedJobs.push({ jobId: syntheticId, ...placeholder });
 
   logger.info(hold ? 'Job held for approval' : 'Job held by a context protection gate', {
     runId,
     workflow: workflow.name,
-    job: mat.expandedName,
+    job: jobName,
     scope: hold?.scope ?? HoldScope.enum.job,
     triggerSource: hold?.triggerSource ?? TriggerSource.enum.context,
     ...(hold
@@ -3920,7 +4062,7 @@ async function holdJobForApproval(args: {
       sha: ctx.ref,
       summary: description,
       credentials: ctx.credentials,
-      logContext: { runId, job: mat.expandedName },
+      logContext: { runId, job: jobName },
       postFailureMessage: 'Failed to post approval hold check',
     });
   }
@@ -3965,7 +4107,7 @@ async function holdJobForApproval(args: {
       sha: ctx.ref,
       summary: holdSummary,
       credentials: ctx.credentials,
-      logContext: { runId, job: mat.expandedName },
+      logContext: { runId, job: jobName },
       postFailureMessage: 'Failed to post security hold check',
     });
   }
@@ -4006,9 +4148,11 @@ async function preRegisterNonRootJobs(args: {
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
   needsGatedJobs: readonly MaterializedJob[];
+  jobContextData: Map<string, JobEnvData>;
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
-  const { ctx, setup, buildPrep, buildJobConfig, needsGatedJobs, dispatchedJobs } = args;
+  const { ctx, setup, buildPrep, buildJobConfig, needsGatedJobs, jobContextData, dispatchedJobs } =
+    args;
   const { deps, workflow, runId } = ctx;
   for (const gated of needsGatedJobs) {
     const gatedJob = gated.lockJob;
@@ -4022,7 +4166,14 @@ async function preRegisterNonRootJobs(args: {
       mat: gated,
       selectors,
     });
-    await storePendingJobContext(deps.db, runId, gated.expandedName, { jobInput, runsOnLabels });
+    await storeDeferredJobContext({
+      ctx,
+      db: deps.db,
+      jobName: gated.expandedName,
+      jobInput,
+      runsOnLabels,
+      resolution: jobContextData.get(gated.expandedName)?.contextResolution,
+    });
     const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${gated.expandedName}-${randomUUID()}`;
     dispatchedJobs.push({
       jobId: syntheticId,
@@ -4094,13 +4245,7 @@ async function clusterRouteRootJobs(args: {
     return;
   }
 
-  const cloneToken = await mintCloneTokenForReroute({
-    bundle,
-    repoIdentifier,
-    credentials,
-    runId,
-    workflowName: workflow.name,
-  });
+  const cloneTokens = await mintRerouteCloneTokens(ctx);
   const runCtx: RunContext = {
     runId,
     deliveryId: setup.effectiveDeliveryId,
@@ -4115,7 +4260,7 @@ async function clusterRouteRootJobs(args: {
     workflowName: workflow.name,
     installationId: (credentials as { installationId?: number }).installationId,
     requestId: getRequestContext().requestId,
-    ...(cloneToken && { cloneToken }),
+    ...cloneTokens,
   };
   const jobsToRoute: JobToRoute[] = rootDispatchableJobs.map((mj) => {
     const j = mj.lockJob;
@@ -4131,7 +4276,7 @@ async function clusterRouteRootJobs(args: {
       // needs-gated path does: without it a relayed test run reaches the agent
       // with no fullRepo / tarballUrl / isTestRun, and the agent clones an
       // empty repoUrl instead of unpacking the overlay.
-      jobConfig: { ...buildJobConfig(mj), ...ctx.extraJobConfig },
+      jobConfig: { ...buildJobConfig(mj), ...globalJobConfigFor(ctx), ...ctx.extraJobConfig },
       repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
@@ -4276,14 +4421,20 @@ async function registerPendingInvokeGate(args: {
   mat: MaterializedJob;
   jobInput: QueuedJobInput;
   invokeParams: InvokeGateParams;
+  /** The gate job's context resolution record, when it binds a context. */
+  resolution: DeferredContextResolution | undefined;
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
   const { ctx, mat, jobInput, invokeParams, dispatchedJobs } = args;
   const { deps, runId, workflow } = ctx;
-  await storePendingJobContext(deps.db, runId, mat.expandedName, {
+  await storeDeferredJobContext({
+    ctx,
+    db: deps.db,
+    jobName: mat.expandedName,
     jobInput,
     runsOnLabels: [],
     invoke: invokeParams,
+    resolution: args.resolution,
   });
   const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${mat.expandedName}-${randomUUID()}`;
   dispatchedJobs.push({
@@ -4363,14 +4514,20 @@ async function registerGeneratedInvokeGate(args: {
   matrixValues?: Record<string, unknown>;
   jobInput: QueuedJobInput;
   invokeParams: InvokeGateParams;
+  /** The generated gate's context resolution record, when it binds a context. */
+  resolution: DeferredContextResolution | undefined;
   release: boolean;
 }): Promise<void> {
   const { ctx, jobName, matrixValues, jobInput, invokeParams, release } = args;
   const { deps, runId, workflow } = ctx;
-  await storePendingJobContext(deps.db, runId, jobName, {
+  await storeDeferredJobContext({
+    ctx,
+    db: deps.db,
+    jobName,
     jobInput,
     runsOnLabels: [],
     invoke: invokeParams,
+    resolution: args.resolution,
   });
   const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${jobName}-${randomUUID()}`;
   if (deps.executionTracker) {
@@ -4616,12 +4773,26 @@ async function dispatchSingleOrchPath(args: {
     // gates are released by the scheduler). Applies to both root and non-root.
     const invokeParams = invokeParamsFromLockJob(lockJob);
     if (invokeParams) {
-      await registerPendingInvokeGate({ ctx, mat, jobInput, invokeParams, dispatchedJobs });
+      await registerPendingInvokeGate({
+        ctx,
+        mat,
+        jobInput,
+        invokeParams,
+        resolution: jobContextData.get(mat.expandedName)?.contextResolution,
+        dispatchedJobs,
+      });
       continue;
     }
 
     if (!isRootJob(lockJob)) {
-      await storePendingJobContext(deps.db, runId, mat.expandedName, { jobInput, runsOnLabels });
+      await storeDeferredJobContext({
+        ctx,
+        db: deps.db,
+        jobName: mat.expandedName,
+        jobInput,
+        runsOnLabels,
+        resolution: envData?.contextResolution,
+      });
       const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${mat.expandedName}-${randomUUID()}`;
       dispatchedJobs.push({
         jobId: syntheticId,
@@ -4645,7 +4816,14 @@ async function dispatchSingleOrchPath(args: {
     // needs gate; the wave_gated=true flag (persisted via onExecutionStarted)
     // keeps the dispatch loop from picking it up and is cleared on release.
     if (wavePlan.held.has(mat.expandedName)) {
-      await storePendingJobContext(deps.db, runId, mat.expandedName, { jobInput, runsOnLabels });
+      await storeDeferredJobContext({
+        ctx,
+        db: deps.db,
+        jobName: mat.expandedName,
+        jobInput,
+        runsOnLabels,
+        resolution: envData?.contextResolution,
+      });
       // Use the SAME `needs-pending-` synthetic-id prefix as the needs gate: the
       // release path (dispatchReadyJob → findSyntheticJobId → addJobsToRun) only
       // cleans up rows with that prefix, so a divergent prefix would leave a
@@ -4794,7 +4972,14 @@ async function dispatchStaticJobs(args: {
         mat,
         selectors,
       });
-      await registerPendingInvokeGate({ ctx, mat, jobInput, invokeParams, dispatchedJobs });
+      await registerPendingInvokeGate({
+        ctx,
+        mat,
+        jobInput,
+        invokeParams,
+        resolution: jobContextData.get(mat.expandedName)?.contextResolution,
+        dispatchedJobs,
+      });
     }
     const nonGateJobs = dispatchableJobs.filter((mj) => !isInvokeGate(mj.lockJob));
     const rootDispatchableJobs = nonGateJobs.filter((mj) => isRootJob(mj.lockJob));
@@ -4805,6 +4990,7 @@ async function dispatchStaticJobs(args: {
       buildPrep,
       buildJobConfig,
       needsGatedJobs,
+      jobContextData,
       dispatchedJobs,
     });
     await clusterRouteRootJobs({
@@ -4920,9 +5106,9 @@ async function startRunBeforeDispatch(args: {
     declaredContexts.length > 0 ? [...declaredContexts] : undefined,
     dispatchTriggerEvent(ctx),
     extractCommitMessage(setup.info.event, setup.info.payload),
-    undefined, // parentRunId
+    ctx.rerunLineage?.parentRunId, // parentRunId
     triggeredBy,
-    undefined, // originalRunId
+    ctx.rerunLineage?.originalRunId, // originalRunId
     setup.workflowConcurrency,
     setup.workflowTimeoutMs,
     setup.checkMode,
@@ -4931,10 +5117,10 @@ async function startRunBeforeDispatch(args: {
     event.senderUserId ?? undefined,
     triggeredByAgentLabel,
     event.prNumber ?? null,
-    undefined, // workflowRepoIdentifier — per-repository dispatch
+    workflowRepoProvenance(ctx),
     // Where the code came from, which `event.targetBranch` above deliberately
     // does not say.
-    resolveRunEventContext(event),
+    runEventContextFor(ctx, event),
   );
   await stampChainDepth(ctx);
   await stampTrustContextBeforeDispatch(ctx);
@@ -5114,9 +5300,9 @@ async function recordRunStart(args: {
       declaredContexts.length > 0 ? [...declaredContexts] : undefined,
       dispatchTriggerEvent(ctx),
       extractCommitMessage(setup.info.event, setup.info.payload),
-      undefined, // parentRunId
+      ctx.rerunLineage?.parentRunId, // parentRunId
       triggeredBy,
-      undefined, // originalRunId
+      ctx.rerunLineage?.originalRunId, // originalRunId
       setup.workflowConcurrency,
       setup.workflowTimeoutMs,
       setup.checkMode,
@@ -5125,10 +5311,10 @@ async function recordRunStart(args: {
       event.senderUserId ?? undefined,
       triggeredByAgentLabel, // triggeredByAgentLabel
       event.prNumber ?? null,
-      undefined, // workflowRepoIdentifier — per-repository dispatch
+      workflowRepoProvenance(ctx),
       // Where the code came from, which `event.targetBranch` above deliberately
       // does not say.
-      resolveRunEventContext(event),
+      runEventContextFor(ctx, event),
     );
     await stampChainDepth(ctx);
   }
@@ -5368,9 +5554,14 @@ async function applyInitResultContext(args: {
   // with no `enabled` check, no branch restriction, no minimum-trust check, no
   // concurrency limit, no required reviewers, no wait timer — and none of the
   // context's vars or secrets.
+  //
+  // The agent resolves only the job's own list, so the workflow-level names
+  // are placed before it here, exactly as the static path places them.
   const resolvedNames = anyDynamic
-    ? (initResult?.contextNames ?? [])
-    : resolveJobContextNames(lockJob).names;
+    ? resolveJobContextNames(ctx.workflow, {
+        contexts: (initResult?.contextNames ?? []).map((value) => ({ value, dynamic: false })),
+      }).names
+    : resolveJobContextNames(ctx.workflow, lockJob).names;
   if (resolvedNames.length > 0 && deps.contextStore) {
     // Overwrite the dispatch-time placeholder list with the agent-resolved one.
     // `applyContextRulesAndSecrets` does not maintain this list, and
@@ -5571,7 +5762,7 @@ async function dispatchExecutionAfterInit(args: {
       runsOnPatterns: selectors.runsOnPatterns,
       excludePatterns: selectors.excludePatterns,
       // Routed through the base dispatcher — see the multi-job route above.
-      jobConfig: { ...buildJobConfig(mat), ...ctx.extraJobConfig },
+      jobConfig: { ...buildJobConfig(mat), ...globalJobConfigFor(ctx), ...ctx.extraJobConfig },
       repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
@@ -5579,13 +5770,7 @@ async function dispatchExecutionAfterInit(args: {
       excludeLabels,
       ...(lockJob.resources && { resources: lockJob.resources }),
     };
-    const cloneToken = await mintCloneTokenForReroute({
-      bundle,
-      repoIdentifier,
-      credentials,
-      runId,
-      workflowName: workflow.name,
-    });
+    const cloneTokens = await mintRerouteCloneTokens(ctx);
     const runCtx: RunContext = {
       runId,
       deliveryId: setup.effectiveDeliveryId,
@@ -5600,7 +5785,7 @@ async function dispatchExecutionAfterInit(args: {
       requestId: getRequestContext().requestId,
       sha: ref,
       ref: event.sourceBranch ?? event.targetBranch,
-      ...(cloneToken && { cloneToken }),
+      ...cloneTokens,
     };
     const routeResult = await deps.coordinator.routeJobs(runCtx, [jobToRoute]);
     if (routeResult.localJobs.length > 0 || routeResult.reroutedJobs.length > 0) {
@@ -6060,6 +6245,12 @@ export interface GeneratedJobConfig {
    * site below, which is what the credential relay authorizes a request against.
    */
   gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /**
+   * What a later dispatch resolves the job's context data from, when the job
+   * binds a context. A generated job stored as a pending dispatch context
+   * carries no context data at rest.
+   */
+  contextResolution?: DeferredContextResolution;
 }
 
 /**
@@ -6106,6 +6297,33 @@ async function dispatchEvalJob(args: {
     sourceIndex: dynamicEntry.source.index,
     resultAware: !!upstreamSnapshot,
   });
+  const jobConfig: Record<string, unknown> = {
+    dynamicJobFn: true,
+    workflowName: workflow.name,
+    source: dynamicEntry.source,
+    event,
+    timeoutMs: 120_000,
+    // The workflow's `filter` gates the generator as well as the static jobs'
+    // init round — the agent runs it first and generates nothing on a `false`
+    // verdict. Without this a generator-only workflow would keep the filter
+    // inert, and a mixed one would half-dispatch. Omitted (never `false`) when
+    // the workflow declares none, matching how the lock file records it.
+    ...(workflow.hasFilter === true && { hasFilter: true }),
+    ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
+    ...(workflow.resolvedHashFiles?.length && {
+      resolvedHashFiles: workflow.resolvedHashFiles,
+    }),
+    // Result-aware generators carry their declared needs + the frozen upstream
+    // snapshot so the agent can build ctx.needs at eval time.
+    ...(upstreamSnapshot && {
+      resultAware: true,
+      declaredNeeds: dynamicEntry.needs ?? [],
+      upstreamSnapshot,
+    }),
+    // A global workflow's generator evaluation checks out the workflow
+    // repository and the source repository, as its other jobs do.
+    ...globalJobConfigFor(ctx),
+  };
   const evalJobInput: QueuedJobInput = {
     runId,
     workflowName: workflow.name,
@@ -6115,30 +6333,7 @@ async function dispatchEvalJob(args: {
       `kici:os:${buildPrep.targetPlatform}`,
       `kici:arch:${buildPrep.targetArch}`,
     ],
-    jobConfig: {
-      dynamicJobFn: true,
-      workflowName: workflow.name,
-      source: dynamicEntry.source,
-      event,
-      timeoutMs: 120_000,
-      // The workflow's `filter` gates the generator as well as the static jobs'
-      // init round — the agent runs it first and generates nothing on a `false`
-      // verdict. Without this a generator-only workflow would keep the filter
-      // inert, and a mixed one would half-dispatch. Omitted (never `false`) when
-      // the workflow declares none, matching how the lock file records it.
-      ...(workflow.hasFilter === true && { hasFilter: true }),
-      ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
-      ...(workflow.resolvedHashFiles?.length && {
-        resolvedHashFiles: workflow.resolvedHashFiles,
-      }),
-      // Result-aware generators carry their declared needs + the frozen upstream
-      // snapshot so the agent can build ctx.needs at eval time.
-      ...(upstreamSnapshot && {
-        resultAware: true,
-        declaredNeeds: dynamicEntry.needs ?? [],
-        upstreamSnapshot,
-      }),
-    },
+    jobConfig,
     repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
@@ -6149,6 +6344,8 @@ async function dispatchEvalJob(args: {
     requestId: getRequestContext().requestId,
     sourceTarUrl: buildPrep.sourceTarUrl,
     sourceTarDigest: buildPrep.sourceTarDigest,
+    // A global job restores the tarball into the workflow repository's checkout,
+    // with or without a source pack.
     depsUrl: buildPrep.depsUrl,
     depsHash: buildPrep.depsHash,
   };
@@ -6175,10 +6372,6 @@ async function dispatchEvalJob(args: {
   };
 }
 
-/**
- * Resolve env/secrets per generated job and build their job configs.
- * Skips jobs that fail individual secret resolution.
- */
 /**
  * Records a dropped generated-job matrix as a `matrix_expansion` init failure so
  * the run's dashboard surfaces it, mirroring the static / top-level dynamic-matrix
@@ -6207,12 +6400,11 @@ async function recordGeneratedMatrixFailure(
     .catch(() => {});
 }
 
-export async function resolveGeneratedJobConfigs(args: {
+/** Inputs {@link resolveGeneratedJobConfigs} builds every generated job's config from. */
+interface ResolveGeneratedJobConfigsArgs {
   ctx: WorkflowDispatchContext;
   workflow: LockWorkflow;
   fullLockFile: WorkflowDispatchContext['fullLockFile'];
-  resolvedSecrets: Record<string, string> | undefined;
-  resolvedNamespacedSecrets: Record<string, Record<string, string>> | undefined;
   runPublicKeyBase64: string | undefined;
   npmRegistries: NpmRegistrySpec[] | undefined;
   installEnvSecrets: Record<string, string> | undefined;
@@ -6220,29 +6412,177 @@ export async function resolveGeneratedJobConfigs(args: {
   dynamicEntry: BuildPrepResult['dynamicEntries'][number];
   /** Frozen upstream snapshot threaded into each generated job's dynamicSource for re-eval. */
   upstreamSnapshot?: UpstreamSnapshot;
-}): Promise<GeneratedJobConfig[]> {
-  const {
-    ctx,
-    workflow,
-    fullLockFile,
-    resolvedSecrets,
-    resolvedNamespacedSecrets,
-    runPublicKeyBase64,
-    npmRegistries,
-    installEnvSecrets,
-    generatedJobs,
-    dynamicEntry,
-    upstreamSnapshot,
-  } = args;
-  const { deps, runId, resolvedOrgId, event } = ctx;
-  const out: GeneratedJobConfig[] = [];
+}
 
+/** A generated job its contexts' protection gates held, with the hold they decided. */
+export interface HeldGeneratedJob {
+  config: GeneratedJobConfig;
+  envData: JobEnvData;
+}
+
+/**
+ * The generated jobs split by their context gate verdict. A job the gates
+ * rejected, or whose resolution threw, appears in neither list: it is recorded
+ * on the run as failed.
+ */
+export interface GeneratedJobResolution {
+  /** Jobs cleared to dispatch, carrying their resolved context data. */
+  dispatchable: GeneratedJobConfig[];
+  /** Jobs to hold; their context secrets are not resolved. */
+  held: HeldGeneratedJob[];
+}
+
+/**
+ * Run a generated job's bound contexts through the SAME gates a lock-defined
+ * job passes — {@link applyContextRulesAndSecrets} — and return the verdict.
+ *
+ * The job arrives on the agent's dynamic-eval reply, so its `contexts` list is
+ * job-code output. Binding a context must therefore cost what it costs a static
+ * job: the repository / branch / trigger / enabled rules, then the reviewer,
+ * wait-timer, minimum-trust and concurrency gates, and only after both the
+ * context's variables and secrets.
+ */
+async function gateGeneratedJobContexts(args: {
+  ctx: WorkflowDispatchContext;
+  /** The workflow the generating dynamic entry belongs to. */
+  workflow: Pick<LockWorkflow, 'contexts'>;
+  mat: MaterializedJob;
+}): Promise<JobEnvData> {
+  const { ctx, workflow, mat } = args;
+  const genJob = mat.lockJob;
+  const jobEnvData: JobEnvData = {};
+  // The workflow-level contexts bind a generated job too. A dynamic element is
+  // not resolved for a generated job, so only the static names are gated.
+  const contextNames = resolveJobContextNames(workflow, genJob).names;
+  if (contextNames.length === 0) return jobEnvData;
+  await applyContextRulesAndSecrets({
+    ctx,
+    lockJob: genJob,
+    expandedName: mat.expandedName,
+    contextNames,
+    concurrencyGroup:
+      genJob.dynamicConcurrencyGroup || typeof genJob.concurrencyGroup !== 'string'
+        ? undefined
+        : genJob.concurrencyGroup,
+    jobEnvData,
+    hostCtx: hostCtxFromMat(mat),
+    // A needs-gated generated job is stored and dispatched later by the needs
+    // scheduler, so it takes no in-pass slot — the same split static jobs use.
+    dispatchesThisPass: isRootJob(genJob),
+    resolveRegistryAuth: false,
+  });
+  return jobEnvData;
+}
+
+/** Build one generated job's config from its gate-resolved context data. */
+async function buildGeneratedJobConfig(args: {
+  base: ResolveGeneratedJobConfigsArgs;
+  mat: MaterializedJob;
+  jobEnvData: JobEnvData;
+  expectedJobNames: string[];
+  expandNeeds: (needs: LockJob['needs']) => LockJob['needs'];
+}): Promise<GeneratedJobConfig> {
+  const { base, mat, jobEnvData, expectedJobNames, expandNeeds } = args;
+  const { ctx, workflow, fullLockFile, runPublicKeyBase64, npmRegistries } = base;
+  const { installEnvSecrets, dynamicEntry, upstreamSnapshot } = base;
+  const { deps, event } = ctx;
+  const genJob = mat.lockJob;
   // A generated job has no lock entry of its own, so it inherits the ceiling its
   // GENERATOR was granted in the lock file. Read from `dynamicEntry` and never
   // from `genJob`: `generatedJobs` arrives on the agent's dynamic-eval reply as
   // unvalidated JSON, so a map read from there would let job code declare its
   // own authorization — the hole the server-side credential record closes.
   const inheritedGitCredentials = dynamicEntry.gitCredentials;
+  // Run-wide CLI flat secrets win on collision + reach env-less dynamic jobs.
+  const genSecrets: Record<string, string> = {
+    ...(jobEnvData.jobSecrets ?? {}),
+    ...(ctx.runWideFlatSecrets ?? {}),
+  };
+  const genNamespacedSecrets: Record<string, Record<string, string>> = {
+    ...(jobEnvData.jobNamespacedSecrets ?? {}),
+  };
+  const hasSecrets = Object.keys(genSecrets).length > 0;
+  const hasNamespaced = Object.keys(genNamespacedSecrets).length > 0;
+  const expandedNeeds = expandNeeds(genJob.needs);
+  const envelope = matrixEnvelopeFields(mat);
+  const genJobConfig: Record<string, unknown> = {
+    source: workflow.source ?? fullLockFile.source,
+    workflowName: workflow.name,
+    name: envelope.name,
+    steps: genJob.steps,
+    needs: expandedNeeds,
+    // Raw matrix/include/exclude are consumed at dispatch time, not shipped:
+    // the child instead carries baseJobName + matrixValues (exposed to the
+    // agent as ctx.job.name + ctx.matrix).
+    ...(envelope.matrixValues && {
+      baseJobName: envelope.baseJobName,
+      matrixValues: envelope.matrixValues,
+    }),
+    ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
+    ...(hasSecrets && { secrets: genSecrets }),
+    ...(hasNamespaced && { namespacedSecrets: genNamespacedSecrets }),
+    ...(runPublicKeyBase64 && { runPublicKey: runPublicKeyBase64 }),
+    ...(npmRegistries && npmRegistries.length > 0 && { npmRegistries }),
+    ...(installEnvSecrets && Object.keys(installEnvSecrets).length > 0 && { installEnvSecrets }),
+    ...(jobEnvData.contextName && { context: jobEnvData.contextName }),
+    ...(jobEnvData.contextVars && { contextVars: jobEnvData.contextVars }),
+    ...(genJob.env &&
+      typeof genJob.env === 'object' && {
+        jobEnv: genJob.env as Record<string, string>,
+      }),
+    ...(inheritedGitCredentials && { gitCredentials: inheritedGitCredentials }),
+    dynamicSource: {
+      index: dynamicEntry.source.index,
+      event,
+      expectedJobNames,
+      // Result-aware generators re-eval against the same frozen snapshot the
+      // eval saw, plus the declared needs that shape ctx.needs.
+      ...(upstreamSnapshot && {
+        upstreamSnapshot,
+        declaredNeeds: dynamicEntry.needs ?? [],
+      }),
+    },
+    ...globalJobConfigFor(ctx),
+  };
+  const genSel = runsOnSelectorsForLockJob(genJob);
+  const pin = await resolveRosterAgentPin({
+    runsOnExact: genSel.runsOnExactRaw,
+    runsOnPatterns: genSel.runsOnPatterns,
+    hostRosterStore: deps.hostRosterStore,
+  });
+  return {
+    genJob: { ...genJob, name: envelope.name, needs: expandedNeeds },
+    genJobConfig,
+    // A pin targets the agent directly — clear routing labels (parity with
+    // runsOnAll children, which carry no routing). A miss keeps normal routing.
+    runsOnLabels: pin ? [] : genSel.runsOnLabels,
+    runsOnPatterns: pin ? [] : genSel.runsOnPatterns,
+    excludeLabels: genSel.excludeLabels,
+    excludePatterns: genSel.excludePatterns,
+    ...(pin && {
+      pinnedAgentId: pin.pinnedAgentId,
+      connectedInstanceId: pin.connectedInstanceId,
+    }),
+    ...(envelope.matrixValues && { matrixValues: envelope.matrixValues }),
+    ...(inheritedGitCredentials && { gitCredentials: inheritedGitCredentials }),
+    ...(jobEnvData.contextResolution && { contextResolution: jobEnvData.contextResolution }),
+  };
+}
+
+/**
+ * Gate each generated job on its bound contexts and build the job configs.
+ *
+ * A job the context rules reject is recorded on the run as failed and returned
+ * in neither list. A job whose resolution throws is recorded on the run as
+ * failed too, and dropped from both lists.
+ */
+export async function resolveGeneratedJobConfigs(
+  args: ResolveGeneratedJobConfigsArgs,
+): Promise<GeneratedJobResolution> {
+  const { ctx, generatedJobs } = args;
+  const { deps, runId } = ctx;
+  const dispatchable: GeneratedJobConfig[] = [];
+  const held: HeldGeneratedJob[] = [];
 
   // Materialize each generated job's matrix into N children at dispatch time —
   // the agent's dynamic serializer already resolved any dynamic matrix fn into a
@@ -6299,126 +6639,226 @@ export async function resolveGeneratedJobConfigs(args: {
   };
 
   for (const mat of fanout.jobs) {
-    const genJob = mat.lockJob;
+    let step = GeneratedJobStep.ContextGate;
     try {
-      let genContextName: string | undefined;
-      let genContextVars: Record<string, string> | undefined;
-      let genSecrets: Record<string, string> = { ...resolvedSecrets };
-      let genNamespacedSecrets: Record<string, Record<string, string>> = {
-        ...resolvedNamespacedSecrets,
-      };
-      const genEnvNames = (genJob.contexts ?? []).filter((e) => !e.dynamic).map((e) => e.value);
-      if (genEnvNames.length > 0 && deps.contextStore) {
-        const present: Array<{ name: string; env: EngineContext }> = [];
-        for (const name of genEnvNames) {
-          const cfg = await deps.contextStore.matchContext(resolvedOrgId, name);
-          if (cfg) {
-            const env = toContext(cfg);
-            present.push({ name: env.name, env });
-          }
-        }
-        if (present.length > 0) {
-          genContextName = present[0].name;
-          try {
-            const merged = await resolveMultiEnvMergedData({
-              deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
-              orgId: resolvedOrgId,
-              entries: present,
-              hostCtx: hostCtxFromMat(mat),
-              routingKey: ctx.info.routingKey,
-            });
-            if (merged.contextVars) genContextVars = merged.contextVars;
-            if (merged.jobSecrets) genSecrets = { ...genSecrets, ...merged.jobSecrets };
-            if (merged.jobNamespacedSecrets) {
-              genNamespacedSecrets = { ...genNamespacedSecrets, ...merged.jobNamespacedSecrets };
-            }
-          } catch (err) {
-            logger.error('Dynamic job: secret resolution failed', {
-              runId,
-              job: mat.expandedName,
-              error: toErrorMessage(err),
-            });
-          }
-        }
+      const jobEnvData = await gateGeneratedJobContexts({ ctx, workflow: args.workflow, mat });
+      // fails-when: a generated job binds a context whose branch / repo / trigger rule refuses the run
+      // breaks-if-wrong: a job whose contexts admit the run must still build and dispatch below
+      if (jobEnvData.rejected) {
+        await recordContextRuleRejectionAfterInit({ ctx, mat, jobEnvData });
+        continue;
       }
-      // Run-wide CLI flat secrets win on collision + reach env-less dynamic jobs.
-      if (ctx.runWideFlatSecrets) {
-        genSecrets = { ...genSecrets, ...ctx.runWideFlatSecrets };
-      }
-      const hasSecrets = Object.keys(genSecrets).length > 0;
-      const hasNamespaced = Object.keys(genNamespacedSecrets).length > 0;
-      const expandedNeeds = expandNeeds(genJob.needs);
-      const envelope = matrixEnvelopeFields(mat);
-      const genJobConfig: Record<string, unknown> = {
-        source: workflow.source ?? fullLockFile.source,
-        workflowName: workflow.name,
-        name: envelope.name,
-        steps: genJob.steps,
-        needs: expandedNeeds,
-        // Raw matrix/include/exclude are consumed at dispatch time, not shipped:
-        // the child instead carries baseJobName + matrixValues (exposed to the
-        // agent as ctx.job.name + ctx.matrix).
-        ...(envelope.matrixValues && {
-          baseJobName: envelope.baseJobName,
-          matrixValues: envelope.matrixValues,
-        }),
-        ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
-        ...(hasSecrets && { secrets: genSecrets }),
-        ...(hasNamespaced && { namespacedSecrets: genNamespacedSecrets }),
-        ...(runPublicKeyBase64 && { runPublicKey: runPublicKeyBase64 }),
-        ...(npmRegistries && npmRegistries.length > 0 && { npmRegistries }),
-        ...(installEnvSecrets &&
-          Object.keys(installEnvSecrets).length > 0 && { installEnvSecrets }),
-        ...(genContextName && { context: genContextName }),
-        ...(genContextVars && { contextVars: genContextVars }),
-        ...(genJob.env &&
-          typeof genJob.env === 'object' && {
-            jobEnv: genJob.env as Record<string, string>,
-          }),
-        ...(inheritedGitCredentials && { gitCredentials: inheritedGitCredentials }),
-        dynamicSource: {
-          index: dynamicEntry.source.index,
-          event,
-          expectedJobNames,
-          // Result-aware generators re-eval against the same frozen snapshot the
-          // eval saw, plus the declared needs that shape ctx.needs.
-          ...(upstreamSnapshot && {
-            upstreamSnapshot,
-            declaredNeeds: dynamicEntry.needs ?? [],
-          }),
-        },
-      };
-      const genSel = runsOnSelectorsForLockJob(genJob);
-      const pin = await resolveRosterAgentPin({
-        runsOnExact: genSel.runsOnExactRaw,
-        runsOnPatterns: genSel.runsOnPatterns,
-        hostRosterStore: deps.hostRosterStore,
+      step = GeneratedJobStep.JobConfig;
+      const config = await buildGeneratedJobConfig({
+        base: args,
+        mat,
+        jobEnvData,
+        expectedJobNames,
+        expandNeeds,
       });
-      out.push({
-        genJob: { ...genJob, name: envelope.name, needs: expandedNeeds },
-        genJobConfig,
-        // A pin targets the agent directly — clear routing labels (parity with
-        // runsOnAll children, which carry no routing). A miss keeps normal routing.
-        runsOnLabels: pin ? [] : genSel.runsOnLabels,
-        runsOnPatterns: pin ? [] : genSel.runsOnPatterns,
-        excludeLabels: genSel.excludeLabels,
-        excludePatterns: genSel.excludePatterns,
-        ...(pin && {
-          pinnedAgentId: pin.pinnedAgentId,
-          connectedInstanceId: pin.connectedInstanceId,
-        }),
-        ...(envelope.matrixValues && { matrixValues: envelope.matrixValues }),
-        ...(inheritedGitCredentials && { gitCredentials: inheritedGitCredentials }),
-      });
+      // fails-when: a reviewer / wait-timer / trust / concurrency gate holds the job
+      // breaks-if-wrong: an ungated or admitted job must land in `dispatchable`
+      if (jobEnvData.held) held.push({ config, envData: jobEnvData });
+      else dispatchable.push(config);
     } catch (err) {
-      logger.error('Failed to resolve secrets for dynamic generated job', {
-        runId,
-        job: mat.expandedName,
-        error: toErrorMessage(err),
-      });
+      await dropGeneratedJob({ ctx, mat, step, err });
     }
   }
-  return out;
+  return { dispatchable, held };
+}
+
+/** The step of resolving one generated job that a per-job failure came from. */
+enum GeneratedJobStep {
+  /** `gateGeneratedJobContexts`: matching its contexts, their gates and secrets. */
+  ContextGate = 'context-gate',
+  /** `buildGeneratedJobConfig`: its job config, including the global checkout fields. */
+  JobConfig = 'job-config',
+}
+
+const DROPPED_GENERATED_JOB_MESSAGES: Record<GeneratedJobStep, string> = {
+  [GeneratedJobStep.ContextGate]: 'Dropped a dynamic generated job: its context gate failed',
+  [GeneratedJobStep.JobConfig]:
+    'Dropped a dynamic generated job: its job config could not be built',
+};
+
+/** The failure a dropped generated job is recorded with on the run, per failed step. */
+const DROPPED_GENERATED_JOB_FAILURES: Record<
+  GeneratedJobStep,
+  { category: InitFailureCategory; reason: string }
+> = {
+  [GeneratedJobStep.ContextGate]: {
+    category: InitFailureCategory.enum.secret_resolution,
+    reason: 'Its contexts could not be resolved',
+  },
+  [GeneratedJobStep.JobConfig]: {
+    category: InitFailureCategory.enum.dynamic_eval,
+    reason: 'Its job config could not be built',
+  },
+};
+
+/**
+ * Drop a generated job whose resolution threw: log the step that failed, give
+ * back any in-pass concurrency slot its context gate reserved, and record the
+ * job on the run as failed.
+ *
+ * The job never dispatches, so a sibling gated after it must not count it as
+ * occupying a slot. The release goes by name because the gate may have thrown
+ * after it reserved, leaving no gate handle to release through.
+ *
+ * The record gives the run a terminal row under the job's name. Without it a
+ * job that `needs` the dropped one waits forever (the needs gate reads a
+ * missing upstream as not yet terminal), and a run with no such dependent
+ * finishes green without the job. It is awaited before the caller inserts the
+ * needs edges and recomputes the gates, so that recompute already reads the
+ * failed upstream and skips its dependents.
+ */
+async function dropGeneratedJob(args: {
+  ctx: WorkflowDispatchContext;
+  mat: MaterializedJob;
+  step: GeneratedJobStep;
+  err: unknown;
+}): Promise<void> {
+  const { ctx, mat, step, err } = args;
+  const jobName = mat.expandedName;
+  // fails-when: a root generated job dropped after its gate admitted it keeps its slot, so a
+  // sibling under the same concurrency limit is queued behind a job that never runs
+  // breaks-if-wrong: a sibling's own reservation under the same key stays in place
+  for (const names of ctx.concurrencyAdmissions?.values() ?? []) names.delete(jobName);
+  const error = toErrorMessage(err);
+  logger.error(DROPPED_GENERATED_JOB_MESSAGES[step], {
+    runId: ctx.runId,
+    job: jobName,
+    step,
+    error,
+  });
+  await recordDroppedGeneratedJob({ ctx, mat, step, error });
+}
+
+/** Record a dropped generated job on the run as a failed job carrying a job-scoped init failure. */
+async function recordDroppedGeneratedJob(args: {
+  ctx: WorkflowDispatchContext;
+  mat: MaterializedJob;
+  step: GeneratedJobStep;
+  error: string;
+}): Promise<void> {
+  const { ctx, mat, step, error } = args;
+  const tracker = ctx.deps.executionTracker;
+  if (!tracker) return;
+  const { category, reason } = DROPPED_GENERATED_JOB_FAILURES[step];
+  const message = `${reason}: ${error}`;
+  const jobId = `generated-failed-${randomUUID()}`;
+  const onError = (recordErr: unknown): void => {
+    logger.error('Failed to record a dropped generated job on the run', {
+      runId: ctx.runId,
+      job: mat.expandedName,
+      error: toErrorMessage(recordErr),
+    });
+  };
+  await tracker
+    .addJobsToRun(ctx.runId, [
+      {
+        jobId,
+        jobName: mat.expandedName,
+        ...(mat.variantValues && { matrixValues: mat.variantValues }),
+        ...variantTrackingFields(mat),
+        runsOnLabels: runsOnLabelsOrNone(mat.lockJob),
+      },
+    ])
+    .catch(onError);
+  await tracker
+    .onJobStatus(ctx.runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {
+      error: message,
+      initFailure: { scope: 'job', category, message, jobName: mat.expandedName },
+    })
+    .catch(onError);
+}
+
+/**
+ * A job's exact runs-on labels, or none when its matchers are invalid. A
+ * generated job's `runsOn` is job-code output, and an invalid matcher may be
+ * the very reason the job is being dropped.
+ */
+function runsOnLabelsOrNone(lockJob: LockJob): string[] {
+  // fails-when: a job dropped for an invalid matcher throws here again, so it is never recorded
+  // breaks-if-wrong: a job with valid matchers is still recorded with its exact labels
+  try {
+    return runsOnSelectorsForLockJob(lockJob).runsOnLabels;
+  } catch {
+    return [];
+  }
+}
+
+/** Insert the `execution_job_needs` edges of needs-gated generated jobs. */
+async function insertGeneratedJobEdges(
+  db: Kysely<Database>,
+  runId: string,
+  configs: readonly GeneratedJobConfig[],
+): Promise<void> {
+  const edgeRows: Array<{
+    run_id: string;
+    job_name: string;
+    upstream_name: string;
+    run_on: string;
+  }> = [];
+  for (const { genJob } of configs) {
+    for (const need of genJob.needs) {
+      if (typeof need === 'string') {
+        edgeRows.push({
+          run_id: runId,
+          job_name: genJob.name,
+          upstream_name: need,
+          run_on: SUCCESS_ONLY_RUN_ON_JSON,
+        });
+      } else if (typeof need === 'object' && 'name' in need && !('group' in need)) {
+        edgeRows.push({
+          run_id: runId,
+          job_name: genJob.name,
+          upstream_name: (need as { name: string }).name,
+          run_on: needsRunOnJson(need as { runOn?: ExecutionJobStatus[] }),
+        });
+      }
+    }
+  }
+  if (edgeRows.length > 0) {
+    await db
+      .insertInto('execution_job_needs')
+      .values(edgeRows)
+      .onConflict((oc) => oc.doNothing())
+      .execute();
+  }
+}
+
+/** The queued dispatch input for one generated job, without a host pin. */
+function buildGeneratedJobInput(args: {
+  ctx: WorkflowDispatchContext;
+  setup: DispatchSetup;
+  buildPrep: BuildPrepResult;
+  config: GeneratedJobConfig;
+}): QueuedJobInput {
+  const { ctx, setup, buildPrep, config } = args;
+  const { workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
+  return {
+    runId,
+    workflowName: workflow.name,
+    jobName: config.genJob.name,
+    runsOnLabels: config.runsOnLabels,
+    runsOnPatterns: config.runsOnPatterns,
+    excludeLabels: config.excludeLabels,
+    excludePatterns: config.excludePatterns,
+    jobConfig: config.genJobConfig,
+    repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+    ref: event.sourceBranch ?? event.targetBranch,
+    sha: ref,
+    deliveryId: setup.effectiveDeliveryId,
+    provider: setup.info.provider,
+    providerContext: credentials as Record<string, unknown>,
+    routingKey: setup.info.routingKey,
+    sourceTarUrl: buildPrep.sourceTarUrl,
+    sourceTarDigest: buildPrep.sourceTarDigest,
+    depsUrl: buildPrep.depsUrl,
+    depsHash: buildPrep.depsHash,
+    requestId: getRequestContext().requestId,
+  };
 }
 
 async function gateAndStoreNonRootGeneratedJobs(args: {
@@ -6428,72 +6868,12 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
   gatedGeneratedConfigs: GeneratedJobConfig[];
 }): Promise<void> {
   const { ctx, setup, buildPrep, gatedGeneratedConfigs } = args;
-  const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
+  const { deps, workflow, runId } = ctx;
   if (gatedGeneratedConfigs.length === 0 || !deps.db) return;
-  const gatedEdgeRows: Array<{
-    run_id: string;
-    job_name: string;
-    upstream_name: string;
-    run_on: string;
-  }> = [];
-  for (const { genJob } of gatedGeneratedConfigs) {
-    for (const need of genJob.needs) {
-      if (typeof need === 'string') {
-        gatedEdgeRows.push({
-          run_id: runId,
-          job_name: genJob.name,
-          upstream_name: need,
-          run_on: SUCCESS_ONLY_RUN_ON_JSON,
-        });
-      } else if (typeof need === 'object' && 'name' in need && !('group' in need)) {
-        gatedEdgeRows.push({
-          run_id: runId,
-          job_name: genJob.name,
-          upstream_name: (need as { name: string }).name,
-          run_on: needsRunOnJson(need as { runOn?: ExecutionJobStatus[] }),
-        });
-      }
-    }
-  }
-  if (gatedEdgeRows.length > 0) {
-    await deps.db
-      .insertInto('execution_job_needs')
-      .values(gatedEdgeRows)
-      .onConflict((oc) => oc.doNothing())
-      .execute();
-  }
-  for (const {
-    genJob,
-    genJobConfig,
-    runsOnLabels,
-    runsOnPatterns,
-    excludeLabels,
-    excludePatterns,
-    matrixValues,
-    gitCredentials,
-  } of gatedGeneratedConfigs) {
-    const gatedJobInput: QueuedJobInput = {
-      runId,
-      workflowName: workflow.name,
-      jobName: genJob.name,
-      runsOnLabels,
-      runsOnPatterns,
-      excludeLabels,
-      excludePatterns,
-      jobConfig: genJobConfig,
-      repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
-      ref: event.sourceBranch ?? event.targetBranch,
-      sha: ref,
-      deliveryId: setup.effectiveDeliveryId,
-      provider: setup.info.provider,
-      providerContext: credentials as Record<string, unknown>,
-      routingKey: setup.info.routingKey,
-      sourceTarUrl: buildPrep.sourceTarUrl,
-      sourceTarDigest: buildPrep.sourceTarDigest,
-      depsUrl: buildPrep.depsUrl,
-      depsHash: buildPrep.depsHash,
-      requestId: getRequestContext().requestId,
-    };
+  await insertGeneratedJobEdges(deps.db, runId, gatedGeneratedConfigs);
+  for (const config of gatedGeneratedConfigs) {
+    const { genJob, runsOnLabels, matrixValues, gitCredentials } = config;
+    const gatedJobInput = buildGeneratedJobInput({ ctx, setup, buildPrep, config });
     // A generated invoke gate never reaches an agent: register it as a pending
     // gate (its cross-domain needs edges were inserted above) and let the
     // scheduler release it when its upstreams complete.
@@ -6505,13 +6885,18 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
         matrixValues,
         jobInput: gatedJobInput,
         invokeParams: gateInvokeParams,
+        resolution: config.contextResolution,
         release: false,
       });
       continue;
     }
-    await storePendingJobContext(deps.db, runId, genJob.name, {
+    await storeDeferredJobContext({
+      ctx,
+      db: deps.db,
+      jobName: genJob.name,
       jobInput: gatedJobInput,
       runsOnLabels,
+      resolution: config.contextResolution,
     });
     const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${genJob.name}-${randomUUID()}`;
     if (deps.executionTracker) {
@@ -6534,6 +6919,54 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
   }
 }
 
+/**
+ * Hold the generated jobs their contexts' protection gates held, through the
+ * same `held_runs` row + pending dispatch context a lock-defined job's hold
+ * writes ({@link persistJobHold}), so approval resumes each one through
+ * `dispatchReadyJob`.
+ *
+ * A needs-gated held job also gets its needs edges: the resume path's needs
+ * gate reads them, so an approval cannot run the job ahead of its upstreams.
+ * The placeholders are registered on the run in one call after the holds, the
+ * same shape {@link holdExecutionAfterInit} uses, and a failure to register
+ * them propagates — a hold with no placeholder would let the run complete
+ * while the job waits.
+ */
+async function holdGeneratedJobs(args: {
+  ctx: WorkflowDispatchContext;
+  setup: DispatchSetup;
+  buildPrep: BuildPrepResult;
+  held: HeldGeneratedJob[];
+}): Promise<void> {
+  const { ctx, setup, buildPrep, held } = args;
+  const { deps, runId } = ctx;
+  if (held.length === 0) return;
+  const needsGated = held.map((h) => h.config).filter((c) => !isRootJob(c.genJob));
+  if (deps.db && needsGated.length > 0) await insertGeneratedJobEdges(deps.db, runId, needsGated);
+  const placeholders: DispatchedJob[] = [];
+  for (const { config, envData } of held) {
+    const { genJob, runsOnLabels, matrixValues, gitCredentials } = config;
+    await persistJobHold({
+      ctx,
+      jobName: genJob.name,
+      envData,
+      runsOnLabels,
+      buildJobInput: () => buildGeneratedJobInput({ ctx, setup, buildPrep, config }),
+      placeholder: {
+        jobName: genJob.name,
+        runsOnLabels,
+        ...(matrixValues && { matrixValues }),
+        // The generator's lock-granted map, never the generated job's own.
+        ...(gitCredentials && { gitCredentials }),
+      },
+      dispatchedJobs: placeholders,
+    });
+  }
+  if (placeholders.length > 0 && deps.executionTracker) {
+    await deps.executionTracker.addJobsToRun(runId, placeholders);
+  }
+}
+
 async function directDispatchGeneratedJobs(args: {
   ctx: WorkflowDispatchContext;
   setup: DispatchSetup;
@@ -6541,41 +6974,13 @@ async function directDispatchGeneratedJobs(args: {
   configs: GeneratedJobConfig[];
 }): Promise<void> {
   const { ctx, setup, buildPrep, configs } = args;
-  const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
-  for (const {
-    genJob,
-    genJobConfig,
-    runsOnLabels,
-    runsOnPatterns,
-    excludeLabels,
-    excludePatterns,
-    matrixValues,
-    pinnedAgentId,
-    connectedInstanceId,
-    gitCredentials,
-  } of configs) {
+  const { deps, runId } = ctx;
+  for (const config of configs) {
+    const { genJob, runsOnLabels, matrixValues, pinnedAgentId, connectedInstanceId } = config;
+    const { gitCredentials } = config;
     try {
       const genJobInput: QueuedJobInput = {
-        runId,
-        workflowName: workflow.name,
-        jobName: genJob.name,
-        runsOnLabels,
-        runsOnPatterns,
-        excludeLabels,
-        excludePatterns,
-        jobConfig: genJobConfig,
-        repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
-        ref: event.sourceBranch ?? event.targetBranch,
-        sha: ref,
-        deliveryId: setup.effectiveDeliveryId,
-        provider: setup.info.provider,
-        providerContext: credentials as Record<string, unknown>,
-        routingKey: setup.info.routingKey,
-        sourceTarUrl: buildPrep.sourceTarUrl,
-        sourceTarDigest: buildPrep.sourceTarDigest,
-        depsUrl: buildPrep.depsUrl,
-        depsHash: buildPrep.depsHash,
-        requestId: getRequestContext().requestId,
+        ...buildGeneratedJobInput({ ctx, setup, buildPrep, config }),
         ...(pinnedAgentId && { pinnedAgentId }),
         ...(connectedInstanceId !== undefined && { connectedInstanceId }),
       };
@@ -6589,6 +6994,7 @@ async function directDispatchGeneratedJobs(args: {
           matrixValues,
           jobInput: genJobInput,
           invokeParams: gateInvokeParams,
+          resolution: config.contextResolution,
           release: true,
         });
         continue;
@@ -6684,13 +7090,7 @@ async function routeRootGeneratedJobs(args: {
     });
     return;
   }
-  const genCloneToken = await mintCloneTokenForReroute({
-    bundle,
-    repoIdentifier,
-    credentials,
-    runId,
-    workflowName: workflow.name,
-  });
+  const genCloneTokens = await mintRerouteCloneTokens(ctx);
   const genRunCtx: RunContext = {
     runId,
     deliveryId: setup.effectiveDeliveryId,
@@ -6705,7 +7105,7 @@ async function routeRootGeneratedJobs(args: {
     requestId: getRequestContext().requestId,
     sha: ref,
     ref: event.sourceBranch ?? event.targetBranch,
-    ...(genCloneToken && { cloneToken: genCloneToken }),
+    ...genCloneTokens,
   };
   let genRouteTimeout: ReturnType<typeof setTimeout> | undefined;
   const routeResult = await Promise.race([
@@ -7252,12 +7652,10 @@ async function processDynamicEntry(args: {
       jobNames: generatedJobs.map((j) => j.name),
     });
 
-    const generatedJobConfigs = await resolveGeneratedJobConfigs({
+    const generated = await resolveGeneratedJobConfigs({
       ctx,
       workflow,
       fullLockFile,
-      resolvedSecrets: secrets.resolvedSecrets,
-      resolvedNamespacedSecrets: secrets.resolvedNamespacedSecrets,
       runPublicKeyBase64: secrets.runPublicKeyBase64,
       npmRegistries: secrets.npmRegistries,
       installEnvSecrets: secrets.installEnvSecrets,
@@ -7265,9 +7663,10 @@ async function processDynamicEntry(args: {
       dynamicEntry,
       upstreamSnapshot,
     });
-    const rootGeneratedConfigs = generatedJobConfigs.filter((c) => isRootJob(c.genJob));
-    const gatedGeneratedConfigs = generatedJobConfigs.filter((c) => !isRootJob(c.genJob));
+    const rootGeneratedConfigs = generated.dispatchable.filter((c) => isRootJob(c.genJob));
+    const gatedGeneratedConfigs = generated.dispatchable.filter((c) => !isRootJob(c.genJob));
 
+    await holdGeneratedJobs({ ctx, setup, buildPrep, held: generated.held });
     await gateAndStoreNonRootGeneratedJobs({
       ctx,
       setup,
@@ -7417,9 +7816,9 @@ async function ensureExecutionRunForDeferred(args: {
     declaredContexts.length > 0 ? [...declaredContexts] : undefined,
     dispatchTriggerEvent(ctx),
     extractCommitMessage(setup.info.event, setup.info.payload),
-    undefined, // parentRunId
+    ctx.rerunLineage?.parentRunId, // parentRunId
     triggeredBy,
-    undefined, // originalRunId
+    ctx.rerunLineage?.originalRunId, // originalRunId
     setup.workflowConcurrency,
     setup.workflowTimeoutMs,
     setup.checkMode,
@@ -7428,10 +7827,10 @@ async function ensureExecutionRunForDeferred(args: {
     event.senderUserId ?? undefined,
     triggeredByAgentLabel, // triggeredByAgentLabel
     event.prNumber ?? null,
-    undefined, // workflowRepoIdentifier — per-repository dispatch
+    workflowRepoProvenance(ctx),
     // Where the code came from, which `event.targetBranch` above deliberately
     // does not say.
-    resolveRunEventContext(event),
+    runEventContextFor(ctx, event),
   );
   await stampChainDepth(ctx);
 }
@@ -7476,8 +7875,8 @@ async function completeChecksForUndispatchedRun(args: {
       repo,
       sha: ref,
       workflowName: workflow.name,
-      // No `workflowRepoIdentifier`: `setupDispatchContext` passes none, so the
-      // checks on the commit carry the unqualified name.
+      // The same name `setupDispatchContext` posted the checks under.
+      ...(ctx.global && { workflowRepoIdentifier: ctx.global.workflowRepoIdentifier }),
       jobNames: workflow.jobs.filter(isLockStaticJob).map((j) => j.name),
       installationId: (credentials as { installationId?: number }).installationId,
       runId,
@@ -7611,6 +8010,8 @@ async function holdWorkflowForInstallGate(args: {
       reason: hold.requirement.reason,
       triggerEvent: dispatchTriggerEvent(ctx),
       commitMessage: extractCommitMessage(setup.info.event, setup.info.payload),
+      workflowSha: ctx.global?.workflowSha ?? null,
+      workflowBranch: ctx.global?.workflowBranch ?? null,
       ...preDispatchRunProvenance(ctx),
     });
   }
@@ -7628,7 +8029,12 @@ async function holdWorkflowForInstallGate(args: {
     });
   }
 
-  await storePendingWorkflowContext(deps.db, toSerializableInputs(ctx));
+  // The record goes with the stored dispatch: its release reads it back to know
+  // which contexts the approval covers.
+  await storePendingWorkflowContext(
+    deps.db,
+    toSerializableInputs({ ...ctx, installGateRecord: hold.record }),
+  );
 }
 
 /**
@@ -7642,6 +8048,32 @@ async function holdWorkflowForInstallGate(args: {
 function securityHoldExpiryMs(decision: Extract<TrustPolicyOutcome, { action: 'hold' }>): number {
   const seconds = decision.approvalExpirySeconds ?? DEFAULT_APPROVAL_EXPIRY_SECONDS;
   return seconds * 1_000;
+}
+
+/**
+ * The `held_runs` row the org trust policy's PR-wide hold writes for `runId`.
+ *
+ * Shared by the per-workflow hold below and the held pre-run evaluation round,
+ * so both land in the same queue and release through the same route.
+ */
+export function buildSecurityHoldData(
+  runId: string,
+  decision: Extract<TrustPolicyOutcome, { action: 'hold' }>,
+) {
+  return {
+    runId,
+    jobId: SECURITY_HOLD_JOB_IDS[decision.reason],
+    contextId: null,
+    holdType: HoldType.enum.security,
+    queueType: 'security' as const,
+    reason: decision.reason,
+    expiresAt: new Date(Date.now() + securityHoldExpiryMs(decision)),
+    // The pair `routeRelease` discriminates on. Workflow scope because the
+    // hold owns the whole dispatch, not one job; `context` because the org
+    // trust policy raised it, not an SDK `requireApproval`.
+    scope: HoldScope.enum.workflow,
+    triggerSource: TriggerSource.enum.context,
+  };
 }
 
 /**
@@ -7700,26 +8132,15 @@ async function holdRunForSecurityPolicy(args: {
       triggerEvent: dispatchTriggerEvent(ctx),
       commitMessage: extractCommitMessage(setup.info.event, setup.info.payload),
       prNumber: event.prNumber ?? null,
+      workflowSha: ctx.global?.workflowSha ?? null,
+      workflowBranch: ctx.global?.workflowBranch ?? null,
       ...preDispatchRunProvenance(ctx),
     });
   }
 
   let heldRow: HeldRun | undefined;
   if (deps.heldRunStore) {
-    const holdData = {
-      runId,
-      jobId: SECURITY_HOLD_JOB_IDS[decision.reason],
-      contextId: null,
-      holdType: HoldType.enum.security,
-      queueType: 'security' as const,
-      reason: decision.reason,
-      expiresAt: new Date(Date.now() + securityHoldExpiryMs(decision)),
-      // The pair `routeRelease` discriminates on. Workflow scope because the
-      // hold owns the whole dispatch, not one job; `context` because the org
-      // trust policy raised it, not an SDK `requireApproval`.
-      scope: HoldScope.enum.workflow,
-      triggerSource: TriggerSource.enum.context,
-    };
+    const holdData = buildSecurityHoldData(runId, decision);
     // The row and the context it resumes from are written TOGETHER, the same
     // pairing `holdJobForApproval` makes and for the same reason: the context
     // is the only thing that can replay this dispatch, so a row that outlived a
@@ -8155,6 +8576,28 @@ export async function dispatchMatchedWorkflow(
   }
 }
 
+/**
+ * Resume path: flip the reused held run row off `held` so the resumed dispatch
+ * can proceed into job dispatch; `recordRunStart` later reuses the row. The
+ * flip is guarded on `held`, so it is also the claim: a re-fired release signal
+ * that loses it must not dispatch the run again. Returns whether to continue.
+ */
+async function claimResumedRun(
+  ctx: WorkflowDispatchContext,
+  opts: DispatchMatchedWorkflowOptions,
+): Promise<boolean> {
+  if (!opts.reuseRunId || !ctx.deps.executionTracker) return true;
+  const claimed = await ctx.deps.executionTracker.resumeHeldRun(opts.reuseRunId);
+  // fails-when: two release signals for one held run both dispatch its jobs
+  // breaks-if-wrong: the first release of a held run must still dispatch it
+  if (!claimed) {
+    logger.info('Held run already resumed by another release; not dispatching it again', {
+      runId: opts.reuseRunId,
+    });
+  }
+  return claimed;
+}
+
 async function dispatchMatchedWorkflowInner(
   ctx: WorkflowDispatchContext,
   opts: DispatchMatchedWorkflowOptions,
@@ -8219,10 +8662,8 @@ async function dispatchMatchedWorkflowInner(
     return { dispatchedJobCount: 0, dispatchedJobIds: [] };
   }
 
-  // Resume path: flip the reused held run row off `held` so the resumed
-  // dispatch can proceed into job dispatch. recordRunStart later reuses the row.
-  if (opts.reuseRunId && ctx.deps.executionTracker) {
-    await ctx.deps.executionTracker.resumeHeldRun(opts.reuseRunId);
+  if (!(await claimResumedRun(ctx, opts))) {
+    return { dispatchedJobCount: 0, dispatchedJobIds: [] };
   }
 
   const evalResult = await evaluateJobContexts({ ctx, setup, buildPrep });
@@ -8269,15 +8710,13 @@ async function dispatchMatchedWorkflowInner(
     workflow: ctx.workflow,
     fullLockFile: ctx.fullLockFile,
     jobContextData: evalResult.jobContextData,
-    resolvedSecrets: secrets.resolvedSecrets,
-    resolvedNamespacedSecrets: secrets.resolvedNamespacedSecrets,
     runPublicKeyBase64: secrets.runPublicKeyBase64,
     npmRegistries: secrets.npmRegistries,
     installEnvSecrets: secrets.installEnvSecrets,
     event: envelopeEvent(ctx.event, ctx.eventWithFiles),
     eventEnvelopeOverride: ctx.eventEnvelopeOverride,
     cacheOrgId: ctx.resolvedOrgId,
-    cacheRepoId: ctx.repoIdentifier,
+    cacheRepoId: cacheRepoIdFor(ctx),
     cacheRefScope: deriveCacheRefScope(ctx.trustResolution),
     omitContentHash: !!ctx.testRun,
     runWideFlatSecrets: ctx.runWideFlatSecrets,

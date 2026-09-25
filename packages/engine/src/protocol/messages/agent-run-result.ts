@@ -132,6 +132,12 @@ export const agentStepLogsSchema = z.object({
   /** Every log line is user/process-controlled — each is enveloped untrusted. */
   lines: z.array(untrustedString),
   nextCursor: z.string().nullable(),
+  /**
+   * Whether a log is stored for the step: `false` when none was ever written,
+   * `true` when one is, even if it holds no lines. Absent when the orchestrator
+   * does not report it.
+   */
+  recorded: z.boolean().optional(),
 });
 export type AgentStepLogs = z.infer<typeof agentStepLogsSchema>;
 

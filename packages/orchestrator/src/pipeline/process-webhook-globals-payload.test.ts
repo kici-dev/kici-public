@@ -4,11 +4,10 @@
  * The per-repository dispatch path persists `info.payload` to
  * `executions/<runId>/webhook-payload.json` (`dispatch-matched-workflow.ts`,
  * `setupDispatchContext`), which is what the dashboard's Payload tab reads and
- * what a re-run copies onto the new run. Both global-dispatch paths build their
- * `QueuedJobInput`s directly and never reach that helper, so a global run had a
- * Payload tab that could only ever fail to load — the event the workflow reacted
- * to, which for a global workflow comes from a repo the author may not even own,
- * was the one thing the run could not show.
+ * what a re-run copies onto the new run. A global run goes through the same
+ * pipeline, so it stores the payload too — the event the workflow reacted to,
+ * which for a global workflow comes from a repo the author may not even own, is
+ * the one thing that explains why the run exists.
  *
  * Both global paths are covered because they are separate call sites:
  * `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock file resolves) and
@@ -94,7 +93,6 @@ function makeDeps(over: { withLockFile?: boolean; logStorage?: boolean } = {}): 
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
-      postGlobalWorkflowsSkippedCheck: vi.fn().mockResolvedValue(undefined),
     },
     lockFileFetcher: over.withLockFile ? { fetchLockFile: vi.fn() } : undefined,
     repoUrlBuilder: { buildCloneUrl: () => 'https://example.invalid/repo.git' },

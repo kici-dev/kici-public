@@ -13,6 +13,11 @@
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import {
+  JobSecretsUnsealError,
+  sealJobConfig,
+  unsealJobConfig,
+} from '../secrets/job-secret-seal.js';
 import { HeldRunStatus } from '../contexts/held-runs.js';
 import { sql, type Kysely } from 'kysely';
 import { githubDisplayMessage } from '../providers/github/commit-message.js';
@@ -80,6 +85,12 @@ import type { OrchestratorMode, WorkflowDecision } from '@kici-dev/engine';
 import { truncateDecisionsToByteBudget } from '@kici-dev/engine';
 import type { TrustPolicyStore } from '../security/trust-policy-store.js';
 import type { TrustDirectoryStore } from '../security/trust-directory-store.js';
+import {
+  logReleaseResolutionFailure,
+  resolveReleasedJobInput,
+  type ContextDataDeps,
+  type DeferredContextResolution,
+} from './held-context-data.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -100,6 +111,60 @@ interface PendingJobContext {
    * to an agent.
    */
   invoke?: InvokeGateParams;
+  /**
+   * Set for a job bound to a context: what `dispatchReadyJob` resolves the
+   * job's context variables and secrets from when the job leaves its pending
+   * context, since `jobInput` is stored without them. Absent for a job with no
+   * bound context, which dispatches its stored input unchanged.
+   */
+  contextResolution?: DeferredContextResolution;
+  /**
+   * Set when the stored row's sealed secret fields could not be decrypted:
+   * `dispatchReadyJob` fails the job with this reason instead of dispatching
+   * it without them.
+   */
+  secretsUnavailable?: string;
+}
+
+/**
+ * A stored job input, and the `sealed_secrets` column value that holds its
+ * secret fields encrypted. See {@link sealJobConfig}.
+ */
+function sealedJobInputColumns(
+  runId: string,
+  jobInput: QueuedJobInput,
+): {
+  job_input: string;
+  sealed_secrets: string | null;
+} {
+  // Sealed under the row's own `run_id`, the value unseal and rotation bind the AAD to.
+  const { jobConfig, sealed } = sealJobConfig(runId, jobInput.jobConfig);
+  return { job_input: JSON.stringify({ ...jobInput, jobConfig }), sealed_secrets: sealed };
+}
+
+/**
+ * A stored job input with its sealed secret fields merged back. A seal that
+ * cannot be opened leaves the plain fields and names the failure.
+ */
+function unsealedJobInput(row: {
+  run_id: string;
+  job_name: string;
+  job_input: unknown;
+  sealed_secrets?: string | null;
+}): Pick<PendingJobContext, 'jobInput' | 'secretsUnavailable'> {
+  const jobInput = row.job_input as unknown as QueuedJobInput;
+  try {
+    const jobConfig = unsealJobConfig(row.run_id, jobInput.jobConfig, row.sealed_secrets);
+    return { jobInput: { ...jobInput, jobConfig } };
+  } catch (err) {
+    if (!(err instanceof JobSecretsUnsealError)) throw err;
+    logger.error('Pending job secrets cannot be decrypted', {
+      runId: row.run_id,
+      jobName: row.job_name,
+      error: err.message,
+    });
+    return { jobInput, secretsUnavailable: err.message };
+  }
 }
 
 const pendingJobContexts = new Map<string, PendingJobContext>();
@@ -174,20 +239,24 @@ export async function storePendingJobContext(
   pendingJobContexts.set(`${runId}:${jobName}`, ctx);
   if (db) {
     const invokeConfig = ctx.invoke ? JSON.stringify(ctx.invoke) : null;
+    const contextResolution = ctx.contextResolution ? JSON.stringify(ctx.contextResolution) : null;
+    const stored = sealedJobInputColumns(runId, ctx.jobInput);
     await db
       .insertInto('pending_job_contexts')
       .values({
         run_id: runId,
         job_name: jobName,
-        job_input: JSON.stringify(ctx.jobInput),
+        ...stored,
         runs_on_labels: JSON.stringify(ctx.runsOnLabels),
         invoke_config: invokeConfig,
+        context_resolution: contextResolution,
       })
       .onConflict((oc) =>
         oc.columns(['run_id', 'job_name']).doUpdateSet({
-          job_input: JSON.stringify(ctx.jobInput),
+          ...stored,
           runs_on_labels: JSON.stringify(ctx.runsOnLabels),
           invoke_config: invokeConfig,
+          context_resolution: contextResolution,
         }),
       )
       .execute();
@@ -232,14 +301,20 @@ export async function consumePendingJobContext(
     .deleteFrom('pending_job_contexts')
     .where('run_id', '=', runId)
     .where('job_name', '=', jobName)
-    .returning(['job_input', 'runs_on_labels', 'invoke_config'])
+    .returning([
+      'job_input',
+      'runs_on_labels',
+      'invoke_config',
+      'context_resolution',
+      'sealed_secrets',
+    ])
     .execute();
 
   if (claimed.length === 0) return undefined;
 
   const row = claimed[0];
   return {
-    jobInput: row.job_input as unknown as QueuedJobInput,
+    ...unsealedJobInput({ ...row, run_id: runId, job_name: jobName }),
     // A context stored before labels were canonicalized still carries the case
     // the workflow author typed, so fold on read. Routing takes its selectors
     // from `jobInput`; this value is what `addJobsToRun` writes to the job's
@@ -249,6 +324,7 @@ export async function consumePendingJobContext(
     ...(row.invoke_config != null && {
       invoke: JSON.parse(row.invoke_config) as InvokeGateParams,
     }),
+    ...(row.context_resolution != null && { contextResolution: row.context_resolution }),
   };
 }
 
@@ -323,13 +399,14 @@ export async function restorePendingJobContexts(db: Kysely<Database>): Promise<n
   for (const row of rows) {
     const key = `${row.run_id}:${row.job_name}`;
     pendingJobContexts.set(key, {
-      jobInput: row.job_input as unknown as QueuedJobInput,
+      ...unsealedJobInput(row),
       // Same fold as the consume path: a row restored from before the fold
       // shipped must report the same way a freshly stored one does.
       runsOnLabels: canonicalizeLabels(row.runs_on_labels as unknown as string[]),
       ...(row.invoke_config != null && {
         invoke: JSON.parse(row.invoke_config) as InvokeGateParams,
       }),
+      ...(row.context_resolution != null && { contextResolution: row.context_resolution }),
     });
   }
   return rows.length;
@@ -1318,6 +1395,12 @@ export interface ReadyDispatchGateDeps {
   accessLogWriter?: Pick<AccessLogWriter, 'record'>;
   /** The routing key the audit row is attributed to, when the call site knows it. */
   routingKey?: string | null;
+  /**
+   * The stores a released held job's context variables and secrets resolve
+   * against. Called at release time, so a call site whose stores are built after
+   * it is wired can still supply them.
+   */
+  contextData?: () => ContextDataDeps;
 }
 
 /** What {@link resolveRunConcurrency} needs to evaluate the concurrency gate. */
@@ -1461,6 +1544,71 @@ async function applyContextProtectionGate(
 }
 
 /**
+ * The dispatch input for a job leaving its pending context.
+ *
+ * A job bound to a context was stored without its context data; resolve it
+ * now. A failure fails the job and returns `undefined` — a job bound to a
+ * context never dispatches without that context's secrets. A pending job with
+ * no record (no bound context, or a row stored before records existed, whose
+ * input still carries its data) dispatches its stored input unchanged.
+ */
+async function releasedJobInput(
+  runId: string,
+  jobName: string,
+  pendingCtx: PendingJobContext,
+  gateDeps: ReadyDispatchGateDeps | undefined,
+  executionTracker: ExecutionTracker | undefined,
+): Promise<QueuedJobInput | undefined> {
+  // A pending context is not handed to another coordinator the way a queued
+  // row is, so a seal this one cannot open fails the job, naming the fix.
+  // fails-when: a job whose sealed secrets cannot be decrypted is dispatched without them
+  // breaks-if-wrong: a pending context whose seal opened dispatches as before
+  if (pendingCtx.secretsUnavailable) {
+    logger.error('Released job failed: its stored secrets cannot be decrypted', {
+      runId,
+      job: jobName,
+      error: pendingCtx.secretsUnavailable,
+    });
+    await failReleasedJob(runId, jobName, executionTracker, pendingCtx.secretsUnavailable);
+    return undefined;
+  }
+  // breaks-if-wrong: a pending context with no record must dispatch its stored input unchanged
+  if (!pendingCtx.contextResolution) return pendingCtx.jobInput;
+  try {
+    return await resolveReleasedJobInput({
+      jobInput: pendingCtx.jobInput,
+      jobName,
+      resolution: pendingCtx.contextResolution,
+      deps: gateDeps?.contextData?.(),
+    });
+  } catch (err) {
+    const error = logReleaseResolutionFailure(pendingCtx.jobInput, err);
+    await failReleasedJob(runId, jobName, executionTracker, error);
+    return undefined;
+  }
+}
+
+/** Fail a job leaving its pending context, on its `needs-pending-` placeholder. */
+async function failReleasedJob(
+  runId: string,
+  jobName: string,
+  executionTracker: ExecutionTracker | undefined,
+  error: string,
+): Promise<void> {
+  if (!executionTracker) return;
+  // The job is tracked under its `needs-pending-` placeholder id — see
+  // {@link resolveTrackedJobId}.
+  await executionTracker.onJobStatus(
+    runId,
+    (await executionTracker.findSyntheticJobId(runId, jobName)) ?? jobName,
+    ExecutionJobStatus.enum.failed,
+    Date.now(),
+    undefined,
+    { error },
+  );
+}
+
+/**
  * Dispatch a job that has become ready via the needs scheduler.
  *
  * Called by the onJobReady callback registered on the execution tracker.
@@ -1547,8 +1695,11 @@ export async function dispatchReadyJob(
     return;
   }
 
+  const jobInput = await releasedJobInput(runId, jobName, pendingCtx, gateDeps, executionTracker);
+  if (!jobInput) return;
+
   try {
-    const result = await dispatcher.dispatch(pendingCtx.jobInput);
+    const result = await dispatcher.dispatch(jobInput);
     if (result.status === 'rejected') {
       logger.error('Scheduler-dispatched job rejected by dispatcher', {
         runId,

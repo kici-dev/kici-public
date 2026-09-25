@@ -4,6 +4,8 @@ import { PeerRegistry } from './peer-registry.js';
 import type { RaftNode } from './raft.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { ClusterSettingsReader } from './cluster-settings-reader.js';
+import { ExecutionRunStatus } from '@kici-dev/engine';
+import { createMockDb as createSharedMockDb } from '../__test-helpers__/mock-db.js';
 
 // ── Mock helpers ──────────────────────────────────────────────────
 
@@ -821,5 +823,56 @@ describe('OrphanRecovery', () => {
 
       recovery.stop();
     });
+  });
+});
+
+/**
+ * A released global evaluation round is claimed off `held` and keeps the
+ * `started_at` of its hold, and it never has job rows. Orphan recovery fails a
+ * stale `running` row with no jobs, so a round claimed into `running` would be
+ * failed mid-release whenever the approval came late. Driven through the real
+ * scan with a database that applies the scan's own predicates.
+ */
+describe('a claimed global evaluation round', () => {
+  const TEN_MINUTES_AGO = new Date(Date.now() - 10 * 60_000);
+  const roundRow = (status: string) => ({
+    run_id: 'round-1',
+    routing_key: 'github:1',
+    workflow_name: '__globaleval__org/ci',
+    provider: 'github',
+    repo_identifier: 'org/app',
+    sha: 'abc',
+    status,
+    started_at: TEN_MINUTES_AGO,
+    is_global_eval_round: true,
+  });
+
+  async function scan(status: string) {
+    const { db, mocks } = createSharedMockDb({ selectRows: [roundRow(status)] });
+    const recovery = new OrphanRecovery({
+      db: db as never,
+      raft: createMockRaft(true),
+      peerRegistry: new PeerRegistry(),
+      executionTracker: createMockExecutionTracker(),
+      clusterSettings: makeClusterSettingsStub(),
+      rerouteFlapGraceFallbackMs: 120_000,
+    });
+    await recovery.scanForOrphans();
+    // One read is the candidate query; a selected row adds the per-run reads.
+    return { reads: mocks.selectFrom.mock.calls.length, updates: mocks.updateTable };
+  }
+
+  it('is not selected while it is pending, however old its hold', async () => {
+    // fails-when: the claimed round sits in a state orphan recovery fails
+    const { reads, updates } = await scan(ExecutionRunStatus.enum.pending);
+    expect(reads).toBe(1);
+    expect(updates).not.toHaveBeenCalled();
+  });
+
+  it('would be selected if it were running — the selection the claim avoids', async () => {
+    // The control: the same row in `running` is a recovery candidate, so the
+    // pending case above is about the status, not a scan that selects nothing.
+    const { reads } = await scan(ExecutionRunStatus.enum.running);
+    expect(reads).toBeGreaterThan(1);
   });
 });

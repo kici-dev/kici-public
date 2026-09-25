@@ -16,10 +16,15 @@
  * run row.
  *
  * Which gate held decides what the replay may skip — see `skipsInstallGate`.
+ *
+ * A held pre-run global evaluation round shares the org trust policy's hold row
+ * but stores no dispatch context: its release re-evaluates the round from the
+ * stored webhook payload (`releaseHeldGlobalEvalRound`).
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import {
   CheckRunConclusion,
+  ExecutionRunStatus,
   HoldScope,
   InitFailureCategory,
   INSTALL_JOB_ID_PREFIX,
@@ -27,6 +32,7 @@ import {
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { ProcessingDeps } from './processor.js';
+import type { ProviderBundle } from '../provider-registry.js';
 import type { ReleaseSignal } from '../contexts/held-runs.js';
 import {
   dispatchMatchedWorkflow,
@@ -38,6 +44,12 @@ import {
   type SerializableWorkflowDispatchInputs,
 } from './pending-workflow-context.js';
 import { completeUndispatchedHoldChecks } from './undispatched-hold-checks.js';
+import { ROUND_JOB_PREFIX } from './global-eval-round.js';
+import { mintWorkflowRepoCredentials } from './global-dispatch.js';
+import type {
+  GlobalDispatchIdentity,
+  SerializableGlobalDispatchIdentity,
+} from './global-dispatch-identity.js';
 import {
   buildHoldEndedSummary,
   settleSecurityHoldCheck,
@@ -48,10 +60,39 @@ import {
 const logger = createLogger({ prefix: 'resume-workflow' });
 
 /**
+ * A global run's identity rebuilt from its stored hold, before the workflow
+ * repository's credentials are minted. It has no `workflowCredentials`, so a
+ * context carrying it is not a {@link WorkflowDispatchContext}.
+ */
+export type UnmintedGlobalIdentity = Omit<
+  GlobalDispatchIdentity,
+  'workflowCredentials' | 'workflowBundle'
+> & {
+  readonly workflowBundle: ProviderBundle;
+};
+
+/**
+ * A dispatch context rebuilt from a stored hold. `dispatchMatchedWorkflow`
+ * does not accept it: only {@link withWorkflowRepoCredentials} turns it into a
+ * {@link WorkflowDispatchContext}, so a resume cannot dispatch a global run
+ * without a freshly minted clone token.
+ */
+export type RebuiltWorkflowDispatchContext = Omit<WorkflowDispatchContext, 'global'> & {
+  global?: UnmintedGlobalIdentity;
+};
+
+/**
  * Rebuild a live `WorkflowDispatchContext` from the persisted serializable
  * inputs by re-attaching the orchestrator's live `deps` and reconstructing the
  * provider `bundle` from the live registry (keyed by the stored routing key).
  * Returns null when the provider bundle can no longer be resolved.
+ *
+ * A global run's identity is rebuilt from what was stored at hold time — the
+ * workflow commit, branch and provider context it was held at — never from the
+ * live registration, which may have moved to a newer commit while the run
+ * waited. Its workflow bundle is looked up by the stored workflow routing key,
+ * and it has no credentials until {@link withWorkflowRepoCredentials} mints
+ * them. Returns null when the workflow bundle can no longer be resolved either.
  *
  * The key it looks the bundle up by is `effectiveRoutingKey ?? info.routingKey`
  * — the post-overlay key, the same one `setupDispatchContext` builds
@@ -64,24 +105,76 @@ const logger = createLogger({ prefix: 'resume-workflow' });
 export function rebuildWorkflowDispatchContext(
   inputs: SerializableWorkflowDispatchInputs,
   deps: ProcessingDeps,
-): WorkflowDispatchContext | null {
+): RebuiltWorkflowDispatchContext | null {
   const bundle = deps.providerRegistry.getByRoutingKey(
     inputs.effectiveRoutingKey ?? inputs.info.routingKey,
   );
   if (!bundle) {
     return null;
   }
+  const { global: storedGlobal, ...rest } = inputs;
+  const global = storedGlobal ? rebuildGlobalIdentity(storedGlobal, deps) : undefined;
+  // fails-when: a held global run resumes although its workflow repository's source is gone
+  // breaks-if-wrong: a same-repo run (no stored global) must still rebuild
+  if (storedGlobal && !global) {
+    return null;
+  }
   return {
-    ...inputs,
+    ...rest,
     // A stored context is JSON cast straight back to its type, so a row written
     // before this field existed carries no value however the type reads. Such a
     // row can only be a per-repository or cross-source context — both define
     // the workflow in the repository the run acts on — so the acted-on
     // repository is the correct answer for every one of them, not a guess.
-    workflowRepoIdentifier: inputs.workflowRepoIdentifier ?? inputs.repoIdentifier,
+    workflowRepoIdentifier:
+      inputs.global?.workflowRepoIdentifier ??
+      inputs.workflowRepoIdentifier ??
+      inputs.repoIdentifier,
+    ...(global && { global }),
     deps,
     bundle,
   };
+}
+
+/**
+ * The live global identity of a held run, from its stored fields: the workflow
+ * bundle is looked up by the stored routing key. Undefined when that key has
+ * no bundle. Fields are picked one by one, so a row stored with a serialized
+ * bundle or a clone token does not carry either into the resume.
+ */
+function rebuildGlobalIdentity(
+  g: SerializableGlobalDispatchIdentity,
+  deps: ProcessingDeps,
+): UnmintedGlobalIdentity | undefined {
+  const workflowBundle = deps.providerRegistry.getByRoutingKey(g.workflowRoutingKey);
+  if (!workflowBundle) return undefined;
+  return {
+    workflowRepoIdentifier: g.workflowRepoIdentifier,
+    workflowSha: g.workflowSha,
+    workflowBranch: g.workflowBranch,
+    workflowRoutingKey: g.workflowRoutingKey,
+    workflowProviderContext: g.workflowProviderContext,
+    workflowBundle,
+  };
+}
+
+/**
+ * The rebuilt context with fresh credentials for a global run's workflow
+ * repository, minted by its bundle the way the first dispatch minted them. A
+ * same-repo context gets no global identity. Throws when the mint fails.
+ */
+export async function withWorkflowRepoCredentials(
+  rebuilt: RebuiltWorkflowDispatchContext,
+): Promise<WorkflowDispatchContext> {
+  const { global: g, ...rest } = rebuilt;
+  // fails-when: a rebuilt global run reaches dispatch without a freshly minted token
+  // breaks-if-wrong: a same-repo resume must dispatch with no global identity and no mint
+  if (!g) return rest;
+  const workflowCredentials = await mintWorkflowRepoCredentials(g.workflowBundle, {
+    repoIdentifier: g.workflowRepoIdentifier,
+    providerContext: g.workflowProviderContext,
+  });
+  return { ...rest, global: { ...g, workflowCredentials } };
 }
 
 /**
@@ -98,9 +191,9 @@ export function rebuildWorkflowDispatchContext(
  * once more.
  *
  * On today's trust-policy path this is inert, and deliberately kept anyway.
- * `skipProtectionGate` reaches only `fireProtectionRulesPerEnv`, and
- * `resolveInstallSecrets` strips an untrusted contributor's install secrets and
- * returns BEFORE it — so for a run that already has a non-trusted tier the flag
+ * `skipProtectionGate` only selects the install gate's release path
+ * (`gateReleasedInstall`), and `resolveInstallSecrets` strips an untrusted
+ * contributor's install secrets and returns BEFORE the gate — so for a run that already has a non-trusted tier the flag
  * decides nothing either way. Every trust-policy hold is such a run:
  * `evaluateSecurityPolicy` passes unless the provider bundle has a fork model,
  * which is the same condition under which trust resolution always yields a tier,
@@ -125,6 +218,20 @@ export async function resumeWorkflow(
   deps: ProcessingDeps,
   db: Kysely<Database> | undefined,
 ): Promise<void> {
+  // A held pre-run evaluation round stores no dispatch context: its release
+  // re-evaluates the round from the stored webhook payload instead of replaying
+  // a workflow dispatch.
+  if (await isHeldGlobalEvalRound(db, signal.runId)) {
+    logger.info('Releasing a held global evaluation round', {
+      runId: signal.runId,
+      holdId: signal.holdId,
+    });
+    // Imported on use: the release re-drives the organization-wide pass, whose
+    // module imports this one.
+    const { releaseHeldGlobalEvalRound } = await import('./rerun.js');
+    await releaseHeldGlobalEvalRound(signal.runId, deps);
+    return;
+  }
   const skipInstallProtectionGate = skipsInstallGate(signal);
   // Names the gate that held, so a lost-context failure points at the right one.
   const gate = skipInstallProtectionGate ? 'install-hold' : 'workflow-hold';
@@ -132,6 +239,26 @@ export async function resumeWorkflow(
     ? InitFailureCategory.enum.install_secrets
     : InitFailureCategory.enum.trust_policy;
   const pending = await loadPendingWorkflowContext(db, signal.runId);
+  const leftHeld = pending ? undefined : await runLeftHeld(db, signal.runId);
+  if (leftHeld) {
+    // A release that already resumed this run consumed its context. This signal
+    // is a re-fired one, and failing the run here would fail the resumed run.
+    // A `pending` row with no job rows is the exception worth a warning: the
+    // claim moved the row but no dispatch followed, so the run may be stranded.
+    const stranded = leftHeld.status === ExecutionRunStatus.enum.pending && !leftHeld.hasJobs;
+    // fails-when: a stranded claim is logged at info and never reaches an operator's warn view
+    // breaks-if-wrong: a re-fired release racing a live resume must stay at info
+    const fields = { runId: signal.runId, holdId: signal.holdId, status: leftHeld.status };
+    if (stranded) {
+      logger.warn(
+        'Workflow hold resume: run was claimed by another release but has no jobs',
+        fields,
+      );
+    } else {
+      logger.info('Workflow hold resume: run already resumed by another release', fields);
+    }
+    return;
+  }
   if (!pending) {
     logger.error('Workflow hold resume: pending context lost', {
       runId: signal.runId,
@@ -146,36 +273,51 @@ export async function resumeWorkflow(
     return;
   }
 
-  const ctx = rebuildWorkflowDispatchContext(pending, deps);
-  if (!ctx) {
+  // fails-when: a held run whose sealed secrets cannot be decrypted resumes without them
+  // breaks-if-wrong: a held run whose seal opened, or that stored none, resumes as before
+  if (pending.secretsUnavailable) {
+    logger.error('Workflow hold resume: stored secrets cannot be decrypted', {
+      runId: signal.runId,
+      gate,
+      error: pending.secretsUnavailable,
+    });
+    await abandonUnresumableRun(
+      { deps, db, runId: signal.runId, gate, category },
+      pending.secretsUnavailable,
+    );
+    return;
+  }
+  const rebuilt = rebuildWorkflowDispatchContext(pending, deps);
+  if (!rebuilt) {
     logger.error('Workflow hold resume: provider bundle unresolvable', {
       runId: signal.runId,
       // The key the lookup actually used, which is the post-overlay one. On a
       // cross-source resume `info.routingKey` still names the INBOUND source, so
       // logging it hands an operator the source that did not fail to resolve.
       routingKey: pending.effectiveRoutingKey ?? pending.info.routingKey,
+      ...(pending.global && { workflowRoutingKey: pending.global.workflowRoutingKey }),
       gate,
     });
-    await failRunResumeLost(
-      deps,
-      signal.runId,
-      `${gate} resume: provider bundle unresolvable`,
-      category,
+    await abandonUnresumableRun(
+      { deps, db, runId: signal.runId, gate, category },
+      'provider bundle unresolvable',
     );
-    // The run is terminal and this release will not be retried, so the queued
-    // check runs the held dispatch posted have to be closed here. Unlike the
-    // branch above, the context loaded — so their names are in hand — and it is
-    // deleted on the next line.
-    await completeUndispatchedHoldChecks({
-      db,
-      checkRunReporter: deps.checkRunReporter,
+    return;
+  }
+  let ctx: WorkflowDispatchContext;
+  try {
+    ctx = await withWorkflowRepoCredentials(rebuilt);
+  } catch (err) {
+    logger.error('Workflow hold resume: cannot mint credentials for the workflow repository', {
       runId: signal.runId,
-      conclusion: CheckRunConclusion.enum.failure,
-      summary:
-        `This run could not be resumed after its ${gate} was released, so no job started. ` +
-        'Push a new commit to have the pull request evaluated again.',
+      workflowRepo: rebuilt.global?.workflowRepoIdentifier,
+      gate,
+      error: toErrorMessage(err),
     });
-    await deletePendingWorkflowContext(db, signal.runId);
+    await abandonUnresumableRun(
+      { deps, db, runId: signal.runId, gate, category },
+      'workflow repository credentials unavailable',
+    );
     return;
   }
 
@@ -233,9 +375,13 @@ export async function rejectWorkflow(
   deps: ProcessingDeps,
   db: Kysely<Database> | undefined,
   reason: string,
+  opts: { runHeld?: boolean } = {},
 ): Promise<boolean> {
   const runId = hold.run_id;
-  if (deps.executionTracker) {
+  // A run that is not `held` (a cancel withdrawing a hold raised at dispatch)
+  // is ended by its caller's job cancellation; the held-run write matches no row.
+  const runHeld = opts.runHeld ?? true;
+  if (deps.executionTracker && runHeld) {
     await deps.executionTracker.cancelHeldRun(runId, reason);
   }
   // One summary for both check families — the sameness is asserted, not assumed.
@@ -261,13 +407,96 @@ export async function rejectWorkflow(
     summary,
   });
   await deletePendingWorkflowContext(db, runId);
-  logger.info('Rejected workflow-scoped hold; run cancelled', {
-    runId,
-    reason,
-    holdJobId: hold.job_id,
-    securityCheck: settled.outcome,
-  });
+  logger.info(
+    runHeld
+      ? 'Rejected workflow-scoped hold; run cancelled'
+      : 'Rejected workflow-scoped hold; run left to its job cancellation',
+    {
+      runId,
+      reason,
+      holdJobId: hold.job_id,
+      securityCheck: settled.outcome,
+    },
+  );
   return settled.posted;
+}
+
+/**
+ * Whether `runId` is a held global evaluation round, recognised by the run
+ * row's structural marker. The row's `__globaleval__` name is not enough on
+ * its own: a customer workflow may carry the same prefix.
+ */
+async function isHeldGlobalEvalRound(
+  db: Kysely<Database> | undefined,
+  runId: string,
+): Promise<boolean> {
+  if (!db) return false;
+  const row = await db
+    .selectFrom('execution_runs')
+    .select(['is_global_eval_round', 'workflow_name'])
+    .where('run_id', '=', runId)
+    .executeTakeFirst();
+  // fails-when: a held round is replayed as a workflow dispatch and fails on its missing context
+  // breaks-if-wrong: a held workflow run must still resume through its stored context
+  return row?.is_global_eval_round === true && row.workflow_name.startsWith(ROUND_JOB_PREFIX);
+}
+
+/**
+ * The run row's status and whether it has job rows, when it records a status
+ * other than `held` — another release resumed it. Undefined when there is no
+ * database or the row records no status or `held`, so a genuinely lost context
+ * still fails the run.
+ */
+async function runLeftHeld(
+  db: Kysely<Database> | undefined,
+  runId: string,
+): Promise<{ status: string; hasJobs: boolean } | undefined> {
+  if (!db) return undefined;
+  const row = await db
+    .selectFrom('execution_runs')
+    .select(['status'])
+    .where('run_id', '=', runId)
+    .executeTakeFirst();
+  // fails-when: a re-fired release fails the run the first release resumed
+  // breaks-if-wrong: a held run whose context was lost must still be failed
+  if (row?.status === undefined || row.status === ExecutionRunStatus.enum.held) return undefined;
+  const job = await db
+    .selectFrom('execution_jobs')
+    .select(['job_id'])
+    .where('run_id', '=', runId)
+    .limit(1)
+    .executeTakeFirst();
+  return { status: row.status, hasJobs: job !== undefined };
+}
+
+/**
+ * Fail a held run whose context loaded but cannot be dispatched, close the
+ * queued check runs its held dispatch posted, and drop the context. The run is
+ * terminal and this release will not be retried, so the checks are closed
+ * here; their names come from the context, which is deleted last.
+ */
+async function abandonUnresumableRun(
+  args: {
+    deps: ProcessingDeps;
+    db: Kysely<Database> | undefined;
+    runId: string;
+    gate: string;
+    category: InitFailureCategory;
+  },
+  cause: string,
+): Promise<void> {
+  const { deps, db, runId, gate, category } = args;
+  await failRunResumeLost(deps, runId, `${gate} resume: ${cause}`, category);
+  await completeUndispatchedHoldChecks({
+    db,
+    checkRunReporter: deps.checkRunReporter,
+    runId,
+    conclusion: CheckRunConclusion.enum.failure,
+    summary:
+      `This run could not be resumed after its ${gate} was released, so no job started. ` +
+      'Push a new commit to have the pull request evaluated again.',
+  });
+  await deletePendingWorkflowContext(db, runId);
 }
 
 /** Fail a held run whose resume context could not be recovered. */

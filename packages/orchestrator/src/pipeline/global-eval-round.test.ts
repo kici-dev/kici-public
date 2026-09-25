@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { LockJobOrFactory, LockWorkflow } from '@kici-dev/engine';
+import {
+  AgentCapabilityFlag,
+  GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
+  type LockJobOrFactory,
+  type LockWorkflow,
+} from '@kici-dev/engine';
 import {
   candidateKey,
   groupCandidates,
   narrowVerdict,
+  isRoundGenerator,
   partitionCandidates,
   runGlobalEvalRounds,
+  RESULT_AWARE_UNSUPPORTED_REASON,
   truncateReasonText,
   MAX_ROUND_REASON_CHARS,
   MIN_GLOBAL_EVAL_AGENT_VERSION,
@@ -325,6 +332,44 @@ describe('runGlobalEvalRounds', () => {
     expect(h.dispatched[0].repoUrl).toBe('https://git.example.com/org/app.git');
   });
 
+  it("takes the round job's routing key and provider from the source its clone URL and credentials come from", async () => {
+    // A cross-provider lock-file fallback hands the round another source's
+    // bundle and credentials. The dispatcher mints the source clone auth through
+    // the bundle of the job's routing key, so that key has to name the same
+    // source, or the auth is minted by the inbound provider for a clone URL and
+    // a provider context that belong to another one.
+    const fallbackBundle = {
+      normalizer: { provider: 'gitlab' },
+      repoUrlBuilder: { buildCloneUrl: (repo: string) => `https://gitlab.example.com/${repo}.git` },
+    } as unknown as ProviderBundle;
+    const cand = candidate('org-ci', { hasFilter: true });
+    const h = harness(() => ({ candidates: [{ workflowName: 'org-ci', run: true }] }));
+
+    await runVerdicts({
+      ...roundArgs([cand], h),
+      dispatchBundle: fallbackBundle,
+      dispatchCredentials: { token: 'gitlab-token' },
+      dispatchRoutingKey: 'gitlab:7',
+    });
+
+    // fails-when: the round job keeps the inbound routing key under a fallback source
+    expect(h.dispatched[0].routingKey).toBe('gitlab:7');
+    expect(h.dispatched[0].provider).toBe('gitlab');
+    expect(h.dispatched[0].repoUrl).toBe('https://gitlab.example.com/org/app.git');
+    expect(h.dispatched[0].providerContext).toEqual({ token: 'gitlab-token' });
+  });
+
+  it('keeps the inbound routing key and provider when the round clones through the inbound source', async () => {
+    // breaks-if-wrong: the ordinary same-source round must keep the event's own key
+    const cand = candidate('org-ci', { hasFilter: true });
+    const h = harness(() => ({ candidates: [{ workflowName: 'org-ci', run: true }] }));
+
+    await runVerdicts(roundArgs([cand], h));
+
+    expect(h.dispatched[0].routingKey).toBe('github:1');
+    expect(h.dispatched[0].provider).toBe('github');
+  });
+
   it('reads both budgets per round from cluster settings', async () => {
     const getNumber = vi.fn(async (column: string) =>
       column === 'global_eval_round_timeout_ms' ? 55_000 : 7_000,
@@ -563,7 +608,7 @@ describe('runGlobalEvalRounds', () => {
 
   it('caches a round only once every candidate is decided', async () => {
     // The other half of the predicate: a fully-decided round IS still cached,
-    // so the change above did not simply disable the cache.
+    // so the change above works without disabling the cache.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const b = candidate('b', { hasFilter: true, id: 'reg-b' });
     const globalEvalCache = new GlobalEvalRoundCache({ max: 10 });
@@ -1330,5 +1375,209 @@ describe('narrowVerdict preserves generated invoke jobs', () => {
     expect(job.name).toBe('docker');
     expect(job.invoke?.event).toBe('myorg.docker-test');
     expect(job.invoke?.optional).toBe(true);
+  });
+});
+
+const RESULT_AWARE_JOB: LockJobOrFactory = {
+  _type: 'dynamic',
+  source: { file: '.kici/workflows/org.ts', index: 1 },
+  needs: ['build'],
+  resultAware: true,
+};
+
+/** A candidate whose lock entry carries exactly the given jobs. */
+function candidateWithJobs(
+  name: string,
+  jobs: LockJobOrFactory[],
+  opts: { hasFilter?: boolean } = {},
+): GlobalEvalCandidate {
+  const lockEntry = lockWorkflow(name, {
+    jobs,
+    ...(opts.hasFilter !== undefined ? { hasFilter: opts.hasFilter } : {}),
+  });
+  return { reg: registration({ id: `reg-${name}`, workflowName: name, lockEntry }), lockEntry };
+}
+
+const SKIPS_RESULT_AWARE = {
+  [AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators]: true,
+};
+
+describe('result-aware generators and the round', () => {
+  it('classifies only a needs-free dynamic entry as a round generator', () => {
+    expect(isRoundGenerator(DYNAMIC_JOB)).toBe(true);
+    // fails-when: a generator with declared needs is classified as a round generator
+    expect(isRoundGenerator(RESULT_AWARE_JOB)).toBe(false);
+    expect(
+      isRoundGenerator({ _type: 'dynamic', source: { file: 'f', index: 2 }, needs: ['x'] }),
+    ).toBe(false);
+    expect(isRoundGenerator(STATIC_JOB)).toBe(false);
+  });
+
+  it('a needs-free generator goes to the round; a result-aware one does not', () => {
+    // fails-when: a result-aware generator is sent to the round (it would run with no upstream outputs)
+    const roundOnly = candidateWithJobs('round-only', [DYNAMIC_JOB]);
+    const deferredOnly = candidateWithJobs('deferred-only', [STATIC_JOB, RESULT_AWARE_JOB]);
+    expect(partitionCandidates([roundOnly, deferredOnly])).toEqual({
+      needsRound: [roundOnly],
+      immediate: [deferredOnly],
+    });
+  });
+
+  it('still sends a result-aware-only workflow with a filter to the round', () => {
+    const filtered = candidateWithJobs('filtered', [STATIC_JOB, RESULT_AWARE_JOB], {
+      hasFilter: true,
+    });
+    expect(partitionCandidates([filtered]).needsRound).toEqual([filtered]);
+  });
+
+  /** A registry whose registered init-runners are `agents`, of which `idle` are available. */
+  function fleet(
+    agents: Array<{ version: string | null; capable: boolean; platform?: string; arch?: string }>,
+    idle: Array<{ platform: string; arch: string }> = [],
+  ) {
+    return {
+      findAvailable: () => idle,
+      getAllEntries: () =>
+        agents.map((agent) => ({
+          labels: new Set([
+            'kici:role:init-runner',
+            ...(agent.capable ? [GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL] : []),
+          ]),
+          platform: agent.platform ?? 'linux',
+          arch: agent.arch ?? 'x64',
+          version: agent.version,
+          capabilities: agent.capable ? SKIPS_RESULT_AWARE : null,
+        })),
+    };
+  }
+
+  it('routes a round with a result-aware generator by the agent-feature label', async () => {
+    const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
+    const h = harness(() => ({ candidates: [{ workflowName: 'mixed', run: true, jobs: [] }] }));
+    const results = await runVerdicts(
+      roundArgs([mixed], h, {
+        agentRegistry: fleet(
+          [{ version: '0.9.3', capable: true }],
+          [{ platform: 'darwin', arch: 'arm64' }],
+        ),
+      }),
+    );
+    expect(results.get(candidateKey(mixed))?.run).toBe(true);
+    // fails-when: the round is dispatched without the label, so an agent that runs result-aware generators can take it
+    expect(h.dispatched[0].runsOnLabels).toEqual([
+      'kici:role:init-runner',
+      GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
+      'kici:os:darwin',
+      'kici:arch:arm64',
+    ]);
+    expect(h.dispatched[0].pinnedAgentId).toBeUndefined();
+  });
+
+  it('queues a result-aware round on an empty fleet instead of refusing it', async () => {
+    // breaks-if-wrong: an empty fleet is a capacity question, answered by a scaler or a registering agent
+    const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
+    const h = harness(() => ({ candidates: [{ workflowName: 'mixed', run: true, jobs: [] }] }));
+    const { failures } = await runGlobalEvalRounds(
+      roundArgs([mixed], h, { agentRegistry: fleet([]) }),
+    );
+    expect(failures).toEqual([]);
+    expect(h.dispatched).toHaveLength(1);
+    expect(h.dispatched[0].runsOnLabels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+  });
+
+  it('targets the platform of a busy capable agent when none is idle', async () => {
+    const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
+    const h = harness(() => ({ candidates: [{ workflowName: 'mixed', run: true, jobs: [] }] }));
+    await runVerdicts(
+      roundArgs([mixed], h, {
+        agentRegistry: fleet([
+          { version: '0.9.0', capable: false, platform: 'linux', arch: 'x64' },
+          { version: '0.9.3', capable: true, platform: 'darwin', arch: 'arm64' },
+        ]),
+      }),
+    );
+    // fails-when: the queued round falls back to linux/x64 and can never match the busy darwin agent
+    expect(h.dispatched[0].runsOnLabels).toEqual([
+      'kici:role:init-runner',
+      GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
+      'kici:os:darwin',
+      'kici:arch:arm64',
+    ]);
+  });
+
+  it('falls back to linux/x64 for a result-aware round when no capable agent is registered', async () => {
+    // breaks-if-wrong: an empty fleet keeps the plain fallback target
+    const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
+    const h = harness(() => ({ candidates: [{ workflowName: 'mixed', run: true, jobs: [] }] }));
+    await runVerdicts(roundArgs([mixed], h, { agentRegistry: fleet([]) }));
+    expect(h.dispatched[0].runsOnLabels).toContain('kici:os:linux');
+    expect(h.dispatched[0].runsOnLabels).toContain('kici:arch:x64');
+  });
+
+  it('queues a result-aware round while the only capable agent is busy', async () => {
+    // breaks-if-wrong: a busy capable agent must be waited for, not treated as absent
+    const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
+    const h = harness(() => ({ candidates: [{ workflowName: 'mixed', run: true, jobs: [] }] }));
+    const { failures } = await runGlobalEvalRounds(
+      roundArgs([mixed], h, {
+        agentRegistry: fleet([
+          { version: '0.9.0', capable: false },
+          { version: '0.9.3', capable: true },
+        ]),
+      }),
+    );
+    expect(failures).toEqual([]);
+    expect(h.dispatched).toHaveLength(1);
+    expect(h.dispatched[0].runsOnLabels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+  });
+
+  it.each([
+    { name: 'every registered init-runner lacks the flag', capable: false, refused: true },
+    { name: 'one registered init-runner has the flag', capable: true, refused: false },
+  ])('refuses a result-aware candidate up front only when $name', async ({ capable, refused }) => {
+    const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
+    const plain = candidateWithJobs('plain', [DYNAMIC_JOB]);
+    const h = harness((input) => ({
+      candidates: (input.jobConfig.candidates as Array<{ workflowName: string }>).map((c) => ({
+        workflowName: c.workflowName,
+        run: true,
+        jobs: [],
+      })),
+    }));
+    const { verdicts, failures } = await runGlobalEvalRounds(
+      roundArgs([mixed, plain], h, {
+        agentRegistry: fleet([
+          { version: '0.9.0', capable: false },
+          { version: '0.9.1', capable },
+        ]),
+      }),
+    );
+    // fails-when: a fleet of registered agents that all lack the flag is sent the mixed candidate
+    expect(verdicts.get(candidateKey(mixed))?.indeterminate === true).toBe(refused);
+    if (refused) {
+      expect(verdicts.get(candidateKey(mixed))?.reason).toContain(RESULT_AWARE_UNSUPPORTED_REASON);
+      expect(failures).toEqual([
+        expect.objectContaining({ workflowNames: ['mixed'], attempts: 0 }),
+      ]);
+      // The plain candidate in the same group still runs, with no feature label.
+      expect(h.dispatched).toHaveLength(1);
+      expect(h.dispatched[0].runsOnLabels).not.toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+    } else {
+      expect(failures).toEqual([]);
+      expect(verdicts.get(candidateKey(mixed))?.run).toBe(true);
+    }
+    expect(verdicts.get(candidateKey(plain))?.run).toBe(true);
+  });
+
+  it('keeps a round of needs-free generators free of the feature label on an old fleet', async () => {
+    // breaks-if-wrong: the pre-existing flow for pure needs-free generators must not need the flag
+    const plain = candidateWithJobs('plain', [STATIC_JOB, DYNAMIC_JOB]);
+    const h = harness(() => ({ candidates: [{ workflowName: 'plain', run: true, jobs: [] }] }));
+    const { verdicts, failures } = await runGlobalEvalRounds(
+      roundArgs([plain], h, { agentRegistry: fleet([{ version: '0.9.0', capable: false }]) }),
+    );
+    expect(failures).toEqual([]);
+    expect(h.dispatched[0].runsOnLabels).not.toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+    expect(verdicts.get(candidateKey(plain))?.run).toBe(true);
   });
 });

@@ -19,7 +19,9 @@ kici-admin runs logs <runId> --job <jobId> [--step <n>] [--limit <n>] [--cursor 
 
 Inspects execution runs, jobs, ephemeral keys, and secret outputs. Useful for investigating run status and failures — and, with `secret-outputs --reveal`, for recovering a job's output values during incident response — without direct database access.
 
-Shows run header (status, repo, ref, SHA, provider, timing, environment, trust tier), jobs table, and steps per job. Internally composes two admin API calls: `GET /admin/runs/:runId` (run header) + `GET /admin/runs/:runId/jobs?includeSteps=true`.
+Shows run header (status, repo, ref, SHA, provider, timing, context, trust tier), jobs table, and steps per job. Internally composes two admin API calls: `GET /admin/runs/:runId` (run header) + `GET /admin/runs/:runId/jobs?includeSteps=true`.
+
+For an organization-wide workflow — one defined in another repository and fired by an event from this one — the header also shows where the workflow comes from. `Defined in:` names the repository that defines the workflow, `Workflow SHA:` the commit of that repository the run dispatched, and `Workflow branch:` its registered branch. A run of a repository's own workflow shows none of these lines. `--json` carries the same values as `workflowRepoIdentifier`, `workflowSha`, and `workflowBranch`, each `null` on a run of a repository's own workflow.
 
 Shows the machine-first, provenance-tagged structured run result — the same shape an automation agent reads over the admin API (`GET /admin/runs/:runId/structured`). Trusted fields (run/job/step ids, enum statuses, exit codes, durations, hashes, the derived failure category) are plain; untrusted fields (workflow / repo / job / step names, refs, error text, job output values) are wrapped in an `{ untrusted: true, value }` envelope so a consumer can keep user-controlled content out of an instruction channel. Secret output **values** are never returned — only their key names. The human view unwraps envelopes for display; `--json` is lossless. See [Agent run-result API](../agent-run-result-api.md) for the full contract.
 
@@ -45,6 +47,10 @@ kici-admin runs logs <run_id> --job <id>
 ```
 
 **Run this recipe with an owner or admin token — an auditor token cannot complete it.** The two steps sit on different permissions: step 1 reads the dispatch queue, which requires `secret.read`, so an auditor is refused with a 403 and never reaches step 2. Only step 2 falls under the `run.read` grant described next. (An operator with database access can take step 1 offline instead, via `kici-admin queue list --database-url <url>`, which bypasses the admin API and its role check entirely.)
+
+`--step=-1` prints a job's setup log. It holds the clone, the `.kici/` dependency install, and the workflow module load, plus a container job's host-side checkout and dependency install.
+
+When a step has no lines, a note on stderr says which case applies. For `--step=-1` the note reads `(no setup log recorded for this job)` or `(the setup log for this job is empty)`; any other step gets the same pair, naming its index. Standard output stays empty, so it remains pipeable. `--json` prints the response as-is, and its `recorded` field carries the same answer.
 
 **RBAC tokens for these commands:** `run.read` is enough for `list`, `show`, `jobs`, `ephemeral-key`, `logs`, and masked `secret-outputs` (all three roles — owner, admin, auditor — carry it). `secret-outputs --reveal` additionally requires `secret.reveal`, which only owner + admin roles hold — auditor tokens get 403. Successful reveals land in `secret_audit_log` with `action = secret-outputs.reveal`, `run_id`, `user_id`, `role`, and a `metadata` JSON object summarising the revealed / failed output keys.
 
@@ -333,18 +339,18 @@ Synopsis: `kici-admin queue list [options]`
 
 **Options**
 
-| Option                          | Default | Description                                                   |
-| ------------------------------- | ------- | ------------------------------------------------------------- |
-| `--status <s>`                  |         | Filter by exact status (pending\|dispatched\|...)             |
-| `--status-not-in <csv>`         |         | Filter status NOT IN (CSV; e.g. "completed,failed,cancelled") |
-| `--job-name-prefix <p>`         |         | Filter by job_name prefix                                     |
-| `--job-name <name>`             |         | Filter by exact job_name match                                |
-| `--job-name-not-like <pattern>` |         | Exclude job_name LIKE pattern (e.g. "**build**%")             |
-| `--workflow-name <n>`           |         | Filter by exact workflow_name                                 |
-| `--created-after <iso>`         |         | Filter created_at > <ISO timestamp>                           |
-| `--limit <n>`                   |         | Max rows to return (default 100, max 1000)                    |
-| `--database-url <url>`          |         | Use direct DB access instead of HTTP (offline mode)           |
-| `--json`                        |         | Emit JSON output                                              |
+| Option                          | Default | Description                                                 |
+| ------------------------------- | ------- | ----------------------------------------------------------- |
+| `--status <s>`                  |         | Filter by exact status (pending\|dispatched\|...)           |
+| `--status-not-in <csv>`         |         | Filter status NOT IN (CSV; e.g. "completed,failed,expired") |
+| `--job-name-prefix <p>`         |         | Filter by job_name prefix                                   |
+| `--job-name <name>`             |         | Filter by exact job_name match                              |
+| `--job-name-not-like <pattern>` |         | Exclude job_name LIKE pattern (e.g. "**build**%")           |
+| `--workflow-name <n>`           |         | Filter by exact workflow_name                               |
+| `--created-after <iso>`         |         | Filter created_at > <ISO timestamp>                         |
+| `--limit <n>`                   |         | Max rows to return (default 100, max 1000)                  |
+| `--database-url <url>`          |         | Use direct DB access instead of HTTP (offline mode)         |
+| `--json`                        |         | Emit JSON output                                            |
 
 ### `kici-admin queue show`
 
@@ -487,7 +493,7 @@ Synopsis: `kici-admin runs logs <runId> [options]`
 | Option          | Default | Description                                            |
 | --------------- | ------- | ------------------------------------------------------ |
 | `--job <jobId>` |         | Job id (the dispatch_queue row id for an eval round)   |
-| `--step <n>`    | `0`     | Step index (default 0)                                 |
+| `--step <n>`    | `0`     | Step index (default 0; -1 is the job setup log)        |
 | `--limit <n>`   | `500`   | Max lines to return (default 500, server caps at 2000) |
 | `--cursor <c>`  |         | Line-offset cursor from a previous page                |
 | `--json`        |         | Emit raw JSON instead of plain lines                   |

@@ -670,7 +670,11 @@ export interface LockWorkflow {
   readonly hashFiles?: string[];
   /** Resolved paths (relative to repo root) used to compute contentHash. Enables agent to verify hash without re-discovering workflow. Optional. */
   readonly resolvedHashFiles?: string[];
-  /** Secret contexts declared by the workflow. Orchestrator validates access before dispatch. */
+  /**
+   * Context names bound by every job of the workflow, gated per job like job-level
+   * contexts. They come before each job's own contexts, so a job-level context wins
+   * a key collision.
+   */
   readonly contexts?: readonly string[];
   /**
    * Private npm registries the agent should authenticate against before `npm install`.

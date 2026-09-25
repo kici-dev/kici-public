@@ -124,10 +124,16 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminM
         const genericCount = await sql<{ count: number }>`
           SELECT COUNT(*)::int AS count FROM generic_webhook_sources
         `.execute(deps.db);
+        // The purge keeps only the sources under the routing key and the
+        // remote sources, and deletes every generic source, so every other
+        // registration, except one under a remote source, is left pointing at
+        // no source and is deleted.
+        // fails-when: the count skips the generic sources' registrations the purge deletes,
+        // or counts the registrations under a remote source the purge keeps
         const orphanRegsCount = await sql<{ count: number }>`
           SELECT COUNT(*)::int AS count FROM workflow_registrations
            WHERE routing_key != ${body.routingKey}
-             AND routing_key NOT IN (SELECT routing_key FROM generic_webhook_sources)
+             AND routing_key NOT IN (SELECT routing_key FROM remote_sources)
         `.execute(deps.db);
         return c.json({
           dryRun: true,
@@ -152,13 +158,17 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminM
       const genericResult = await sql`DELETE FROM generic_webhook_sources`.execute(deps.db);
       // Delete workflow_registrations rows whose routing_key no longer points
       // at a live source (generic_webhook_sources was wiped above; only real
-      // provider rows remain in `sources`). Without this, cross-source dispatch
-      // fans out to long-dead repo identifiers from earlier tests and breaks
-      // subsequent runs.
+      // provider rows remain in `sources`, and an org's remote source lives in
+      // `remote_sources`, which the purge never touches). Without this,
+      // cross-source dispatch fans out to long-dead repo identifiers from
+      // earlier tests and breaks subsequent runs.
+      // fails-when: a registration under a live remote source (`remote:<orgId>`) is deleted
+      // breaks-if-wrong: a registration under no source at all must still be deleted
       const registrationsResult = await sql`
         DELETE FROM workflow_registrations
          WHERE routing_key != ${body.routingKey}
            AND routing_key NOT IN (SELECT routing_key FROM sources)
+           AND routing_key NOT IN (SELECT routing_key FROM remote_sources)
       `.execute(deps.db);
       const secretsDeleted = Number(secretsResult.numAffectedRows ?? 0n);
       const sourcesDeleted = Number(sourcesResult.numAffectedRows ?? 0n);

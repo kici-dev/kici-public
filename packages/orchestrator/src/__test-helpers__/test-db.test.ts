@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import pg from 'pg';
-import { terminateTestDbBackends } from './test-db.js';
+import { TestDbBackendsRemainError, terminateTestDbBackends } from './test-db.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -71,5 +71,53 @@ describeDb('terminateTestDbBackends', () => {
     expect(await backendCount(admin)).toBe(0);
     await expect(client.query('SELECT 1')).rejects.toThrow();
     await client.end().catch(() => undefined);
+  });
+});
+
+/**
+ * A pool double answering the backend-count query from `counts` in order (the
+ * last value repeats) and recording each terminate.
+ */
+function scriptedPool(counts: number[]) {
+  const calls: string[] = [];
+  let next = 0;
+  const pool = {
+    query: async (text: string) => {
+      if (text.includes('pg_terminate_backend')) {
+        calls.push('terminate');
+        return { rows: [] };
+      }
+      const n = counts[Math.min(next, counts.length - 1)];
+      next += 1;
+      calls.push(`count:${n}`);
+      return { rows: [{ n }] };
+    },
+  };
+  return { pool: pool as unknown as pg.Pool, calls };
+}
+
+describe('terminateTestDbBackends — after the terminate', () => {
+  it('returns only once the terminated backends have left pg_stat_activity', async () => {
+    // Still listed at the deadline, then still listed right after the terminate.
+    const { pool, calls } = scriptedPool([1, 1, 1, 0]);
+    await terminateTestDbBackends(pool, 'db', { timeoutMs: 0 });
+    // fails-when: the helper returns right after pg_terminate_backend, so DROP DATABASE races the exit
+    expect(calls).toEqual(['terminate', 'count:1', 'count:1', 'count:1', 'count:0']);
+  });
+
+  it('throws naming the remaining backends when they never exit', async () => {
+    const { pool, calls } = scriptedPool([2]);
+    const done = terminateTestDbBackends(pool, 'db', { timeoutMs: 0, exitTimeoutMs: 60 });
+    // fails-when: the post-terminate wait is unbounded, or gives up silently and lets DROP run blind
+    await expect(done).rejects.toBeInstanceOf(TestDbBackendsRemainError);
+    await expect(done).rejects.toThrow(/2 backend/);
+    expect(calls[0]).toBe('terminate');
+  });
+
+  it('neither terminates nor waits when no backend is left', async () => {
+    const { pool, calls } = scriptedPool([0]);
+    await terminateTestDbBackends(pool, 'db');
+    // breaks-if-wrong: a database already empty must return after one count, with no terminate
+    expect(calls).toEqual(['count:0']);
   });
 });

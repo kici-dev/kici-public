@@ -134,7 +134,7 @@ If a peer accepts the job, the local fallback entry is cancelled and the peer ru
 
 At expiry the verdict splits:
 
-- A label set that **neither** a connected agent **nor** a scaler backend can serve settles the job [`unroutable`](../../../architecture/execution/state-machine.md). Its error message names the unsatisfied `runsOn` selectors, and the run **fails** — a job that could never be routed does not report success.
+- A label set that **neither** a connected agent **nor** a scaler backend can serve settles the job [`unroutable`](../../../architecture/execution/state-machine.md). Its error message names the unsatisfied `runsOn` selectors, and the run **fails** — a job that could never be routed does not report success. For a `container:` job, a connected agent serves the labels only when it can start the container; when none can, the message names the selectors and says that no matching agent reports a container runtime. An agent started inside one job's image serves no other job; when the only matching agents are such agents, the message says so.
 - Anything else — including a job whose agent spawn was attempted and recorded a provisioning error — settles `timed_out_stale`. A failed spawn proves the labels did route, so the provisioning error is the real cause to investigate.
 
 ## Config reload (SIGHUP)

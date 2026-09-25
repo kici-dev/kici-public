@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as lockTypes from './types.js';
 import {
   BREAKING_FLOOR,
+  GLOBAL_APPROVAL_MIN_READER,
   NeedsEntrySchema,
   NeedsGroupEntrySchema,
   SCHEMA_VERSION,
@@ -17,8 +18,16 @@ describe('lock schema version window', () => {
   });
 
   it('pins the current window (bump floor ONLY on a breaking schema change)', () => {
-    expect(SCHEMA_VERSION).toBe(41);
+    expect(SCHEMA_VERSION).toBe(42);
     expect(BREAKING_FLOOR).toBe(30);
+  });
+
+  it('the global-approval reader floor sits between the breaking floor and the current version', () => {
+    // fails-when: GLOBAL_APPROVAL_MIN_READER exceeds SCHEMA_VERSION — every lock
+    // carrying a gated global workflow would then be refused by this same build.
+    expect(GLOBAL_APPROVAL_MIN_READER).toBe(42);
+    expect(GLOBAL_APPROVAL_MIN_READER).toBeGreaterThan(BREAKING_FLOOR);
+    expect(GLOBAL_APPROVAL_MIN_READER).toBeLessThanOrEqual(SCHEMA_VERSION);
   });
 
   it('LockJob.invoke is additive — the floor stays below the version', () => {
@@ -61,8 +70,8 @@ describe('lock schema version window', () => {
 });
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 41 (adds LockDynamicJobFn.gitCredentials)', () => {
-    expect(SCHEMA_VERSION).toBe(41);
+  it('SCHEMA_VERSION is 42 (approval enforced on organization-wide workflows)', () => {
+    expect(SCHEMA_VERSION).toBe(42);
   });
 
   it('LockJob accepts includeUninitialized alongside runsOnAll', () => {

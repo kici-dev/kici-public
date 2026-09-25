@@ -47,7 +47,7 @@ interface RunSummaryDTO {
   parentRunId: string | null;
   triggeredBy: string | null;
   failureReason: string | null;
-  environment: string | null;
+  context: string | null;
   trustTier: string | null;
   createdAt: string;
 }
@@ -117,12 +117,23 @@ interface RunDetailDTO {
   originalRunId: string | null;
   triggeredBy: string | null;
   cancelledBy: string | null;
-  environment: string | null;
+  context: string | null;
   trustTier: string | null;
   lockFileSource: string | null;
   contributorUsername: string | null;
   failureReason: string | null;
   createdAt: string;
+  /**
+   * The repository that defines the workflow, set only when it is not the
+   * repository the run acted on (an organization-wide workflow). The same
+   * narrowing holds for the commit and branch below: all three are null on a
+   * run of a repository's own workflow.
+   */
+  workflowRepoIdentifier?: string | null;
+  /** The workflow repository commit the run dispatched. */
+  workflowSha?: string | null;
+  /** The workflow repository's registered branch. */
+  workflowBranch?: string | null;
 }
 
 interface RunDetailResponse {
@@ -208,6 +219,46 @@ function formatDuration(ms: number | null): string {
   const mins = Math.floor(secs / 60);
   const remainSecs = secs % 60;
   return `${mins}m${remainSecs}s`;
+}
+
+/**
+ * Header lines naming where an organization-wide run's workflow is defined.
+ *
+ * "Defined in" prints only when the workflow repository differs from the run's
+ * own repository, which is the condition the dashboard's run metadata panel
+ * uses for the same row. The commit and branch print whenever they are set.
+ */
+function workflowProvenanceLines(run: RunDetailDTO): string[] {
+  const lines: string[] = [];
+  if (run.workflowRepoIdentifier && run.workflowRepoIdentifier !== run.repoIdentifier) {
+    lines.push(`  Defined in:  ${run.workflowRepoIdentifier} (organization-wide workflow)`);
+  }
+  if (run.workflowSha) lines.push(`  Workflow SHA: ${run.workflowSha}`);
+  if (run.workflowBranch) lines.push(`  Workflow branch: ${run.workflowBranch}`);
+  return lines;
+}
+
+/** The step index of a job's setup log: the clone, the install and the module load. */
+const SETUP_LOG_STEP_INDEX = -1;
+
+/**
+ * The note `runs logs` prints when a step has no lines: whether no log was ever
+ * recorded, or a log is stored and holds nothing. `null` when the step has
+ * lines, or when the orchestrator does not report which case applies.
+ */
+export function emptyStepLogNote(
+  stepIndex: number,
+  logs: Pick<AgentStepLogs, 'totalLines' | 'recorded'>,
+): string | null {
+  if (logs.totalLines > 0 || logs.recorded === undefined) return null;
+  if (stepIndex === SETUP_LOG_STEP_INDEX) {
+    return logs.recorded
+      ? '(the setup log for this job is empty)'
+      : '(no setup log recorded for this job)';
+  }
+  return logs.recorded
+    ? `(the log for step ${stepIndex} is empty)`
+    : `(no log recorded for step ${stepIndex})`;
 }
 
 /**
@@ -348,8 +399,9 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         if (run.cancelledBy) console.log(`  Cancelled by: ${run.cancelledBy}`);
         if (run.parentRunId) console.log(`  Parent run:  ${run.parentRunId}`);
         if (run.originalRunId) console.log(`  Original run: ${run.originalRunId}`);
-        if (run.environment) console.log(`  Environment: ${run.environment}`);
+        if (run.context) console.log(`  Context:     ${run.context}`);
         if (run.trustTier) console.log(`  Trust tier:  ${run.trustTier}`);
+        for (const line of workflowProvenanceLines(run)) console.log(line);
         if (run.failureReason) console.log(`  Failure:     ${run.failureReason}`);
         if (run.isTestRun) console.log(`  Test run:    yes`);
 
@@ -543,7 +595,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
       'Print a page of a step log (dogfooded via /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)',
     )
     .requiredOption('--job <jobId>', 'Job id (the dispatch_queue row id for an eval round)')
-    .option('--step <n>', 'Step index (default 0)', '0')
+    .option('--step <n>', 'Step index (default 0; -1 is the job setup log)', '0')
     .option('--limit <n>', 'Max lines to return (default 500, server caps at 2000)', '500')
     .option('--cursor <c>', 'Line-offset cursor from a previous page')
     .option('--json', 'Emit raw JSON instead of plain lines')
@@ -562,11 +614,13 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           return;
         }
         // Plain mode prints only the line values so the output stays pipeable;
-        // the pagination hint goes to stderr for the same reason.
+        // the pagination hint and the empty-log note go to stderr for the same reason.
         for (const line of response.lines) console.log(line.value);
         if (response.nextCursor) {
           console.error(`(more: re-run with --cursor ${response.nextCursor})`);
         }
+        const note = emptyStepLogNote(parseInt(String(opts.step), 10), response);
+        if (note) console.error(note);
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);

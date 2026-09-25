@@ -76,12 +76,13 @@ const contextStore = {
   }),
 } as unknown as ContextStore;
 
+/** Both contexts are bound to the scope holding the seeded token. */
 const secretResolver = {
-  resolveForJob: vi.fn(),
-  resolveForJobWithMeta: vi.fn(),
-  resolveNamedInternal: vi.fn(async (_org: string, context: string, key: string) =>
-    key === 'GITCRED_TOKEN' && (context === 'ci' || context === 'locked') ? SEEDED : null,
+  resolveForContext: vi.fn(async (_org: string, context: { id: string }) =>
+    context.id === 'ctx-ci' || context.id === 'ctx-locked' ? { GITCRED_TOKEN: SEEDED } : {},
   ),
+  resolveForContextWithMeta: vi.fn(),
+  resolveNamedInternal: vi.fn(),
 } as unknown as SecretResolverApi;
 
 /** The run row exists; the job row does not yet. The dispatch record does. */

@@ -59,7 +59,7 @@ import {
 } from '../agent/token-store.js';
 import type { OwnershipTracker } from '../agent/ownership-tracker.js';
 import { OWNERSHIP_REFUSED } from '../agent/ownership-refusal.js';
-import { gateOwnership } from './ownership-gate.js';
+import { gateOwnership, type OwnershipDecision } from './ownership-gate.js';
 import type { SourceCache } from '../cache/source-cache.js';
 import { depTarballKey } from '../cache/dep-cache.js';
 import { sourceTarballKey } from '../cache/source-cache.js';
@@ -342,19 +342,19 @@ export interface AgentWsHandlerDeps {
       data?: Record<string, unknown>;
     },
   ) => void;
-  /** Optional callback when agent sends log chunks. */
-  onLogChunk?: (
-    agentId: string,
-    msg: {
-      runId: string;
-      jobId: string;
-      stepIndex: number;
-      lines: string[];
-      timestamp: number;
-      /** Absent when the agent does not report a stream; read as `stdout`. */
-      stream?: LogStream;
-    },
-  ) => void;
+  /**
+   * Optional callback when agent sends log chunks. A returned promise is the
+   * chunk's write, which {@link AgentWsHandlerDeps.trackLogChunk} registers.
+   */
+  onLogChunk?: (agentId: string, msg: AgentLogChunkInput) => void | Promise<void>;
+  /**
+   * Register a log chunk's handling with its run's log drain, before anything
+   * is awaited (`LogWriter.trackPending`). The ownership check can fall back
+   * to the database, and a run that completes during that lookup would
+   * otherwise be drained without the chunk, whose segment is then never
+   * sealed.
+   */
+  trackLogChunk?: (runId: string, pending: Promise<unknown>) => void;
   /** Optional callback when agent sends step status updates. */
   onStepStatus?: (
     agentId: string,
@@ -748,6 +748,52 @@ function isValidHeartbeat(raw: unknown): raw is { type: 'heartbeat'; timestamp: 
   return msg.type === 'heartbeat' && typeof msg.timestamp === 'number';
 }
 
+/** A log chunk as the handler passes it on. */
+export interface AgentLogChunkInput {
+  runId: string;
+  jobId: string;
+  stepIndex: number;
+  lines: string[];
+  timestamp: number;
+  /** Absent when the agent does not report a stream; read as `stdout`. */
+  stream?: LogStream;
+}
+
+/**
+ * Pass a log chunk through its ownership gate and on to the sink, with its
+ * whole handling registered with the run's log drain first.
+ *
+ * Ownership resolution falls back to the database: the synchronous check hits
+ * the in-memory dispatcher Map, and a miss in HA failover is looked up before
+ * the chunk is accepted or refused. That makes the log writer tolerant of
+ * post-failover and post-complete chunks as benign duplicates rather than
+ * dropping them — and it is why the drain has to know about the chunk before
+ * the gate is awaited.
+ */
+function acceptLogChunk(
+  deps: Pick<AgentWsHandlerDeps, 'onLogChunk' | 'trackLogChunk'>,
+  agentId: string,
+  chunk: AgentLogChunkInput,
+  gate: () => Promise<OwnershipDecision>,
+): Promise<void> {
+  const handled = (async () => {
+    // A refused frame carries no reply: the agent is not awaiting one.
+    if ((await gate()) === 'reject') return;
+    logger.debug('Log chunk received', {
+      agentId,
+      runId: chunk.runId,
+      jobId: chunk.jobId,
+      stepIndex: chunk.stepIndex,
+      lineCount: chunk.lines.length,
+    });
+    await deps.onLogChunk?.(agentId, chunk);
+  })();
+  // fails-when: a drain that starts during the ownership lookup seals the run
+  // without this chunk
+  deps.trackLogChunk?.(chunk.runId, handled);
+  return handled;
+}
+
 export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
   const {
     registry,
@@ -755,7 +801,6 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     tokenStore,
     agentAuthMode,
     onJobStatus,
-    onLogChunk,
     onStepStatus,
     onScalerAgentRegistered,
     onScalerAgentDisconnected,
@@ -1405,6 +1450,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             nodeVersion: parsed.data.nodeVersion,
             runningAsUser: parsed.data.runningAsUser,
             runningAsUid: parsed.data.runningAsUid,
+            capabilities: parsed.data.capabilities,
             // Threaded through so AgentRegistry.disconnectByTokenId(...)
             // can enumerate every in-flight WS for a revoked token. Null
             // when auth mode is `none` (no token-bound authority).
@@ -1541,30 +1587,19 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
       }
 
       if (isValidLogChunk(raw)) {
-        // Ownership resolution with DB fallback. The synchronous check hits the
-        // in-memory dispatcher Map; a miss in HA failover falls through to the
-        // database before the chunk is accepted or refused. That makes the log
-        // writer tolerant of post-failover and post-complete chunks as benign
-        // duplicates rather than dropping them.
-        if ((await gateOwnership(ownershipTracker, agentId, raw.jobId, 'log.chunk')) === 'reject') {
-          return;
-        }
-
-        logger.debug('Log chunk received', {
+        await acceptLogChunk(
+          deps,
           agentId,
-          runId: raw.runId,
-          jobId: raw.jobId,
-          stepIndex: raw.stepIndex,
-          lineCount: raw.lines.length,
-        });
-        onLogChunk?.(agentId, {
-          runId: raw.runId,
-          jobId: raw.jobId,
-          stepIndex: raw.stepIndex,
-          lines: raw.lines,
-          timestamp: raw.timestamp,
-          ...(raw.stream !== undefined && { stream: raw.stream }),
-        });
+          {
+            runId: raw.runId,
+            jobId: raw.jobId,
+            stepIndex: raw.stepIndex,
+            lines: raw.lines,
+            timestamp: raw.timestamp,
+            ...(raw.stream !== undefined && { stream: raw.stream }),
+          },
+          () => gateOwnership(ownershipTracker, agentId, raw.jobId, 'log.chunk'),
+        );
         return;
       }
 
@@ -1670,6 +1705,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               nodeVersion: msg.nodeVersion,
               runningAsUser: msg.runningAsUser,
               runningAsUid: msg.runningAsUid,
+              capabilities: msg.capabilities,
               mandatoryLabels: existingEntry ? [...existingEntry.mandatoryLabels] : undefined,
               // Preserve single-use status across a re-register so disconnect
               // triage stays correct for a scaler-managed agent that reconnects.
@@ -1753,6 +1789,14 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               agentId,
               activeJobs: msg.activeJobs,
             });
+
+            // An agent reporting no running jobs lifts a busy-rejection hold: it
+            // finished tearing down the job it was holding the slot for. Only
+            // zero counts — an agent that enforces one job at a time rejects
+            // busy with any job running, whatever its maxConcurrency.
+            // fails-when: the hold is never lifted — a busy-rejected agent
+            // takes no work until BUSY_HOLD_MAX_MS passes.
+            if (msg.activeJobs === 0) registry.clearBusyHeld(agentId);
 
             // Drain trigger: if the registry shows capacity, try the queue.
             if (entry.activeJobs < entry.maxConcurrency) {
@@ -1879,29 +1923,13 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'log.chunk': {
-          // A refused frame carries no reply: the agent is not awaiting one.
-          if (
-            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'log.chunk')) === 'reject'
-          ) {
-            break;
-          }
-
           const { runId, jobId, stepIndex, lines, timestamp, stream } = msg;
-          logger.debug('Log chunk received', {
+          await acceptLogChunk(
+            deps,
             agentId,
-            runId,
-            jobId,
-            stepIndex,
-            lineCount: lines.length,
-          });
-          onLogChunk?.(agentId, {
-            runId,
-            jobId,
-            stepIndex,
-            lines,
-            timestamp,
-            ...(stream !== undefined && { stream }),
-          });
+            { runId, jobId, stepIndex, lines, timestamp, ...(stream !== undefined && { stream }) },
+            () => gateOwnership(ownershipTracker, agentId, jobId, 'log.chunk'),
+          );
           break;
         }
 

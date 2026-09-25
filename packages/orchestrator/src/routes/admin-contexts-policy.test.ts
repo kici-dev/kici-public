@@ -132,3 +132,85 @@ describe('PATCH /contexts/:name/policy — zero hold expiry', () => {
     );
   });
 });
+
+describe('repository patterns', () => {
+  it('PATCH forwards repo patterns, and an empty list clears them', async () => {
+    const { update } = stubStore();
+
+    const set = await patchPolicy({ repoPatterns: ['acme/workflows'] });
+    const cleared = await patchPolicy({ repoPatterns: [] });
+
+    expect(set.status).toBe(200);
+    expect(cleared.status).toBe(200);
+    // fails-when: setPolicySchema strips repoPatterns, so the request carries no policy field
+    expect(update).toHaveBeenNthCalledWith(1, 'org-1', 'env-abc', {
+      repoPatterns: ['acme/workflows'],
+    });
+    expect(update).toHaveBeenNthCalledWith(2, 'org-1', 'env-abc', { repoPatterns: [] });
+  });
+
+  it('PATCH rejects repo patterns that are not an array of strings', async () => {
+    const { update } = stubStore();
+
+    const res = await patchPolicy({ repoPatterns: 'acme/*' });
+
+    // fails-when: the schema accepts a bare string and the gate compares it character by character
+    // breaks-if-wrong: the array form above must still reach the store
+    expect(res.status).toBe(400);
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('POST create forwards repo patterns to a new context', async () => {
+    vi.spyOn(ContextStore.prototype, 'getByName').mockResolvedValue(null);
+    const create = vi
+      .spyOn(ContextStore.prototype, 'create')
+      .mockResolvedValue({ id: 'env-new' } as never);
+
+    const res = await buildTestApp().request('http://localhost/contexts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orgId: 'org-1', name: 'deploy', repoPatterns: ['acme/*'] }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(create).toHaveBeenCalledWith(
+      'org-1',
+      expect.objectContaining({ name: 'deploy', repoPatterns: ['acme/*'] }),
+    );
+  });
+
+  it('POST upsert forwards repo patterns to an existing context', async () => {
+    const { update } = stubStore();
+
+    const res = await buildTestApp().request('http://localhost/contexts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orgId: 'org-1', name: 'production', repoPatterns: ['acme/*'] }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(update).toHaveBeenCalledWith(
+      'org-1',
+      'env-abc',
+      expect.objectContaining({ repoPatterns: ['acme/*'] }),
+    );
+  });
+
+  it('GET show returns the stored repo patterns', async () => {
+    vi.spyOn(ContextStore.prototype, 'getByName').mockResolvedValue({
+      id: 'env-abc',
+      name: 'production',
+      repo_patterns: ['acme/workflows'],
+    } as never);
+    const { BindingStore } = await import('../contexts/binding-store.js');
+    const { VariableStore } = await import('../contexts/variable-store.js');
+    vi.spyOn(BindingStore.prototype, 'list').mockResolvedValue([]);
+    vi.spyOn(VariableStore.prototype, 'listVars').mockResolvedValue([]);
+
+    const res = await buildTestApp().request('http://localhost/contexts/production?orgId=org-1');
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { context: { repo_patterns: string[] } };
+    expect(body.context.repo_patterns).toEqual(['acme/workflows']);
+  });
+});

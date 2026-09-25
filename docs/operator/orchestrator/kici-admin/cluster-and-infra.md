@@ -210,6 +210,7 @@ Synopsis: `kici-admin cluster-settings reset [options]`
 | `--concurrency-wait-timeout-ms`                     |         | Clear only Concurrency wait timeout (ms)              |
 | `--agent-token-ttl-ms`                              |         | Clear only Agent token TTL (ms)                       |
 | `--ownership-db-check-timeout-ms`                   |         | Clear only Ownership DB check timeout (ms)            |
+| `--sealed-secrets-retry-backoff-ms`                 |         | Clear only Sealed-secrets retry back-off (ms)         |
 | `--unroutable-grace-ms`                             |         | Clear only Unroutable fast-fail grace (ms)            |
 | `--ingest-overflow-claim-timeout-ms`                |         | Clear only Ingest queue claim timeout (ms)            |
 | `--lockfile-cache-max`                              |         | Clear only Lock-file cache max entries                |
@@ -263,6 +264,7 @@ Synopsis: `kici-admin cluster-settings set [options]`
 | `--concurrency-wait-timeout-ms <value>`                     |         | Concurrency wait timeout (ms) (integer >= 1000)               |
 | `--agent-token-ttl-ms <value>`                              |         | Agent token TTL (ms) (integer >= 1000)                        |
 | `--ownership-db-check-timeout-ms <value>`                   |         | Ownership DB check timeout (ms) (integer >= 100)              |
+| `--sealed-secrets-retry-backoff-ms <value>`                 |         | Sealed-secrets retry back-off (ms) (integer >= 1000)          |
 | `--unroutable-grace-ms <value>`                             |         | Unroutable fast-fail grace (ms) (integer >= 0)                |
 | `--ingest-overflow-claim-timeout-ms <value>`                |         | Ingest queue claim timeout (ms) (integer >= 60000)            |
 | `--lockfile-cache-max <value>`                              |         | Lock-file cache max entries (integer 1-100000)                |

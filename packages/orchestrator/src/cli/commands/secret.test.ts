@@ -5,12 +5,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const mockSetContextSecretDirect = vi.fn();
+const mockListContextsDirect = vi.fn();
+const mockShowContextDirect = vi.fn();
 
 vi.mock('@kici-dev/shared', async (importOriginal) => {
   const original = (await importOriginal()) as Record<string, unknown>;
   return {
     ...original,
     setContextSecretDirect: mockSetContextSecretDirect,
+    listContextsDirect: mockListContextsDirect,
+    showContextDirect: mockShowContextDirect,
   };
 });
 
@@ -62,8 +66,11 @@ vi.mock('../../secrets/pg-secret-store.js', async (importOriginal) => {
 
 const { SecretScopeExistsError } = await import('../../secrets/pg-secret-store.js');
 const { registerSecretCommands, planPrefixedScopeFixes } = await import('./secret.js');
+const { unboundContextWarning } = await import('./shared/unbound-context-warning.js');
+const { ContextType } = await import('@kici-dev/engine');
 
 interface MockClient {
+  get: ReturnType<typeof vi.fn>;
   listScopes: ReturnType<typeof vi.fn>;
   listKeys: ReturnType<typeof vi.fn>;
   setSecret: ReturnType<typeof vi.fn>;
@@ -72,6 +79,7 @@ interface MockClient {
 
 function makeMockClient(): MockClient {
   return {
+    get: vi.fn(),
     listScopes: vi.fn(),
     listKeys: vi.fn(),
     setSecret: vi.fn(),
@@ -185,6 +193,72 @@ describe('kici-admin secret CLI', () => {
       expect(exitCode).toBe(1);
       expect(stderr).toMatch(/letters, digits/);
       expect(mockSetContextSecretDirect).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── unbound-context warning ──────────────────────────────────────────────
+  // A secret written to a scope named after a fixed context with no binding
+  // reaches no job. The write still succeeds; the warning names the fix.
+  describe('set — unbound context warning', () => {
+    function contextsClient(bindings: number): MockClient {
+      const client = makeMockClient();
+      client.setSecret.mockResolvedValue(undefined);
+      client.get.mockImplementation(async (path: string) =>
+        path.startsWith('/api/v1/admin/contexts?')
+          ? { contexts: [{ name: 'staging', type: ContextType.enum.fixed }] }
+          : {
+              context: { name: 'staging', type: ContextType.enum.fixed },
+              variables: [],
+              bindings: Array.from({ length: bindings }, () => ({ scope_pattern: 'staging' })),
+            },
+      );
+      return client;
+    }
+
+    it('warns on stderr and still exits 0 when the target context has no binding (HTTP)', async () => {
+      const { stderr, exitCode, client } = await runCommand(
+        ['secret', 'set', '--org', 'org-1', '--context', 'staging', '--key', 'K', '--value', 'v'],
+        contextsClient(0),
+      );
+      expect(client.setSecret).toHaveBeenCalledWith('org-1', 'staging', 'K', 'v');
+      // fails-when: the warning is not printed for a bindingless fixed context
+      expect(stderr).toContain(unboundContextWarning('org-1', 'staging', ContextType.enum.fixed));
+      expect(exitCode).toBeNull();
+    });
+
+    it('warns in direct-DB mode too', async () => {
+      mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
+      mockListContextsDirect.mockResolvedValue({
+        contexts: [{ name: 'staging', type: ContextType.enum.fixed }],
+      });
+      mockShowContextDirect.mockResolvedValue({
+        context: { name: 'staging', type: ContextType.enum.fixed },
+        variables: [],
+        bindings: [],
+      });
+      const { stderr, exitCode } = await runCommand([
+        'secret',
+        'set',
+        'org-1',
+        'staging',
+        'K',
+        '--value',
+        'ciphertext',
+        '--database-url',
+        'postgres://x',
+      ]);
+      expect(stderr).toContain(unboundContextWarning('org-1', 'staging', ContextType.enum.fixed));
+      expect(exitCode).toBeNull();
+    });
+
+    it('prints no warning when the target context is bound', async () => {
+      // breaks-if-wrong: a bound context must write silently
+      const { stderr, exitCode } = await runCommand(
+        ['secret', 'set', '--org', 'org-1', '--context', 'staging', '--key', 'K', '--value', 'v'],
+        contextsClient(1),
+      );
+      expect(stderr).not.toContain('has no binding');
+      expect(exitCode).toBeNull();
     });
   });
 

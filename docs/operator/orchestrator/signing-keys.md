@@ -26,7 +26,9 @@ orchestrator generates (or loads) its signing key, mints and signs identity
 tokens locally, verifies attestations at ingest against its own keys, and serves:
 
 - `GET /.well-known/openid-configuration` — OIDC discovery (`issuer`, `jwks_uri`,
-  `id_token_signing_alg_values_supported: ["ES256"]`).
+  `id_token_signing_alg_values_supported: ["ES256"]`, and `claims_supported`, which
+  names every claim an ID token carries so a cloud trust policy can be written
+  against the full set).
 - `GET /.well-known/jwks.json` — the public key set (public halves only, safe to
   expose). This is what makes offline verification work.
 - `POST /v1/verify-attestation` — a native online verify endpoint: submit a
@@ -37,6 +39,37 @@ cluster's provenance. Changing it re-roots trust for future attestations.
 
 In a clustered deployment every node reads the one cluster key from the shared
 database, so any node's public endpoint serves the same JWKS.
+
+With `db` custody, the cluster creates the key on first use. The Raft leader
+creates it first. When no key is active after about two seconds, any node with
+signing enabled creates it, so the key also appears when the leader runs with
+signing disabled. When several nodes create a key at the same moment, one key
+becomes active and every node signs with that key.
+
+A node creates a key only when no key of any custody is active. A node with
+`db` custody never replaces an active `aws-kms` or `command` key: it signs
+nothing and logs an error that names the active key and its custody. Give every
+node the same custody. To move a cluster from `aws-kms` or `command` custody to
+`db`, restart every node with `KICI_ORCHESTRATOR_SIGNER_KIND=db`, then run
+`kici-admin signing-key rotate` once.
+
+When a step asks for an identity token and no key is ready, the orchestrator
+waits up to 7.5 seconds for one. This is half of the agent's 15-second request
+timeout, so the step always gets an answer before the agent gives up. If no key
+is ready in that time, the step receives `{ deferred: true, code: 'unavailable' }`
+instead of a token:
+
+- [`ctx.attestProvenance`](../../user/provenance.md) freezes the statement, and
+  the orchestrator retries the mint in the background until the key is ready.
+  The attestation shows as `pending` until then.
+- A step that calls [`ctx.kici.oidc.token()`](../../user/oidc.md) directly gets
+  the deferred result and decides whether to fail or try again.
+
+The orchestrator logs a warning when it defers a mint because no key is ready:
+`provenance signing key is not provisioned; deferring the identity-token mint`.
+The line names the job, the run, the agent, and whether the node is the Raft
+leader. During a long outage it repeats at most once a minute and counts the
+deferrals in between (`deferredSinceLastWarning`).
 
 ## Custody backends
 
@@ -82,6 +115,15 @@ kici-admin signing-key retire <kid>             # move a retiring key to retired
 kici-admin signing-key revoke <kid> --reason r  # distrust a compromised key (removed from the JWKS)
 kici-admin signing-key export --public --out f  # write the { issuer, jwks } backup / air-gap artifact
 ```
+
+`signing-key list` reads the orchestrator database when you pass
+`--database-url` or set `KICI_DATABASE_URL`. With neither, it reads the admin
+API (`GET /api/v1/admin/signing-keys`) of the orchestrator at `KICI_ADMIN_URL`
+/ `--url`, with the token from `KICI_ADMIN_TOKEN` / `--token`. Both modes print
+the same output. The admin API needs an unscoped token with the `secret.read`
+permission (the `owner` and `admin` roles). It returns each key's `kid`,
+`status`, `alg`, `signer_kind`, `key_ref`, `activated_at` and `created_at`,
+and never key material. The other subcommands read and write the database only.
 
 ### Key lifecycle
 
@@ -150,7 +192,7 @@ check that proves the key survived the rotation.
 External custody (`aws-kms`, `command`) is unaffected: the private key never
 enters the database, so the master key wraps nothing to rotate.
 
-Full procedure: [secret management → key rotation](../security/secrets.md#key-rotation).
+Full procedure: [secret management → key rotation](../security/secrets.md#rotation-procedure).
 
 ## Verifying against your orchestrator
 

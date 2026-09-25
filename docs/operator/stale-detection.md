@@ -120,7 +120,7 @@ When all jobs in a run reach a terminal state (including `timed_out_stale`), the
 
 ### Held run expiry
 
-The stale detector also handles expiring overdue held runs (runs awaiting environment approval that exceed their hold expiry timeout). When a `HeldRunStore` is configured, each scan calls `expireOverdue()` to transition expired pending holds to `expired` status, cancelling the associated jobs. See [Contexts](contexts.md) for details on hold expiry configuration.
+The stale detector also handles expiring overdue held runs (runs awaiting environment approval that exceed their hold expiry timeout). When a `HeldRunStore` is configured, each scan fails the run of every overdue job- or workflow-scoped hold with an `Approval expired` reason. For an overdue step-scoped hold, it tells the waiting agent to fail the step. It then calls `expireOverdue()` to transition those holds to `expired` status. See [Contexts](contexts.md) for details on hold expiry configuration.
 
 ### Workflow deadline expiry
 

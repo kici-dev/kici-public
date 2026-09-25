@@ -12,7 +12,6 @@ import type { Kysely } from 'kysely';
 import type { SecretStore } from '@kici-dev/engine';
 import type { Logger } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
-import { ContextStore } from '../contexts/context-store.js';
 import type { AuditLogger } from './audit-logger.js';
 import type { PgSecretStore } from './pg-secret-store.js';
 import { SecretResolver, type SecretStoreLike } from './secret-resolver.js';
@@ -26,13 +25,12 @@ export interface ContextSecretResolverDeps {
 }
 
 /**
- * Build a `SecretResolver` over the org's contexts, bindings, and registered
+ * Build a `SecretResolver` over the org's context bindings and registered
  * secret backends. The `pg` backend decrypts through the master key; external
  * backends (Vault) return plaintext, so their decrypt is identity.
  */
 export function buildContextSecretResolver(deps: ContextSecretResolverDeps): SecretResolver {
   const { pgSecretStore, backendStores, db, auditLogger, logger } = deps;
-  const envStore = new ContextStore(db);
 
   const resolverBackendStores = new Map<string, SecretStoreLike>();
   for (const [backendName, store] of backendStores) {
@@ -87,13 +85,6 @@ export function buildContextSecretResolver(deps: ContextSecretResolverDeps): Sec
   }
 
   return new SecretResolver({
-    contextStore: {
-      getByName: async (orgId, name) => {
-        const row = await envStore.getByName(orgId, name);
-        if (!row) return null;
-        return { id: row.id, name: row.name, orgId: row.org_id };
-      },
-    },
     bindingStore: {
       getByContextId: async (contextId: string) => {
         const rows = await db

@@ -244,6 +244,13 @@ When the named install context carries a protection rule that holds — a requir
 
 A `reject` protection outcome (for example a disabled context or a branch the context forbids) still fails the dispatch loudly with a clear reason, exactly as before — the orchestrator never dispatches a run with an unresolved install token.
 
+When `registries:` and `installEnv:` name more than one context, the install gate checks the rules of every context before it decides:
+
+- **Any reject fails the dispatch**, even when another context would hold it.
+- **Holds combine into one hold.** When any holding context requires reviewers, the run waits for approval, and every required reviewer of every holding context must approve. That approval releases the run for every holding context, including one that holds only for a wait timer. When no holding context requires a reviewer, the run waits for the longest wait timer.
+- **On release, the holding contexts are not checked again.** The approval covers them. Every other named context is checked again. If one of them no longer admits the run, the run fails with the reason and receives no token.
+- **A context deleted or recreated while the run waits fails the run.** The release resolves tokens only from the contexts the hold was raised against.
+
 ## Limitations
 
 - **`registries:` is workflow-level only in v1.** Per-job overrides aren't supported — there is one shared `.kici/` per workspace, so a per-job `registries:` would be physically nonsensical.

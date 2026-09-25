@@ -20,14 +20,22 @@
 import { randomUUID } from 'node:crypto';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
 import type {
+  AgentCapabilities,
   GlobalEvalCandidateResult,
   GlobalEvalRoundResult,
   LockJob,
+  LockJobOrFactory,
   LockWorkflow,
   SimulatedEvent,
   WorkflowDecision,
 } from '@kici-dev/engine';
-import { INIT_RUNNER_ROLE_LABEL, isLockDynamicJobFn } from '@kici-dev/engine';
+import {
+  AgentCapabilityFlag,
+  GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
+  INIT_RUNNER_ROLE_LABEL,
+  hasAgentCapability,
+  isLockDynamicJobFn,
+} from '@kici-dev/engine';
 import {
   globalEvalCacheLookupsTotal,
   globalEvalCandidatesTotal,
@@ -132,9 +140,33 @@ export function candidateKey(candidate: GlobalEvalCandidate): string {
   return [candidate.reg.id, candidate.lockEntry.name].join(KEY_SEPARATOR);
 }
 
-/** True when the workflow carries at least one `DynamicJobFn` entry. */
-function hasDynamicJob(lockEntry: LockWorkflow): boolean {
-  return (lockEntry.jobs ?? []).some((job) => isLockDynamicJobFn(job));
+/**
+ * True for a `DynamicJobFn` entry the pre-run round runs: a generator with no
+ * upstream `needs`.
+ *
+ * A result-aware generator (`resultAware`, or any declared `needs`) reads its
+ * upstreams' outputs, which do not exist before the run starts. It runs on the
+ * run's deferred path instead, once those upstreams complete.
+ */
+export function isRoundGenerator(job: LockJobOrFactory): boolean {
+  return (
+    isLockDynamicJobFn(job) && job.resultAware !== true && !(job.needs && job.needs.length > 0)
+  );
+}
+
+/** True for a `DynamicJobFn` entry that runs on the deferred path, never in the round. */
+export function isDeferredGenerator(job: LockJobOrFactory): boolean {
+  return isLockDynamicJobFn(job) && !isRoundGenerator(job);
+}
+
+/** True when the workflow carries at least one generator the round runs. */
+function hasRoundGenerator(lockEntry: LockWorkflow): boolean {
+  return (lockEntry.jobs ?? []).some(isRoundGenerator);
+}
+
+/** True when the workflow carries at least one generator the round must NOT run. */
+export function hasDeferredGenerator(lockEntry: LockWorkflow): boolean {
+  return (lockEntry.jobs ?? []).some(isDeferredGenerator);
 }
 
 /**
@@ -142,9 +174,11 @@ function hasDynamicJob(lockEntry: LockWorkflow): boolean {
  * those that must go through an eval round first.
  *
  * A candidate needs the round when it declares a `filter` (only the agent may
- * run the predicate) or carries a `DynamicJobFn` (only the agent may run the
- * generator). Everything else is fully described by the lock file, so routing it
- * through a round would add a job dispatch and an agent round trip for nothing.
+ * run the predicate) or carries a needs-free `DynamicJobFn` (only the agent may
+ * run the generator, and it depends on nothing the run produces). Everything
+ * else — static jobs, and result-aware generators the run evaluates later — is
+ * handed to the dispatch pipeline as declared, so routing it through a round
+ * would add a job dispatch and an agent round trip for nothing.
  */
 export function partitionCandidates(candidates: readonly GlobalEvalCandidate[]): {
   immediate: GlobalEvalCandidate[];
@@ -153,7 +187,9 @@ export function partitionCandidates(candidates: readonly GlobalEvalCandidate[]):
   const immediate: GlobalEvalCandidate[] = [];
   const needsRound: GlobalEvalCandidate[] = [];
   for (const candidate of candidates) {
-    if (candidate.lockEntry.hasFilter === true || hasDynamicJob(candidate.lockEntry)) {
+    // fails-when: a candidate whose only generators are result-aware is sent to the round
+    // breaks-if-wrong: a candidate with a needs-free generator or a filter must still need the round
+    if (candidate.lockEntry.hasFilter === true || hasRoundGenerator(candidate.lockEntry)) {
       needsRound.push(candidate);
     } else {
       immediate.push(candidate);
@@ -212,6 +248,18 @@ export interface GlobalEvalAgentRegistry {
   findAvailable(
     labels: string[],
   ): Array<{ platform: string; arch: string; version?: string | null }>;
+  /**
+   * Every registered agent, busy or idle. Optional so a test double can omit
+   * it; without it the up-front result-aware refusal never fires.
+   */
+  getAllEntries?(): Iterable<{
+    labels: ReadonlySet<string>;
+    platform: string;
+    arch: string;
+    version: string | null;
+    /** What the agent advertised on `agent.register`; `null` = supports nothing optional. */
+    capabilities: AgentCapabilities | null;
+  }>;
 }
 
 /**
@@ -258,6 +306,12 @@ export interface GlobalEvalRoundArgs {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
+  /**
+   * The source `dispatchBundle` and `dispatchCredentials` belong to, when a
+   * cross-provider lock-file fallback made it a different source from
+   * `info.routingKey`. Absent means the inbound source.
+   */
+  dispatchRoutingKey?: string;
   /** Cluster defaults for the round budgets and the wait ceiling (`config.ts`). */
   config: {
     globalEvalRoundTimeoutMs: number;
@@ -460,6 +514,18 @@ async function resolveBudgets(
 }
 
 /**
+ * The role and feature labels a round job requires of its agent, before the
+ * platform labels. A round holding a result-aware generator also requires the
+ * agent-feature label, so it runs only on an agent that skips such generators —
+ * and, when none is up, queues for one the way any round queues for capacity.
+ */
+function roundLabels(requiresResultAwareSkip: boolean): string[] {
+  return requiresResultAwareSkip
+    ? [INIT_RUNNER_ROLE_LABEL, GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL]
+    : [INIT_RUNNER_ROLE_LABEL];
+}
+
+/**
  * Pick the platform labels for the round job by probing the fleet for an
  * init-runner, mirroring how the per-workflow dispatch picks its build target.
  * Falls back to linux/x64 when nothing is registered.
@@ -467,18 +533,44 @@ async function resolveBudgets(
  * An init-runner new enough to understand the round is preferred over one that
  * is not, so a fleet mid-upgrade targets the platform of an agent that can
  * actually decide the round rather than the first one indexed.
+ *
+ * A round that needs the agent-feature label, with no such agent idle, takes
+ * the platform of a registered (busy) one, so the queued round can still match
+ * it. The linux/x64 fallback applies only when no such agent is registered.
  */
-function chooseRoundTarget(agentRegistry?: GlobalEvalAgentRegistry): {
+function chooseRoundTarget(
+  agentRegistry: GlobalEvalAgentRegistry | undefined,
+  requiresResultAwareSkip: boolean,
+): {
   targetPlatform: string;
   targetArch: string;
 } {
   if (!agentRegistry) return { ...FALLBACK_TARGET };
-  const available = agentRegistry.findAvailable([INIT_RUNNER_ROLE_LABEL]);
+  const available = agentRegistry.findAvailable(roundLabels(requiresResultAwareSkip));
   const first =
     available.find((agent) => agentVersionAtLeast(agent.version, MIN_GLOBAL_EVAL_AGENT_VERSION)) ??
     available[0];
-  if (!first) return { ...FALLBACK_TARGET };
-  return { targetPlatform: first.platform, targetArch: first.arch };
+  const chosen =
+    first ?? (requiresResultAwareSkip ? registeredResultAwareRunner(agentRegistry) : undefined);
+  // fails-when: a result-aware round targets linux/x64 while its only capable agent is a busy darwin/arm64 one
+  if (!chosen) return { ...FALLBACK_TARGET };
+  return { targetPlatform: chosen.platform, targetArch: chosen.arch };
+}
+
+/** A registered init-runner carrying the agent-feature label, busy or idle. */
+function registeredResultAwareRunner(
+  agentRegistry: GlobalEvalAgentRegistry,
+): { platform: string; arch: string } | undefined {
+  if (!agentRegistry.getAllEntries) return undefined;
+  for (const agent of agentRegistry.getAllEntries()) {
+    if (
+      agent.labels.has(INIT_RUNNER_ROLE_LABEL) &&
+      agent.labels.has(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL)
+    ) {
+      return { platform: agent.platform, arch: agent.arch };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -521,6 +613,51 @@ export function unsupportedFleetReason(agentRegistry?: GlobalEvalAgentRegistry):
 }
 
 /**
+ * Why a candidate with a result-aware generator is refused before any round.
+ *
+ * An agent without the capability runs every generator in the round, a
+ * result-aware one included; that generator sees no upstream outputs and
+ * returns the wrong jobs.
+ */
+export const RESULT_AWARE_UNSUPPORTED_REASON =
+  'every registered init-runner agent lacks the ' +
+  `'${AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators}' capability, which a ` +
+  "global workflow's eval round needs when the workflow also declares a result-aware " +
+  "generator (dynamicJob with 'needs'). Upgrade your agents so the round runs only the " +
+  'needs-free generators';
+
+/**
+ * Why no agent can run a round holding a result-aware generator, or `null`
+ * when one might.
+ *
+ * The same bar as {@link unsupportedFleetReason}: refused only on proof. That
+ * means init-runners ARE registered, every one reports a readable version, and
+ * none advertises the capability. An empty fleet, a busy capable agent, or an
+ * agent whose version cannot be read is not refused — the round queues on the
+ * agent-feature label, and a scaler or a registering agent can still serve it.
+ */
+export function resultAwareUnsupportedReason(
+  agentRegistry?: GlobalEvalAgentRegistry,
+): string | null {
+  if (!agentRegistry?.getAllEntries) return null;
+  const runners = [...agentRegistry.getAllEntries()].filter((agent) =>
+    agent.labels.has(INIT_RUNNER_ROLE_LABEL),
+  );
+  // breaks-if-wrong: an empty fleet must queue the round, never refuse it
+  if (runners.length === 0) return null;
+  if (runners.some((agent) => agent.version === null || parseVersionBase(agent.version) === null))
+    return null;
+  // fails-when: a fleet of registered agents that all lack the flag is sent a round they would get wrong
+  const capable = runners.some((agent) =>
+    hasAgentCapability(
+      agent.capabilities,
+      AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators,
+    ),
+  );
+  return capable ? null : RESULT_AWARE_UNSUPPORTED_REASON;
+}
+
+/**
  * Reduce one candidate to the three fields the agent's round runner reads.
  *
  * `sourceFile` prefers the workflow's own lock entry over the registration's
@@ -545,6 +682,8 @@ function buildRoundJobInput(args: {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
+  /** The source `dispatchBundle` belongs to, when it is not the inbound one. */
+  dispatchRoutingKey?: string;
   budgets: RoundBudgets;
   target: { targetPlatform: string; targetArch: string };
   /**
@@ -559,6 +698,8 @@ function buildRoundJobInput(args: {
    * inventing a run.
    */
   runId: string;
+  /** The group holds a result-aware generator, so the round needs an agent that skips it. */
+  requiresResultAwareSkip: boolean;
 }): QueuedJobInput {
   const { info, event, group, repoIdentifier, ref, dispatchBundle, dispatchCredentials } = args;
   const reg = group[0].reg;
@@ -576,7 +717,9 @@ function buildRoundJobInput(args: {
     workflowName: `${ROUND_JOB_PREFIX}${reg.repoIdentifier}`,
     jobName: `${ROUND_JOB_PREFIX}${reg.repoIdentifier}__${workflowSha.slice(0, 12)}`,
     runsOnLabels: [
-      INIT_RUNNER_ROLE_LABEL,
+      // fails-when: a round holding a result-aware generator reaches an agent that would run it
+      // breaks-if-wrong: a round of needs-free generators must carry no feature label
+      ...roundLabels(args.requiresResultAwareSkip),
       `kici:os:${args.target.targetPlatform}`,
       `kici:arch:${args.target.targetArch}`,
     ],
@@ -594,10 +737,9 @@ function buildRoundJobInput(args: {
       workflowRef: '',
       workflowSha,
       workflowRepoIdentifier: reg.repoIdentifier,
-      // Cross-provider auth plumbing: when the registration's routing key
-      // differs from the inbound one, the dispatcher resolves the workflow-repo
-      // bundle by this key and mints `workflowAuth` independently of
-      // `sourceAuth`.
+      // The dispatcher resolves the workflow repository's bundle by this key
+      // and mints `workflowAuth` for that repository with this provider
+      // context, separately from `sourceAuth`.
       workflowRoutingKey: reg.routingKey,
       workflowProviderContext: reg.providerContext,
       roundTimeoutMs: args.budgets.roundTimeoutMs,
@@ -607,9 +749,15 @@ function buildRoundJobInput(args: {
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
     deliveryId: info.deliveryId,
-    provider: info.provider,
+    // The routing key, provider, clone URL and credentials all name the source
+    // the clone goes through. The dispatcher mints the source clone auth through
+    // the bundle of this routing key with this provider context, so a key naming
+    // the inbound source under a cross-provider fallback would mint the auth
+    // with one provider for another provider's repository.
+    provider:
+      args.dispatchRoutingKey !== undefined ? dispatchBundle.normalizer.provider : info.provider,
     providerContext: dispatchCredentials,
-    routingKey: info.routingKey,
+    routingKey: args.dispatchRoutingKey ?? info.routingKey,
     requestId: getRequestContext().requestId,
   };
 }
@@ -894,6 +1042,7 @@ async function runOneRound(
   group: readonly GlobalEvalCandidate[],
   budgets: RoundBudgets,
   runId: string,
+  requiresResultAwareSkip: boolean,
 ): Promise<Map<string, GlobalEvalCandidateResult>> {
   const { deps, info, ref } = args;
   const reg = group[0].reg;
@@ -908,9 +1057,11 @@ async function runOneRound(
     ref,
     dispatchBundle: args.dispatchBundle,
     dispatchCredentials: args.dispatchCredentials,
+    ...(args.dispatchRoutingKey !== undefined && { dispatchRoutingKey: args.dispatchRoutingKey }),
     budgets,
-    target: chooseRoundTarget(deps.agentRegistry),
+    target: chooseRoundTarget(deps.agentRegistry, requiresResultAwareSkip),
     runId,
+    requiresResultAwareSkip,
   });
 
   // Keyed off the job input the agent actually receives, not off a parallel
@@ -1060,6 +1211,7 @@ async function runGroupRound(
   args: GlobalEvalRoundArgs,
   group: readonly GlobalEvalCandidate[],
   budgets: RoundBudgets,
+  requiresResultAwareSkip: boolean,
 ): Promise<GroupRoundOutcome> {
   let lastError = 'Global eval round did not run';
   let lastRunId = '';
@@ -1068,7 +1220,7 @@ async function runGroupRound(
     try {
       return {
         ok: true,
-        verdicts: await runOneRound(args, group, budgets, lastRunId),
+        verdicts: await runOneRound(args, group, budgets, lastRunId, requiresResultAwareSkip),
         attempts: attempt,
         runId: lastRunId,
       };
@@ -1162,6 +1314,83 @@ export interface GlobalEvalRoundsOutcome {
 }
 
 /**
+ * How one group is routed. A group with a result-aware generator runs only on an
+ * agent carrying the agent-feature label; when every registered init-runner
+ * provably lacks it, those candidates are refused up front and the rest of the
+ * group runs as usual.
+ */
+interface GroupPlan {
+  run: readonly GlobalEvalCandidate[];
+  requiresResultAwareSkip: boolean;
+  refused: readonly GlobalEvalCandidate[];
+}
+
+function planGroup(
+  group: readonly GlobalEvalCandidate[],
+  agentRegistry: GlobalEvalAgentRegistry | undefined,
+): GroupPlan {
+  const deferred = group.filter((candidate) => hasDeferredGenerator(candidate.lockEntry));
+  // fails-when: a candidate with a result-aware generator runs on an agent that would run it too
+  // breaks-if-wrong: a group with no result-aware generator must run exactly as it always has
+  if (deferred.length === 0) return { run: group, requiresResultAwareSkip: false, refused: [] };
+  if (!resultAwareUnsupportedReason(agentRegistry)) {
+    return { run: group, requiresResultAwareSkip: true, refused: [] };
+  }
+  return {
+    run: group.filter((candidate) => !hasDeferredGenerator(candidate.lockEntry)),
+    requiresResultAwareSkip: false,
+    refused: deferred,
+  };
+}
+
+/** Fold one round outcome into the delivery's verdicts and failure records. */
+function settleGroupOutcome(
+  args: GlobalEvalRoundArgs,
+  group: readonly GlobalEvalCandidate[],
+  outcome: GroupRoundOutcome,
+  verdicts: Map<string, GlobalEvalCandidateResult>,
+  failures: GlobalEvalRoundFailure[],
+): void {
+  if (outcome.ok) {
+    for (const [key, verdict] of outcome.verdicts) verdicts.set(key, verdict);
+    const partial = partialFailure(group, outcome);
+    if (partial) {
+      logger.warn('Global eval round left some candidates undecided', {
+        deliveryId: args.info.deliveryId,
+        workflowRepo: group[0].reg.repoIdentifier,
+        candidateCount: group.length,
+        undecidedCount: partial.workflowNames.length,
+        error: partial.error,
+      });
+      failures.push(partial);
+    }
+    return;
+  }
+  // `attempts: 0` is the one outcome that never reached an agent, so it reads
+  // as "not attempted" everywhere it surfaces — including the commit check,
+  // where "failed" would send an author looking for a job that never ran.
+  const failureReason =
+    outcome.attempts === 0
+      ? `Global eval round not attempted: ${outcome.error}`
+      : `Global eval round failed: ${outcome.error}`;
+  logger.error('Global eval round failed', {
+    deliveryId: args.info.deliveryId,
+    workflowRepo: group[0].reg.repoIdentifier,
+    candidateCount: group.length,
+    attempts: outcome.attempts,
+    error: outcome.error,
+  });
+  markGroupIndeterminate(group, failureReason, verdicts);
+  failures.push({
+    runId: outcome.runId,
+    workflowRepoIdentifier: group[0].reg.repoIdentifier,
+    workflowNames: group.map((candidate) => candidate.lockEntry.name),
+    error: outcome.error,
+    attempts: outcome.attempts,
+  });
+}
+
+/**
  * Run every eval round the candidate set needs and return one verdict per
  * candidate, plus one failure record per round that produced none.
  *
@@ -1192,46 +1421,30 @@ export async function runGlobalEvalRounds(
   const unsupported = unsupportedFleetReason(args.deps.agentRegistry);
 
   for (const group of groups.values()) {
-    const outcome: GroupRoundOutcome = unsupported
-      ? { ok: false, error: unsupported, attempts: 0, runId: randomUUID() }
-      : await runGroupRound(args, group, budgets);
-    if (outcome.ok) {
-      for (const [key, verdict] of outcome.verdicts) verdicts.set(key, verdict);
-      const partial = partialFailure(group, outcome);
-      if (partial) {
-        logger.warn('Global eval round left some candidates undecided', {
-          deliveryId: args.info.deliveryId,
-          workflowRepo: group[0].reg.repoIdentifier,
-          candidateCount: group.length,
-          undecidedCount: partial.workflowNames.length,
-          error: partial.error,
-        });
-        failures.push(partial);
-      }
+    if (unsupported) {
+      settleGroupOutcome(
+        args,
+        group,
+        { ok: false, error: unsupported, attempts: 0, runId: randomUUID() },
+        verdicts,
+        failures,
+      );
       continue;
     }
-    // `attempts: 0` is the one outcome that never reached an agent, so it reads
-    // as "not attempted" everywhere it surfaces — including the commit check,
-    // where "failed" would send an author looking for a job that never ran.
-    const failureReason =
-      outcome.attempts === 0
-        ? `Global eval round not attempted: ${outcome.error}`
-        : `Global eval round failed: ${outcome.error}`;
-    logger.error('Global eval round failed', {
-      deliveryId: args.info.deliveryId,
-      workflowRepo: group[0].reg.repoIdentifier,
-      candidateCount: group.length,
-      attempts: outcome.attempts,
-      error: outcome.error,
-    });
-    markGroupIndeterminate(group, failureReason, verdicts);
-    failures.push({
-      runId: outcome.runId,
-      workflowRepoIdentifier: group[0].reg.repoIdentifier,
-      workflowNames: group.map((candidate) => candidate.lockEntry.name),
-      error: outcome.error,
-      attempts: outcome.attempts,
-    });
+    const plan = planGroup(group, args.deps.agentRegistry);
+    if (plan.refused.length > 0) {
+      settleGroupOutcome(
+        args,
+        plan.refused,
+        { ok: false, error: RESULT_AWARE_UNSUPPORTED_REASON, attempts: 0, runId: randomUUID() },
+        verdicts,
+        failures,
+      );
+    }
+    if (plan.run.length > 0) {
+      const outcome = await runGroupRound(args, plan.run, budgets, plan.requiresResultAwareSkip);
+      settleGroupOutcome(args, plan.run, outcome, verdicts, failures);
+    }
   }
 
   recordVerdictOutcomes(verdicts);

@@ -139,7 +139,7 @@ export function buildProgram(): Command {
   registerWorkflowCommands(program, getClient);
   registerRunsCommands(program, getClient);
   registerAttestationsCommands(program, getClient);
-  registerSigningKeyCommands(program);
+  registerSigningKeyCommands(program, tryGetClient);
   registerDashboardEncryptionKeyCommands(program);
   registerEventLogCommands(program, getClient);
   registerAccessLogCommands(program, getClient);

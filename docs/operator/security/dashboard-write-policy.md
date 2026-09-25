@@ -255,21 +255,21 @@ The full input-mode behavior is documented in [Secrets — operator path](./secr
 
 ## Wire shape
 
-The orchestrator's policy view is broadcast to the control plane on every WebSocket auth handshake and on every `kici-admin` policy change as an `orch.capabilities.update` message. The message wraps the orchestrator's whole capabilities object, so the control plane replaces its per-org cache wholesale instead of merging:
+The orchestrator sends its policy view to the control plane in the `capabilities` of its `auth.request` on every WebSocket handshake. On every `kici-admin` policy change it sends an `orch.capabilities.update` message. Both carry the orchestrator's whole capabilities object, so the control plane replaces its per-org cache wholesale instead of merging:
 
 ```json
 {
   "type": "orch.capabilities.update",
   "capabilities": {
     "dashboardWrites": {
-      "secrets.set": false,
+      "secrets.set": "disabled",
       "variables.set": "encrypted"
     }
   }
 }
 ```
 
-The `dashboardWrites` map is **sparse**: only operations that deviate from the permissive default appear. A missing key resolves to allowed, so an orchestrator running the default policy sends an empty map rather than all 27 operations. A value is either `false` (blocked) or a policy state such as `"encrypted"` (allowed only as a browser-sealed write).
+The `dashboardWrites` map is **sparse**: only operations that deviate from the permissive default appear. A missing key resolves to `permissive`, so an orchestrator running the default policy sends an empty map rather than all 27 operations. Each value is one of the three policy states: `"permissive"`, `"encrypted"` (allowed only as a browser-sealed write, and valid only for `secrets.set` and `variables.set`), or `"disabled"` (blocked). A frame carrying any other value fails to parse.
 
 The dashboard's `GET /api/v1/orgs/:customerId/orchestrators/:clusterName/capabilities` endpoint reads this cache and expands the sparse map into a full row per operation for the SPA.
 

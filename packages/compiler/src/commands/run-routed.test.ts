@@ -21,6 +21,7 @@ vi.mock('../local-plane/source-provider.js', () => ({
     sha: 'deadbeef',
     branch: 'kici-local',
     cleanup: vi.fn().mockResolvedValue(undefined),
+    warnings: [],
   }),
 }));
 vi.mock('../local-plane/plane-seed.js', () => ({
@@ -120,6 +121,32 @@ describe('runRoutedCommand', () => {
     // The isolated workdir cleanup runs.
     const wd = await (resolveWorkdir as ReturnType<typeof vi.fn>).mock.results[0].value;
     expect(wd.cleanup).toHaveBeenCalled();
+  });
+
+  it('prints each workdir warning on stderr, also under --quiet', async () => {
+    const { runRoutedCommand } = await import('./run-routed.js');
+    const { resolveWorkdir } = await import('../local-plane/source-provider.js');
+    const warning = 'Not copying the files of these submodules: vendor/sub.';
+    (resolveWorkdir as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      dir: '/tmp/clone-x',
+      ref: 'refs/heads/kici-local',
+      sha: 'deadbeef',
+      branch: 'kici-local',
+      cleanup: vi.fn().mockResolvedValue(undefined),
+      warnings: [warning],
+    });
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    try {
+      await runRoutedCommand({ local: true, offline: true, event: 'push', quiet: true });
+    } finally {
+      spy.mockRestore();
+    }
+    // fails-when: the warning goes through the quiet-gated logger and is dropped
+    expect(stderr.some((line) => line.includes(warning))).toBe(true);
   });
 
   it('--in-place resolves the working tree directly', async () => {

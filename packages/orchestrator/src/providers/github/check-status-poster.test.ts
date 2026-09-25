@@ -234,7 +234,6 @@ describe('GitHubCheckStatusPoster', () => {
       expect(mockOctokit.checks.update).not.toHaveBeenCalled();
       const name = mockOctokit.checks.create.mock.calls[0][0].name;
       expect(name).not.toBe('KiCI Security');
-      expect(name).not.toBe('KiCI: Organization workflows');
     });
 
     it('throws on API error', async () => {

@@ -13,7 +13,7 @@
  * logged.
  */
 import type { Kysely } from 'kysely';
-import { TERMINAL_JOB_STATES } from '@kici-dev/engine';
+import { AGENT_API_REQUEST_TIMEOUT_MS, TERMINAL_JOB_STATES } from '@kici-dev/engine';
 import {
   oidcTokenRequestParamsSchema,
   type OidcTokenResult,
@@ -32,6 +32,25 @@ export const DEFAULT_ORG_ID = '__default__';
 
 /** ID-token lifetime (seconds). */
 export const ORCHESTRATOR_ID_TOKEN_TTL_SECONDS = 600;
+
+/**
+ * Longest an agent mint waits for the provenance signer before it answers
+ * `{ deferred: true, code: 'unavailable' }`. Half the agent's `agent.api`
+ * timeout, so the deferred answer crosses the WebSocket and sandbox hops and
+ * reaches the step before the agent gives up on the call.
+ */
+export const ORCHESTRATOR_MINT_SIGNER_WAIT_MS = AGENT_API_REQUEST_TIMEOUT_MS / 2;
+
+/**
+ * Minimum spacing between two warnings about mints deferred for want of a
+ * signing key. The first deferral after a signer was last available warns at
+ * once; later ones within the interval are counted into the next warning.
+ */
+export const MINT_DEFER_WARN_INTERVAL_MS = 60_000;
+
+/** Logged when an agent mint defers because no provenance signing key is ready. */
+export const MINT_DEFERRED_NO_SIGNER_MESSAGE =
+  'provenance signing key is not provisioned; deferring the identity-token mint';
 
 export class OrchestratorMintRunNotFoundError extends Error {}
 export class OrchestratorMintJobNotFoundError extends Error {}
@@ -82,6 +101,7 @@ export async function mintOrchestratorIdToken(
       'run_id',
       'routing_key',
       'repo_identifier',
+      'workflow_repo_identifier',
       'ref',
       'sha',
       'workflow_name',
@@ -137,6 +157,7 @@ export async function mintOrchestratorIdToken(
       run_id: run.run_id,
       org_id: orgId,
       repo_identifier: run.repo_identifier,
+      workflow_repo_identifier: run.workflow_repo_identifier,
       ref: run.ref,
       sha: run.sha,
       workflow_name: run.workflow_name,
@@ -185,12 +206,18 @@ export class OrchestratorMintSignerUnavailableError extends Error {}
 export interface OrchestratorOidcTokenHandlerDeps {
   dispatcher: OrchestratorMintOwnershipResolver;
   /**
-   * Lazily resolve the orchestrator's signing key. Resolved on first token
-   * request (not at boot) so it is unaffected by the Raft leader-election race —
-   * by the time an agent requests a token the cluster has a leader and the key
-   * exists. May return null while the key is still being reconciled.
+   * Lazily resolve the orchestrator's signing key. May return null while the
+   * key is still being reconciled. The handler waits at most
+   * {@link ORCHESTRATOR_MINT_SIGNER_WAIT_MS} for it; a null or a later answer
+   * defers the mint.
    */
   resolveSigner: () => Promise<Signer | null>;
+  /**
+   * Whether this node is the Raft leader, named in the deferral warning so an
+   * operator can tell a non-leader waiting on the leader from a leader that
+   * could not create the key.
+   */
+  isLeader?: () => boolean;
   /** Mint deps except the signer (supplied lazily via `resolveSigner`). */
   mint: Omit<OrchestratorMintDeps, 'signer'>;
   /**
@@ -213,6 +240,7 @@ export interface OrchestratorOidcTokenHandlerDeps {
 export function createOrchestratorOidcTokenHandler(
   deps: OrchestratorOidcTokenHandlerDeps,
 ): (agentId: string, params: Record<string, unknown>) => Promise<OidcTokenResult> {
+  const deferralWarning = createSignerDeferralWarning(deps.isLeader);
   return async (agentId, params) => {
     const { jobId, audience } = oidcTokenRequestParamsSchema.parse(params);
     const owned = deps.dispatcher.resolveOwnedJob(agentId, jobId);
@@ -228,16 +256,84 @@ export function createOrchestratorOidcTokenHandler(
       logger.warn('mint-defer fault-injection ACTIVE via injected policy.', { jobId, audience });
       return { deferred: true, code: 'unavailable' };
     }
-    const signer = await deps.resolveSigner();
+    const signer = await resolveSignerWithin(deps.resolveSigner, ORCHESTRATOR_MINT_SIGNER_WAIT_MS);
     if (!signer) {
       // Signing configured but the key is not ready yet — defer the mint (the
       // agent freezes + DSSE-signs the statement; the retrier fulfils later).
+      deferralWarning.deferred({ jobId, runId: owned.runId, agentId });
       return { deferred: true, code: 'unavailable' };
     }
+    deferralWarning.resolved();
     const result = await mintOrchestratorIdToken(
       { ...deps.mint, signer },
       { runId: owned.runId, jobId, audience },
     );
     return { token: result.token, expiresIn: result.expiresIn, jti: result.jti };
   };
+}
+
+/**
+ * Rate-limited warning for mints deferred because no signing key is ready: at
+ * most one line per {@link MINT_DEFER_WARN_INTERVAL_MS}, never one per poll or
+ * per request. A mint that finds the signer ends the episode, so the next
+ * outage warns at once.
+ */
+function createSignerDeferralWarning(isLeader: (() => boolean) | undefined): {
+  deferred: (meta: { jobId: string; runId: string; agentId: string }) => void;
+  resolved: () => void;
+} {
+  let lastWarnAt: number | undefined;
+  let suppressed = 0;
+  return {
+    deferred(meta) {
+      const now = Date.now();
+      // fails-when: every deferral warns — one line per job during an outage.
+      // breaks-if-wrong: the first deferral of an outage must warn at once.
+      if (lastWarnAt !== undefined && now - lastWarnAt < MINT_DEFER_WARN_INTERVAL_MS) {
+        suppressed += 1;
+        return;
+      }
+      const leader = isLeader?.();
+      logger.warn(MINT_DEFERRED_NO_SIGNER_MESSAGE, {
+        ...meta,
+        deferredSinceLastWarning: suppressed,
+        ...(leader === undefined ? {} : { nodeIsLeader: leader, hint: signerWaitHint(leader) }),
+      });
+      lastWarnAt = now;
+      suppressed = 0;
+    },
+    resolved() {
+      lastWarnAt = undefined;
+      suppressed = 0;
+    },
+  };
+}
+
+function signerWaitHint(nodeIsLeader: boolean): string {
+  return nodeIsLeader
+    ? 'this node is the Raft leader and could neither load nor create the key; see the provenance signing key errors logged before this line'
+    : 'this node is not the Raft leader; it creates the key itself once a short leader grace has passed, so a deferral after that means it could neither load nor create the key; see the provenance signing key errors logged before this line';
+}
+
+/**
+ * Resolve the signer, or null once `waitMs` has passed. The resolver keeps
+ * running after the deadline and caches a signer it finds for the next mint; a
+ * rejection it raises after the deadline is dropped, and one raised before it
+ * propagates as it always did.
+ */
+async function resolveSignerWithin(
+  resolveSigner: () => Promise<Signer | null>,
+  waitMs: number,
+): Promise<Signer | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), waitMs);
+  });
+  const resolving = resolveSigner();
+  resolving.catch(() => {});
+  try {
+    return await Promise.race([resolving, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

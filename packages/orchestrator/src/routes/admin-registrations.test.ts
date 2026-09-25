@@ -468,6 +468,50 @@ describe('admin registration routes', () => {
       expect(deps.registrationStore.replaceAll).toHaveBeenCalled();
     });
 
+    it('records the dependency-cache key the submitted lock file carries', async () => {
+      // fails-when: the manual route drops the key, or keeps a stale one from an earlier push
+      const replaceAll = vi.fn();
+      deps = createMockDeps({
+        registrationStore: {
+          ...(createMockDeps().registrationStore as any),
+          replaceAll,
+          bumpVersion: vi.fn().mockResolvedValue(3),
+        },
+      });
+      app = createAdminRegistrationRoutes(deps);
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+      const body = lockBody([]);
+      const withKey = {
+        ...body,
+        lockFileContents: JSON.stringify({
+          ...JSON.parse(body.lockFileContents),
+          lockfileHash: 'lock-hash-1',
+          siblingsDigest: 'siblings-1',
+        }),
+      };
+
+      const keyed = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: withKey,
+      });
+      const plain = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body,
+      });
+
+      expect(keyed.status).toBe(200);
+      expect(plain.status).toBe(200);
+      expect(replaceAll.mock.calls[0][4].depCacheKey).toEqual({
+        lockfileHash: 'lock-hash-1',
+        siblingsDigest: 'siblings-1',
+      });
+      // breaks-if-wrong: a lock file with no key must clear, not keep, a stored one
+      expect(replaceAll.mock.calls[1][4].depCacheKey).toEqual({
+        lockfileHash: null,
+        siblingsDigest: null,
+      });
+    });
+
     it('accepts a binding to environments with no configured record (lenient)', async () => {
       // Reproduces the scaler-container cross-source E2E: the lock binds env
       // names that have no environment record in this orchestrator. matchContext

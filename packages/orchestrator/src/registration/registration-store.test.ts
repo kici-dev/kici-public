@@ -844,6 +844,183 @@ describe('RegistrationStore', () => {
     });
   });
 
+  describe('replaceAll with the dependency-cache key', () => {
+    const KEY = { lockfileHash: 'lock-hash-1', siblingsDigest: 'siblings-1' };
+
+    it('stores the lock file key on a new registration', async () => {
+      // fails-when: the INSERT drops either field, so a global run never probes the dependency cache
+      const { db, mocks } = createMockDb({ trxSelectResult: [] });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+          commitSha: 'a1',
+          depCacheKey: KEY,
+        },
+      );
+
+      const inserted = mocks.trxInsertValues.mock.calls[0][0];
+      expect(inserted.lockfile_hash).toBe('lock-hash-1');
+      expect(inserted.siblings_digest).toBe('siblings-1');
+      // fails-when: the key is written without the commit it describes, so it is never used
+      expect(inserted.dep_cache_key_sha).toBe('a1');
+    });
+
+    it('stores the lock file key on an existing registration', async () => {
+      // fails-when: the UPDATE keeps the previous key while the lock entry moves to a new lock
+      const existing = [
+        makeRegistrationRow({
+          workflow_name: 'wf-1',
+          customer_id: 'cust-1',
+          lockfile_hash: 'old-lock-hash',
+          siblings_digest: 'old-siblings',
+        }),
+      ];
+      const { db, mocks } = createMockDb({ trxSelectResult: existing });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+          commitSha: 'a1',
+          depCacheKey: KEY,
+        },
+      );
+
+      const set = mocks.trxUpdateSet.mock.calls[0][0];
+      expect(set.lockfile_hash).toBe('lock-hash-1');
+      expect(set.siblings_digest).toBe('siblings-1');
+      // fails-when: the UPDATE keeps the commit the previous key was written for
+      expect(set.dep_cache_key_sha).toBe('a1');
+      expect(set.commit_sha).toBe('a1');
+    });
+
+    it('clears a stored key when the registering lock file records none', async () => {
+      // fails-when: a lock with no key leaves the previous key on the row, so a run restores
+      //   dependencies built for a lock file it does not execute
+      // breaks-if-wrong: a lock that records a key must still store it (the tests above)
+      const existing = [
+        makeRegistrationRow({
+          workflow_name: 'wf-1',
+          customer_id: 'cust-1',
+          lockfile_hash: 'old-lock-hash',
+          siblings_digest: 'old-siblings',
+        }),
+      ];
+      const { db, mocks } = createMockDb({ trxSelectResult: existing });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+          depCacheKey: { lockfileHash: null, siblingsDigest: null },
+        },
+      );
+
+      const set = mocks.trxUpdateSet.mock.calls[0][0];
+      expect(set.lockfile_hash).toBeNull();
+      expect(set.siblings_digest).toBeNull();
+    });
+
+    it('writes no key when the caller supplies none', async () => {
+      // fails-when: an omitted key keeps a stale one on the row the lock entry replaces
+      const existing = [
+        makeRegistrationRow({ workflow_name: 'wf-1', lockfile_hash: 'old-lock-hash' }),
+      ];
+      const { db, mocks } = createMockDb({ trxSelectResult: existing });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+        },
+      );
+
+      expect(mocks.trxUpdateSet.mock.calls[0][0].lockfile_hash).toBeNull();
+      expect(mocks.trxUpdateSet.mock.calls[0][0].siblings_digest).toBeNull();
+    });
+
+    it("parseRow surfaces a key written for the row's current commit", async () => {
+      const rows = [
+        makeRegistrationRow({
+          lockfile_hash: 'h',
+          siblings_digest: 'd',
+          commit_sha: 'a1',
+          dep_cache_key_sha: 'a1',
+        }),
+      ];
+      const { db } = createMockDb({ selectManyResult: rows });
+
+      const [row] = await new RegistrationStore(db).getAll();
+
+      // breaks-if-wrong: the commit check still passes a key written with the current commit
+      expect(row.lockfileHash).toBe('h');
+      expect(row.siblingsDigest).toBe('d');
+    });
+
+    it('parseRow drops a key written for an older commit', async () => {
+      // An older writer moved the row to a1 and left the key it did not know about at a0.
+      const rows = [
+        makeRegistrationRow({
+          lockfile_hash: 'h-a0',
+          siblings_digest: 'd-a0',
+          commit_sha: 'a1',
+          dep_cache_key_sha: 'a0',
+        }),
+      ];
+      const { db } = createMockDb({ selectManyResult: rows });
+
+      const [row] = await new RegistrationStore(db).getAll();
+
+      // fails-when: the key of the a0 lock file is used for the a1 lock entry, and a global
+      //   run restores dependencies built for a lock file it does not execute
+      expect(row.lockfileHash).toBeNull();
+      expect(row.siblingsDigest).toBeNull();
+      expect(row.commitSha).toBe('a1');
+    });
+
+    it('parseRow drops a key with no recorded commit', async () => {
+      // A row keyed before the commit column existed, and a row registered with no commit.
+      const rows = [
+        makeRegistrationRow({ id: 'pre', lockfile_hash: 'h', commit_sha: 'a1' }),
+        makeRegistrationRow({ id: 'nocommit', lockfile_hash: 'h', dep_cache_key_sha: null }),
+      ];
+      const { db } = createMockDb({ selectManyResult: rows });
+
+      const result = await new RegistrationStore(db).getAll();
+
+      // fails-when: a key no commit ties to the row's lock entry is used
+      expect(result.map((r) => r.lockfileHash)).toEqual([null, null]);
+    });
+
+    it('parseRow surfaces a row written before the columns existed as no key', async () => {
+      // breaks-if-wrong: an old registration must read as "no key", which installs as before
+      const { db } = createMockDb({ selectManyResult: [makeRegistrationRow()] });
+
+      const [row] = await new RegistrationStore(db).getAll();
+
+      expect(row.lockfileHash).toBeNull();
+      expect(row.siblingsDigest).toBeNull();
+    });
+  });
+
   describe('getAll', () => {
     it('should return all registrations with parsed lock_entry', async () => {
       const wf = makeLockWorkflow('on-deploy');

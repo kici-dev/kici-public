@@ -1,8 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  AGENT_API_REQUEST_TIMEOUT_MS,
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
   type AgentToOrchestratorMessage,
+  type AgentCapabilities,
+  AgentCapabilityFlag,
+  agentRegisterSchema,
+  hasAgentCapability,
+  GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
 } from '@kici-dev/engine';
 import {
   MAX_COMPLETE_RESEND_ATTEMPTS,
@@ -217,6 +223,17 @@ describe('OrchestratorClient', () => {
       expect(msg.messageId).toBeDefined();
       // Reports its own package version so the Infrastructure page can show it.
       expect(msg.version).toBe(readAgentVersion());
+      // fails-when: the agent stops advertising that its eval round skips result-aware generators
+      expect(
+        hasAgentCapability(
+          msg.capabilities as AgentCapabilities,
+          AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators,
+        ),
+      ).toBe(true);
+      // fails-when: the agent stops self-reporting the label a result-aware round is routed by
+      expect(msg.labels).toEqual(expect.arrayContaining([GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL]));
+      // The advertised message still parses under the shared wire schema.
+      expect(agentRegisterSchema.safeParse(msg).success).toBe(true);
     });
 
     it('transitions to disconnected on close', () => {
@@ -1473,6 +1490,32 @@ describe('OrchestratorClient', () => {
         sizeBytes: 4096,
       });
       expect(response).toEqual({ type: 'cache.response', requestId: 'ipc-3' });
+    });
+  });
+
+  describe('agent API relay (sendApiRequest)', () => {
+    it('fails the call only once the shared agent.api timeout has passed', async () => {
+      const client = createClient();
+      registerClient(client);
+      const promise = client.sendApiRequest('oidc.token.request', { jobId: 'job-1' });
+      const outcome = promise.then(
+        () => 'resolved',
+        (err: Error) => err.message,
+      );
+      // breaks-if-wrong: an orchestrator answering just inside the window must
+      // still reach the step.
+      vi.advanceTimersByTime(AGENT_API_REQUEST_TIMEOUT_MS - 1);
+      await Promise.resolve();
+      let settled = false;
+      void outcome.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      // fails-when: the client times out on a number of its own instead of the
+      // shared constant the orchestrator sizes its signer wait from.
+      vi.advanceTimersByTime(1);
+      await expect(outcome).resolves.toMatch(/timed out/);
     });
   });
 

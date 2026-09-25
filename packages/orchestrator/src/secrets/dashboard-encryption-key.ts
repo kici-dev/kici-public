@@ -7,8 +7,7 @@
  * wrapped under `KICI_SECRET_KEY`) in the DB. Generation is LEADER-GATED so an
  * HA cluster never races two active keys; every node then loads the one active
  * row. A non-leader that finds no active row yet returns null this tick and is
- * retried on the next leadership/boot cycle. Mirrors
- * `reconcileOrchestratorSigningKey`'s db-custody path.
+ * retried on the next leadership/boot cycle.
  */
 import { createPublicKey } from 'node:crypto';
 import { calculateJwkThumbprint, type JWK } from 'jose';

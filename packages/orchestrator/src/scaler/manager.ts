@@ -18,6 +18,7 @@ import {
   platformToTaints,
   hostToScalerPlatform,
   PLATFORM_TAINT_LABELS,
+  AGENT_FEATURE_LABELS,
   agentTypeLabel,
   scalerLabel,
   resolveRoleLabels,
@@ -53,6 +54,7 @@ import {
 } from '../metrics/prometheus.js';
 import { ScalerEventType } from './types.js';
 import { ScaleDownReason } from './scaler-events.js';
+import { spawnsInJobImage, type ScalerAgentView } from './agent-fit.js';
 import { EventScalerBackend } from './event-backend.js';
 import type { ScalerEventEmitterLike } from './event-backend.js';
 import type { ClaimStore, ClaimedCredentials } from './claim-store.js';
@@ -234,7 +236,7 @@ interface ReservationEntry {
    * it, and therefore the other half of the shape a job has to match to be
    * served by a pre-spawned one. Not persisted, so it is absent on a
    * reservation `recoverState` rehydrated after a restart;
-   * {@link ScalerManager.canPrespawnedAgentServe} treats that as "cannot tell"
+   * {@link ScalerManager.agentView}'s shape check treats that as "cannot tell"
    * on the limits dimension alone rather than refusing.
    */
   limits?: { cpus: number; memBytes: number };
@@ -434,6 +436,21 @@ interface SpawningEntry {
   boundJobId?: string;
   /** Run this spawn's bound job belongs to. Undefined for warm-pool spawns. */
   runId?: string;
+  /**
+   * The agent starts inside its bound job's own container image. Such an agent
+   * may run only that job. Recorded here because the spawn is the one place
+   * that knows it, and this entry is what registration reads.
+   */
+  jobImage?: boolean;
+}
+
+/**
+ * The job a registered scaler agent was started for, and whether it runs
+ * inside that job's own image.
+ */
+interface AgentBinding {
+  jobId: string;
+  jobImage: boolean;
 }
 
 /**
@@ -736,6 +753,15 @@ export class ScalerManager {
    * dispatch has not yet arrived.
    */
   private readonly warmAgents = new Set<string>();
+
+  /**
+   * Registered agents this instance started for a specific queued job, keyed
+   * by agent id. The spawning entry that carries the binding is deleted at
+   * registration, so this is where {@link agentView} reads it: the agent always
+   * runs its own job, and an agent started inside a job's image runs nothing
+   * else.
+   */
+  private readonly boundAgents = new Map<string, AgentBinding>();
 
   /**
    * Warm agents whose destroy is issued but has not settled yet.
@@ -1090,7 +1116,7 @@ export class ScalerManager {
             // The same resolved limits a job-bound spawn of this label set
             // would carry. A warm agent's shape is fixed when it starts, and
             // it is the shape this pre-spawn just reserved and that
-            // `canPrespawnedAgentServe` matches jobs against — so the compute
+            // the shape check matches jobs against — so the compute
             // has to be started at it.
             spawnLimitsFor(effective.limits),
             // Unbound spawn, so no job/run identity — but the pool's taints
@@ -1170,28 +1196,37 @@ export class ScalerManager {
   }
 
   /**
-   * Whether this scaler pre-spawned (warm-filled) the agent, i.e. whether
-   * {@link canPrespawnedAgentServe} can ever answer false for it. A caller that
-   * picks one agent at a time uses this to decide whether the suitability check
-   * is worth carrying at all.
+   * Whether this scaler pre-spawned (warm-filled) the agent.
    */
   isPrespawnedAgent(agentId: string): boolean {
     return this.warmAgents.has(agentId);
   }
 
   /**
-   * Whether a pre-spawned (warm) agent can serve this job.
+   * What this scaler knows about an agent it started, for `canAgentRunJob`,
+   * or undefined for an agent it did not start.
+   */
+  agentView(agentId: string): ScalerAgentView | undefined {
+    if (!this.managedAgentIndex.has(agentId)) return undefined;
+    const binding = this.boundAgents.get(agentId);
+    return {
+      ...(binding ? { binding: { ...binding } } : {}),
+      prespawned: this.isPrespawnedAgent(agentId),
+      shapeFits: (resources) => this.prespawnedShapeFits(agentId, resources),
+    };
+  }
+
+  /**
+   * Whether a pre-spawned (warm) agent's shape fits the shape a job declares.
    *
    * A warm agent is generic by construction: it was started before the job
-   * existed, at the pool's declared shape and running the pool's agent image.
-   * Both are applied when the agent starts and cannot be changed afterwards —
-   * nothing in the agent reads a job's `resources`, and an already-running
-   * container cannot become a different image. So a job that needs something
-   * else must get its own agent instead of silently running with the pool's.
+   * existed, at the pool's declared shape. The shape is applied when the agent
+   * starts and cannot be changed afterwards — nothing in the agent reads a
+   * job's `resources`. So a job that needs another shape must get its own
+   * agent instead of silently running with the pool's.
    *
-   * Returns true for any agent this scaler did not pre-spawn: a job-bound or
-   * static agent is not this predicate's business. {@link isPrespawnedAgent}
-   * answers that half on its own.
+   * Returns true for any agent this scaler did not pre-spawn: a job-bound agent
+   * was started at its job's shape.
    *
    * Only the fields the job actually declares are compared. `resolveEffective`
    * layers a job's declaration over the label set and the scaler defaults field
@@ -1212,17 +1247,11 @@ export class ScalerManager {
    * them apart, so a job matched on `requests` alone can still land on an agent
    * capped somewhere else entirely.
    */
-  canPrespawnedAgentServe(
-    agentId: string,
-    job: { resources?: ResourceRequest; hasOwnContainerImage: boolean },
-  ): boolean {
+  private prespawnedShapeFits(agentId: string, resources: ResourceRequest | undefined): boolean {
     if (!this.isPrespawnedAgent(agentId)) return true;
 
-    // A warm agent runs the pool's agent image; it cannot become the job's.
-    if (job.hasOwnContainerImage) return false;
-
     // A job that declares nothing takes the pool's shape by definition.
-    const wanted = mirrorRequestsLimits(job.resources);
+    const wanted = mirrorRequestsLimits(resources);
     if (!wanted) return true;
 
     // A deliberate fail-open branch: no reservation means this cannot be told,
@@ -1536,6 +1565,10 @@ export class ScalerManager {
           agentTypeLabel(backend.type),
           scalerLabel(name),
           ...roleLabels,
+          // The agent-feature labels a spawned agent of this build self-reports
+          // at registration, so a job routed by one (a global eval round that
+          // must skip result-aware generators) matches a pool that can serve it.
+          ...AGENT_FEATURE_LABELS,
         ];
 
         return {
@@ -1799,6 +1832,9 @@ export class ScalerManager {
       spawnedAt: Date.now(),
       boundJobId: jobId,
       runId,
+      jobImage:
+        containerSpawn !== undefined &&
+        spawnsInJobImage(backend.type, backend.labelSets[match.labelSetIndex]),
     });
     // A claimed cluster slot already wrote this row inside the cap
     // transaction; re-writing it here would only reset `spawned_at`, which the
@@ -2405,6 +2441,11 @@ export class ScalerManager {
     // job is a warm fill, and only such an agent may be reaped.
     if (adopted.boundJobId == null) {
       this.warmAgents.add(agentId);
+    } else {
+      // Adoption takes event rows only, and an event spawn never starts
+      // inside the job's image (`spawnsInJobImage`), so the binding carries no
+      // image restriction.
+      this.boundAgents.set(agentId, { jobId: adopted.boundJobId, jobImage: false });
     }
     this.adoptedAgents.set(agentId, {
       scalerName: adopted.scalerName,
@@ -2509,9 +2550,15 @@ export class ScalerManager {
     spawning: SpawningEntry,
   ): { boundJobId?: string; mandatoryLabels: string[] } {
     // A warm spawn binds no job. The spawning entry is the only carrier of that
-    // fact and is deleted immediately below, so capture it now.
+    // fact and is deleted immediately below, so capture it now — and the same
+    // for the job a bound spawn was started for.
     if (spawning.boundJobId == null) {
       this.warmAgents.add(agentId);
+    } else {
+      this.boundAgents.set(agentId, {
+        jobId: spawning.boundJobId,
+        jobImage: spawning.jobImage === true,
+      });
     }
 
     // The in-memory entry always goes; what happens to the durable row depends
@@ -2614,6 +2661,7 @@ export class ScalerManager {
       }
       this.managedAgentIndex.delete(agentId);
       this.warmAgents.delete(agentId);
+      this.boundAgents.delete(agentId);
       this.adoptedAgents.delete(agentId);
       this.releaseAll(agentId);
       return;
@@ -2646,6 +2694,7 @@ export class ScalerManager {
 
     this.managedAgentIndex.delete(agentId);
     this.warmAgents.delete(agentId);
+    this.boundAgents.delete(agentId);
     this.adoptedAgents.delete(agentId);
     this.logForwarders.delete(agentId);
     this.agentJobCorrelation.delete(agentId);
@@ -3227,6 +3276,7 @@ export class ScalerManager {
     this.spawningAgents.clear();
     this.managedAgentIndex.clear();
     this.warmAgents.clear();
+    this.boundAgents.clear();
     this.warmDestroying.clear();
     this.adoptedAgents.clear();
     this.logForwarders.clear();

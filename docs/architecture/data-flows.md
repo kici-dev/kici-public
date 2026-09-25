@@ -5,7 +5,7 @@ description: End-to-end data flows through the KiCI three-tier architecture
 
 This document describes the key data flows through the KiCI architecture: webhook delivery, job execution, developer-initiated remote runs, dependency caching, re-run and cancel, trace ID propagation, internal event routing, and generic webhook ingestion.
 
-> **Lock file schema version:** The orchestrator accepts a compatibility window of lock schema versions rather than an exact match. A lock is accepted when its `schemaVersion` is at or above the orchestrator's oldest supported version (additive bumps add fields older readers ignore) and the orchestrator's own schema is at or above the lock's `minReaderVersion` (the newest breaking version at compile time). A lock below the floor must be recompiled with `kici compile` and pushed; a lock requiring a newer reader means the orchestrator must be upgraded. Both out-of-window cases are rejected with an actionable error rather than a silent mis-route. See [lock file and drift](../user/lock-file-and-drift.md#schema-compatibility-window).
+> **Lock file schema version:** The orchestrator accepts a compatibility window of lock schema versions rather than an exact match. A lock is accepted when its `schemaVersion` is at or above the orchestrator's oldest supported version (additive bumps add fields older readers ignore) and the orchestrator's own schema is at or above the lock's `minReaderVersion` (the newest breaking version at compile time, or schema v42 when an organization-wide workflow declares `approval`). A lock below the floor must be recompiled with `kici compile` and pushed; a lock requiring a newer reader means the orchestrator must be upgraded. Both out-of-window cases are rejected with an actionable error rather than a silent mis-route. See [lock file and drift](../user/lock-file-and-drift.md#schema-compatibility-window).
 
 ## Webhook delivery flow
 
@@ -212,19 +212,20 @@ No build job is dispatched. The execution agent performs exactly two S3 GETs and
 
 The source cache and dep cache are independent. Four combinations are possible:
 
-| Source | Deps | Behavior                                                                             |
-| ------ | ---- | ------------------------------------------------------------------------------------ |
-| HIT    | HIT  | Direct execution dispatch (fastest, two S3 GETs)                                     |
-| HIT    | MISS | No build job; execution agent falls back to inline `npm ci` after restoring source   |
-| MISS   | HIT  | Build job for source only (agent still packs deps opportunistically); then execution |
-| MISS   | MISS | Build job for source + deps (single job packs both), then execution                  |
+| Source | Deps | Behavior                                                            |
+| ------ | ---- | ------------------------------------------------------------------- |
+| HIT    | HIT  | Direct execution dispatch (fastest, two S3 GETs)                    |
+| HIT    | MISS | Build job for deps only (`buildDepsNeeded`), then execution         |
+| MISS   | HIT  | Build job for source only (`buildSourceNeeded`), then execution     |
+| MISS   | MISS | Build job for source + deps (single job packs both), then execution |
 
-Dep cache misses alone do **not** trigger a build job. Deps are platform-specific (`deps/{platform}-{arch}/{hash}.tar.gz`) so a build job would need a builder agent matching the target platform, which may not exist (e.g., an arm64 builder when only x64 builders are available). When the source cache misses, the dispatched build job piggy-backs dep packing if deps are also missing. A single build job handles both artifacts when both miss, avoiding duplicate builds.
+A miss on either cache triggers a build job, and the job carries `buildSourceNeeded` and `buildDepsNeeded` separately. Deps are platform-specific (`deps/{platform}-{arch}/{hash}.tar.gz`), so the build job requires a builder agent with the target platform's `kici:os:` and `kici:arch:` labels. A single build job handles both artifacts when both miss, avoiding duplicate builds. A miss needs its key: a workflow with no `contentHash` builds no source pack, and a lock with no `lockfileHash` builds no dependency tarball.
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 41.
-- **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 42.
+- **Cross-source dispatch** (a workflow registered against source A fired by a generic webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
+- **Global-workflow dispatch** (a workflow defined in repository A with `repos:`, fired by an event from repository B) uses both caches when A's registration records a commit. The build job packs A's `.kici/` at that commit under A's `contentHash`, and the dependency cache is keyed by the `lockfileHash` and `siblingsDigest` the registration stored from A's lock file. A registration with no commit clones and installs on the agent. See [global workflows](global-workflows.md#which-repository-each-decision-uses).
 
 ### Build deduplication
 

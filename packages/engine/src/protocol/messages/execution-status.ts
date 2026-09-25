@@ -152,6 +152,8 @@ export type TimeoutReason = z.infer<typeof TimeoutReason>;
  *    build_coordination, approval_misconfig, sandbox_denied, trust_policy).
  *  - `job`-scoped categories fail one job and leave siblings alone
  *    (context_rules, dynamic_eval, no_agent, matrix_expansion).
+ *  - `secret_resolution` is also job-scoped on a dynamically generated job
+ *    whose own context gate failed; its siblings still dispatch.
  */
 export const InitFailureCategory = z.enum([
   'secret_resolution',
@@ -304,6 +306,12 @@ export const TERMINAL_STEP_STATES: ReadonlySet<string> = new Set<ExecutionStepSt
 
 // --- Orchestrator -> Platform: Execution status messages ---
 
+/** Largest status generation a frame may carry: the Platform stores it in a 32-bit integer column. */
+export const STATUS_EPOCH_MAX = 2_147_483_647;
+
+/** A run's status generation — see `executionStatusSchema.statusEpoch`. */
+const statusEpochSchema = z.number().int().nonnegative().max(STATUS_EPOCH_MAX);
+
 /** Structured execution status update for Platform metadata tracking. */
 export const executionStatusSchema = z.object({
   type: z.literal('execution.status'),
@@ -395,6 +403,16 @@ export const executionStatusSchema = z.object({
   initFailure: initFailureSchema.optional(),
   /** Why a terminal run failed (only present for failed/cancelled runs). */
   failureClass: RunFailureClass.optional(),
+  /**
+   * The run's status generation. It starts at 0 and the orchestrator raises it
+   * each time the run leaves a terminal status (a run failed before a job it had
+   * already dispatched reported in, and then continues). The Platform keeps a
+   * terminal status against a non-terminal frame unless the frame's generation
+   * is newer, so a frame that arrives late cannot move a finished run back.
+   * Optional for backward compatibility: an older orchestrator omits it, and the
+   * Platform then applies the frame unguarded.
+   */
+  statusEpoch: statusEpochSchema.optional(),
 });
 
 /** Per-step status forwarded from agent to Platform (real-time). */
@@ -494,6 +512,8 @@ export const stateReplayRunSchema = z.object({
   failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
   /** Why the run failed (`RunFailureClass`); only present for failed/cancelled runs. */
   failureClass: RunFailureClass.optional(),
+  /** The run's status generation, with the same meaning as on `execution.status`. */
+  statusEpoch: statusEpochSchema.optional(),
   jobs: z
     .array(
       z.object({

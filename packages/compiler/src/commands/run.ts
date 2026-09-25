@@ -495,9 +495,13 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
   // URL), so a diff-only overlay against a remote HEAD would leave the agent
   // with no base tree. `fullWorkingTree: true` forces the complete selection
   // regardless of whether the repo has a git remote.
-  const { tarballPath, summary, hasRemote } = await createOverlayTarball(repoRoot, {
+  const { tarballPath, summary, hasRemote, warnings } = await createOverlayTarball(repoRoot, {
     fullWorkingTree: true,
   });
+  // Warnings name paths the remote workspace will not contain (submodules,
+  // dangling symlinks). They go to stderr so --json keeps stdout parseable and
+  // still shows them.
+  for (const warning of warnings) process.stderr.write(`${pc.yellow(`⚠ ${warning}`)}\n`);
 
   if (!options.quiet) {
     // Guarded by !quiet so `--json` (which sets quiet) keeps stdout pure JSON.

@@ -1410,7 +1410,7 @@ describe('PeerHandler', () => {
       const sink = createLogChunkSink({
         source: 'peer',
         stepLogBuffer: { addLines } as unknown as StepLogBuffer,
-        logWriter: { appendChunk } as unknown as LogWriter,
+        logWriter: { appendChunk, trackPending: vi.fn() } as unknown as LogWriter,
         executionTracker: { resolveJobName: () => Promise.resolve('build') },
         forwardToPlatform,
       });

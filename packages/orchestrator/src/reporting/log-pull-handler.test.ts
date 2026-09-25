@@ -164,6 +164,34 @@ describe('LogPullHandler', () => {
       expect(response.complete).toBe(true);
     });
 
+    it("includes a job's workflow-level setup log (step -1)", async () => {
+      const { handler, logStorage, send } = setup();
+      logStorage.seed(
+        'executions/run-1/job-test/step--1.log',
+        '{"ts":"2026-01-01T00:00:00Z","msg":"[host-checkout] Clone complete"}\n',
+      );
+      logStorage.seed(
+        'executions/run-1/job-test/step-0.log',
+        '{"ts":"2026-01-01T00:00:01Z","msg":"step 0"}\n',
+      );
+
+      await handler.handleRequest({
+        messageId: 'msg-setup',
+        executionId: 'run-1',
+        jobName: 'test',
+      });
+      await handler.handleRequest({ messageId: 'msg-setup-all', executionId: 'run-1' });
+
+      // fails-when: the file match is `step-(\d+)`, which skips `step--1.log`.
+      for (const call of send.mock.calls) {
+        const indexes = (call[0] as { chunks: Array<{ stepIndex: number }> }).chunks
+          .map((c) => c.stepIndex)
+          .sort((a, b) => a - b);
+        expect(indexes).toEqual([-1, 0]);
+      }
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
     it('returns all logs for entire execution', async () => {
       const { handler, logStorage, send } = setup();
       logStorage.seed(

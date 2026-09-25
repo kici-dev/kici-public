@@ -16,6 +16,8 @@ import {
   separateLabels,
   scalerAgentLabels,
   isSelfReportedLabel,
+  AGENT_FEATURE_LABELS,
+  GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
   derivePlatformTaints,
   PLATFORM_TAINT_LABELS,
   ScalerOs,
@@ -342,6 +344,17 @@ describe('isSelfReportedLabel', () => {
     expect(isSelfReportedLabel('kici:os:linux')).toBe(true);
     expect(isSelfReportedLabel('kici:arch:x64')).toBe(true);
     expect(isSelfReportedLabel('kici:host:abc123')).toBe(true);
+  });
+
+  it('treats agent-feature labels as self-reported behaviour facts', () => {
+    // fails-when: the register-time label-scope gate reads the feature label as an elevation
+    expect(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL).toBe(
+      'kici:agent-feature:global-eval-skips-result-aware',
+    );
+    expect(AGENT_FEATURE_LABELS).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+    expect(isSelfReportedLabel(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL)).toBe(true);
+    // breaks-if-wrong: a capability label (a privilege) must stay token-bound
+    expect(isSelfReportedLabel('kici:capability:ssh-transport')).toBe(false);
   });
 
   it('does NOT treat scaler-assigned labels (role/agent/scaler) as self-reported', () => {

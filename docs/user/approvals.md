@@ -141,9 +141,11 @@ Here `build-plan` runs, then the job pauses for a `dba` approval. On approval, `
 
 Because a step-level hold keeps an agent and its workspace occupied for the whole human wait, prefer job- or workflow-level gates when you do not need prior-step state, and keep step-level timeouts short. See the [operator note on agent occupancy](../operator/approvals.md#agent-occupancy-during-step-level-holds).
 
-### Not available on organization-wide workflows
+### Organization-wide workflows
 
-An `approval` gate applies to per-repository workflows only. A workflow whose trigger carries `repos:` — an [organization-wide workflow](global-workflows.md) — is dispatched by a path that never consults the gate, so the gate would not hold anything. `kici compile` refuses it with `error [E124]` at the workflow level and on any static job, rather than accepting a security control the workflow does not have. Drop the `approval`, or move the gated jobs into a workflow whose triggers carry no `repos:`. A job produced by a `dynamicJob` generator never passes through the compiler, so that one is caught at dispatch instead: the orchestrator logs an error naming the workflow and job, and runs it ungated.
+An `approval` gate works the same way in an [organization-wide workflow](global-workflows.md#holds-approvals-and-pull-requests-from-forks) as in a per-repository one. The held run belongs to the repository whose event started it, so a member scoped to that repository releases it.
+
+A lock whose organization-wide workflow declares `approval` requires orchestrator schema v42 or newer. An older orchestrator rejects that lock and asks you to upgrade it, because it would run the workflow without holding it. See [schema compatibility window](lock-file-and-drift.md#schema-compatibility-window).
 
 ## Drift gates (`when: 'drift'`)
 
@@ -214,7 +216,7 @@ kici approve <run-id> --job deploy --hold-type security
 
 Pass `--hold <id>` when the command's error lists two holds that `--hold-type` still cannot separate. The pull request's `KiCI Security` check stays pending until both holds have ended, and its description names the second gate and the permission that clears it.
 
-Each hold carries its own expiry, so the job is cancelled when the **first** one runs out.
+Each hold carries its own expiry, so the run fails when the **first** one runs out.
 
 ### Inline approval and `--approve-all` in `kici run remote`
 
@@ -238,4 +240,4 @@ You can also approve from the dashboard approval queue. See [Dashboard](dashboar
 - [Contexts](contexts.md) — operator-required reviewers on protected contexts.
 - [Approval gates (operator guide)](../operator/approvals.md) — teams, the approval queue, expiry, and self-approval.
 - [Approval gates (architecture)](../architecture/approvals.md) — the unified hold model and the step-level round-trip.
-- [Organization-wide workflows](global-workflows.md) — why an approval gate is refused there.
+- [Organization-wide workflows](global-workflows.md) — how holds, approvals and fork pull requests work there.

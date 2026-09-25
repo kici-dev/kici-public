@@ -1,45 +1,64 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { OrchestratorSigningKeyRow } from '../db/types.js';
-import type { UpsertActiveInput } from '../db/repos/signing-keys-repo.js';
-import { reconcileOrchestratorSigningKey } from './reconcile-signing-key.js';
+import type { ActivateIfCurrentResult, UpsertActiveInput } from '../db/repos/signing-keys-repo.js';
+import { createKeyCreationGate, reconcileOrchestratorSigningKey } from './reconcile-signing-key.js';
+import { SigningKeyStatus } from './signing-key-status.js';
 import { wrapPrivateJwk } from './db-signer.js';
 
 const KEY = '0'.repeat(64);
 const ISSUER = 'https://orch.example';
 
-/** Minimal in-memory stand-in for OrchestratorSigningKeyRepo (getActiveRow/upsertActive). */
+/** Minimal in-memory stand-in for OrchestratorSigningKeyRepo. */
 function fakeRepo(): {
   getActiveRow: () => Promise<OrchestratorSigningKeyRow | null>;
   upsertActive: (i: UpsertActiveInput) => Promise<boolean>;
+  activateIfCurrent: (
+    expected: string | null,
+    i: UpsertActiveInput,
+  ) => Promise<ActivateIfCurrentResult>;
   rows: Map<string, OrchestratorSigningKeyRow>;
 } {
   const rows = new Map<string, OrchestratorSigningKeyRow>();
+  const active = (): OrchestratorSigningKeyRow | null => {
+    for (const r of rows.values()) if (r.status === SigningKeyStatus.enum.active) return r;
+    return null;
+  };
+  const activate = (i: UpsertActiveInput): OrchestratorSigningKeyRow => {
+    for (const r of rows.values()) {
+      if (r.status === SigningKeyStatus.enum.active) r.status = SigningKeyStatus.enum.retiring;
+    }
+    const row: OrchestratorSigningKeyRow = {
+      kid: i.kid,
+      public_jwk: i.public_jwk,
+      encrypted_private_jwk: i.encrypted_private_jwk,
+      key_version: 1,
+      alg: i.alg,
+      signer_kind: i.signer_kind,
+      key_ref: i.key_ref,
+      status: SigningKeyStatus.enum.active,
+      revocation_reason: null,
+      created_at: new Date(),
+      activated_at: new Date(),
+      retired_at: null,
+      revoked_at: null,
+    };
+    rows.set(i.kid, row);
+    return row;
+  };
   return {
     rows,
     async getActiveRow() {
-      for (const r of rows.values()) if (r.status === 'active') return r;
-      return null;
+      return active();
     },
     async upsertActive(i: UpsertActiveInput) {
-      const existing = rows.get(i.kid);
-      if (existing?.status === 'active') return false;
-      for (const r of rows.values()) if (r.status === 'active') r.status = 'retiring';
-      rows.set(i.kid, {
-        kid: i.kid,
-        public_jwk: i.public_jwk,
-        encrypted_private_jwk: i.encrypted_private_jwk,
-        key_version: 1,
-        alg: i.alg,
-        signer_kind: i.signer_kind,
-        key_ref: i.key_ref,
-        status: 'active',
-        revocation_reason: null,
-        created_at: new Date(),
-        activated_at: new Date(),
-        retired_at: null,
-        revoked_at: null,
-      });
+      if (rows.get(i.kid)?.status === SigningKeyStatus.enum.active) return false;
+      activate(i);
       return true;
+    },
+    async activateIfCurrent(expected: string | null, i: UpsertActiveInput) {
+      const current = active();
+      if ((current?.kid ?? null) !== expected) return { activated: false, active: current };
+      return { activated: true, active: activate(i) };
     },
   };
 }
@@ -50,7 +69,7 @@ describe('reconcileOrchestratorSigningKey (db custody)', () => {
     const result = await reconcileOrchestratorSigningKey({
       repo,
       config: {},
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       audit: vi.fn(),
     });
@@ -58,13 +77,13 @@ describe('reconcileOrchestratorSigningKey (db custody)', () => {
     expect(repo.rows.size).toBe(0);
   });
 
-  it('leader generates a key when none exists, audits once, and is idempotent', async () => {
+  it('a node allowed to create generates a key when none exists, audits once, and is idempotent', async () => {
     const repo = fakeRepo();
     const audit = vi.fn();
     const deps = {
       repo,
       config: { provenanceSigningIssuer: 'https://orch.example' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       audit,
     };
@@ -82,17 +101,42 @@ describe('reconcileOrchestratorSigningKey (db custody)', () => {
     expect(audit).toHaveBeenCalledTimes(1);
   });
 
-  it('a non-leader with no active row waits (returns null, generates nothing)', async () => {
+  it('a node not yet allowed to create waits (returns null, generates nothing)', async () => {
     const repo = fakeRepo();
     const result = await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: 'https://orch.example' },
-      isLeader: () => false,
+      mayCreateKey: () => false,
       secretKey: KEY,
       audit: vi.fn(),
     });
     expect(result).toBeNull();
     expect(repo.rows.size).toBe(0);
+  });
+
+  it('refuses, and creates nothing, when the active key is of another custody kind', async () => {
+    const repo = fakeRepo();
+    await repo.upsertActive({
+      kid: 'kms-kid',
+      public_jwk: {},
+      encrypted_private_jwk: null,
+      alg: 'ES256',
+      signer_kind: 'aws-kms',
+      key_ref: 'arn:aws:kms:eu-west-1:1:key/k',
+    });
+    const activate = vi.spyOn(repo, 'activateIfCurrent');
+    // fails-when: an allowed node treats the keyless KMS row as "no key" and replaces it
+    await expect(
+      reconcileOrchestratorSigningKey({
+        repo,
+        config: { provenanceSigningIssuer: ISSUER },
+        mayCreateKey: () => true,
+        secretKey: KEY,
+        audit: vi.fn(),
+      }),
+    ).rejects.toThrow(/kms-kid is held in 'aws-kms' custody/);
+    expect(activate).not.toHaveBeenCalled();
+    expect(repo.rows.get('kms-kid')?.status).toBe(SigningKeyStatus.enum.active);
   });
 
   it('db custody without a master key fails loudly', async () => {
@@ -101,7 +145,7 @@ describe('reconcileOrchestratorSigningKey (db custody)', () => {
       reconcileOrchestratorSigningKey({
         repo,
         config: { provenanceSigningIssuer: 'https://orch.example' },
-        isLeader: () => true,
+        mayCreateKey: () => true,
         secretKey: undefined,
         audit: vi.fn(),
       }),
@@ -118,7 +162,7 @@ describe('reconcileOrchestratorSigningKey master-key rotation', () => {
     await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: OLD_KEY,
       audit: vi.fn(),
     });
@@ -131,7 +175,7 @@ describe('reconcileOrchestratorSigningKey master-key rotation', () => {
       reconcileOrchestratorSigningKey({
         repo,
         config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-        isLeader: () => true,
+        mayCreateKey: () => true,
         secretKey: KEY,
         audit: vi.fn(),
       }),
@@ -140,7 +184,7 @@ describe('reconcileOrchestratorSigningKey master-key rotation', () => {
     const reconciled = await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       oldSecretKey: OLD_KEY,
       audit: vi.fn(),
@@ -157,7 +201,7 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
     await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: OLD_KEY,
       audit: vi.fn(),
     });
@@ -174,7 +218,7 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
     const reconciled = await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       oldSecretKey: OLD_KEY,
       selfHeal,
@@ -192,7 +236,7 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
     const healed = await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       audit: vi.fn(),
     });
@@ -204,7 +248,7 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
     await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       audit: vi.fn(),
     });
@@ -212,7 +256,7 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
     await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: KEY,
       oldSecretKey: OLD_KEY,
       selfHeal,
@@ -226,7 +270,7 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
     await reconcileOrchestratorSigningKey({
       repo,
       config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-      isLeader: () => true,
+      mayCreateKey: () => true,
       secretKey: '2'.repeat(64),
       audit: vi.fn(),
     });
@@ -234,11 +278,39 @@ describe('reconcileOrchestratorSigningKey boot self-heal', () => {
       reconcileOrchestratorSigningKey({
         repo,
         config: { provenanceSigningIssuer: ISSUER, provenanceSignerKind: 'db' },
-        isLeader: () => true,
+        mayCreateKey: () => true,
         secretKey: KEY,
         oldSecretKey: OLD_KEY,
         audit: vi.fn(),
       }),
     ).rejects.toThrow(/KICI_SECRET_KEY_OLD/);
+  });
+});
+
+describe('createKeyCreationGate', () => {
+  it('lets the leader create at once', () => {
+    const gate = createKeyCreationGate({ isLeader: () => true, graceMs: 2_000, now: () => 0 });
+    expect(gate()).toBe(true);
+  });
+
+  it('lets a non-leader create only once the grace since its first ask has passed', () => {
+    let now = 10_000;
+    const gate = createKeyCreationGate({ isLeader: () => false, graceMs: 2_000, now: () => now });
+    // breaks-if-wrong: inside the grace the leader keeps the first chance.
+    expect(gate()).toBe(false);
+    now += 1_999;
+    expect(gate()).toBe(false);
+    // fails-when: the gate never opens for a non-leader, which is the cluster
+    // whose leader has signing disabled never getting a key.
+    now += 1;
+    expect(gate()).toBe(true);
+  });
+
+  it('opens for a node that becomes leader inside the grace', () => {
+    let leader = false;
+    const gate = createKeyCreationGate({ isLeader: () => leader, graceMs: 2_000, now: () => 0 });
+    expect(gate()).toBe(false);
+    leader = true;
+    expect(gate()).toBe(true);
   });
 });

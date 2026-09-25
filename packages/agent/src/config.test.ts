@@ -264,6 +264,66 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow(/sandboxNetwork/);
   });
 
+  describe('KICI_HOST_INSTALL_REGISTRIES', () => {
+    it('defaults to no extra origins', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      expect(loadConfig().hostInstallRegistries).toEqual([]);
+    });
+
+    it('normalizes each entry to its origin', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_HOST_INSTALL_REGISTRIES =
+        ' http://Verdaccio.LOCAL:4873/ , https://npm.acme.internal:443,,http://verdaccio.local:4873';
+      // breaks-if-wrong: an origin written with a trailing slash, an upper-case
+      // host or the scheme's default port parses to the same origin.
+      expect(loadConfig().hostInstallRegistries).toEqual([
+        'http://verdaccio.local:4873',
+        'https://npm.acme.internal',
+      ]);
+    });
+
+    it.each([
+      ['a bare host:port', 'verdaccio.local:4873'],
+      ['a non-http scheme', 'ftp://mirror.example'],
+      ['a path', 'http://verdaccio.local:4873/npm/'],
+      ['credentials', 'https://user:pass@npm.acme.internal'],
+      ['a query', 'https://npm.acme.internal/?x=1'],
+      ['an env reference in the host', 'http://${REGISTRY_HOST}:4873'],
+    ])('refuses startup on an entry with %s', (_name, entry) => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_HOST_INSTALL_REGISTRIES = `https://registry.example,${entry}`;
+      // fails-when: an invalid entry is dropped silently, so the operator
+      // believes an origin is allowed that the host install never matches.
+      expect(() => loadConfig()).toThrow(/KICI_HOST_INSTALL_REGISTRIES entry/);
+    });
+
+    it.each([
+      [
+        'userinfo',
+        'https://ci:s3cret@npm.acme.internal',
+        /"https:\/\/npm\.acme\.internal" carries credentials/,
+      ],
+      [
+        'a query',
+        'https://npm.acme.internal/?token=s3cret',
+        /"https:\/\/npm\.acme\.internal\/\?\[redacted\]" names more/,
+      ],
+    ])('refuses startup on %s without echoing the credential', (_name, entry, named) => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_HOST_INSTALL_REGISTRIES = entry;
+      let message = '';
+      try {
+        loadConfig();
+      } catch (err) {
+        message = String(err);
+      }
+      // breaks-if-wrong: the error still names the entry, without its credential, and the reason.
+      expect(message).toMatch(named);
+      // fails-when: the startup error prints the entry verbatim, credential included.
+      expect(message).not.toContain('s3cret');
+    });
+  });
+
   it('parses KICI_LOG_LEVEL enum values', () => {
     process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
     process.env.KICI_LOG_LEVEL = 'debug';

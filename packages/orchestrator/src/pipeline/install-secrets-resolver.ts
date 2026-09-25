@@ -7,16 +7,20 @@
  * `<context>:<secret-name>` syntax. The resolver:
  *
  *   1. Parses every qualified ref and groups by context name.
- *   2. Fires the per-context protection-rule pipeline once per unique env
- *      (branch / trust / concurrency / reviewer / wait-timer). A `reject`
- *      result fails the whole workflow dispatch with a clear reason; a
- *      `hold` / `wait` / `queue` result returns a structured `hold` decision
- *      so the caller can pause the workflow dispatch as a workflow-scoped held
- *      run and resume it when the gate clears. On the resume path the caller
- *      sets `skipProtectionGate` so the gate (already satisfied) is bypassed
- *      and secrets are resolved directly.
- *   3. Resolves secrets per context via `secretResolver.resolveForJob`
- *      (which writes its own audit log lines).
+ *   2. Runs the install gate (`install-gate.ts`): every referenced context's
+ *      protection rules (branch / trust / concurrency / reviewer / wait-timer)
+ *      are evaluated before it decides. Any `reject` fails the whole workflow
+ *      dispatch with a clear reason; otherwise any hold returns ONE structured
+ *      `hold` decision, aggregated across the contexts, so the caller can
+ *      pause the workflow dispatch as a workflow-scoped held run and resume it
+ *      when the gate clears. The hold records which contexts held and which
+ *      passed. On the resume path the caller sets `skipProtectionGate` and
+ *      hands back that record: the contexts that held are covered by the
+ *      approval, every other context is gated again, and a context that now
+ *      matches a different row is refused.
+ *   3. Resolves secrets per context via `secretResolver.resolveForContext`
+ *      against the row step 2 gated (which writes its own audit log lines),
+ *      so a context whose name is a glob pattern delivers its own bindings.
  *   4. Validates each registry URL scheme: HTTPS always allowed; `http://`
  *      allowed only for loopback / `*.local` hosts OR when the org operator
  *      has flipped `org_settings.allow_http_npm_registries=true`.
@@ -35,12 +39,15 @@ import type { ApproverClause, LockRegistry } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { ContextStore } from '../contexts/context-store.js';
-import { toContext } from '../contexts/context-store.js';
+import type { Context as ContextRow } from '../db/types.js';
 import { isUntrustedTier } from '../security/trust-tier.js';
+import type { JobDispatchContext } from '../contexts/protection/pipeline.js';
 import {
-  evaluateProtectionRules,
-  type JobDispatchContext,
-} from '../contexts/protection/pipeline.js';
+  gateInstall,
+  gateReleasedInstall,
+  type InstallGateOutcome,
+  type InstallGateRecord,
+} from './install-gate.js';
 import {
   InstallSecretsChannel,
   InstallSecretsDecisionReason,
@@ -92,10 +99,18 @@ export interface ResolveInstallSecretsArgs {
   secretResolver: SecretResolverApi | undefined;
   protectionContext: JobDispatchContext;
   /**
-   * Resume path: skip the protection-rule gate (already satisfied) and resolve
-   * secrets directly. The untrusted-contributor strip still runs first.
+   * Resume path: the dispatch continues past a released install-gate hold. The
+   * gate runs only for the contexts `releasedHold` does not cover. The
+   * untrusted-contributor strip still runs first.
    */
   skipProtectionGate?: boolean;
+  /**
+   * Resume path: what the released hold recorded (`hold` decision's
+   * `record`). Its held contexts are covered by the approval; every recorded
+   * context must still match the same row. Read as stored JSON: absent or
+   * malformed, it covers no context.
+   */
+  releasedHold?: InstallGateRecord;
 }
 
 /** Normalized requirement carried on a `hold` decision. */
@@ -126,6 +141,8 @@ export type ResolveInstallSecretsResult =
       holdType: string;
       queueType: 'context' | 'security';
       requirement: InstallHoldRequirement;
+      /** Which contexts held (the approval covers them) and which passed. */
+      record: InstallGateRecord;
     };
 
 /** Parse `<context>:<secret-name>`. Returns null on malformed input. */
@@ -262,87 +279,45 @@ export function resolveHoldType(
 }
 
 /**
- * Result of evaluating the per-context install gates. `held` carries the
- * structured gate outcome (action, env id, hold type, clauses, hold-expiry) so
- * the caller can pause the workflow dispatch as a workflow-scoped held run.
+ * Match every referenced context name once — exact name first, then a glob
+ * context whose pattern matches — so the protection gate and the secret
+ * resolution below both act on the same row. A name with no match maps to null.
  */
-type FireProtectionResult =
-  | { ok: true }
-  | { ok: false; reasonKind: 'env_not_found' | 'protection_rule_block'; reason: string }
-  | {
-      ok: false;
-      reasonKind: 'held';
-      action: 'hold' | 'wait' | 'queue';
-      envName: string;
-      contextId: string;
-      holdType: string;
-      holdUntil: string | undefined;
-      clauses: ApproverClause[];
-      reason: string;
-    };
+async function matchInstallContexts(
+  envNames: Iterable<string>,
+  resolvedOrgId: string,
+  contextStore: ContextStore,
+): Promise<Map<string, ContextRow | null>> {
+  const matched = new Map<string, ContextRow | null>();
+  for (const envName of envNames) {
+    matched.set(envName, await contextStore.matchContext(resolvedOrgId, envName));
+  }
+  return matched;
+}
 
 /**
- * Run the protection-rule pipeline once per unique context. On the first
- * `reject` env returns a reject result; on the first `hold`/`wait`/`queue` env
- * returns a structured `held` result. When `skipProtectionGate` is set (resume
- * path) the gate is bypassed entirely.
+ * The hold decision for a gate outcome that held: the aggregated verdict, the
+ * context that names the hold, and the record of which contexts held.
  */
-async function fireProtectionRulesPerEnv(args: {
-  envNames: Iterable<string>;
-  resolvedOrgId: string;
-  contextStore: ContextStore;
-  trustResolution: TrustResolution | undefined;
-  protectionContext: JobDispatchContext;
-  skipProtectionGate: boolean;
-}): Promise<FireProtectionResult> {
-  const { envNames, resolvedOrgId, contextStore, trustResolution, protectionContext } = args;
-  if (args.skipProtectionGate) return { ok: true };
-  for (const envName of envNames) {
-    const envRow = await contextStore.matchContext(resolvedOrgId, envName);
-    if (!envRow) {
-      return {
-        ok: false,
-        reasonKind: 'env_not_found',
-        reason: `registries: refers to context '${envName}' which does not exist`,
-      };
-    }
-    const env = toContext(envRow);
-    // Workflow-level install has no per-job concurrency group — pass the
-    // env name itself so the concurrency-gate counts on the env scope only.
-    const concurrencyGroup = envName;
-    // Workflow-install protection does not queue on concurrency: the running
-    // count is always 0 here, so the concurrency gate never holds a workflow
-    // install. Concurrency limits apply at the job scope, enforced by the
-    // concurrency-groups module on dispatch.
-    const result = await evaluateProtectionRules(
-      env,
-      protectionContext,
-      0,
-      concurrencyGroup,
-      trustResolution?.tier,
-    );
-    if (result.action === 'pass') continue;
-    if (result.action === 'reject') {
-      const detail = result.reason ?? 'rejected';
-      return {
-        ok: false,
-        reasonKind: 'protection_rule_block',
-        reason: `context '${envName}' install gate reject: ${detail}`,
-      };
-    }
-    return {
-      ok: false,
-      reasonKind: 'held',
-      action: result.action,
-      envName,
-      contextId: env.id,
-      holdType: resolveHoldType(result.action, result.holdType),
-      holdUntil: result.holdUntil,
+function holdDecision(
+  gate: Extract<InstallGateOutcome, { kind: 'hold' }>,
+): Extract<ResolveInstallSecretsResult, { decision: 'hold' }> {
+  const { result, primary } = gate;
+  const holdType = resolveHoldType(result.action, result.holdType);
+  return {
+    decision: 'hold',
+    action: result.action,
+    envName: primary.name,
+    contextId: primary.id,
+    holdType,
+    queueType: holdType === HoldType.enum.security ? 'security' : 'context',
+    requirement: {
       clauses: result.clauses ?? [],
-      reason: result.reason ?? `context '${envName}' install gate ${result.action}`,
-    };
-  }
-  return { ok: true };
+      expiresAt: result.holdUntil ?? new Date(Date.now() + DEFAULT_HOLD_EXPIRY_MS).toISOString(),
+      reason: result.reason ?? `context '${primary.name}' install gate ${result.action}`,
+    },
+    record: gate.record,
+  };
 }
 
 export async function resolveInstallSecrets(
@@ -408,47 +383,41 @@ export async function resolveInstallSecrets(
     };
   }
 
-  const gateResult = await fireProtectionRulesPerEnv({
-    envNames: collected.envs.keys(),
-    resolvedOrgId: args.resolvedOrgId,
-    contextStore: args.contextStore,
+  const matched = await matchInstallContexts(
+    collected.envs.keys(),
+    args.resolvedOrgId,
+    args.contextStore,
+  );
+  const gateInputs = {
+    matched,
     trustResolution: args.trustResolution,
     protectionContext: args.protectionContext,
-    skipProtectionGate: args.skipProtectionGate ?? false,
-  });
-  if (!gateResult.ok && gateResult.reasonKind === 'held') {
+  };
+  const gate = args.skipProtectionGate
+    ? await gateReleasedInstall({ ...gateInputs, releasedHold: args.releasedHold })
+    : await gateInstall(gateInputs);
+  if (gate.kind === 'hold') {
     recordHold();
-    const expiresAt =
-      gateResult.holdUntil ?? new Date(Date.now() + DEFAULT_HOLD_EXPIRY_MS).toISOString();
-    return {
-      decision: 'hold',
-      action: gateResult.action,
-      envName: gateResult.envName,
-      contextId: gateResult.contextId,
-      holdType: gateResult.holdType,
-      queueType: gateResult.holdType === HoldType.enum.security ? 'security' : 'context',
-      requirement: {
-        clauses: gateResult.clauses,
-        expiresAt,
-        reason: gateResult.reason,
-      },
-    };
+    return holdDecision(gate);
   }
-  if (!gateResult.ok) {
-    recordReject(
-      gateResult.reasonKind === 'env_not_found'
-        ? InstallSecretsDecisionReason.EnvNotFound
-        : InstallSecretsDecisionReason.ProtectionRuleBlock,
-    );
-    return { decision: 'reject', reason: gateResult.reason };
+  if (gate.kind === 'reject') {
+    recordReject(gate.reasonKind);
+    return { decision: 'reject', reason: gate.reason };
   }
 
   // Resolve once per unique env, then look up the bare secret names from
   // each result. Missing secret => reject with a clear message.
   const perEnv = new Map<string, Record<string, string>>();
   for (const envName of collected.envs.keys()) {
+    const envRow = matched.get(envName);
     const startNs = performance.now();
-    const resolved = await args.secretResolver.resolveForJob(args.resolvedOrgId, envName);
+    // Both gates reject an unmatched name, so every name here matched a row.
+    const resolved = envRow
+      ? await args.secretResolver.resolveForContext(args.resolvedOrgId, {
+          id: envRow.id,
+          name: envName,
+        })
+      : {};
     installSecretsTokenResolutionDurationSeconds.record((performance.now() - startNs) / 1000, {
       context: envName,
     });

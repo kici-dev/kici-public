@@ -118,6 +118,8 @@ interface Harness {
   registered: () => string[];
   /** The `globalWorkflowNames` set the store was told to mark. */
   markedGlobal: () => string[];
+  /** The dependency-cache key the store was told to record. */
+  depCacheKey: () => unknown;
   isWorkflowRepoAllowed: ReturnType<typeof vi.fn>;
 }
 
@@ -129,7 +131,13 @@ interface Harness {
  * and leave the per-repo workflow registered, and a single-workflow fixture
  * cannot tell "dropped the globals" from "dropped everything".
  */
-function makeDeps(over: { allowed: boolean; orgId?: string; reason?: string }): Harness {
+function makeDeps(over: {
+  allowed: boolean;
+  orgId?: string;
+  reason?: string;
+  /** Dependency-cache fields the registering lock file records. */
+  lockKey?: { lockfileHash?: string; siblingsDigest?: string };
+}): Harness {
   const orgId = over.orgId ?? DEFAULT_ORG;
   const isWorkflowRepoAllowed = vi.fn(async () => ({
     allowed: over.allowed,
@@ -158,7 +166,6 @@ function makeDeps(over: { allowed: boolean; orgId?: string; reason?: string }): 
     checkStatusPoster: {
       provider: 'github',
       postCheckStatus: vi.fn(),
-      postGlobalWorkflowsSkippedCheck: vi.fn(),
       postGlobalEvalFailedCheck: vi.fn(),
     },
     lockFileFetcher: { fetchLockFile: vi.fn() },
@@ -188,6 +195,7 @@ function makeDeps(over: { allowed: boolean; orgId?: string; reason?: string }): 
         schemaVersion: 34,
         source: { file: '.kici/workflows/ci.ts', export: '#default' },
         contentHash: 'srchash',
+        ...over.lockKey,
         workflows: [
           workflow(GLOBAL_WORKFLOW, [{ type: 'glob', pattern: '**' }]),
           workflow(PER_REPO_WORKFLOW),
@@ -216,6 +224,9 @@ function makeDeps(over: { allowed: boolean; orgId?: string; reason?: string }): 
       ...((replaceAll.mock.calls[0]?.[4] as { globalWorkflowNames?: Set<string> } | undefined)
         ?.globalWorkflowNames ?? new Set<string>()),
     ],
+    depCacheKey: () =>
+      ((replaceAll.mock.calls as unknown[][])[0]?.[4] as { depCacheKey?: unknown } | undefined)
+        ?.depCacheKey,
     isWorkflowRepoAllowed,
   };
 }
@@ -357,5 +368,35 @@ describe('a failed org lookup says the org was downgraded, not resolved', () => 
 
     expect(lines.countLookupFailures()).toBe(0);
     expect(lines.find().orgId).toBe(DEFAULT_ORG);
+  });
+});
+
+/**
+ * A registration records the dependency-cache key of the lock file that
+ * registered it, so a global run dispatched from the registration probes the
+ * dependency cache with the key a per-repository run of the same lock uses.
+ */
+describe('a default-branch push records the lock file dependency-cache key', () => {
+  it('hands the store the lock file key', async () => {
+    // fails-when: the push path drops the key, so every global run installs its dependencies
+    const h = makeDeps({
+      allowed: true,
+      orgId: REAL_ORG,
+      lockKey: { lockfileHash: 'lock-hash-1', siblingsDigest: 'siblings-1' },
+    });
+
+    await processWebhook(makeInfo(), h.deps);
+
+    expect(h.registered().sort()).toEqual([GLOBAL_WORKFLOW, PER_REPO_WORKFLOW].sort());
+    expect(h.depCacheKey()).toEqual({ lockfileHash: 'lock-hash-1', siblingsDigest: 'siblings-1' });
+  });
+
+  it('hands the store no key when the lock file records none', async () => {
+    // breaks-if-wrong: a lock with no dependency lockfile must clear a key an earlier lock stored
+    const h = makeDeps({ allowed: true, orgId: REAL_ORG });
+
+    await processWebhook(makeInfo(), h.deps);
+
+    expect(h.depCacheKey()).toEqual({ lockfileHash: null, siblingsDigest: null });
   });
 });

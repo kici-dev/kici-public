@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import type { Job, Workflow, FilterContext, DynamicJobContext } from '@kici-dev/sdk';
+import { dynamicJob } from '@kici-dev/sdk';
 import { runGlobalEvalRound, type GlobalEvalRoundArgs } from './global-eval-runner.js';
 import { GLOBAL_WORKFLOW_ENV_KEYS } from './global-workflow-env.js';
 import { buildEvalShell } from './job-runner.js';
@@ -178,6 +179,52 @@ describe('runGlobalEvalRound', () => {
 
     expect(result.candidates[0]).toMatchObject({ run: false, indeterminate: true });
     expect(result.candidates[0].reason).toContain("Duplicate job name 'build'");
+  });
+
+  it('skips a generator declared with needs and runs a needs-free one', async () => {
+    let resultAwareCalls = 0;
+    const wf = makeWorkflow({
+      name: 'split',
+      jobs: [
+        makeJob('build'),
+        dynamicJob('shards', async () => [makeJob('shard-1')]),
+        dynamicJob('reports', {
+          needs: ['build'],
+          generate: async () => {
+            resultAwareCalls += 1;
+            return [makeJob('report')];
+          },
+        }),
+      ],
+    });
+
+    const result = await runGlobalEvalRound(
+      argsFor({ 's.ts': [wf] }, [{ workflowName: 'split', sourceFile: 's.ts', hasFilter: false }]),
+    );
+
+    // fails-when: the round runs the result-aware generator (no upstream outputs exist yet)
+    expect(resultAwareCalls).toBe(0);
+    // breaks-if-wrong: the needs-free generator in the same workflow must still run
+    expect(result.candidates[0].run).toBe(true);
+    expect(result.candidates[0].jobs?.map((j) => j.name)).toEqual(['shard-1']);
+  });
+
+  it('returns no jobs key when every generator is result-aware', async () => {
+    const wf = makeWorkflow({
+      name: 'only-deferred',
+      jobs: [
+        makeJob('build'),
+        dynamicJob('reports', { needs: ['build'], generate: async () => [makeJob('r')] }),
+      ],
+    });
+
+    const result = await runGlobalEvalRound(
+      argsFor({ 'o.ts': [wf] }, [
+        { workflowName: 'only-deferred', sourceFile: 'o.ts', hasFilter: false },
+      ]),
+    );
+
+    expect(result.candidates).toEqual([{ workflowName: 'only-deferred', run: true }]);
   });
 
   it('allows two generators emitting distinct job names', async () => {

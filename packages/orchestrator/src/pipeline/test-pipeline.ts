@@ -294,6 +294,12 @@ function decryptCliSecrets(input: TestTriggerInput): {
  * overlay the CLI-uploaded contexts (CLI wins per-context). Keyed by the
  * fixture context name (e.g. `db`), not the env name — the run carries these
  * verbatim on every dispatched job via `extraJobConfig.namespacedSecrets`.
+ *
+ * Each `envName` is matched the way a job's declared context is — exact name
+ * first, then a glob context whose pattern matches — and the matched row both
+ * decides the test-run gate and supplies the bindings the secrets resolve
+ * through. Without a context store nothing is resolved, and a warning names the
+ * mappings that were skipped; every orchestrator that serves test runs wires one.
  */
 async function resolveFixtureNamespacedSecrets(
   input: TestTriggerInput,
@@ -302,22 +308,29 @@ async function resolveFixtureNamespacedSecrets(
 ): Promise<{ namespaced: Record<string, Record<string, string>> } | { rejected: string }> {
   const namespaced: Record<string, Record<string, string>> = {};
 
-  for (const [ctxName, envName] of Object.entries(input.secrets ?? {})) {
-    if (deps.db) {
-      const env = await deps.db
-        .selectFrom('contexts')
-        .select(['allow_local_execution'])
-        .where('org_id', '=', orgId)
-        .where('name', '=', envName)
-        .executeTakeFirst();
-      if (!env || !env.allow_local_execution) {
-        return {
-          rejected: `Fixture secret context '${ctxName}' maps to context '${envName}' which does not allow test runs`,
-        };
-      }
+  const mappings = Object.entries(input.secrets ?? {});
+  // fails-when: a fixture's secret mappings are dropped with no trace
+  if (mappings.length > 0 && !deps.contextStore) {
+    logger.warn('Fixture secret mappings not resolved: no context store is configured', {
+      orgId,
+      mappings: mappings.map(([ctxName, envName]) => `${ctxName}=${envName}`),
+    });
+  }
+  for (const [ctxName, envName] of mappings) {
+    if (!deps.contextStore) continue;
+    const env = await deps.contextStore.matchContext(orgId, envName);
+    // fails-when: a context that does not allow test runs (or no context) hands its secrets to a test run
+    // breaks-if-wrong: a fixed or glob context with allow_local_execution must still resolve
+    if (!env || !env.allow_local_execution) {
+      return {
+        rejected: `Fixture secret context '${ctxName}' maps to context '${envName}' which does not allow test runs`,
+      };
     }
     if (deps.secretResolver) {
-      namespaced[ctxName] = await deps.secretResolver.resolveForJob(orgId, envName);
+      namespaced[ctxName] = await deps.secretResolver.resolveForContext(orgId, {
+        id: env.id,
+        name: envName,
+      });
     }
   }
 

@@ -11,7 +11,7 @@ A context in KiCI provides:
 
 - **Variables** -- non-secret key-value configuration (e.g., `API_URL`, `CLUSTER_NAME`)
 - **Scoped secrets** -- encrypted values bound to the context via scope bindings
-- **Protection rules** -- branch restrictions, required reviewers, wait timers, and concurrency limits
+- **Protection rules** -- branch restrictions, repository patterns, required reviewers, wait timers, and concurrency limits
 - **Per-source overrides** -- repositories can override unlocked variables for their own deployments
 
 ## SDK API
@@ -174,6 +174,14 @@ When a job targets a context, variables are merged in this order (last wins):
 
 Contexts can have protection rules that gate job execution:
 
+A job that does not start at once gets no context secrets while it waits. This applies to:
+
+- a job that a rule holds (required reviewers, a wait timer, minimum trust, or a concurrency limit);
+- a job that an approval gate (`requireApproval`) holds;
+- a job that waits for the jobs in its `needs` list.
+
+While the job waits, the orchestrator stores the names of its contexts, not their values. When the job is released, the orchestrator resolves the context's variables and secrets and dispatches the job with them. So a secret that you rotate while the job waits reaches the job with its new value. If that resolution fails, or a context is deleted or recreated while the job waits, the job fails with the error. It never runs without the secrets of its contexts.
+
 ### Branch restrictions
 
 Limit which branches can deploy to a context:
@@ -183,6 +191,8 @@ Allowed branches: main, release/*
 ```
 
 Jobs from other branches are rejected immediately with an error message.
+
+For a job of an [organization-wide workflow](./global-workflows.md#secrets-come-from-the-workflow-repository), the repository and branch are the workflow repository and the branch its workflow was registered from. The branch of the source repository that fired the run is not checked.
 
 **Most internally-triggered runs carry a branch.** KiCI starts these runs for itself: a [schedule](./sdk/triggers.md) fire, a [custom event](./events.md), a completion trigger, a failure batch, or an [invoke gate](./global-workflows.md) summon. None comes from a branch push. A run with one source branch presents it:
 
@@ -211,6 +221,20 @@ type instead
 ```
 
 To limit a context by how the run started instead of by branch, use a **trigger-type filter**: the trigger type is a real name (`schedule`, `kici_event`, `workflow_complete`, `job_complete`), so a filter that allows it works on these runs.
+
+### Repository patterns
+
+Limit which repositories can use a context:
+
+```
+Repository patterns: acme/workflows, acme/deploy-*
+```
+
+Each pattern is a glob over the repository's `owner/repo` name. A job from a repository that matches no pattern is rejected immediately. The failure reason names the repository and the context. A context with no patterns applies to every repository.
+
+For a job of an [organization-wide workflow](./global-workflows.md), the pattern is checked against the **workflow repository**: the repository that defines the workflow, not the repository whose event started it. So a context limited to `acme/workflows` admits every job of the organization-wide workflows in `acme/workflows`, whichever source repository fired them. It rejects a workflow that a source repository defines for itself. This is the main control that keeps a source repository from binding a context meant for your organization-wide workflows.
+
+Set the patterns in the dashboard **Protection** tab, or with `kici-admin context create` / `kici-admin context set-policy` and `--repo-patterns '["acme/workflows"]'`. Pass `--repo-patterns '[]'` to clear them. See the [`kici-admin context` reference](../operator/orchestrator/kici-admin/secrets-tokens-context.md#context----context-management-dual-mode).
 
 ### Required reviewers
 
@@ -270,9 +294,9 @@ Held runs can be approved:
 - Via the **dashboard** on the [Approval queue](dashboard/contexts-and-secrets.md#approval-queue) page, which lists security and context holds together
 - Via a PR comment: `/kici approve` (commenter must have `ci_trust:write+`)
 
-A hold raised by the fork switch covers the whole pull request and uses the org's approval expiry (default 72 hours). A `minimumTrust` hold is raised by a context, so it uses that context's own hold expiry (default one hour). A job carrying both a reviewer approval hold and a security hold carries both expiries, and whichever comes first cancels the run.
+A hold raised by the fork switch covers the whole pull request and uses the org's approval expiry (default 72 hours). A `minimumTrust` hold is raised by a context, so it uses that context's own hold expiry (default one hour). A job carrying both a reviewer approval hold and a security hold carries both expiries, and whichever comes first ends the hold: an expired hold fails the run with an expiry reason.
 
-While the fork switch is holding a pull request, your organization's global workflows do not run for it. Approving the hold releases that pull request's own workflows; it does not retroactively run the organization's global workflows for the event.
+While the fork switch is holding a pull request, its [organization-wide workflow](global-workflows.md#holds-approvals-and-pull-requests-from-forks) runs wait in the same security queue. They are the pull request's global runs, plus one `__globaleval__<owner>/<repo>` evaluation run for each workflow repository that needs a pre-run evaluation. Approving the hold runs them with the pull request's own workflows.
 
 ### Concurrency limits
 
@@ -341,7 +365,7 @@ Each context has four tabs:
 
 2. **Secrets** -- view bound secret scopes and their resolved secret count. Add bindings by specifying scope glob patterns (e.g., `aws/prod/**`).
 
-3. **Protection** -- configure branch restrictions, required reviewers, wait timers, and concurrency limits with enable toggles for each section. Turning a section's toggle off and saving clears that rule on the context, so the gate stops applying to new runs. Emptying the hold expiry field clears it too, and held runs fall back to the default one-hour hold window.
+3. **Protection** -- configure branch restrictions, repository patterns, required reviewers, wait timers, and concurrency limits with enable toggles for each section. Turning a section's toggle off and saving clears that rule on the context, so the gate stops applying to new runs. Emptying the hold expiry field clears it too, and held runs fall back to the default one-hour hold window.
 
 4. **History** -- view filtered runs targeting this context.
 

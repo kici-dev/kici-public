@@ -144,7 +144,7 @@ Two further sentinels, `__workflow_modification__` and `__unknown_contributor__`
 | `pending`  | Awaiting reviewer approval or timer expiry      |
 | `approved` | Reviewer approved; job proceeds to dispatch     |
 | `rejected` | Reviewer rejected; job is cancelled             |
-| `expired`  | Hold expiry timeout reached; job is cancelled   |
+| `expired`  | Hold expiry timeout reached; run fails          |
 | `released` | Workflow-scope wait timer elapsed; run proceeds |
 
 ### Expiry and cleanup
@@ -152,9 +152,9 @@ Two further sentinels, `__workflow_modification__` and `__unknown_contributor__`
 - Default hold expiry: 3600 seconds (1 hour), configurable per-context via `hold_expiry_seconds`
 - A context whose `hold_expiry_seconds` is cleared (`NULL`) uses that same 3600-second default — as does a context that never set one, since the column carries no default of its own
 - Clear a context's hold expiry with an empty value: `kici-admin context set-policy --org <id> --env <name> --hold-expiry ""`
-- A hold expiry of `0` is rejected. It would place the hold's deadline at the instant the hold is created, so the stale detector expires it before a reviewer can act — cancelling the job the hold existed to gate
+- A hold expiry of `0` is rejected. It would place the hold's deadline at the instant the hold is created, so the stale detector expires it before a reviewer can act — failing the run the hold existed to gate
 - The stale run detector (Sub-scan E) periodically calls `heldRunStore.expireOverdue()` to transition expired pending holds to `expired` status
-- Expired held runs result in the associated job being cancelled
+- An expired hold fails its run with an `Approval expired` reason
 
 ### Approval flow
 
@@ -223,6 +223,12 @@ SELECT name, branch_restrictions FROM contexts WHERE org_id = 'your-org';
 **Fix:** Update branch restrictions to include the required branch pattern, or remove restrictions entirely by setting `branch_restrictions = '[]'`.
 
 For a job bound to multiple contexts (`contexts: ['staging', 'my-testing']`), protection rules combine all-must-pass: the run is rejected if **any** configured bound context rejects it, and the rejection reason names the offending context and rule (e.g. `multi-context gate: 'my-testing' rejected (branch_restricted: branch 'main' not allowed)`). A bound name with no configured context contributes no rules (it is skipped, not rejected). Check the branch restrictions of every configured context in the array, not just the first.
+
+**Symptom:** Job fails with "Repository 'X' not allowed for context 'Y'" (reason `repo_unmatched` in a multi-context gate).
+
+**Diagnosis:** The context lists repository patterns, and the job's repository matches none of them. `kici-admin context show --org <id> --name <context>` prints the patterns as `repos=` on the `policy:` line. For a job of an organization-wide workflow, the repository checked is the workflow repository, not the source repository.
+
+**Fix:** Add a matching `owner/repo` glob with `kici-admin context set-policy --org <id> --env <context> --repo-patterns '["acme/workflows"]'`, or clear the rule with `--repo-patterns '[]'`.
 
 ### Job held indefinitely
 

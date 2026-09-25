@@ -49,14 +49,16 @@ export interface LogChunkSinkDeps {
   forwardToPlatform?: (chunk: NormalizedLogChunk) => void;
 }
 
-export function createLogChunkSink(deps: LogChunkSinkDeps): (chunk: NormalizedLogChunk) => void {
+export function createLogChunkSink(
+  deps: LogChunkSinkDeps,
+): (chunk: NormalizedLogChunk) => Promise<void> {
   const attrs = { source: deps.source };
 
   // Async so the storage path can resolve the job name through the durable
-  // resolver. Callers invoke this fire-and-forget (the returned promise is
-  // ignored), and the synchronous side effects — metrics, the in-memory tail
-  // buffer, Platform fan-out — all run before the first `await`, so making the
-  // sink async does not delay them.
+  // resolver. The returned promise is the chunk's write: the agent handler
+  // awaits it, and a caller that does not may ignore it. The synchronous side
+  // effects — metrics, the in-memory tail buffer, Platform fan-out — all run
+  // before the first `await`, so making the sink async does not delay them.
   return async (chunk) => {
     if (chunk.lines.length === 0) return;
 
@@ -70,23 +72,33 @@ export function createLogChunkSink(deps: LogChunkSinkDeps): (chunk: NormalizedLo
     deps.forwardToPlatform?.(chunk);
 
     if (deps.logWriter) {
-      const jobName = deps.executionTracker
-        ? await deps.executionTracker.resolveJobName(chunk.runId, chunk.jobId)
-        : chunk.jobId;
-      deps.logWriter.appendChunk(
-        chunk.runId,
-        jobName,
-        chunk.stepIndex,
-        chunk.lines,
-        chunk.timestamp,
-        chunk.jobId,
-        undefined,
-        chunk.stream,
-      );
+      const logWriter = deps.logWriter;
+      const write = (async () => {
+        const jobName = deps.executionTracker
+          ? await deps.executionTracker.resolveJobName(chunk.runId, chunk.jobId)
+          : chunk.jobId;
+        await logWriter.appendChunk(
+          chunk.runId,
+          jobName,
+          chunk.stepIndex,
+          chunk.lines,
+          chunk.timestamp,
+          chunk.jobId,
+          undefined,
+          chunk.stream,
+        );
+      })();
+      // Registered before the job name is resolved, not once the append
+      // starts: the run can complete while the name is being looked up, and
+      // its drain has to wait for this chunk and seal it.
+      // fails-when: a drain that starts during the name lookup seals the run
+      // without this chunk, and the chunk's segment is never sealed
+      logWriter.trackPending(chunk.runId, write);
 
       // Approximate: sum of line lengths plus one newline each.
       const byteCount = chunk.lines.reduce((sum, line) => sum + line.length + 1, 0);
       logBytesStoredTotal.add(byteCount, attrs);
+      await write;
     }
   };
 }

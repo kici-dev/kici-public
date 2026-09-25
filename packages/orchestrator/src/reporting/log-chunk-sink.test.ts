@@ -1,13 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { LogStream } from '@kici-dev/engine';
 import { createLogChunkSink, type NormalizedLogChunk } from './log-chunk-sink.js';
-import type { LogWriter } from './log-writer.js';
+import { LogWriter } from './log-writer.js';
+import type { LogStorage } from './log-storage.js';
 import type { StepLogBuffer } from './step-log-buffer.js';
 
 function makeDeps() {
   return {
     stepLogBuffer: { addLines: vi.fn() },
-    logWriter: { appendChunk: vi.fn().mockResolvedValue(undefined) },
+    logWriter: { appendChunk: vi.fn().mockResolvedValue(undefined), trackPending: vi.fn() },
     executionTracker: {
       resolveJobName: vi.fn<(runId: string, jobId: string) => Promise<string>>(),
     },
@@ -108,5 +109,40 @@ describe('createLogChunkSink', () => {
       undefined,
       LogStream.enum.stderr,
     );
+  });
+
+  it("makes the run's drain wait for a chunk whose job name is still resolving", async () => {
+    const appended: string[] = [];
+    const finalized: string[] = [];
+    const storage = {
+      appendStreaming: vi.fn(async (path: string) => {
+        appended.push(path);
+      }),
+      finalize: vi.fn(async (path: string) => {
+        finalized.push(path);
+      }),
+    } as unknown as LogStorage;
+    const logWriter = new LogWriter({ logStorage: storage });
+    let resolveName!: (name: string) => void;
+    const sink = createLogChunkSink({
+      source: 'local',
+      logWriter,
+      executionTracker: {
+        resolveJobName: () => new Promise<string>((r) => (resolveName = r)),
+      },
+    });
+
+    // The job's last setup lines arrive, and its terminal status completes the
+    // run while the chunk's job name is still being looked up.
+    const written = sink({ ...chunk, stepIndex: -1 });
+    const drained = logWriter.drain('run-1');
+    resolveName('build');
+    await Promise.all([written, drained]);
+
+    // fails-when: the drain snapshots before the chunk is registered, seals
+    // nothing, and the chunk's segment is never sealed
+    const path = 'executions/run-1/job-build/step--1.log';
+    expect(appended).toEqual([path]);
+    expect(finalized).toEqual([path]);
   });
 });

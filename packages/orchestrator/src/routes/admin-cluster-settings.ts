@@ -61,6 +61,7 @@ const COLUMNS = {
   concurrencyWaitTimeoutMs: 'concurrency_wait_timeout_ms',
   agentTokenTtlMs: 'agent_token_ttl_ms',
   ownershipDbCheckTimeoutMs: 'ownership_db_check_timeout_ms',
+  sealedSecretsRetryBackoffMs: 'sealed_secrets_retry_backoff_ms',
   unroutableGraceMs: 'unroutable_grace_ms',
   ingestOverflowClaimTimeoutMs: 'ingest_overflow_claim_timeout_ms',
   lockfileCacheMax: 'lockfile_cache_max',
@@ -136,6 +137,7 @@ const updateSchema = z
     concurrencyWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
     agentTokenTtlMs: z.number().int().min(1000).nullable().optional(),
     ownershipDbCheckTimeoutMs: z.number().int().min(100).nullable().optional(),
+    sealedSecretsRetryBackoffMs: z.number().int().min(1000).nullable().optional(),
     /** 0 disables unroutable fast-fail, so the floor is 0, not 1000. */
     unroutableGraceMs: z.number().int().min(0).nullable().optional(),
     /**

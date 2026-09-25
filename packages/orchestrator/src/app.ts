@@ -77,6 +77,7 @@ import { configureSecureWsServer } from './ws/server-options.js';
 import type { CheckRunReporter } from './reporting/check-run-reporter.js';
 import type { ExecutionTracker } from './reporting/execution-tracker.js';
 import { cancelRunWithReason } from './cancel/cancel-run.js';
+import { cancelRouteAnswer } from './cancel/cancel-route-answer.js';
 import type { LogWriter } from './reporting/log-writer.js';
 import type { LogStorage } from './reporting/log-storage.js';
 import type { StepLogBuffer } from './reporting/step-log-buffer.js';
@@ -84,7 +85,7 @@ import type { SourceLocationData } from './reporting/check-run-summary.js';
 import type { Hono as HonoType } from 'hono';
 import type { PeerWsLike } from './cluster/peer-handler.js';
 import type { PeerToPeerMessage } from '@kici-dev/engine';
-import { ExecutionJobStatus, ExecutionRunStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
+import { ExecutionJobStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { AgentTokenStore } from './agent/token-store.js';
 import type { OwnershipTracker } from './agent/ownership-tracker.js';
 import type { ObserverRegistry } from './ws/observer-registry.js';
@@ -158,6 +159,7 @@ import type { VariableStore } from './contexts/variable-store.js';
 import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
 import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
 import { buildHeldRunRelease } from './approvals/held-run-release-wiring.js';
+import { rejectWorkflow } from './pipeline/resume-workflow.js';
 import { stepsTotal, registerOrchestratorMetrics } from './metrics/prometheus.js';
 import { createLogChunkSink } from './reporting/log-chunk-sink.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
@@ -285,6 +287,8 @@ export interface AppDependencies {
     issuer: string;
     resolveSigner: () => Promise<import('./oidc/signer.js').Signer | null>;
     repo: import('./db/repos/signing-keys-repo.js').OrchestratorSigningKeyRepo;
+    /** Whether this node is the Raft leader; named when a mint defers for want of a key. */
+    isLeader?: () => boolean;
   };
   /**
    * Dashboard-encryption (X25519) key custody. Present whenever KICI_SECRET_KEY
@@ -726,6 +730,7 @@ export function createApp(deps: AppDependencies) {
     independentIdentity: deps.config.independentIdentity,
     localOidcSigner: deps.localOidcSigner,
     resolveOrchestratorSigner: deps.provenanceSigning?.resolveSigner,
+    isLeader: deps.provenanceSigning?.isLeader,
     provenanceSigningIssuer: deps.provenanceSigning?.issuer,
     dispatcher: deps.dispatcher,
     db: deps.db,
@@ -933,7 +938,7 @@ export function createApp(deps: AppDependencies) {
                 // reach this agent WebSocket handler at all.
               }
             : undefined,
-        onLogChunk: (_agentId, msg) => {
+        onLogChunk: (_agentId, msg) =>
           localLogChunkSink({
             runId: msg.runId,
             jobId: msg.jobId,
@@ -941,8 +946,11 @@ export function createApp(deps: AppDependencies) {
             lines: msg.lines,
             timestamp: msg.timestamp,
             ...(msg.stream !== undefined && { stream: msg.stream }),
-          });
-        },
+          }),
+        ...(deps.logWriter && {
+          trackLogChunk: (runId: string, pending: Promise<unknown>) =>
+            deps.logWriter!.trackPending(runId, pending),
+        }),
         onStepStatus: (_agentId, msg) => {
           stepsTotal.add(1, { status: msg.state });
 
@@ -1419,31 +1427,36 @@ export function createApp(deps: AppDependencies) {
 
       const reason = force ? 'force cancelled via API' : 'run cancelled via API';
       // Canonical run-cancel path — shared with the WorkflowDeadlineDetector.
-      const { agentsNotified, unreachable, pendingCancelled, alreadyTerminal } =
-        await cancelRunWithReason(
-          {
-            db: deps.db,
-            jobQueue: deps.jobQueue,
-            registry: deps.registry,
-            executionTracker: deps.executionTracker,
-            instanceId: deps.config.instanceId,
-            // Absent in a deployment with no peer transport, which reads as
-            // "a sibling-owned job is unreachable" rather than "orphaned".
-            cancelJobOnPeer: deps.coordinator
-              ? (peerId, cancelRunId, jobId, cancelReason) =>
-                  deps.coordinator!.cancelJobOnPeer(peerId, cancelRunId, jobId, cancelReason)
-              : undefined,
+      const result = await cancelRunWithReason(
+        {
+          db: deps.db,
+          jobQueue: deps.jobQueue,
+          registry: deps.registry,
+          executionTracker: deps.executionTracker,
+          instanceId: deps.config.instanceId,
+          // Absent in a deployment with no peer transport, which reads as
+          // "a sibling-owned job is unreachable" rather than "orphaned".
+          cancelJobOnPeer: deps.coordinator
+            ? (peerId, cancelRunId, jobId, cancelReason) =>
+                deps.coordinator!.cancelJobOnPeer(peerId, cancelRunId, jobId, cancelReason)
+            : undefined,
+          // A held run's cancel withdraws its approval request the way a
+          // reject does, from the live processing-deps bag.
+          rejectHeldWorkflow: (hold, holdReason, holdOpts) => {
+            const procDeps = buildProcessingDeps();
+            return rejectWorkflow(hold, procDeps, procDeps.db, holdReason, holdOpts);
           },
-          runId,
-          reason,
-          { force, cancelledBy: `api_key:${tokenInfo.id}` },
-        );
+        },
+        runId,
+        reason,
+        { force, cancelledBy: `api_key:${tokenInfo.id}` },
+      );
 
       // The run can finish between the status check above and the cancel. The
       // shared path then writes nothing, so answering 200 would report a
       // cancellation that did not happen — give the same 409 the pre-check does,
       // re-reading the status the run actually settled on.
-      if (alreadyTerminal) {
+      if (result.alreadyTerminal) {
         const settled = await deps.db
           .selectFrom('execution_runs')
           .select(['status'])
@@ -1453,20 +1466,9 @@ export function createApp(deps: AppDependencies) {
         return c.json({ error: 'Run already in terminal state', status: settled?.status }, 409);
       }
 
-      // `unreachable` counts jobs whose owning coordinator is alive but could
-      // not be reached, so the cancel did not land and the job is very likely
-      // still running. Reporting `cancelled` there is the exact failure this
-      // path exists to stop: the caller is told the deploy stopped while it runs
-      // on. The run stays `cancelling` and the re-drive sweep tries again.
-      const resultStatus =
-        agentsNotified > 0 || unreachable > 0
-          ? ExecutionRunStatus.enum.cancelling
-          : ExecutionRunStatus.enum.cancelled;
-      recordAccess('allowed');
-      return c.json(
-        { status: resultStatus, cancelledJobs: agentsNotified + pendingCancelled },
-        200,
-      );
+      const answer = cancelRouteAnswer(result);
+      recordAccess('allowed', answer.accessNote);
+      return c.json(answer.body, answer.httpStatus);
     } catch (err) {
       logger.error('Cancel run failed', {
         runId,

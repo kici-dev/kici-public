@@ -29,6 +29,7 @@ import type {
 import { buildSanitizedEnv } from './env-sanitizer.js';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import type { CloneJobReposRequest } from '../../checkout/clone-job-repos.js';
 
 /**
  * Best-effort SIGKILL/SIGTERM of an entire process group led by `pid`.
@@ -177,6 +178,34 @@ export interface ForkRunnerHandle {
 }
 
 /**
+ * The clone-relevant slice of a dispatch, read from where the orchestrator puts
+ * each field: the source repo and its credentials on the dispatch envelope, the
+ * workflow repo and the checkout switches in `jobConfig`. Both the runner's
+ * request and the agent's host-side checkout are built from this one reader, so
+ * the two clones cannot read different fields.
+ */
+export function buildCloneRequest(
+  dispatch: JobDispatch,
+  extra?: { credentialHelperPath?: string | undefined },
+): CloneJobReposRequest {
+  const jobConfig = dispatch.jobConfig as Record<string, unknown>;
+  return {
+    repoUrl: dispatch.repoUrl,
+    ref: dispatch.ref,
+    sha: dispatch.sha,
+    token: dispatch.token,
+    sourceAuth: dispatch.sourceAuth,
+    workflowAuth: dispatch.workflowAuth,
+    ...(extra?.credentialHelperPath ? { credentialHelperPath: extra.credentialHelperPath } : {}),
+    workflowRepoUrl: jobConfig.workflowRepoUrl as string | undefined,
+    workflowRef: jobConfig.workflowRef as string | undefined,
+    workflowSha: jobConfig.workflowSha as string | undefined,
+    checkout: (jobConfig.checkout as boolean | undefined) ?? true,
+    fullRepo: (jobConfig.fullRepo as boolean | undefined) ?? false,
+  };
+}
+
+/**
  * Build a JobExecutionRequest from a JobDispatch.
  *
  * Maps orchestrator dispatch fields to the subset needed by the workflow runner.
@@ -197,14 +226,7 @@ export function buildRequest(
     runId: dispatch.runId,
     jobId: dispatch.jobId,
     workDir,
-    repoUrl: dispatch.repoUrl,
-    ref: dispatch.ref,
-    sha: dispatch.sha,
-    token: dispatch.token,
-    sourceAuth: dispatch.sourceAuth,
-    workflowAuth: dispatch.workflowAuth,
-
-    ...(extra?.credentialHelperPath ? { credentialHelperPath: extra.credentialHelperPath } : {}),
+    ...buildCloneRequest(dispatch, extra),
     ...(extra?.allowInstallScripts ? { allowInstallScripts: true } : {}),
     sourceTarUrl: dispatch.sourceTarUrl,
     sourceTarDigest: dispatch.sourceTarDigest,
@@ -238,9 +260,7 @@ export function buildRequest(
     container: jobConfig.container as Record<string, unknown> | undefined,
     event: jobConfig.event as Record<string, unknown> | undefined,
     provider: jobConfig.provider as string | undefined,
-    checkout: (jobConfig.checkout as boolean | undefined) ?? true,
     isTestRun: (jobConfig.isTestRun as boolean | undefined) ?? false,
-    fullRepo: (jobConfig.fullRepo as boolean | undefined) ?? false,
     checkMode: jobConfig.checkMode as CheckMode | undefined,
 
     tarballUrl: jobConfig.tarballUrl as string | undefined,
@@ -259,9 +279,6 @@ export function buildRequest(
 
     // Global workflow fields
     isGlobalWorkflow: jobConfig.isGlobalWorkflow as boolean | undefined,
-    workflowRepoUrl: jobConfig.workflowRepoUrl as string | undefined,
-    workflowRef: jobConfig.workflowRef as string | undefined,
-    workflowSha: jobConfig.workflowSha as string | undefined,
     workflowRepoIdentifier: jobConfig.workflowRepoIdentifier as string | undefined,
 
     hasConcurrencyGroup: (jobConfig.hasConcurrencyGroup as boolean | undefined) ?? false,

@@ -1057,8 +1057,8 @@ export interface JobOptions {
  * a private package registry before running `npm install`.
  *
  * `tokenSecret` uses qualified `<context>:<secret-name>` syntax — the
- * orchestrator resolves the secret from the named context's scoped secret
- * store at dispatch time. Example: `tokenSecret: 'production:NPM_TOKEN'`.
+ * orchestrator resolves the secret through the named context's secret
+ * bindings at dispatch time. Example: `tokenSecret: 'production:NPM_TOKEN'`.
  */
 export interface Registry {
   /** Registry URL (e.g. `https://npm.pkg.github.com`). */
@@ -1070,7 +1070,8 @@ export interface Registry {
   readonly scope?: string;
   /**
    * Qualified secret reference of the form `<context>:<secret-name>`.
-   * The orchestrator resolves it at dispatch via `secretResolver.resolveForJob(orgId, context)`.
+   * The orchestrator resolves it at dispatch through the named context's
+   * secret bindings, once that context's protection rules admit the run.
    */
   readonly tokenSecret: string;
   /** Whether to require auth on every request (rendered as `always-auth=true` in `.npmrc`). Defaults to `true`. */

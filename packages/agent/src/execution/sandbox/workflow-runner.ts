@@ -25,6 +25,7 @@ import { initZx, toErrorMessage } from '@kici-dev/shared';
 import { createTempScope, makeTempDir, type TempHandle, type TempScope } from '@kici-dev/core/tmp';
 import { makeStreamingZxLog } from '../streaming-zx-log.js';
 import {
+  AGENT_API_REQUEST_TIMEOUT_MS,
   ExecutionJobStatus,
   ExecutionStepStatus,
   reservedEventNamePrefix,
@@ -606,7 +607,7 @@ const pendingApiResponses = new Map<
   }
 >();
 
-const API_RESPONSE_TIMEOUT_MS = 15_000;
+const API_RESPONSE_TIMEOUT_MS = AGENT_API_REQUEST_TIMEOUT_MS;
 
 /**
  * Wait for an agent.api.response from the agent with the given requestId.

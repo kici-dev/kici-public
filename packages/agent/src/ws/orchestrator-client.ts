@@ -11,6 +11,7 @@ import {
 } from '@kici-dev/engine';
 import { runtimeFactLabels } from '../execution/image-build/runtime-facts.js';
 import {
+  AGENT_API_REQUEST_TIMEOUT_MS,
   orchestratorToAgentMessageSchema,
   heartbeatSchema,
   PROTOCOL_VERSION,
@@ -24,6 +25,8 @@ import {
   ArtifactCompleteAckOutcome,
   hasOrchAgentCapability,
   type OrchAgentCapabilities,
+  AGENT_CAPABILITIES,
+  AGENT_FEATURE_LABELS,
 } from '@kici-dev/engine';
 import type {
   CacheRequestIpc,
@@ -681,8 +684,8 @@ export class OrchestratorClient {
    * Used by a provisioning workflow (via `ctx.kici.scaler.claimAgentCredentials`)
    * to exchange a single-use claim code — delivered on a `kici.scaler.scale-up`
    * event — for freshly minted ephemeral agent credentials. The token rides the
-   * response only; it is never logged. Times out after 15 seconds (matching the
-   * generic agent-API request timeout).
+   * response only; it is never logged. Times out after
+   * `AGENT_API_REQUEST_TIMEOUT_MS`, the generic agent-API request timeout.
    */
   async sendClaimCredentials(claimCode: string): Promise<{
     credentials?: {
@@ -698,7 +701,7 @@ export class OrchestratorClient {
       const timer = setTimeout(() => {
         this.pendingClaimCredentialsRequests.delete(requestId);
         reject(new Error('scaler.claim-credentials timed out'));
-      }, 15_000);
+      }, AGENT_API_REQUEST_TIMEOUT_MS);
 
       this.pendingClaimCredentialsRequests.set(requestId, {
         resolve: (response) => {
@@ -756,15 +759,20 @@ export class OrchestratorClient {
    * Send a typed API request to the orchestrator and await the response.
    *
    * This is the transport layer for the agent private API. The SDK's typed
-   * KiciApi interface calls this with dot-namespaced method names.
+   * KiciApi interface calls this with dot-namespaced method names. Times out
+   * after `AGENT_API_REQUEST_TIMEOUT_MS`.
    */
   async sendApiRequest(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     const requestId = randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingApiRequests.delete(requestId);
-        reject(new Error(`API request '${method}' timed out after 15s`));
-      }, 15_000);
+        reject(
+          new Error(
+            `API request '${method}' timed out after ${AGENT_API_REQUEST_TIMEOUT_MS / 1000}s`,
+          ),
+        );
+      }, AGENT_API_REQUEST_TIMEOUT_MS);
 
       this.pendingApiRequests.set(requestId, {
         resolve: (result) => {
@@ -2067,6 +2075,9 @@ export class OrchestratorClient {
       // os/arch/host — the orchestrator cannot know it, and the scaler cannot
       // predict it when it mints the agent's token.
       ...runtimeFactLabels(),
+      // Behaviours this build implements, so work that depends on one routes
+      // only to an agent that has it. A fact about the build, not a privilege.
+      ...AGENT_FEATURE_LABELS,
       ...resolveRoleLabels(this.roles),
     ];
     const allLabels = mergeAutoLabels(this.labels, autoLabels);
@@ -2084,6 +2095,9 @@ export class OrchestratorClient {
       totalMemoryMb: Math.round(os.totalmem() / (1024 * 1024)),
       cpuCount: os.cpus().length,
       nodeVersion: process.versions.node,
+      // Optional agent behaviours this build implements; the orchestrator routes
+      // work that depends on one of them only to an agent advertising it.
+      capabilities: AGENT_CAPABILITIES,
       ...(() => {
         const v = readAgentVersion();
         return v ? { version: v } : {};

@@ -7,6 +7,8 @@ type RunRow = {
   ref: string;
   trigger_event: string | null;
   trust_tier: string | null;
+  workflow_repo_identifier?: string | null;
+  workflow_branch?: string | null;
 };
 type JobRow = { git_credentials: Record<string, Record<string, string>> | null };
 type DispatchRow = { job_config: string };
@@ -62,8 +64,70 @@ describe('createJobCredentialContextReader', () => {
       sourceRepo: 'acme/main',
       declaredCredentials: { forge: { kind: 'token' } },
       trustTier: 'trusted',
-      branch: 'main',
+      policyRepo: 'acme/main',
+      policyBranch: 'main',
       triggerType: 'push',
+    });
+  });
+
+  it('a global run presents the workflow repo and its registered branch to the credential gate', async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: {
+          customer_id: 'org-1',
+          repo_identifier: 'org/app',
+          ref: 'feature',
+          trigger_event: 'push',
+          trust_tier: 'trusted',
+          workflow_repo_identifier: 'org/ci',
+          workflow_branch: 'main',
+        },
+        execution_jobs: { git_credentials: null },
+      }),
+    );
+    const ctx = await read('run-1', JOB_ID);
+    // fails-when: the gate repository is repo_identifier (org/app) for a run
+    // whose workflow_repo_identifier is set.
+    expect(ctx?.policyRepo).toBe('org/ci');
+    // fails-when: the gate branch is the event's ref (feature) instead of the
+    // workflow's registered branch.
+    expect(ctx?.policyBranch).toBe('main');
+    // breaks-if-wrong: the write-credential fence stays anchored on the
+    // event's repository.
+    expect(ctx?.sourceRepo).toBe('org/app');
+  });
+
+  it('a global run with no recorded workflow branch presents an empty branch', async () => {
+    // fails-when: a missing workflow_branch falls back to the event's ref,
+    // which would let the event's branch satisfy the workflow repo's context.
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: {
+          ...RUN,
+          ref: 'feature',
+          workflow_repo_identifier: 'org/ci',
+          workflow_branch: null,
+        },
+      }),
+    );
+    await expect(read('run-1', JOB_ID)).resolves.toMatchObject({
+      policyRepo: 'org/ci',
+      policyBranch: '',
+    });
+  });
+
+  it('a same-repo run keeps its own repository and presented branch', async () => {
+    // breaks-if-wrong: a NULL workflow_repo_identifier must leave the gate on
+    // repo_identifier and ref, exactly as for every per-repo run.
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: { ...RUN, workflow_repo_identifier: null, workflow_branch: null },
+      }),
+    );
+    await expect(read('run-1', JOB_ID)).resolves.toMatchObject({
+      sourceRepo: 'acme/main',
+      policyRepo: 'acme/main',
+      policyBranch: 'main',
     });
   });
 

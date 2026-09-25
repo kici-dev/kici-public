@@ -134,10 +134,14 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     const lockFile = generateLockFile(workflowsWithSource);
     const lockJson = serializeLockFile(lockFile);
 
-    // Informational: when the current schema version is itself breaking, warn
-    // that orchestrators older than it cannot read this lock. Silent otherwise
-    // (older orchestrators down to the breaking floor still read it).
-    const windowWarning = schemaWindowWarning(BREAKING_FLOOR, SCHEMA_VERSION);
+    // Informational: when this lock's minReaderVersion reaches SCHEMA_VERSION
+    // (see schemaWindowWarning), warn that older orchestrators cannot read it.
+    // Silent otherwise (older orchestrators down to the lock's minReaderVersion
+    // still read it).
+    const windowWarning = schemaWindowWarning(
+      lockFile.minReaderVersion ?? BREAKING_FLOOR,
+      SCHEMA_VERSION,
+    );
     if (windowWarning) {
       logger.warn(pc.yellow(windowWarning));
     }

@@ -39,7 +39,8 @@ import {
 } from '../metrics/prometheus.js';
 import type { ObserverRegistry } from '../ws/observer-registry.js';
 import type { LogStorage } from './log-storage.js';
-import type { JobQueue } from '../queue/job-queue.js';
+import { stepLogPath } from './step-log-path.js';
+import { STOPPED_RUN_DISPATCH_REASON, type JobQueue } from '../queue/job-queue.js';
 import { ROUND_JOB_PREFIX } from '../pipeline/global-eval-round.js';
 import { extractPrecursorResult } from '../cache/precursor-result.js';
 import {
@@ -96,6 +97,45 @@ function crossRepoWorkflowRepoOf(args: {
 }
 
 /**
+ * The repository that defines a run's workflow, with the commit the run
+ * dispatched from it and that repository's registered branch.
+ */
+export interface WorkflowRepoProvenance {
+  identifier: string;
+  sha: string | null;
+  branch: string | null;
+}
+
+/**
+ * The workflow-repository provenance a run records: the whole provenance when
+ * the workflow is defined in a repository other than the one the run acted on,
+ * `undefined` otherwise. The same single narrowing as
+ * {@link crossRepoWorkflowRepoOf}, so the identifier, commit, and branch are
+ * written together or not at all.
+ */
+function crossRepoProvenanceOf(
+  repoIdentifier: string,
+  workflowRepo: WorkflowRepoProvenance | null | undefined,
+): WorkflowRepoProvenance | undefined {
+  return workflowRepo != null && workflowRepo.identifier !== repoIdentifier
+    ? workflowRepo
+    : undefined;
+}
+
+/** The `execution_runs` columns a cross-repository provenance fills. */
+function workflowProvenanceColumns(provenance: WorkflowRepoProvenance): {
+  workflow_repo_identifier: string;
+  workflow_sha: string | null;
+  workflow_branch: string | null;
+} {
+  return {
+    workflow_repo_identifier: provenance.identifier,
+    workflow_sha: provenance.sha,
+    workflow_branch: provenance.branch,
+  };
+}
+
+/**
  * The `chain_depth` column value for a run recorded by a pre-dispatch path (a
  * hold, an init failure, or a build that failed before tracking started).
  *
@@ -121,6 +161,26 @@ function inheritedChainDepth(chainDepth: number | undefined): { chain_depth?: nu
 }
 
 /**
+ * The run a re-run re-executes and the root of its re-run chain. Stamped by the
+ * pre-dispatch writers too, so a re-run that is held or fails before its first
+ * job still records what it re-ran.
+ */
+export interface RerunLineage {
+  parentRunId: string;
+  originalRunId: string;
+}
+
+/** The lineage columns of a re-run's row; empty for a first run. */
+function rerunLineageColumns(lineage: RerunLineage | undefined): {
+  parent_run_id?: string;
+  original_run_id?: string;
+} {
+  return lineage
+    ? { parent_run_id: lineage.parentRunId, original_run_id: lineage.originalRunId }
+    : {};
+}
+
+/**
  * The `trigger_decision` blob for a run recorded by a pre-dispatch path.
  *
  * These paths write the row before any decision summary exists, so the column
@@ -129,7 +189,8 @@ function inheritedChainDepth(chainDepth: number | undefined): { chain_depth?: nu
  * `EventRouter.isFailureLifecycleRun` reads back is the whole blob.
  *
  * A HELD run is the case that makes it load-bearing: it resumes onto this same
- * row (`onExecutionStarted` no-ops on the conflict), completes, and its
+ * row (`onExecutionStarted`'s conflict path fills only event-context and
+ * workflow-provenance gaps, so it keeps this column), completes, and its
  * completion is what a `workflows_failed_batch` accumulator would otherwise
  * fold back into the batch that spawned it — a notifier re-triggering itself.
  * An init failure records the same marker for consistency, not for a reader:
@@ -137,6 +198,30 @@ function inheritedChainDepth(chainDepth: number | undefined): { chain_depth?: nu
  */
 function failureLifecycleTriggerDecision(dispatched: boolean | undefined): string | null {
   return dispatched ? JSON.stringify({ dispatchedByFailureLifecycle: true }) : null;
+}
+
+/** The `trigger_decision` key a held evaluation round records its covered workflows under. */
+export const HELD_ROUND_WORKFLOWS_KEY = 'heldRoundWorkflows';
+
+/**
+ * The `trigger_decision` blob of a held run: the failure-lifecycle marker, and
+ * for a held evaluation round the workflows it covers. Null when it carries
+ * neither, as every held workflow run's blob always has been.
+ *
+ * The blob is used rather than a new column: a held round's row has no
+ * decision summary of its own, the blob already carries markers read back by
+ * key, and nothing forwards or renders it — so the record needs no migration
+ * and changes nothing an older reader sees.
+ */
+function heldRunTriggerDecision(args: {
+  dispatchedByFailureLifecycle?: boolean;
+  heldRoundWorkflows?: readonly string[];
+}): string | null {
+  const blob = {
+    ...(args.dispatchedByFailureLifecycle && { dispatchedByFailureLifecycle: true }),
+    ...(args.heldRoundWorkflows && { [HELD_ROUND_WORKFLOWS_KEY]: [...args.heldRoundWorkflows] }),
+  };
+  return Object.keys(blob).length > 0 ? JSON.stringify(blob) : null;
 }
 
 /** Context passed to onExecutionComplete for commit status updates. */
@@ -160,8 +245,7 @@ export interface ExecutionContext {
   workflowRepoIdentifier?: string;
   /**
    * True when this run records a global evaluation round rather than a
-   * workflow. Forwarded to the Platform so its own re-run refusal can admit the
-   * round's re-evaluation.
+   * workflow. Forwarded to the Platform, which mirrors it on the run row.
    */
   isGlobalEvalRound?: boolean;
   /** Git branch or tag (e.g. "main", "feature/foo"). */
@@ -192,6 +276,13 @@ export interface ExecutionContext {
    * subscriptions can match on it. Null/undefined for success or non-terminal.
    */
   failureClass?: RunFailureClass | null;
+  /**
+   * The run's status generation (`execution_runs.status_epoch`), forwarded on
+   * `execution.status` as `statusEpoch`. Absent reads as 0. It rises only when
+   * a run leaves a terminal status to continue, so the Platform can keep a
+   * finished run finished against a non-terminal frame that arrives late.
+   */
+  statusEpoch?: number;
   /**
    * Resolved trust tier of the run's ref, and which branch's lock file it was
    * evaluated against. Mirror the `execution_runs.trust_tier` /
@@ -409,6 +500,20 @@ export interface ExecutionTrackerDeps {
 /** The org used when no routing key / resolver is available (matches the column DEFAULT). */
 const DEFAULT_CUSTOMER_ID = '__default__';
 
+/** The `statusEpoch` context field for a run, omitted at 0 (its default). */
+function statusEpochField(epoch: number | null | undefined): { statusEpoch?: number } {
+  return epoch ? { statusEpoch: epoch } : {};
+}
+
+/**
+ * Whether a live job report may reopen a run row: the run failed, and not on a
+ * build failure. Mirrors the guard on the reopen UPDATE itself.
+ */
+function isReopenableFailure(status: string, failureReason: string | null): boolean {
+  if (status !== ExecutionRunStatus.enum.failed) return false;
+  return failureReason === null || !failureReason.toLowerCase().includes('build');
+}
+
 /** In-memory state for a single execution run. */
 interface RunState {
   /** Current run-level status (pending until first job starts running). */
@@ -456,6 +561,18 @@ interface RunState {
   driftDetected?: boolean;
   startedAt: number;
   completedAt?: number;
+  /**
+   * The run's status generation (`execution_runs.status_epoch`), forwarded on
+   * every `execution.status` frame. Absent reads as 0: a run this coordinator
+   * started has never left a terminal status.
+   */
+  statusEpoch?: number;
+  /**
+   * Set on a run rehydrated from a `failed` row that a live job report may
+   * reopen ({@link ExecutionTracker.reopenRecoveredRun}). Cleared once the
+   * reopen is decided.
+   */
+  reopenableFailedRow?: boolean;
   /**
    * Number of outstanding "jobs are still to be registered" tokens. While it is
    * above zero `isRunComplete` is false regardless of the jobs already tracked.
@@ -721,12 +838,13 @@ export class ExecutionTracker {
     /** Pull-request number for PR-triggered runs; null/omitted for non-PR runs. */
     prNumber?: number | null,
     /**
-     * The repository that DEFINES the workflow, when that is not
-     * `repoIdentifier` — an organization-wide workflow authored in one
-     * repository and dispatched against another. Omitted/null for every
-     * per-repository run, where the two are the same repository.
+     * The repository that DEFINES the workflow, with the commit dispatched from
+     * it and its registered branch, when that is not `repoIdentifier` — an
+     * organization-wide workflow authored in one repository and dispatched
+     * against another. Omitted/null for every per-repository run, where the two
+     * are the same repository.
      */
-    workflowRepoIdentifier?: string | null,
+    workflowRepo?: WorkflowRepoProvenance | null,
     /**
      * Pull-request head context, resolved from the normalized event.
      *
@@ -762,10 +880,8 @@ export class ExecutionTracker {
     // in-memory state, and every Platform forward built from it — reads this
     // one value, so a null keeps meaning "the workflow lives in this run's own
     // repository" for every per-repository run.
-    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf({
-      repoIdentifier,
-      workflowRepoIdentifier,
-    });
+    const crossRepoProvenance = crossRepoProvenanceOf(repoIdentifier, workflowRepo);
+    const crossRepoWorkflowRepo = crossRepoProvenance?.identifier;
 
     // In-memory state
     const jobMap = new Map<
@@ -820,8 +936,8 @@ export class ExecutionTracker {
       jobs: jobMap,
     });
 
-    // DB: insert execution run (ON CONFLICT DO NOTHING handles the case where
-    // the run was already created by the deferred-init early-creation path)
+    // DB: insert the execution run. A pre-dispatch path may already have written
+    // the row; the conflict path below fills only the gaps it left.
     const customerId = await this.resolveCustomerId(routingKey);
     await this.db
       .insertInto('execution_runs')
@@ -865,9 +981,7 @@ export class ExecutionTracker {
         // Only recorded when it differs from the repository the run acted on;
         // a null keeps "the workflow lives in this run's own repo" as the
         // meaning of the column for every per-repository run.
-        ...(crossRepoWorkflowRepo && {
-          workflow_repo_identifier: crossRepoWorkflowRepo,
-        }),
+        ...(crossRepoProvenance && workflowProvenanceColumns(crossRepoProvenance)),
       })
       // The conflict path fills in the event context and nothing else. A
       // pre-dispatch path may already have written this row (an early start, a
@@ -875,9 +989,11 @@ export class ExecutionTracker {
       // NOTHING would leave these NULL forever — the git credential relay needs
       // `trigger_event` to evaluate a context's trigger-type filters, and the
       // OIDC mint needs the head context to tell a fork pull request from a
-      // push to the same base branch. COALESCE keeps an already-recorded value,
-      // so this only ever fills a gap; every other column stays owned by
-      // whoever inserted the row.
+      // push to the same base branch. The workflow-repository provenance is
+      // filled the same way: a held row records the workflow repository but not
+      // always its commit and branch, and a re-run dispatches that commit.
+      // COALESCE keeps an already-recorded value, so this only ever fills a gap;
+      // every other column stays owned by whoever inserted the row.
       .onConflict((oc) =>
         oc.column('run_id').doUpdateSet({
           trigger_event: sql`COALESCE(execution_runs.trigger_event, EXCLUDED.trigger_event)`,
@@ -885,6 +1001,9 @@ export class ExecutionTracker {
           head_repository: sql`COALESCE(execution_runs.head_repository, EXCLUDED.head_repository)`,
           is_fork: sql`COALESCE(execution_runs.is_fork, EXCLUDED.is_fork)`,
           subject_trigger_event: sql`COALESCE(execution_runs.subject_trigger_event, EXCLUDED.subject_trigger_event)`,
+          workflow_repo_identifier: sql`COALESCE(execution_runs.workflow_repo_identifier, EXCLUDED.workflow_repo_identifier)`,
+          workflow_sha: sql`COALESCE(execution_runs.workflow_sha, EXCLUDED.workflow_sha)`,
+          workflow_branch: sql`COALESCE(execution_runs.workflow_branch, EXCLUDED.workflow_branch)`,
         }),
       )
       .execute();
@@ -965,6 +1084,41 @@ export class ExecutionTracker {
         .onConflict((oc) => oc.columns(['run_id', 'job_id']).doUpdateSet(mutable))
         .execute();
     }
+    if (jobs.length > 0) await this.cancelJobsOfStoppedRun(runId, jobs);
+  }
+
+  /**
+   * Cancel job rows just registered under a run that has already stopped.
+   *
+   * A job registers after its dispatch, so a cancel landing in between leaves
+   * the run terminal while the job's row is written `pending`. The queue
+   * refuses that job's dispatch (`JobQueue.insertDispatched`), so no agent
+   * will ever report on it: its row is cancelled here, as the cancel cancels
+   * the queued jobs it can see.
+   */
+  private async cancelJobsOfStoppedRun(runId: string, jobs: TrackedJobRow[]): Promise<void> {
+    const stopped = [...TERMINAL_RUN_STATES, ExecutionRunStatus.enum.cancelling];
+    await this.db
+      .updateTable('execution_jobs')
+      .set({
+        status: ExecutionJobStatus.enum.cancelled,
+        completed_at: new Date(),
+        error_message: STOPPED_RUN_DISPATCH_REASON,
+        routing_reason: null,
+      })
+      .where('run_id', '=', runId)
+      .where(
+        'job_id',
+        'in',
+        jobs.map((job) => job.jobId),
+      )
+      .where('status', 'in', [ExecutionJobStatus.enum.pending, ExecutionJobStatus.enum.queued])
+      // fails-when: a job registered under a cancelled run stays pending forever
+      // breaks-if-wrong: a job registered under a running run must stay pending
+      .where(
+        sql<boolean>`EXISTS (SELECT 1 FROM execution_runs er WHERE er.run_id = execution_jobs.run_id AND er.status IN (${sql.join(stopped.map((status) => sql`${status}`))}))`,
+      )
+      .execute();
   }
 
   /**
@@ -1274,6 +1428,7 @@ export class ExecutionTracker {
       run.status,
       {
         workflowName: run.workflowName,
+        ...statusEpochField(run.statusEpoch),
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
         ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
@@ -1457,6 +1612,7 @@ export class ExecutionTracker {
         status: state,
       });
     }
+    await this.reopenRecoveredRun(run, runId);
     const jobLogBytesTotal = persisted.jobLogBytesTotal;
 
     // Update in-memory state
@@ -1649,6 +1805,8 @@ export class ExecutionTracker {
         'workflow_repo_identifier',
         'trust_tier',
         'lock_file_source',
+        'failure_reason',
+        'status_epoch',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -1740,6 +1898,10 @@ export class ExecutionTracker {
       ...(dbRun.trust_tier != null && { trustTier: dbRun.trust_tier }),
       ...(dbRun.lock_file_source != null && { lockFileSource: dbRun.lock_file_source }),
       ...(recoveredDriftDetected && { driftDetected: true }),
+      ...(dbRun.status_epoch ? { statusEpoch: dbRun.status_epoch } : {}),
+      ...(isReopenableFailure(dbRun.status, dbRun.failure_reason) && {
+        reopenableFailedRow: true,
+      }),
       jobs: new Map(),
       startedAt: new Date(dbRun.started_at).getTime(),
     };
@@ -1747,25 +1909,75 @@ export class ExecutionTracker {
 
     logger.info('Recovered in-memory run state from DB', { runId });
 
-    // If the run was prematurely marked as failed (e.g. "No agents available
-    // to dispatch jobs" but a queued job is now running), reset to running.
-    // The run completion logic will set the correct final status.
-    // Do NOT reset runs that failed due to build failures — those are
-    // intentionally terminal (the build timed out or errored).
-    await this.db
+    return recoveredRun;
+  }
+
+  /**
+   * Reopen a run rehydrated from a prematurely `failed` row (e.g. "No agents
+   * available to dispatch jobs", but a queued job is now running): reset the
+   * row to `running`, clear the failure it recorded, and raise its status
+   * generation. The run completion logic then sets the correct final status.
+   *
+   * Called only once the job report that rehydrated the run has been applied to
+   * its job row. A replay of a frame the row already records must not reopen a
+   * finished run: it would roll the run up a second time. A run that failed on
+   * a build failure is never reopened — that failure is intentionally terminal.
+   */
+  private async reopenRecoveredRun(run: RunState, runId: string): Promise<void> {
+    if (!run.reopenableFailedRow) return;
+    run.reopenableFailedRow = false;
+    const nextEpoch = (run.statusEpoch ?? 0) + 1;
+    const result = await this.db
       .updateTable('execution_runs')
-      .set({ status: ExecutionRunStatus.enum.running, completed_at: null, duration_ms: null })
+      .set({
+        status: ExecutionRunStatus.enum.running,
+        completed_at: null,
+        duration_ms: null,
+        // fails-when: a reopened run keeps the failure it left, and shows it while it runs
+        // breaks-if-wrong: the build-failure predicate below still reads the reason before it clears
+        failure_reason: null,
+        failure_class: null,
+        status_epoch: nextEpoch,
+      })
       .where('run_id', '=', runId)
       .where('status', '=', ExecutionRunStatus.enum.failed)
+      // fails-when: two reopens of one generation both raise the epoch.
+      // breaks-if-wrong: the first reopen of a failed run must still raise it.
+      .where('status_epoch', '=', run.statusEpoch ?? 0)
       .where((eb) =>
         eb.or([
           eb('failure_reason', 'is', null),
           eb(sql`lower(failure_reason)`, 'not like', '%build%'),
         ]),
       )
-      .execute();
+      .executeTakeFirst();
+    if (Number(result?.numUpdatedRows ?? 0n) > 0) {
+      run.statusEpoch = nextEpoch;
+      logger.info('Reopened a prematurely failed run', { runId, statusEpoch: nextEpoch });
+      return;
+    }
+    await this.adoptStoredStatusEpoch(run, runId);
+  }
 
-    return recoveredRun;
+  /**
+   * Read the run row's status generation into the in-memory run after this
+   * coordinator's reopen matched nothing.
+   *
+   * The reopen loses when another coordinator already reopened the run, or when
+   * this view is a generation behind the row. Either way the row's generation
+   * is the current one: a coordinator that kept its own older value would send
+   * every later frame of the run at a generation the Platform keeps as older, so
+   * none of them would apply.
+   */
+  private async adoptStoredStatusEpoch(run: RunState, runId: string): Promise<void> {
+    const row = await this.db
+      .selectFrom('execution_runs')
+      .select('status_epoch')
+      .where('run_id', '=', runId)
+      .executeTakeFirst();
+    // fails-when: the losing coordinator keeps generation 0 after the winner raised the row to 1
+    // breaks-if-wrong: a run row that no longer exists leaves the in-memory generation as it was
+    if (row) run.statusEpoch = row.status_epoch;
   }
 
   /**
@@ -1959,6 +2171,7 @@ export class ExecutionTracker {
       ExecutionRunStatus.enum.running,
       {
         workflowName: run.workflowName,
+        ...statusEpochField(run.statusEpoch),
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
         ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
@@ -2026,6 +2239,7 @@ export class ExecutionTracker {
       ExecutionRunStatus.enum.cancelling,
       {
         workflowName: run.workflowName,
+        ...statusEpochField(run.statusEpoch),
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
         ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
@@ -2575,6 +2789,7 @@ export class ExecutionTracker {
       overallStatus,
       {
         workflowName: run.workflowName,
+        ...statusEpochField(run.statusEpoch),
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
         ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
@@ -2859,6 +3074,7 @@ export class ExecutionTracker {
         ExecutionRunStatus.enum.failed,
         {
           workflowName: run.workflowName,
+          ...statusEpochField(run.statusEpoch),
           provider: run.provider,
           repoIdentifier: run.repoIdentifier,
           ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
@@ -2923,7 +3139,11 @@ export class ExecutionTracker {
      * `preDispatchRunProvenance` in `dispatch-matched-workflow.ts`, which is
      * the only caller.
      */
-    provenance?: { chainDepth?: number; dispatchedByFailureLifecycle?: boolean },
+    provenance?: {
+      chainDepth?: number;
+      dispatchedByFailureLifecycle?: boolean;
+      rerunLineage?: RerunLineage;
+    },
   ): Promise<void> {
     const now = new Date();
     const reason = failureReason ?? 'Build job timed out before execution tracking started';
@@ -2948,6 +3168,7 @@ export class ExecutionTracker {
         status: ExecutionRunStatus.enum.failed,
         failure_reason: reason,
         ...inheritedChainDepth(provenance?.chainDepth),
+        ...rerunLineageColumns(provenance?.rerunLineage),
         ...(initFailure && { init_failure: JSON.stringify(initFailure) }),
       })
       .execute();
@@ -3025,6 +3246,8 @@ export class ExecutionTracker {
      * loop.
      */
     dispatchedByFailureLifecycle?: boolean;
+    /** Re-run lineage, when this run re-runs another. */
+    rerunLineage?: RerunLineage;
   }): Promise<void> {
     const now = new Date();
     const customerId = await this.resolveCustomerId(args.routingKey);
@@ -3050,6 +3273,7 @@ export class ExecutionTracker {
         failure_class: RunFailureClass.enum.never_started,
         init_failure: JSON.stringify(args.initFailure),
         ...inheritedChainDepth(args.chainDepth),
+        ...rerunLineageColumns(args.rerunLineage),
         ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
       })
       // Overwrite a non-terminal row: dispatch may already have registered the
@@ -3317,6 +3541,16 @@ export class ExecutionTracker {
      */
     workflowRepoIdentifier: string;
     /**
+     * Commit of the workflow repository the held run dispatches, recorded only
+     * when the workflow is defined in another repository.
+     */
+    workflowSha?: string | null;
+    /**
+     * The workflow repository's registered branch, recorded only when the
+     * workflow is defined in another repository.
+     */
+    workflowBranch?: string | null;
+    /**
      * Inherited invoke-chain depth for a run summoned by an invoke gate.
      * REQUIRED to be threaded by any caller that has one: a hold is resumable,
      * so the resumed run can fire its own invoke gate, and the chain-depth
@@ -3330,14 +3564,41 @@ export class ExecutionTracker {
      * excluded from batch accumulation (`EventRouter.isFailureLifecycleRun`).
      */
     dispatchedByFailureLifecycle?: boolean;
+    /** Re-run lineage, when this run re-runs another. */
+    rerunLineage?: RerunLineage;
+    /**
+     * True when the held run is a pre-run global evaluation round rather than a
+     * workflow: the structural marker the release and re-run paths branch on,
+     * written here because a held round is recorded through this method.
+     */
+    isGlobalEvalRound?: boolean;
+    /**
+     * For a held evaluation round: the workflows the round covers, recorded so
+     * its release can refuse when one of them lost its registration while the
+     * round waited. Stored in the row's `trigger_decision` blob.
+     */
+    heldRoundWorkflows?: readonly string[];
+    /**
+     * The source `providerContext` was taken from, when it is not
+     * `routingKey`. Recorded for a held evaluation round, whose release re-drives
+     * the organization-wide pass with that same pair — see
+     * {@link ExecutionTracker.recordGlobalEvalRoundFailureRun}.
+     */
+    dispatchRoutingKey?: string;
   }): Promise<void> {
     const now = new Date();
-    // Populate customer_id here too: the resume path reuses this held row
-    // (onExecutionStarted is a no-op via ON CONFLICT), so the concurrency gate
-    // must see the resumed run's real org, not the '__default__' fallback.
+    // Populate customer_id here too: the resume path reuses this held row, and
+    // onExecutionStarted's conflict path does not write customer_id, so the
+    // concurrency gate must see the resumed run's real org here, not the
+    // '__default__' fallback.
     const customerId = await this.resolveCustomerId(args.routingKey);
-    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf(args);
-    await this.db
+    const crossRepoProvenance = crossRepoProvenanceOf(args.repoIdentifier, {
+      identifier: args.workflowRepoIdentifier,
+      sha: args.workflowSha ?? null,
+      branch: args.workflowBranch ?? null,
+    });
+    const crossRepoWorkflowRepo = crossRepoProvenance?.identifier;
+    const written = await this.db
       .insertInto('execution_runs')
       .values({
         run_id: args.runId,
@@ -3349,14 +3610,21 @@ export class ExecutionTracker {
         ref: args.ref,
         sha: args.sha,
         delivery_id: args.deliveryId,
-        trigger_decision: failureLifecycleTriggerDecision(args.dispatchedByFailureLifecycle),
+        trigger_decision: heldRunTriggerDecision(args),
         provider_context: JSON.stringify(args.providerContext),
         started_at: now,
         status: ExecutionRunStatus.enum.held,
         ...(args.contextName && { context: args.contextName }),
         ...(args.prNumber != null && { pr_number: args.prNumber }),
         ...inheritedChainDepth(args.chainDepth),
-        ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+        ...rerunLineageColumns(args.rerunLineage),
+        ...(crossRepoProvenance && workflowProvenanceColumns(crossRepoProvenance)),
+        ...(args.isGlobalEvalRound === true && { is_global_eval_round: true }),
+        // NULL reads as "the source the event arrived on", as on the failed round.
+        ...(args.dispatchRoutingKey != null &&
+          args.dispatchRoutingKey !== args.routingKey && {
+            dispatch_routing_key: args.dispatchRoutingKey,
+          }),
       })
       // Overwrite a non-terminal row: dispatch may already have registered the
       // run as `pending` before the install gate held it, and leaving that row
@@ -3376,12 +3644,36 @@ export class ExecutionTracker {
             ...inheritedChainDepth(args.chainDepth),
             // See the same restatement on `recordInitFailureRun`: a marker is
             // only ever set, never cleared, so the row cannot be left claiming
-            // the workflow lives in the repository the run acted on.
-            ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+            // the workflow lives in the repository the run acted on. The commit
+            // and branch follow the same rule: a hold that does not know them
+            // keeps the ones the row already records, and one that does
+            // replaces them.
+            ...(crossRepoProvenance && {
+              workflow_repo_identifier: crossRepoProvenance.identifier,
+              workflow_sha: sql<
+                string | null
+              >`COALESCE(EXCLUDED.workflow_sha, execution_runs.workflow_sha)`,
+              workflow_branch: sql<
+                string | null
+              >`COALESCE(EXCLUDED.workflow_branch, execution_runs.workflow_branch)`,
+            }),
           })
           .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
       )
-      .execute();
+      .executeTakeFirst();
+
+    // The guard kept a terminal row: the run finished and is not held. Tell the
+    // Platform nothing — a `held` frame would move its finished run backwards.
+    // fails-when: a hold on a finished run still forwards `held`.
+    // breaks-if-wrong: a hold on a live run must still forward `held`.
+    if (Number(written?.numInsertedOrUpdatedRows ?? 0n) === 0) {
+      logger.warn('Held execution run not recorded: the run is already terminal', {
+        runId: args.runId,
+        workflowName: args.workflowName,
+      });
+      this.runs.delete(args.runId);
+      return;
+    }
 
     this.onExecutionStatusChange?.(
       args.runId,
@@ -3391,6 +3683,9 @@ export class ExecutionTracker {
         provider: args.provider,
         repoIdentifier: args.repoIdentifier,
         ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
+        // The Platform mirrors the marker, so its row reads as a round rather
+        // than an organization-wide workflow run.
+        ...(args.isGlobalEvalRound === true && { isGlobalEvalRound: true }),
         sha: args.sha,
         routingKey: args.routingKey,
         ref: args.ref,
@@ -3413,6 +3708,103 @@ export class ExecutionTracker {
     // held the run could satisfy the completion check and finalize a run that
     // is paused, not finished.
     this.runs.delete(args.runId);
+  }
+
+  /**
+   * Claim a held global evaluation round for its release: move it from `held`
+   * to `pending`. Returns false when the row is not a held round — another
+   * release already claimed it — so a re-fired release signal dispatches the
+   * round at most once.
+   *
+   * `pending`, as a resumed per-repository run (`resumeHeldRun`), and not
+   * `running`: orphan recovery fails a `running` row older than its stale
+   * threshold that has no job rows, and a round row keeps the `started_at` of
+   * its hold and never has job rows. No sweeper selects a `pending` row with no
+   * job rows and no workflow timeout.
+   */
+  async claimHeldGlobalEvalRound(runId: string): Promise<boolean> {
+    const result = await this.db
+      .updateTable('execution_runs')
+      .set({ status: ExecutionRunStatus.enum.pending })
+      .where('run_id', '=', runId)
+      // fails-when: a second release signal claims a round the first one is running
+      // breaks-if-wrong: the first release of a held round must still claim it
+      .where('status', '=', ExecutionRunStatus.enum.held)
+      .where('is_global_eval_round', '=', true)
+      .executeTakeFirst();
+    return Number(result?.numUpdatedRows ?? 0n) > 0;
+  }
+
+  /**
+   * Terminalize a held global evaluation round whose hold was released.
+   *
+   * The released round runs as a job of its own and creates no run row when it
+   * decides, so nothing else ever moves this row out of `held`. `success`
+   * records that the round reached a verdict for its workflow repository;
+   * `failed` that it did not, with the reason. Guarded on `pending`, the
+   * state {@link ExecutionTracker.claimHeldGlobalEvalRound} moved the row to,
+   * so only the release that claimed it settles it.
+   *
+   * A settled round is not an execution: no `executions_total` sample is
+   * counted for a success, and the forwarded frame carries `isGlobalEvalRound`
+   * so the Platform raises no run notification or outbound webhook for it.
+   */
+  async completeReleasedGlobalEvalRound(
+    runId: string,
+    outcome:
+      | { status: typeof ExecutionRunStatus.enum.success }
+      | { status: typeof ExecutionRunStatus.enum.failed; reason: string },
+  ): Promise<void> {
+    const now = new Date();
+    const failed = outcome.status === ExecutionRunStatus.enum.failed;
+    const row = await this.db
+      .updateTable('execution_runs')
+      .set({
+        status: outcome.status,
+        completed_at: now,
+        ...(failed && {
+          failure_reason: outcome.reason,
+          failure_class: RunFailureClass.enum.never_started,
+        }),
+      })
+      .where('run_id', '=', runId)
+      // fails-when: a release that did not claim the round settles it
+      // breaks-if-wrong: the release that claimed the round must still settle it
+      .where('status', '=', ExecutionRunStatus.enum.pending)
+      .where('is_global_eval_round', '=', true)
+      .returningAll()
+      .executeTakeFirst();
+    if (!row) {
+      logger.warn('completeReleasedGlobalEvalRound: no held round to settle', { runId });
+      return;
+    }
+    // A failed round is counted like the failed round row the delivery writes.
+    if (failed) executionsTotal.add(1, { status: outcome.status });
+    this.onRunTerminalCleanup?.(runId);
+    this.onExecutionStatusChange?.(
+      runId,
+      outcome.status,
+      {
+        workflowName: row.workflow_name,
+        ...statusEpochField(row.status_epoch),
+        provider: row.provider ?? '',
+        repoIdentifier: row.repo_identifier ?? '',
+        ...(row.workflow_repo_identifier && {
+          workflowRepoIdentifier: row.workflow_repo_identifier,
+        }),
+        isGlobalEvalRound: true,
+        sha: row.sha ?? '',
+        routingKey: row.routing_key ?? undefined,
+        ref: row.ref ?? '',
+        ...(failed && { failureClass: RunFailureClass.enum.never_started }),
+      },
+      0,
+      row.started_at ? new Date(row.started_at).getTime() : now.getTime(),
+      now.getTime(),
+      0,
+      failed ? outcome.reason : undefined,
+    );
+    logger.info('Settled a released global eval round', { runId, status: outcome.status });
   }
 
   /**
@@ -3466,8 +3858,10 @@ export class ExecutionTracker {
       ExecutionRunStatus.enum.cancelled,
       {
         workflowName: row.workflow_name,
+        ...statusEpochField(row.status_epoch),
         provider: row.provider ?? '',
         repoIdentifier: row.repo_identifier ?? '',
+        ...(row.is_global_eval_round === true && { isGlobalEvalRound: true }),
         sha: row.sha ?? '',
         routingKey: row.routing_key ?? undefined,
         ref: row.ref ?? '',
@@ -3480,6 +3874,70 @@ export class ExecutionTracker {
       reason,
     );
     logger.info('Cancelled held execution run (install gate rejected)', { runId, reason });
+  }
+
+  /**
+   * Cancel a run that has no job rows: a run cancelled before it dispatched
+   * any job, a pre-run evaluation round, or a `pending` row a crash left
+   * behind. No job will ever report a terminal status for it, so the cancel
+   * itself writes the terminal row and forwards it, as `cancelHeldRun` does.
+   *
+   * Guarded on the row being non-terminal, not `held`, and having no job rows,
+   * so a run a job registered on in the meantime is left to the job-driven
+   * completion and a held run to the hold-rejection path.
+   * The cancellation reason already stamped on the row wins over `reason`.
+   * Returns whether a row was cancelled.
+   */
+  async cancelJoblessRun(runId: string, reason: string): Promise<boolean> {
+    const now = new Date();
+    const row = await this.db
+      .updateTable('execution_runs')
+      .set({
+        status: ExecutionRunStatus.enum.cancelled,
+        completed_at: now,
+        failure_reason: sql<string>`COALESCE(execution_runs.failure_reason, ${reason})`,
+        failure_class: RunFailureClass.enum.cancelled,
+      })
+      .where('run_id', '=', runId)
+      // A held run is left to the hold-rejection path, which also withdraws its
+      // approval request; cancelling only the row would leave that request live.
+      // fails-when: a cancel moves a held run to cancelled while its hold stays pending
+      // breaks-if-wrong: a jobless pending run must still reach cancelled
+      .where('status', 'not in', [...TERMINAL_RUN_STATES, ExecutionRunStatus.enum.held])
+      // fails-when: a cancel terminalizes a run whose jobs will report their own terminal status
+      // breaks-if-wrong: a run with no job rows must still reach `cancelled`
+      .where(
+        sql<boolean>`NOT EXISTS (SELECT 1 FROM execution_jobs ej WHERE ej.run_id = execution_runs.run_id)`,
+      )
+      .returningAll()
+      .executeTakeFirst();
+    if (!row) return false;
+    this.onRunTerminalCleanup?.(runId);
+    this.onExecutionStatusChange?.(
+      runId,
+      ExecutionRunStatus.enum.cancelled,
+      {
+        workflowName: row.workflow_name,
+        ...statusEpochField(row.status_epoch),
+        provider: row.provider ?? '',
+        repoIdentifier: row.repo_identifier ?? '',
+        ...(row.workflow_repo_identifier && {
+          workflowRepoIdentifier: row.workflow_repo_identifier,
+        }),
+        ...(row.is_global_eval_round === true && { isGlobalEvalRound: true }),
+        sha: row.sha ?? '',
+        routingKey: row.routing_key ?? undefined,
+        ref: row.ref ?? '',
+        failureClass: RunFailureClass.enum.cancelled,
+      },
+      0,
+      row.started_at ? new Date(row.started_at).getTime() : now.getTime(),
+      now.getTime(),
+      0,
+      row.failure_reason ?? reason,
+    );
+    logger.info('Cancelled a run with no jobs', { runId, reason });
+    return true;
   }
 
   /**
@@ -3550,6 +4008,7 @@ export class ExecutionTracker {
         ExecutionRunStatus.enum.failed,
         {
           workflowName: run.workflowName,
+          ...statusEpochField(run.statusEpoch),
           provider: run.provider,
           repoIdentifier: run.repoIdentifier,
           ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
@@ -3639,7 +4098,7 @@ export class ExecutionTracker {
       perJob.set(jobId, (perJob.get(jobId) ?? 0) + logBytesStreamed);
     }
     const jobName = await this.resolveJobName(runId, jobId);
-    const logPath = `executions/${runId}/job-${jobName}/step-${stepIndex}.log`;
+    const logPath = stepLogPath(runId, jobName, stepIndex);
     const now = new Date(timestamp);
 
     // Build values for upsert (single object for both insert and conflict update)
@@ -4155,6 +4614,7 @@ export class ExecutionTracker {
     startedAt: number;
     completedAt?: number;
     durationMs?: number;
+    statusEpoch?: number;
     jobs: Array<{
       jobId: string;
       jobName: string;
@@ -4184,6 +4644,7 @@ export class ExecutionTracker {
       startedAt: number;
       completedAt?: number;
       durationMs?: number;
+      statusEpoch?: number;
       jobs: Array<{
         jobId: string;
         jobName: string;
@@ -4248,6 +4709,8 @@ export class ExecutionTracker {
         startedAt: run.startedAt,
         completedAt: run.completedAt,
         durationMs,
+        // Always sent, so the Platform applies its keep-terminal rule to a replay.
+        statusEpoch: run.statusEpoch ?? 0,
         jobs,
       });
     }
@@ -4298,6 +4761,7 @@ export class ExecutionTracker {
       triggered_by_agent_label: string | null;
       failure_reason: string | null;
       failure_class: string | null;
+      status_epoch: number;
     }> = [];
 
     try {
@@ -4321,6 +4785,7 @@ export class ExecutionTracker {
           'triggered_by_agent_label',
           'failure_reason',
           'failure_class',
+          'status_epoch',
         ])
         .where('status', 'in', [
           ExecutionRunStatus.enum.success,
@@ -4389,6 +4854,7 @@ export class ExecutionTracker {
         startedAt: r.started_at.getTime(),
         ...(r.completed_at && { completedAt: r.completed_at.getTime() }),
         ...(r.duration_ms !== null && { durationMs: r.duration_ms }),
+        statusEpoch: r.status_epoch ?? 0,
         jobs,
       });
       appended++;
@@ -4672,6 +5138,7 @@ export class ExecutionTracker {
       overallStatus,
       {
         workflowName: memRun.workflowName,
+        ...statusEpochField(memRun.statusEpoch),
         provider: memRun.provider,
         repoIdentifier: memRun.repoIdentifier,
         ...(memRun.workflowRepoIdentifier && {
@@ -4854,6 +5321,7 @@ export class ExecutionTracker {
         'trigger_actor_username',
         'trigger_actor_user_id',
         'workflow_repo_identifier',
+        'status_epoch',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -4977,6 +5445,7 @@ export class ExecutionTracker {
       overallStatus,
       {
         workflowName: dbRun.workflow_name,
+        ...statusEpochField(dbRun.status_epoch),
         provider: dbRun.provider,
         repoIdentifier: dbRun.repo_identifier,
         ...(dbRun.workflow_repo_identifier && {

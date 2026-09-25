@@ -33,6 +33,11 @@ export interface BackfillRunRow {
   started_at: Date | null;
   completed_at: Date | null;
   duration_ms: number | null;
+  /**
+   * The run's status generation. Forwarded so the Platform mirror records the
+   * generation the backfilled status belongs to. Absent reads as 0.
+   */
+  status_epoch?: number | null;
 }
 
 /** The local `execution_jobs` fields the backfill needs. */
@@ -90,6 +95,7 @@ export async function backfillRunToPlatform(deps: BackfillRunDeps, runId: string
     startedAt: ms(run.started_at) ?? now,
     ...(ms(run.completed_at) !== undefined ? { completedAt: ms(run.completed_at) } : {}),
     ...(run.duration_ms != null ? { durationMs: run.duration_ms } : {}),
+    statusEpoch: run.status_epoch ?? 0,
     timestamp: now,
   } as unknown as OrchestratorToPlatformMessage);
 

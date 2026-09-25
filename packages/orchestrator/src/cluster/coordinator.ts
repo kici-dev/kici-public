@@ -68,6 +68,8 @@ export interface RunContext {
   traceId?: string;
   /** Pre-resolved clone token for workers without provider credentials. */
   cloneToken?: string;
+  /** Pre-resolved clone token for the workflow repository of an organization-wide job. */
+  workflowCloneToken?: string;
 }
 
 export interface JobToRoute {
@@ -1147,6 +1149,7 @@ export class RunCoordinator {
       depsHash: job.depsHash,
       // Include pre-resolved clone token for workers without provider credentials
       cloneToken: runContext.cloneToken,
+      workflowCloneToken: runContext.workflowCloneToken,
     };
   }
 

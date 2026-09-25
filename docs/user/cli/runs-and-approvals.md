@@ -227,13 +227,12 @@ An orchestrator with no Platform connection cannot serve remote runs — the Pla
 
 #### Fresh repos (no GitHub remote)
 
-`kici run remote` works even if the repo has never been pushed to GitHub. When no remote is detected:
+`kici run remote` works even if the repo has never been pushed to GitHub, because no run depends on a git remote. Every `kici run remote` run behaves the same way, with or without a remote:
 
-- The entire repo content is uploaded (not just a diff overlay)
+- The entire working tree is uploaded, including the `.git` directory, so steps that run git commands work
 - The lock file is sent inline (no GitHub API fetch)
-- Steps that use git commands will fail (no `.git` directory in the remote workspace)
-- Build cache (`__build__` jobs) is skipped for local repos
-- Environments must have `allowLocalExecution: true` to be accessible from local runs (default is `false`)
+- The build cache is skipped: no `__build__` job runs, and no cached source or dependencies are used
+- A bound context that does not set `allowLocalExecution: true` (the default is `false`) is skipped for the run, and the run shows a warning that names it
 
 Destination routing is unchanged for fresh repos: the run still goes to your active org through the Platform.
 
@@ -319,7 +318,29 @@ kici runs show abc123 --json
 
 #### kici runs logs
 
-Print each job/step's log lines in order, with headers.
+Print each job/step's log lines in order, with headers. Each job starts with its
+setup log, under a `(setup)` heading, when it wrote one: the clone, the `.kici`
+dependency install and the workflow module load. The parentheses keep it apart
+from a step named `setup`. When a job's setup log has no lines, a note under
+the heading tells the two cases apart: `(no setup log recorded for this job)` or
+`(the setup log for this job is empty)`. When the orchestrator does not report
+the difference, no setup heading prints for that job. The `--json` output carries
+no note.
+
+`--json` prints an object that maps each key to an array of lines. A step's key
+is `<job>/<step>`. A job's setup lines, when it wrote any, are under
+`setup:<job>`, with `%` and `/` in the job name written as `%25` and `%2F`. A
+setup key never contains a `/` and a step key always does, so a step named
+`setup` cannot collide with it:
+
+```json
+{
+  "setup:build": ["[host-install] Dependencies installed"],
+  "build/setup": ["step output"],
+  "setup:deploy%2Fprod": ["[host-install] Dependencies installed"],
+  "deploy/prod/apply": ["step output"]
+}
+```
 
 ```bash
 kici runs logs <run-id> [options]

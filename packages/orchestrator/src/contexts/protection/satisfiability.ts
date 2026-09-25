@@ -20,6 +20,7 @@
  */
 import { z } from 'zod';
 import type { Context } from '@kici-dev/engine';
+import { effectiveContextRefs, type ContextRef } from '../../pipeline/job-contexts.js';
 
 /** Which decidable rule made a binding unsatisfiable. */
 export const UnsatisfiableRule = z.enum(['enabled', 'branch', 'trigger', 'repo']);
@@ -138,21 +139,30 @@ interface SatisfiabilityLockJob {
 
 /** Minimal lock-workflow shape needed to walk its jobs for satisfiability. */
 interface SatisfiabilityLockWorkflow {
+  /** Workflow-level context names, bound by every job before its own. */
+  contexts?: readonly unknown[];
   jobs?: readonly unknown[];
 }
 
-/** Extract the statically-known (non-dynamic, string-valued) bound env names of a lock job. */
-function staticBoundNames(job: SatisfiabilityLockJob): string[] {
-  return (job.contexts ?? [])
-    .filter((e) => !e.dynamic && typeof e.value === 'string')
-    .map((e) => e.value as string);
+/**
+ * The statically-known (non-dynamic, string-valued) context names a lock job
+ * binds: the workflow-level names first, then the job's own, through the same
+ * {@link effectiveContextRefs} every dispatch-time gate reads.
+ */
+function staticBoundNames(wf: SatisfiabilityLockWorkflow, job: SatisfiabilityLockJob): string[] {
+  const workflowNames = (wf.contexts ?? []).filter((n): n is string => typeof n === 'string');
+  const own = (job.contexts ?? []).filter((e): e is ContextRef => typeof e.value === 'string');
+  return effectiveContextRefs({ contexts: workflowNames }, { contexts: own })
+    .filter((e) => !e.dynamic)
+    .map((e) => e.value);
 }
 
 /**
  * Walk every workflow's static jobs and reject the registration when a bound
- * context list is provably unsatisfiable (a disabled context, or
- * mutually-exclusive fixed branch/trigger/repo restrictions among the resolved
- * contexts — missing names are lenient, never rejected). Dynamic elements
+ * context list — the workflow-level names plus the job's own — is provably
+ * unsatisfiable (a disabled context, or mutually-exclusive fixed
+ * branch/trigger/repo restrictions among the resolved contexts — missing names
+ * are lenient, never rejected). Dynamic elements
  * are skipped (unresolvable at registration); the all-must-pass semantics keep
  * the static subset's exclusivity sound. Throws the first
  * `UnsatisfiableBinding.message` so the registration route / direct helper
@@ -170,7 +180,9 @@ export async function assertWorkflowsSatisfiable(
   for (const wf of workflows) {
     for (const job of (wf.jobs ?? []) as SatisfiabilityLockJob[]) {
       if (typeof job?.name !== 'string') continue;
-      const names = staticBoundNames(job);
+      // fails-when: only the job's own contexts are read, so a workflow-level context
+      // that excludes the job's own never reaches the intersection
+      const names = staticBoundNames(wf, job);
       if (names.length === 0) continue;
       const resolved = await Promise.all(names.map((n) => resolve(n)));
       const problem = checkBindingSatisfiable(

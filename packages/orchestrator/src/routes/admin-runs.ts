@@ -297,6 +297,9 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
           'failure_reason',
           'created_at',
           'routing_key',
+          'workflow_repo_identifier',
+          'workflow_sha',
+          'workflow_branch',
         ])
         .where('run_id', '=', runId)
         .executeTakeFirst();
@@ -333,6 +336,11 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
             contributorUsername: run.contributor_username,
             failureReason: run.failure_reason,
             createdAt: run.created_at.toISOString(),
+            // Set only on an organization-wide run whose workflow is defined in
+            // another repository; null on every run of a repository's own workflow.
+            workflowRepoIdentifier: run.workflow_repo_identifier,
+            workflowSha: run.workflow_sha,
+            workflowBranch: run.workflow_branch,
           },
         },
         200,

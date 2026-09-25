@@ -12,6 +12,7 @@
  * - run.cancel.request: cancels a running workflow run
  */
 import { setupStepsFirst } from '../reporting/step-display-order.js';
+import { HeldRunCancelRefusedError } from '../cancel/cancel-run.js';
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
 import type {
@@ -91,6 +92,7 @@ const ATTESTATIONS_PAGE_SIZE = 25;
 import { buildRunDetailJobs, aggregateRunDetail } from '../reporting/run-aggregator.js';
 import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import type { LogStorage } from '../reporting/log-storage.js';
+import { resolveStepLogPath } from '../reporting/step-log-reader.js';
 import type { CacheStorage } from '../storage/types.js';
 import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
@@ -1351,14 +1353,24 @@ export class DashboardHandler {
   async handleStepLogs(msg: DashboardStepLogsRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     try {
-      // Query the step to get the log_path
-      const step = await this.db
-        .selectFrom('execution_steps')
-        .select(['log_path'])
-        .where('run_id', '=', msg.runId)
-        .where('job_id', '=', msg.jobId)
-        .where('step_index', '=', msg.stepIndex)
-        .executeTakeFirst();
+      // The workflow-level log (step -1: the job's setup narration) has no step
+      // row; the shared reader derives its key. A job that wrote none reads as
+      // an empty page rather than an error, so a client can probe for it.
+      // fails-when: step -1 goes through the row lookup below and always
+      // answers "Step not found".
+      const isWorkflowLog = msg.stepIndex < 0;
+      const step = isWorkflowLog
+        ? {
+            log_path:
+              (await resolveStepLogPath({ db: this.db, logStorage: this.logStorage }, msg)) ?? '',
+          }
+        : await this.db
+            .selectFrom('execution_steps')
+            .select(['log_path'])
+            .where('run_id', '=', msg.runId)
+            .where('job_id', '=', msg.jobId)
+            .where('step_index', '=', msg.stepIndex)
+            .executeTakeFirst();
 
       if (!step) {
         this.recordAccess(
@@ -1395,7 +1407,11 @@ export class DashboardHandler {
           requestId: msg.requestId,
           lines: [],
           totalLines: 0,
-          error: 'No logs available',
+          // breaks-if-wrong: a regular step with no log path still reports why.
+          // fails-when: a job that wrote no setup log reads like one whose log is empty
+          ...(isWorkflowLog
+            ? { nextCursor: null, recorded: false }
+            : { error: 'No logs available' }),
         });
         return;
       }
@@ -1417,6 +1433,7 @@ export class DashboardHandler {
         lines: page,
         totalLines,
         nextCursor,
+        recorded: true,
       });
       if (!validated.success) {
         logger.error('Outgoing dashboard.step.logs response validation failed', {
@@ -1459,6 +1476,7 @@ export class DashboardHandler {
         lines: validated.data.lines,
         totalLines: validated.data.totalLines,
         nextCursor: validated.data.nextCursor ?? null,
+        recorded: validated.data.recorded,
       });
     } catch (err) {
       logger.error('Error handling dashboard.step.logs', {
@@ -2421,10 +2439,24 @@ export class DashboardHandler {
         ...(result.alreadyTerminal !== undefined && { alreadyTerminal: result.alreadyTerminal }),
       });
     } catch (err) {
-      logger.error('Error handling run.cancel.request', {
-        runId: msg.runId,
-        error: toErrorMessage(err),
-      });
+      // A decision (an approve, a reject, an expiry) that reached the held run
+      // first is an expected race: the cancel is refused, not failed, so it is
+      // neither an error log nor an error outcome (the admin cancel route
+      // records it the same way).
+      // fails-when: the race is logged at error level with an 'error' outcome
+      // breaks-if-wrong: any other cancel failure must still record 'error'
+      const refused = err instanceof HeldRunCancelRefusedError;
+      if (refused) {
+        logger.info('Cancel refused: a decision reached the held run first', {
+          runId: msg.runId,
+          decision: err.decision,
+        });
+      } else {
+        logger.error('Error handling run.cancel.request', {
+          runId: msg.runId,
+          error: toErrorMessage(err),
+        });
+      }
 
       this.recordAccess(
         ctx,
@@ -2432,7 +2464,7 @@ export class DashboardHandler {
         'run.cancel',
         { type: 'run', id: msg.runId },
         msg.requestId,
-        'error',
+        refused ? 'allowed' : 'error',
         toErrorMessage(err),
       );
       this.send({

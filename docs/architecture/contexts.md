@@ -325,7 +325,7 @@ held status:
   awaiting approval / timer
     -> approval satisfied  -> queued -> running
     -> rejection           -> cancelled
-    -> expiry (hold_expiry_seconds exceeded) -> cancelled
+    -> expiry (hold_expiry_seconds exceeded) -> failed
 ```
 
 The `held` status is non-terminal. It resolves to `queued` once the gate is satisfied (a reviewer approves, or a timer elapses).

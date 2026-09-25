@@ -34,6 +34,7 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | `KICI_DOCKER_KEEP_FAILED`                  | no       | "false"    | string                                  |         |             |
 | `KICI_EXECUTION_MODE`                      | no       |            | enum:container\|bare-metal\|firecracker |         |             |
 | `KICI_GITHUB_TOKEN`                        | no       |            | string                                  |         |             |
+| `KICI_HOST_INSTALL_REGISTRIES`             | no       |            | string                                  |         |             |
 | `KICI_IN_PLACE`                            | no       | "false"    | string                                  |         |             |
 | `KICI_JOB_IMAGE_AGENT`                     | no       |            | string                                  |         |             |
 | `KICI_LABELS`                              | no       |            | string                                  |         |             |
@@ -173,9 +174,175 @@ Podman exposes its socket at a different path (`/run/podman/podman.sock` rootful
 The agent:
 
 1. Creates a job container from the specified image (already-present images are used as-is; a missing image is pulled on demand first) with `/workspace` as a container-owned volume
-2. Clones the repository on the host, then copies the tree into the container's `/workspace` volume — so the job's image needs no git, and clone credentials never enter it
-3. Starts the workflow runner inside the container via a single exec — the dependency install and every step run inside the container
+2. Clones the repository on the host and, when the conditions below hold, installs its `.kici/` dependencies there. It then copies the tree into the container's `/workspace` volume — so the job's image needs no git, and clone credentials never enter it
+3. Starts the workflow runner inside the container via a single exec — every step, and any dependency install the host did not do, runs inside the container
 4. Removes the container (and its workspace volume) after job completion
+
+### Where `.kici/` dependencies install
+
+The agent installs a container job's `.kici/` dependencies on its own host,
+into the checkout, when all of these are true:
+
+- `KICI_ALLOW_INSTALL_SCRIPTS` is unset or `false`. When it is `true`, a
+  container job's install and its lifecycle scripts run inside the job
+  container.
+- A runtime is injected (`KICI_RUNTIME_IMAGE` or `KICI_RUNTIME_NODE_SOURCE`). The
+  runner then runs on the KiCI runtime, and the image preflight admits glibc
+  images only. The job container shares the host's CPU architecture, so modules
+  installed on the host load inside it.
+- The dispatch carries no cached dependency tarball.
+- `.kici/` is a plain npm or pnpm project. The agent refuses the host install,
+  and the job container installs instead, when any of these holds:
+  - The project uses yarn, or carries `yarn.lock`, `.yarnrc`, `.yarnrc.yml` or
+    `.pnp.cjs` in `.kici/` or at the repository root.
+  - `.kici/` sits in a workspace: a `pnpm-workspace.yaml` or a `workspaces`
+    field in `.kici/` or at the repository root.
+  - pnpm hooks are declared: a `.pnpmfile.cjs`, `.pnpmfile.mjs` or
+    `.pnpmfile.js`, or a `pnpmfile`, `global-pnpmfile`, `config-dependencies`
+    or `hooks` key in an `.npmrc`, in `.kici/` or at the repository root.
+  - `.kici/package.json` has a `pnpm` field key other than `overrides`,
+    `onlyBuiltDependencies`, `neverBuiltDependencies`,
+    `ignoredBuiltDependencies`, `allowedDeprecatedVersions`,
+    `peerDependencyRules`, `packageExtensions` or `auditConfig`.
+  - A dependency or an override in `.kici/package.json`, or an entry in its
+    lockfile, is not a registry package: a git, file, link, `workspace:`,
+    tarball or URL source. The `overrides`, `resolutions` and `pnpm.overrides`
+    fields are checked like the dependency fields. In `package-lock.json`, a
+    `version` must be a version, a range, a dist-tag or an `npm:` alias. npm
+    installs an entry with no `resolved` URL from what its `version` names,
+    such as `http:127.0.0.1:8080/x.tgz` or a directory on the agent host.
+  - A registry the job's `registries:` resolved, or a `registry` or
+    `@scope:registry` in `.kici/.npmrc`, is on an origin outside the
+    [registries the host install may contact](#registries-the-host-install-may-contact).
+  - A lockfile tarball URL is not a package tarball on one of those registries.
+    This covers `resolved` in `package-lock.json` and `resolution.tarball` in
+    `pnpm-lock.yaml`.
+  - A registry-auth value in `.kici/.npmrc` or `~/.npmrc` references a variable
+    that npm, pnpm or Node reads, as `${NAME}`. Examples are the proxy
+    variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `PROXY`, in any case),
+    names that start with `NODE_`, `NPM_`, `PNPM_`, `SSL_`, `OPENSSL_` or
+    `LD_`, names that contain `DEBUG`, and config roots such as `HOME`, `PATH`
+    and `PREFIX`. Two names are exempt, in upper case only: `NPM_TOKEN` and
+    `NODE_AUTH_TOKEN`. No tool reads them, so `${NPM_TOKEN}` and
+    `${NPM_TOKEN?}` keep the install on the host.
+  - An `.npmrc` in `.kici/` or at the repository root holds a control
+    character other than LF or TAB. A CR is one, so a file with CRLF line
+    endings is refused.
+  - A registry the job's `registries:` resolved has whitespace or a control
+    character in its URL or scope.
+  - `.kici`, its `package.json`, its lockfile or its `.npmrc` is a symlink, or
+    so is the repository root's `package.json` or `.npmrc`. The manifest or
+    the lockfile does not parse.
+- The agent has its own package manager for the project: the npm bundled with
+  the Node that runs the agent, version 11.10.0 or later, or pnpm `11.3.0` in
+  the agent's corepack cache (`COREPACK_HOME`, else `~/.cache/node/corepack`).
+  The agent never runs a corepack shim, and never follows the project's
+  `packageManager` field. The agent image sets `COREPACK_HOME=/opt/corepack`
+  and bakes pnpm `11.3.0` there, owned by root, so the agent user cannot
+  change the pnpm the host install runs.
+- The npm bundled with the Node that runs the agent is present, for a pnpm
+  project too. The agent reads every `.npmrc` with that npm's parser.
+- With an npm older than 11.15.0, `.kici/` has a `package-lock.json` or
+  `npm-shrinkwrap.json` of lockfile version 2 or 3 that pins every package.
+  That npm has no `--allow-remote`, `--allow-file` or `--allow-directory`, so
+  the host install runs `npm ci`. `npm ci` resolves a dependency the lockfile
+  leaves open before it refuses the lockfile, and that can fetch a URL. So the
+  agent reads the lockfile with that npm's own reader. It refuses the lockfile
+  when a dependency of the project or of a locked package is missing or does
+  not satisfy its range. It also refuses a locked package that ships its own
+  `npm-shrinkwrap.json`. A missing optional peer dependency is allowed.
+  Every locked package must also have a semver version and a `resolved`
+  tarball URL on one of the
+  [registries the host install may contact](#registries-the-host-install-may-contact).
+  A package bundled in its parent's tarball has no `resolved` URL of its own,
+  so it needs only the version. A lockfile written with
+  `omit-lockfile-registry-resolved` records no `resolved` URLs, so the job
+  container installs it.
+
+The host install never runs in the checkout. The agent copies
+`.kici/package.json` and its lockfile into a fresh staging directory and writes
+the only `.npmrc` the install reads. The agent parses `.kici/.npmrc` and the
+agent user's `~/.npmrc` with the `ini` parser of the npm it runs. npm and pnpm
+read `.npmrc` files with the same parser. The agent then writes a new file from
+the kept key-value pairs, and copies no line of either file. The file holds only
+these keys:
+
+- From `.kici/.npmrc` and from the agent user's `~/.npmrc`: `registry`,
+  `@scope:registry`, `always-auth`, and the per-registry `_authToken`, `_auth`,
+  `username`, `_password` and `always-auth`.
+- From the agent user's `~/.npmrc` only: `strict-ssl`, `ca`, `cafile`, `proxy`,
+  `https-proxy`, `noproxy` and `no-proxy`.
+- The registries and tokens the orchestrator resolved for the job, written last.
+
+Every other key is dropped, including `node-options`, `git` and `script-shell`.
+A key inside a `[section]` is dropped, and so is a value that holds a control
+character. When `.kici/.npmrc` and `~/.npmrc` set the same key, the
+`.kici/.npmrc` value applies. An install secret reaches the install only when a
+kept registry-auth value (`_authToken`, `_auth`, `username` or `_password`)
+references it as `${NAME}`. The install runs with the agent's
+install environment, not the job's `env`, `contextVars` or `jobEnv`. It keeps only `PATH`, locale, timezone and
+temp variables from the agent, and points `HOME` into the staging directory.
+`NODE_OPTIONS`, `npm_config_*` and `pnpm_config_*` never pass.
+
+npm 11.15.0 and later runs `npm install` with `--ignore-scripts
+--allow-git=none --allow-remote=none --allow-file=none --allow-directory=none`.
+An older npm runs `npm ci --ignore-scripts --allow-git=none`, which installs
+only what the lockfile pins. pnpm runs
+with `--ignore-scripts --ignore-pnpmfile --ignore-workspace --pm-on-fail=ignore`
+and with the `runtime-on-fail=ignore`, `block-exotic-subdeps=true` and
+`enable-global-virtual-store=false` settings. Cancelling the job kills the
+install, and the agent then creates no job container.
+
+In every other case the runner installs inside the job container, and the
+registry must be reachable from the job network. A failed host install fails the
+job with the installer's error, with registry tokens and install secrets masked.
+The agent never retries the install inside the container.
+
+All of this applies to a container job's own `.kici/` install. Other jobs
+install `.kici/` on the agent host with the project's own package manager,
+run in the checkout. Lifecycle scripts stay off unless
+`KICI_ALLOW_INSTALL_SCRIPTS=true`, but pnpm hooks, a yarn plugin or an `.npmrc`
+setting from the repository still take effect. An agent with the `builder`
+role runs the `__build__` job this way. An agent with the `init-runner` role
+runs the `__init__`, `__dynamic__` and `__globaleval__` jobs this way, and
+those jobs also import the workflow module in a child process on the agent
+host. An agent with `KICI_ROLES` unset holds both roles. To keep that work off
+the hosts that run container jobs, set `KICI_ROLES=` on those agents, and run
+dedicated agents with `KICI_ROLES=builder,init-runner`. See
+[Agent roles](#agent-roles).
+
+#### Registries the host install may contact
+
+The host install runs on the agent host, outside the job network and its egress
+filter (`KICI_SANDBOX_NETWORK_ISOLATION`). So it contacts only the registries
+the operator chose:
+
+- the public npm registry, `https://registry.npmjs.org/`;
+- a `registry` or `@scope:registry` in the agent user's `~/.npmrc`;
+- the origins listed in `KICI_HOST_INSTALL_REGISTRIES`.
+
+`KICI_HOST_INSTALL_REGISTRIES` takes comma-separated origins, for example
+`http://verdaccio.local:4873,https://npm.example.internal`. Each entry is a
+scheme, a host and an optional port, with no path. The agent compares origins
+exactly after it normalizes them: the host is lower-cased and a default port is
+dropped. It never compares the addresses a name resolves to. An entry that is
+not an http or https origin stops the agent at startup. The error names the
+entry with its credentials, query and fragment removed. The agent reads this
+setting from its own environment only, never from a dispatch or a workflow.
+
+A registry that the workflow names does not widen this set. The job's
+`registries:` block and `.kici/.npmrc` come from the repository, so a repository
+could otherwise point the host install at the agent's loopback, its LAN or a
+cloud metadata address. When one of them is on another origin, the job container
+installs instead, and the job's registry tokens never reach the host install.
+The install sends the token for an allowed registry only to that registry's
+host.
+
+A private registry outside this set is reached from the job container, so the
+job network must reach it. `KICI_SANDBOX_NETWORK=host` runs the job container on
+the host network, and `KICI_SANDBOX_NETWORK_ISOLATION=false` turns the egress
+filter off. See [Agent security](../security/agent-security.md) for what each
+one gives up.
 
 Job containers are hardened by default: all Linux capabilities dropped, no-new-privileges, cgroup PID/memory/CPU caps, and a private tmpfs `/tmp`, tunable via the `KICI_SANDBOX_*` variables above. See [Agent security](../security/agent-security.md) for the full isolation model and the per-job `sandbox:` escape hatch.
 
@@ -214,13 +381,18 @@ CLI fails the job with a message naming what to install.
 The agent reports what it found at registration, as self-reported labels
 alongside `kici:os:*` and `kici:arch:*`:
 
-| Label                          | Meaning                                                        |
-| ------------------------------ | -------------------------------------------------------------- |
-| `kici:runtime:docker`          | a docker socket is present — the agent can run a job container |
-| `kici:runtime:podman`          | a podman socket is present                                     |
-| `kici:runtime:container-build` | a build CLI is on `PATH` — the agent can build a job image     |
+| Label                          | Meaning                                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------------------- |
+| `kici:runtime:docker`          | a docker socket is present — the agent can run a job container                              |
+| `kici:runtime:podman`          | a podman socket is present                                                                  |
+| `kici:runtime:container-build` | a build CLI is on `PATH` — the agent can build a job image                                  |
+| `kici:runtime:job-image`       | the agent runs inside one job's own image (`KICI_JOB_IMAGE_AGENT=1`) and takes no other job |
 
-The socket labels report that the socket file exists, not that a daemon answered on it. Registration must not block on a runtime that is slow or wedged. So the label answers the routing question — is there a runtime on this host at all — and a job that reaches a broken daemon fails with that daemon's own error. The agent honours `DOCKER_HOST` first when it is set, then `/var/run/docker.sock`, then the rootful and rootless podman socket paths.
+The socket labels report that the socket file exists, not that a daemon answered on it. Registration must not block on a runtime that is slow or wedged. So the label answers the routing question — is there a runtime on this host at all — and a job that reaches a broken daemon fails with that daemon's own error.
+
+The agent starts a job container on `DOCKER_HOST` when it is set, and on nothing else: a `DOCKER_HOST` socket that does not exist means no runtime, and neither socket label is reported. A `DOCKER_HOST` that names a remote daemon (`tcp://…`) reports `kici:runtime:docker`. With no `DOCKER_HOST`, the agent uses the first of `/var/run/docker.sock`, the rootful podman socket and the rootless podman socket that exists, so a host that runs only Podman starts job containers on Podman. A container job on a host with none fails before the clone, with a message naming the missing runtime and the agent's labels.
+
+The orchestrator routes a container job to an agent only when the auto-scaler started that agent for the job, or the agent reports `kici:runtime:docker` or `kici:runtime:podman`. An agent from a release before 0.10.0 does not report a remote `DOCKER_HOST` as a runtime. So the orchestrator does not hold a missing label against it, and a container job that reaches such an agent without a runtime fails there instead. An agent that reports `kici:runtime:job-image` takes no job but the one it was started for.
 
 The last one is separate on purpose: an agent given only a mounted runtime
 socket can **run** a container but not **build** one, because the build shells
@@ -261,7 +433,8 @@ configured with. Set it yourself on an agent you start by hand.
 Two consequences of leaving it unset:
 
 - A `container` job runs on the image's own `node`. That works for an image
-  that ships one, and fails for one that does not.
+  that ships one, and fails for one that does not. The job then fails at once
+  with a message that names the image and these two settings.
 - The image preflight does not run, so a musl image such as `alpine` is not
   refused up front.
 

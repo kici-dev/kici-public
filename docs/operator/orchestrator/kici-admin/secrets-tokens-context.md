@@ -26,6 +26,7 @@ kici-admin secret fix-prefixed-scopes <orgId> [--dry-run] [--database-url <url>]
 - `--dry-run` parses + validates the value, prints fingerprint + length, and skips the write.
 - `--database-url` (on `set`) switches to direct-DB mode and writes the caller-supplied `encrypted_value` verbatim into `scoped_secrets` — used by E2E `globalSetup` helpers that need to seed secrets before the orchestrator is up.
 - `delete` asks for confirmation unless `--yes` is passed.
+- After a successful `set`, the command checks whether a context has the same name as the scope. When that context is a fixed or glob context with no binding, it prints a warning on stderr. Jobs that list that context in `contexts:` get none of its secrets until a scope is bound to it. The secret still reaches any other context bound to its scope. For a fixed context, a `<context>:<key>` git credential or registry reference still reads the scope named after the context, through a [deprecated](../../../user/deprecations.md) fallback, and the warning says so. The warning names the `kici-admin context bind` command. The exit code stays 0.
 
 For full details on encryption, backends, and key rotation, see [Secrets management](../../security/secrets.md).
 
@@ -156,14 +157,14 @@ kici-admin rotate-key
 
 Re-encrypts all PostgreSQL-stored secrets with the current master key. When `KICI_SECRET_KEY_OLD` is configured alongside `KICI_SECRET_KEY`, this performs a true key rotation. Without the old key, it re-encrypts at an incremented key version.
 
-See [Secrets management > Key rotation](../../security/secrets.md#key-rotation) for the full procedure.
+See [Secrets management > Key rotation](../../security/secrets.md#rotation-procedure) for the full procedure.
 
 ### context -- context management (dual-mode)
 
 ```bash
-kici-admin context create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted] [--database-url <url>] [--json]
+kici-admin context create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--repo-patterns <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted] [--database-url <url>] [--json]
 kici-admin context bind --org <id> --env <name> --scope <pattern> [--host <pattern>] [--database-url <url>] [--json]
-kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted|null] [--enabled true|false] [--database-url <url>] [--json]
+kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--repo-patterns <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted|null] [--enabled true|false] [--database-url <url>] [--json]
 kici-admin context list --org <id> [--database-url <url>] [--json]
 kici-admin context show --org <id> --name <name> [--database-url <url>] [--json]
 kici-admin context delete --org <id> --name <name> [--database-url <url>] [--json]
@@ -173,12 +174,13 @@ kici-admin context purge [--org <id>] [--database-url <url>] [--json]
 
 Seeds and mutates context rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — used by E2E `globalSetup` helpers that need to seed contexts before the orchestrator is up.
 
-- `create` upserts a context (idempotent by `org + name`). Omit a policy flag to leave it unset. `--glob-pattern` is required when `--type glob` and sets the match pattern that resolves run scopes to this context; passing it with any other `--type` is an error.
+- `create` upserts a context (idempotent by `org + name`). On a new context, an omitted policy flag leaves that rule unset. On an existing context, an omitted policy flag leaves the stored value unchanged in both modes, and an explicit empty value (`'[]'`, an empty CSV, or `--minimum-trust null`) clears it. `--glob-pattern` is required when `--type glob` and sets the match pattern that resolves run scopes to this context; passing it with any other `--type` is an error. `--repo-patterns` limits the context to repositories whose `owner/repo` matches one of the globs (see [Repository patterns](../../../user/contexts.md#repository-patterns)).
+- `create` prints a warning on stderr when the context it created or updated is a fixed or glob context with no binding, because such a context delivers no secrets to the jobs that list it in `contexts:`. For a fixed context, the warning also names the deprecated fallback a `<context>:<key>` reference takes to the scope named after the context. The warning names the `kici-admin context bind` command. The exit code stays 0.
 - `bind` upserts a `context_bindings` row mapping a scope pattern to a context. `--host <pattern>` scopes the binding to a subset of hosts (default `**` = all hosts) — see [Per-host secret scoping](../../security/secrets.md#per-host-secret-scoping) for the host dimension, the templating syntax, and precedence.
-- `set-policy` updates only the provided policy fields on an existing context. Pass `--minimum-trust null` to clear the tier gate, and `--hold-expiry ''` (an empty value) to clear the hold expiry. Omitting a flag leaves that field untouched, which is why clearing needs an explicit empty / `null` value rather than omission.
+- `set-policy` updates only the provided policy fields on an existing context. Pass `--minimum-trust null` to clear the tier gate, `--repo-patterns '[]'` to clear the repository patterns, and `--hold-expiry ''` (an empty value) to clear the hold expiry. Omitting a flag leaves that field untouched, which is why clearing needs an explicit empty / `null` value rather than omission.
 - `list` / `show` read back the current state; `show` also returns variables and bindings.
 - `delete` removes a context and cascades its bindings, variables, and overrides. Reports `deleted=true` on success and exits non-zero if no matching context exists. Pending held runs block the deletion with a clear error (HTTP mode returns 409) — approve or reject them first; resolved held-run history survives the deletion with its context reference cleared.
-- `create-template` creates/updates a template context and seeds its variables in one call (`--variables '{"K":"V"}'`).
+- `create-template` creates/updates a template context and seeds its variables in one call (`--variables '{"K":"V"}'`). Like `create`, it leaves the policy fields you omit unchanged.
 - `purge` (direct-DB only) bulk-deletes every context for an org (cascading bindings, variables, and overrides) and removes the org's held runs for a clean slate. Omit `--org` to clear all orgs. Destructive break-glass / test-reset verb with no orchestrator HTTP wire; requires `--database-url` (or `KICI_DATABASE_URL`). Reports `{ contextsDeleted, heldRunsDeleted }` with `--json`.
 
 See [Contexts](../../contexts.md) for the broader feature walkthrough.
@@ -382,20 +384,21 @@ Synopsis: `kici-admin context create [options]`
 
 **Options**
 
-| Option                         | Default | Description                                                                     |
-| ------------------------------ | ------- | ------------------------------------------------------------------------------- |
-| `--org <id>`                   |         | Org ID                                                                          |
-| `--name <name>`                |         | Context name                                                                    |
-| `--type <t>`                   | `fixed` | Context type (fixed\|glob\|template)                                            |
-| `--glob-pattern <pattern>`     |         | Glob pattern matched against declared context names (required with --type glob) |
-| `--enabled <bool>`             | `true`  | Enabled flag (true\|false)                                                      |
-| `--branch-restrictions <json>` |         | JSON array of allowed branches (e.g. '["main"]')                                |
-| `--required-reviewers <csv>`   |         | CSV of required reviewer user IDs (or empty to clear)                           |
-| `--wait-timer <seconds>`       |         | Wait timer before release (seconds)                                             |
-| `--hold-expiry <seconds>`      |         | Hold expiry TTL (seconds)                                                       |
-| `--minimum-trust <level>`      |         | Minimum trust (trusted)                                                         |
-| `--database-url <url>`         |         | Use direct DB access instead of HTTP (offline mode)                             |
-| `--json`                       |         | Emit JSON output                                                                |
+| Option                         | Default | Description                                                                               |
+| ------------------------------ | ------- | ----------------------------------------------------------------------------------------- |
+| `--org <id>`                   |         | Org ID                                                                                    |
+| `--name <name>`                |         | Context name                                                                              |
+| `--type <t>`                   | `fixed` | Context type (fixed\|glob\|template)                                                      |
+| `--glob-pattern <pattern>`     |         | Glob pattern matched against declared context names (required with --type glob)           |
+| `--enabled <bool>`             |         | Enabled flag (true\|false); a new context is enabled, an existing one keeps its flag      |
+| `--branch-restrictions <json>` |         | JSON array of allowed branches (e.g. '["main"]')                                          |
+| `--repo-patterns <json>`       |         | JSON array of owner/repo globs the context is limited to (e.g. '["acme/*"]'; '[]' clears) |
+| `--required-reviewers <csv>`   |         | CSV of required reviewer user IDs (or empty to clear)                                     |
+| `--wait-timer <seconds>`       |         | Wait timer before release (seconds)                                                       |
+| `--hold-expiry <seconds>`      |         | Hold expiry TTL (seconds)                                                                 |
+| `--minimum-trust <level>`      |         | Minimum trust (trusted)                                                                   |
+| `--database-url <url>`         |         | Use direct DB access instead of HTTP (offline mode)                                       |
+| `--json`                       |         | Emit JSON output                                                                          |
 
 ### `kici-admin context create-template`
 
@@ -470,19 +473,20 @@ Synopsis: `kici-admin context set-policy [options]`
 
 **Options**
 
-| Option                           | Default | Description                                           |
-| -------------------------------- | ------- | ----------------------------------------------------- |
-| `--org <id>`                     |         | Org ID                                                |
-| `--env <name>`                   |         | Context name                                          |
-| `--branch-restrictions <json>`   |         | JSON array of allowed branches                        |
-| `--required-reviewers <csv>`     |         | CSV of required reviewer user IDs (empty to clear)    |
-| `--wait-timer <seconds>`         |         | Wait timer before release (seconds)                   |
-| `--hold-expiry <seconds>`        |         | Hold expiry TTL in seconds (empty to clear)           |
-| `--minimum-trust <level>`        |         | Minimum trust (trusted, or "null" to clear)           |
-| `--enabled <bool>`               |         | Enabled flag (true\|false)                            |
-| `--allow-local-execution <bool>` |         | Allow CLI/test runs to resolve this env (true\|false) |
-| `--database-url <url>`           |         | Use direct DB access instead of HTTP (offline mode)   |
-| `--json`                         |         | Emit JSON output                                      |
+| Option                           | Default | Description                                                                               |
+| -------------------------------- | ------- | ----------------------------------------------------------------------------------------- |
+| `--org <id>`                     |         | Org ID                                                                                    |
+| `--env <name>`                   |         | Context name                                                                              |
+| `--branch-restrictions <json>`   |         | JSON array of allowed branches                                                            |
+| `--repo-patterns <json>`         |         | JSON array of owner/repo globs the context is limited to (e.g. '["acme/*"]'; '[]' clears) |
+| `--required-reviewers <csv>`     |         | CSV of required reviewer user IDs (empty to clear)                                        |
+| `--wait-timer <seconds>`         |         | Wait timer before release (seconds)                                                       |
+| `--hold-expiry <seconds>`        |         | Hold expiry TTL in seconds (empty to clear)                                               |
+| `--minimum-trust <level>`        |         | Minimum trust (trusted, or "null" to clear)                                               |
+| `--enabled <bool>`               |         | Enabled flag (true\|false)                                                                |
+| `--allow-local-execution <bool>` |         | Allow CLI/test runs to resolve this env (true\|false)                                     |
+| `--database-url <url>`           |         | Use direct DB access instead of HTTP (offline mode)                                       |
+| `--json`                         |         | Emit JSON output                                                                          |
 
 ### `kici-admin context show`
 
@@ -501,7 +505,7 @@ Synopsis: `kici-admin context show [options]`
 
 ### `kici-admin rotate-key`
 
-Rotate the master encryption key (re-encrypts every master-key-wrapped store: scoped_secrets, config_versions, secret_backends, orchestrator_signing_keys, dashboard_encryption_keys, run_ephemeral_keys and run_secret_outputs)
+Rotate the master encryption key (re-encrypts every master-key-wrapped store: scoped_secrets, config_versions, secret_backends, orchestrator_signing_keys, dashboard_encryption_keys, run_ephemeral_keys, run_secret_outputs and the sealed secrets of queued and waiting jobs)
 
 Synopsis: `kici-admin rotate-key`
 

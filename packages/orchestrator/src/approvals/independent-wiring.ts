@@ -103,6 +103,7 @@ export function createIndependentApprovalExtras(
           heldRunStore,
           // Read lazily: `createApp` builds the deps bag after the mode hook runs.
           accessLogWriter: sub.buildProcessingDeps().accessLogWriter,
+          contextData: () => sub.buildProcessingDeps(),
         },
       );
     },

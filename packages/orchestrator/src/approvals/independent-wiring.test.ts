@@ -109,8 +109,17 @@ describe('createIndependentApprovalExtras', () => {
       // Releasing a hold frees no slot, so the re-gate has to be armed here too.
       // It must mint its re-hold into the SAME store the stale detector sweeps;
       // a second instance would raise holds nothing ever releases.
-      { matchContext: expect.any(Function), heldRunStore: extras.heldRunStore },
+      {
+        matchContext: expect.any(Function),
+        heldRunStore: extras.heldRunStore,
+        contextData: expect.any(Function),
+      },
     );
+    // fails-when: the release path is handed no context stores, so a context-held job fails on release
+    const gateDeps = (mocks.dispatchReadyJob.mock.calls[0] as unknown[])[7] as {
+      contextData: () => unknown;
+    };
+    expect(gateDeps.contextData()).toEqual({ marker: 'deps' });
   });
 
   it('resolves a concurrency group through the context store', async () => {

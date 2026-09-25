@@ -53,6 +53,7 @@ import {
   storePendingWorkflowContext,
 } from './pending-workflow-context.js';
 import { resumeWorkflow } from './resume-workflow.js';
+import { makeSingleJobContext } from './dispatch-matched-workflow.test-helpers.js';
 import { releaseInvokeGate } from './invoke-gate.js';
 import { SecurityHoldReason } from '../contexts/held-runs.js';
 import { REDUCED_PRIVILEGE_MARKER } from '../security/reduced-privilege-note.js';
@@ -556,241 +557,6 @@ function makeUpdateRecordingDb(): {
     }),
   };
   return { db, updates };
-}
-
-/**
- * Assemble a minimal real `WorkflowDispatchContext` for a single static job,
- * with a capturing dispatcher and all optional deps absent unless overridden.
- * This is the test-mode shape: `bundle` may be undefined and `trustResolution`
- * is undefined (single-orch, no holds, no trust).
- */
-function makeSingleJobContext(over: {
-  bundle: WorkflowDispatchContext['bundle'];
-  fullRepo?: boolean;
-  testRun?: { fixtureId: string };
-  db?: unknown;
-  executionTracker?: unknown;
-  withBuildInfra?: boolean;
-  withBuildMiss?: boolean;
-  localWorkingTree?: boolean;
-  runWideFlatSecrets?: Record<string, string>;
-  jobContext?: string;
-  secretResolver?: unknown;
-  checkMode?: string;
-  jobContainer?: unknown;
-  jobSandbox?: { capabilities?: string[]; network?: string };
-  sandboxAllowListReader?: unknown;
-  jobMatrix?: unknown;
-  contextConcurrencyLimit?: number | null;
-  /** Set wait_timer_seconds on the jobContext row, so its gate returns `wait`. */
-  contextWaitTimerSeconds?: number | null;
-  heldRunStore?: unknown;
-  /** Append a dynamic job fn, so dispatch spawns a deferred dynamic entry. */
-  withDynamicEntry?: boolean;
-  /** Give the static job a dynamic matrix, so its init is deferred. */
-  withDeferredInit?: boolean;
-  /** Declare a workflow-level filter, so every job defers to the init round. */
-  withFilter?: boolean;
-  pendingDynamics?: unknown;
-  pendingInits?: unknown;
-  /** Give the static job an explicit SDK requireApproval. */
-  jobApproval?: unknown;
-  /** Give the job a dynamic env, so its init is deferred without a matrix. */
-  withDynamicEnv?: boolean;
-  /** Bind the job to a DYNAMIC context, resolved only by the init round. */
-  withDynamicContext?: boolean;
-  /** A contextStore stub used verbatim (overrides the jobContext-derived one). */
-  contextStore?: unknown;
-  /**
-   * A checkRunReporter stub, so a case can observe the queued check runs the
-   * dispatch setup phase creates against the commit.
-   */
-  checkRunReporter?: unknown;
-}): { ctx: WorkflowDispatchContext; dispatched: QueuedJobInput[] } {
-  const dispatched: QueuedJobInput[] = [];
-  const workflow = {
-    name: 'ci',
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'wf-hash',
-    triggers: [],
-    ...(over.withFilter ? { hasFilter: true } : {}),
-    jobs: [
-      {
-        _type: 'static' as const,
-        name: 'build',
-        runsOn: [{ kind: 'exact', value: 'default' }],
-        steps: [{ name: 'echo', run: 'echo hi' }],
-        needs: [],
-        rules: [],
-        ...(over.jobContext ? { contexts: [{ value: over.jobContext, dynamic: false }] } : {}),
-        ...(over.jobContainer ? { container: over.jobContainer } : {}),
-        ...(over.jobSandbox ? { sandbox: over.jobSandbox } : {}),
-        ...(over.jobMatrix ? { matrix: over.jobMatrix } : {}),
-        ...(over.jobApproval ? { approval: over.jobApproval } : {}),
-        ...(over.withDynamicEnv ? { dynamicEnv: true } : {}),
-        ...(over.withDynamicContext ? { contexts: [{ dynamic: true }] } : {}),
-        ...(over.withDeferredInit
-          ? {
-              matrix: {
-                _type: 'dynamic' as const,
-                source: { file: '.kici/workflows/ci.ts', jobName: 'build' },
-              },
-            }
-          : {}),
-      },
-      ...(over.withDynamicEntry
-        ? [
-            {
-              _type: 'dynamic' as const,
-              source: { file: '.kici/workflows/ci.ts', index: 0 },
-            },
-          ]
-        : []),
-    ],
-  } as unknown as LockWorkflow;
-  const fullLockFile = {
-    schemaVersion: 4 as const,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'abc',
-    lockfileHash: 'lock',
-    workflows: [workflow],
-  } as unknown as WorkflowDispatchContext['fullLockFile'];
-  const event: SimulatedEvent = {
-    type: 'push',
-    action: undefined,
-    targetBranch: 'main',
-    sourceBranch: undefined,
-    payload: { ref: 'refs/heads/main' },
-    changedFiles: undefined,
-  };
-  const info: WebhookInfo = {
-    routingKey: 'local:repo',
-    deliveryId: 'test:delivery',
-    event: 'push',
-    action: null,
-    provider: 'local' as WebhookInfo['provider'],
-    payload: { ref: 'refs/heads/main' },
-  };
-  const decision: WorkflowDecision = {
-    workflowName: 'ci',
-    matched: true,
-    checks: [],
-    summary: 'Direct test run',
-  } as unknown as WorkflowDecision;
-  const deps = {
-    dispatcher: {
-      dispatch: async (input: QueuedJobInput) => {
-        dispatched.push(input);
-        return { status: 'dispatched' as const, agentId: 'a1', jobId: `job-${dispatched.length}` };
-      },
-    },
-    ...(over.db ? { db: over.db } : {}),
-    ...(over.executionTracker ? { executionTracker: over.executionTracker } : {}),
-    ...(over.secretResolver ? { secretResolver: over.secretResolver } : {}),
-    ...(over.sandboxAllowListReader ? { sandboxAllowListReader: over.sandboxAllowListReader } : {}),
-    ...(over.heldRunStore ? { heldRunStore: over.heldRunStore } : {}),
-    ...(over.pendingDynamics ? { pendingDynamics: over.pendingDynamics } : {}),
-    ...(over.pendingInits ? { pendingInits: over.pendingInits } : {}),
-    ...(over.checkRunReporter ? { checkRunReporter: over.checkRunReporter } : {}),
-    // An env-declaring job needs a context store so the core resolves its
-    // per-job secrets (matchContext returns a no-rules config).
-    ...(over.jobContext
-      ? {
-          contextStore: {
-            matchContext: async (_org: string, n: string) =>
-              n === over.jobContext
-                ? {
-                    id: `env-${n}`,
-                    org_id: '__default__',
-                    name: n,
-                    type: 'deployment',
-                    glob_pattern: null,
-                    branch_restrictions: null,
-                    trigger_type_filters: null,
-                    repo_patterns: null,
-                    concurrency_limit: over.contextConcurrencyLimit ?? null,
-                    concurrency_strategy: null,
-                    concurrency_timeout_ms: null,
-                    required_reviewers: null,
-                    wait_timer_seconds: over.contextWaitTimerSeconds ?? null,
-                    hold_expiry_seconds: null,
-                    minimum_trust: null,
-                    allow_local_execution: true,
-                    enabled: true,
-                    created_at: new Date(),
-                    updated_at: new Date(),
-                    created_by: null,
-                  }
-                : null,
-          },
-        }
-      : {}),
-    // An explicit contextStore wins over the jobContext-derived one above. It
-    // used to be spread FIRST and was silently clobbered, so a test that passed
-    // its own store (e.g. with a disabled row) was quietly run against the
-    // harness's always-enabled stub instead.
-    ...(over.contextStore ? { contextStore: over.contextStore } : {}),
-    // Build infra present but bundle undefined: a local-repo run must NOT probe
-    // the cache or dispatch a __build__ job (it carries a working-tree overlay).
-    ...(over.withBuildInfra
-      ? {
-          buildCoordinator: { coalesce: async (_k: string, fn: () => unknown) => fn() },
-          sourceCache: {
-            has: async () => true,
-            getUrl: async () => 'https://cache/tar.tgz',
-            getUrlAndDigest: async () => ({ url: 'https://cache/tar.tgz', digest: 'd' }),
-          },
-        }
-      : {}),
-    // Cache MISS + build infra: drives the real source-pack build path, where
-    // the run is registered with the __build__ job alone while the build runs.
-    ...(over.withBuildMiss
-      ? {
-          buildCoordinator: { ensureBuild: async (_k: string, fn: () => unknown) => fn() },
-          sourceCache: {
-            has: async () => false,
-            getUrl: async () => 'https://cache/tar.tgz',
-            getUrlAndDigest: async () => null,
-          },
-        }
-      : {}),
-  } as unknown as ProcessingDeps;
-  const ctx: WorkflowDispatchContext = {
-    info,
-    deps,
-    bundle: over.bundle,
-    payload: info.payload,
-    repoIdentifier: 'repo',
-    // Required, and stated as the acted-on repository — the per-repository
-    // shape every real caller of this function produces. A case about a
-    // cross-repository workflow overwrites it.
-    workflowRepoIdentifier: 'repo',
-    credentials: {},
-    event,
-    eventWithFiles: event,
-    ref: 'main',
-    fullLockFile,
-    resolvedOrgId: '__default__',
-    workflow,
-    decision,
-    runId: 'run-1',
-    trustResolution: undefined,
-    lockFileSource: undefined,
-    crossSource: false,
-    localWorkingTree: over.localWorkingTree ?? false,
-    // Required: the harness states the verdict explicitly, exactly as a real
-    // dispatch path must. Cases that exercise the gate overwrite it.
-    securityDecision: { action: 'pass' },
-    extraJobConfig: {
-      isTestRun: true,
-      fixtureId: 'fx-1',
-      ...(over.checkMode ? { checkMode: over.checkMode } : {}),
-    },
-    ...(over.runWideFlatSecrets ? { runWideFlatSecrets: over.runWideFlatSecrets } : {}),
-    ...(over.fullRepo ? {} : {}),
-    ...(over.testRun ? { testRun: over.testRun } : {}),
-  };
-  return { ctx, dispatched };
 }
 
 /**
@@ -2032,9 +1798,9 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
       jobContext: 'staging',
       db: envDb,
       secretResolver: {
-        resolveForJob: async () => ({ DB_URL: 'env-db', SHARED: 'env' }),
+        resolveForContext: async () => ({ DB_URL: 'env-db', SHARED: 'env' }),
         resolveNamedInternal: async () => null,
-        resolveForJobWithMeta: async () => ({}),
+        resolveForContextWithMeta: async () => ({}),
       },
       runWideFlatSecrets: { SHARED: 'cli', EXTRA: 'cli' },
     });
@@ -2519,6 +2285,9 @@ async function runEvaluateJobContexts(over: {
     credentials: {},
     event,
     ref: 'sha',
+    // A real dispatch context always carries the webhook info; a held job
+    // records its routing key from it.
+    info: { provider: 'local', routingKey: 'local:repo', deliveryId: 'd' },
     resolvedOrgId: '__default__',
     deps: { pendingInits: { has: () => false }, ...over.deps },
   };
@@ -3361,9 +3130,9 @@ describe('dispatchMatchedWorkflow — a STATIC context on a dynamic-field job st
         matchContext: async (_o: string, n: string) => (n === 'prod' ? prodRow(rowOver) : null),
       },
       secretResolver: {
-        resolveForJob: async () => ({ DEPLOY_TOKEN: 'sekrit' }),
+        resolveForContext: async () => ({ DEPLOY_TOKEN: 'sekrit' }),
         resolveNamedInternal: async () => null,
-        resolveForJobWithMeta: async () => ({}),
+        resolveForContextWithMeta: async () => ({}),
       },
       pendingInits: {
         track: vi.fn(async () => ({ env: { RESOLVED: 'yes' } })),
@@ -3514,14 +3283,13 @@ describe('dispatchMatchedWorkflow — a held job is held on the cluster path too
   });
 });
 
-describe('dispatchMatchedWorkflow — a held dynamic job keeps its context secrets', () => {
-  // `applyStaticApprovalHolds` used to run BEFORE the init round, so by the time
-  // the flow-back delegated to `applyContextRulesAndSecrets`, `held` was already
-  // true and that function's final block — guarded on `!held` — skipped
-  // resolving context vars, secrets and registry auth. The values were baked out
-  // of the stored jobInput, and `dispatchReadyJob` dispatches it verbatim on
-  // release: the approved job ran with none of its context's secrets.
-  it('resolves and stores the context secrets for a job held with a dynamic env', async () => {
+describe('dispatchMatchedWorkflow — a held dynamic job stores its context resolution record', () => {
+  // The static approval hold is minted in the flow-back, AFTER the init round
+  // named the job's context and `applyContextRulesAndSecrets` admitted it. The
+  // stored input carries the init-resolved env and no context secret; the
+  // context resolution record it stores is what the release path resolves the
+  // secrets from.
+  it('stores the context resolution record for a job held with a dynamic env', async () => {
     const createHold = vi.fn().mockResolvedValue({ id: 'held-sec-1' });
     const { ctx } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
@@ -3567,9 +3335,9 @@ describe('dispatchMatchedWorkflow — a held dynamic job keeps its context secre
         cleanup: vi.fn(),
       },
       secretResolver: {
-        resolveForJob: async () => ({ DEPLOY_TOKEN: 'sekrit' }),
+        resolveForContext: async () => ({ DEPLOY_TOKEN: 'sekrit' }),
         resolveNamedInternal: async () => null,
-        resolveForJobWithMeta: async () => ({}),
+        resolveForContextWithMeta: async () => ({}),
       },
       heldRunStore: { createHold, create: vi.fn() },
       db: makeHoldDbWithTrx(),
@@ -3591,9 +3359,10 @@ describe('dispatchMatchedWorkflow — a held dynamic job keeps its context secre
     expect(pending).toBeDefined();
     // The init-resolved env survives (it always did)…
     expect(pending?.jobInput.jobConfig.jobEnv).toEqual({ RESOLVED: 'yes' });
-    // …and so must the context's secrets, which the release path has no other
-    // chance to resolve.
-    expect(pending?.jobInput.jobConfig.secrets).toMatchObject({ DEPLOY_TOKEN: 'sekrit' });
+    // fails-when: the flow-back stores the held job without running its context rules, so no record exists
+    expect(pending?.contextResolution?.contexts).toEqual([{ name: 'prod', id: 'env-prod' }]);
+    // …and the context secret stays out of the stored input.
+    expect(JSON.stringify(pending?.jobInput)).not.toContain('sekrit');
   });
 });
 
@@ -3659,9 +3428,9 @@ describe('dispatchMatchedWorkflow — a non-reviewer context hold is resumable',
       heldRunStore: { create, createHold: vi.fn() },
       db: makeHoldDb(),
       secretResolver: {
-        resolveForJob: async () => ({}),
+        resolveForContext: async () => ({}),
         resolveNamedInternal: async () => null,
-        resolveForJobWithMeta: async () => ({}),
+        resolveForContextWithMeta: async () => ({}),
       },
       executionTracker: {
         addJobsToRun,
@@ -3795,9 +3564,9 @@ describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated
       db: makeDb(),
       executionTracker: tracker,
       secretResolver: {
-        resolveForJob: async () => ({}),
+        resolveForContext: async () => ({}),
         resolveNamedInternal: async () => null,
-        resolveForJobWithMeta: async () => ({}),
+        resolveForContextWithMeta: async () => ({}),
       },
     });
     await dispatchMatchedWorkflow(ctx);
@@ -4095,9 +3864,9 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
       db: envDb,
       executionTracker,
       secretResolver: {
-        resolveForJob: async () => ({}),
+        resolveForContext: async () => ({}),
         resolveNamedInternal: async () => null,
-        resolveForJobWithMeta: async () => ({}),
+        resolveForContextWithMeta: async () => ({}),
       },
     });
     await dispatchMatchedWorkflow(ctx);
@@ -4987,7 +4756,13 @@ describe('a fork-PR hold, held and released end to end', () => {
   it('dispatches the workflow on approval, still under the untrusted tier', async () => {
     clearPendingWorkflowContextsMap();
     const create = vi.fn().mockResolvedValue({ id: 'held-fork-e2e' });
-    const resumeHeldRun = vi.fn().mockResolvedValue(undefined);
+    // The guarded held → pending flip: only the first release finds the row held.
+    let held = true;
+    const resumeHeldRun = vi.fn(async () => {
+      const claimed = held;
+      held = false;
+      return claimed;
+    });
     const setRunTrustContext = vi.fn();
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
@@ -5058,6 +4833,55 @@ describe('a fork-PR hold, held and released end to end', () => {
     // The context is consumed, so a re-fired release is inert rather than a
     // second dispatch.
     expect(await loadPendingWorkflowContext(undefined, ctx.runId)).toBeNull();
+  });
+
+  it('dispatches once when the release signal fires twice at the same time', async () => {
+    // Both signals load the stored context before either deletes it, so only
+    // the claim on the held row can stop the second dispatch.
+    clearPendingWorkflowContextsMap();
+    let held = true;
+    const resumeHeldRun = vi.fn(async () => {
+      const claimed = held;
+      held = false;
+      return claimed;
+    });
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: undefined,
+      heldRunStore: { create: vi.fn().mockResolvedValue({ id: 'held-twice' }) },
+      executionTracker: {
+        recordRunHeld: vi.fn().mockResolvedValue(undefined),
+        resumeHeldRun,
+        onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+        addJobsToRun: vi.fn().mockResolvedValue(undefined),
+        onJobStatus: vi.fn().mockResolvedValue(undefined),
+        holdRunForPendingJobs: vi.fn(() => true),
+        releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
+        setRunTrustContext: vi.fn(),
+      },
+    });
+    ctx.securityDecision = holdDecision(SecurityHoldReason.enum.fork_pr);
+    ctx.lockFileSource = 'base';
+    await dispatchMatchedWorkflow(ctx);
+    (ctx.deps as unknown as Record<string, unknown>).providerRegistry = {
+      getByRoutingKey: () => ({ normalizer: { provider: 'local' } }),
+    };
+    const signal = {
+      holdId: 'held-twice',
+      runId: ctx.runId,
+      jobId: SECURITY_HOLD_JOB_IDS.fork_pr,
+      scope: HoldScope.enum.workflow,
+      stepIndex: null,
+      triggerSource: TriggerSource.enum.context,
+    };
+
+    await Promise.all([
+      resumeWorkflow(signal, ctx.deps, undefined),
+      resumeWorkflow(signal, ctx.deps, undefined),
+    ]);
+
+    // fails-when: the losing release ignores the claim and dispatches the run again
+    expect(resumeHeldRun).toHaveBeenCalledTimes(2);
+    expect(dispatched.filter((d) => d.jobName === 'build')).toHaveLength(1);
   });
 });
 
@@ -6115,7 +5939,7 @@ describe('resolveGeneratedJobConfigs gitCredentials', () => {
     dynamicEntry: Record<string, unknown>;
     generatedJobs: unknown[];
   }): Promise<GeneratedJobConfig[]> {
-    return resolveGeneratedJobConfigs({
+    const { dispatchable } = await resolveGeneratedJobConfigs({
       ctx: {
         deps: {} as never,
         runId: 'run-1',
@@ -6125,14 +5949,13 @@ describe('resolveGeneratedJobConfigs gitCredentials', () => {
       } as never,
       workflow: { name: 'ci', source: 'ci.ts' } as never,
       fullLockFile: { source: 'ci.ts' } as never,
-      resolvedSecrets: undefined,
-      resolvedNamespacedSecrets: undefined,
       runPublicKeyBase64: undefined,
       npmRegistries: undefined,
       installEnvSecrets: undefined,
       generatedJobs: args.generatedJobs as never,
       dynamicEntry: args.dynamicEntry as never,
     });
+    return dispatchable;
   }
 
   it("copies the generator's lock-declared map onto every child", async () => {

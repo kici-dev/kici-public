@@ -19,6 +19,7 @@ export const ID_TOKEN_CLAIM_NAMES = [
   'kici_run_id',
   'kici_job_id',
   'repository',
+  'workflow_repository',
   'ref',
   'base_ref',
   'head_ref',

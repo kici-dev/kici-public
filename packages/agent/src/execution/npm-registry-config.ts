@@ -75,12 +75,15 @@ function noopResult(): ApplyNpmRegistryConfigResult {
 }
 
 /** Build the synthesized env-var name for registry index `i`. */
-function tokenEnvName(jobIdShort: string, index: number): string {
+export function tokenEnvName(jobIdShort: string, index: number): string {
   return `KICI_NPM_TOKEN_${jobIdShort}_${index}`;
 }
 
 /** Render the agent-managed block of `.npmrc` lines. */
-function renderAgentLines(registries: readonly NpmRegistrySpec[], jobIdShort: string): string {
+export function renderAgentLines(
+  registries: readonly NpmRegistrySpec[],
+  jobIdShort: string,
+): string {
   if (registries.length === 0) return '';
   const lines: string[] = [];
   for (let i = 0; i < registries.length; i++) {

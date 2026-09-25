@@ -20,6 +20,13 @@ import { execFileSync, execSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { makeTempDir } from '@kici-dev/core/tmp';
+import {
+  classifySelection,
+  gitlinkPaths,
+  overlaySkipWarnings,
+  SkipContext,
+  type OverlayEntries,
+} from '../remote/overlay-links.js';
 import { selectOverlayFiles } from '../remote/uploader.js';
 
 /** The `kici-local` branch the isolated profile commits its overlay onto. */
@@ -40,6 +47,8 @@ export interface ResolvedWorkdir {
   branch: string;
   /** Remove the tmp workdir (no-op for `--in-place`). */
   cleanup: () => Promise<void>;
+  /** Paths the isolated checkout leaves out (submodules, dangling symlinks), one line per kind. */
+  warnings: string[];
 }
 
 /**
@@ -68,6 +77,7 @@ function resolveInPlace(repoRoot: string): ResolvedWorkdir {
     cleanup: async () => {
       /* the working tree is the developer's — never removed */
     },
+    warnings: [],
   };
 }
 
@@ -79,12 +89,28 @@ function resolveInPlace(repoRoot: string): ResolvedWorkdir {
 async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
   // Retained-until-GC clone dir: allocated in persist mode so it is not
   // auto-registered to any temp scope — its lifetime is owned by the returned
-  // `cleanup`. mkdtemp creates it mode-0700; `git clone` into the empty dir is
-  // fine.
+  // `cleanup`, or by the catch below when building the clone fails.
+  // mkdtemp creates it mode-0700; `git clone` into the empty dir is fine.
   const workdir = await makeTempDir('local-run', { persist: true });
-  const tmpDir = workdir.path;
+  try {
+    return await materializeIsolated(repoRoot, workdir.path, () => workdir.cleanup());
+  } catch (err) {
+    // fails-when: a failed clone, overlay copy or commit leaves the tmp clone behind
+    // A cleanup failure must not replace the error that says why the clone failed.
+    await workdir.cleanup().catch(() => undefined);
+    throw err;
+  }
+}
 
-  const { sha, existingFiles, deletedFiles } = await selectOverlayFiles(repoRoot);
+/** Build the isolated clone in `tmpDir` and commit the overlay onto it. */
+async function materializeIsolated(
+  repoRoot: string,
+  tmpDir: string,
+  cleanup: () => Promise<void>,
+): Promise<ResolvedWorkdir> {
+  const selection = await selectOverlayFiles(repoRoot);
+  const { sha } = selection;
+  const entries = await classifySelection(repoRoot, selection);
 
   // Base tree at HEAD: local clone then pin to the exact SHA. `--no-hardlinks`
   // copies the object store (hardlinks cannot span filesystems: repo under
@@ -94,7 +120,7 @@ async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
   });
   execSync(`git checkout --quiet ${sha}`, { cwd: tmpDir, stdio: 'ignore' });
 
-  await applyOverlay(repoRoot, tmpDir, existingFiles, deletedFiles);
+  await applyOverlay(repoRoot, tmpDir, entries);
 
   // Commit the overlay onto a named branch so the agent's clone-by-sha (and the
   // orchestrator's ref-scoped trigger) resolve a sha that carries it.
@@ -124,25 +150,76 @@ async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
     ref: `refs/heads/${LOCAL_RUN_BRANCH}`,
     sha: committed,
     branch: LOCAL_RUN_BRANCH,
-    cleanup: () => workdir.cleanup(),
+    cleanup,
+    warnings: overlaySkipWarnings(entries.skipped, SkipContext.LocalRun),
   };
 }
 
-/** Copy overlay files onto the clone and remove local deletions. */
+/**
+ * Apply the classified overlay to the clone. Deletions run first, so a path the
+ * developer turned from a file or symlink into a directory (or back) is gone
+ * before its new content lands; then files and file symlinks; then directory
+ * symlinks, once the directories they replace are emptied.
+ */
 async function applyOverlay(
   repoRoot: string,
   tmpDir: string,
-  existingFiles: string[],
-  deletedFiles: string[],
+  entries: OverlayEntries,
 ): Promise<void> {
-  for (let i = 0; i < existingFiles.length; i += COPY_BATCH_SIZE) {
-    const batch = existingFiles.slice(i, i + COPY_BATCH_SIZE);
-    await Promise.all(batch.map((file) => copyOverlayFile(repoRoot, tmpDir, file)));
+  await removeDeletions(tmpDir, entries.deletions);
+  for (let i = 0; i < entries.files.length; i += COPY_BATCH_SIZE) {
+    const batch = entries.files.slice(i, i + COPY_BATCH_SIZE);
+    // Every copy settles before a failure is thrown, so the caller's cleanup
+    // never races a copy still writing into the clone.
+    const results = await Promise.allSettled(
+      batch.map((file) => copyOverlayFile(repoRoot, tmpDir, file)),
+    );
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw failed.reason;
   }
-  for (let i = 0; i < deletedFiles.length; i += COPY_BATCH_SIZE) {
-    const batch = deletedFiles.slice(i, i + COPY_BATCH_SIZE);
-    await Promise.all(batch.map((file) => fs.rm(path.join(tmpDir, file), { force: true })));
+  for (const [file, text] of Object.entries(entries.symlinks)) {
+    const dest = await clearDestination(tmpDir, file);
+    await fs.symlink(text, dest, 'dir');
   }
+}
+
+/**
+ * Remove the overlay's deletions from the clone, one at a time: a deletion and
+ * the entry that replaces it must not race. A submodule the developer removed
+ * is an empty directory in the clone, which checks out no submodule, so that
+ * path is removed as an empty directory. Only a path the clone's index records
+ * as a submodule is removed that way, and never recursively.
+ */
+async function removeDeletions(tmpDir: string, deletions: string[]): Promise<void> {
+  const stats = await Promise.all(
+    deletions.map((file) => fs.lstat(path.join(tmpDir, file)).catch(() => undefined)),
+  );
+  const dirs = deletions.filter((_, i) => stats[i]?.isDirectory());
+  const submodules = dirs.length > 0 ? gitlinkPaths(tmpDir, dirs) : new Set<string>();
+  for (const file of deletions) {
+    const dest = path.join(tmpDir, file);
+    // fails-when: the clone's empty directory for a removed submodule is removed as a file (EISDIR)
+    // breaks-if-wrong: a deleted regular file or symlink is still removed
+    if (submodules.has(file)) await fs.rmdir(dest);
+    else await fs.rm(dest, { force: true });
+  }
+}
+
+/**
+ * Make room for an overlay entry in the clone and return its path: create the
+ * parent directories and remove whatever is at the path. A directory there is
+ * the clone's copy of a directory the developer replaced, whose tracked files
+ * the deletions already removed.
+ */
+async function clearDestination(tmpDir: string, file: string): Promise<string> {
+  const dest = path.join(tmpDir, file);
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  const existing = await fs.lstat(dest).catch(() => undefined);
+  // fails-when: the clone has a directory where the developer now has a file or a link
+  // breaks-if-wrong: a path the clone does not have is written without a removal
+  if (existing?.isDirectory()) await fs.rm(dest, { recursive: true, force: true });
+  else if (existing) await fs.rm(dest, { force: true });
+  return dest;
 }
 
 /**
@@ -151,13 +228,10 @@ async function applyOverlay(
  */
 async function copyOverlayFile(repoRoot: string, tmpDir: string, file: string): Promise<void> {
   const src = path.join(repoRoot, file);
-  const dest = path.join(tmpDir, file);
-  await fs.mkdir(path.dirname(dest), { recursive: true });
+  const dest = await clearDestination(tmpDir, file);
   const srcStat = await fs.lstat(src);
   if (srcStat.isSymbolicLink()) {
-    const target = await fs.readlink(src);
-    await fs.rm(dest, { force: true });
-    await fs.symlink(target, dest);
+    await fs.symlink(await fs.readlink(src), dest);
     return;
   }
   await fs.copyFile(src, dest);
