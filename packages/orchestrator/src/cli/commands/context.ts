@@ -8,8 +8,10 @@
  *   context show           — show a single context with variables + bindings
  *   context delete         — delete a context (cascades bindings, variables, overrides; held-run history survives; pending held runs block with a clear error, resolved holds do not)
  *   context create-template — create/update a context template + its seed variables
+ *   context source-override list|set|delete — per-source variable overrides (HTTP only)
  *
- * Each command supports two modes (stage-4 pattern from `maintenance.ts`):
+ * Each command except `source-override` supports two modes, the same split
+ * `maintenance.ts` uses:
  *
  *   HTTP mode (default): requires `--url` + `--token`, routes through the
  *   orchestrator admin HTTP API at /api/v1/admin/contexts.
@@ -568,6 +570,134 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         } else {
           console.log(
             `context create-template: envId=${result.envId} created=${result.created} variablesSet=${result.variablesSet}${dbUrl ? ' (direct)' : ''}`,
+          );
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  registerSourceOverrideCommands(env, getClient);
+}
+
+/** One row of `GET /api/v1/admin/contexts/:name/source-overrides`. */
+interface SourceOverrideRow {
+  routing_key: string;
+  key: string;
+  value: string;
+  updated_at: string;
+}
+
+function printSourceOverrides(rows: SourceOverrideRow[]): void {
+  if (rows.length === 0) {
+    console.log('No source overrides found.');
+    return;
+  }
+  const header = ['ROUTING KEY', 'KEY', 'VALUE'];
+  const data = rows.map((r) => [r.routing_key, r.key, r.value]);
+  const widths = header.map((h, i) => Math.max(h.length, ...data.map((row) => row[i].length)));
+  const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length));
+  console.log(header.map((h, i) => pad(h, widths[i])).join('  '));
+  for (const row of data) {
+    console.log(row.map((c, i) => pad(c, widths[i])).join('  '));
+  }
+}
+
+/** Admin API path of one source override, every segment URI-encoded. */
+function sourceOverridePath(opts: {
+  org: string;
+  env: string;
+  routingKey: string;
+  key: string;
+}): string {
+  const params = new URLSearchParams({ orgId: opts.org });
+  return (
+    `/api/v1/admin/contexts/${encodeURIComponent(opts.env)}/source-overrides/` +
+    `${encodeURIComponent(opts.routingKey)}/${encodeURIComponent(opts.key)}?${params}`
+  );
+}
+
+/**
+ * `context source-override list|set|delete` — the operator path for the
+ * dashboard's per-source override writes (`contexts.source_overrides.*` in the
+ * dashboard-write policy). HTTP only: each verb calls the orchestrator admin API.
+ */
+function registerSourceOverrideCommands(context: Command, getClient: () => AdminApiClient): void {
+  const so = context
+    .command('source-override')
+    .description('Per-source variable overrides in a context (HTTP only)');
+
+  so.command('list')
+    .description('List the source overrides in a context, for every source unless --routing-key')
+    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--env <name>', 'Context name')
+    .option('--routing-key <key>', 'Only list the overrides for this source routing key')
+    .option('--json', 'Emit JSON output')
+    .action(async (opts) => {
+      try {
+        const params = new URLSearchParams({ orgId: opts.org });
+        if (opts.routingKey) params.set('routingKey', opts.routingKey);
+        const result = await getClient().get<{ overrides: SourceOverrideRow[] }>(
+          `/api/v1/admin/contexts/${encodeURIComponent(opts.env)}/source-overrides?${params}`,
+        );
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          printSourceOverrides(result.overrides);
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  so.command('set')
+    .description(
+      'Set the value one source sees for a context variable key. A locked context ' +
+        'variable keeps its own value.',
+    )
+    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--env <name>', 'Context name')
+    .requiredOption('--routing-key <key>', 'Routing key of the source the override applies to')
+    .requiredOption('--key <key>', 'Variable key')
+    .requiredOption('--value <value>', 'Override value')
+    .option('--json', 'Emit JSON output')
+    .action(async (opts) => {
+      try {
+        const result = await getClient().put<{ set: boolean }>(sourceOverridePath(opts), {
+          value: opts.value,
+        });
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(
+            `context source-override set: key=${opts.key} routing-key=${opts.routingKey} (env=${opts.env})`,
+          );
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  so.command('delete')
+    .description(
+      'Delete one source override, so the source resolves the key from the context variables',
+    )
+    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--env <name>', 'Context name')
+    .requiredOption('--routing-key <key>', 'Routing key of the source the override applies to')
+    .requiredOption('--key <key>', 'Variable key')
+    .option('--json', 'Emit JSON output')
+    .action(async (opts) => {
+      try {
+        const result = await getClient().delete<{ deleted: boolean }>(sourceOverridePath(opts));
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(
+            `context source-override delete: key=${opts.key} routing-key=${opts.routingKey} (env=${opts.env})`,
           );
         }
       } catch (err) {

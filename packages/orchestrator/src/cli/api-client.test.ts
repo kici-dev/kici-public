@@ -95,6 +95,50 @@ describe('AdminApiClient', () => {
     expect(opts.method).toBe('DELETE');
   });
 
+  it('sends POST for createScope with the org and the scope in the body', async () => {
+    const fetchMock = mockFetch(200, { created: true });
+    globalThis.fetch = fetchMock;
+
+    const result = await client.createScope('org-1', 'pg:aws/prod');
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${BASE_URL}/api/v1/admin/secrets/scopes`);
+    expect(opts.method).toBe('POST');
+    expect(JSON.parse(opts.body)).toEqual({ orgId: 'org-1', scope: 'pg:aws/prod' });
+    expect(result).toEqual({ created: true });
+  });
+
+  it('sends PUT for renameScope with both scope names in the body', async () => {
+    const fetchMock = mockFetch(200, { renamed: true });
+    globalThis.fetch = fetchMock;
+
+    const result = await client.renameScope('org-1', 'aws/prod', 'aws/production');
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${BASE_URL}/api/v1/admin/secrets/scopes/rename`);
+    expect(opts.method).toBe('PUT');
+    expect(JSON.parse(opts.body)).toEqual({
+      orgId: 'org-1',
+      oldScope: 'aws/prod',
+      newScope: 'aws/production',
+    });
+    expect(result).toEqual({ renamed: true });
+  });
+
+  it('sends DELETE for deleteScope with the org and the scope encoded as single segments', async () => {
+    const fetchMock = mockFetch(200, { deleted: true });
+    globalThis.fetch = fetchMock;
+
+    const result = await client.deleteScope('org-1', 'pg:aws/prod');
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    // fails-when: the scope is interpolated raw — its `/` would split it into
+    //   two path segments and the route would match nothing.
+    expect(url).toBe(`${BASE_URL}/api/v1/admin/secrets/scopes/org-1/pg%3Aaws%2Fprod`);
+    expect(opts.method).toBe('DELETE');
+    expect(result).toEqual({ deleted: true });
+  });
+
   // --- Context management ---
 
   it('sends POST for createContext with orgId/name/allowLocalExecution body', async () => {

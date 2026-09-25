@@ -1,5 +1,5 @@
 /**
- * Smoke tests for `kici-admin cold-store` Phase C wiring.
+ * Smoke tests for `kici-admin cold-store` subcommand wiring.
  *
  * Each subcommand registers under `cold-store` and either:
  *   - rejects fast (exit 2) with a clear "Database URL required" when
@@ -82,7 +82,7 @@ async function runCapture(
   return { stdout, stderr, exitCode };
 }
 
-describe('kici-admin cold-store (Phase C — surface smoke)', () => {
+describe('kici-admin cold-store (surface smoke)', () => {
   it('archive-now requires a database URL', async () => {
     const { stderr, exitCode } = await runCapture(['cold-store', 'archive-now', 'execution_runs']);
     expect(stderr).toMatch(/Database URL required/);

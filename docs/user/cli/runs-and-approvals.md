@@ -9,7 +9,7 @@ description: 'Run push and inspection plus approval / rejection of held runs'
 
 Execute workflows locally or remotely. A bare `kici run [event]` performs a real routed run with this machine as the ephemeral agent; the `remote` subcommand runs fixtures through an orchestrator.
 
-#### kici run <event> --local
+#### `kici run <event> --local`
 
 Run a workflow on this machine as a real routed dispatch. `kici run <event> --local` compiles your workflows, matches triggers against the specified event, expands matrices, and executes the matched jobs — this machine joins as an ephemeral agent through the warm local dev plane. No orchestrator deployment is required.
 

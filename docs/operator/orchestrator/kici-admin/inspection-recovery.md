@@ -50,7 +50,7 @@ An object the current writers produce is never a candidate: a user-cache entry w
 ### attestations -- provenance verdict backfill and listing
 
 ```bash
-kici-admin attestations reverify [--all] [--database-url <url>]
+kici-admin attestations reverify [--all] [--yes] [--database-url <url>]
 ```
 
 - `reverify` recomputes the stored verification verdict for build-provenance
@@ -137,18 +137,20 @@ Requires the orchestrator's master key (`KICI_SECRET_KEY`) — the private half 
 ### access-log -- read / admin-mutation attribution log
 
 ```bash
-kici-admin access-log list [--org-id <orgId>] [--actor-type <t>] [--actor-id <id>] [--action <action>] [--source <s>] [--outcome <o>] [--target-type <t>] [--target-id <id>] [--from <ts>] [--to <ts>] [--q <text>] [--limit <n>] [--cursor <c>] [--json]
-kici-admin access-log show <id> [--json]
+kici-admin access-log list [--org-id <orgId>] [--actor-type <t>] [--actor-id <id>] [--action <action>] [--source <s>] [--outcome <o>] [--target-type <t>] [--target-id <id>] [--from <ts>] [--to <ts>] [--q <text>] [--agent-label <label>] [--agent-only] [--limit <n>] [--cursor <c>] [--json]
+kici-admin access-log show <id> [--org-id <orgId>] [--json]
 ```
 
 Operator-facing read access to the orchestrator's `access_log` table — every read / admin-mutation attributed to an `ActorPrincipal` (user, api_key, service_account, platform_operator, system). Dogfood replacement for raw `psql` when an operator asks "who read this run's payload last Tuesday" or "show me everything a platform_operator actor did".
 
 Output includes actor (type + id + optional metadata), action, source, outcome, target (if any), request ID, and timestamps.
 
+`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org-id <orgId>` names the tenant to scan in cold storage when the row is archived (older than 30 days). Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
+
 ### event-log -- inbound webhook delivery log
 
 ```bash
-kici-admin event-log list [--org <orgId>] [--routing-key <key>] [--event <type>] [--status <s>] [--from <ts>] [--to <ts>] [--delivery-id <substr>] [--limit <n>] [--offset <n>] [--include-archived] [--json]
+kici-admin event-log list [--org <orgId>] [--routing-key <key>] [--event <type>] [--action <action>] [--status <s>] [--from <ts>] [--to <ts>] [--delivery-id <substr>] [--limit <n>] [--offset <n>] [--include-archived] [--json]
 kici-admin event-log show <deliveryId> --org <orgId> [--include-payload] [--routing-key <key>] [--json]
 ```
 
@@ -426,7 +428,7 @@ Synopsis: `kici-admin cold-store list-chunks <table> [options]`
 
 ### `kici-admin cold-store list-purgeable`
 
-Phase 2: list chunks past their cold-retention horizon (read-only)
+List chunks past their cold-retention horizon (read-only)
 
 Synopsis: `kici-admin cold-store list-purgeable [options]`
 
@@ -463,7 +465,7 @@ Synopsis: `kici-admin cold-store peek-chunk <chunkId> [options]`
 
 ### `kici-admin cold-store purge-now`
 
-Phase 2: purge expired chunks from S3 + PG bookkeeping. DRY-RUN by default — pass --apply to actually delete.
+Purge expired chunks from S3 + PG bookkeeping. DRY-RUN by default — pass --apply to actually delete.
 
 Synopsis: `kici-admin cold-store purge-now [options]`
 
@@ -520,7 +522,7 @@ Synopsis: `kici-admin cold-store replay-chunk <chunkId> [options]`
 
 ### `kici-admin cold-store replay-into-pg`
 
-Phase F: promote every row in a chunk BACK into orchestrator PG (clear archived_at, write replay audit)
+Promote every row in a chunk back into orchestrator PG (clear archived_at, write a replay audit row)
 
 Synopsis: `kici-admin cold-store replay-into-pg <chunkId> [options]`
 

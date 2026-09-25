@@ -3,7 +3,9 @@ title: Pattern reference
 description: Step context, examples repository, GitHub check run output — cross-cutting reference for all patterns
 ---
 
-Every step receives a `StepContext` with these properties:
+## Step context
+
+Every step receives a `StepContext`. The properties most patterns use are below. For the full interface, see [SDK reference: runtime](../sdk/runtime.md#stepcontext).
 
 | Property            | Type                                | Description                                                      |
 | ------------------- | ----------------------------------- | ---------------------------------------------------------------- |
@@ -72,5 +74,3 @@ To enable source location annotations, recompile your workflows after updating K
 ```bash
 pnpm kici compile  # Regenerates kici.lock.json with source locations
 ```
-
-## See also

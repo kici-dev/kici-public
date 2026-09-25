@@ -264,6 +264,78 @@ describe('admin routes', () => {
   });
 
   // ── Scope-name validation ─────────────────────────────────────
+  // Scope writes are secret mutations, so they land in secret_audit_log like
+  // the setSecret / deleteSecret routes beside them.
+  describe('scope write audit rows', () => {
+    it('POST /secrets/scopes records a createScope row with the scope as sent', async () => {
+      (deps.secretStore.createScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'POST', '/secrets/scopes', {
+        token: validToken,
+        body: { orgId: 'org-1', scope: 'pg:aws/prod' },
+      });
+      expect(res.status).toBe(200);
+      // fails-when: the route creates the scope without writing an audit row.
+      expect(deps.auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'createScope',
+          contextName: 'pg:aws/prod',
+          secretKeys: null,
+          outcome: 'allowed',
+          userId: 'user-1',
+          role: 'owner',
+          metadata: { orgId: 'org-1' },
+        }),
+      );
+    });
+
+    it('PUT /secrets/scopes/rename records a renameScope row under the old name', async () => {
+      (deps.secretStore.renameScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'aws/prod', newScope: 'aws/production' },
+      });
+      expect(res.status).toBe(200);
+      expect(deps.auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'renameScope',
+          contextName: 'aws/prod',
+          outcome: 'allowed',
+          metadata: { orgId: 'org-1', newScope: 'aws/production' },
+        }),
+      );
+    });
+
+    it('DELETE /secrets/scopes/:orgId/:scope records a deleteScope row', async () => {
+      (deps.secretStore.deleteScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'DELETE', '/secrets/scopes/org-1/aws%2Fprod', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(deps.auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deleteScope',
+          contextName: 'aws/prod',
+          outcome: 'allowed',
+          metadata: { orgId: 'org-1' },
+        }),
+      );
+    });
+
+    it('a refused rename records no allowed row', async () => {
+      // breaks-if-wrong: the audit call must sit after the store call, so a
+      //   rename the store refuses is never recorded as an allowed mutation.
+      (deps.secretStore.renameScope as any).mockRejectedValue(
+        new SecretScopeNotFoundError('does-not-exist'),
+      );
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'does-not-exist', newScope: 'x' },
+      });
+      expect(res.status).toBe(404);
+      expect(deps.auditLogger.log).not.toHaveBeenCalled();
+    });
+  });
+
   describe('scope-name validation', () => {
     it('POST /secrets/scopes rejects an empty-path-segment scope with 400', async () => {
       const res = await request(app, 'POST', '/secrets/scopes', {

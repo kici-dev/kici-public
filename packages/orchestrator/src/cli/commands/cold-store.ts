@@ -1,9 +1,9 @@
 /**
  * Cold-store commands for kici-admin (orchestrator side).
  *
- * Phase C: every subcommand has a real implementation that builds an
- * `OrchestratorColdStore` against the orchestrator Postgres + S3 and
- * delegates to the helpers in `cold-store-impl.ts`. Mirrors
+ * Every subcommand builds an `OrchestratorColdStore` against the
+ * orchestrator Postgres + S3 and delegates to the helpers in
+ * `cold-store-impl.ts`. Mirrors
  * `kici-platform-admin cold-store …` on the Platform side.
  *
  *   cold-store archive-now <table>       Run one cycle for a single adapter
@@ -11,7 +11,10 @@
  *   cold-store list-chunks <table>       List chunks for a table
  *   cold-store verify-chunk <chunkId>    Recompute contentHash for a chunk
  *   cold-store replay-chunk <chunkId>    Re-run UPDATE+DELETE for a stuck chunk
+ *   cold-store replay-into-pg <chunkId>  Promote a chunk's rows back into PG
  *   cold-store reconcile <table>         Rebuild orphaned manifests from data
+ *   cold-store list-purgeable            List chunks past cold retention
+ *   cold-store purge-now                 Purge expired chunks (dry-run default)
  *   cold-store peek-chunk <chunkId>      Stream the first N rows of a chunk
  *
  * The CLI talks **directly** to the orchestrator Postgres (and the same
@@ -190,7 +193,7 @@ export function registerColdStoreCommands(
   coldStore
     .command('replay-into-pg <chunkId>')
     .description(
-      'Phase F: promote every row in a chunk BACK into orchestrator PG (clear archived_at, write replay audit)',
+      'Promote every row in a chunk back into orchestrator PG (clear archived_at, write a replay audit row)',
     )
     .option('--database-url <url>', 'Orchestrator Postgres URL (else KICI_DATABASE_URL)')
     .requiredOption('--table <table>', 'Adapter table name (currently: execution_runs)')
@@ -244,7 +247,7 @@ export function registerColdStoreCommands(
 
   coldStore
     .command('list-purgeable')
-    .description('Phase 2: list chunks past their cold-retention horizon (read-only)')
+    .description('List chunks past their cold-retention horizon (read-only)')
     .option('--database-url <url>', 'Orchestrator Postgres URL (else KICI_DATABASE_URL)')
     .option('--table <table>', 'Filter to a single adapter table (else all)')
     .option('--bucket <bucket>', 'Filter to a single cold-bucket (30d / 180d / 1y / 2y)')
@@ -268,7 +271,7 @@ export function registerColdStoreCommands(
   coldStore
     .command('purge-now')
     .description(
-      'Phase 2: purge expired chunks from S3 + PG bookkeeping. DRY-RUN by default — pass --apply to actually delete.',
+      'Purge expired chunks from S3 + PG bookkeeping. DRY-RUN by default — pass --apply to actually delete.',
     )
     .option('--database-url <url>', 'Orchestrator Postgres URL (else KICI_DATABASE_URL)')
     .option('--table <table>', 'Filter to a single adapter table (else all)')

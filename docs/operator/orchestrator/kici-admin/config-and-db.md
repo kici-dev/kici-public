@@ -33,13 +33,14 @@ For full configuration details, see [Configuration management](../config-managem
 ### db -- database management
 
 ```bash
-kici-admin db migrate            # Run pending migrations (HTTP — orchestrator must be up)
-kici-admin db migrate --status   # Show migration status without applying
+kici-admin db migrate                     # Run pending migrations (HTTP — orchestrator must be up)
+kici-admin db migrate --status            # Show migration status without applying
+kici-admin db migrate --to <migration>    # Revert to a named migration (before a rollback)
 
 # Infrastructure operations (direct DB — use --database-url or KICI_DATABASE_URL).
 # These cannot go through HTTP because the target DB may not exist yet or is about to be dropped.
 kici-admin db fresh --confirm [--yes]                          # DROP + CREATE + migrate + record content hash
-kici-admin db ensure <name>                                    # CREATE DATABASE IF NOT EXISTS
+kici-admin db ensure <name> [--owner <role>] [--revoke-connect-public] [--grant-connect-role <role>...]  # CREATE DATABASE IF NOT EXISTS
 kici-admin db create-role --user <name> --password <pw> [--createdb]
 kici-admin db create-readonly-user --user <name> --password <pw>
 kici-admin db check-schema [--json]                            # Exit 2 on migration drift
@@ -48,18 +49,21 @@ kici-admin db reindex --confirm --reason <text> [--database-url <url>]
 kici-admin db refresh-collation-version --reason <text> [--database-url <url>]
 
 # Backup / restore (direct DB — wraps pg_dump / pg_restore).
-kici-admin db backup [--output <path>] [--database-url <url>]
+kici-admin db backup [--output <path> | --output-dir <dir> [--keep <n>]] [--database-url <url>]
+kici-admin db backup --install-timer | --uninstall-timer [--schedule <spec>] [--output-dir <dir>] [--keep <n>] [--name <name>] [--instance-dir <path>]
 kici-admin db restore --input <path> [--yes] [--database-url <url>]
 ```
 
-- `migrate` goes through the orchestrator HTTP admin API (orchestrator auto-migrates on startup by default; set `KICI_AUTO_MIGRATE=false` to disable and run manually). Every successful migration run records the bundled-migration content hash in `_migration_content_hash` — including warm runs that apply zero migrations — so `check-schema` reports the schema as current on a long-lived database whose migrations are already up to date.
+- `migrate` goes through the orchestrator HTTP admin API (orchestrator auto-migrates on startup by default; set `KICI_AUTO_MIGRATE=false` to disable and run manually). `migrate --to <migration>` reverts every migration newer than the named one. Run it before a rollback, while the newer version still serves — only that version carries the `down()` functions of its own migrations.
+- `ensure` creates the database when it is missing. `--owner` sets a separate owner role, `--revoke-connect-public` revokes `CONNECT` from `PUBLIC`, and `--grant-connect-role` (repeatable) grants `CONNECT` to a named role. Every successful migration run records the bundled-migration content hash in `_migration_content_hash` — including warm runs that apply zero migrations — so `check-schema` reports the schema as current on a long-lived database whose migrations are already up to date.
 - `fresh` / `ensure` / `create-role` / `create-readonly-user` / `check-schema` / `collation-check` / `reindex` / `refresh-collation-version` open their own pool and run SQL directly — needed for deploy / bootstrap / DR workflows.
 - `fresh` prompts for the target database name as a confirmation. Pass `--yes` to skip the prompt (scripted use).
 - `check-schema` compares the bundled migration manifest (names + body hash) against the live schema and the stored `_migration_content_hash` marker. Exit code 2 means drift — call `fresh` or run `migrate` depending on intent.
 - `collation-check` compares `pg_database.datcollversion` against the running libc collation version. Exit code 2 means the stamped and actual collation versions differ — a libc upgrade changed sort order out from under existing indexes.
 - `reindex` runs `REINDEX DATABASE CONCURRENTLY`, rebuilding every index under the current libc collation rules. Non-blocking but takes minutes and roughly 2× temporary disk. Requires `--confirm` and `--reason`.
 - `refresh-collation-version` runs `ALTER DATABASE … REFRESH COLLATION VERSION` — a metadata-only bump that clears the drift warning. Pair it with `db reindex` after a libc-base image rebuild so the indexes match the new collation. Requires `--reason`.
-- `backup` wraps `pg_dump -Fc` into a custom-format dump (default `./kici-orchestrator-backup-<timestamp>.dump`, override with `--output`) and writes a sidecar `<dump>.manifest.json` recording the creation time, byte size, secret-key version, Postgres server version, migrations hash, cluster id, and hostname. Each run is also recorded in the `backup_runs` table, which is what the [backup-freshness](./org-settings.md) WARN threshold reads.
+- `backup` wraps `pg_dump -Fc` into a custom-format dump (default `./kici-orchestrator-backup-<timestamp>.dump`, override with `--output`) and writes a sidecar `<dump>.manifest.json` recording the creation time, byte size, secret-key version, Postgres server version, migrations hash, cluster id, and hostname. Each run is also recorded in the `backup_runs` table, which is what the [backup-freshness](./org-settings.md) WARN threshold reads. `--output-dir` writes a timestamped dump into a directory and keeps the newest `--keep` dumps (default 7).
+- `backup --install-timer` installs a scheduled backup service and timer for the named orchestrator instance, then exits; `--uninstall-timer` removes it. See [Schedule backups](../db-backup-restore.md#schedule-backups) for the per-platform behavior of `--schedule`.
 - `restore` wraps `pg_restore --clean --if-exists --no-owner` and is **destructive** — it drops and recreates the target's objects. It prompts before proceeding; pass `--yes` for scripted use. Afterwards it reports whether the dump carried encrypted secrets, because those only decrypt under the **same** `KICI_SECRET_KEY` the source orchestrator used.
 - Both require a `postgresql-client` on `PATH` whose major version is at least the server's, and both refuse rather than produce a half-usable dump when it is older. Credentials ride in `PG*` environment variables, never in argv, so the DB password never appears in the world-readable `/proc/<pid>/cmdline`.
 

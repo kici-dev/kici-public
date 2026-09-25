@@ -14,7 +14,6 @@ import path from 'node:path';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { execSync, spawnSync } from 'node:child_process';
-import { createInterface } from 'node:readline';
 import { select } from '@inquirer/prompts';
 import {
   DEFAULT_RESTART_POLICY,
@@ -42,6 +41,7 @@ import {
   type MigrationStatusRow,
 } from './upgrade-safety.js';
 import { makeTempDir } from '@kici-dev/shared/tmp';
+import { confirmPrompt } from './confirm.js';
 
 /** Component types that can be upgraded. */
 type UpgradeComponent = 'orchestrator' | 'agent';
@@ -188,15 +188,9 @@ export async function resolveUpgradeTarget(args: {
   };
 }
 
-/** Prompt the user for confirmation (returns true if yes). */
-async function confirm(message: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(`${message} [y/N] `, (answer) => {
-      rl.close();
-      resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
-    });
-  });
+/** Prompt the user for confirmation on stdout, beside the upgrade plan it follows. */
+function confirm(message: string): Promise<boolean> {
+  return confirmPrompt(`${message} [y/N] `, { input: process.stdin, output: process.stdout });
 }
 
 /** Download a file from a URL to a local path. */

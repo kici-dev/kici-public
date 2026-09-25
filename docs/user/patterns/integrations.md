@@ -3,6 +3,8 @@ title: Integration patterns
 description: Workflow chaining, generic webhooks, Stripe, self-hosted git forges, plain GitHub repos
 ---
 
+## Workflow chaining
+
 Use internal event triggers to chain workflows together. Workflow A completes, emits an event (or the system auto-emits a completion event), and Workflow B triggers in response.
 
 ### Using system completion events
@@ -358,5 +360,3 @@ export default workflow('on-github-repo-push', {
 - Workflow authors must use `genericWebhook()`, not `push()` / `pr()` / `webhook()` — the latter three only match events delivered through the native GitHub App provider.
 
 **When to use it anyway:** trigger-only workflows that don't need the cloned repo — posting Slack messages, kicking off external deploys, forwarding to downstream systems, or exposing GitHub repo events as `genericWebhook` for same-org [cross-source fan-out](../../architecture/webhooks/webhook-delivery.md#cross-source-delivery). For anything that compiles, tests, or checks code, install the GitHub App instead.
-
-## Nightly cron build

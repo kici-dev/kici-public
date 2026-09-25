@@ -43,7 +43,7 @@ export class AuditLogger {
    * engine's `shouldRecordSecretResolve` helper) since they're written
    * once per JOB-step secret resolution and dwarf every other action's
    * volume. Denied resolves and every other action (`setSecret`,
-   * `deleteSecret`, `rotateKey`, `secret-outputs.reveal`) bypass the
+   * `deleteSecret`, the scope writes, `rotateKey`, `secret-outputs.reveal`) bypass the
    * sampler — they are transactional with the mutation and must always
    * land.
    *

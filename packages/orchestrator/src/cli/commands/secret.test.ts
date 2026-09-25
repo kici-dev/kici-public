@@ -75,6 +75,9 @@ interface MockClient {
   listKeys: ReturnType<typeof vi.fn>;
   setSecret: ReturnType<typeof vi.fn>;
   deleteSecret: ReturnType<typeof vi.fn>;
+  createScope: ReturnType<typeof vi.fn>;
+  renameScope: ReturnType<typeof vi.fn>;
+  deleteScope: ReturnType<typeof vi.fn>;
 }
 
 function makeMockClient(): MockClient {
@@ -84,6 +87,9 @@ function makeMockClient(): MockClient {
     listKeys: vi.fn(),
     setSecret: vi.fn(),
     deleteSecret: vi.fn(),
+    createScope: vi.fn(),
+    renameScope: vi.fn(),
+    deleteScope: vi.fn(),
   };
 }
 
@@ -411,6 +417,94 @@ describe('kici-admin secret CLI', () => {
       expect(exitCode).toBeNull();
       expect(client.deleteSecret).toHaveBeenCalledWith('org-1', 'staging', 'API_KEY');
       expect(stdout).toContain("deleted from scope 'staging'");
+    });
+  });
+
+  // ── secret scope create|rename|delete ───────────────────────────────────
+  describe('scope create / rename / delete', () => {
+    it('create sends the org and the scope as typed, backend qualifier included', async () => {
+      const client = makeMockClient();
+      client.createScope.mockResolvedValue({ created: true });
+      const { stdout, exitCode } = await runCommand(
+        ['secret', 'scope', 'create', 'org-1', 'pg:aws/prod'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.createScope).toHaveBeenCalledWith('org-1', 'pg:aws/prod');
+      expect(stdout).toContain("Secret scope 'pg:aws/prod' created for org org-1.");
+    });
+
+    it('create --json prints the route response', async () => {
+      const client = makeMockClient();
+      client.createScope.mockResolvedValue({ created: true });
+      const { stdout } = await runCommand(
+        ['secret', 'scope', 'create', 'org-1', 'staging', '--json'],
+        client,
+      );
+      expect(JSON.parse(stdout)).toEqual({ created: true });
+    });
+
+    it('rename sends the old and the new scope name', async () => {
+      const client = makeMockClient();
+      client.renameScope.mockResolvedValue({ renamed: true });
+      const { stdout, exitCode } = await runCommand(
+        ['secret', 'scope', 'rename', 'org-1', 'aws/prod', 'aws/production'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.renameScope).toHaveBeenCalledWith('org-1', 'aws/prod', 'aws/production');
+      expect(stdout).toContain("Secret scope 'aws/prod' renamed to 'aws/production'");
+    });
+
+    it('rename exits 1 with the route error when the destination exists', async () => {
+      // fails-when: the action swallows the rejection and exits 0 — a refused
+      //   rename would then read as a success in a script.
+      const client = makeMockClient();
+      client.renameScope.mockRejectedValue(
+        new Error("HTTP 409: Secret scope 'aws/staging' already exists"),
+      );
+      const { stderr, exitCode } = await runCommand(
+        ['secret', 'scope', 'rename', 'org-1', 'aws/prod', 'aws/staging'],
+        client,
+      );
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('HTTP 409');
+    });
+
+    it('delete with --yes skips the prompt and deletes the scope', async () => {
+      const client = makeMockClient();
+      client.deleteScope.mockResolvedValue({ deleted: true });
+      const { stdout, exitCode } = await runCommand(
+        ['secret', 'scope', 'delete', 'org-1', 'staging', '--yes'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.deleteScope).toHaveBeenCalledWith('org-1', 'staging');
+      expect(stdout).toContain("Secret scope 'staging' deleted for org org-1.");
+    });
+
+    it('delete --yes --json prints the route response', async () => {
+      const client = makeMockClient();
+      client.deleteScope.mockResolvedValue({ deleted: true });
+      const { stdout } = await runCommand(
+        ['secret', 'scope', 'delete', 'org-1', 'staging', '--yes', '--json'],
+        client,
+      );
+      expect(JSON.parse(stdout)).toEqual({ deleted: true });
+    });
+
+    it('create exits 1 when a required argument is missing', async () => {
+      // fails-when: the scope argument is declared optional, so the verb
+      //   would reach the orchestrator with an undefined scope.
+      const client = makeMockClient();
+      const program = new Command();
+      program.exitOverride();
+      program.configureOutput({ writeErr: () => {} });
+      registerSecretCommands(program, () => client as any);
+      await expect(
+        program.parseAsync(['secret', 'scope', 'create', 'org-1'], { from: 'user' }),
+      ).rejects.toThrow(/missing required argument 'scope'/);
+      expect(client.createScope).not.toHaveBeenCalled();
     });
   });
 

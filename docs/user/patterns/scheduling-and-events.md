@@ -3,6 +3,8 @@ title: Scheduling & event patterns
 description: Nightly cron, workflow-complete-triggered deploys, custom event chaining
 ---
 
+## Nightly cron build
+
 Run a full build and test suite on a schedule using `schedule()`. Schedule triggers are evaluated by the orchestrator's Raft leader in clustered deployments.
 
 ```typescript
@@ -185,6 +187,4 @@ export const autoDeploy = workflow('auto-deploy', {
 - Custom events are delivered immediately when `ctx.emit()` is called (mid-workflow), not queued until the workflow completes.
 - Payload matching is available via the `match` option: `kiciEvent({ name: 'tests-passed', match: { '$.branch': 'main' } })`.
 - The `auto-deploy` workflow uses the [registration model](../events.md#the-registration-model) -- it will not trigger until you push to your default branch.
-- The [circuit breaker](../events.md#circuit-breaker) limits chain depth (default: 10) and rate (default: 100/min per workflow) to prevent infinite loops.
-
-## Step context
+- The [circuit breaker](../events.md#circuit-breaker) limits chain depth (default: 10) and emission rate (default: 100 per minute for each source routing key and event name) to prevent infinite loops.

@@ -79,6 +79,18 @@ export class VariableStore {
       .execute();
   }
 
+  /** List every source override in a context, across all routing keys. */
+  async listAllSourceOverrides(orgId: string, contextId: string): Promise<ContextSourceOverride[]> {
+    return this.db
+      .selectFrom('context_source_overrides')
+      .selectAll()
+      .where('org_id', '=', orgId)
+      .where('context_id', '=', contextId)
+      .orderBy('routing_key', 'asc')
+      .orderBy('key', 'asc')
+      .execute();
+  }
+
   /** Upsert a source override. */
   async setSourceOverride(
     orgId: string,

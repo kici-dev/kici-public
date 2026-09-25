@@ -100,8 +100,8 @@ describe('kici-admin held-run', () => {
   });
 
   it('refuses to guess between a job’s two holds, and POSTs nothing', async () => {
-    // The shape Task 11h named: one job gated by a reviewer hold AND a security
-    // hold writes two pending rows, and both must be answered separately.
+    // One job gated by a reviewer hold AND a security hold writes two pending
+    // rows, and both must be answered separately.
     const { program, post } = harness([REVIEWER_HOLD, SECURITY_HOLD]);
     await expect(
       program.parseAsync([...BASE, 'approve', '--customer-id', ORG, '--run-id', RUN]),

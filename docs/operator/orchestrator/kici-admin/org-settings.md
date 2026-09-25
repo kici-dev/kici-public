@@ -321,9 +321,9 @@ A run can carry more than one hold, and each takes its own decision: a job gated
 
 Four properties worth knowing:
 
-- **Both verbs refuse with a `409` on a Platform-attached orchestrator.** There the Platform authorizes each decision against the acting member's org RBAC, and an orchestrator admin token carries none of it. The CLI surfaces that refusal verbatim.
+- **All three verbs refuse with a `409` on a Platform-attached orchestrator.** There the Platform authorizes each decision against the acting member's org RBAC, and an orchestrator admin token carries none of it. The CLI surfaces that refusal verbatim.
 - **Approving lets the held work run; it does not make its contributor trusted.** A released fork pull request resumes with the base branch's lock file, no install or registry secrets, and an isolated cache write scope.
-- **The decision is attributed to the admin token, not to a person.** There is no flag to claim someone else's identity, because `held_run_approvals` is the record of who approved and a name the operator merely typed would make it false. A `{team}` clause is satisfiable only if that team, in the stored approval directory, contains the token's own subject.
+- **By default the decision is attributed to the admin token, not to a person.** The token's subject (`service:<token user id>`) satisfies no `{user}` clause and belongs to no `{team}`. To answer such a hold, pass `--as <user-id>`: the decision is then attributed to that member, and team clauses resolve against the stored approval directory. The orchestrator accepts only an id you registered with `kici-admin trust-policy directory-set` and refuses any other id with a `400`. The access-log row still names the admin token as the actor and records the member as `approvedAsUserId`.
 - **Step-scoped holds are refused.** Answering one means notifying the waiting agent, and an independent orchestrator wires no such bridge; flipping the row without it would leave the agent waiting with nothing left to release or expire it.
 
 `list` needs `ci_trust.read`; `approve` and `reject` need `ci_trust.admin` — the same permissions `trust-policy` takes, held by owner and admin only, and by no routing-key-scoped token. Every decision writes a `held_run.approve` or `held_run.reject` row to the access log; read them back with `kici-admin access-log list --action held_run.approve`.

@@ -177,6 +177,27 @@ curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/secrets/<org-id>/production/KICI_DAT
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
 ```
 
+**Create, rename or delete a scope** (PG backend only; `delete` removes every secret in the scope):
+
+```bash
+kici-admin secret scope create <org-id> staging
+kici-admin secret scope rename <org-id> staging preprod
+kici-admin secret scope delete <org-id> preprod --yes
+```
+
+```bash
+curl -X POST $KICI_ADMIN_URL/api/v1/admin/secrets/scopes \
+  -H "Authorization: Bearer $KICI_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"orgId": "<org-id>", "scope": "staging"}'
+curl -X PUT $KICI_ADMIN_URL/api/v1/admin/secrets/scopes/rename \
+  -H "Authorization: Bearer $KICI_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"orgId": "<org-id>", "oldScope": "staging", "newScope": "preprod"}'
+curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/secrets/scopes/<org-id>/preprod \
+  -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
+```
+
 #### Key naming
 
 A secret key may contain letters, digits, `_`, `.` and `-`, up to 256
@@ -329,7 +350,9 @@ Query parameters: `contextName`, `routingKey`, `action`, `from`, `to`, `limit`, 
 
 ## CLI input modes
 
-`kici-admin secret set` accepts five input modes. Exactly one must be selected per invocation; combining them throws before any I/O happens.
+`kici-admin secret set` names its target either positionally (`secret set <orgId> <scope> <key>`) or with the context form (`--org <orgId> --context <name> --key <key>`).
+
+It accepts five input modes. Exactly one must be selected per invocation; combining them throws before any I/O happens.
 
 | Flag                  | Source                                                          | Default selection                                      | Security notes                                                                                                                |
 | --------------------- | --------------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -342,9 +365,9 @@ Query parameters: `contextName`, `routingKey`, `action`, `from`, `to`, `limit`, 
 Two cross-cutting flags work with every mode:
 
 - `--confirm-fingerprint <hex>` — pre-compute SHA-256 of the value and pass it. The CLI rejects the call if the value's fingerprint doesn't match. Catches paste corruption.
-- `--dry-run` — parse and validate the value, print `[dry-run] would set <key> in scope <scope> sha256=<hex>`, exit without writing.
+- `--dry-run` — parse and validate the value, print `[dry-run] would set secret '<key>' in scope '<scope>' for org <orgId> (<length> chars, source=<mode>, sha256=<hex>)`, exit without writing.
 
-After a successful write, the CLI prints a one-line confirmation with the key, the scope, and the value's length (never the value itself) plus the recorded `updated_at`.
+After a successful write, the CLI prints a one-line confirmation with the key, the scope, and the org (never the value itself).
 
 `kici-admin variable set` accepts the same five input modes plus `--locked` to mark the variable as immutable from subsequent dashboard writes. `kici-admin variable list` accepts `--values` to render the values inline (default is keys-only); `kici-admin variable delete` accepts `--yes` to skip the confirmation prompt.
 
@@ -352,21 +375,21 @@ After a successful write, the CLI prints a one-line confirmation with the key, t
 
 ```bash
 # Interactive prompt
-kici-admin secret set --scope production DB_PASSWORD --prompt
+kici-admin secret set <orgId> production DB_PASSWORD --prompt
 
 # Pipe from another tool
-pass show prod/db | kici-admin secret set --scope production DB_PASSWORD --from-stdin
+pass show prod/db | kici-admin secret set <orgId> production DB_PASSWORD --from-stdin
 
 # Read from a temp file (after sops decrypt)
 sops -d --output prod-db.txt secrets.enc.yaml
-kici-admin secret set --scope production DB_PASSWORD --from-file ./prod-db.txt
+kici-admin secret set <orgId> production DB_PASSWORD --from-file ./prod-db.txt
 rm prod-db.txt
 
 # Read from a CI-provided env var
-kici-admin secret set --scope production DB_PASSWORD --from-env CI_DB_PASSWORD
+kici-admin secret set <orgId> production DB_PASSWORD --from-env CI_DB_PASSWORD
 
 # Dry-run with fingerprint check
-kici-admin secret set --scope production DB_PASSWORD --prompt \
+kici-admin secret set <orgId> production DB_PASSWORD --prompt \
   --confirm-fingerprint 7b3d6e... --dry-run
 ```
 
@@ -399,10 +422,10 @@ Set the flag with `kici-admin`:
 
 ```bash
 # Enable test-run access on a dedicated test context
-kici-admin context set-policy --env test-database --allow-local-execution true
+kici-admin context set-policy --org <orgId> --env test-database --allow-local-execution true
 
 # Keep production locked down (explicit, though false is the default)
-kici-admin context set-policy --env production --allow-local-execution false
+kici-admin context set-policy --org <orgId> --env production --allow-local-execution false
 ```
 
 The same toggle is available on the context detail page in the dashboard (the "Test runs" switch), gated by the same permission as writing a secret. Whether the dashboard surface accepts the change is decided by the [dashboard-write policy](./dashboard-write-policy.md) operation `contexts.test_access.set`.
@@ -851,7 +874,7 @@ If expected scopes don't appear after sync:
 
 - Verify the scope filter patterns match the desired paths
 - Check that secrets exist at the expected mount/base path
-- Run manual sync: `kici-admin backend sync --name <backend>`
+- Run manual sync: `kici-admin backend sync <backend>`
 - Check orchestrator logs for sync errors
 
 **Data migration:**

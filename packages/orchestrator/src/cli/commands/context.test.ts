@@ -32,6 +32,7 @@ interface MockClient {
   get: ReturnType<typeof vi.fn>;
   post: ReturnType<typeof vi.fn>;
   patch: ReturnType<typeof vi.fn>;
+  put: ReturnType<typeof vi.fn>;
   delete: ReturnType<typeof vi.fn>;
 }
 
@@ -40,6 +41,7 @@ function makeMockClient(): MockClient {
     get: vi.fn(),
     post: vi.fn(),
     patch: vi.fn(),
+    put: vi.fn(),
     delete: vi.fn(),
   };
 }
@@ -1061,6 +1063,160 @@ describe('kici-admin context CLI', () => {
         '--json',
       ]);
       expect(JSON.parse(json.stdout).context.repo_patterns).toEqual(['acme/workflows']);
+    });
+  });
+
+  describe('source-override', () => {
+    it('list reads every source of the context and prints a table', async () => {
+      const client = makeMockClient();
+      client.get.mockResolvedValue({
+        overrides: [
+          { routing_key: 'github:42', key: 'API_URL', value: 'https://a', updated_at: 't1' },
+        ],
+      });
+      const { stdout, exitCode } = await runCommand(
+        ['context', 'source-override', 'list', '--org', 'org1', '--env', 'prod env'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.get).toHaveBeenCalledWith(
+        '/api/v1/admin/contexts/prod%20env/source-overrides?orgId=org1',
+      );
+      expect(stdout).toContain('ROUTING KEY');
+      expect(stdout).toMatch(/github:42\s+API_URL\s+https:\/\/a/);
+    });
+
+    it('list --routing-key narrows the request to one source', async () => {
+      const client = makeMockClient();
+      client.get.mockResolvedValue({ overrides: [] });
+      const { stdout } = await runCommand(
+        [
+          'context',
+          'source-override',
+          'list',
+          '--org',
+          'org1',
+          '--env',
+          'prod',
+          '--routing-key',
+          'github:42',
+        ],
+        client,
+      );
+      expect(client.get).toHaveBeenCalledWith(
+        '/api/v1/admin/contexts/prod/source-overrides?orgId=org1&routingKey=github%3A42',
+      );
+      expect(stdout).toContain('No source overrides found.');
+    });
+
+    it('set PUTs the value with every path segment encoded', async () => {
+      const client = makeMockClient();
+      client.put.mockResolvedValue({ set: true });
+      const { stdout, exitCode } = await runCommand(
+        [
+          'context',
+          'source-override',
+          'set',
+          '--org',
+          'org1',
+          '--env',
+          'prod',
+          '--routing-key',
+          'github:42',
+          '--key',
+          'API_URL',
+          '--value',
+          'https://override',
+          '--json',
+        ],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      // fails-when: the routing key is interpolated raw — a routing key that
+      //   carries a `/` would split into two path segments.
+      expect(client.put).toHaveBeenCalledWith(
+        '/api/v1/admin/contexts/prod/source-overrides/github%3A42/API_URL?orgId=org1',
+        { value: 'https://override' },
+      );
+      expect(JSON.parse(stdout)).toEqual({ set: true });
+    });
+
+    it('set refuses to run without --value and sends nothing', async () => {
+      const client = makeMockClient();
+      const program = new Command();
+      program.exitOverride();
+      program.configureOutput({ writeErr: () => {} });
+      registerContextCommands(program, () => client as any);
+      await expect(
+        program.parseAsync(
+          [
+            'context',
+            'source-override',
+            'set',
+            '--org',
+            'org1',
+            '--env',
+            'prod',
+            '--routing-key',
+            'github:42',
+            '--key',
+            'API_URL',
+          ],
+          { from: 'user' },
+        ),
+      ).rejects.toThrow(/required option '--value <value>' not specified/);
+      expect(client.put).not.toHaveBeenCalled();
+    });
+
+    it('delete sends a DELETE for the one override', async () => {
+      const client = makeMockClient();
+      client.delete.mockResolvedValue({ deleted: true });
+      const { stdout, exitCode } = await runCommand(
+        [
+          'context',
+          'source-override',
+          'delete',
+          '--org',
+          'org1',
+          '--env',
+          'prod',
+          '--routing-key',
+          'github:42',
+          '--key',
+          'API_URL',
+        ],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.delete).toHaveBeenCalledWith(
+        '/api/v1/admin/contexts/prod/source-overrides/github%3A42/API_URL?orgId=org1',
+      );
+      expect(stdout).toContain('context source-override delete: key=API_URL');
+    });
+
+    it('delete exits 1 with the route error when the context is missing', async () => {
+      const client = makeMockClient();
+      client.delete.mockRejectedValue(
+        new Error('HTTP 404: context not found (org=org1, name=ghost)'),
+      );
+      const { stderr, exitCode } = await runCommand(
+        [
+          'context',
+          'source-override',
+          'delete',
+          '--org',
+          'org1',
+          '--env',
+          'ghost',
+          '--routing-key',
+          'github:42',
+          '--key',
+          'API_URL',
+        ],
+        client,
+      );
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('HTTP 404');
     });
   });
 });

@@ -16,7 +16,6 @@
  * The PRIVATE half is master-key wrapped (`KICI_SECRET_KEY`) in the orchestrator
  * DB and is never exportable — recovery from a lost key is a routine rotation.
  */
-import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
@@ -26,6 +25,7 @@ import { DashboardEncryptionKeyRepo } from '../../db/repos/dashboard-encryption-
 import { ClusterSettingsReader } from '../../cluster/cluster-settings-reader.js';
 import { jwksUrlFor, resolveVerifiedIssuer } from '../../cluster/verified-issuer.js';
 import { generateDashboardEncryptionKey } from '../../secrets/dashboard-encryption-key.js';
+import { confirmPrompt } from './shared/confirm.js';
 
 const logger = createLogger({ prefix: 'kici-admin-dashboard-encryption-key' });
 
@@ -45,17 +45,6 @@ function resolveSecretKey(): string {
     );
   }
   return config.secretKey;
-}
-
-async function confirmInteractive(prompt: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
-    const a = answer.trim().toLowerCase();
-    return a === 'y' || a === 'yes';
-  } finally {
-    rl.close();
-  }
 }
 
 async function withRepo<T>(
@@ -223,7 +212,7 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
                 process.stderr.write(`Rotated: new active dashboard-encryption key ${kid}.\n`);
               },
             },
-            { confirm: confirmInteractive, yes: opts.yes, dryRun: opts.dryRun },
+            { confirm: confirmPrompt, yes: opts.yes, dryRun: opts.dryRun },
           );
         });
       } catch (err) {

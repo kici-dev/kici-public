@@ -8,7 +8,6 @@
  *
  * Classified `kici-admin` (orchestrator DB plane) per .claude/rules/platform-admin.md.
  */
-import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
 import { loadConfig } from '../../config.js';
@@ -19,6 +18,7 @@ import { createProvenanceTrustRoot } from '../../provenance/trust-root.js';
 import { reverifyAttestations } from './attestations-reverify.js';
 import type { AdminApiClient } from '../api-client.js';
 import { runAttestationRetry } from './attestations-retry.js';
+import { confirmPrompt } from './shared/confirm.js';
 import {
   runAttestationList,
   readAttestations,
@@ -60,16 +60,6 @@ function buildStorage(config: ReturnType<typeof loadConfig>): CacheStorage | und
     });
   }
   return undefined;
-}
-
-async function confirmInteractive(prompt: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
-    return answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes';
-  } finally {
-    rl.close();
-  }
 }
 
 /** Render attestation rows as a compact human table (stderr note when empty). */
@@ -134,7 +124,7 @@ export function registerAttestationsCommands(
         const config = loadConfig();
         const url = resolveDatabaseUrl(opts.databaseUrl ?? (config.databaseUrl || undefined));
         if (opts.all && !opts.yes) {
-          const ok = await confirmInteractive(
+          const ok = await confirmPrompt(
             'Re-evaluate the verdict of EVERY attestation (including already-verified)? [y/N] ',
           );
           if (!ok) {

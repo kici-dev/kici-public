@@ -34,6 +34,7 @@ import { LocalSourceConfigSchema } from '../../providers/local/local-source-conf
 import { buildLocalTriggerRequest, readRepoHead, sendLocalTrigger } from './local-trigger.js';
 import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
 import { runGithubManifestSetup } from './source-manifest.js';
+import { confirmPrompt } from './shared/confirm.js';
 
 /** Mirror of the identical helper in queue.ts / event.ts / etc.: an explicit
  *  --database-url wins, else KICI_DATABASE_URL, else null (→ HTTP path). */
@@ -677,7 +678,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--allowed-events <events>', 'Comma-separated list of allowed event types')
     .option('--strip-headers <headers>', 'Comma-separated list of headers to strip')
     .option('--rate-limit <rpm>', 'Rate limit in requests per minute (default: 600)', parseInt)
-    // Universal-git flags (Phase 1): present iff the source should also know
+    // Universal-git flags: present iff the source should also know
     // how to clone, fetch lock files, and match triggers against a real git
     // server. Supplying --preset or --git-url-template flips this source
     // into a universal-git source; omitting them keeps it payload-only.
@@ -1281,12 +1282,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           localConfig?: { repoBasePath: string; cloneUrlBase?: string };
         } = {};
         if (opts.name) data.name = opts.name;
-        // `--clone-url-base` used to be applied only inside the `--path` branch,
-        // so passing it alone silently updated nothing and the command exited
-        // "no fields to update" — while still advertising the flag in --help.
-        // Switching a local source from file:// to a git daemon changes only the
-        // clone base, which made the one edit the flag exists for impossible
-        // without re-supplying the unchanged path.
+        // `--clone-url-base` applies on its own, without `--path`: switching a
+        // local source from file:// to a git daemon changes only the clone
+        // base, so the operator does not have to re-supply the unchanged path.
         if (opts.path !== undefined || opts.cloneUrlBase !== undefined) {
           let repoBasePath: string | undefined = opts.path;
           if (repoBasePath === undefined) {
@@ -1353,16 +1351,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .action(async (routingKey: string, opts) => {
       try {
-        if (!opts.yes) {
-          const rl = createInterface({ input: process.stdin, output: process.stdout });
-          const answer = await new Promise<string>((resolve) => {
-            rl.question(`Remove source "${routingKey}"? (y/N) `, resolve);
-          });
-          rl.close();
-          if (answer.toLowerCase() !== 'y') {
-            console.log('Cancelled.');
-            return;
-          }
+        if (!opts.yes && !(await confirmPrompt(`Remove source "${routingKey}"? (y/N) `))) {
+          console.log('Cancelled.');
+          return;
         }
 
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);

@@ -21,37 +21,37 @@ Each operation carries one of three postures:
 
 Every mutating dashboard action maps to exactly one `DashboardWriteOperation`. The orchestrator ships with **27 operations** today, grouped into ten categories and three sensitivity buckets:
 
-| Category          | Operation                          | Sensitivity | Operator equivalent                                                     |
-| ----------------- | ---------------------------------- | ----------- | ----------------------------------------------------------------------- |
-| **Secrets**       | `secrets.set`                      | plaintext   | `kici-admin secret set`                                                 |
-|                   | `secrets.delete`                   | authority   | `kici-admin secret delete`                                              |
-|                   | `secrets.scope.create`             | authority   | `POST /api/v1/admin/secrets/scopes` (no CLI subcommand)                 |
-|                   | `secrets.scope.rename`             | authority   | `PUT /api/v1/admin/secrets/scopes/rename` (no CLI subcommand)           |
-|                   | `secrets.scope.delete`             | authority   | `DELETE /api/v1/admin/secrets/scopes/:orgId/:scope` (no CLI subcommand) |
-| **Variables**     | `variables.set`                    | plaintext   | `kici-admin variable set`                                               |
-|                   | `variables.delete`                 | authority   | `kici-admin variable delete`                                            |
-| **Contexts**      | `contexts.create`                  | authority   | `kici-admin context create`                                             |
-|                   | `contexts.update`                  | authority   | `kici-admin context set-policy`                                         |
-|                   | `contexts.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution`                 |
-|                   | `contexts.delete`                  | authority   | `kici-admin context delete`                                             |
-| **Bindings**      | `contexts.bindings.set`            | authority   | `kici-admin context bind`                                               |
-|                   | `contexts.source_overrides.set`    | authority   | `kici-admin context source-override set`                                |
-|                   | `contexts.source_overrides.delete` | authority   | `kici-admin context source-override delete`                             |
-| **Held runs**     | `held_runs.approve`                | dispatch    | `kici-admin held-run approve` (independent mode only)                   |
-|                   | `held_runs.reject`                 | dispatch    | `kici-admin held-run reject` (independent mode only)                    |
-| **DLQ**           | `event_dlq.retry`                  | dispatch    | `kici-admin event-dlq retry`                                            |
-|                   | `event_dlq.discard`                | dispatch    | `kici-admin event-dlq discard`                                          |
-| **Attestations**  | `attestations.retry`               | dispatch    | `kici-admin attestations retry`                                         |
-| **Registrations** | `registration.disable`             | dispatch    | `kici-admin registration disable`                                       |
-|                   | `registration.delete`              | dispatch    | `kici-admin registration delete`                                        |
-| **Topology**      | `global_workflows.update`          | dispatch    | `kici-admin org-settings global-workflows {allow,deny,elevate}-add`     |
-|                   | `backends.sync`                    | dispatch    | `kici-admin backend sync`                                               |
-|                   | `backends.sync_one`                | dispatch    | `kici-admin backend sync --one`                                         |
-|                   | `backends.test`                    | dispatch    | `kici-admin backend test`                                               |
-| **Fleet**         | `fleet.host.declare`               | dispatch    | `kici-admin host declare`                                               |
-|                   | `fleet.host.remove`                | dispatch    | `kici-admin host remove`                                                |
+| Category          | Operation                          | Sensitivity | Operator equivalent                                                  |
+| ----------------- | ---------------------------------- | ----------- | -------------------------------------------------------------------- |
+| **Secrets**       | `secrets.set`                      | plaintext   | `kici-admin secret set`                                              |
+|                   | `secrets.delete`                   | authority   | `kici-admin secret delete`                                           |
+|                   | `secrets.scope.create`             | authority   | `kici-admin secret scope create`                                     |
+|                   | `secrets.scope.rename`             | authority   | `kici-admin secret scope rename`                                     |
+|                   | `secrets.scope.delete`             | authority   | `kici-admin secret scope delete`                                     |
+| **Variables**     | `variables.set`                    | plaintext   | `kici-admin variable set`                                            |
+|                   | `variables.delete`                 | authority   | `kici-admin variable delete`                                         |
+| **Contexts**      | `contexts.create`                  | authority   | `kici-admin context create`                                          |
+|                   | `contexts.update`                  | authority   | `kici-admin context set-policy`                                      |
+|                   | `contexts.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution`              |
+|                   | `contexts.delete`                  | authority   | `kici-admin context delete`                                          |
+| **Bindings**      | `contexts.bindings.set`            | authority   | `kici-admin context bind`                                            |
+|                   | `contexts.source_overrides.set`    | authority   | `kici-admin context source-override set`                             |
+|                   | `contexts.source_overrides.delete` | authority   | `kici-admin context source-override delete`                          |
+| **Held runs**     | `held_runs.approve`                | dispatch    | `kici-admin held-run approve` (independent mode only)                |
+|                   | `held_runs.reject`                 | dispatch    | `kici-admin held-run reject` (independent mode only)                 |
+| **DLQ**           | `event_dlq.retry`                  | dispatch    | `kici-admin event-dlq retry`                                         |
+|                   | `event_dlq.discard`                | dispatch    | `kici-admin event-dlq discard`                                       |
+| **Attestations**  | `attestations.retry`               | dispatch    | `kici-admin attestations retry`                                      |
+| **Registrations** | `registration.disable`             | dispatch    | `kici-admin registration disable` (`enable` turns it back on)        |
+|                   | `registration.delete`              | dispatch    | `kici-admin registration delete`                                     |
+| **Topology**      | `global_workflows.update`          | dispatch    | `kici-admin org-settings global-workflows {allow,deny}-{add,remove}` |
+|                   | `backends.sync`                    | dispatch    | `kici-admin backend sync`                                            |
+|                   | `backends.sync_one`                | dispatch    | `kici-admin backend sync <name>`                                     |
+|                   | `backends.test`                    | dispatch    | `kici-admin backend test`                                            |
+| **Fleet**         | `fleet.host.declare`               | dispatch    | `kici-admin host declare`                                            |
+|                   | `fleet.host.remove`                | dispatch    | `kici-admin host remove`                                             |
 
-Three secret-scope operations have no `kici-admin` subcommand today, so their operator equivalent is the orchestrator HTTP admin API route directly. Disabling one of them leaves that route as the only path, and it needs an unscoped admin token carrying `secret.write` (`secret.delete` for the delete route).
+Every row names a `kici-admin` command, so disabling an operation on the web UI moves it to the operator's CLI rather than removing it. The secret-scope and source-override commands need an admin token that is not scoped to one routing key and carries `secret.write` (`secret.delete` for a delete). `registration.disable` covers both directions: `kici-admin registration disable` stops a registration from dispatching, and `kici-admin registration enable` turns it back on.
 
 The two **held-run** operations are the one row whose operator equivalent is not universally available. `kici-admin held-run approve` and `reject` answer a hold on an **independent** orchestrator. Wherever a Platform is attached they refuse with a 409: the Platform's own held-run trust gate authorizes each decision against the acting member's org RBAC, and an orchestrator admin token carries none of it.
 
@@ -69,7 +69,7 @@ The **sensitivity** bucket describes the threat each operation participates in w
 
 `kici-admin` only. The policy lives in the orchestrator's database and mutates through the orchestrator's HTTP admin API; the dashboard renders the current state read-only and links to the canonical commands. **The dashboard cannot change the policy itself** — that's the point. If the dashboard could flip switches, a compromised control-plane process could flip every disabled operation back to permissive and exfiltrate. The CLI is the operator-side trust root for policy decisions.
 
-The orchestrator's RBAC for admin tokens (see [Two-layer RBAC](./rbac-two-layers.md)) gates the `kici-admin org-settings dashboard-writes` subcommand on the `org-settings.write` permission — the same permission that gates other orchestrator-level configuration.
+The orchestrator's RBAC for admin tokens (see [Two-layer RBAC](./rbac-two-layers.md)) gates the `kici-admin org-settings dashboard-writes` subcommand on `secret.write` for a change and `secret.read` to show the policy — the same permissions that gate the other `org-settings` writes and reads.
 
 ## Managing the policy
 

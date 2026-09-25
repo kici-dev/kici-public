@@ -3,6 +3,7 @@
  *
  * Provides scoped secret operations:
  *   secret scopes, list, set, delete, fix-prefixed-scopes
+ *   secret scope create|rename|delete
  *
  * Secret values are write-only -- there is no "get value" command.
  */
@@ -19,6 +20,7 @@ import { AuditLogger } from '../../secrets/audit-logger.js';
 import { loadSecretStoreConfig } from '../../secrets/config.js';
 import { DEFAULT_BACKEND_NAME } from '../../secrets/scope-routing.js';
 import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
+import { confirmPrompt } from './shared/confirm.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
   return explicit ?? process.env.KICI_DATABASE_URL ?? null;
@@ -306,8 +308,8 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
     .action(async (orgId: string, scope: string, key: string, opts: { yes?: boolean }) => {
       try {
         if (!opts.yes) {
-          const confirmed = await confirm(
-            `Are you sure you want to delete secret '${key}' from scope '${scope}'?`,
+          const confirmed = await confirmPrompt(
+            `Are you sure you want to delete secret '${key}' from scope '${scope}'? [y/N] `,
           );
           if (!confirmed) {
             console.log('Aborted.');
@@ -321,6 +323,8 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
         process.exit(1);
       }
     });
+
+  registerSecretScopeCommands(sec, getClient);
 
   sec
     .command('fix-prefixed-scopes <orgId>')
@@ -415,13 +419,81 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
     });
 }
 
-async function confirm(message: string): Promise<boolean> {
-  const { createInterface } = await import('node:readline');
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  return new Promise((resolve) => {
-    rl.question(`${message} [y/N] `, (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes');
+/**
+ * `secret scope create|rename|delete` — the operator path for the dashboard's
+ * scope writes (`secrets.scope.*` in the dashboard-write policy). HTTP only,
+ * like `secret scopes`: each verb calls the orchestrator admin API.
+ */
+function registerSecretScopeCommands(sec: Command, getClient: () => AdminApiClient): void {
+  const scope = sec.command('scope').description('Create, rename or delete a secret scope');
+
+  scope
+    .command('create <orgId> <scope>')
+    .description(
+      'Create an empty secret scope. A <backend>: qualifier selects the backend; an ' +
+        'unqualified scope targets the PG backend. An existing scope stays unchanged.',
+    )
+    .option('--json', 'Emit JSON output')
+    .action(async (orgId: string, scopeName: string, opts: { json?: boolean }) => {
+      try {
+        const result = await getClient().createScope(orgId, scopeName);
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(`Secret scope '${scopeName}' created for org ${orgId}.`);
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
     });
-  });
+
+  scope
+    .command('rename <orgId> <oldScope> <newScope>')
+    .description(
+      'Rename a secret scope inside its backend. Refuses a move between backends and a ' +
+        'rename onto a scope that already exists.',
+    )
+    .option('--json', 'Emit JSON output')
+    .action(async (orgId: string, oldScope: string, newScope: string, opts: { json?: boolean }) => {
+      try {
+        const result = await getClient().renameScope(orgId, oldScope, newScope);
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(`Secret scope '${oldScope}' renamed to '${newScope}' for org ${orgId}.`);
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  scope
+    .command('delete <orgId> <scope>')
+    .description('Delete a secret scope and every secret in it')
+    .option('--yes', 'Skip confirmation prompt')
+    .option('--json', 'Emit JSON output')
+    .action(async (orgId: string, scopeName: string, opts: { yes?: boolean; json?: boolean }) => {
+      try {
+        if (!opts.yes) {
+          const confirmed = await confirmPrompt(
+            `Are you sure you want to delete scope '${scopeName}' and every secret in it? [y/N] `,
+          );
+          if (!confirmed) {
+            console.log('Aborted.');
+            return;
+          }
+        }
+        const result = await getClient().deleteScope(orgId, scopeName);
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(`Secret scope '${scopeName}' deleted for org ${orgId}.`);
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
 }

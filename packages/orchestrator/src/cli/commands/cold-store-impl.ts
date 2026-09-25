@@ -1,5 +1,5 @@
 /**
- * Phase C implementations for `kici-admin cold-store` subcommands.
+ * Implementations for `kici-admin cold-store` subcommands.
  *
  * Mirrors the Platform-side implementation in
  * `packages/platform/src/admin/cold-store-commands.ts` — same shape,
@@ -14,9 +14,8 @@
  *   - prints results to stdout (JSON Lines for list-chunks, JSONL for
  *     peek-chunk, free-form for the others)
  *
- * Audit emission lives one level up in the command registration so we
- * can write one `access_log` breadcrumb row per CLI invocation in the
- * same shape the Platform admin CLI uses for `audit_log`.
+ * No per-invocation breadcrumb row is written: the Platform admin CLI's
+ * `audit_log` breadcrumb has no `access_log` counterpart here.
  */
 import {
   ChunkLru,
@@ -388,10 +387,10 @@ export async function replayChunk(opts: {
   }
 }
 
-// ── replay-into-pg (Phase F) ────────────────────────────────────────
+// ── replay-into-pg ────────────────────────────────────────────────────
 
 /**
- * Phase F — promote a chunk's rows BACK into the orchestrator PG.
+ * Promote a chunk's rows back into the orchestrator PG.
  * Mirrors the Platform-side `replayIntoPg`. Adapter must implement
  * `replayInsert` — currently only `execution_runs`.
  */
@@ -560,7 +559,7 @@ export async function reconcile(opts: {
 // ── list-purgeable ──────────────────────────────────────────────────
 
 /**
- * Phase 2 — list chunks past their cold-retention horizon. Read-only;
+ * List chunks past their cold-retention horizon. Read-only;
  * no S3 or PG mutation. Emits one JSON line per row so the output is
  * easy to pipe through `jq` / `column -t` / etc.
  */
@@ -594,7 +593,7 @@ export async function listPurgeable(opts: {
 // ── purge-now ───────────────────────────────────────────────────────
 
 /**
- * Phase 2 — delete S3 objects + clean up PG bookkeeping for chunks
+ * Delete S3 objects + clean up PG bookkeeping for chunks
  * past their cold-retention horizon. Defaults to dry-run; pass
  * `--apply` to actually delete.
  */

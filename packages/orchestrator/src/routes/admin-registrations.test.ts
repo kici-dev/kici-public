@@ -19,6 +19,7 @@ function createMockDeps(
       getByRoutingKeyAndRepo: vi.fn().mockResolvedValue([]),
       getById: vi.fn().mockResolvedValue(null),
       deleteById: vi.fn().mockResolvedValue(false),
+      setDisabled: vi.fn().mockResolvedValue(false),
       bumpVersion: vi.fn().mockResolvedValue(1),
       getVersion: vi.fn().mockResolvedValue(0),
     } as any,
@@ -372,6 +373,75 @@ describe('admin registration routes', () => {
         token: validToken,
       });
       expect(res.status).toBe(404);
+    });
+  });
+
+  // ---- PATCH /registrations/:id/disable ----
+
+  describe('PATCH /registrations/:id/disable', () => {
+    it('disables the registration, bumps the registry version and refreshes the index', async () => {
+      (deps.registrationStore.getById as any).mockResolvedValue(sampleRegistration);
+      (deps.registrationStore.setDisabled as any).mockResolvedValue(true);
+      (deps.registrationStore.bumpVersion as any).mockResolvedValue(7);
+      const res = await request(app, 'PATCH', '/registrations/reg-1/disable', {
+        token: validToken,
+        body: { disabled: true },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ disabled: true, registryVersion: 7 });
+      expect(deps.registrationStore.setDisabled).toHaveBeenCalledWith('reg-1', true);
+      // fails-when: the route writes the flag but never bumps the version, so
+      //   peers keep dispatching the registration from their stale index.
+      expect(deps.registrationIndex.refreshIfNeeded).toHaveBeenCalledWith(7);
+    });
+
+    it('re-enables the registration with disabled: false', async () => {
+      // breaks-if-wrong: the same route must still turn a disabled
+      //   registration back on — kici-admin registration enable relies on it.
+      (deps.registrationStore.getById as any).mockResolvedValue(sampleRegistration);
+      (deps.registrationStore.setDisabled as any).mockResolvedValue(true);
+      const res = await request(app, 'PATCH', '/registrations/reg-1/disable', {
+        token: validToken,
+        body: { disabled: false },
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json()).disabled).toBe(false);
+      expect(deps.registrationStore.setDisabled).toHaveBeenCalledWith('reg-1', false);
+    });
+
+    it('returns 404 and writes nothing when the registration does not exist', async () => {
+      const res = await request(app, 'PATCH', '/registrations/ghost/disable', {
+        token: validToken,
+        body: { disabled: true },
+      });
+      expect(res.status).toBe(404);
+      expect(deps.registrationStore.setDisabled).not.toHaveBeenCalled();
+      expect(deps.registrationStore.bumpVersion).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 and writes nothing when the body carries no boolean', async () => {
+      (deps.registrationStore.getById as any).mockResolvedValue(sampleRegistration);
+      const res = await request(app, 'PATCH', '/registrations/reg-1/disable', {
+        token: validToken,
+        body: { disabled: 'yes' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.registrationStore.setDisabled).not.toHaveBeenCalled();
+    });
+
+    it('refuses a role without context.update and writes nothing', async () => {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-2',
+        role: 'auditor' as Role,
+        label: 'test',
+      });
+      (deps.registrationStore.getById as any).mockResolvedValue(sampleRegistration);
+      const res = await request(app, 'PATCH', '/registrations/reg-1/disable', {
+        token: validToken,
+        body: { disabled: true },
+      });
+      expect(res.status).toBe(403);
+      expect(deps.registrationStore.setDisabled).not.toHaveBeenCalled();
     });
   });
 

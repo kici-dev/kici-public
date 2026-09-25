@@ -417,7 +417,7 @@ Each context carries an `allowLocalExecution` flag (default `false`) that contro
 The flag is set by the orchestrator operator, either via the CLI:
 
 ```bash
-kici-admin context set-policy --env test-database --allow-local-execution true
+kici-admin context set-policy --org <orgId> --env test-database --allow-local-execution true
 ```
 
 or via the dashboard's "Test runs" toggle on the context detail page. `kici secrets list` only surfaces contexts whose `allowLocalExecution` is `true`, so production contexts are never advertised as test-accessible.

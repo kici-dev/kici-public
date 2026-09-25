@@ -17,6 +17,7 @@ import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
 import { resolveSecretInput, fingerprintValue } from './shared/secret-input.js';
+import { confirmPrompt } from './shared/confirm.js';
 
 export function registerVariableCommands(program: Command, getClient: () => AdminApiClient): void {
   const vr = program.command('variable').description('Manage context variables');
@@ -125,8 +126,8 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
     .action(async (orgId: string, context: string, key: string, opts: { yes?: boolean }) => {
       try {
         if (!opts.yes) {
-          const confirmed = await confirm(
-            `Are you sure you want to delete variable '${key}' from context '${context}'?`,
+          const confirmed = await confirmPrompt(
+            `Are you sure you want to delete variable '${key}' from context '${context}'? [y/N] `,
           );
           if (!confirmed) {
             console.log('Aborted.');
@@ -140,15 +141,4 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
         process.exit(1);
       }
     });
-}
-
-async function confirm(message: string): Promise<boolean> {
-  const { createInterface } = await import('node:readline');
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  return new Promise((resolve) => {
-    rl.question(`${message} [y/N] `, (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes');
-    });
-  });
 }

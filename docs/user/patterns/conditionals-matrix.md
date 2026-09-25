@@ -3,6 +3,8 @@ title: Conditionals & matrix patterns
 description: Conditional execution with rules, matrix builds (static + dynamic), dynamic job generation
 ---
 
+## Conditional execution with rules
+
 Rules control whether a workflow or job runs. Use `rule()` for conditions that must pass, and `skip()` for conditions that should skip execution.
 
 ### Workflow-level rules
@@ -337,5 +339,3 @@ This workflow:
 2. Skips entirely if only docs files changed (workflow-level `skip` rule)
 3. Runs lint first, then tests across 3 Node versions in parallel
 4. Deploys only on push events (not on PRs), after all tests pass
-
-## Workflow chaining

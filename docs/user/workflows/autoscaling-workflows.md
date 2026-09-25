@@ -49,7 +49,11 @@ export default workflow('hetzner-autoscale-provision', {
           },
           {
             maxLifetimeMinutes: 30,
+            // Container delivery starts the agent with `docker run`, and the
+            // stock `debian-12` image below ships no Docker — so install it.
+            // Drop this line when your image already carries Docker.
             deliveryMode: 'container',
+            packages: ['docker.io'],
           },
         );
 
@@ -115,7 +119,7 @@ Bind provisioning and teardown workflows to a context that carries the cloud cre
 
 The `0600` env file still protects the non-secret env from other users on the instance. The claim code it carries is single-use and short-lived, so even that value is spent the moment the agent claims its token.
 
-`maxLifetimeMinutes` is the one required option. It adds a max-lifetime self-poweroff (teardown layer L2): an instance that never receives a scale-down still removes itself after a hard cap. `deliveryMode` selects how the agent binary arrives — `'container'` runs the published agent image, `'payload'` fetches it from the orchestrator.
+`maxLifetimeMinutes` is the one required option. It adds a max-lifetime self-poweroff (teardown layer L2): an instance that never receives a scale-down still powers itself off after a hard cap. A cloud such as Hetzner still bills a powered-off server, so the reaper (L4) deletes it. `deliveryMode` selects how the agent binary arrives — `'container'` runs the published agent image, `'payload'` fetches it from the orchestrator. Container delivery starts the agent with `docker run`, so the instance needs Docker: boot an image that ships it, or install it with `packages: ['docker.io']` as the example above does on `debian-12`.
 
 ### Customization axes
 
@@ -177,11 +181,11 @@ export default workflow('hetzner-autoscale-teardown', {
 });
 ```
 
-Keep the teardown idempotent. "None found" logs and succeeds, and a delete that returns "already gone" is not an error. A scale-down can arrive after the instance already removed itself through the self-poweroff backstop.
+Keep the teardown idempotent. "None found" logs and succeeds, and a delete that returns "already gone" is not an error. A scale-down can arrive after the instance is already gone, for example because the reaper (L4) deleted it first.
 
 ## Guaranteed teardown
 
-The scale-down workflow is the primary teardown path, but it is not the only one. The reference Hetzner implementation guarantees teardown with five independent layers, keyed off the resource labels every instance carries. The host-side reaper is the backstop that survives a crash or reboot. See the [teardown reaper runbook](../../operator/orchestrator/hetzner-autoscale-reaper.md) for the full model and the recommended alert.
+The scale-down workflow is the primary teardown path, but it is not the only one. The reference Hetzner implementation guarantees teardown with five independent layers, keyed off the resource labels every instance carries. The host-side reaper is the backstop that survives a crash or reboot. See the [teardown reaper runbook](../../operator/orchestrator/hetzner-autoscale-reaper.md) for the full model and the recommended alerts.
 
 ## Running on other clouds (AWS / GCP / Azure)
 

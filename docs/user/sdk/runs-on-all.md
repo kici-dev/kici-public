@@ -159,16 +159,22 @@ const rollout = job('rollout', {
   maxParallel: 1, // serial, so "first" runs before the rest
   steps: [
     // Runs only on the first (lowest-agent-id) host — KiCI's run-once primitive.
-    step('enable-sync-mode', { rules: [onlyOnFirstHost()] }, async (ctx) => {
-      /* configure the leader before standbys join */
+    step('enable-sync-mode', {
+      rules: [onlyOnFirstHost()],
+      run: async (ctx) => {
+        /* configure the leader before standbys join */
+      },
     }),
     // Runs on every host.
     step('apply', async (ctx) => {
       /* ... */
     }),
     // Runs only on the last host.
-    step('finalize', { rules: [onlyOnLastHost()] }, async (ctx) => {
-      /* ... */
+    step('finalize', {
+      rules: [onlyOnLastHost()],
+      run: async (ctx) => {
+        /* ... */
+      },
     }),
   ],
 });

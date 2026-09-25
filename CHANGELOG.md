@@ -2,6 +2,26 @@
 
 Release notes for the public KiCI packages.
 
+## v0.11.0 — 2026-09-25
+
+### Features
+
+- The docs site header, mobile menu, and footer now link back to the kici.dev homepage.
+- The Hetzner autoscaling reaper is a public example, examples/hetzner-autoscale/reap.ts: it runs with plain node, reads Hetzner's own HCLOUD_TOKEN, and deletes labelled servers older than a TTL when a teardown workflow never ran.
+- Every operation the dashboard-write policy can disable now has a working kici-admin command. New verbs: secret scope create, rename and delete; context source-override list, set and delete; registration disable, enable and delete. The orchestrator admin API adds routes for context source overrides and for disabling a registration. Secret scope create, rename and delete through the admin API now write a createScope, renameScope or deleteScope row to the secret audit log. The command the dashboard shows for a disabled operation now names a command that exists.
+
+### Fixes
+
+- A kici-admin command that asks for confirmation now stops with a non-zero exit when stdin closes before an answer arrives. Run from a script without --yes, such a command printed the prompt, changed nothing and exited 0. This covers secret delete, secret scope delete, variable delete, registration delete, backend remove, source remove, attestations reverify --all, the signing-key and dashboard-encryption-key prompts, and the upgrade, switch and rollback prompts.
+
+### Documentation
+
+- The autoscaling guide's Hetzner example now installs Docker on the instance, which container delivery needs to start the agent.
+- The global workflows guide now says that a repos: workflow is not registered while the fleet-wide switch is off, and that you push the workflow repo's default branch again after you turn the switch on.
+- kici-admin help text no longer carries internal planning labels: audit --include-archived and cold-store replay-into-pg, list-purgeable and purge-now describe what they do.
+- The event routing guide's registry refresh example now sends the routingKey field the refresh route requires, so the documented request no longer fails with HTTP 400.
+- The SDK and workflow-pattern reference pages are corrected: every GitHub trigger's repos option, the requires and commitMessage filters on pr() and push(), the full ContainerConfig and step options, AgentInfo.host, and section headings that sat on the wrong page.
+
 ## v0.10.0 — 2026-09-25
 
 ### Features

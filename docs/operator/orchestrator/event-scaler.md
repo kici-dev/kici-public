@@ -150,7 +150,7 @@ The matching environment variables — `KICI_SCALER_PROVISION_BACKOFF_BASE_MS`, 
 
 ## Teardown
 
-Every provisioned instance must be deleted. Teardown has two halves: the five instance-side layers the reference Hetzner implementation adds, and the orchestrator-side backstop below. The scale-down workflow is the primary path, and a host-side reaper is the backstop that survives a crash. See the [teardown reaper runbook](./hetzner-autoscale-reaper.md) for the instance-side layers, the reaper CLI, and the recommended alert.
+Every provisioned instance must be deleted. Teardown has two halves: the five instance-side layers the reference Hetzner implementation adds, and the orchestrator-side backstop below. The scale-down workflow is the primary path, and a host-side reaper is the backstop that survives a crash. See the [teardown reaper runbook](./hetzner-autoscale-reaper.md) for the instance-side layers, the reference reaper, and the recommended alerts.
 
 ### Orchestrator-side backstop
 
@@ -236,7 +236,7 @@ An event scaler is not limited to a cloud VM. A provisioning workflow can dispat
 
 ## Reference implementation and operator setup
 
-KiCI ships a reference reaper CLI at `hack/hetzner/reap.ts`. It deletes managed instances older than a TTL and writes a Prometheus metric. It is documented in the [teardown reaper runbook](./hetzner-autoscale-reaper.md).
+KiCI ships a reference reaper as a public example, [`examples/hetzner-autoscale/reap.ts`](https://github.com/kici-dev/kici-public/tree/main/examples/hetzner-autoscale). It deletes managed instances older than a TTL and writes Prometheus metrics. It is documented in the [teardown reaper runbook](./hetzner-autoscale-reaper.md).
 
 Two pieces are operator setup, not part of the orchestrator itself:
 

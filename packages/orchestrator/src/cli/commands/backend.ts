@@ -13,10 +13,10 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { purgeSecretBackendsDirect, toErrorMessage } from '@kici-dev/shared';
+import { confirmPrompt } from './shared/confirm.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
   return explicit ?? process.env.KICI_DATABASE_URL ?? null;
@@ -101,7 +101,7 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
             // Backend might not exist; remove will 404
           }
 
-          const confirmed = await confirm(`Backend "${name}"${scopeInfo} Continue? [y/N] `);
+          const confirmed = await confirmPrompt(`Backend "${name}"${scopeInfo} Continue? [y/N] `);
           if (!confirmed) {
             console.log('Aborted.');
             return;
@@ -388,17 +388,4 @@ function printBackendSummary(b: Record<string, unknown>): void {
   console.log(`  Scope filter:  ${b.scopeFilter}`);
   console.log(`  Sync interval: ${Math.round(Number(b.syncIntervalMs) / 60000)}m`);
   console.log(`  Enabled:       ${b.enabled}`);
-}
-
-/**
- * Simple confirmation prompt.
- */
-async function confirm(message: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  return new Promise((resolve) => {
-    rl.question(message, (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes');
-    });
-  });
 }

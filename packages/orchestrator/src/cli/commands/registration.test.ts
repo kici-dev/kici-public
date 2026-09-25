@@ -17,10 +17,12 @@ const { registerRegistrationCommands } = await import('./registration.js');
 
 interface MockClient {
   get: ReturnType<typeof vi.fn>;
+  patch: ReturnType<typeof vi.fn>;
+  delete: ReturnType<typeof vi.fn>;
 }
 
 function makeMockClient(): MockClient {
-  return { get: vi.fn() };
+  return { get: vi.fn(), patch: vi.fn(), delete: vi.fn() };
 }
 
 async function runCommand(
@@ -162,5 +164,49 @@ describe('kici-admin registration CLI', () => {
     ]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain('registration: not found');
+  });
+
+  describe('disable / enable / delete', () => {
+    it('disable PATCHes the disable route with disabled: true', async () => {
+      const client = makeMockClient();
+      client.patch.mockResolvedValue({ disabled: true, registryVersion: 9 });
+      const { stdout, exitCode } = await runCommand(['registration', 'disable', 'reg/1'], client);
+      expect(exitCode).toBeNull();
+      // fails-when: the id is interpolated raw, or the verb sends the wrong flag.
+      expect(client.patch).toHaveBeenCalledWith('/api/v1/admin/registrations/reg%2F1/disable', {
+        disabled: true,
+      });
+      expect(stdout).toContain('registration disable: id=reg/1 disabled=true registry_version=9');
+    });
+
+    it('enable PATCHes the same route with disabled: false', async () => {
+      const client = makeMockClient();
+      client.patch.mockResolvedValue({ disabled: false, registryVersion: 10 });
+      const { stdout } = await runCommand(['registration', 'enable', 'reg-1', '--json'], client);
+      expect(client.patch).toHaveBeenCalledWith('/api/v1/admin/registrations/reg-1/disable', {
+        disabled: false,
+      });
+      expect(JSON.parse(stdout)).toEqual({ disabled: false, registryVersion: 10 });
+    });
+
+    it('disable exits 1 with the route error for an unknown id', async () => {
+      const client = makeMockClient();
+      client.patch.mockRejectedValue(new Error('HTTP 404: Registration not found'));
+      const { stderr, exitCode } = await runCommand(['registration', 'disable', 'ghost'], client);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('HTTP 404: Registration not found');
+    });
+
+    it('delete --yes DELETEs the registration without prompting', async () => {
+      const client = makeMockClient();
+      client.delete.mockResolvedValue({ deleted: true, registryVersion: 11 });
+      const { stdout, exitCode } = await runCommand(
+        ['registration', 'delete', 'reg-1', '--yes', '--json'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.delete).toHaveBeenCalledWith('/api/v1/admin/registrations/reg-1');
+      expect(JSON.parse(stdout)).toEqual({ deleted: true, registryVersion: 11 });
+    });
   });
 });

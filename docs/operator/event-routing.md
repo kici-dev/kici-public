@@ -136,14 +136,34 @@ curl -X POST https://<orchestrator>/api/v1/admin/registrations/refresh \
   -H "Authorization: Bearer <admin-token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "customerId": "my-org",
+    "routingKey": "github:12345",
     "repoIdentifier": "org/my-repo"
   }'
+```
+
+**Disable or re-enable a registration**
+
+A disabled registration stays registered, but none of its triggers dispatch. Both verbs bump the registry version to notify peers.
+
+```bash
+kici-admin registration disable <id>
+kici-admin registration enable <id>
+```
+
+```bash
+curl -X PATCH https://<orchestrator>/api/v1/admin/registrations/<id>/disable \
+  -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled": true}'
 ```
 
 **Delete a registration**
 
 Deletes a single registration and bumps the registry version to notify peers.
+
+```bash
+kici-admin registration delete <id> --yes
+```
 
 ```bash
 curl -X DELETE https://<orchestrator>/api/v1/admin/registrations/<id> \
@@ -152,12 +172,13 @@ curl -X DELETE https://<orchestrator>/api/v1/admin/registrations/<id> \
 
 ### Permissions
 
-| Endpoint                                   | Required permission |
-| ------------------------------------------ | ------------------- |
-| `GET /api/v1/admin/registrations`          | `context.read`      |
-| `GET /api/v1/admin/registrations/:id`      | `context.read`      |
-| `POST /api/v1/admin/registrations/refresh` | `context.update`    |
-| `DELETE /api/v1/admin/registrations/:id`   | `context.delete`    |
+| Endpoint                                        | Required permission |
+| ----------------------------------------------- | ------------------- |
+| `GET /api/v1/admin/registrations`               | `context.read`      |
+| `GET /api/v1/admin/registrations/:id`           | `context.read`      |
+| `POST /api/v1/admin/registrations/refresh`      | `context.update`    |
+| `PATCH /api/v1/admin/registrations/:id/disable` | `context.update`    |
+| `DELETE /api/v1/admin/registrations/:id`        | `context.delete`    |
 
 ## Cron scheduler
 
@@ -280,7 +301,7 @@ To accept signatures from providers that use a different header name (for exampl
 }
 ```
 
-The CLI (`kici-admin source add generic`) currently does not expose `--signature-header`; to customise the header name use the REST API form above (or `kici-admin source update --verification hmac_sha256 --config '{...}'` if you already created the source).
+The CLI (`kici-admin source add generic` and `source update-generic`) does not expose the header name. To customise it, use the REST API form above, or `PATCH /api/v1/admin/generic-sources/<id>` with the same `verificationConfig` body if you already created the source.
 
 **Bearer token** -- The source sends a static token in the `Authorization: Bearer <token>` header. Verification uses constant-time comparison.
 

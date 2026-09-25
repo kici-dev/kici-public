@@ -405,7 +405,7 @@ Same crypto protocol, but the new orchestrator connects directly to an existing 
 
 ### Token lifecycle
 
-1. Operator creates a join token via `POST /api/v1/admin/join-tokens` or `kici-admin create-join-token`
+1. Operator creates a join token via `POST /api/v1/admin/join-tokens` or `kici-admin peer create-token`
 2. Token hash is stored in the `join_tokens` DB table with expiry
 3. New orchestrator runs `kici-admin join --token TOKEN --platform URL` or `--peer URL`
 4. Existing orchestrator validates the token hash, builds and encrypts the config bundle

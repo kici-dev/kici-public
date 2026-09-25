@@ -13,7 +13,7 @@ description: 'Webhook source and remote-run anchor management'
 kici-admin source add github --name <name> --manifest [--github-org <slug>] [--webhook-url <url>] [--no-browser] [--json]
 # Manual: store credentials for a GitHub App you already created
 kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin]
-kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin]
+kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--customer-id <orgId>]
 # Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth)
 kici-admin source refresh <routingKey> [--json]
 kici-admin source refresh --all [--json]
@@ -33,10 +33,10 @@ kici-admin source disable <id>
 # Local filesystem (file://) sources — a git repo present on the agent
 # filesystem (see the Local filesystem source guide). verification='none'.
 kici-admin source add local --org <orgId> --path <abs-dir> [--name <name>] [--clone-url-base <url>]
-kici-admin source update-local <id> [--path <abs-dir>] [--name <name>]
+kici-admin source update-local <id> [--path <abs-dir>] [--name <name>] [--clone-url-base <url>]
 kici-admin source remove <routingKey> --local [--hard] [--yes]
-kici-admin source trigger-local <id> [--event push|pull_request] [--ref <ref>] [--sha <sha>] [--repo-full-name <name>]
-kici-admin source install-hook <id> [--repo <path>]
+kici-admin source trigger-local <id> [--event push|pull_request] [--ref <ref>] [--sha <sha>] [--repo-full-name <name>] [--base-url <url>]
+kici-admin source install-hook <id> [--repo <path>] [--base-url <url>]
 
 # List all sources (without --org, only GitHub sources are shown)
 kici-admin source list [--org <orgId>] [--include-deleted]
@@ -80,7 +80,8 @@ filesystem — see the [Local filesystem source guide](../../../user/providers/l
 forge to sign the payload, so only register repos you trust. Drive runs with
 `source trigger-local <id>` (reads the repo HEAD and POSTs a synthetic push) or
 install a `post-receive` hook with `source install-hook <id>` so every push
-triggers a run. The orchestrator accepts a local source on any scaler backend
+triggers a run. `trigger-local` and the installed hook send to the orchestrator
+at `--base-url` (default: `KICI_ADMIN_URL`, else `http://localhost:8080`). The orchestrator accepts a local source on any scaler backend
 and logs a reachability warning (not a rejection) on container / Firecracker
 scalers, where the repo must be baked into the image / rootfs or bind-mounted at
 the registered path.

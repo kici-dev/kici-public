@@ -18,10 +18,9 @@
  *                                         halves ONLY — never private material.
  *
  * The PRIVATE key is non-exportable by design: there is no export of private
- * material and no import. Loss recovery is a routine rotation (§ H of the design).
+ * material and no import. Loss recovery is a routine rotation.
  */
 import { writeFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
@@ -33,6 +32,7 @@ import {
 } from '../../db/repos/signing-keys-repo.js';
 import { DbSigner } from '../../oidc/db-signer.js';
 import type { AdminApiClient } from '../api-client.js';
+import { confirmPrompt } from './shared/confirm.js';
 
 const logger = createLogger({ prefix: 'kici-admin-signing-key' });
 
@@ -99,17 +99,6 @@ function resolveSecretKey(): string {
     );
   }
   return config.secretKey;
-}
-
-async function confirmInteractive(prompt: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
-    const a = answer.trim().toLowerCase();
-    return a === 'y' || a === 'yes';
-  } finally {
-    rl.close();
-  }
 }
 
 interface WithDb<T> {
@@ -247,7 +236,7 @@ export function registerSigningKeyCommands(
                 process.stderr.write(`Generated active signing key ${outcome.kid}.\n`);
               },
             },
-            { confirm: confirmInteractive, yes: opts.yes, dryRun: opts.dryRun },
+            { confirm: confirmPrompt, yes: opts.yes, dryRun: opts.dryRun },
           );
         });
       } catch (err) {
@@ -279,7 +268,7 @@ export function registerSigningKeyCommands(
                 process.stderr.write(`Rotated: new active signing key ${kid}.\n`);
               },
             },
-            { confirm: confirmInteractive, yes: opts.yes, dryRun: opts.dryRun },
+            { confirm: confirmPrompt, yes: opts.yes, dryRun: opts.dryRun },
           );
         });
       } catch (err) {
@@ -315,7 +304,7 @@ export function registerSigningKeyCommands(
     .action(async (kid: string, opts: { reason: string; databaseUrl?: string; yes?: boolean }) => {
       try {
         if (!opts.yes) {
-          const ok = await confirmInteractive(
+          const ok = await confirmPrompt(
             `Revoke signing key ${kid}? Everything it ever signed becomes UNVERIFIABLE. [y/N] `,
           );
           if (!ok) {

@@ -14,6 +14,9 @@ kici-admin secret set [orgId] [scope] [key] [--value <v> | --prompt | --from-std
 kici-admin secret set --org <orgId> --context <name> --key <k> [value-source flags as above]
 kici-admin secret delete <orgId> <scope> <key> [--yes]
 kici-admin secret fix-prefixed-scopes <orgId> [--dry-run] [--database-url <url>]
+kici-admin secret scope create <orgId> <scope> [--json]
+kici-admin secret scope rename <orgId> <oldScope> <newScope> [--json]
+kici-admin secret scope delete <orgId> <scope> [--yes] [--json]
 ```
 
 - Secret values are **write-only** -- there is no command to read a secret value.
@@ -26,6 +29,11 @@ kici-admin secret fix-prefixed-scopes <orgId> [--dry-run] [--database-url <url>]
 - `--dry-run` parses + validates the value, prints fingerprint + length, and skips the write.
 - `--database-url` (on `set`) switches to direct-DB mode and writes the caller-supplied `encrypted_value` verbatim into `scoped_secrets` — used by E2E `globalSetup` helpers that need to seed secrets before the orchestrator is up.
 - `delete` asks for confirmation unless `--yes` is passed.
+- `scope create`, `scope rename` and `scope delete` act on a whole scope. They are the operator path for the dashboard's scope writes (`secrets.scope.*` in the [dashboard-write policy](../../security/dashboard-write-policy.md)). Only the PG backend supports them; a scope in another backend gets an error that names the backend.
+  - `scope create` makes an empty scope. An existing scope stays unchanged.
+  - `scope rename` keeps the scope in its backend. It re-encrypts every secret under the new name, and the bindings to the old name move with it. It refuses a move to another backend and a rename onto a scope that already exists.
+  - `scope delete` removes the scope, every secret in it, and the bindings to it. It asks for confirmation unless `--yes` is passed.
+  - Each verb writes a row to the secret audit log: `createScope`, `renameScope` or `deleteScope`. Query them with `kici-admin audit --action <action>`.
 - After a successful `set`, the command checks whether a context has the same name as the scope. When that context is a fixed or glob context with no binding, it prints a warning on stderr. Jobs that list that context in `contexts:` get none of its secrets until a scope is bound to it. The secret still reaches any other context bound to its scope. For a fixed context, a `<context>:<key>` git credential or registry reference still reads the scope named after the context, through a [deprecated](../../../user/deprecations.md) fallback, and the warning says so. The warning names the `kici-admin context bind` command. The exit code stays 0.
 
 For full details on encryption, backends, and key rotation, see [Secrets management](../../security/secrets.md).
@@ -81,10 +89,10 @@ Vault options (`--vault-url`, `--auth-method`, `--role-id`, `--secret-id`, `--se
 ### audit -- secrets audit log
 
 ```bash
-kici-admin audit [--context <name>] [--action <action>] [--from <date>] [--to <date>] [--limit <n>] [--offset <n>]
+kici-admin audit [--context <name>] [--routing-key <key>] [--action <action>] [--from <date>] [--to <date>] [--limit <n>] [--offset <n>] [--include-archived]
 ```
 
-Queries the secrets operation audit log. All date filters use ISO 8601 format. Default limit is 100.
+Queries the secrets operation audit log. All date filters use ISO 8601 format. Default limit is 100. `--include-archived` also reads rows moved to cold storage; the cold-storage scan needs `--routing-key`.
 
 ### api-key -- API key management
 
@@ -164,12 +172,15 @@ See [Secrets management > Key rotation](../../security/secrets.md#rotation-proce
 ```bash
 kici-admin context create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--repo-patterns <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted] [--database-url <url>] [--json]
 kici-admin context bind --org <id> --env <name> --scope <pattern> [--host <pattern>] [--database-url <url>] [--json]
-kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--repo-patterns <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted|null] [--enabled true|false] [--database-url <url>] [--json]
+kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--repo-patterns <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted|null] [--enabled true|false] [--allow-local-execution true|false] [--database-url <url>] [--json]
 kici-admin context list --org <id> [--database-url <url>] [--json]
 kici-admin context show --org <id> --name <name> [--database-url <url>] [--json]
 kici-admin context delete --org <id> --name <name> [--database-url <url>] [--json]
 kici-admin context create-template --org <id> --template <name> [--type template] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust trusted] [--variables <json>] [--database-url <url>] [--json]
 kici-admin context purge [--org <id>] [--database-url <url>] [--json]
+kici-admin context source-override list --org <id> --env <name> [--routing-key <key>] [--json]
+kici-admin context source-override set --org <id> --env <name> --routing-key <key> --key <key> --value <value> [--json]
+kici-admin context source-override delete --org <id> --env <name> --routing-key <key> --key <key> [--json]
 ```
 
 Seeds and mutates context rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — used by E2E `globalSetup` helpers that need to seed contexts before the orchestrator is up.
@@ -177,11 +188,16 @@ Seeds and mutates context rows (plus their variables and scope bindings). Defaul
 - `create` upserts a context (idempotent by `org + name`). On a new context, an omitted policy flag leaves that rule unset. On an existing context, an omitted policy flag leaves the stored value unchanged in both modes, and an explicit empty value (`'[]'`, an empty CSV, or `--minimum-trust null`) clears it. `--glob-pattern` is required when `--type glob` and sets the match pattern that resolves run scopes to this context; passing it with any other `--type` is an error. `--repo-patterns` limits the context to repositories whose `owner/repo` matches one of the globs (see [Repository patterns](../../../user/contexts.md#repository-patterns)).
 - `create` prints a warning on stderr when the context it created or updated is a fixed or glob context with no binding, because such a context delivers no secrets to the jobs that list it in `contexts:`. For a fixed context, the warning also names the deprecated fallback a `<context>:<key>` reference takes to the scope named after the context. The warning names the `kici-admin context bind` command. The exit code stays 0.
 - `bind` upserts a `context_bindings` row mapping a scope pattern to a context. `--host <pattern>` scopes the binding to a subset of hosts (default `**` = all hosts) — see [Per-host secret scoping](../../security/secrets.md#per-host-secret-scoping) for the host dimension, the templating syntax, and precedence.
-- `set-policy` updates only the provided policy fields on an existing context. Pass `--minimum-trust null` to clear the tier gate, `--repo-patterns '[]'` to clear the repository patterns, and `--hold-expiry ''` (an empty value) to clear the hold expiry. Omitting a flag leaves that field untouched, which is why clearing needs an explicit empty / `null` value rather than omission.
+- `set-policy` updates only the provided policy fields on an existing context. Pass `--minimum-trust null` to clear the tier gate, `--repo-patterns '[]'` to clear the repository patterns, and `--hold-expiry ''` (an empty value) to clear the hold expiry. Omitting a flag leaves that field untouched, which is why clearing needs an explicit empty / `null` value rather than omission. `--allow-local-execution true|false` sets whether test runs may resolve the context (see [The `allowLocalExecution` context flag](../../../user/testing-guide.md#the-allowlocalexecution-context-flag)).
 - `list` / `show` read back the current state; `show` also returns variables and bindings.
 - `delete` removes a context and cascades its bindings, variables, and overrides. Reports `deleted=true` on success and exits non-zero if no matching context exists. Pending held runs block the deletion with a clear error (HTTP mode returns 409) — approve or reject them first; resolved held-run history survives the deletion with its context reference cleared.
 - `create-template` creates/updates a template context and seeds its variables in one call (`--variables '{"K":"V"}'`). Like `create`, it leaves the policy fields you omit unchanged.
 - `purge` (direct-DB only) bulk-deletes every context for an org (cascading bindings, variables, and overrides) and removes the org's held runs for a clean slate. Omit `--org` to clear all orgs. Destructive break-glass / test-reset verb with no orchestrator HTTP wire; requires `--database-url` (or `KICI_DATABASE_URL`). Reports `{ contextsDeleted, heldRunsDeleted }` with `--json`.
+- `source-override` manages per-source overrides: the value one source (routing key) sees for a context variable key. A locked context variable keeps its own value. These verbs are the operator path for the dashboard's `contexts.source_overrides.*` writes in the [dashboard-write policy](../../security/dashboard-write-policy.md). They call the orchestrator admin API only; `--database-url` does not apply.
+  - `source-override list` prints every source's overrides in the context. `--routing-key` narrows the list to one source.
+  - `source-override set` creates or replaces one override.
+  - `source-override delete` removes one override, so the source resolves the key from the context variables.
+  - A context that does not exist in the org is refused with HTTP 404 and a non-zero exit.
 
 See [Contexts](../../contexts.md) for the broader feature walkthrough.
 
@@ -238,7 +254,7 @@ Synopsis: `kici-admin audit [options]`
 | `--to <date>`        |         | To date (ISO 8601)                                   |
 | `--limit <n>`        | `100`   | Max entries to return                                |
 | `--offset <n>`       |         | Offset for pagination                                |
-| `--include-archived` | `false` | Include rows from cold storage (Phase D)             |
+| `--include-archived` | `false` | Include rows from cold storage                       |
 
 ### `kici-admin backend`
 
@@ -503,6 +519,60 @@ Synopsis: `kici-admin context show [options]`
 | `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
 | `--json`               |         | Emit JSON output                                    |
 
+### `kici-admin context source-override`
+
+Per-source variable overrides in a context (HTTP only)
+
+Synopsis: `kici-admin context source-override`
+
+### `kici-admin context source-override delete`
+
+Delete one source override, so the source resolves the key from the context variables
+
+Synopsis: `kici-admin context source-override delete [options]`
+
+**Options**
+
+| Option                | Default | Description                                       |
+| --------------------- | ------- | ------------------------------------------------- |
+| `--org <id>`          |         | Org ID                                            |
+| `--env <name>`        |         | Context name                                      |
+| `--routing-key <key>` |         | Routing key of the source the override applies to |
+| `--key <key>`         |         | Variable key                                      |
+| `--json`              |         | Emit JSON output                                  |
+
+### `kici-admin context source-override list`
+
+List the source overrides in a context, for every source unless --routing-key
+
+Synopsis: `kici-admin context source-override list [options]`
+
+**Options**
+
+| Option                | Default | Description                                         |
+| --------------------- | ------- | --------------------------------------------------- |
+| `--org <id>`          |         | Org ID                                              |
+| `--env <name>`        |         | Context name                                        |
+| `--routing-key <key>` |         | Only list the overrides for this source routing key |
+| `--json`              |         | Emit JSON output                                    |
+
+### `kici-admin context source-override set`
+
+Set the value one source sees for a context variable key. A locked context variable keeps its own value.
+
+Synopsis: `kici-admin context source-override set [options]`
+
+**Options**
+
+| Option                | Default | Description                                       |
+| --------------------- | ------- | ------------------------------------------------- |
+| `--org <id>`          |         | Org ID                                            |
+| `--env <name>`        |         | Context name                                      |
+| `--routing-key <key>` |         | Routing key of the source the override applies to |
+| `--key <key>`         |         | Variable key                                      |
+| `--value <value>`     |         | Override value                                    |
+| `--json`              |         | Emit JSON output                                  |
+
 ### `kici-admin rotate-key`
 
 Rotate the master encryption key (re-encrypts every master-key-wrapped store: scoped_secrets, config_versions, secret_backends, orchestrator_signing_keys, dashboard_encryption_keys, run_ephemeral_keys, run_secret_outputs and the sealed secrets of queued and waiting jobs)
@@ -581,6 +651,71 @@ Synopsis: `kici-admin secret purge [options]`
 | `--confirm`            |         | Explicit confirmation flag                              |
 | `--org <orgId>`        |         | Restrict to a single org (defaults to ALL orgs)         |
 | `--yes`                |         | Skip interactive confirmation prompt (for scripted use) |
+
+### `kici-admin secret scope`
+
+Create, rename or delete a secret scope
+
+Synopsis: `kici-admin secret scope`
+
+### `kici-admin secret scope create`
+
+Create an empty secret scope. A <backend>: qualifier selects the backend; an unqualified scope targets the PG backend. An existing scope stays unchanged.
+
+Synopsis: `kici-admin secret scope create <orgId> <scope> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | yes      | no       |             |
+| `scope`  | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description      |
+| -------- | ------- | ---------------- |
+| `--json` |         | Emit JSON output |
+
+### `kici-admin secret scope delete`
+
+Delete a secret scope and every secret in it
+
+Synopsis: `kici-admin secret scope delete <orgId> <scope> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | yes      | no       |             |
+| `scope`  | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description              |
+| -------- | ------- | ------------------------ |
+| `--yes`  |         | Skip confirmation prompt |
+| `--json` |         | Emit JSON output         |
+
+### `kici-admin secret scope rename`
+
+Rename a secret scope inside its backend. Refuses a move between backends and a rename onto a scope that already exists.
+
+Synopsis: `kici-admin secret scope rename <orgId> <oldScope> <newScope> [options]`
+
+**Arguments**
+
+| Argument   | Required | Variadic | Description |
+| ---------- | -------- | -------- | ----------- |
+| `orgId`    | yes      | no       |             |
+| `oldScope` | yes      | no       |             |
+| `newScope` | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description      |
+| -------- | ------- | ---------------- |
+| `--json` |         | Emit JSON output |
 
 ### `kici-admin secret scopes`
 

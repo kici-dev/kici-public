@@ -106,6 +106,27 @@ describe('VariableStore', () => {
     });
   });
 
+  describe('listAllSourceOverrides', () => {
+    it('returns the context overrides for every routing key, ordered by routing key then key', async () => {
+      const rows = [
+        makeOverrideRow({ routing_key: 'github:42', key: 'API_URL' }),
+        makeOverrideRow({ id: 'ovr-002', routing_key: 'generic:ops', key: 'REGION' }),
+        makeOverrideRow({ id: 'ovr-003', context_id: 'env-other', routing_key: 'github:42' }),
+      ];
+      const { db, mocks } = createMockDb({ selectRows: rows });
+      const store = new VariableStore(db);
+
+      const result = await store.listAllSourceOverrides('org-abc', 'env-001');
+
+      // fails-when: the context filter is dropped — the env-other row would list.
+      expect(result.map((r) => r.id)).toEqual(['ovr-001', 'ovr-002']);
+      // breaks-if-wrong: no routing-key filter, so both sources' overrides list.
+      expect(mocks.selectWhere).not.toHaveBeenCalledWith('routing_key', '=', expect.anything());
+      expect(mocks.selectOrderBy).toHaveBeenCalledWith('routing_key', 'asc');
+      expect(mocks.selectOrderBy).toHaveBeenCalledWith('key', 'asc');
+    });
+  });
+
   describe('setSourceOverride', () => {
     it('should upsert a source override', async () => {
       const { db, mocks } = createMockDb();

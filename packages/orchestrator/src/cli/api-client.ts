@@ -329,6 +329,42 @@ export class AdminApiClient {
     );
   }
 
+  /**
+   * Create an empty secret scope. A `<backend>:` qualifier selects the
+   * backend; an unqualified scope targets the PG backend. Creating a scope
+   * that already exists succeeds and changes nothing.
+   */
+  async createScope(orgId: string, scope: string): Promise<{ created: boolean }> {
+    return this.request<{ created: boolean }>('POST', '/api/v1/admin/secrets/scopes', {
+      orgId,
+      scope,
+    });
+  }
+
+  /**
+   * Rename a secret scope inside its backend. The route refuses a move between
+   * backends and a rename onto a scope that already exists.
+   */
+  async renameScope(
+    orgId: string,
+    oldScope: string,
+    newScope: string,
+  ): Promise<{ renamed: boolean }> {
+    return this.request<{ renamed: boolean }>('PUT', '/api/v1/admin/secrets/scopes/rename', {
+      orgId,
+      oldScope,
+      newScope,
+    });
+  }
+
+  /** Delete a secret scope and every secret in it. */
+  async deleteScope(orgId: string, scope: string): Promise<{ deleted: boolean }> {
+    return this.request<{ deleted: boolean }>(
+      'DELETE',
+      `/api/v1/admin/secrets/scopes/${encodeURIComponent(orgId)}/${encodeURIComponent(scope)}`,
+    );
+  }
+
   // --- Context management ---
 
   /**
@@ -563,7 +599,7 @@ export class AdminApiClient {
     to?: string;
     limit?: number;
     offset?: number;
-    /** Phase D opt-in for cold-store read-through. */
+    /** Opt-in cold-store read-through. */
     includeArchived?: boolean;
   }): Promise<any[]> {
     const params = new URLSearchParams();

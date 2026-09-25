@@ -357,6 +357,21 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         );
       }
       await resolved.store.createScope(parsed.orgId, resolved.path);
+
+      await deps.auditLogger.log({
+        action: 'createScope',
+        // Recorded exactly as the caller sent it — see setSecret below.
+        contextName: parsed.scope,
+        routingKey: null,
+        secretKeys: null,
+        outcome: 'allowed',
+        runId: null,
+        jobId: null,
+        userId: c.get('userId'),
+        role: c.get('role'),
+        metadata: { orgId: parsed.orgId },
+      });
+
       return c.json({ created: true }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -402,6 +417,23 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         );
       }
       await from.store.renameScope(parsed.orgId, from.path, to.path);
+
+      await deps.auditLogger.log({
+        action: 'renameScope',
+        // The row files under the scope's old name, so `kici-admin audit
+        // --context <old>` ends that scope's history with the rename; the new
+        // name rides in the metadata.
+        contextName: parsed.oldScope,
+        routingKey: null,
+        secretKeys: null,
+        outcome: 'allowed',
+        runId: null,
+        jobId: null,
+        userId: c.get('userId'),
+        role: c.get('role'),
+        metadata: { orgId: parsed.orgId, newScope: parsed.newScope },
+      });
+
       return c.json({ renamed: true }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -424,6 +456,21 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         );
       }
       await resolved.store.deleteScope(orgId, resolved.path);
+
+      await deps.auditLogger.log({
+        action: 'deleteScope',
+        // Recorded exactly as the caller sent it — see setSecret below.
+        contextName: scope,
+        routingKey: null,
+        secretKeys: null,
+        outcome: 'allowed',
+        runId: null,
+        jobId: null,
+        userId: c.get('userId'),
+        role: c.get('role'),
+        metadata: { orgId },
+      });
+
       return c.json({ deleted: true }, 200);
     } catch (err) {
       return handleError(c, err);

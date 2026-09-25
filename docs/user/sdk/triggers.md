@@ -9,6 +9,8 @@ Triggers define when a workflow runs. KiCI provides 23 trigger types: 16 GitHub 
 
 All triggers use a config object form -- pass an options object to configure the trigger.
 
+Every GitHub webhook trigger accepts `repos`: glob or regex patterns over source repositories. A trigger with `repos` makes the workflow organization-wide. See [global workflows](../global-workflows.md).
+
 ### pr()
 
 Create a pull request trigger. Returns a frozen `PrTriggerConfig` directly.
@@ -26,6 +28,8 @@ interface PrConfigInput {
   source?: string | RegExp | (string | RegExp)[];
   paths?: string[]; // Use '!' prefix for exclusions (e.g., '!docs/**')
   repos?: string | RegExp | (string | RegExp)[]; // Cross-repo source patterns -- see global-workflows.md
+  requires?: ContentRequirement[]; // File-content filter -- see "Content requirements" below
+  commitMessage?: TextMatch; // Title + body filter -- see "Commit-message filters" below
   description?: string;
 }
 ```
@@ -63,6 +67,8 @@ interface PushConfigInput {
   tags?: string | RegExp | (string | RegExp)[];
   paths?: string[]; // Use '!' prefix for exclusions (e.g., '!docs/**')
   repos?: string | RegExp | (string | RegExp)[]; // Cross-repo source patterns -- see global-workflows.md
+  requires?: ContentRequirement[]; // File-content filter -- see "Content requirements" below
+  commitMessage?: TextMatch; // Head-commit message filter -- see "Commit-message filters" below
   description?: string;
 }
 ```
@@ -278,7 +284,7 @@ Create a tag trigger. Returns a frozen `TagTriggerConfig`.
 function tag(config?: TagConfigInput): TagTriggerConfig;
 ```
 
-**Config options:** `patterns` (string/RegExp/array), `description`
+**Config options:** `patterns` (string/RegExp/array), `repos`, `requires`, `commitMessage`, `description`
 
 ```typescript
 tag(); // Any tag
@@ -294,7 +300,7 @@ Create an issue/PR comment trigger. Returns a frozen `CommentTriggerConfig`.
 function comment(config?: CommentConfigInput): CommentTriggerConfig;
 ```
 
-**Config options:** `actions` (created/edited/deleted), `source` (issue/pr), `bodyMatch` (string or RegExp), `description`
+**Config options:** `actions` (created/edited/deleted), `source` (issue/pr), `bodyMatch` (string or RegExp), `repos`, `description`
 
 ```typescript
 comment(); // Any comment
@@ -311,7 +317,7 @@ Create a pull request review trigger. Returns a frozen `ReviewTriggerConfig`.
 function review(config?: ReviewConfigInput): ReviewTriggerConfig;
 ```
 
-**Config options:** `actions` (submitted/edited/dismissed), `states` (approved/changes_requested/commented/dismissed), `description`
+**Config options:** `actions` (submitted/edited/dismissed), `states` (approved/changes_requested/commented/dismissed), `repos`, `description`
 
 ```typescript
 review(); // Any review
@@ -327,7 +333,7 @@ Create a PR review comment trigger. Returns a frozen `ReviewCommentTriggerConfig
 function reviewComment(config?: ReviewCommentConfigInput): ReviewCommentTriggerConfig;
 ```
 
-**Config options:** `actions` (created/edited/deleted), `description`
+**Config options:** `actions` (created/edited/deleted), `repos`, `description`
 
 ```typescript
 reviewComment(); // Any review comment
@@ -342,7 +348,7 @@ Create a release trigger. Returns a frozen `ReleaseTriggerConfig`.
 function release(config?: ReleaseConfigInput): ReleaseTriggerConfig;
 ```
 
-**Config options:** `actions` (published/unpublished/created/edited/deleted/prereleased/released), `description`
+**Config options:** `actions` (published/unpublished/created/edited/deleted/prereleased/released), `repos`, `description`
 
 ```typescript
 release(); // Any release event
@@ -357,7 +363,7 @@ Create a repository_dispatch trigger. Returns a frozen `DispatchTriggerConfig`.
 function dispatch(config?: DispatchConfigInput): DispatchTriggerConfig;
 ```
 
-**Config options:** `types` (string[]), `description`, `inputs` (typed dispatch inputs map)
+**Config options:** `types` (string[]), `repos`, `description`, `inputs` (typed dispatch inputs map)
 
 ```typescript
 dispatch(); // Any dispatch
@@ -432,7 +438,7 @@ Create a ref creation trigger (branches/tags). Returns a frozen `CreateTriggerCo
 function create(config?: CreateConfigInput): CreateTriggerConfig;
 ```
 
-**Config options:** `refTypes` (branch/tag), `patterns` (string/RegExp/array), `description`
+**Config options:** `refTypes` (branch/tag), `patterns` (string/RegExp/array), `repos`, `description`
 
 ```typescript
 create(); // Any ref creation
@@ -449,7 +455,7 @@ Note: Since `delete` is a JavaScript reserved word, import as `del`: `import { d
 function del(config?: DeleteConfigInput): DeleteTriggerConfig;
 ```
 
-**Config options:** `refTypes` (branch/tag), `patterns` (string/RegExp/array), `description`
+**Config options:** `refTypes` (branch/tag), `patterns` (string/RegExp/array), `repos`, `description`
 
 ```typescript
 del(); // Any ref deletion
@@ -464,7 +470,7 @@ Create a commit status trigger. Returns a frozen `StatusTriggerConfig`.
 function status(config?: StatusConfigInput): StatusTriggerConfig;
 ```
 
-**Config options:** `contexts` (glob patterns like 'ci/\*'), `states` (error/failure/pending/success), `description`
+**Config options:** `contexts` (glob patterns like 'ci/\*'), `states` (error/failure/pending/success), `repos`, `description`
 
 ```typescript
 status(); // Any status
@@ -479,7 +485,7 @@ Create a workflow_run trigger. Returns a frozen `WorkflowRunTriggerConfig`.
 function workflowRun(config?: WorkflowRunConfigInput): WorkflowRunTriggerConfig;
 ```
 
-**Config options:** `actions` (requested/completed/in_progress), `workflows` (name filters), `conclusions` (success/failure/cancelled), `description`
+**Config options:** `actions` (requested/completed/in_progress), `workflows` (name filters), `conclusions` (success/failure/cancelled), `repos`, `description`
 
 ```typescript
 workflowRun(); // Any workflow run
@@ -488,7 +494,7 @@ workflowRun({ workflows: ['CI'], actions: ['completed'], conclusions: ['success'
 
 ### fork()
 
-Create a fork trigger. No filter fields. Returns a frozen `ForkTriggerConfig`.
+Create a fork trigger. Its only config options are `repos` and `description`. Returns a frozen `ForkTriggerConfig`.
 
 ```typescript
 function fork(config?: ForkConfigInput): ForkTriggerConfig;
@@ -507,7 +513,7 @@ Create a star trigger. Returns a frozen `StarTriggerConfig`.
 function star(config?: StarConfigInput): StarTriggerConfig;
 ```
 
-**Config options:** `actions` (created/deleted), `description`
+**Config options:** `actions` (created/deleted), `repos`, `description`
 
 ```typescript
 star(); // Any star event
@@ -522,7 +528,7 @@ Create a watch trigger. Returns a frozen `WatchTriggerConfig`.
 function watch(config?: WatchConfigInput): WatchTriggerConfig;
 ```
 
-**Config options:** `actions` (started), `description`
+**Config options:** `actions` (started), `repos`, `description`
 
 ```typescript
 watch(); // Any watch event

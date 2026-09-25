@@ -25,17 +25,17 @@ kici-admin agent revoke <id>
 **Service lifecycle:**
 
 ```bash
-kici-admin agent install [--wizard] [--platform systemd|launchd|windows|compose] [--env-file <path>] [--binary <path>] [--name <name>] [--instance-dir <path>] [--force] [--orchestrator-url <url>] [--token <token>] [--labels <labels>]
-kici-admin agent uninstall [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin agent start [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin agent stop [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin agent restart [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin agent status [--platform <type>] [--instance-dir <path>] [--name <name>] [--json]
-kici-admin agent logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--since <duration>] [--level <level>] [--json] [--no-follow]
-kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
+kici-admin agent install [--wizard] [--platform systemd|launchd|windows|compose] [--env-file <path>] [--binary <path>] [--name <name>] [--system|--user-level] [--instance-dir <path>] [--force] [--orchestrator-url <url>] [--token <token>] [--labels <labels>]
+kici-admin agent uninstall [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin agent start [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin agent stop [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin agent restart [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin agent status [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--json]
+kici-admin agent logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--since <duration>] [--level <level>] [--json] [--no-follow]
+kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--restart-only] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
 ```
 
-These commands manage the agent as a native system service. The `install --wizard` flow walks through orchestrator URL, agent token, and labels configuration. Lifecycle targeting is folder-anchored — see [Service installation guide](../../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
+These commands manage the agent as a native system service. `--system` targets a system-level service (requires root) and `--user-level` a user-level one. The `install --wizard` flow walks through orchestrator URL, agent token, and labels configuration. Lifecycle targeting is folder-anchored — see [Service installation guide](../../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
 
 Every lifecycle command (`uninstall`, `upgrade`, `start`, `stop`, `restart`, `status`, `logs`) resolves its target through the priority chain `--instance-dir` > `--name` > manifest in the current working directory. A bare `kici-admin agent <cmd>` outside any deploy folder with no flags refuses non-zero and prints the candidate list of installed agent instances on the host.
 
@@ -65,7 +65,7 @@ kici-admin peer prune-credentials --filter <pattern> --database-url <url> [--jso
 kici-admin peer reset-raft-state --database-url <url> [--json]
 ```
 
-Manages peer credentials for multi-orchestrator clusters. These commands access the database directly (not via the admin API).
+Manages peer credentials for multi-orchestrator clusters. These commands access the database directly (not via the admin API). `create-token`, `list`, `revoke` and `revoke-all` read the database URL from `KICI_DATABASE_URL` only; `prune-credentials` and `reset-raft-state` also accept `--database-url`.
 
 - `create-token` generates a single-use join token (defaults: coordinator role, 1-hour expiry, org-id `default`, routing-key `default`, attribution `cli`).
   - `--created-by <actor>` sets the `join_tokens.created_by` audit attribution. Defaults to `cli`; deploy scripts pass e.g. `deploy-stg` so staging join-tokens are distinguishable from ad-hoc operator ones.
@@ -103,12 +103,12 @@ Bootstraps a new orchestrator into an existing cluster. Connects via Platform re
 ```bash
 kici-admin host list [--json]
 kici-admin host get --agent-id <id> [--json]
-kici-admin host declare --agent-id <id> [--labels <labels>] [--hostname <name>]
+kici-admin host declare --agent-id <id> [--labels <labels>] [--hostname <name>] [--prop <key=value>...] [--address <host>] [--ssh-user <user>] [--ssh-port <port>] [--ssh-key-secret <scope/key>] [--s3-reachable]
 kici-admin host remove --agent-id <id>
 ```
 
 - `list` / `get` read the durable host roster and report each host's derived status (`ready` / `unreachable` / `stale`) from the shared last-seen + connected-instance columns.
-- `declare` pre-declares a `static` host before its agent connects — until the agent dials in, the host reads `unreachable`, making "expected but not yet here" a visible state.
+- `declare` pre-declares a `static` host before its agent connects — until the agent dials in, the host reads `unreachable`, making "expected but not yet here" a visible state. `--prop` (repeatable) seeds typed host properties. The reach fields (`--address`, `--ssh-user`, `--ssh-port`, `--ssh-key-secret`, `--s3-reachable`) let a fresh box be bootstrapped before it runs an agent. Every attempt writes a `fleet.host.declare` `access_log` entry.
 - `remove` deletes the host's roster row — the retirement path for a box that is gone for good, so it stops reading `unreachable` forever. It exits non-zero when no row matches, and every attempt writes a `fleet.host.remove` `access_log` entry.
 
 These commands read and write the orchestrator database directly (set `KICI_DATABASE_URL`). See [Host roster (declared inventory)](../host-roster.md) for the full model, derived-status table, and the `KICI_ROSTER_GRACE_MS` / `KICI_ROSTER_TTL_MS` timing knobs.

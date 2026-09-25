@@ -100,17 +100,23 @@ kici-admin queue clear --confirm --database-url $URL --yes     # Offline mode (o
 - `list` / `show` are read-only inspection verbs (dual-mode: HTTP or direct DB via `--database-url`). Handy for investigating stuck dispatch state without `psql`.
 - `clear` truncates `dispatch_queue` — stale pending jobs can linger after a crash or upgrade, and `clear` wipes the table so the next boot starts clean. HTTP mode is preferred when the orchestrator is up; direct-DB mode (via `--database-url`) is the legitimate path for warm-start cleanup before restart.
 
-### registration -- workflow registration inspection
+### registration -- workflow registration management
 
 ```bash
 kici-admin registration list [--org <id>] [--routing-key <k>] [--repo <ident>] [--trigger-type <type>] [--limit <n>] [--database-url <url>] [--json]
 kici-admin registration show <id> [--database-url <url>] [--json]
+kici-admin registration disable <id> [--json]
+kici-admin registration enable <id> [--json]
+kici-admin registration delete <id> [--yes] [--json]
 ```
 
-Reads rows from `workflow_registrations`. Distinct from `workflow list` (which inspects workflow-code) — `registration` is the registered-workflow-instance row. Dual-mode (HTTP via `/api/v1/admin/registrations` or direct DB).
+Reads and changes rows in `workflow_registrations`. Distinct from `workflow list` (which inspects workflow-code) — `registration` is the registered-workflow-instance row. `list` and `show` are dual-mode (HTTP via `/api/v1/admin/registrations` or direct DB).
 
 - `list` returns `{ registrations, registryVersion }`; filter by customer, routing key, repo identifier, or trigger type.
 - `show <id>` prints the single row plus its `registry_version`.
+- `disable <id>` keeps the registration but stops its triggers from dispatching. `enable <id>` turns it back on. Both call `PATCH /api/v1/admin/registrations/:id/disable` with `{ "disabled": true | false }`.
+- `delete <id>` removes the registration. It asks for confirmation unless `--yes` is passed.
+- `disable`, `enable` and `delete` are HTTP only, and are the operator path for the dashboard's `registration.disable` and `registration.delete` writes in the [dashboard-write policy](../../security/dashboard-write-policy.md). Each one bumps the registry version, so every peer reloads its registrations, and prints the new `registry_version`. A token scoped to one routing key can act only on registrations under that key. An unknown id exits non-zero with HTTP 404.
 
 ### workflow -- workflow registration inspection
 
@@ -373,9 +379,64 @@ Synopsis: `kici-admin queue show <id> [options]`
 
 ### `kici-admin registration`
 
-Registered workflow instance read (workflow_registrations table)
+Registered workflow instances (workflow_registrations table)
 
 Synopsis: `kici-admin registration`
+
+### `kici-admin registration delete`
+
+Delete a workflow registration by id
+
+Synopsis: `kici-admin registration delete <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description              |
+| -------- | ------- | ------------------------ |
+| `--yes`  |         | Skip confirmation prompt |
+| `--json` |         | Emit JSON output         |
+
+### `kici-admin registration disable`
+
+Disable a workflow registration: it stays registered, but its triggers stop dispatching
+
+Synopsis: `kici-admin registration disable <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description      |
+| -------- | ------- | ---------------- |
+| `--json` |         | Emit JSON output |
+
+### `kici-admin registration enable`
+
+Re-enable a disabled workflow registration
+
+Synopsis: `kici-admin registration enable <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description      |
+| -------- | ------- | ---------------- |
+| `--json` |         | Emit JSON output |
 
 ### `kici-admin registration list`
 

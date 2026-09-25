@@ -126,7 +126,12 @@ export interface DashboardWriteOperationDescriptor {
   readonly label: string;
   /** Threat-model bucket — used by docs + the --sensitivity CLI sugar. */
   readonly sensitivity: DashboardWriteSensitivity;
-  /** kici-admin invocation hint shown in the CLI snippet copied from the UI. */
+  /**
+   * kici-admin invocation hint shown in the CLI snippet copied from the UI.
+   * It names a real command path; `--flags` and `<arg>` / `[arg]` placeholders
+   * must exist on that command. The orchestrator's cli-equivalents test
+   * resolves every entry against the `kici-admin` command tree.
+   */
   readonly cliEquivalent: string;
 }
 
@@ -306,7 +311,9 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       category: 'Topology',
       label: 'Update global workflow policy',
       sensitivity: 'dispatch',
-      cliEquivalent: 'kici-admin org-settings global-workflows set',
+      // The group: its allow-add / allow-remove / deny-add / deny-remove leaves
+      // together cover the whole-list write the dashboard sends.
+      cliEquivalent: 'kici-admin org-settings global-workflows',
     },
     {
       name: 'backends.sync',
@@ -322,7 +329,7 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       category: 'Topology',
       label: 'Sync one scaler backend',
       sensitivity: 'dispatch',
-      cliEquivalent: 'kici-admin backend sync --one',
+      cliEquivalent: 'kici-admin backend sync <name>',
     },
     {
       name: 'backends.test',

@@ -189,7 +189,7 @@ notably the dispatch-queue **job timeout**, which a queued job resolves from its
 own org:
 
 ```bash
-kici-admin org-settings queue-timeout set --timeout 120000 --org <orgId>
+kici-admin org-settings queue-timeout set 120000 --org <orgId>
 kici-admin org-settings queue-timeout reset --org <orgId>
 ```
 

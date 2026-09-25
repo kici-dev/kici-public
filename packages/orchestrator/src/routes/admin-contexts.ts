@@ -11,6 +11,12 @@
  *   GET    /api/v1/admin/contexts/:name/variables?orgId=<id>         — list org-level variables
  *   PUT    /api/v1/admin/contexts/:name/variables/:key?orgId=<id>    — upsert variable
  *   DELETE /api/v1/admin/contexts/:name/variables/:key?orgId=<id>    — delete variable
+ *   GET    /api/v1/admin/contexts/:name/source-overrides?orgId=<id>[&routingKey=<k>]
+ *                                                                    — list per-source overrides
+ *   PUT    /api/v1/admin/contexts/:name/source-overrides/:routingKey/:key?orgId=<id>
+ *                                                                    — upsert a source override
+ *   DELETE /api/v1/admin/contexts/:name/source-overrides/:routingKey/:key?orgId=<id>
+ *                                                                    — delete a source override
  *
  * Backs the `kici-admin context` dual-mode CLI. Offline (direct-DB) mode
  * bypasses this router entirely — the CLI calls `*Direct` helpers from
@@ -109,6 +115,10 @@ const createTemplateSchema = z.object({
 const setVariableSchema = z.object({
   value: z.string(),
   locked: z.boolean().optional(),
+});
+
+const setSourceOverrideSchema = z.object({
+  value: z.string(),
 });
 
 /**
@@ -507,7 +517,94 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
     }
   });
 
+  registerSourceOverrideRoutes(app, deps, envStore, variableStore);
+
   return app;
+}
+
+/**
+ * Per-source variable overrides — the operator path for the dashboard's
+ * `contexts.source_overrides.*` writes. The context is addressed by name with
+ * `?orgId=`, like the variable routes; the stores key it by id.
+ */
+function registerSourceOverrideRoutes(
+  app: Hono<AdminEnvEnv>,
+  deps: AdminContextRoutesDeps,
+  envStore: ContextStore,
+  variableStore: VariableStore,
+): void {
+  // ── GET /contexts/:name/source-overrides ─ list overrides ────
+  // `routingKey` narrows the list to one source; without it every source's
+  // overrides in the context are listed.
+  app.get('/contexts/:name/source-overrides', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'secret.read');
+      const orgId = c.req.query('orgId');
+      const routingKey = c.req.query('routingKey');
+      const name = c.req.param('name');
+      if (!orgId) return c.json({ error: 'orgId required' }, 400);
+      const env = await envStore.getByName(orgId, name);
+      if (!env) {
+        return c.json({ error: `context not found (org=${orgId}, name=${name})` }, 404);
+      }
+      const overrides = routingKey
+        ? await variableStore.listSourceOverrides(orgId, env.id, routingKey)
+        : await variableStore.listAllSourceOverrides(orgId, env.id);
+      return c.json({
+        overrides: overrides.map((o) => ({
+          routing_key: o.routing_key,
+          key: o.key,
+          value: o.value,
+          updated_at: o.updated_at,
+        })),
+      });
+    } catch (err) {
+      return handleError(c, err);
+    }
+  });
+
+  // ── PUT /contexts/:name/source-overrides/:routingKey/:key ─ upsert ─
+  app.put('/contexts/:name/source-overrides/:routingKey/:key', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'secret.write');
+      const body = setSourceOverrideSchema.parse(await c.req.json());
+      const orgId = c.req.query('orgId');
+      const name = c.req.param('name');
+      const routingKey = c.req.param('routingKey');
+      const key = c.req.param('key');
+      if (!orgId) return c.json({ error: 'orgId required' }, 400);
+      const env = await envStore.getByName(orgId, name);
+      if (!env) {
+        return c.json({ error: `context not found (org=${orgId}, name=${name})` }, 404);
+      }
+      await variableStore.setSourceOverride(orgId, env.id, routingKey, key, body.value);
+      logger.info('context source override set', { orgId, context: name, routingKey, key });
+      return c.json({ set: true });
+    } catch (err) {
+      return handleError(c, err);
+    }
+  });
+
+  // ── DELETE /contexts/:name/source-overrides/:routingKey/:key ─ delete ─
+  app.delete('/contexts/:name/source-overrides/:routingKey/:key', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'secret.delete');
+      const orgId = c.req.query('orgId');
+      const name = c.req.param('name');
+      const routingKey = c.req.param('routingKey');
+      const key = c.req.param('key');
+      if (!orgId) return c.json({ error: 'orgId required' }, 400);
+      const env = await envStore.getByName(orgId, name);
+      if (!env) {
+        return c.json({ error: `context not found (org=${orgId}, name=${name})` }, 404);
+      }
+      await variableStore.deleteSourceOverride(orgId, env.id, routingKey, key);
+      logger.info('context source override deleted', { orgId, context: name, routingKey, key });
+      return c.json({ deleted: true });
+    } catch (err) {
+      return handleError(c, err);
+    }
+  });
 }
 
 function handleError(c: any, err: unknown) {

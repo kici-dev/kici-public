@@ -40,7 +40,7 @@ export function registerAuditCommands(program: Command, getClient: () => AdminAp
     .option('--to <date>', 'To date (ISO 8601)')
     .option('--limit <n>', 'Max entries to return', '100')
     .option('--offset <n>', 'Offset for pagination')
-    .option('--include-archived', 'Include rows from cold storage (Phase D)', false)
+    .option('--include-archived', 'Include rows from cold storage', false)
     .action(
       async (opts: {
         context?: string;

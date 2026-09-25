@@ -8,19 +8,23 @@ description: 'Service lifecycle, cluster identity, scaler maintenance, and Firec
 ### orchestrator -- service lifecycle
 
 ```bash
-kici-admin orchestrator install [--wizard] [--platform systemd|launchd|windows|compose] [--env-file <path>] [--binary <path>] [--dev] [--name <name>] [--instance-dir <path>] [--force]
-kici-admin orchestrator uninstall [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin orchestrator start [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin orchestrator stop [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin orchestrator restart [--platform <type>] [--instance-dir <path>] [--name <name>]
-kici-admin orchestrator status [--platform <type>] [--instance-dir <path>] [--name <name>] [--json]
-kici-admin orchestrator logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--since <duration>] [--level <level>] [--json] [--no-follow]
-kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
+kici-admin orchestrator install [--wizard|--no-wizard] [--platform systemd|launchd|windows|compose] [--mode platform|hybrid|independent|observed] [--env-file <path>] [--binary <path>] [--dev] [--name <name>] [--system|--user-level] [--user <name>] [--instance-dir <path>] [--force]
+kici-admin orchestrator uninstall [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin orchestrator start [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin orchestrator stop [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin orchestrator restart [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
+kici-admin orchestrator status [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--json]
+kici-admin orchestrator logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--since <duration>] [--level <level>] [--json] [--no-follow]
+kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--restart-only] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
+                                [--skip-backup] [--backup-dir <path>] [--no-drain] [--drain-timeout <seconds>] [--migrate-down]
+                                [--no-agent-packages] [--agent-package-platforms <list>] [--node-mirror <url>] [--npm-registry <url>]
 ```
 
-Manages the orchestrator as a native system service. The `install --wizard` flow handles database setup, encryption key generation, Platform credentials, and optionally adding your first source. Lifecycle targeting is folder-anchored — see [Service installation guide](../../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
+Manages the orchestrator as a native system service. The `install --wizard` flow handles database setup, encryption key generation, Platform credentials, and optionally adding your first source. `--no-wizard` skips it and writes a stub env file to edit by hand. `--mode` sets the operating mode written to the env file (default `hybrid`). Lifecycle targeting is folder-anchored — see [Service installation guide](../../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
 
 The `upgrade` command uses a name-scoped versioned directory layout: new versions are extracted under the resolved instance's own `<installBase>/<name>/` tree alongside old ones, and a per-instance symlink is atomically switched. Other installed instances on the host are not touched. Use `--rollback` to revert to the previous version and `--cleanup` to remove old versions (keeping current and previous). Use `--pick` to switch to any already-installed version: it lists every installed version, lets you choose one interactively (the active version is shown but not selectable), prints the change summary, and confirms before switching. Like `--rollback`, `--pick` only switches between versions already extracted under the instance's install base — it never downloads.
+
+Before it stops the service, `upgrade` takes a database dump and drains the coordinator. `--skip-backup` and `--no-drain` opt out of each step, and `--backup-dir` / `--drain-timeout` tune them. `--migrate-down` reverts the schema on a rollback whose database is ahead of the target version. `--restart-only` restarts onto a package you already installed yourself. After an upgrade, the command also packages and uploads agent payloads for the new version, unless you pass `--no-agent-packages`. See [What an upgrade does before it stops the service](../../distribution/service-installation.md#what-an-upgrade-does-before-it-stops-the-service) and [Upgrade CLI flags](../../distribution/service-installation.md#upgrade-cli-flags) for the full behavior.
 
 Every lifecycle command (`uninstall`, `upgrade`, `start`, `stop`, `restart`, `status`, `logs`) resolves its target through the priority chain `--instance-dir` > `--name` > manifest in the current working directory. A bare `kici-admin orchestrator <cmd>` outside any deploy folder with no flags refuses non-zero and prints the candidate list of installed orchestrator instances on the host.
 

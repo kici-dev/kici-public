@@ -62,6 +62,18 @@ VALUES ('my-org', '<env-id>', 'API_URL', 'https://api.example.com', false);
 
 The `locked` flag prevents source-level overrides from changing this variable. Locked variables can only be modified by context admins.
 
+### Setting per-source overrides
+
+A source override gives one source (routing key) its own value for a variable key. The orchestrator merges it over the context variable for runs from that source, unless the variable is locked.
+
+```bash
+kici-admin context source-override set --org my-org --env production \
+  --routing-key github:12345 --key API_URL --value https://api-canary.example.com
+kici-admin context source-override list --org my-org --env production
+kici-admin context source-override delete --org my-org --env production \
+  --routing-key github:12345 --key API_URL
+```
+
 ### Configuring protection rules
 
 Protection rules are columns on the `contexts` table:

@@ -1,8 +1,8 @@
 /**
  * Admin API routes for workflow registration management.
  *
- * Provides endpoints for listing, inspecting, refreshing, and deleting
- * workflow registrations. All routes are protected by Bearer token
+ * Provides endpoints for listing, inspecting, refreshing, disabling and
+ * deleting workflow registrations. All routes are protected by Bearer token
  * authentication via the existing admin auth middleware pattern.
  */
 
@@ -53,6 +53,10 @@ type AdminRegEnv = {
 const refreshSchema = z.object({
   routingKey: z.string().min(1),
   repoIdentifier: z.string().min(1),
+});
+
+const disableSchema = z.object({
+  disabled: z.boolean(),
 });
 
 const registerManualSchema = z.object({
@@ -275,6 +279,44 @@ export function createAdminRegistrationRoutes(
       });
 
       return c.json({ registryVersion }, 200);
+    } catch (err) {
+      return handleError(c, err);
+    }
+  });
+
+  // Disable (or, with `disabled: false`, re-enable) a registration by ID. A
+  // disabled registration stays registered, but none of its triggers dispatch.
+  app.patch('/api/v1/admin/registrations/:id/disable', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'context.update');
+
+      const id = c.req.param('id');
+      const parsed = disableSchema.parse(await c.req.json());
+      // Look up the row's routing key first so a scoped token cannot toggle a
+      // registration outside its scope, as the DELETE route below does.
+      const existing = await deps.registrationStore.getById(id);
+      if (!existing) {
+        return c.json({ error: 'Registration not found' }, 404);
+      }
+      const denied = enforceRoutingKeyScope(c, existing.routing_key);
+      if (denied) return denied;
+
+      const updated = await deps.registrationStore.setDisabled(id, parsed.disabled);
+      if (!updated) {
+        return c.json({ error: 'Registration not found' }, 404);
+      }
+
+      // Bump registry version so every peer reloads the disabled flag.
+      const registryVersion = await deps.registrationStore.bumpVersion();
+      await deps.registrationIndex.refreshIfNeeded(registryVersion);
+
+      logger.info('Registration disabled flag set', {
+        id,
+        disabled: parsed.disabled,
+        registryVersion,
+      });
+
+      return c.json({ disabled: parsed.disabled, registryVersion }, 200);
     } catch (err) {
       return handleError(c, err);
     }

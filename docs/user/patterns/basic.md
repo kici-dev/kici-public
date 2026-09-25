@@ -226,5 +226,3 @@ npx kici run dispatch --local
 ### Unfiltered vs typed `dispatch()`
 
 Leave `dispatch()` unfiltered while you drive it from `kici run <event> --local`. The CLI simulates a dispatch event with no event type (i.e. `action` is undefined), so a trigger defined as `dispatch({ types: ['deploy', 'rollback'] })` will not match `kici run dispatch --local` — the typed form is intended for real `repository_dispatch` deliveries from the orchestrator.
-
-## Conditional execution with rules

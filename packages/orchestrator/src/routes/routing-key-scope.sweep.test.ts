@@ -475,6 +475,7 @@ describe('routing-key scope sweep — admin-registrations.ts', () => {
         }),
         replaceAll: vi.fn(),
         deleteById: vi.fn(),
+        setDisabled: vi.fn(),
         bumpVersion: vi.fn().mockResolvedValue(1),
       } as any,
       registrationIndex: {
@@ -491,6 +492,17 @@ describe('routing-key scope sweep — admin-registrations.ts', () => {
       token: VALID_TOKEN,
     });
     expect(res.status).toBe(403);
+  });
+
+  it('refuses PATCH /registrations/:id/disable for a foreign routing key', async () => {
+    const res = await request(
+      app,
+      'PATCH',
+      'http://localhost/api/v1/admin/registrations/reg-1/disable',
+      { token: VALID_TOKEN, body: { disabled: true } },
+    );
+    expect(res.status).toBe(403);
+    expect(deps.registrationStore.setDisabled).not.toHaveBeenCalled();
   });
 
   it('refuses POST /registrations/register-manual when the body routing key differs', async () => {

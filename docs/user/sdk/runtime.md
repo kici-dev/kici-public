@@ -22,7 +22,7 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 | `StepInput`       | Union of step input forms accepted by `job()`                                                                                                                                                                                                                                      |
 | `OutputSchema`    | Record of Zod types for step outputs                                                                                                                                                                                                                                               |
 | `InferOutputs<T>` | Infer output type from output schema                                                                                                                                                                                                                                               |
-| `ContainerConfig` | Container config for job execution (`image`, `env?`)                                                                                                                                                                                                                               |
+| `ContainerConfig` | Container config for job execution: `image` or `dockerfile` (with `context`, `target`, `args`), plus `env` and registry `auth`. See [Container jobs](../container-jobs.md).                                                                                                        |
 | `RunsOn`          | Union of `runsOn` forms: `string \| RegExp \| (string \| RegExp)[] \| RunsOnSelector`. A plain string matches exactly, a string with glob metacharacters (`*?[]{}`) is a glob, and a `RegExp` is a regular expression. See [Targeting by pattern](./core.md#targeting-by-pattern). |
 | `RunsOnSelector`  | Object form for `runsOn` with `labels` (required) and `exclude` (optional) properties. Each element accepts the exact / glob / regex forms on both sides.                                                                                                                          |
 | `RunsOnPick`      | Single-agent selection policy when several agents match a `runsOn` selector: `'deterministic'` (stable hash — same job lands on the same host across re-runs) or `'any'` (spread load). See [runsOnAll](./runs-on-all.md#targeting-by-pattern) for the fan-out forms.              |
@@ -78,7 +78,7 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 | `RuleContext`          | Context passed to rule check functions                                  |
 | `RuleResult`           | Result of rule evaluation (label, passed, duration)                     |
 | `EventPayload`         | Discriminated union over event type (narrow on `type` for autocomplete) |
-| `RuleEvaluationResult` | Result of `evaluateRules()` (allPassed + results)                       |
+| `RuleEvaluationResult` | Result of evaluating a rule list (`allPassed` + per-rule `results`)     |
 
 ### Matrix types
 
@@ -119,7 +119,7 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 | `Logger`              | Logger interface (info, warn, error, debug)                                                                      |
 | `WorkflowInfo`        | Workflow metadata: `{ name: string }`                                                                            |
 | `JobInfo`             | Job metadata: `{ name: string, runsOn: string }`                                                                 |
-| `AgentInfo`           | Facts about the pinned agent (`hostname`, `labels`, `platform`, `arch`), set on `runsOnAll` fan-out jobs         |
+| `AgentInfo`           | Facts about the pinned agent (`host`, `labels`, `platform`, `arch`), set on `runsOnAll` fan-out jobs             |
 | `FanoutPosition`      | Position of a child within its fan-out (host or matrix), deterministically ordered                               |
 | `MatrixJobOutputs`    | Envelope returned by `jobOutputs()` for a matrix upstream: `{ byMatrix, merged }`                                |
 | `HostJobOutputs`      | Envelope returned by `jobOutputs()` for a `runsOnAll` upstream, keyed per host                                   |
@@ -203,6 +203,7 @@ interface StepContext<TInputs = Record<string, unknown>> {
   outputsOf<T>(ref: { _tag: 'Step'; name: string } | ((...args: any[]) => any)): T;
   /** Resolve outputs from a preceding job by reference (fan-out upstreams return an envelope) */
   jobOutputs<T>(ref: Job<T>): T | MatrixJobOutputs<T> | HostJobOutputs<T>;
+  jobOutputs(ref: { name: string }): Record<string, unknown> | MatrixJobOutputs | HostJobOutputs;
   /** Publish a secret output value from this job (encrypted before leaving the agent) */
   setSecretOutput(key: string, value: string): void;
   /** Typed KiCI API — orchestrator queries over WS (e.g. `kici.infrastructure.list()`) */

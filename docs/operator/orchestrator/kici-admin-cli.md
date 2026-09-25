@@ -7,7 +7,7 @@ The `kici-admin` CLI manages the KiCI orchestrator: configuration, secrets, toke
 
 Some command groups deliberately bypass that API, because they must work while the orchestrator is down (or before it exists):
 
-- **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `peer`, `check-run`, `cluster`, `signing-key`, `dashboard-encryption-key`, `remote-source`. `host` also goes straight to the database, but it reads `KICI_DATABASE_URL` only — it carries no `--database-url` flag. Several API-backed commands offer a direct-DB mode through the same flag — each one says so in its guide entry.
+- **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `check-run`, `cluster`, `signing-key`, `dashboard-encryption-key`, `remote-source`, and `peer prune-credentials` / `reset-raft-state`. `host` and the other `peer` verbs (`create-token`, `list`, `revoke`, `revoke-all`) also go straight to the database, but they read `KICI_DATABASE_URL` only. They carry no `--database-url` flag. Several API-backed commands offer a direct-DB mode through the same flag — each one says so in its guide entry.
 - **Local host only** (no orchestrator, no database): `firecracker`, `scaler`, `inspect-bundle`, and the `agent` / `orchestrator` service-lifecycle verbs (`install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs`, `upgrade`, plus `agent package`; `orchestrator drain` / `resume` are API-backed).
 - **Own transport**: `join` connects straight to the Platform relay or a peer orchestrator.
 
@@ -78,6 +78,10 @@ kici-admin runs list --json | jq -r '.runs[].runId'
 ```
 
 The CLI sets `KICI_LOG_STDERR=1` for you when it starts. Set it yourself only if you invoke the orchestrator CLI module through some other entry point and want the same split.
+
+## Confirmation prompts
+
+Some commands that delete or replace state ask for confirmation on stderr before they act. Answer `y` or `yes` to continue. Any other answer cancels the command. Pass `--yes` to skip the prompt, for example in a script. If stdin closes before an answer arrives, the command stops with a non-zero exit and changes nothing.
 
 ## RBAC roles
 
