@@ -49,7 +49,7 @@ export const peerCapabilitiesSchema = z.object({
  */
 const scalerCapacitySummarySchema = z
   .object({
-    /** Scaler backend name (e.g. "stg-worker-bare-metal") */
+    /** Scaler backend name (e.g. "worker-bare-metal") */
     name: z.string().optional(),
     /** Scaler backend type (e.g. "bare-metal", "container") */
     type: z.string().optional(),

@@ -12,7 +12,7 @@ import { type Kysely, sql } from 'kysely';
  *   distinct per-host selectors.
  *
  * Idempotent: re-running on a DB that already has the column / index is a no-op.
- * Additive — staging data is preserved.
+ * Additive — existing data is preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.environment_bindings

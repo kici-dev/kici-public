@@ -5,7 +5,7 @@
  * Contract:
  *   - tenant column: `routing_key` (denormalized in migration 006)
  *   - partition column: `created_at`
- *   - warm TTL: 30 days (design §5 matrix row 9)
+ *   - warm TTL: 30 days
  *   - eligibility: created_at < cutoff (steps are append-only and have no
  *     terminal-status predicate — there is no UPDATE statement against
  *     `execution_steps` in the orchestrator codebase, so age alone is
@@ -35,7 +35,7 @@ export type ExecutionStepRow = Selectable<ExecutionStepTable>;
 const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|execution_steps';
 const APPROX_ROW_BYTES = 600;
 
-/** Per-table defaults (design §5 matrix row 9). */
+/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 10 * 1024 * 1024,
@@ -174,7 +174,7 @@ export class ExecutionStepsAdapter implements TableAdapter<ExecutionStepRow> {
 
       await trx.deleteFrom('execution_steps').where('id', 'in', ids).execute();
 
-      // Orchestrator-side audit: access_log (mirrors design §8 split —
+      // Orchestrator-side audit: access_log (the audit split —
       // Platform writes to audit_log, Orchestrator writes to access_log).
       await trx
         .insertInto('access_log')

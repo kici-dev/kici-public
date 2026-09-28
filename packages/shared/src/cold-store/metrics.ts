@@ -9,13 +9,13 @@
  * `cold_store_archive_cycles_total` is always-non-zero — incremented
  * on every `runArchiveCycle()` call with a `result` label — so the
  * meter scope + instrument metadata always surface on /metrics.
- * This is the counterpart to the design doc's original "zero-add
- * trick": `@opentelemetry/exporter-prometheus` 0.213.0 filters out
+ * A "zero-add" counter would not work:
+ * `@opentelemetry/exporter-prometheus` 0.213.0 filters out
  * counters whose only observations are `.add(0)`, so we need a
  * guaranteed-non-zero counter to keep the series visible.
  *
  * `cold_store_archive_rows_total` stays dormant (hidden) until a
- * Phase B+ `TableAdapter` actually archives rows — at which point
+ * `TableAdapter` actually archives rows — at which point
  * its samples appear naturally.
  *
  * Lazy meter initialization: the `@kici-dev/shared` barrel is imported
@@ -82,7 +82,7 @@ export function coldStoreArchiveCyclesTotal(): Counter {
  * Total rows archived, by db / table / outcome.
  * `result` ∈ success | failure | skipped_min_chunk | skipped_min_warm.
  *
- * Hidden from /metrics until the first Phase B+ TableAdapter moves
+ * Hidden from /metrics until the first TableAdapter moves
  * a row; the visible proof that the subsystem is wired is
  * `cold_store_archive_cycles_total`, not this counter.
  */
@@ -124,7 +124,7 @@ export function coldStoreArchiveDurationSeconds(): Histogram {
 
 /**
  * Rehydrate requests (cache hit vs miss). Incremented by the
- * read-through layer (Phase B+) when it serves a range query from
+ * read-through layer when it serves a range query from
  * cold storage.
  */
 export function coldStoreRehydrateRequestsTotal(): Counter {
@@ -171,7 +171,7 @@ export function coldStoreVerifyFailuresTotal(): Counter {
 }
 
 /**
- * Phase F — rows promoted back into PG via `replayChunk` / `replayRow`.
+ * Rows promoted back into PG via `replayChunk` / `replayRow`.
  * `result` ∈ `success` | `failure` | `idempotent_skip`. The
  * `idempotent_skip` bucket counts rows already present in PG (chunk
  * replayed twice — no-op via ON CONFLICT). Hidden until the first
@@ -188,7 +188,7 @@ export function coldStoreReplayRowsTotal(): Counter {
 }
 
 /**
- * Phase F — replay duration (S3 GET + manifest scan + decode + INSERT),
+ * Replay duration (S3 GET + manifest scan + decode + INSERT),
  * seconds. Buckets mirror archive duration: 10ms, 100ms, 500ms, 1s, 5s,
  * 30s, 120s.
  */
@@ -203,7 +203,7 @@ export function coldStoreReplayDurationSeconds(): Histogram {
 }
 
 /**
- * Phase 2 — chunks acted on by `purgeExpiredChunks`, labeled by db,
+ * Chunks acted on by `purgeExpiredChunks`, labeled by db,
  * table, and outcome. `result` ∈ `purged` | `dry_run` | `skipped_locked`
  * | `failure`. Hidden until the first GC sweep finds candidates;
  * `cold_store_archive_cycles_total` remains the always-non-zero
@@ -218,7 +218,7 @@ export function coldStorePurgeChunksTotal(): Counter {
   return _purgeChunksTotal;
 }
 
-/** Phase 2 — gzipped bytes deleted from S3 by the purge sweep. */
+/** Gzipped bytes deleted from S3 by the purge sweep. */
 export function coldStorePurgeBytesTotal(): Counter {
   if (!_purgeBytesTotal) {
     _purgeBytesTotal = meter().createCounter('cold_store_purge_bytes_total', {
@@ -229,7 +229,7 @@ export function coldStorePurgeBytesTotal(): Counter {
 }
 
 /**
- * Phase 2 — purge duration per sweep, seconds. Buckets mirror the
+ * Purge duration per sweep, seconds. Buckets mirror the
  * archive duration histogram: 10ms, 100ms, 500ms, 1s, 5s, 30s, 120s.
  */
 export function coldStorePurgeDurationSeconds(): Histogram {

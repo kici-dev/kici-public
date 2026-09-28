@@ -52,7 +52,7 @@ async function buildGateRun(
   const summonedRun = {
     runId: summonedRunId,
     repo: 'acme/canary',
-    workflow: 'stg-repo-tests-sub',
+    workflow: 'repo-tests-sub',
   };
   const proxyName = proxyJobName('repo-tests', summonedRun as any);
 
@@ -102,7 +102,7 @@ async function buildGateRun(
     .values({
       run_id: summonedRunId,
       routing_key: null,
-      workflow_name: 'stg-repo-tests-sub',
+      workflow_name: 'repo-tests-sub',
       status: ExecutionRunStatus.enum.success,
       provider: 'github',
       repo_identifier: 'acme/canary',
@@ -231,10 +231,10 @@ describeDb('handleRunDetail — invoke-gate run', () => {
 
   it('produces a schema-valid run-detail response for a proxy with NO outputs', async () => {
     const tracker = new ExecutionTracker({ db });
-    // The staging subscriber fixture's `unit` job returns nothing, so the
-    // summoned run has no non-secret outputs and the mirror writes none onto the
-    // proxy — the proxy's `outputs` cell stays null. This is the exact shape of
-    // the run the invoke-gate global-workflow-stg E2E produces.
+    // A subscriber whose `unit` job returns nothing leaves the summoned run
+    // with no non-secret outputs, so the mirror writes none onto the proxy —
+    // the proxy's `outputs` cell stays null. This is the shape an invoke-gate
+    // run produces when its subscriber declares no outputs.
     const { gateRunId } = await buildGateRun(tracker, db, null);
 
     const sent: any[] = [];

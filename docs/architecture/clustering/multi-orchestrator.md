@@ -238,6 +238,10 @@ follower -> candidate -> leader
 
 When the peer registry has 0 connected peers, the Raft node self-elects immediately. This makes single-orchestrator deployments trivially self-elected leaders without any special-casing. If peers connect later, normal election resumes.
 
+### Leaving the cluster
+
+A coordinator that shuts down stops its Raft node before it disconnects from its peers. The stop is final. The node gives up leadership, so its leader-only services stop with it. It ignores every election message after the stop and grants no vote. So a `peer.leaving` from a sibling that stops at the same time cannot elect it again while it shuts down, and neither can its own peers dropping away. The remaining coordinators elect a new leader among themselves. The node's last save to the shared `raft_state` row does not overwrite a newer term that they have already written.
+
 ### State persistence
 
 Raft state (currentTerm, votedFor, leaderId) is persisted to the `raft_state` PostgreSQL table via upsert. Persistence uses fire-and-forget (`.catch()`) to avoid blocking election transitions on DB writes.

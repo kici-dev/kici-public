@@ -84,7 +84,7 @@ describe('launchd service manager', () => {
   let manager: LaunchdServiceManager;
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     manager = new LaunchdServiceManager();
   });
 
@@ -126,13 +126,45 @@ describe('launchd service manager', () => {
       expect(plist).toContain('<string>/opt/kici/dist/server.js</string>');
     });
 
-    it('includes KeepAlive and RunAtLoad', () => {
-      const config = makeConfig();
-      const plist = manager.generatePlist(config);
+    it('includes RunAtLoad', () => {
+      const plist = manager.generatePlist(makeConfig());
 
-      expect(plist).toContain('<key>KeepAlive</key>');
-      expect(plist).toContain('<key>RunAtLoad</key>');
-      expect(plist).toContain('<true/>');
+      expect(plist).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
+    });
+
+    it('keeps the job alive only after a failed exit, as Restart=on-failure does', () => {
+      // fails-when: KeepAlive is `<true/>`, so launchd restarts a process that
+      // exited 0 (an agent drain, a SIGTERM from outside launchd) forever.
+      const plist = manager.generatePlist(makeConfig());
+
+      expect(plist).toMatch(
+        /<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>\s*<\/dict>/,
+      );
+      expect(plist).not.toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+    });
+
+    it('omits KeepAlive and ThrottleInterval when the restart policy is disabled', () => {
+      // breaks-if-wrong: a disabled policy still restarts the service, unlike
+      // the systemd unit, which then carries no Restart= line.
+      const plist = manager.generatePlist(
+        makeConfig({
+          restartPolicy: { enabled: false, delays: [1], maxRetries: 5, windowSeconds: 300 },
+        }),
+      );
+
+      expect(plist).not.toContain('<key>KeepAlive</key>');
+      expect(plist).not.toContain('<key>ThrottleInterval</key>');
+      expect(plist).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
+    });
+
+    it("sets ExitTimeOut to the component's shutdown grace, above launchd's 5s default", () => {
+      // fails-when: the plist has no ExitTimeOut, so `stop` (bootout) SIGKILLs
+      // the process 5s after SIGTERM, partway through its graceful shutdown.
+      const orch = manager.generatePlist(makeConfig({ component: 'orchestrator' }));
+      expect(orch).toMatch(/<key>ExitTimeOut<\/key>\s*<integer>45<\/integer>/);
+
+      const agent = manager.generatePlist(makeConfig({ component: 'agent', name: 'kici-agent' }));
+      expect(agent).toMatch(/<key>ExitTimeOut<\/key>\s*<integer>20<\/integer>/);
     });
 
     it('includes ThrottleInterval from restart policy', () => {
@@ -259,7 +291,8 @@ describe('launchd service manager', () => {
       const config = makeConfig({ isUserLevel: false });
       // No existing instance loaded, so install goes straight to bootstrap.
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
-        if (Array.isArray(args) && args[0] === 'print') throw new Error('not loaded');
+        if (Array.isArray(args) && args[0] === 'print')
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         return '';
       });
       await manager.install(config);
@@ -276,7 +309,8 @@ describe('launchd service manager', () => {
       const config = makeConfig({ isUserLevel: true });
       // No existing instance loaded, so install goes straight to bootstrap.
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
-        if (Array.isArray(args) && args[0] === 'print') throw new Error('not loaded');
+        if (Array.isArray(args) && args[0] === 'print')
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         return '';
       });
       await manager.install(config);
@@ -293,7 +327,7 @@ describe('launchd service manager', () => {
       // Mock isLoaded to return false (no existing instance to boot out).
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
-          throw new Error('not loaded');
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         }
         return '';
       });
@@ -310,7 +344,7 @@ describe('launchd service manager', () => {
       const config = makeConfig({ isUserLevel: true });
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
-          throw new Error('not loaded');
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         }
         return '';
       });
@@ -338,7 +372,7 @@ describe('launchd service manager', () => {
           return '';
         }
         if (Array.isArray(args) && args[0] === 'print') {
-          if (bootedOut) throw new Error('not loaded'); // unloaded after bootout
+          if (bootedOut) throw Object.assign(new Error('not loaded'), { status: 113 }); // unloaded after bootout
           return ''; // success → isLoaded === true
         }
         return '';
@@ -361,7 +395,7 @@ describe('launchd service manager', () => {
       let bootstrapCalls = 0;
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
-          throw new Error('not loaded'); // isLoaded === false throughout
+          throw Object.assign(new Error('not loaded'), { status: 113 }); // isLoaded === false throughout
         }
         if (Array.isArray(args) && args[0] === 'bootstrap') {
           bootstrapCalls += 1;
@@ -389,7 +423,7 @@ describe('launchd service manager', () => {
       let bootstrapCalls = 0;
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
-          throw new Error('not loaded');
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         }
         if (Array.isArray(args) && args[0] === 'bootstrap') {
           bootstrapCalls += 1;
@@ -416,7 +450,7 @@ describe('launchd service manager', () => {
       const config = makeConfig({ isUserLevel: false, user: 'alice' });
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
-          throw new Error('not loaded');
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         }
         return '';
       });
@@ -433,7 +467,7 @@ describe('launchd service manager', () => {
       const config = makeConfig({ isUserLevel: true });
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
-          throw new Error('not loaded');
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         }
         return '';
       });
@@ -444,91 +478,474 @@ describe('launchd service manager', () => {
     });
   });
 
-  describe('start', () => {
-    it('runs `launchctl kickstart -k <domain>/<label>`', async () => {
-      const config = makeConfig({ isUserLevel: false });
-      await manager.start(config);
+  /**
+   * Simulate launchd's view of one job. `print` answers while the job is
+   * loaded; `bootout` unloads it (after `unloadAfterPrints` more `print` calls,
+   * to model launchd's asynchronous teardown); `bootstrap` loads it. `fail`
+   * makes one verb throw the given launchctl error.
+   */
+  function simulateLaunchd(opts: {
+    loaded: boolean;
+    /** Whether the job's plist is on disk (default true). */
+    installed?: boolean;
+    unloadAfterPrints?: number;
+    /**
+     * Make one verb throw this launchctl error. `once` fails only the first
+     * call; `loadedAfter` sets the job's loaded state as the call fails,
+     * modelling another caller that loaded or unloaded the job concurrently;
+     * `unloadAfterPrints` makes the job leave the domain after that many more
+     * prints, modelling an unload already in progress.
+     */
+    fail?: {
+      verb: string;
+      status: number;
+      stderr: string;
+      once?: boolean;
+      loadedAfter?: boolean;
+      unloadAfterPrints?: number;
+    };
+  }): { launchctlVerbs: () => unknown[][] } {
+    let loaded = opts.loaded;
+    let printsUntilUnloaded = -1;
+    let failArmed = true;
+    mockedExistsSync.mockReturnValue(opts.installed ?? true);
+    mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
+      if (bin !== 'launchctl' || !Array.isArray(args)) return '';
+      const verb = args[0];
+      if (opts.fail && verb === opts.fail.verb && failArmed) {
+        if (opts.fail.once) failArmed = false;
+        if (opts.fail.loadedAfter !== undefined) loaded = opts.fail.loadedAfter;
+        if (opts.fail.unloadAfterPrints !== undefined) {
+          printsUntilUnloaded = opts.fail.unloadAfterPrints;
+        }
+        throw Object.assign(new Error(`Command failed: launchctl ${args.join(' ')}`), {
+          status: opts.fail.status,
+          stderr: opts.fail.stderr,
+        });
+      }
+      if (verb === 'print') {
+        if (printsUntilUnloaded === 0) loaded = false;
+        if (printsUntilUnloaded > 0) printsUntilUnloaded -= 1;
+        if (!loaded) throw Object.assign(new Error('Could not find service'), { status: 113 });
+        return '\tstate = running\n\tpid = 4321\n\tlast exit code = (never exited)\n';
+      }
+      if (verb === 'bootout') {
+        if (!loaded) {
+          throw Object.assign(new Error('Boot-out failed: 3: No such process'), { status: 3 });
+        }
+        printsUntilUnloaded = opts.unloadAfterPrints ?? 0;
+        return '';
+      }
+      if (verb === 'bootstrap') {
+        // launchd answers a bootstrap of a job that is still loaded with EIO.
+        if (loaded) {
+          throw Object.assign(new Error('Bootstrap failed: 5: Input/output error'), {
+            status: 5,
+            stderr: 'Bootstrap failed: 5: Input/output error\n',
+          });
+        }
+        loaded = true;
+        return '';
+      }
+      if ((verb === 'kill' || verb === 'kickstart') && !loaded) {
+        throw Object.assign(new Error('Could not find service'), { status: 113 });
+      }
+      return '';
+    });
+    return {
+      launchctlVerbs: () =>
+        mockedExecFileSync.mock.calls
+          .filter((c: unknown[]) => c[0] === 'launchctl')
+          .map((c: unknown[]) => c[1] as unknown[]),
+    };
+  }
 
-      expect(mockedExecFileSync).toHaveBeenCalledWith(
-        'launchctl',
-        ['kickstart', '-k', 'system/dev.kici.kici-orchestrator'],
-        expect.any(Object),
-      );
+  describe('start', () => {
+    it('kickstarts a loaded job without killing a running instance', async () => {
+      // fails-when: start() keeps `kickstart -k`, which restarts a running service.
+      const sim = simulateLaunchd({ loaded: true });
+      await manager.start(makeConfig({ isUserLevel: false }));
+
+      const verbs = sim.launchctlVerbs();
+      expect(verbs).toContainEqual(['kickstart', 'system/dev.kici.kici-orchestrator']);
+      expect(verbs.some((v) => v[0] === 'bootstrap')).toBe(false);
+    });
+
+    it('bootstraps the installed plist when the job is not loaded (after stop)', async () => {
+      // fails-when: start() only kickstarts, which fails with 113 on an unloaded job.
+      const sim = simulateLaunchd({ loaded: false });
+      await manager.start(makeConfig({ isUserLevel: false }));
+
+      const verbs = sim.launchctlVerbs();
+      expect(verbs).toContainEqual([
+        'bootstrap',
+        'system',
+        '/Library/LaunchDaemons/dev.kici.kici-orchestrator.plist',
+      ]);
+      expect(verbs.some((v) => v[0] === 'kickstart')).toBe(false);
     });
 
     it('targets the gui/<uid> domain for user-level services', async () => {
-      const config = makeConfig({ isUserLevel: true });
-      await manager.start(config);
+      const loadedSim = simulateLaunchd({ loaded: true });
+      await manager.start(makeConfig({ isUserLevel: true }));
+      expect(loadedSim.launchctlVerbs()).toContainEqual([
+        'kickstart',
+        'gui/501/dev.kici.kici-orchestrator',
+      ]);
 
-      expect(mockedExecFileSync).toHaveBeenCalledWith(
-        'launchctl',
-        ['kickstart', '-k', 'gui/501/dev.kici.kici-orchestrator'],
-        expect.any(Object),
-      );
+      vi.clearAllMocks();
+      const unloadedSim = simulateLaunchd({ loaded: false });
+      await manager.start(makeConfig({ isUserLevel: true }));
+      expect(unloadedSim.launchctlVerbs()).toContainEqual([
+        'bootstrap',
+        'gui/501',
+        '/Users/testuser/Library/LaunchAgents/dev.kici.kici-orchestrator.plist',
+      ]);
+    });
+
+    it('leaves a job alone that another caller loaded while start was bootstrapping', async () => {
+      // fails-when: start() retries a failed bootstrap by booting out whatever
+      // is loaded (install's replace path), restarting the service it just
+      // found running.
+      const sim = simulateLaunchd({
+        loaded: false,
+        fail: {
+          verb: 'bootstrap',
+          status: 5,
+          stderr: 'Bootstrap failed: 5: Input/output error\n',
+          once: true,
+          loadedAfter: true,
+        },
+      });
+      await expect(manager.start(makeConfig())).resolves.toBeUndefined();
+      expect(sim.launchctlVerbs().some((v) => v[0] === 'bootout')).toBe(false);
+    });
+
+    it('retries a bootstrap that hits the transient EIO right after an unload', async () => {
+      vi.useFakeTimers();
+      try {
+        const sim = simulateLaunchd({
+          loaded: false,
+          fail: {
+            verb: 'bootstrap',
+            status: 5,
+            stderr: 'Bootstrap failed: 5: Input/output error\n',
+            once: true,
+          },
+        });
+        const starting = manager.start(makeConfig());
+        await vi.advanceTimersByTimeAsync(5_000);
+        await expect(starting).resolves.toBeUndefined();
+        expect(sim.launchctlVerbs().filter((v) => v[0] === 'bootstrap')).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('surfaces a bootstrap failure', async () => {
+      simulateLaunchd({
+        loaded: false,
+        fail: { verb: 'bootstrap', status: 22, stderr: 'Load failed: 22: Invalid argument\n' },
+      });
+      await expect(manager.start(makeConfig())).rejects.toThrow(/launchctl bootstrap/);
     });
   });
 
   describe('stop', () => {
-    it('runs `launchctl kill TERM <domain>/<label>`', async () => {
-      const config = makeConfig({ isUserLevel: false });
-      await manager.stop(config);
+    it('unloads a running job so KeepAlive cannot respawn it', async () => {
+      // fails-when: stop() sends `kill TERM`, which KeepAlive answers with a respawn.
+      const sim = simulateLaunchd({ loaded: true });
+      await manager.stop(makeConfig({ isUserLevel: false }));
 
-      expect(mockedExecFileSync).toHaveBeenCalledWith(
-        'launchctl',
-        ['kill', 'TERM', 'system/dev.kici.kici-orchestrator'],
-        expect.any(Object),
-      );
+      const verbs = sim.launchctlVerbs();
+      expect(verbs).toContainEqual(['bootout', 'system/dev.kici.kici-orchestrator']);
+      expect(verbs.some((v) => v[0] === 'kill')).toBe(false);
+    });
+
+    it('waits until launchd has finished unloading the job before it returns', async () => {
+      // launchctl bootout returns while the process is still shutting down.
+      vi.useFakeTimers();
+      try {
+        const sim = simulateLaunchd({ loaded: true, unloadAfterPrints: 3 });
+        let settled = false;
+        const stopping = manager.stop(makeConfig()).then(() => {
+          settled = true;
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await stopping;
+        expect(settled).toBe(true);
+        const prints = sim.launchctlVerbs().filter((v) => v[0] === 'print');
+        expect(prints.length).toBeGreaterThanOrEqual(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('succeeds on a job that is already stopped (not loaded)', async () => {
+      // fails-when: stop() runs `kill TERM` or `bootout` bare — both fail on an unloaded job.
+      const sim = simulateLaunchd({ loaded: false });
+      await expect(manager.stop(makeConfig())).resolves.toBeUndefined();
+      expect(sim.launchctlVerbs().some((v) => v[0] === 'kill')).toBe(false);
+    });
+
+    it('surfaces a bootout failure that leaves the job loaded', async () => {
+      // fails-when: stop() swallows every bootout error, as uninstall() does.
+      vi.useFakeTimers();
+      try {
+        simulateLaunchd({
+          loaded: true,
+          fail: {
+            verb: 'bootout',
+            status: 1,
+            stderr: 'Boot-out failed: 1: Operation not permitted\n',
+          },
+        });
+        const assertion = expect(manager.stop(makeConfig())).rejects.toThrow(/launchctl bootout/);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('succeeds when bootout fails because the job unloaded concurrently', async () => {
+      // fails-when: stop() rethrows every bootout error, even when the job has
+      // left the domain (another stop, or launchd finishing a teardown).
+      simulateLaunchd({
+        loaded: true,
+        fail: {
+          verb: 'bootout',
+          status: 3,
+          stderr: 'Boot-out failed: 3: No such process\n',
+          loadedAfter: false,
+        },
+      });
+      await expect(manager.stop(makeConfig())).resolves.toBeUndefined();
+    });
+
+    it('succeeds when bootout fails while launchd is still finishing an unload', async () => {
+      // fails-when: stop() checks once after a failed bootout instead of
+      // letting a teardown already in progress finish.
+      vi.useFakeTimers();
+      try {
+        simulateLaunchd({
+          loaded: true,
+          // The job leaves the domain on the 4th print after the failed bootout (~1.5s).
+          fail: {
+            verb: 'bootout',
+            status: 36,
+            stderr: 'Boot-out failed: 36\n',
+            unloadAfterPrints: 3,
+          },
+        });
+        const stopping = manager.stop(makeConfig());
+        const assertion = expect(stopping).resolves.toBeUndefined();
+        await vi.advanceTimersByTimeAsync(4_000);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('fails on a job that is neither loaded nor installed', async () => {
+      // fails-when: stop() reports success for a service with no job and no
+      // plist, e.g. one addressed by the wrong label.
+      simulateLaunchd({ loaded: false, installed: false });
+      await expect(manager.stop(makeConfig())).rejects.toThrow(/not installed/);
+    });
+
+    it('surfaces a launchctl print failure instead of reporting the job stopped', async () => {
+      // fails-when: isLoaded() reads every print failure as "not loaded", so
+      // stop() returns and the CLI prints "stopped" for a job it never saw.
+      mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
+        if (bin === 'launchctl' && Array.isArray(args) && args[0] === 'print') {
+          throw Object.assign(new Error('Command failed: launchctl print'), { status: 1 });
+        }
+        return '';
+      });
+      await expect(manager.stop(makeConfig())).rejects.toThrow(/launchctl print/);
+      const verbs = mockedExecFileSync.mock.calls.map((c: unknown[]) => (c[1] as unknown[])[0]);
+      expect(verbs).not.toContain('bootout');
+    });
+
+    it('waits past the ExitTimeOut, then fails when the job is still loaded', async () => {
+      vi.useFakeTimers();
+      try {
+        // bootout succeeds but launchd never finishes the teardown.
+        simulateLaunchd({ loaded: true, unloadAfterPrints: Number.MAX_SAFE_INTEGER });
+        let rejection: unknown;
+        const stopping = manager
+          .stop(makeConfig({ component: 'orchestrator' }))
+          .catch((err: unknown) => {
+            rejection = err;
+          });
+        // fails-when: the deadline is shorter than the plist's ExitTimeOut (45s
+        // for the orchestrator), so stop gives up before launchd has SIGKILLed.
+        await vi.advanceTimersByTimeAsync(45_000);
+        expect(rejection).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(30_000);
+        await stopping;
+        expect(String(rejection)).toMatch(/still loaded 60s after launchctl bootout/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('install over a running job', () => {
+    it("waits for a shutdown as long as the job's grace before it bootstraps", async () => {
+      // The running orchestrator takes 30s to shut down (within its 45s grace).
+      // fails-when: install waits only 15s and then retries bootstrap for ~10s
+      // more, so it bootstraps into a domain that still holds the job (EIO).
+      vi.useFakeTimers();
+      try {
+        const sim = simulateLaunchd({ loaded: true, unloadAfterPrints: 60 });
+        const installing = manager.install(makeConfig({ component: 'orchestrator' }));
+        const assertion = expect(installing).resolves.toBeUndefined();
+        await vi.advanceTimersByTimeAsync(70_000);
+        await assertion;
+        const verbs = sim.launchctlVerbs().filter((v) => v[0] !== 'print');
+        expect(verbs).toEqual([
+          ['bootout', 'system/dev.kici.kici-orchestrator'],
+          ['bootstrap', 'system', '/Library/LaunchDaemons/dev.kici.kici-orchestrator.plist'],
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
   describe('restart', () => {
-    it('stops then starts the service', async () => {
-      const config = makeConfig({ isUserLevel: false });
-      await manager.restart(config);
+    it('unloads the job, then bootstraps it again', async () => {
+      // fails-when: start() kickstarts after stop() unloaded the job (113, nothing restarts).
+      const sim = simulateLaunchd({ loaded: true });
+      await manager.restart(makeConfig({ isUserLevel: false }));
 
-      const calls = mockedExecFileSync.mock.calls.map((c: unknown[]) => c[1]);
-      expect(calls).toContainEqual(['kill', 'TERM', 'system/dev.kici.kici-orchestrator']);
-      expect(calls).toContainEqual(['kickstart', '-k', 'system/dev.kici.kici-orchestrator']);
+      const verbs = sim.launchctlVerbs().filter((v) => v[0] !== 'print');
+      expect(verbs).toEqual([
+        ['bootout', 'system/dev.kici.kici-orchestrator'],
+        ['bootstrap', 'system', '/Library/LaunchDaemons/dev.kici.kici-orchestrator.plist'],
+      ]);
     });
   });
 
   describe('status', () => {
-    it('parses running state from launchctl list', async () => {
-      mockedExecFileSync.mockReturnValue('12345\t0\tdev.kici.kici-orchestrator\n');
+    /**
+     * Answer `launchctl print` with `body` (or throw launchctl's exit code),
+     * and `launchctl list` with an output that never names the job — what a
+     * non-root caller sees for a system daemon.
+     */
+    function launchctlAnswers(print: { body: string } | { status: number }): void {
+      mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
+        if (bin !== 'launchctl' || !Array.isArray(args)) return '';
+        if (args[0] === 'print') {
+          if ('status' in print) {
+            throw Object.assign(new Error('Command failed: launchctl print'), {
+              status: print.status,
+            });
+          }
+          return print.body;
+        }
+        if (args[0] === 'list') return '123\t0\tcom.apple.something\n';
+        return '';
+      });
+    }
 
-      const config = makeConfig();
-      const result = await manager.status(config);
+    it("reads the job's own domain, which a non-root caller can see for a system daemon", async () => {
+      // fails-when: status reads `launchctl list`, which lists only the
+      // caller's domain, so a running system daemon reads as not loaded.
+      launchctlAnswers({
+        // A nested block ahead of the job's own lines repeats `pid` one tab
+        // deeper; only the one-tab line belongs to the job.
+        body:
+          'system/dev.kici.kici-orchestrator = {\n' +
+          '\tendpoints = {\n' +
+          '\t\tstate = active\n' +
+          '\t\tpid = 999\n' +
+          '\t}\n' +
+          '\tstate = running\n' +
+          '\tpid = 12345\n' +
+          '\tlast exit code = (never exited)\n' +
+          '}\n',
+      });
+      mockedExistsSync.mockReturnValue(true);
 
-      expect(result.state).toBe('running');
-      expect(result.pid).toBe(12345);
+      const result = await manager.status(makeConfig({ isUserLevel: false }));
+
+      expect(result).toEqual({ state: 'running', pid: 12345 });
+      expect(mockedExecFileSync).toHaveBeenCalledWith(
+        'launchctl',
+        ['print', 'system/dev.kici.kici-orchestrator'],
+        expect.any(Object),
+      );
     });
 
-    it('parses stopped state when PID is -', async () => {
-      mockedExecFileSync.mockReturnValue('-\t0\tdev.kici.kici-orchestrator\n');
+    it('reports stopped for a loaded job that exited cleanly', async () => {
+      launchctlAnswers({ body: '\tstate = not running\n\tlast exit code = 0\n' });
 
-      const config = makeConfig();
-      const result = await manager.status(config);
+      const result = await manager.status(makeConfig());
 
-      expect(result.state).toBe('stopped');
-      expect(result.pid).toBeUndefined();
+      expect(result).toEqual({ state: 'stopped' });
     });
 
-    it('returns failed state when exit code is non-zero', async () => {
-      mockedExecFileSync.mockReturnValue('-\t1\tdev.kici.kici-orchestrator\n');
+    it('reports failed for a loaded job whose last exit code is non-zero', async () => {
+      launchctlAnswers({ body: '\tstate = not running\n\tlast exit code = 3\n' });
 
-      const config = makeConfig();
-      const result = await manager.status(config);
+      const result = await manager.status(makeConfig());
 
       expect(result.state).toBe('failed');
     });
 
-    it('returns unknown when service not found in launchctl list', async () => {
-      mockedExecFileSync.mockImplementation(() => {
-        throw new Error('Could not find service');
-      });
+    it('reports failed for an exit code launchd prints with its name', async () => {
+      // fails-when: the exit-code pattern is anchored at the end of the line,
+      // so `78: EX_CONFIG` (a job that cannot spawn) reads as stopped.
+      launchctlAnswers({ body: '\tstate = spawn scheduled\n\tlast exit code = 78: EX_CONFIG\n' });
 
-      const config = makeConfig();
-      const result = await manager.status(config);
+      const result = await manager.status(makeConfig());
+
+      expect(result.state).toBe('failed');
+    });
+
+    it('reports failed for a job a signal terminated', async () => {
+      // fails-when: only `last exit code` is read, so a job killed by a signal
+      // (launchd prints no exit code for it) reads as stopped.
+      launchctlAnswers({ body: '\tstate = not running\n\tlast terminating signal = Killed: 9\n' });
+
+      const result = await manager.status(makeConfig());
+
+      expect(result.state).toBe('failed');
+    });
+
+    it('reports stopped for an installed job that is not loaded (the state stop leaves)', async () => {
+      // fails-when: a job launchd does not know reads as unknown whatever is on disk.
+      launchctlAnswers({ status: 113 });
+      mockedExistsSync.mockImplementation(
+        (p: string) => p === '/Library/LaunchDaemons/dev.kici.kici-orchestrator.plist',
+      );
+
+      const result = await manager.status(makeConfig({ isUserLevel: false }));
+
+      expect(result).toEqual({ state: 'stopped' });
+    });
+
+    it('reports unknown for a job that is neither loaded nor installed', async () => {
+      launchctlAnswers({ status: 113 });
+      mockedExistsSync.mockReturnValue(false);
+
+      const result = await manager.status(makeConfig());
+
+      expect(result.state).toBe('unknown');
+    });
+
+    it('reports unknown when launchctl print fails for another reason', async () => {
+      // fails-when: every print failure is read as "not loaded", so an
+      // installed service that cannot be inspected reads as stopped.
+      launchctlAnswers({ status: 1 });
+      mockedExistsSync.mockReturnValue(true);
+
+      const result = await manager.status(makeConfig());
 
       expect(result.state).toBe('unknown');
     });
@@ -558,6 +975,20 @@ describe('launchd service manager', () => {
         ['bootout', 'gui/501/dev.kici.kici-orchestrator'],
         expect.any(Object),
       );
+    });
+
+    it('keeps launchctl quiet about a job that stop already unloaded', async () => {
+      // fails-when: the bootout inherits stderr, so `stop` then `uninstall`
+      // prints "Boot-out failed: 3: No such process" to the operator.
+      simulateLaunchd({ loaded: false });
+      await expect(manager.uninstall(makeConfig())).resolves.toBeUndefined();
+
+      const bootout = mockedExecFileSync.mock.calls.find(
+        (c: unknown[]) => Array.isArray(c[1]) && (c[1] as unknown[])[0] === 'bootout',
+      );
+      expect(bootout).toBeDefined();
+      expect((bootout![2] as { stdio: unknown[] }).stdio[2]).toBe('pipe');
+      expect(mockedUnlinkSync).toHaveBeenCalled();
     });
   });
 
@@ -601,7 +1032,8 @@ describe('launchd service manager', () => {
     it('writes KiCIComponent=orchestrator into the plist when component is set', async () => {
       const config = makeConfig({ isUserLevel: false, component: 'orchestrator' });
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
-        if (Array.isArray(args) && args[0] === 'print') throw new Error('not loaded');
+        if (Array.isArray(args) && args[0] === 'print')
+          throw Object.assign(new Error('not loaded'), { status: 113 });
         return '';
       });
       await manager.install(config);
@@ -845,6 +1277,200 @@ describe('launchd service manager', () => {
     });
   });
 
+  describe('an instance whose plist carries another label', () => {
+    // list() reports com.kici.foo.plist, or a marked foo.plist, as instance "foo".
+    const DIR = '/Library/LaunchDaemons';
+    const CANONICAL_PLIST = `${DIR}/dev.kici.foo.plist`;
+    const LEGACY_PLIST = `${DIR}/com.kici.foo.plist`;
+    const config = makeConfig({ name: 'foo', isUserLevel: false });
+
+    function plistFor(label: string, { marked = true } = {}): string {
+      return [
+        '<plist version="1.0"><dict>',
+        '  <key>Label</key>',
+        `  <string>${label}</string>`,
+        ...(marked ? ['  <key>KiCIComponent</key>', '  <string>orchestrator</string>'] : []),
+        '  <key>ProgramArguments</key>',
+        '  <array>',
+        `    <string>/opt/${label}/kici-orchestrator</string>`,
+        '  </array>',
+        '</dict></plist>',
+      ].join('\n');
+    }
+
+    /**
+     * Put `files` (plist path -> content) on disk and simulate launchd, which
+     * holds each job under the Label its plist declares.
+     */
+    function onDisk(
+      files: Record<string, string>,
+      loaded: string[],
+    ): { verbs: () => unknown[][]; loaded: Set<string> } {
+      const jobs = new Set(loaded);
+      mockedExistsSync.mockImplementation((p: string) => p in files);
+      mockedReadFileSync.mockImplementation((p: string) => files[p] ?? '');
+      mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
+        if (bin !== 'launchctl' || !Array.isArray(args)) return '';
+        const target = String(args[1]).replace(/^system\//, '');
+        if (args[0] === 'print') {
+          if (!jobs.has(target)) throw Object.assign(new Error('not loaded'), { status: 113 });
+          return '\tstate = running\n\tpid = 77\n';
+        }
+        if (args[0] === 'bootout') jobs.delete(target);
+        if (args[0] === 'bootstrap') {
+          const label = /<string>([^<]+)<\/string>/.exec(files[String(args[2])] ?? '')?.[1];
+          if (label) jobs.add(label);
+        }
+        return '';
+      });
+      return {
+        loaded: jobs,
+        verbs: () =>
+          mockedExecFileSync.mock.calls
+            .filter((c: unknown[]) => c[0] === 'launchctl')
+            .map((c: unknown[]) => c[1] as unknown[])
+            .filter((v) => v[0] !== 'print'),
+      };
+    }
+
+    it('stop unloads the job under the label its plist carries', async () => {
+      // fails-when: stop() targets dev.kici.foo and answers "not installed".
+      const sim = onDisk({ [LEGACY_PLIST]: plistFor('com.kici.foo') }, ['com.kici.foo']);
+
+      await manager.stop(config);
+
+      expect(sim.verbs()).toEqual([['bootout', 'system/com.kici.foo']]);
+      expect(sim.loaded.has('com.kici.foo')).toBe(false);
+    });
+
+    it('start loads the plist it found, and status reads the job it loaded', async () => {
+      const sim = onDisk({ [LEGACY_PLIST]: plistFor('com.kici.foo') }, []);
+
+      await manager.start(config);
+
+      expect(sim.verbs()).toEqual([['bootstrap', 'system', LEGACY_PLIST]]);
+      expect(await manager.status(config)).toEqual({ state: 'running', pid: 77 });
+      expect(await manager.isInstalled(config)).toBe(true);
+      expect(await manager.readLaunchSpec(config)).toEqual({
+        execPath: '/opt/com.kici.foo/kici-orchestrator',
+        args: [],
+      });
+    });
+
+    it('restart and uninstall act on the same job', async () => {
+      const sim = onDisk({ [LEGACY_PLIST]: plistFor('com.kici.foo') }, ['com.kici.foo']);
+
+      await manager.restart(config);
+      await manager.uninstall(config);
+
+      expect(sim.verbs()).toEqual([
+        ['bootout', 'system/com.kici.foo'],
+        ['bootstrap', 'system', LEGACY_PLIST],
+        ['bootout', 'system/com.kici.foo'],
+      ]);
+      expect(mockedUnlinkSync).toHaveBeenCalledWith(LEGACY_PLIST);
+    });
+
+    it('resolves a marked plist that carries no prefix, under its declared Label', async () => {
+      const sim = onDisk({ [`${DIR}/foo.plist`]: plistFor('org.example.foo') }, [
+        'org.example.foo',
+      ]);
+
+      await manager.stop(config);
+
+      expect(sim.verbs()).toEqual([['bootout', 'system/org.example.foo']]);
+    });
+
+    it('does not act on a plist that carries no KiCI component marker', async () => {
+      // breaks-if-wrong: a same-named plist KiCI did not install is unloaded.
+      const sim = onDisk({ [`${DIR}/foo.plist`]: plistFor('foo', { marked: false }) }, ['foo']);
+
+      await expect(manager.stop(config)).rejects.toThrow(/dev\.kici\.foo is not installed/);
+      expect(sim.loaded.has('foo')).toBe(true);
+    });
+
+    it('prefers the dev.kici plist when both are installed', async () => {
+      // breaks-if-wrong: the canonical job is left running and the legacy one unloaded.
+      const sim = onDisk(
+        { [CANONICAL_PLIST]: plistFor('dev.kici.foo'), [LEGACY_PLIST]: plistFor('com.kici.foo') },
+        ['dev.kici.foo'],
+      );
+
+      await manager.stop(config);
+
+      expect(sim.verbs()).toEqual([['bootout', 'system/dev.kici.foo']]);
+    });
+
+    it('install moves the instance to dev.kici.<name>: the old job is unloaded and its plist removed', async () => {
+      // fails-when: install leaves com.kici.foo loaded beside the new job, so
+      // two processes run the same instance and fight over its port.
+      const files: Record<string, string> = { [LEGACY_PLIST]: plistFor('com.kici.foo') };
+      const sim = onDisk(files, ['com.kici.foo']);
+      mockedWriteFileSync.mockImplementation((p: string, content: string) => {
+        files[p] = content;
+      });
+      mockedUnlinkSync.mockImplementation((p: string) => {
+        delete files[p];
+      });
+
+      await manager.install(config);
+
+      expect(sim.verbs()).toEqual([
+        ['bootout', 'system/com.kici.foo'],
+        ['bootstrap', 'system', CANONICAL_PLIST],
+      ]);
+      expect(mockedUnlinkSync).toHaveBeenCalledWith(LEGACY_PLIST);
+      expect([...sim.loaded]).toEqual(['dev.kici.foo']);
+    });
+
+    it('install that cannot unload the old job leaves the instance on its old plist', async () => {
+      // fails-when: install writes dev.kici.foo.plist before it unloads
+      // com.kici.foo. A failed unload then leaves both plists, stop resolves
+      // the unloaded dev.kici job and reports success, and com.kici.foo runs on.
+      vi.useFakeTimers();
+      try {
+        const files: Record<string, string> = { [LEGACY_PLIST]: plistFor('com.kici.foo') };
+        onDisk(files, ['com.kici.foo']);
+        const simulate = mockedExecFileSync.getMockImplementation() as (
+          bin: unknown,
+          args: unknown,
+        ) => unknown;
+        mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
+          if (bin === 'launchctl' && Array.isArray(args) && args[0] === 'bootout') {
+            throw Object.assign(new Error('Boot-out failed: 1: Operation not permitted'), {
+              status: 1,
+              stderr: '',
+            });
+          }
+          return simulate(bin, args);
+        });
+        mockedWriteFileSync.mockImplementation((p: string, content: string) => {
+          files[p] = content;
+        });
+
+        const installing = manager.install(config);
+        const assertion = expect(installing).rejects.toThrow(/Operation not permitted/);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await assertion;
+
+        expect(files[CANONICAL_PLIST]).toBeUndefined();
+
+        // stop still acts on the running com.kici.foo job.
+        mockedExecFileSync.mockClear();
+        const stopping = manager.stop(config).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await stopping;
+        const bootouts = mockedExecFileSync.mock.calls
+          .filter((c: unknown[]) => Array.isArray(c[1]) && (c[1] as unknown[])[0] === 'bootout')
+          .map((c: unknown[]) => (c[1] as unknown[])[1]);
+        expect(bootouts).toContain('system/com.kici.foo');
+        expect(bootouts).not.toContain('system/dev.kici.foo');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe('readLaunchSpec', () => {
     const config = makeConfig({ isUserLevel: true });
 
@@ -883,7 +1509,7 @@ describe('launchd service manager', () => {
 
 describe('stripLabelPrefix', () => {
   it('strips the current reverse-DNS prefix', () => {
-    expect(stripLabelPrefix('dev.kici.kici-stg-orch-macos')).toBe('kici-stg-orch-macos');
+    expect(stripLabelPrefix('dev.kici.kici-orch-macos')).toBe('kici-orch-macos');
   });
 
   it('strips the historical com.kici prefix', () => {

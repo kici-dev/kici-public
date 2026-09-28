@@ -14,9 +14,9 @@
  *   GET /api/v1/admin/runs/:runId/ephemeral-key   — scrub status
  *   GET /api/v1/admin/runs/:runId/secret-outputs  — masked by default; ?reveal=true
  *
- * This is the server-side counterpart to `kici-admin runs` — the dogfooded
- * replacement for hand-rolled curl commands and dashboard clicks when
- * verifying execution state.
+ * This is the server-side counterpart to `kici-admin runs`, which replaces
+ * hand-rolled curl commands and dashboard clicks when verifying execution
+ * state.
  */
 
 import { setupStepsFirst } from '../reporting/step-display-order.js';

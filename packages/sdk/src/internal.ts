@@ -8,7 +8,7 @@
  * matrix. A workflow author never calls any of it.
  *
  * It lives on its own subpath because the root barrel is a **compat-protected**
- * surface (`.claude/rules/compatibility.md`): every symbol on it is frozen at
+ * surface: every symbol on it is frozen at
  * v1.0.0 and can only be removed at a major bump. Leaving the runtime ABI there
  * would mean a version handshake, or making the outputs map per-job instead of
  * module-global, is a customer-facing SDK deprecation — with a ledger row and a

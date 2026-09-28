@@ -43,7 +43,7 @@ The consequence is blunt: if a value isn't in the lock, the orchestrator can't s
 
 ## Orchestrator time
 
-On each event the orchestrator matches triggers using only the lock — it never clones your repository and never evaluates workflow code. Dynamic `context`, `env`, and `concurrencyGroup` functions are not run here: the orchestrator dispatches a short init step to an agent to resolve them (see below).
+On each event the orchestrator matches triggers using only the lock — it never clones your repository and never evaluates workflow code. Dynamic `context` (or `contexts` entry), `env`, `concurrencyGroup`, and `matrix` functions are not run here: the orchestrator dispatches a short init step to an agent to resolve them (see below).
 
 Trigger matching can query the **contents** of individual source files, not just their paths: a `pr()`, `push()`, or `tag()` trigger with a [`requires`](./sdk/triggers.md#content-requirements-requires) filter is matched by reading the named files at the event's commit and evaluating the filter as declarative data — still with no repository clone and no workflow code executed. A `requires` regex is checked for catastrophic (ReDoS) shapes at `kici compile` time and rejected there, so only safe patterns reach the orchestrator.
 
@@ -59,7 +59,7 @@ After dispatch, each job runs in its own ephemeral agent sandbox: a shallow clon
 
 1. **Job-level rules** are evaluated. By this point the agent has already spawned and the source has already been restored, so a job that its rules skip has **still** paid for that spawn and clone; only its steps are avoided.
 2. **Step-level rules**, then each step's `run()` body and its hooks.
-3. **Dynamic values** (`context`, `env`, `concurrencyGroup` functions) are resolved here, via a short `__init__` job that runs the function before the real job runs; this shows in the run timeline as an `Init:` entry.
+3. **Dynamic values** (`context` or `contexts` entry, `env`, `concurrencyGroup`, and `matrix` functions) are resolved here, via a short `__init__` job that runs the function before the real job runs; this shows in the run timeline as an `Init:` entry.
 4. **`dynamicJob` generators run here — both forms.** The event-only (function) form runs in a dedicated evaluation job dispatched at event time; the result-aware (options) form is deferred until its declared `needs` complete, then run with the upstream outputs frozen as `ctx.needs`.
 5. **A workflow-level `filter` predicate runs here too**, before the jobs it gates. A global workflow evaluates it once per (event × workflow repo), before any run row exists, so a `false` verdict leaves no run at all. A same-repo workflow evaluates it once per job that reaches dispatch and once per job generator, after the run row exists, so a `false` verdict leaves a run whose only entries are the evaluation jobs. Keep the predicate cheap, pure, and side-effect free — a ten-job workflow calls it ten times for one event. See [narrowing with a filter](./global-workflows.md#narrowing-with-a-filter).
 

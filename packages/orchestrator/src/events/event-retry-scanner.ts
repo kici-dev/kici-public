@@ -8,6 +8,7 @@ import type { EventEmitter } from './event-emitter.js';
 import type { EventRouterConfig } from './types.js';
 import { sweepExpiredBatchWindows } from './batch-accumulator.js';
 import { eventLeaseExpirationsTotal, setEventDlqDepth } from '../metrics/prometheus.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'event-retry-scanner' });
 
@@ -67,7 +68,7 @@ export class EventRetryScanner {
   }
 
   onBecomeLeader(): void {
-    void this.scheduler.onBecomeLeader();
+    runDetached(logger, 'Event retry scanner start', () => this.scheduler.onBecomeLeader());
   }
 
   onLoseLeadership(): void {

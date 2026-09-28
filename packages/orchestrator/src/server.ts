@@ -7,12 +7,16 @@
  *
  * Both modes connect a PlatformClient to the Platform relay and run an agent WS server.
  *
- * Startup sequence follows packages/platform/src/server.ts pattern:
+ * Startup sequence (the same one the Platform follows):
  * config -> DB -> migrations -> provider registry -> dispatcher -> PlatformClient -> app -> HTTP -> heartbeat
  *
  * Graceful shutdown in reverse order:
  * Platform client -> agent WS -> heartbeat -> HTTP -> DB
  */
+
+// First import: applies the env file a Windows service names in KICI_ENV_FILE
+// before any other module reads the environment.
+import '@kici-dev/shared/load-service-env-file';
 
 import {
   createLogger,
@@ -38,7 +42,6 @@ import { createDashboardCancelHandler } from './cancel/dashboard-cancel-handler.
 // The six workspace dep fingerprints power the SDK drift diagnostic — compare
 // orchestrator.sdkBundleHash against agent.sdkBundleHash in one log-grep.
 declare const KICI_PKG_VERSION: string;
-declare const KICI_BUILD_COMMIT: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 declare const KICI_SHARED_VERSION: string;
@@ -46,7 +49,6 @@ declare const KICI_SHARED_BUNDLE_HASH: string;
 declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
 const ORCHESTRATOR_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
-const BUILD_COMMIT = typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : 'unknown';
 const SDK_VERSION = typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown';
 const SDK_BUNDLE_HASH =
   typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown';
@@ -163,6 +165,7 @@ import {
   dashboardEncryptionJwkSchema,
   type DashboardEncryptionJwk,
 } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
+import { runDetached } from './helpers/run-detached.js';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'server' });
@@ -206,7 +209,6 @@ export async function runServer(
     // config / DB might fail later: the bundle fingerprint is always observable.
     logger.info('orchestrator.build.info', {
       orchestratorVersion: ORCHESTRATOR_VERSION,
-      buildCommit: BUILD_COMMIT,
       sdkVersion: SDK_VERSION,
       sdkBundleHash: SDK_BUNDLE_HASH,
       sharedVersion: SHARED_VERSION,
@@ -1027,29 +1029,41 @@ export async function runServer(
           ): Promise<void> => {
             try {
               const response = await run();
-              void sub.accessLogWriter?.record({
-                orgId: resolvedOrgContext?.orgId ?? null,
-                routingKey: resolvedOrgContext?.routingKey ?? null,
-                actor,
-                action: 'fleet.read',
-                target: { type: 'fleet', id: targetId },
-                requestId,
-                source: 'platform_proxy',
-                outcome: 'allowed',
-              });
+              runDetached(
+                logger,
+                'Access log write',
+                () =>
+                  sub.accessLogWriter?.record({
+                    orgId: resolvedOrgContext?.orgId ?? null,
+                    routingKey: resolvedOrgContext?.routingKey ?? null,
+                    actor,
+                    action: 'fleet.read',
+                    target: { type: 'fleet', id: targetId },
+                    requestId,
+                    source: 'platform_proxy',
+                    outcome: 'allowed',
+                  }),
+                { requestId },
+              );
               platformClient!.sendRaw(response);
             } catch (err) {
-              void sub.accessLogWriter?.record({
-                orgId: resolvedOrgContext?.orgId ?? null,
-                routingKey: resolvedOrgContext?.routingKey ?? null,
-                actor,
-                action: 'fleet.read',
-                target: { type: 'fleet', id: targetId },
-                requestId,
-                source: 'platform_proxy',
-                outcome: 'error',
-                errorMessage: toErrorMessage(err),
-              });
+              runDetached(
+                logger,
+                'Access log write',
+                () =>
+                  sub.accessLogWriter?.record({
+                    orgId: resolvedOrgContext?.orgId ?? null,
+                    routingKey: resolvedOrgContext?.routingKey ?? null,
+                    actor,
+                    action: 'fleet.read',
+                    target: { type: 'fleet', id: targetId },
+                    requestId,
+                    source: 'platform_proxy',
+                    outcome: 'error',
+                    errorMessage: toErrorMessage(err),
+                  }),
+                { requestId },
+              );
               throw err;
             }
           };
@@ -1223,29 +1237,41 @@ export async function runServer(
                   msg.requestId,
                   msg.includeAgents,
                 );
-                void sub.accessLogWriter?.record({
-                  orgId: resolvedOrgContext?.orgId ?? null,
-                  routingKey: resolvedOrgContext?.routingKey ?? null,
-                  actor: msg.actor,
-                  action: 'diagnostics.read',
-                  target: { type: 'diagnostics', id: '_' },
-                  requestId: msg.requestId,
-                  source: 'platform_proxy',
-                  outcome: 'allowed',
-                });
+                runDetached(
+                  logger,
+                  'Access log write',
+                  () =>
+                    sub.accessLogWriter?.record({
+                      orgId: resolvedOrgContext?.orgId ?? null,
+                      routingKey: resolvedOrgContext?.routingKey ?? null,
+                      actor: msg.actor,
+                      action: 'diagnostics.read',
+                      target: { type: 'diagnostics', id: '_' },
+                      requestId: msg.requestId,
+                      source: 'platform_proxy',
+                      outcome: 'allowed',
+                    }),
+                  { requestId: msg.requestId },
+                );
                 platformClient.sendRaw(response);
               } catch (err) {
-                void sub.accessLogWriter?.record({
-                  orgId: resolvedOrgContext?.orgId ?? null,
-                  routingKey: resolvedOrgContext?.routingKey ?? null,
-                  actor: msg.actor,
-                  action: 'diagnostics.read',
-                  target: { type: 'diagnostics', id: '_' },
-                  requestId: msg.requestId,
-                  source: 'platform_proxy',
-                  outcome: 'error',
-                  errorMessage: toErrorMessage(err),
-                });
+                runDetached(
+                  logger,
+                  'Access log write',
+                  () =>
+                    sub.accessLogWriter?.record({
+                      orgId: resolvedOrgContext?.orgId ?? null,
+                      routingKey: resolvedOrgContext?.routingKey ?? null,
+                      actor: msg.actor,
+                      action: 'diagnostics.read',
+                      target: { type: 'diagnostics', id: '_' },
+                      requestId: msg.requestId,
+                      source: 'platform_proxy',
+                      outcome: 'error',
+                      errorMessage: toErrorMessage(err),
+                    }),
+                  { requestId: msg.requestId },
+                );
                 throw err;
               }
             },
@@ -1282,29 +1308,41 @@ export async function runServer(
                   sub.scalerManager ?? null,
                   msg.requestId,
                 );
-                void sub.accessLogWriter?.record({
-                  orgId: resolvedOrgContext?.orgId ?? null,
-                  routingKey: resolvedOrgContext?.routingKey ?? null,
-                  actor: msg.actor,
-                  action: 'scaler.capacity.read',
-                  target: { type: 'scaler', id: '_' },
-                  requestId: msg.requestId,
-                  source: 'platform_proxy',
-                  outcome: 'allowed',
-                });
+                runDetached(
+                  logger,
+                  'Access log write',
+                  () =>
+                    sub.accessLogWriter?.record({
+                      orgId: resolvedOrgContext?.orgId ?? null,
+                      routingKey: resolvedOrgContext?.routingKey ?? null,
+                      actor: msg.actor,
+                      action: 'scaler.capacity.read',
+                      target: { type: 'scaler', id: '_' },
+                      requestId: msg.requestId,
+                      source: 'platform_proxy',
+                      outcome: 'allowed',
+                    }),
+                  { requestId: msg.requestId },
+                );
                 platformClient.sendRaw(response);
               } catch (err) {
-                void sub.accessLogWriter?.record({
-                  orgId: resolvedOrgContext?.orgId ?? null,
-                  routingKey: resolvedOrgContext?.routingKey ?? null,
-                  actor: msg.actor,
-                  action: 'scaler.capacity.read',
-                  target: { type: 'scaler', id: '_' },
-                  requestId: msg.requestId,
-                  source: 'platform_proxy',
-                  outcome: 'error',
-                  errorMessage: toErrorMessage(err),
-                });
+                runDetached(
+                  logger,
+                  'Access log write',
+                  () =>
+                    sub.accessLogWriter?.record({
+                      orgId: resolvedOrgContext?.orgId ?? null,
+                      routingKey: resolvedOrgContext?.routingKey ?? null,
+                      actor: msg.actor,
+                      action: 'scaler.capacity.read',
+                      target: { type: 'scaler', id: '_' },
+                      requestId: msg.requestId,
+                      source: 'platform_proxy',
+                      outcome: 'error',
+                      errorMessage: toErrorMessage(err),
+                    }),
+                  { requestId: msg.requestId },
+                );
                 throw err;
               }
             },
@@ -1320,29 +1358,41 @@ export async function runServer(
               };
               try {
                 const response = handleScalerAgentsRequest(diagDeps, msg.requestId, msg.scalerName);
-                void sub.accessLogWriter?.record({
-                  orgId: resolvedOrgContext?.orgId ?? null,
-                  routingKey: resolvedOrgContext?.routingKey ?? null,
-                  actor: msg.actor,
-                  action: 'scaler.agents.read',
-                  target: { type: 'scaler', id: msg.scalerName ?? '_' },
-                  requestId: msg.requestId,
-                  source: 'platform_proxy',
-                  outcome: 'allowed',
-                });
+                runDetached(
+                  logger,
+                  'Access log write',
+                  () =>
+                    sub.accessLogWriter?.record({
+                      orgId: resolvedOrgContext?.orgId ?? null,
+                      routingKey: resolvedOrgContext?.routingKey ?? null,
+                      actor: msg.actor,
+                      action: 'scaler.agents.read',
+                      target: { type: 'scaler', id: msg.scalerName ?? '_' },
+                      requestId: msg.requestId,
+                      source: 'platform_proxy',
+                      outcome: 'allowed',
+                    }),
+                  { requestId: msg.requestId },
+                );
                 platformClient.sendRaw(response);
               } catch (err) {
-                void sub.accessLogWriter?.record({
-                  orgId: resolvedOrgContext?.orgId ?? null,
-                  routingKey: resolvedOrgContext?.routingKey ?? null,
-                  actor: msg.actor,
-                  action: 'scaler.agents.read',
-                  target: { type: 'scaler', id: msg.scalerName ?? '_' },
-                  requestId: msg.requestId,
-                  source: 'platform_proxy',
-                  outcome: 'error',
-                  errorMessage: toErrorMessage(err),
-                });
+                runDetached(
+                  logger,
+                  'Access log write',
+                  () =>
+                    sub.accessLogWriter?.record({
+                      orgId: resolvedOrgContext?.orgId ?? null,
+                      routingKey: resolvedOrgContext?.routingKey ?? null,
+                      actor: msg.actor,
+                      action: 'scaler.agents.read',
+                      target: { type: 'scaler', id: msg.scalerName ?? '_' },
+                      requestId: msg.requestId,
+                      source: 'platform_proxy',
+                      outcome: 'error',
+                      errorMessage: toErrorMessage(err),
+                    }),
+                  { requestId: msg.requestId },
+                );
                 throw err;
               }
             },
@@ -1654,7 +1704,7 @@ export async function runServer(
               // from the control plane when no verified issuer is configured; the
               // verified issuer, when set, tells the dashboard to fetch the key
               // straight from the customer's own origin instead.
-              void (async () => {
+              runDetached(logger, 'Dashboard encryption capability broadcast', async () => {
                 let lastVerifiedIssuer: string | null = null;
                 const resolveKey = async () =>
                   dashboardEncryptionJwkSchema.safeParse(
@@ -1716,7 +1766,7 @@ export async function runServer(
                     error: toErrorMessage(err),
                   });
                 }
-              })();
+              });
 
               // Send state replay so Platform can reconcile execution_runs and execution_jobs.
               // The DB-backed variant adds terminal runs that completed before an orchestrator

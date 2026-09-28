@@ -6,7 +6,7 @@
  * are replaced by HMAC-signed `http://<orchUrl>/api/v1/cache/blob/...` URLs
  * — see `sign-url.ts` for the token mechanics and `app.ts` for the route.
  *
- * Intended for single-host deployments and E2E sandboxes where standing up
+ * Intended for single-host deployments and test sandboxes where standing up
  * an S3-compatible service is overkill. Production should still use S3.
  *
  * Metadata is co-located as a sibling JSON file (`<key>.meta.json`) so the

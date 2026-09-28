@@ -37,9 +37,9 @@ describe('agentVersionAtLeast', () => {
   });
 
   it('accepts a prerelease of the minimum', () => {
-    // The suffixes in play are dev-registry build counters, not release
-    // candidates: strict semver would order `0.5.0-9159` below `0.5.0` and read
-    // every staging agent as too old for a feature it in fact carries.
+    // The suffixes in play are build counters, not release candidates: strict
+    // semver would order `0.5.0-9159` below `0.5.0` and read every agent on a
+    // prerelease build as too old for a feature it in fact carries.
     expect(agentVersionAtLeast('0.5.0-9159', '0.5.0')).toBe(true);
   });
 

@@ -50,9 +50,9 @@ export interface FeedbackContract {
 
 /**
  * The single definition of what a reportable discrepancy is and what a report
- * must carry. `kici feedback` prints it, `--json` emits it verbatim, and
- * hack/feedback-contract.test.ts asserts the published guide says the same
- * thing — so the CLI and the doc cannot drift apart.
+ * must carry. `kici feedback` prints it, `--json` emits it verbatim, and a
+ * repository test asserts the published guide says the same thing — so the
+ * CLI and the doc cannot drift apart.
  */
 export const FEEDBACK_CONTRACT: FeedbackContract = {
   tracker: FEEDBACK_TRACKER_URL,

@@ -330,7 +330,7 @@ describe('retention-policy — SQL fragment generators', () => {
   });
 });
 
-describe('retention-policy — cold retention (Phase 2)', () => {
+describe('retention-policy — cold retention', () => {
   it('ACCESS_LOG_COLD_DAYS is exhaustive over AccessLogAction.options', () => {
     const mapped = new Set(Object.keys(ACCESS_LOG_COLD_DAYS));
     for (const action of AccessLogAction.options) {
@@ -438,7 +438,7 @@ describe('retention-policy — cold retention (Phase 2)', () => {
 
 describe('retention-policy — unknown-action fallback (defensive)', () => {
   it('getAccessLogWarmDays returns the conservative default for unknown actions', () => {
-    // Real-world drivers: E2E synthetic action names, future enum additions
+    // Real-world drivers: synthetic test action names, future enum additions
     // not yet in the deployed binary, post-rollback action strings.
     const warm = getAccessLogWarmDays({
       action: 'cold-store-e2e.access-action-7' as never,

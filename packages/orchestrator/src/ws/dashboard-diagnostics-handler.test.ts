@@ -191,7 +191,7 @@ describe('handleDiagnosticsRequest', () => {
           host: 'unix:///run/podman/podman.sock',
           socketPath: '/run/podman/podman.sock',
           orchestratorUrl: 'ws://localhost:4000',
-          extraHosts: ['verdaccio.local:host-gateway'],
+          extraHosts: ['registry.local:host-gateway'],
           networkIsolation: true,
         },
       ],
@@ -693,7 +693,7 @@ describe('buildSafeScalerConfig', () => {
       runtime: 'podman',
       host: 'tcp://host:2376',
       orchestratorUrl: 'ws://localhost:4000',
-      extraHosts: ['verdaccio.local:host-gateway'],
+      extraHosts: ['registry.local:host-gateway'],
       networkIsolation: true,
       warmPool: { enabled: true, size: 2, idleTimeoutSeconds: 300 },
     };
@@ -704,7 +704,7 @@ describe('buildSafeScalerConfig', () => {
     expect(safe.runtime).toBe('podman');
     expect(safe.host).toBe('tcp://host:2376');
     expect(safe.orchestratorUrl).toBe('ws://localhost:4000');
-    expect(safe.extraHosts).toEqual(['verdaccio.local:host-gateway']);
+    expect(safe.extraHosts).toEqual(['registry.local:host-gateway']);
     expect(safe.networkIsolation).toBe(true);
     expect(safe.warmPool).toEqual({ minIdle: 2, maxIdle: 2, enabled: true });
     expect(safe.labelSets).toEqual([['linux', 'x64']]);

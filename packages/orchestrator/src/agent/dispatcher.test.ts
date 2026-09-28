@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Dispatcher, containerSpawnFor, type DispatchMetrics } from './dispatcher.js';
+import {
+  Dispatcher,
+  containerSpawnFor,
+  type DispatchMetrics,
+  type OnDispatch,
+} from './dispatcher.js';
 import { AgentRegistry, BUSY_HOLD_MAX_MS } from './registry.js';
 import type { ScaleResult } from '../scaler/types.js';
 import {
@@ -962,7 +967,7 @@ describe('Dispatcher', () => {
 
       // Ack sweep requeues + one-shot redispatch — but the only matching agent
       // is transiently at capacity, so the job is left pending with no
-      // re-trigger. This is the orphan the E2E flake reproduces.
+      // re-trigger: an orphan that only the redrive below can recover.
       await dispatcher.sweepExpiredAckDeadlines();
       expect(onDispatch).not.toHaveBeenCalled();
 
@@ -3407,6 +3412,154 @@ describe('Dispatcher', () => {
         expect.any(String),
       );
       dispatcher.stopRecoveryTimers();
+    });
+  });
+
+  describe('a drain whose query fails after the claim', () => {
+    const dbDown = () => new Error('Connection terminated unexpectedly');
+    let send: ReturnType<typeof vi.fn<OnDispatch>>;
+
+    beforeEach(() => {
+      send = vi.fn<OnDispatch>();
+    });
+
+    // fails-when: the claim keeps the agent's only slot after a failed
+    // re-affirm — the agent is stranded, and the row stays dispatched to nobody.
+    it('frees the slot and puts the job back when marking it dispatched fails', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'job-a', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, dequeueJobs: [job] });
+      (queue.markDispatched as ReturnType<typeof vi.fn>).mockRejectedValueOnce(dbDown());
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+
+      await expect(dispatcher.onAgentAvailable('agent-1')).rejects.toThrow(
+        'Connection terminated unexpectedly',
+      );
+
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
+      expect(queue.requeue).toHaveBeenCalledWith('job-a', { countAttempt: false });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    // fails-when: a throw inside the dispatch callback before the send leaves
+    // the job tracked and the slot held.
+    it('frees the slot and puts the job back when the dispatch callback throws before the send', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'job-a', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, dequeueJobs: [job] });
+      send.mockRejectedValueOnce(dbDown());
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+
+      await expect(dispatcher.onAgentAvailable('agent-1')).rejects.toThrow(
+        'Connection terminated unexpectedly',
+      );
+
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
+      expect(queue.requeue).toHaveBeenCalledWith('job-a', { countAttempt: false });
+    });
+
+    // breaks-if-wrong: a put-back the requeue refuses (the run stopped after the
+    // claim) settles the row instead of leaving it dispatched to nobody.
+    it('settles the row of a stopped run when the put-back is refused', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'job-a', runId: 'run-9', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, dequeueJobs: [job] });
+      (queue.markDispatched as ReturnType<typeof vi.fn>).mockRejectedValueOnce(dbDown());
+      (queue.requeue as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+      (
+        queue as unknown as { settleClaimOfStoppedRun: ReturnType<typeof vi.fn> }
+      ).settleClaimOfStoppedRun = vi.fn().mockResolvedValue(true);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+
+      await expect(dispatcher.onAgentAvailable('agent-1')).rejects.toThrow();
+
+      expect(queue.settleClaimOfStoppedRun).toHaveBeenCalledWith('job-a', 'run-9');
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
+    });
+
+    // breaks-if-wrong: once the job reached the agent, a later failure must not
+    // put it back — it would run twice.
+    it('keeps a sent job when arming its ack deadline fails', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'job-a', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch: send,
+        getAckTimeoutMs: vi.fn().mockRejectedValue(dbDown()),
+      });
+
+      await expect(dispatcher.onAgentAvailable('agent-1')).rejects.toThrow();
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(registry.get('agent-1')!.activeJobs).toBe(1);
+      expect(queue.requeue).not.toHaveBeenCalled();
+    });
+
+    // breaks-if-wrong: a refusal already released the claim and owns the row;
+    // its failed write must not release the slot twice or put the job back.
+    it('leaves a claim that a refusal already settled', async () => {
+      registry.register('agent-1', mockWs(), ['linux'], 'linux', 'x64', undefined, 2);
+      const job = makeQueuedJob({ id: 'job-a', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, dequeueJobs: [job] });
+      (queue.markFailed as ReturnType<typeof vi.fn>).mockRejectedValueOnce(dbDown());
+      send.mockResolvedValueOnce({ refused: 'job needs a container runtime' });
+      registry.incrementActiveJobs('agent-1'); // another job already holds one slot
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+
+      await expect(dispatcher.onAgentAvailable('agent-1')).rejects.toThrow();
+
+      expect(registry.get('agent-1')!.activeJobs).toBe(1);
+      expect(queue.requeue).not.toHaveBeenCalled();
+    });
+
+    // fails-when: the slot is not freed, so the 10 s re-drive finds no idle agent
+    // and the job waits until it expires.
+    it('delivers the returned job to the idle agent on the next re-drive', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'job-a', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, dequeueJobs: [job], pendingJobs: [job] });
+      (queue.markDispatched as ReturnType<typeof vi.fn>).mockRejectedValueOnce(dbDown());
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+      await expect(dispatcher.onAgentAvailable('agent-1')).rejects.toThrow();
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(1);
+      expect(send).toHaveBeenCalledWith('agent-1', expect.objectContaining({ id: 'job-a' }));
+      expect(registry.get('agent-1')!.activeJobs).toBe(1);
+    });
+
+    // fails-when: a direct dispatch whose callback throws keeps the slot.
+    it('frees the slot when a direct dispatch fails before the send', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      send.mockRejectedValueOnce(dbDown());
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+
+      await expect(dispatcher.dispatch(makeJobInput())).rejects.toThrow(
+        'Connection terminated unexpectedly',
+      );
+
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
+      expect(queue.requeue).not.toHaveBeenCalled();
+    });
+
+    // fails-when: a pinned direct dispatch whose callback throws keeps the slot.
+    it('frees the slot when a pinned direct dispatch fails before the send', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      send.mockRejectedValueOnce(dbDown());
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch: send });
+
+      await expect(dispatcher.dispatch(makeJobInput({ pinnedAgentId: 'agent-1' }))).rejects.toThrow(
+        'Connection terminated unexpectedly',
+      );
+
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
+      expect(queue.requeue).not.toHaveBeenCalled();
     });
   });
 });

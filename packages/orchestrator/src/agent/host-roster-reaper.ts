@@ -2,6 +2,7 @@ import { createLogger } from '@kici-dev/shared';
 import type { HostRosterStore } from './host-roster.js';
 import { LeaderGatedScheduler } from '../cluster/leader-gated-scheduler.js';
 import { RebootDeadlineSweep } from '../stale-detector/reboot-deadline-sweep.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'host-roster-reaper' });
 
@@ -62,7 +63,7 @@ export class HostRosterReaper {
   }
 
   onBecomeLeader(): void {
-    void this.scheduler.onBecomeLeader();
+    runDetached(logger, 'Host roster reaper start', () => this.scheduler.onBecomeLeader());
   }
 
   onLoseLeadership(): void {

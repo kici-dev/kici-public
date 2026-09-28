@@ -2,9 +2,8 @@
  * Execution run commands for kici-admin.
  *
  * Provides operator-facing read access to execution runs and their
- * sub-resources via the orchestrator's admin HTTP API. This is the
- * dogfooded replacement for hand-rolled curl commands when inspecting
- * run state.
+ * sub-resources via the orchestrator's admin HTTP API. Use it instead of
+ * hand-rolled curl commands when inspecting run state.
  *
  *   runs list                          List execution runs (table or JSON)
  *   runs show <runId>                  Show run detail with jobs and steps
@@ -270,7 +269,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   // ── runs list ──────────────────────────────────────────────────
   runs
     .command('list')
-    .description('List execution runs (dogfooded via /api/v1/admin/runs)')
+    .description('List execution runs (admin API: /api/v1/admin/runs)')
     .option(
       '--status <statuses>',
       'Filter by run status. Accepts a single value or a comma-separated list (e.g. success,failed)',
@@ -529,7 +528,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   // ── runs jobs <runId> ──────────────────────────────────────────
   runs
     .command('jobs <runId>')
-    .description('List jobs for a run (dogfooded via /api/v1/admin/runs/:runId/jobs)')
+    .description('List jobs for a run (admin API: /api/v1/admin/runs/:runId/jobs)')
     .option('--include-steps', 'Embed step list inside each job (default false)')
     .option('--json', 'Emit raw JSON instead of a table')
     .action(async (runId: string, opts) => {
@@ -592,7 +591,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   runs
     .command('logs <runId>')
     .description(
-      'Print a page of a step log (dogfooded via /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)',
+      'Print a page of a step log (admin API: /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)',
     )
     .requiredOption('--job <jobId>', 'Job id (the dispatch_queue row id for an eval round)')
     .option('--step <n>', 'Step index (default 0; -1 is the job setup log)', '0')

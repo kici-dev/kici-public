@@ -8,7 +8,7 @@ function configWith(storage: unknown, port = 10143): AppConfig {
 }
 
 describe('resolveAgentHostAccess default', () => {
-  const base = { orchestratorUrl: 'http://192.168.1.85:10143', gateway: '172.30.0.1' };
+  const base = { orchestratorUrl: 'http://192.168.1.40:10143', gateway: '172.30.0.1' };
 
   it('grants the orchestrator port and DNS on the gateway, and nothing else', () => {
     // The whole-host grant this replaces was every port on every host address.
@@ -27,8 +27,8 @@ describe('resolveAgentHostAccess default', () => {
 
   it('folds in the host services the orchestrator directed the agent at', () => {
     expect(
-      resolveAgentHostAccess({ policy: undefined, ...base, hostServices: ['192.168.1.85:9000'] }),
-    ).toEqual(['172.30.0.1:53', '*:10143', '192.168.1.85:9000']);
+      resolveAgentHostAccess({ policy: undefined, ...base, hostServices: ['192.168.1.40:9000'] }),
+    ).toEqual(['172.30.0.1:53', '*:10143', '192.168.1.40:9000']);
   });
 
   it('does not repeat a host service that is already the orchestrator port', () => {
@@ -63,7 +63,7 @@ describe('resolveAgentHostAccess default', () => {
 });
 
 describe('resolveAgentHostAccess with an operator policy', () => {
-  const base = { orchestratorUrl: 'http://192.168.1.85:10143', gateway: '172.30.0.1' };
+  const base = { orchestratorUrl: 'http://192.168.1.40:10143', gateway: '172.30.0.1' };
 
   it('takes the label set at its word and adds nothing', () => {
     expect(
@@ -86,9 +86,9 @@ describe('storageHostAccessEntries', () => {
   it('scopes an IP-literal endpoint to that exact address and port', () => {
     expect(
       storageHostAccessEntries(
-        configWith({ type: 's3', externalEndpoint: 'http://192.168.1.85:9000' }),
+        configWith({ type: 's3', externalEndpoint: 'http://192.168.1.40:9000' }),
       ),
-    ).toEqual(['192.168.1.85:9000']);
+    ).toEqual(['192.168.1.40:9000']);
   });
 
   it('names the port on any host address when the endpoint is a name with a port', () => {
@@ -126,8 +126,8 @@ describe('storageHostAccessEntries', () => {
   it('honours an explicit filesystem base URL', () => {
     expect(
       storageHostAccessEntries(
-        configWith({ type: 'filesystem', fsBaseUrl: 'http://192.168.1.85:10143' }),
+        configWith({ type: 'filesystem', fsBaseUrl: 'http://192.168.1.40:10143' }),
       ),
-    ).toEqual(['192.168.1.85:10143']);
+    ).toEqual(['192.168.1.40:10143']);
   });
 });

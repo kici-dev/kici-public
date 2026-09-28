@@ -100,7 +100,7 @@ export interface FollowRunOptions {
   /**
    * Idle window: the max time with NO observed progress (no new log line, no run
    * status change) before the follow gives up. Resets on every progress tick, so
-   * a legitimately long run (e.g. a full `deploy:stg`, tens of minutes of image
+   * a legitimately long run (e.g. a full deploy, tens of minutes of image
    * builds + host mutation) never times out while it is actively advancing —
    * only a genuinely stalled run does. Default 15 min. `timeoutMs` is a
    * back-compat alias.

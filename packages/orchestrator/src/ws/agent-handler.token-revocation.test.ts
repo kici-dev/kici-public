@@ -1,6 +1,6 @@
 /**
- * pentest repro: agent-token revocation does not close in-flight
- * agent WS connections.
+ * regression: agent-token revocation must close in-flight agent WS
+ * connections.
  *
  * Trust model the system claims to hold:
  *   When an admin revokes an agent token (via
@@ -10,24 +10,21 @@
  *   retain data-plane access — job claims, log streaming, secret receipt
  *   — past the revocation.
  *
- *   Today the orchestrator's agent WS handler validates the token only
- *   once at the auth phase. After `register.ack` the WS stays open until
- *   the agent disconnects. `tokenStore.revoke(id)` writes `revoked_at` to
- *   the DB and returns; the existing connection is unaffected. An A10
- *   stolen-credential attacker retains data-plane access until they
- *   choose to drop the connection (typically days for a stable agent).
+ *   The orchestrator's agent WS handler validates the token only once, at
+ *   the auth phase: after `register.ack` the WS stays open until the agent
+ *   disconnects, and `tokenStore.revoke(id)` only writes `revoked_at` to the
+ *   DB. So the revoke route also kicks every in-flight WS under the token
+ *   (`AgentRegistry.disconnectByTokenId`), and cluster peers get the same
+ *   kick through a `peer.agent-token.revoke` broadcast. Without the kick, an
+ *   attacker holding a stolen token would keep data-plane access until they
+ *   chose to drop the connection (typically days for a stable agent).
  *
- * This is the direct parallel of finding `orch-token-stale-revoke`
- *   (HIGH, fixed in `4fbfba7b4`) on the orch->Platform leg. The
- *   architectural fix on that leg added a synchronous local kick + a
- *   `kici:revoke-key` Valkey channel for cross-instance fan-out. The
- *   agent->orch leg is single-instance per tenant (the orchestrator is
- *   single-tenant) so the same wiring without the cross-instance hop is
- *   the natural fix shape.
+ * The orch->Platform leg holds the same invariant: revoking an
+ *   orchestrator API key kicks its open WS, with a `kici:revoke-key`
+ *   Valkey channel for cross-instance fan-out.
  *
- * This test asserts the desired invariant (revocation propagates to
- * in-flight WS within a bounded window). It is currently expected to fail
- * (`it.fails`). When the fix lands, flip `it.fails` -> `it`.
+ * This test asserts the invariant: revocation propagates to in-flight WS
+ * within a bounded window.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PROTOCOL_VERSION } from '@kici-dev/engine';
@@ -74,7 +71,7 @@ function registerMsg(opts: { agentId: string; labels: string[] }) {
  * - flips its internal `revoked` flag on `revoke(...)` so subsequent
  *   `validate()` calls return null (mirrors production semantics: revoked_at IS NULL gate)
  *
- * Lets the test simulate a revocation that the fix's re-validation /
+ * Lets the test simulate a revocation that the re-validation /
  * listener / kick path can observe.
  */
 function makeRevocableTokenStore(authorizedLabels: string[] | null): {
@@ -124,8 +121,8 @@ function makeRevocableTokenStore(authorizedLabels: string[] | null): {
  *   1) calls `tokenStore.revoke(id)` (DB write)
  *   2) calls `agentRegistry.disconnectByTokenId(id)` (in-flight WS kick)
  *
- * The kick step is the fix; without it the WS stays open until the
- * agent itself disconnects.
+ * The kick step is what closes the WS; without it the WS stays open
+ * until the agent itself disconnects.
  */
 async function adminRevoke(
   registry: AgentRegistry,
@@ -138,7 +135,7 @@ async function adminRevoke(
   return { revoked, kicked };
 }
 
-describe(' agent-token revocation propagation to in-flight WS', () => {
+describe('agent-token revocation propagation to in-flight WS', () => {
   let registry: AgentRegistry;
   let dispatcher: Dispatcher;
 
@@ -193,7 +190,7 @@ describe(' agent-token revocation propagation to in-flight WS', () => {
   });
 
   // Sanity counter-test: a NON-revoked agent must remain connected after
-  // the same elapsed time. Catches a regression where the fix's mechanism
+  // the same elapsed time. Catches a regression where the kick mechanism
   // closes WS too aggressively (e.g., closes every WS on every poll
   // because the validate predicate inverted).
   it('does NOT close in-flight WS when the token has not been revoked', async () => {

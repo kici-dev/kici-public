@@ -4,7 +4,7 @@
  * Operator-facing read access to the per-delivery records the orchestrator
  * persists for every inbound webhook. Mirrors the dashboard's WS handler
  * (`DashboardHandler.handleEventLogList/Detail`) but is exposed over HTTP +
- * Bearer auth so operators can dogfood from the CLI without going through
+ * Bearer auth so operators can read it from the CLI without going through
  * the dashboard.
  *
  *   GET /api/v1/admin/event-log
@@ -37,7 +37,7 @@ export interface AdminEventLogRoutesDeps {
   logStorage: LogStorage;
   tokenManager: TokenManager;
   rbac: RbacEnforcer;
-  /** Phase E: optional cold-store for archived event_log rows. */
+  /** Optional cold-store for archived event_log rows. */
   coldStore?: ColdStore;
 }
 
@@ -84,10 +84,10 @@ export function createAdminEventLogRoutes(deps: AdminEventLogRoutesDeps): Hono<A
       const offset = parseInt(c.req.query('offset') ?? '0', 10) || 0;
       const includeArchived = c.req.query('includeArchived') === 'true';
 
-      // Cold-store list (Phase E) requires a routing_key to scope the
+      // Cold-store list requires a routing_key to scope the
       // tenant-partitioned scan. When `includeArchived=true` and
       // `routingKey` is supplied, the loader merges hot + cold rows;
-      // otherwise the hot-only path runs (preserving the pre-Phase-E
+      // otherwise the hot-only path runs (keeping the hot-only
       // count-and-page contract that callers without routing_key rely on).
       let rows: Awaited<ReturnType<typeof loadEventLogRange>>;
       let total: number;
@@ -215,7 +215,7 @@ export function createAdminEventLogRoutes(deps: AdminEventLogRoutesDeps): Hono<A
         deps.rbac.requirePermission(c.get('role'), 'event_log.read_payload');
       }
 
-      // Phase E: hot lookup first; on miss falls back to cold-store
+      // Hot lookup first; on miss falls back to cold-store
       // (scoped by routingKey when supplied via query).
       const row = await loadEventLogByDeliveryId({
         db: deps.db,

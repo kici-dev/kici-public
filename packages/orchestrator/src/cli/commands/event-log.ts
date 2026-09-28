@@ -2,9 +2,8 @@
  * Inbound webhook delivery log commands for kici-admin.
  *
  * Operator-facing read access to the orchestrator's event_log table via the
- * admin HTTP API. Dogfood replacement for raw psql / log-grep when an
- * operator asks "did delivery <id> arrive, and what did its payload look
- * like".
+ * admin HTTP API. Use it instead of raw psql / log-grep when an operator
+ * asks "did delivery <id> arrive, and what did its payload look like".
  *
  *   event-log list   List inbound deliveries with filters
  *   event-log show   Show a single delivery (optionally with payload)
@@ -71,7 +70,7 @@ export function registerEventLogCommands(program: Command, getClient: () => Admi
   // ── event-log list ─────────────────────────────────────────────
   eventLog
     .command('list')
-    .description('List inbound webhook deliveries (dogfooded via /api/v1/admin/event-log)')
+    .description('List inbound webhook deliveries (admin API: /api/v1/admin/event-log)')
     .option('--org <orgId>', 'Filter by org/tenant ID')
     .option('--routing-key <key>', 'Filter by routing key (e.g. github:42)')
     .option('--event <type>', 'Filter by event type (e.g. push, pull_request)')

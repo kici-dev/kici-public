@@ -18,8 +18,7 @@
  *   - `UniversalGitRepoUrlBuilder` — substitutes `{owner}`/`{name}`/`{repo}`
  *     in the source's `gitUrlTemplate`.
  *
- * No `CheckStatusPoster` is wired for v1 — forge API support for it is uneven
- * and adding it is a separate phase.
+ * No `CheckStatusPoster` is wired — forge API support for it is uneven.
  *
  * The bundle also leaves `hasForkModel` unset. The normalizer does report an
  * `isForkPR`, but it compares two repo names that `extractRepoFullName` reads

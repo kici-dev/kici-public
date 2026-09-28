@@ -192,7 +192,7 @@ export function buildProgram(): Command {
   // `workflow list` — they cover different concerns).
   registerRegistrationCommands(program, getClient);
   // Event CLI is a new top-level namespace — `event emit` lands in kici_events
-  // + pg_notify, mirroring the shared `emitKiciEventDirect` helper used by e2e.
+  // + pg_notify, mirroring the shared `emitKiciEventDirect` helper.
   registerEventCommands(program, getClient);
   // `event-dlq` is the operator triage surface for at-least-once event delivery
   // — list / retry / discard events that exhausted their retry budget.

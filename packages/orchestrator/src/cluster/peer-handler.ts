@@ -54,6 +54,7 @@ import {
   parseToken,
   type JoinTokenManager,
 } from './join-token.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'peer-handler' });
 
@@ -600,10 +601,16 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'peer.logs.collect.request': {
-        void onLogsCollectRequest?.(msg, (out) => {
-          sendEncryptedMessage(conn.ws, conn.sessionKey, out);
-          return true;
-        });
+        runDetached(
+          logger,
+          'Peer logs collect request',
+          () =>
+            onLogsCollectRequest?.(msg, (out) => {
+              sendEncryptedMessage(conn.ws, conn.sessionKey, out);
+              return true;
+            }),
+          { messageType: msg.type, peerId: conn.peerInstanceId },
+        );
         break;
       }
 
@@ -1330,8 +1337,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
    * the HTTP server during graceful shutdown, otherwise server.close() waits
    * indefinitely for upgraded WebSocket sockets to go idle — Node's
    * server.closeAllConnections() does NOT touch upgraded protocols (WS/HTTP2).
-   * Leaving this out caused the 30s graceful shutdown timer to force-exit the
-   * orchestrator with status=1 on every restart in the E2E HA chaos tests.
+   * Without it, the 30s graceful shutdown timer force-exits the orchestrator
+   * with status=1 on every restart while peers are connected.
    */
   function closeAllInbound(): void {
     for (const [, conn] of connections) {

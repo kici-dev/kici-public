@@ -18,8 +18,8 @@
  *
  *   Direct-DB mode: activated when `--database-url` is passed (or
  *   KICI_DATABASE_URL / DATABASE_URL is set). Opens its own pool and runs the
- *   SQL directly via *Direct helpers in @kici-dev/shared. Used by E2E
- *   `globalSetup` helpers that need to seed envs before the orchestrator is up.
+ *   SQL directly via *Direct helpers in @kici-dev/shared, so a setup script can
+ *   seed contexts before the orchestrator is up.
  */
 import type { Command } from 'commander';
 import {

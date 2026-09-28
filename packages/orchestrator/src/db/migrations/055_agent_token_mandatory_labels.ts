@@ -11,7 +11,7 @@ import { type Kysely, sql } from 'kysely';
  *   agent accepts any job its advertised labels match), so every existing token
  *   stays unconfined until re-minted.
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so staging data is
+ * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
  * preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {

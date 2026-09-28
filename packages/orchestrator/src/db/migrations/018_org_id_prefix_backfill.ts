@@ -9,7 +9,7 @@ import { type Kysely, sql } from 'kysely';
  * orphaned and regenerated on the next deploy. That works for
  * historical artefacts (execution_runs, event_log, access_log) but
  * NOT for tenant-state tables the orchestrator needs to recognise the
- * staging org at routing time (`sources`, `generic_webhook_sources`,
+ * tenant's org at routing time (`sources`, `generic_webhook_sources`,
  * `workflow_registrations`, `org_settings`) and the env-config tables
  * referenced from runtime requests (`environments`,
  * `environment_bindings`, `environment_source_overrides`,

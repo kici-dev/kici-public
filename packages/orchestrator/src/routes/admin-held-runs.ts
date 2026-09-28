@@ -68,6 +68,7 @@ import {
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { Database, HeldRun } from '../db/types.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'admin-held-runs' });
 
@@ -371,17 +372,23 @@ export function createHeldRunRoutes(deps: HeldRunRouteDeps): Hono<AdminEnv> {
       }
 
       const rows = (await store.listPending(customerId)).filter((r) => r.run_id === runId);
-      void deps.accessLog.record({
-        orgId: customerId,
-        routingKey: null,
-        actor: heldRunActor(c),
-        action: 'held_run.list.read',
-        target: { type: 'held_run', id: runId },
-        requestId: null,
-        source: 'admin_http',
-        outcome: 'allowed',
-        meta: { runId, pending: rows.length },
-      });
+      runDetached(
+        logger,
+        'Access log write',
+        () =>
+          deps.accessLog.record({
+            orgId: customerId,
+            routingKey: null,
+            actor: heldRunActor(c),
+            action: 'held_run.list.read',
+            target: { type: 'held_run', id: runId },
+            requestId: null,
+            source: 'admin_http',
+            outcome: 'allowed',
+            meta: { runId, pending: rows.length },
+          }),
+        { runId },
+      );
       return c.json({ heldRuns: rows.map(toSummary) });
     } catch (err) {
       return handleAdminError(c, err, logger);
@@ -474,18 +481,25 @@ async function applyAdminDecision(
       },
     });
 
-  if (result.consequence) {
+  const consequence = result.consequence;
+  if (consequence) {
     // The decision is durable, so this route answers now and audits when the
     // consequence settles — the resume replay of a workflow-scoped hold is
     // unbounded work, and an answer that waits for it is an answer whose
     // latency is the dispatch's. One entry per decision either way; a failed
     // consequence records `error` with its message, which is where an operator
     // reading `kici-admin access-log` learns the resume did not land.
-    void result.consequence.then((outcome) =>
-      recordDecisionAccess(
-        outcome.ok ? AccessLogOutcome.enum.allowed : AccessLogOutcome.enum.error,
-        outcome.error,
-      ),
+    runDetached(
+      logger,
+      'Held-run decision audit',
+      () =>
+        consequence.then((outcome) =>
+          recordDecisionAccess(
+            outcome.ok ? AccessLogOutcome.enum.allowed : AccessLogOutcome.enum.error,
+            outcome.error,
+          ),
+        ),
+      { heldRunId },
     );
   } else {
     await recordDecisionAccess(

@@ -5,7 +5,7 @@ description: Bucket and prefix map for every object-storage subsystem the orches
 
 The orchestrator writes to **three independent object-storage subsystems**: cache, logs, and cold-store. Each is configured with its own env vars and key prefix; they can share a bucket or use separate ones depending on retention and access patterns. This doc is the canonical map of which prefix holds what data, which env var names the bucket, and where to look in code if the doc and reality drift.
 
-> **Doc invariants:** any change to a storage prefix, env var, or cold-store table requires updating this doc in the same commit. See `.claude/rules/storage.md` for the enforced 1:1 rules.
+> **Doc invariants:** any change to a storage prefix, env var, or cold-store table updates this doc in the same commit.
 
 ## Bucket inventory
 
@@ -22,7 +22,7 @@ The log bucket falls back to the cache bucket if `KICI_STORAGE_LOG_BUCKET` is un
 Compiled source bundles and dependency tarballs the orchestrator hands to execution agents. Two backends ship:
 
 - `s3` — pre-signed URLs against an S3-compatible bucket. Recommended for multi-host / production deployments.
-- `filesystem` — local files served through the orchestrator's HMAC-signed `/api/v1/cache/blob/<key>` HTTP route. Intended for single-host deployments and E2E sandboxes where standing up an S3-compatible service is overkill.
+- `filesystem` — local files served through the orchestrator's HMAC-signed `/api/v1/cache/blob/<key>` HTTP route. Intended for single-host deployments and test sandboxes where standing up an S3-compatible service is overkill.
 
 ### Prefixes
 
@@ -368,7 +368,7 @@ The warm TTL column below applies **only when the cold store is configured**. Th
 | `access_log`       | 30 days                  | `KICI_AUDIT_RETENTION_DAYS` (365 days) | Audit trail of API and CLI actions on the orchestrator                    |
 | `event_log`        | 30 days                  | `KICI_AUDIT_RETENTION_DAYS` (365 days) | Webhook delivery metadata (paired with the gzipped payload object)        |
 
-Tables registered in `packages/orchestrator/src/cold-store/orchestrator-cold-store.ts`. Adding a new table to that file is a doc trigger — see `.claude/rules/storage.md`.
+Tables registered in `packages/orchestrator/src/cold-store/orchestrator-cold-store.ts`. A table added to that file is added to this list in the same commit.
 
 ## Database retention
 
@@ -471,12 +471,7 @@ Source: `packages/orchestrator/src/cold-store/orchestrator-cold-store.ts`. See [
 
 ## External services
 
-Two non-KiCI services deployed alongside the orchestrator in staging also write to S3, with their own buckets and credentials:
-
-- **Loki** (log aggregation): `<deployment-slug>-loki`
-- **Mimir** (metrics TSDB): `<deployment-slug>-mimir`
-
-These are out of scope for this doc — they're maintained by the platform deployment, not the orchestrator. See `docs/internal/platform/storage-layout.md` for the full inventory (internal docs only).
+A log or metrics stack you run next to the orchestrator (for example Loki or Mimir) may write to the same object store. Give it its own buckets and credentials: the orchestrator neither reads nor writes them, and this page does not cover them.
 
 ## See also
 

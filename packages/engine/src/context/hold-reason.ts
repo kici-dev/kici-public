@@ -4,16 +4,14 @@
  * `minimumTrust`.
  *
  * Single source of truth for the sentence: the orchestrator's trust gate emits
- * it, the ci-security DB fixture seeds it, and the unit and E2E assertions
- * compare against it. One copy means a copy edit moves every site at once
- * (`.claude/rules/code-style.md` § "Enums over hardcoded strings").
+ * it, and test fixtures and assertions compare against it. One copy means a
+ * copy edit moves every site at once.
  *
  * `held_runs.reason` is a free-text column, so this is a function rather than
  * an enum: the sentence carries the context name, which is per-hold data.
  *
  * Carries no runtime import on purpose — this module reaches the browser
- * through the engine barrel, which must pull in no Node built-ins
- * (`.claude/rules/engine.md` § "Browser-safe barrel export"). The one import
+ * through the engine barrel, which must pull in no Node built-ins. The one import
  * below is type-only and is erased at compile time.
  */
 import type { TrustTier } from './types.js';

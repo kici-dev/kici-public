@@ -8,12 +8,10 @@ import { type Kysely, sql } from 'kysely';
  * `kici-admin cold-store list-chunks` CLI can report totals without
  * issuing S3 LIST calls (expensive + rate-limited).
  *
- * Phase A creates the table empty; the cold-store archiver
- * (Phase B+) updates it transactionally with every successful chunk
+ * The table starts empty; the cold-store archiver
+ * updates it transactionally with every successful chunk
  * write via `INSERT ... ON CONFLICT (db, table_name, tenant_id) DO
  * UPDATE SET chunk_count = chunk_count + EXCLUDED.chunk_count, ...`.
- *
- * sections 5 and 8.
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {

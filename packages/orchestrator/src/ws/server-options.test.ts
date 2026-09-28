@@ -5,20 +5,19 @@ import { configureSecureWsServer } from './server-options.js';
 
 // ── `permessage-deflate` compression bombs (security invariant) ──
 //
-// Invariant (per the pentest catalog at
-// every WS endpoint that negotiates `permessage-deflate` MUST cap the maximum
-// decompressed message size via `maxPayload` (sized to `WS_MAX_PAYLOAD_BYTES`,
-// 25 MiB) and MUST set `serverNoContextTakeover: true` so per-message
-// dictionary state does not accumulate across messages.
+// Invariant: every WS endpoint that negotiates `permessage-deflate` MUST cap
+// the maximum decompressed message size via `maxPayload` (sized to
+// `WS_MAX_PAYLOAD_BYTES`, 25 MiB) and MUST set `serverNoContextTakeover: true`
+// so per-message dictionary state does not accumulate across messages.
 //
 // The orchestrator's agent-WS server is single-tenant data plane, so the
-// blast radius here is narrower than the Platform branch — A6 (fake or
-// compromised agent) DoSes its own orchestrator, not other tenants. Same
+// blast radius here is narrower than the Platform branch — a fake or
+// compromised agent DoSes its own orchestrator, not other tenants. Same
 // fix shape, same helper.
 //
 // These tests assert the EXACT configured values so any regression that
 // changes the cap or drops the flag is loud.
-describe(' compression bomb defense — orchestrator agent-WS server (security invariant)', () => {
+describe('compression bomb defense — orchestrator agent-WS server (security invariant)', () => {
   it('caps maxPayload to bound decompressed frame size (= WS_MAX_PAYLOAD_BYTES)', () => {
     const wss = new WebSocketServer({ noServer: true });
     configureSecureWsServer(wss);

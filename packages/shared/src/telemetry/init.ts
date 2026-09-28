@@ -111,7 +111,7 @@ async function probeRuntimeInstruments(): Promise<RuntimeMetricDescriptor[]> {
 /**
  * The sorted set of dotted instrument names `RuntimeNodeInstrumentation`
  * emits. This is the ground truth for the curated runtime-metrics catalog
- * drift guard (`scripts/generate-prometheus.ts`).
+ * drift guard.
  */
 export async function collectRuntimeMetricNames(): Promise<string[]> {
   const descriptors = await probeRuntimeInstruments();

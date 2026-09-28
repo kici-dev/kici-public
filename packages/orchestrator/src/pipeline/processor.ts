@@ -91,6 +91,7 @@ import {
   type ContextDataDeps,
   type DeferredContextResolution,
 } from './held-context-data.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -447,8 +448,8 @@ export function isRootJob(lockJob: LockJob): boolean {
  * Why this exists
  * ----------------
  * The webhook pipeline binds `lockFileFetcher` to the inbound webhook's
- * provider bundle. When a local-sourced webhook (e.g., the staging
- * stg-ha-smoke failover-dispatch test) arrives for a repo whose lock file
+ * provider bundle. When a local-sourced webhook (e.g., a failover-dispatch
+ * push sent through the internal ingress) arrives for a repo whose lock file
  * is only accessible via a different provider (e.g., github), the inbound
  * fetcher returns null and trigger matching silently drops the webhook.
  * This resolver lets the pipeline consult OTHER bundles whose registrations
@@ -1522,24 +1523,30 @@ async function applyContextProtectionGate(
   // every row it mints: a hold that appears in the approval queue with no trail
   // saying it was raised is a gap, whichever gate raised it. The actor is the
   // dispatcher system component — no operator is present on this path.
-  void gateDeps.accessLogWriter?.record({
-    orgId: conc.orgId,
-    routingKey: gateDeps.routingKey ?? null,
-    actor: { type: 'system', component: 'dispatcher' },
-    action: 'held_run.request',
-    target: { type: 'held_run', id: held.id },
-    requestId: null,
-    source: 'platform_proxy',
-    outcome: 'allowed',
-    meta: {
-      runId,
-      jobId: jobName,
-      holdType: HoldType.enum.concurrency,
-      concurrencyGroup: conc.group,
-      running,
-      limit: conc.limit,
-    },
-  });
+  runDetached(
+    logger,
+    'Access log write',
+    () =>
+      gateDeps.accessLogWriter?.record({
+        orgId: conc.orgId,
+        routingKey: gateDeps.routingKey ?? null,
+        actor: { type: 'system', component: 'dispatcher' },
+        action: 'held_run.request',
+        target: { type: 'held_run', id: held.id },
+        requestId: null,
+        source: 'platform_proxy',
+        outcome: 'allowed',
+        meta: {
+          runId,
+          jobId: jobName,
+          holdType: HoldType.enum.concurrency,
+          concurrencyGroup: conc.group,
+          running,
+          limit: conc.limit,
+        },
+      }),
+    { runId, heldRunId: held.id },
+  );
   return 'stop';
 }
 

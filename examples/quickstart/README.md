@@ -6,7 +6,7 @@ Two paths to a running KiCI orchestrator + agent on your machine. Pick whichever
 
 Drop-in `docker compose up -d` stack: orchestrator, agent, and PostgreSQL in three containers. Best for laptops, home servers, and quick evaluation VMs.
 
-The compose file is **generated on every release** by `packages/ci/src/generate-quickstart-compose.ts`, so the image tags always match the latest published `quay.io/kici-dev/kici-{orchestrator,agent}` build. Don't hand-edit `compose/docker-compose.yaml` — your changes will be overwritten the next time `pnpm release` runs.
+The compose file is **generated on every release**, so the image tags always match the latest published `quay.io/kici-dev/kici-{orchestrator,agent}` build. Don't hand-edit `compose/docker-compose.yaml` — the next release overwrites your changes.
 
 Walkthrough: [`docs/user/quickstart.md`](../../docs/user/quickstart.md).
 

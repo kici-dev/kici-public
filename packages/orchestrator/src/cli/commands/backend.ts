@@ -222,10 +222,10 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
   // ── backend purge-stale ───────────────────────────────────────────
   //
   // Direct-DB-only helper: removes backends whose encrypted config can no
-  // longer be decrypted (e.g. warm-start E2E where KICI_SECRET_KEY rotated
-  // between categories). The default `pg` backend is preserved — it's seeded
-  // by the initial migration with config_encrypted = '' (sentinel), so it's
-  // never the source of the decryption failure.
+  // longer be decrypted (e.g. KICI_SECRET_KEY rotated while the database kept
+  // configs encrypted under the previous key). The default `pg` backend is
+  // preserved — it's seeded by the initial migration with config_encrypted = ''
+  // (sentinel), so it's never the source of the decryption failure.
   //
   // This is a break-glass bootstrap command: it must run *before* the
   // orchestrator starts, because BackendRegistry.loadAllStores() crashes

@@ -315,7 +315,7 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
 
       const browserCmd = process.env.KICI_BROWSER_CMD;
       if (browserCmd === 'none') {
-        // Machine-parseable output for E2E test capture (no picocolors)
+        // Machine-parseable output for scripts to capture (no picocolors)
         console.log(`KICI_AUTH_URL=${authUrl.toString()}`);
         console.log(pc.cyan(`  Waiting for browser callback on port ${actualPort}...`));
       } else if (browserCmd) {
@@ -397,8 +397,8 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   const scopes = ['openid', 'profile', 'email', 'offline_access'];
 
   // Generate PKCE parameters. Keycloak's device authorization flow enforces
-  // PKCE when the client has `pkce.code.challenge.method` set (which is the
-  // KiCI staging shape — every public client requires S256). RFC 8628 itself
+  // PKCE when the client has `pkce.code.challenge.method` set (KiCI's public
+  // clients require S256). RFC 8628 itself
   // does not require PKCE on device flow, but sending the params is forward-
   // compatible with PKCE-enforced IdPs and harmless against IdPs that don't
   // enforce it. The verifier is sent back on the token-poll step below.
@@ -437,7 +437,7 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   // Display instructions to user. When the IdP returns verification_uri_complete
   // the code is embedded in the URL, so the user usually skips code entry and
   // goes straight to login + approval. Keep the `Enter code:` substring in both
-  // branches so output-parsing scrapers (E2E tests, support tooling) keep working.
+  // branches so output-parsing scrapers (automated logins, support tooling) keep working.
   console.log();
   console.log(pc.bold('  Device authorization'));
   if (deviceAuth.verification_uri_complete) {

@@ -5,9 +5,8 @@
  * a single bare-metal scaler pointed at a label set matching the default
  * `runsOn` (`default`), so an offline `kici run --local` dispatch auto-spawns an
  * ephemeral, one-job-then-exit agent on this machine. The spawned binary is a
- * small executable wrapper that execs `node <@kici-dev/agent server entry>` —
- * mirroring the shape proven by the `local-file-source` E2E, and avoiding a
- * dependency on the (non-executable) shipped `kici-agent` script.
+ * small executable wrapper that execs `node <@kici-dev/agent server entry>`,
+ * which avoids a dependency on the (non-executable) shipped `kici-agent` script.
  */
 
 import { createRequire } from 'node:module';
@@ -52,7 +51,7 @@ export const TRUSTED_ROUTING_LABEL = 'self-hosted';
  * The non-reserved routing label a `kici run --local --trusted --in-place` run
  * appends (alongside `self-hosted`) so the dispatch lands on the plane's trusted
  * **in-place** label set — the agent runs the operator's real working tree
- * directly (no clone). This is the profile KiCI's own routed `deploy:stg` uses.
+ * directly (no clone).
  */
 export const IN_PLACE_ROUTING_LABEL = 'in-place';
 
@@ -78,8 +77,7 @@ export const IN_PLACE_ROUTING_LABEL = 'in-place';
  *     - `default` + `self-hosted` + `in-place` — the trusted **in-place**
  *       profile (adds `KICI_IN_PLACE=true`) a `kici run --local --trusted
  *       --in-place` run lands on: same trusted env, but the agent uses the
- *       operator's real working tree directly (no clone) — the profile KiCI's
- *       own routed `deploy:stg` uses.
+ *       operator's real working tree directly (no clone).
  *
  * The `self-hosted` taint is the isolation guarantee: without it, an idle
  * trusted agent (spawned for an earlier `--trusted` run and lingering for

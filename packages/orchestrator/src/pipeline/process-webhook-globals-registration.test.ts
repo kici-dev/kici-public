@@ -31,7 +31,7 @@ const PER_REPO_WORKFLOW = 'repo-ci';
 const ROUTING_KEY = 'github:1';
 /** The plane's no-tenant anchor — what `resolveOrgId` reports for an unmapped source. */
 const DEFAULT_ORG = '__default__';
-const REAL_ORG = 'org_kiciStg00001';
+const REAL_ORG = 'org_acmeOrg00001';
 
 function makeInfo(): WebhookInfo {
   return {

@@ -10,9 +10,9 @@
  *
  * This module provides the orchestrator-side primitives for preparing those
  * artefacts. It is used in two contexts:
- *   - **Agent-side** (Phase 4+): the agent receives the PEM + host-key policy
+ *   - **Agent-side**: the agent receives the PEM + host-key policy
  *     in the dispatch message and materializes them before cloning.
- *   - **Lock-file fetcher** (Phase 2, this module's immediate consumer):
+ *   - **Lock-file fetcher**:
  *     the orchestrator shallow-clones the source repo itself at registration
  *     time, using the same SSH materialization path.
  *
@@ -140,8 +140,8 @@ export function prepareSshAuthSync(opts: PrepareSshAuthOptions): SshAuthArtefact
  * mismatches against cached keys). The per-call file is wiped by `cleanup()`.
  *
  * IdentitiesOnly=yes ensures ssh ignores any agent-forwarded keys and only
- * uses the one we provided; this is critical in staging where the runner
- * user may have a populated ssh-agent.
+ * uses the one we provided; this is critical on any host where the
+ * orchestrator's runtime user may have a populated ssh-agent.
  */
 export function composeGitSshCommand(
   privateKeyPath: string,

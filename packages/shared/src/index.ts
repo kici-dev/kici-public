@@ -22,7 +22,10 @@ export {
 export {
   createPool,
   createDb,
+  closeDatabase,
+  DEFAULT_DB_DRAIN_TIMEOUT_MS,
   isPoolAcquireTimeout,
+  type CloseDatabaseResult,
   type CreatePoolOptions,
   type PgPoolErrorSource,
   type PoolAcquireOutcome,
@@ -98,7 +101,16 @@ export {
 } from './db-admin.js';
 export { depCacheKeyOf, type DepCacheKey } from './dep-cache-key.js';
 export { createMetricsRoutes, type MetricsRoutesDeps } from './routes/metrics.js';
-export { createHealthRoutes, type HealthRoutesDeps } from './routes/health.js';
+export {
+  createHealthRoutes,
+  ReadinessStatus,
+  type HealthRoutesDeps,
+  type LivenessBase,
+  type LivenessResponse,
+  type ReadinessResponse,
+  type BuildFingerprint,
+  type AgentLivenessInfo,
+} from './routes/health.js';
 export { getReconnectDelay } from './reconnect-delay.js';
 export {
   initTelemetry,
@@ -121,6 +133,13 @@ export {
   PROXY_KEEP_ALIVE_TIMEOUT_MS,
   type KeepAliveTimeoutTarget,
 } from './http-server-timeouts.js';
+export {
+  stopHttpServer,
+  trackOpenSockets,
+  DEFAULT_HTTP_STOP_GRACE_MS,
+  type OpenSocketTracker,
+  type StoppableServer,
+} from './http-server-stop.js';
 export { kiciTmpBase, kiciMkdtemp } from './tmp-dir.js';
 export { createS3Client, type CreateS3ClientOptions, type SharedS3Config } from './s3-client.js';
 export {

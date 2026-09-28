@@ -12,15 +12,14 @@
  *    appear authenticated as the first-listed token's owner).
  *
  * Trust model (must hold):
- *   For attacker model A1 (external, unauthenticated) and A10 (stolen
- *   credential), the orchestrator's bearer-token validate path is the
+ *   For an external, unauthenticated attacker and for one holding a
+ *   stolen credential, the orchestrator's bearer-token validate path is the
  *   sole identity gate. Defense-in-depth requires ALL three filters
  *   apply to ALL validate calls — caching, fast paths, or "quick
- *   checks" that omit any filter widen the attack surface beyond what
- *   the catalog assumes.
+ *   checks" that omit any filter widen the attack surface.
  *
  *   The handler returns the same 401 ("Invalid or expired token") for
- *   every failure mode (`admin.ts:151`), so an attacker can't tell
+ *   every failure mode (`routes/admin-auth.ts`), so an attacker can't tell
  *   from the response whether the token was unknown, revoked, or
  *   expired — no enumeration oracle.
  */

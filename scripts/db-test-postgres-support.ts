@@ -9,9 +9,8 @@
 import { $ } from 'zx';
 
 /**
- * Throwaway Postgres image for the gated suites. Pinned via `TS_CONST_PINS` in
- * hack/containers-lock.ts (identity dhi.io/postgres+debian13), so a lock bump
- * rewrites it in place.
+ * Throwaway Postgres image for the gated suites. The repository's container-pin
+ * tooling rewrites this pin in place when the image is bumped.
  */
 export const DB_TEST_PG_IMAGE = 'dhi.io/postgres:18.6-debian13';
 
@@ -24,7 +23,7 @@ export const DB_SKIP_ENV = 'KICI_SKIP_DB_TESTS';
 export type ContainerRuntime = 'podman' | 'docker';
 
 /**
- * Both packages carry a Postgres-free static guard at
+ * Each package with such suites carries a Postgres-free static guard at
  * `src/db/migration-test-targets.test.ts`. Each reads every per-migration
  * test's source off disk and asserts it targets its own migration, so its own
  * source contains the gate env var as a string literal. Neither needs a
@@ -60,8 +59,7 @@ function defaultProbe(cmd: string): boolean {
  *
  * Deliberately NOT `podman … || docker …`: on a host with both, `podman ps`
  * exits 0 with empty output so the `||` never falls through and docker is never
- * seen (.claude/rules/e2e-executor-109.md). The primary dev machine is podman,
- * the E2E executor is Docker, so both must work.
+ * seen. A build host may have either runtime, so both must work.
  */
 export function resolveContainerRuntime(
   probe: (cmd: string) => boolean = defaultProbe,
@@ -77,9 +75,9 @@ export function resolveContainerRuntime(
 /**
  * Filter a selected spec list down to the modules that need a database.
  *
- * Matches on file CONTENT, not path: 49 of the 133 gated suites live outside
- * `db/` (platform notifications, dashboard routes, secrets, oidc, webhooks,
- * billing, auth), so a path glob would miss more than a third of them.
+ * Matches on file CONTENT, not path: many gated suites live outside `db/`
+ * (notifications, routes, secrets, OIDC, webhooks, auth), so a path glob would
+ * miss them.
  *
  * A module that cannot be read is skipped rather than fatal: a stale spec entry
  * must not take down a run that would otherwise not need a database at all.
@@ -113,8 +111,7 @@ const CONTAINER_NAME_RE = /^kici-db-test-pg-\d+-([0-9a-z]+)$/;
  * Select leaked throwaway Postgres containers old enough to reap.
  *
  * The name carries its own creation time, so a stray can be aged without asking
- * the runtime — the same trick `kici-leak-sweep` uses for leaked
- * `kici-{orch,agent}-linux-e2e-*` units.
+ * the runtime.
  *
  * A name that does not match, or whose timestamp does not parse, is NEVER
  * selected: killing a live test's database is far worse than leaving a stray

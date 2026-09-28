@@ -27,6 +27,8 @@ kici-admin agent install|uninstall|start|stop|restart|status|logs|upgrade
 
 Each `kici-admin orchestrator install` (and `kici-admin agent install`) writes a **manifest** into a deploy folder — `.kici-orchestrator.json` for the orchestrator, `.kici-agent.json` for the agent. The deploy folder is the **instance directory**: pass `--instance-dir <path>` to choose it explicitly; the default is the current working directory. Every subsequent `kici-admin <component> <cmd>` resolves its target via this manifest — either by running the command from inside the deploy folder, or by passing `--instance-dir <path>` explicitly.
 
+Re-running `install` for an instance whose deploy folder already holds its manifest updates that manifest. It does not replace it. The migration heads the instance recorded (see [The schema precondition](#the-schema-precondition)) and the time of the first install stay. The paths and the platform come from the new install. The recorded version is the version of the launcher the service definition starts: the version of its npm package, or the version folder under the install base that the launcher is in. When the launcher does not show a version, for example a `--binary` outside the install base, the version recorded before stays. A compose install records the release of the image its compose file pins. When the compose file pins `:latest`, the version recorded before stays. When the manifest cannot be read, or belongs to an instance with another name, `install` replaces it and prints a warning. To keep the env file, pass `--no-wizard` or the same `--env-file`. On a terminal, `install` otherwise runs the setup wizard, which writes a new env file.
+
 The host's installed instances are tracked at an **instance index**:
 
 - User-level: `~/.config/kici/instances.json` (Linux), `~/Library/Application Support/kici/instances.json` (macOS), `%LOCALAPPDATA%\kici\instances.json` (Windows).
@@ -48,7 +50,7 @@ Both instances can run different versions concurrently — `upgrade` flips the s
 
 ### Multi-instance hosts
 
-When running multiple orchestrators or agents on one host (for example, a dogfood instance alongside an E2E test instance), give each a distinct `--name` and a distinct `--instance-dir`. The `install` command guards against accidental collisions: it refuses to register a same-named instance at a different `--instance-dir` unless you pass `--force`. The error names the existing instance directory so you can choose between picking a different name, picking a different deploy folder, or explicitly overwriting.
+When running multiple orchestrators or agents on one host (for example, a production instance alongside a test instance), give each a distinct `--name` and a distinct `--instance-dir`. The `install` command guards against accidental collisions: it refuses to register a same-named instance at a different `--instance-dir` unless you pass `--force`. The error names the existing instance directory so you can choose between picking a different name, picking a different deploy folder, or explicitly overwriting.
 
 ### Targeting operating commands
 
@@ -72,8 +74,10 @@ A driver that cannot read its own registry is skipped instead of reporting nothi
 
 You need one of:
 
-- A **full package** (standalone, includes Node.js binary) -- see [Packaging guide](./sea-binaries.md)
+- A **full package** (standalone, includes the Node.js binary and npm) -- download it from the release, see [Download a package](./sea-binaries.md#download-a-package)
 - **Node.js 24+** with the orchestrator package installed via npm
+
+A `kici-admin` from a standalone package carries no orchestrator or agent server. With it, pass `install --binary` with the path of the launcher in the orchestrator or agent package, such as `<package dir>/kici-orchestrator-standalone`. Without `--binary`, `install` stops and asks for it.
 
 For Windows, [shawl](https://github.com/mtkennerly/shawl) is downloaded automatically on first install (cached for future use).
 
@@ -128,6 +132,12 @@ kici-admin orchestrator start --instance-dir C:\kici-deploy
 kici-admin orchestrator status --instance-dir C:\kici-deploy
 ```
 
+The Windows service receives the path of its env file in `KICI_ENV_FILE`, never the values in the file, because any local account can read the command line of a service with `sc.exe qc`. The orchestrator or agent reads the env file when it starts. Thus an edit to the file takes effect at the next `restart`. Each line is `KEY=value`, and the value is everything after the first `=`, as written: the service removes no quotes, and a `#` in a value is part of the value. `PATH` lines in the file go in front of the PATH of the service. Node.js reads some variables, such as `NODE_OPTIONS` and `NODE_EXTRA_CA_CERTS`, only when it starts. When the file sets one of them, the process starts again with the loaded environment, so the variable applies as it does on Linux and macOS. A batch file that you give as `--binary` runs before the process reads the env file, so the batch file does not see the variables in it.
+
+A service that an older CLI installed has the values of the env file on its command line. To register it again, upgrade it, or re-run `install --no-wizard` with the `--instance-dir`, `--name` and `--binary` of the first install, then `start` it. `--no-wizard` keeps the env file. Every upgrade on Windows registers the service again, with the registration of the `kici-admin` that runs the upgrade: an archive upgrade, `--rollback`, `--pick`, and an npm-source upgrade, `--restart-only` included. After an upgrade that an older `kici-admin` ran, register the service again with the new `kici-admin`. For an install from npm, run `kici-admin <component> upgrade --restart-only --yes`. For an install from a package, re-run `install --no-wizard` as above, because `--restart-only` cannot read the version of a package launcher.
+
+A release from before `KICI_ENV_FILE` can run only with the values of the env file on its command line. So on Windows, `upgrade` refuses such a release: an archive upgrade, `--rollback`, `--pick` and an npm-source upgrade all refuse it before they change anything, and the service keeps running. `install` also refuses such a release as `--binary`. To run such a release anyway, uninstall the service, then install the release with the `kici-admin` of that release.
+
 ### Docker/Podman Compose
 
 ```bash
@@ -150,6 +160,8 @@ mutable `:latest` tag:
 ```yaml
 image: quay.io/kici-dev/kici-orchestrator:0.1.15@sha256:<index-digest>
 ```
+
+The image is `kici-orchestrator` for an orchestrator and `kici-agent` for an agent, whatever `--name` the service has.
 
 The digest is the multi-arch image-index digest recorded at release time, so the
 same reference resolves the correct image on both `linux/amd64` and `linux/arm64`,
@@ -276,18 +288,21 @@ kici-admin agent install \
   --name kici-agent \
   --orchestrator-url http://orchestrator:4000 \
   --token <agent-token> \
-  --labels "os=linux,arch=amd64"
+  --labels "linux,docker"
 ```
 
 Agent-specific flags:
 
-| Flag                       | Description                           |
-| -------------------------- | ------------------------------------- |
-| `--orchestrator-url <url>` | URL of the orchestrator to connect to |
-| `--token <token>`          | Agent authentication token            |
-| `--labels <labels>`        | Comma-separated label key=value pairs |
+| Flag                       | Description                                                                                              |
+| -------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `--orchestrator-url <url>` | URL of the orchestrator to connect to                                                                    |
+| `--token <token>`          | Agent authentication token                                                                               |
+| `--labels <labels>`        | Comma-separated routing labels, for example `linux,docker`. Every agent also reports its `kici:*` labels |
+| `--port <port>`            | HTTP port for the agent's `/health`, `/ready` and `/metrics` endpoints (default `8080`)                  |
 
-The same `--instance-dir` / `--name` / `--force` flags described above apply to `agent install`. Multiple agents on one host need distinct `--name` and `--instance-dir` values; the create-path guard refuses to clobber a same-named foreign agent unless `--force` is set.
+The flags are written to the agent's env file as `KICI_ORCHESTRATOR_URL`, `KICI_AGENT_TOKEN`, `KICI_LABELS` and `KICI_PORT`.
+
+The same `--instance-dir` / `--name` / `--force` flags described above apply to `agent install`. Multiple agents on one host need distinct `--name`, `--instance-dir` and `--port` values: two agents on the same port cannot both start. The create-path guard refuses to clobber a same-named foreign agent unless `--force` is set.
 
 ## File locations
 
@@ -311,6 +326,8 @@ Instance index: `/etc/kici/instances.json` (system) or `~/.config/kici/instances
 
 Instance index: `/etc/kici/instances.json` (system) or `~/Library/Application Support/kici/instances.json` (user).
 
+A KiCI plist file named `com.kici.{name}.plist` or `{name}.plist` is also instance `{name}`. The lifecycle commands manage it under the label that the plist declares. `install` replaces it with `dev.kici.{name}`: it unloads the old job and removes the old plist.
+
 ### Windows
 
 | Level  | Config root + instance dir    | Log root + instance dir            |
@@ -319,6 +336,8 @@ Instance index: `/etc/kici/instances.json` (system) or `~/Library/Application Su
 | User   | `%LOCALAPPDATA%\kici\{name}\` | `%LOCALAPPDATA%\kici\{name}\logs\` |
 
 Instance index: `C:\ProgramData\kici\instances.json` (system) or `%LOCALAPPDATA%\kici\instances.json` (user).
+
+For a system-level service, `install` gives the config folder of the instance an ACL of its own. LocalSystem, the account the service runs as, and Administrators get full control, and other accounts get no access. Everything in the folder gets the same ACL, including the env file and the service logs. Read or edit them from an elevated shell. A user-level config folder is in the profile of its user, which other accounts cannot read, and `install` leaves its ACL unchanged.
 
 ### Install base (versioned upgrade tree)
 
@@ -342,11 +361,19 @@ Every lifecycle command resolves its target through the same priority chain: `--
 kici-admin orchestrator start [--instance-dir <path>] [--name <name>] [--platform <type>]
 ```
 
+On systemd, launchd and Windows, `start` does not restart a service that is already running.
+
 ### Stop
 
 ```bash
 kici-admin orchestrator stop [--instance-dir <path>] [--name <name>] [--platform <type>]
 ```
+
+`stop` returns when the service has stopped, and the service stays stopped until you start it. `stop` also succeeds on a service that is already stopped, so you can run it more than once.
+
+On macOS, launchd restarts a job whose process fails. So `stop` unloads the launchd job, and `start` loads it again from its plist. The plist stays installed, so launchd still starts the service at the next boot (system-level) or login (user-level). launchd gives the process 45 seconds (orchestrator) or 20 seconds (agent) to shut down before it kills the process. A service installed by an older CLI uses the launchd default of 5 seconds. To apply the longer period, re-run `install` for that service.
+
+On Windows, `stop` sends the process a ctrl-C. The service wrapper then waits up to 45 seconds (orchestrator) or 20 seconds (agent) for the process to exit. Both processes finish their own shutdown within that time. When `--binary` is a batch file (`.cmd` or `.bat`), the service runs it through `cmd.exe` with its input from `NUL`. Thus the service stops when the process exits: `cmd.exe` does not wait at its `Terminate batch job (Y/N)?` prompt. Because its input is `NUL`, a command in the batch file that waits for input, such as `timeout` or `pause`, does not wait. `install` refuses a batch-file path that holds `"`, `%` or `^`. When the path holds no space, `install` also refuses `&`, `|`, `<`, `>`, `(`, `)`, `,`, `;` and `=`. For a service installed by an older CLI, the wrapper kills what it runs 3 seconds after the ctrl-C. To apply the longer period, re-run `install` for that service, or upgrade it: every upgrade registers a Windows service again.
 
 ### Restart
 
@@ -356,7 +383,7 @@ kici-admin orchestrator restart [--instance-dir <path>] [--name <name>] [--platf
 
 ### Status
 
-Shows OS-level service state (running/stopped/failed, PID, uptime), names the config files this install owns, and queries the running orchestrator's health API for KiCI-specific info:
+Shows OS-level service state (running/stopped/failed, PID, uptime) and names the config files this install owns. For a running service, it also reads the orchestrator's `/health` and `/ready` endpoints. It finds them from the env file: the port in `KICI_PORT` (default `4000`), the path prefix in `KICI_BASE_PATH`, and the address in `KICI_HOST` when that names one address rather than every interface:
 
 ```bash
 kici-admin orchestrator status [--instance-dir <path>] [--name <name>] [--json]
@@ -372,21 +399,41 @@ PID:     12345
 Uptime:  2h 15m
 
 --- KiCI orchestrator ---
-Mode:       independent
-Port:       4000
-Database:   connected
-Agents:     3
-Scaler:     container (warm: 2, max: 10)
-Jobs:       0 pending, 1 running
+Health:     ok
+Ready:      yes
+Version:    0.11.0 (built 2026-09-25T15:27:17.455Z)
+SDK:        0.11.0 (bundle b012bd8bace3)
+Uptime:     2h 15m
 
 --- Config files ---
 Env file:      /etc/kici/kici-orchestrator/kici-orchestrator.env
 Scaler config: /etc/kici/scalers.yaml
 ```
 
+- **Health** is `ok` whenever the orchestrator answers `/health`.
+- **Ready** is `yes` when every readiness check passes: `database` (the database answers) and `warm` (the orchestrator has finished starting). Otherwise it reads `no` and names the failing checks, for example `no (failing: database)`. It reads `unknown` when `/ready` does not answer. The command waits for `/ready` a few seconds longer than the database pool waits for a connection (`KICI_DB_POOL_ACQUIRE_TIMEOUT_MS`), so a database that does not answer shows as a failing check.
+- **Version** is the KiCI release the orchestrator was built from, with its build date. **Version** and **SDK** are the build fingerprint. The SDK bundle hash matches the one `kici-admin agent status` prints when the orchestrator and the agent were built from the same SDK.
+- **Uptime** in this section is the orchestrator process's own uptime.
+
+A running service that does not answer on its port prints `(Could not reach health API)` in place of the section.
+
 The **Config files** block comes from the install manifest and the env file on disk, so it prints for a stopped service too. A compose install also lists the generated compose file. The scaler line appears only when the env file names a scaler config.
 
-Use `--json` for machine-readable output; the same paths come back as a `configPaths` object.
+Use `--json` for machine-readable output. The `health` and `readiness` objects carry the `/health` and `/ready` responses, and the config paths come back as a `configPaths` object. The `buildCommit` field of `health` is deprecated and carries the version (see [Deprecations](../../user/deprecations.md)).
+
+`kici-admin agent status` reports an agent the same way. It reads the agent's `/health` endpoint on the port the agent's env file sets in `KICI_PORT` (default `8080`):
+
+```
+--- KiCI agent ---
+Agent ID:     kici-agent-7f3a
+Orchestrator: connected
+Active jobs:  1
+Version:      0.11.0
+SDK:          0.11.0 (bundle b012bd8bace3)
+Uptime:       42m 7s
+```
+
+**Orchestrator** is `connected` while the agent's connection to its orchestrator is open. With `--json`, the `health` object carries the agent's `/health` response, with the version in the deprecated `buildCommit` field.
 
 ### Logs
 
@@ -428,19 +475,21 @@ The upgrade uses a **name-scoped versioned directory layout**: each version is e
 ```bash
 # Upgrade from a local archive (target resolved from CWD manifest)
 cd ~/kici-deploy
-kici-admin orchestrator upgrade --from /path/to/kici-orchestrator-0.3.0.tar.gz --version 0.3.0
+kici-admin orchestrator upgrade --from /path/to/kici-orchestrator-standalone-0.3.0-linux-x64.tar.gz --version 0.3.0
 
 # Or pass --instance-dir from anywhere
 kici-admin orchestrator upgrade \
   --instance-dir ~/kici-deploy \
-  --url https://releases.kici.dev/v0.3.0/kici-orchestrator.tar.gz \
+  --url https://github.com/kici-dev/kici-public/releases/download/v0.3.0/kici-orchestrator-standalone-0.3.0-linux-x64.tar.gz \
   --version 0.3.0
 ```
+
+An archive upgrade of the orchestrator starts the `kici-orchestrator-standalone` launcher of the archive, which is the independent-mode orchestrator. Use it only for an orchestrator in independent mode (`KICI_MODE=independent`), with a `kici-orchestrator-standalone` package. `--url` downloads the archive without a checksum check. To verify it first, download it and `SHA256SUMS` as [Download a package](./sea-binaries.md#download-a-package) shows, and pass the verified file with `--from`.
 
 The upgrade command:
 
 1. Resolves the target instance (refuses if no target can be resolved).
-2. Extracts the new version under the resolved instance's `<installBase>/<name>/` tree (e.g., `/opt/kici/<name>/orchestrator-0.3.0/`).
+2. Extracts the new version under the resolved instance's `<installBase>/<name>/` tree (e.g., `/opt/kici/<name>/orchestrator-0.3.0/`). On Windows, it first refuses a version from before `KICI_ENV_FILE` (see [Windows](#windows)), and extracts nothing.
 3. Stops the running service.
 4. Updates the per-instance symlink atomically (Unix) or re-registers the service (Windows).
 5. Starts the service with the new version.
@@ -462,8 +511,8 @@ kici-admin agent upgrade --version <version> --yes
 With no archive source, the self-driving upgrade:
 
 1. Reads the launch command the installed service unit will actually execute (the `ExecStart` of the systemd unit, the `ProgramArguments` of the launchd plist, or the service binary path on Windows), and from it recovers **the unit's pinned node runtime** and **the global package its launch target resolves** — `kici-admin` when the component is loaded through kici-admin's nested `node_modules`, or the standalone `@kici-dev/<component>`.
-2. Runs `npm install -g <package>@<version>` using the npm co-located with that pinned node, so the install lands in exactly the global prefix the unit's launch path resolves from — regardless of which node your interactive shell has active.
-3. Restarts the service and verifies the unit now launches `<version>`. If the launched version does not match, the upgrade fails loudly rather than reporting a success it can't stand behind.
+2. Runs `npm install -g <package>@<version>` using the npm co-located with that pinned node, so the install lands in exactly the global prefix the unit's launch path resolves from — regardless of which node your interactive shell has active. On Windows, it first asks the registry whether `<version>` reads `KICI_ENV_FILE` with `npm view`, and refuses a release from before it (see [Windows](#windows)) before npm installs anything.
+3. Restarts the service and verifies the unit now launches `<version>`. On Windows, the restart also registers the service again from the launch command that step 1 read, so its registration matches what `install` writes. If the launched version does not match, the upgrade fails loudly rather than reporting a success it can't stand behind.
 
 No archive is downloaded, no versioned directory is created, and no symlink is flipped. The `--from`/`--url` archive flow (versioned directory, symlink, and rollback) is unchanged and remains a path for offline or air-gapped upgrades.
 
@@ -479,7 +528,7 @@ If you have already installed the package yourself under the unit's runtime — 
 kici-admin orchestrator upgrade --restart-only --yes
 ```
 
-In restart-only mode the CLI reads the version the unit will actually launch, verifies it matches the invoking `kici-admin`, and only then restarts. If the versions diverge (your manual install landed under a different runtime than the unit is pinned to), it aborts **before** stopping the service and names both versions and the launch path.
+In restart-only mode the CLI reads the version the unit will actually launch, verifies it matches the invoking `kici-admin`, and only then restarts. If the versions diverge (your manual install landed under a different runtime than the unit is pinned to), it aborts **before** stopping the service and names both versions and the launch path. On Windows, the restart also registers the service again.
 
 #### `--force` for opaque launch targets
 
@@ -509,7 +558,7 @@ cd ~/kici-deploy
 kici-admin orchestrator upgrade --rollback
 ```
 
-This stops the service, switches the per-instance symlink to the previous version, and restarts.
+This stops the service, switches the per-instance symlink to the previous version, and restarts. On Windows, it registers the service again for the previous version. It refuses a previous version from before `KICI_ENV_FILE` (see [Windows](#windows)) before it stops the service.
 
 **Take a dump first**, and read the schema precondition below.
 
@@ -517,11 +566,13 @@ This stops the service, switches the per-instance symlink to the previous versio
 
 A rollback moves the code back; it does not move the database back. Each release carries a fixed list of migrations. A version whose list lacks the names your database has already applied refuses to boot with `corrupted migrations`, and restarts in a loop. Auto-migration is on by default, so this happens at startup, unconditionally.
 
-The upgrade checks for this. At every version change it records the migration head each installed version was running at. Before it flips anything, it compares that head to the live database:
+The upgrade checks for this. At every version change it records the migration head each installed version was running at. Re-running `install` keeps the recorded heads. Before the upgrade flips anything, it compares that head to the live database:
 
 - **Heads match** — the switch proceeds.
 - **The database is ahead** — the switch **refuses**, naming every migration applied since, and prints the two ways forward.
-- **No head recorded for the target** — this instance was installed before the check existed, so it cannot be verified. The switch prints a prominent warning and falls through to the usual confirmation. The head is recorded from this version change on, so the check is armed for the next one.
+- **No head recorded for the target** — this instance was installed before the check existed, or the upgrade away from the target ran without admin access. So the head cannot be verified. The switch prints a prominent warning and falls through to the usual confirmation. A version change with admin access records the head, so the check is armed for the next one.
+
+The upgrade reads the migration ledger through the admin API, as the drain does. Set `KICI_ADMIN_TOKEN` to an admin token, and `KICI_ADMIN_URL` to the address of the orchestrator. Without `KICI_ADMIN_URL`, `kici-admin` uses `http://localhost:8080`, and the orchestrator listens on port 4000 by default. Without an admin token, the upgrade records no head, and a rollback prints that the schema was not checked, then falls through to the usual confirmation.
 
 To roll back across a schema change, revert the schema first, while the newer version is still running:
 
@@ -559,7 +610,7 @@ the instance's install base — it never downloads. It requires an interactive
 terminal (for non-interactive switching, use `--rollback` or an explicit
 `--from`/`--url` archive).
 
-`--pick` runs the same schema precondition as `--rollback`, and it matters more here: `--pick` can select any installed version, not only the one immediately before the current.
+`--pick` runs the same schema precondition as `--rollback`, and it matters more here: `--pick` can select any installed version, not only the one immediately before the current. On Windows, `--pick` also refuses a version from before `KICI_ENV_FILE`, as `--rollback` does.
 
 ### Cleanup old versions
 
@@ -678,10 +729,10 @@ Services are configured with automatic restart on failure:
 This is implemented via:
 
 - systemd: `Restart=on-failure` and `RestartSec` in `[Service]`; the `StartLimitBurst` / `StartLimitIntervalSec` rate limit in `[Unit]` (systemd reads the start rate limit from `[Unit]` only)
-- launchd: `KeepAlive` with `SuccessfulExit: false`, `ThrottleInterval`
+- launchd: `KeepAlive` with `SuccessfulExit` set to false, and `ThrottleInterval`. launchd restarts the service when it exits non-zero or a signal kills it, and it has no retry limit. A plist installed by an older CLI sets `KeepAlive` to true, and launchd restarts that service after every exit.
 - Windows: `sc.exe failure` with restart actions
 
-The rate limit is written into the service definition at install time, so a
+The restart policy is written into the service definition at install time, so a
 service installed by an older CLI keeps whatever definition it was installed
 with. To apply the current restart policy to an existing instance, re-run
 `install` for it — on Unix, `upgrade` swaps the version symlink and does not
@@ -707,27 +758,19 @@ The services distinguish clean stops from fatal failures by exit code: an
 intentional shutdown (SIGTERM/SIGINT from a service stop, or an admin-initiated
 drain) exits 0 and does not trigger a restart, while a fatal internal error
 (an uncaught exception) runs the same graceful teardown but exits non-zero so
-the on-failure restart policy brings the service back automatically.
+the on-failure restart policy brings the service back automatically. This
+holds on launchd too, except for a plist from an older CLI (see above), which
+restarts the service after any exit until `stop` unloads the job.
 
 ## Firecracker scaler setup
 
-When the orchestrator is configured to use the Firecracker scaler, additional machine setup is required. The installer automates the safe parts and provides instructions for manual steps.
+When the orchestrator is configured to use the Firecracker scaler, the host needs additional setup. The installer does not do it. It only warns when the env file names Firecracker and you install a user-level service.
 
-### Automated by the installer
+- The orchestrator creates the network bridge and its NAT rules itself at startup, unless the scaler config sets `firecracker.autoProvisionHost: false`.
+- Everything else is a one-time host setup: KVM, the Firecracker and jailer binaries, the jailer user and directories, a guest kernel, and the agent rootfs image. The setup scripts for these steps, and the rootfs build script, are in `scripts/firecracker/` of the source repository, [github.com/kici-dev/kici-public](https://github.com/kici-dev/kici-public), from KiCI 0.12.0 on.
+- The scaler's network and jailer operations need root privileges, so run the installer as root to install a system-level service. [Firecracker host setup, Step 10](../orchestrator/firecracker/host-setup.md#step-10-grant-orchestrator-capabilities) describes the non-root options for a service you define yourself.
 
-- Download Firecracker and jailer binaries
-- Verify `/dev/kvm` is accessible
-- Create network bridge
-- Set up NAT rules with TCP MSS clamping
-- Download kernel and rootfs images
-
-### Manual requirements
-
-- KVM must be enabled in BIOS/firmware
-- Kernel 5.10+ with `random.trust_cpu=on` boot argument (critical for TLS in VMs)
-- The service must run as root
-
-See `scripts/firecracker/` in the source repository for detailed setup scripts.
+Follow [Firecracker host setup](../orchestrator/firecracker/host-setup.md) for every step, and the [Firecracker rootfs build guide](../orchestrator/firecracker/rootfs.md) for the image.
 
 ## Troubleshooting
 
@@ -784,3 +827,4 @@ This is done automatically during install, but can be undone if system settings 
 1. Check Windows Event Log: Event Viewer > Windows Logs > Application
 2. Verify shawl was downloaded: check `%LOCALAPPDATA%\kici\deps\` or `C:\ProgramData\kici\deps\`
 3. Ensure the binary path doesn't contain spaces without proper quoting
+4. Read the service log in `C:\ProgramData\kici\{name}\logs\`. The line `[kici] KICI_ENV_FILE names <path>, which could not be read (<code>)` means that the env file at that path is missing, or that the service account cannot read it. Put the file back, then re-run `install --no-wizard` as the Windows quick start describes, to reset its ACL.

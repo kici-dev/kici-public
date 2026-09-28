@@ -108,7 +108,7 @@ export class PeerCredentialStore {
     // Retry-once on PG unique_violation ('23505'): the partial unique index
     // peer_credentials_active_uniq makes the UPDATE+INSERT racing two
     // concurrent saves a TOCTOU loser. The retry's UPDATE now sees the
-    // winner's committed row and revokes it before re-inserting. See
+    // winner's committed row and revokes it before re-inserting.
     try {
       return { revokedCount: await runOnce() };
     } catch (err: unknown) {
@@ -271,7 +271,7 @@ export async function readCredentialFile(filePath: string): Promise<CredentialFi
  * store plus a disposer that closes the underlying pool. Lets tests
  * exercise the real Kysely-backed store without importing pg/kysely.
  *
- * Intended for e2e coverage of the store's own CRUD methods — production
+ * Intended for tests of the store's own CRUD methods — production
  * code constructs the store with an already-allocated Kysely instance
  * shared with the orchestrator.
  */

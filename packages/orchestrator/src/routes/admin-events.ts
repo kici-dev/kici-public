@@ -424,7 +424,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEve
     }
   });
 
-  // ---- Event emission (phase 28.10 plan 03 artifact) ----
+  // ---- Event emission ----
   //
   // Mirrors `emitKiciEventDirect` in `@kici-dev/shared/db-admin.ts`. INSERTs
   // a row into `kici_events` and fires `pg_notify('kici_event_channel', <id>)`

@@ -17,6 +17,10 @@
  * - SIGUSR1: Drain mode (stop accepting, finish current, exit)
  */
 
+// First import: applies the env file a Windows service names in KICI_ENV_FILE
+// before any other module reads the environment.
+import '@kici-dev/shared/load-service-env-file';
+
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { Writable } from 'node:stream';
@@ -56,7 +60,6 @@ import { decideIdleShutdown } from './idle-shutdown.js';
 // Workspace dep fingerprints power the SDK drift diagnostic: compare the agent's
 // baked sdkBundleHash against the orchestrator's at /health to catch drift in one grep.
 declare const KICI_PKG_VERSION: string;
-declare const KICI_BUILD_COMMIT: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 declare const KICI_SHARED_VERSION: string;
@@ -65,7 +68,6 @@ declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
 
 const AGENT_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : 'unknown';
-const BUILD_COMMIT = typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : 'unknown';
 const SDK_VERSION = typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown';
 const SDK_BUNDLE_HASH =
   typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown';
@@ -160,7 +162,6 @@ await guardStartup(logger, async () => {
   // class before the first workflow runs.
   logger.info('agent.build.info', {
     agentVersion: AGENT_VERSION,
-    buildCommit: BUILD_COMMIT,
     sdkVersion: SDK_VERSION,
     sdkBundleHash: SDK_BUNDLE_HASH,
     sharedVersion: SHARED_VERSION,

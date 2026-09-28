@@ -8,7 +8,7 @@
  * The in-memory private key is imported NON-EXTRACTABLE (`extractable: false`),
  * so once loaded the raw private material can never be read back out of the
  * process — the only export path is the public JWK. This is what makes the
- * private key "non-exportable by design" (design spec § A / § H).
+ * private key "non-exportable by design".
  */
 import { calculateJwkThumbprint, type JWK } from 'jose';
 import { decrypt, deriveKey, encrypt, type EncryptedValue } from '@kici-dev/shared';

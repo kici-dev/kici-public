@@ -17,7 +17,12 @@ import { execSync, spawnSync } from 'node:child_process';
 import { select } from '@inquirer/prompts';
 import {
   DEFAULT_RESTART_POLICY,
+  ENV_FILE_LOADER_EXPORT,
+  SERVICE_TEXT,
+  envFileRefusal,
   isRoot,
+  launchReadsEnvFile,
+  launchedRelease,
   kiciConfigRoot,
   readKiciVersion,
   resolveInstanceTarget,
@@ -37,6 +42,7 @@ import {
   drainTimeoutMessage,
   mergeMigrationHead,
   readLiveMigrationRows,
+  SCHEMA_NOT_CHECKED,
   schemaGuardVerdict,
   type MigrationStatusRow,
 } from './upgrade-safety.js';
@@ -44,10 +50,10 @@ import { makeTempDir } from '@kici-dev/shared/tmp';
 import { confirmPrompt } from './confirm.js';
 
 /** Component types that can be upgraded. */
-type UpgradeComponent = 'orchestrator' | 'agent';
+export type UpgradeComponent = 'orchestrator' | 'agent';
 
 /** Options for the versioned upgrade command. */
-interface VersionedUpgradeOptions {
+export interface VersionedUpgradeOptions {
   platform?: ServicePlatform;
   /**
    * Service name. No default — targeting flows through {@link resolveInstanceTarget}
@@ -164,8 +170,7 @@ export async function resolveUpgradeTarget(args: {
   });
   const config: ServiceConfig = {
     name: resolved.manifest.name,
-    displayName: `KiCI ${component}`,
-    description: `KiCI ${component} service`,
+    ...SERVICE_TEXT[component],
     executablePath: '',
     envFilePath: resolved.manifest.envFilePath,
     workingDirectory: resolved.manifest.configDir,
@@ -209,8 +214,8 @@ async function downloadArchive(url: string, destPath: string): Promise<void> {
  * Install base for a KiCI component instance.
  *
  * Name-scoped so that two instances of the same component (e.g. an org's
- * dogfood orchestrator and an E2E test orchestrator) own independent
- * versioned trees and symlinks. Per-platform bases:
+ * production orchestrator and a test orchestrator on the same host) own
+ * independent versioned trees and symlinks. Per-platform bases:
  *   - systemd / compose: /opt/kici/<name>/
  *   - launchd:           /usr/local/kici/<name>/
  *   - windows:           C:\Program Files\KiCI\<name>\
@@ -290,9 +295,103 @@ export function checkPickFlagConflicts(opts: {
   );
 }
 
+/**
+ * Point the Windows service at `launcherPath`. sc.exe has no "update binary
+ * path", so `install` replaces the registration: it checks the new launch
+ * command first, then removes the old service and waits until it is gone
+ * before it creates the new one. A launch command it refuses leaves the old
+ * registration in place.
+ */
+async function reregisterWindowsService(
+  manager: ServiceManager,
+  config: ServiceConfig,
+  launcherPath: string,
+): Promise<void> {
+  config.executablePath = launcherPath;
+  await manager.install(config);
+}
+
 /** Check if the platform is Windows. */
 function isWindows(platform: ServicePlatform): boolean {
   return platform === 'windows';
+}
+
+/**
+ * Refuse to point a Windows service at a release from before KICI_ENV_FILE.
+ * Every caller runs it before it stops the service, so a refused switch leaves
+ * the service registered and running as it was.
+ */
+function assertWindowsLaunchReadsEnvFile(args: {
+  launch: { executablePath: string; args?: string[] };
+  /** How the refusal names the release. */
+  release: string;
+  /** What was refused, for example `switch "<name>" to <version>`. */
+  action: string;
+  config: ServiceConfig;
+}): void {
+  if (launchReadsEnvFile(args.launch)) return;
+  throw new Error(
+    `refusing to ${args.action}: ${envFileRefusal(args.release, args.config.envFilePath)} ` +
+      'The service was not changed.',
+  );
+}
+
+/**
+ * Stop the service, register it again on Windows, then start it: the restart
+ * every npm-source upgrade ends with.
+ *
+ * `npm install -g` replaces the package in place, so the launch command the
+ * service runs (`spec`, read back from its registration) stays valid. On
+ * Windows the registration around that command (the service wrapper's
+ * arguments, the description, the recovery settings) is whatever the CLI that
+ * installed it wrote, so `install` writes the current one, as the archive
+ * upgrade does. A launch command that names a file that does not exist was
+ * read back wrong, so it is not registered: the service restarts as it was,
+ * with a warning. systemd and launchd keep their unit as it is.
+ */
+export async function restartOntoInstalledPackage(args: {
+  manager: ServiceManager;
+  config: ServiceConfig;
+  platform: ServicePlatform;
+  spec: LaunchSpec | null;
+}): Promise<void> {
+  const { manager, config, platform, spec } = args;
+  const component = config.component ?? 'orchestrator';
+  const read = spec ? { executablePath: spec.execPath, args: spec.args } : null;
+  const launch =
+    read && fs.existsSync(read.executablePath) && fs.existsSync(launchedRelease(read))
+      ? read
+      : null;
+  if (isWindows(platform) && launch) {
+    assertWindowsLaunchReadsEnvFile({
+      launch,
+      release: launchedRelease(launch),
+      action: `restart "${config.name}" onto the installed package`,
+      config,
+    });
+  }
+  const status = await manager.status(config);
+  if (status.state === 'running') await manager.stop(config);
+  if (isWindows(platform)) {
+    if (launch) {
+      try {
+        await manager.install({ ...config, ...launch });
+      } catch (err) {
+        throw new Error(
+          `could not register the service again: ${toErrorMessage(err)}. ` +
+            `Run \`kici-admin ${component} install\` for it.`,
+          { cause: err },
+        );
+      }
+      console.log('Service registration rewritten from the current installer.');
+    } else {
+      console.warn(
+        'Warning: the service was not registered again, because its launch command could not ' +
+          `be read, or names a file that does not exist. Run \`kici-admin ${component} install\` for it to apply the current registration.`,
+      );
+    }
+  }
+  await manager.start(config);
 }
 
 /** Get the launcher script name for a component. */
@@ -330,6 +429,67 @@ function extractArchive(archivePath: string, destDir: string): string {
     throw new Error('Archive does not contain a directory');
   }
   return dirs[0]!;
+}
+
+/**
+ * Extract a release archive into `tmpDir` and return the release folder in it.
+ * On Windows a release from before KICI_ENV_FILE is refused here, before
+ * anything is copied into the install base or the service is stopped.
+ */
+export function extractRelease(args: {
+  archivePath: string;
+  tmpDir: string;
+  component: UpgradeComponent;
+  platform: ServicePlatform;
+  version: string;
+  config: ServiceConfig;
+}): string {
+  const { archivePath, tmpDir, component, platform, version, config } = args;
+  const extractDir = path.join(tmpDir, 'extract');
+  const srcDir = path.join(extractDir, extractArchive(archivePath, extractDir));
+  if (isWindows(platform)) {
+    assertWindowsLaunchReadsEnvFile({
+      launch: { executablePath: path.join(srcDir, getLauncherName(component, platform)) },
+      release: `version ${version}`,
+      action: `upgrade "${config.name}" to ${version}`,
+      config,
+    });
+  }
+  return srcDir;
+}
+
+/**
+ * Put the release in `archivePath` at `versionedDirPath`. The release is
+ * extracted and checked first ({@link extractRelease}); only then is a folder
+ * already at `versionedDirPath` removed, which the caller allows with
+ * `--force`, and the release copied in. A refused release leaves the install
+ * base as it was.
+ */
+export function installRelease(args: {
+  archivePath: string;
+  tmpDir: string;
+  installBase: string;
+  versionedDirPath: string;
+  component: UpgradeComponent;
+  platform: ServicePlatform;
+  version: string;
+  config: ServiceConfig;
+}): void {
+  const { installBase, versionedDirPath, platform } = args;
+  const srcDir = extractRelease(args);
+  if (fs.existsSync(versionedDirPath)) {
+    console.log(`Removing existing directory ${versionedDirPath} (--force)`);
+    fs.rmSync(versionedDirPath, { recursive: true, force: true });
+  }
+  // A platform copy handles a move across devices (e.g., /tmp on tmpfs to
+  // /opt/kici on disk).
+  fs.mkdirSync(installBase, { recursive: true });
+  if (isWindows(platform)) {
+    execSync(`xcopy "${srcDir}" "${versionedDirPath}" /E /I /Q /Y`, { stdio: 'inherit' });
+  } else {
+    execSync(`cp -r "${srcDir}" "${versionedDirPath}"`, { stdio: 'inherit' });
+  }
+  console.log(`Extracted to ${versionedDirPath}`);
 }
 
 /**
@@ -575,21 +735,91 @@ export function planNpmSourceUpgrade(opts: {
   return { kind: 'self-drive', target, version: requestedVersion };
 }
 
-/** Injected process runner seam for {@link installGlobalPackage}. */
-type SpawnRunner = (
+/** Injected process runner seam for the npm calls of an npm-source upgrade. */
+export type SpawnRunner = (
   cmd: string,
   args: string[],
   opts?: { env?: NodeJS.ProcessEnv },
-) => { status: number | null; stderr: string };
+) => { status: number | null; stdout: string; stderr: string };
+
+/**
+ * The cmd.exe command line for npm on Windows. npm is a batch file there, which
+ * Node.js starts only through a shell, and Node.js joins the parts of a shell
+ * command with spaces and quotes none of them. The standard Node.js install is
+ * under `C:\Program Files`, so the npm path is quoted here. An argument with a
+ * character outside those of a package name, a version or a flag is refused
+ * rather than handed to cmd.exe.
+ */
+export function windowsShellCommand(cmd: string, args: string[]): string {
+  if (cmd.includes('"')) {
+    throw new Error(`cannot run "${cmd}" through cmd.exe: the path holds a double quote`);
+  }
+  for (const arg of args) {
+    if (!/^[A-Za-z0-9@/._+-]+$/.test(arg)) {
+      throw new Error(`cannot pass "${arg}" to npm: it holds a character cmd.exe reads as syntax`);
+    }
+  }
+  return [`"${cmd}"`, ...args].join(' ');
+}
 
 const defaultSpawnRunner: SpawnRunner = (cmd, args, opts) => {
-  const r = spawnSync(cmd, args, {
-    encoding: 'utf-8',
-    shell: process.platform === 'win32',
-    env: opts?.env ?? process.env,
-  });
-  return { status: r.status, stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
+  const env = opts?.env ?? process.env;
+  const r =
+    process.platform === 'win32'
+      ? spawnSync(windowsShellCommand(cmd, args), { encoding: 'utf-8', shell: true, env })
+      : spawnSync(cmd, args, { encoding: 'utf-8', env });
+  return {
+    status: r.status,
+    stdout: r.stdout ?? '',
+    stderr: (r.stderr ?? '') + (r.error ? String(r.error) : ''),
+  };
 };
+
+/**
+ * The environment npm runs in: the unit's pinned node first on PATH, because
+ * npm derives its global prefix from the node that runs it.
+ */
+function npmEnv(target: NpmInstallTarget): NodeJS.ProcessEnv {
+  const pinnedBinDir = path.dirname(target.nodeExecPath);
+  return { ...process.env, PATH: `${pinnedBinDir}${path.delimiter}${process.env.PATH ?? ''}` };
+}
+
+/**
+ * Whether `version` of the KiCI packages reads KICI_ENV_FILE, asked of the
+ * registry the unit's npm installs from. A release that reads it publishes the
+ * env-file loader in `@kici-dev/shared`, which every KiCI package of the same
+ * version depends on.
+ */
+export function npmReleaseReadsEnvFile(
+  target: NpmInstallTarget,
+  version: string,
+  run: SpawnRunner = defaultSpawnRunner,
+): { ok: true; reads: boolean } | { ok: false; error: string } {
+  const res = run(target.npmPath, ['view', `@kici-dev/shared@${version}`, 'exports', '--json'], {
+    env: npmEnv(target),
+  });
+  if (res.status !== 0) {
+    return { ok: false, error: res.stderr.trim() || `npm view exited with ${res.status}` };
+  }
+  const out = res.stdout.trim();
+  // A release whose @kici-dev/shared declares no exports prints nothing.
+  if (!out) return { ok: true, reads: false };
+  let exportsMap: unknown;
+  try {
+    exportsMap = JSON.parse(out);
+  } catch {
+    return { ok: false, error: `npm view printed no JSON: ${out.slice(0, 200)}` };
+  }
+  if (Array.isArray(exportsMap)) {
+    return {
+      ok: false,
+      error: `npm matched more than one version of @kici-dev/shared for ${version}; pass an exact --version`,
+    };
+  }
+  const reads =
+    typeof exportsMap === 'object' && exportsMap !== null && ENV_FILE_LOADER_EXPORT in exportsMap;
+  return { ok: true, reads };
+}
 
 /**
  * Install `<owningPackage>@<version>` globally under the unit's own pinned node,
@@ -610,12 +840,9 @@ export function installGlobalPackage(
   version: string,
   run: SpawnRunner = defaultSpawnRunner,
 ): { ok: boolean; stderr: string } {
-  const pinnedBinDir = path.dirname(target.nodeExecPath);
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    PATH: `${pinnedBinDir}${path.delimiter}${process.env.PATH ?? ''}`,
-  };
-  const res = run(target.npmPath, ['install', '-g', `${target.owningPackage}@${version}`], { env });
+  const res = run(target.npmPath, ['install', '-g', `${target.owningPackage}@${version}`], {
+    env: npmEnv(target),
+  });
   return { ok: res.status === 0, stderr: res.stderr };
 }
 
@@ -790,16 +1017,12 @@ export async function performVersionedUpgrade(
     const versionedDirName = `${component}-${version}`;
     const versionedDirPath = path.join(installBase, versionedDirName);
 
-    // Check if versioned directory already exists
-    if (fs.existsSync(versionedDirPath)) {
-      if (opts.force) {
-        console.log(`Removing existing directory ${versionedDirPath} (--force)`);
-        fs.rmSync(versionedDirPath, { recursive: true, force: true });
-      } else {
-        console.error(`Error: version directory already exists: ${versionedDirPath}`);
-        console.error('Use --force to overwrite.');
-        process.exit(1);
-      }
+    // An existing versioned directory is replaced only with --force, and only
+    // once the new release is accepted (installRelease).
+    if (fs.existsSync(versionedDirPath) && !opts.force) {
+      console.error(`Error: version directory already exists: ${versionedDirPath}`);
+      console.error('Use --force to overwrite.');
+      process.exit(1);
     }
 
     // Check service is installed
@@ -846,22 +1069,23 @@ export async function performVersionedUpgrade(
       }
     }
 
-    // Extract archive to temp directory
+    // Extract the archive, check the release, and copy it into the install base.
     console.log('Extracting archive...');
-    const extractDir = path.join(tmpDir, 'extract');
-    const extractedDirName = extractArchive(archivePath, extractDir);
-
-    // Move extracted directory to versioned location.
-    // Use platform-appropriate copy to handle cross-device moves
-    // (e.g., /tmp on tmpfs → /opt/kici on disk).
-    fs.mkdirSync(installBase, { recursive: true });
-    const srcDir = path.join(extractDir, extractedDirName);
-    if (isWindows(platform)) {
-      execSync(`xcopy "${srcDir}" "${versionedDirPath}" /E /I /Q /Y`, { stdio: 'inherit' });
-    } else {
-      execSync(`cp -r "${srcDir}" "${versionedDirPath}"`, { stdio: 'inherit' });
+    try {
+      installRelease({
+        archivePath,
+        tmpDir,
+        installBase,
+        versionedDirPath,
+        component,
+        platform,
+        version,
+        config,
+      });
+    } catch (err) {
+      await cleanupTmpDir();
+      throw err;
     }
-    console.log(`Extracted to ${versionedDirPath}`);
 
     // Take a dump and quiesce the coordinator BEFORE anything stops. Both are
     // orchestrator-only: an agent has no database and no drain.
@@ -877,14 +1101,8 @@ export async function performVersionedUpgrade(
 
     // Update version pointer
     if (isWindows(platform)) {
-      // Windows: uninstall and re-install with the new executable path.
-      // sc.exe has no "update binary path" — must delete+create the service.
       const launcherPath = path.join(versionedDirPath, getLauncherName(component, platform));
-      config.executablePath = launcherPath;
-      await manager.uninstall(config);
-      // Brief pause after deletion to let Windows fully release the service kernel object.
-      await new Promise((r) => setTimeout(r, 2_000));
-      await manager.install(config);
+      await reregisterWindowsService(manager, config, launcherPath);
       // Track current version in a file (Windows has no symlinks)
       writeCurrentVersion(installBase, component, version);
       console.log(`Service registration updated to ${launcherPath}`);
@@ -988,11 +1206,49 @@ async function performNpmSourceUpgrade(
   }
 
   if (action.kind === 'restart-only') {
-    await restartOnlyUpgrade(component, config, resolvedInstance, manager, action.verdict, opts);
+    await restartOnlyUpgrade({
+      component,
+      config,
+      resolvedInstance,
+      manager,
+      verdict: action.verdict,
+      opts,
+      platform,
+      spec,
+    });
     return;
   }
 
-  await performSelfDrivingInstall(component, config, resolvedInstance, manager, action, opts);
+  await performSelfDrivingInstall({
+    component,
+    config,
+    resolvedInstance,
+    manager,
+    action,
+    opts,
+    platform,
+    spec,
+  });
+}
+
+/** The inputs of {@link restartOnlyUpgrade}. */
+export interface RestartOnlyArgs {
+  component: UpgradeComponent;
+  config: ServiceConfig;
+  resolvedInstance: ResolvedInstance;
+  manager: ServiceManager;
+  verdict: NpmSourceLaunchVerdict;
+  opts: VersionedUpgradeOptions;
+  platform: ServicePlatform;
+  /** The launch command read from the registration before the upgrade. */
+  spec: LaunchSpec | null;
+}
+
+/** The inputs of {@link performSelfDrivingInstall}. */
+export interface SelfDriveArgs extends Omit<RestartOnlyArgs, 'verdict'> {
+  action: { target: NpmInstallTarget; version: string };
+  /** Runs npm; tests inject it. */
+  run?: SpawnRunner;
 }
 
 /**
@@ -1000,14 +1256,8 @@ async function performNpmSourceUpgrade(
  * kici-admin) themselves. Verify the unit will launch the invoking CLI's version,
  * restart onto it, and persist the manifest version.
  */
-async function restartOnlyUpgrade(
-  component: UpgradeComponent,
-  config: ServiceConfig,
-  resolvedInstance: ResolvedInstance,
-  manager: ServiceManager,
-  verdict: NpmSourceLaunchVerdict,
-  opts: VersionedUpgradeOptions,
-): Promise<void> {
+export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
+  const { config, resolvedInstance, manager, verdict, opts, platform, spec } = args;
   if (!verdict.ok) {
     console.error(`Error: ${verdict.reason}`);
     process.exit(1);
@@ -1027,11 +1277,7 @@ async function restartOnlyUpgrade(
   }
 
   console.log('Restarting service onto the npm-installed package...');
-  const status = await manager.status(config);
-  if (status.state === 'running') {
-    await manager.stop(config);
-  }
-  await manager.start(config);
+  await restartOntoInstalledPackage({ manager, config, platform, spec });
 
   if (verdict.manifestVersion !== null) {
     writeManifest(resolvedInstance.instanceDir, {
@@ -1052,15 +1298,30 @@ async function restartOnlyUpgrade(
  * pinned node/npm, restart, and verify the unit now launches the requested
  * version.
  */
-async function performSelfDrivingInstall(
-  component: UpgradeComponent,
-  config: ServiceConfig,
-  resolvedInstance: ResolvedInstance,
-  manager: ServiceManager,
-  action: { target: NpmInstallTarget; version: string },
-  opts: VersionedUpgradeOptions,
-): Promise<void> {
+export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<void> {
+  const { component, config, resolvedInstance, manager, action, opts, platform, spec } = args;
   const { target, version } = action;
+
+  // Before anything is installed: a Windows service may not run a release from
+  // before KICI_ENV_FILE, and once npm has replaced the package the service
+  // would start that release at its next restart.
+  if (isWindows(platform)) {
+    const release = `${target.owningPackage}@${version}`;
+    const verdict = npmReleaseReadsEnvFile(target, version, args.run);
+    if (!verdict.ok) {
+      throw new Error(
+        `could not check whether ${release} reads KICI_ENV_FILE: ${verdict.error}. ` +
+          'The service and the installed package were not changed.',
+      );
+    }
+    if (!verdict.reads) {
+      throw new Error(
+        `refusing to install ${release} for "${config.name}": ` +
+          `${envFileRefusal(release, config.envFilePath)} ` +
+          'The service and the installed package were not changed.',
+      );
+    }
+  }
 
   if (!opts.yes) {
     console.log(`This will install ${target.owningPackage}@${version} using ${target.npmPath}`);
@@ -1074,7 +1335,7 @@ async function performSelfDrivingInstall(
   }
 
   console.log(`Installing ${target.owningPackage}@${version} under the unit's runtime...`);
-  const result = installGlobalPackage(target, version);
+  const result = installGlobalPackage(target, version, args.run);
   if (!result.ok) {
     const hint = /EACCES|permission denied|EPERM/i.test(result.stderr)
       ? " The unit's global prefix is not writable — re-run with privileges matching the unit's runtime."
@@ -1085,9 +1346,7 @@ async function performSelfDrivingInstall(
   }
 
   console.log('Restarting service onto the freshly-installed package...');
-  const status = await manager.status(config);
-  if (status.state === 'running') await manager.stop(config);
-  await manager.start(config);
+  await restartOntoInstalledPackage({ manager, config, platform, spec });
 
   // Verify the unit now launches the requested version.
   const newSpec = await manager.readLaunchSpec(config);
@@ -1182,14 +1441,6 @@ async function handlePick(
 }
 
 /**
- * Stop the service, switch the active version pointer to an already-installed
- * versioned directory (atomic symlink on Unix; uninstall→install + version file
- * on Windows), restart, and persist the new `kiciVersion` into the manifest.
- *
- * Shared by `--rollback` (switch to the previous version) and `--pick` (switch
- * to any chosen installed version).
- */
-/**
  * Refuse a version switch whose target cannot boot against the current schema.
  *
  * `--rollback` and `--pick` both flip a version pointer, and the previous
@@ -1220,7 +1471,7 @@ async function assertSchemaAllowsSwitch(args: {
   // because the thing being rolled back is already down.
   if (rows === null) {
     console.log('');
-    console.log('  !!  The running service could not be reached, so the schema was not checked.');
+    console.log(`  !!  ${SCHEMA_NOT_CHECKED}`);
     console.log('');
     return yes ? true : confirm('Proceed with the switch anyway?');
   }
@@ -1273,6 +1524,14 @@ async function assertSchemaAllowsSwitch(args: {
   return true;
 }
 
+/**
+ * Stop the service, switch the active version pointer to an already-installed
+ * versioned directory (atomic symlink on Unix; re-registration + version file
+ * on Windows), restart, and persist the new `kiciVersion` into the manifest.
+ *
+ * Shared by `--rollback` (switch to the previous version) and `--pick` (switch
+ * to any chosen installed version).
+ */
 export async function switchToInstalledVersion(args: {
   component: UpgradeComponent;
   platform: ServicePlatform;
@@ -1290,6 +1549,22 @@ export async function switchToInstalledVersion(args: {
 }): Promise<void> {
   const { component, platform, installBase, config, manager, resolvedInstance, targetVersion } =
     args;
+  const launcherPath = path.join(
+    installBase,
+    `${component}-${targetVersion}`,
+    getLauncherName(component, platform),
+  );
+
+  // First, before the schema check can revert anything: `--rollback` and
+  // `--pick` may select a release an older CLI installed.
+  if (isWindows(platform)) {
+    assertWindowsLaunchReadsEnvFile({
+      launch: { executablePath: launcherPath },
+      release: `version ${targetVersion}`,
+      action: `switch "${config.name}" to ${targetVersion}`,
+      config,
+    });
+  }
 
   // The guard lives here rather than in handleRollback so `--pick` inherits it
   // for free — `--pick` can select ANY installed version, which is a strictly
@@ -1315,14 +1590,7 @@ export async function switchToInstalledVersion(args: {
   }
 
   if (isWindows(platform)) {
-    const launcherPath = path.join(
-      installBase,
-      `${component}-${targetVersion}`,
-      getLauncherName(component, platform),
-    );
-    config.executablePath = launcherPath;
-    await manager.uninstall(config);
-    await manager.install(config);
+    await reregisterWindowsService(manager, config, launcherPath);
     writeCurrentVersion(installBase, component, targetVersion);
     console.log(`Service registration updated to ${launcherPath}`);
   } else {

@@ -264,7 +264,7 @@ ScalerCapacitySummary:
 
 | Field                   | Type       | Required | Description                                                                                                                                |
 | ----------------------- | ---------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| name                    | string     | No       | Scaler backend name (e.g., `stg-worker-bare-metal`)                                                                                        |
+| name                    | string     | No       | Scaler backend name (e.g., `worker-bare-metal`)                                                                                            |
 | type                    | string     | No       | Scaler backend type (e.g., `bare-metal`, `container`)                                                                                      |
 | labelSets               | string[][] | Yes      | Label sets this backend provisions                                                                                                         |
 | maxAgents               | number     | Yes      | Maximum agents for this backend                                                                                                            |

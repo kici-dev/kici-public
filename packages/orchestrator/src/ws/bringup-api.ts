@@ -19,7 +19,7 @@ import {
   SSH_TRANSPORT_CAPABILITY,
   type AccessLogAction,
 } from '@kici-dev/engine';
-import { AgentDeliveryMode, AgentPlatform } from '@kici-dev/shared';
+import { AgentDeliveryMode, AgentPlatform, createLogger } from '@kici-dev/shared';
 import {
   presignAgentPackageDownload,
   type AgentPackageDownloadStorage,
@@ -36,6 +36,9 @@ import type { AgentRegistry } from '../agent/registry.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import { runDetached } from '../helpers/run-detached.js';
+
+const logger = createLogger({ prefix: 'bringup-api' });
 
 /** Bootstrap token TTL: short by design — a leaked token is inert after it. */
 export const BOOTSTRAP_TOKEN_TTL_MS = 10 * 60 * 1000;
@@ -150,18 +153,24 @@ function recordBringup(
   targetAgentId: string,
   outcome: 'allowed' | 'denied',
 ): void {
-  void deps.accessLog.record({
-    orgId: null,
-    routingKey: null,
-    // An ops agent is a service-account principal (a non-human orchestrator
-    // tenant), targeting a fleet host over the agent-WS RPC plane.
-    actor: { type: 'service_account', id: callingAgentId },
-    action,
-    target: { type: 'fleet', id: targetAgentId },
-    requestId: null,
-    source: 'agent',
-    outcome,
-  });
+  runDetached(
+    logger,
+    'Access log write',
+    () =>
+      deps.accessLog.record({
+        orgId: null,
+        routingKey: null,
+        // An ops agent is a service-account principal (a non-human orchestrator
+        // tenant), targeting a fleet host over the agent-WS RPC plane.
+        actor: { type: 'service_account', id: callingAgentId },
+        action,
+        target: { type: 'fleet', id: targetAgentId },
+        requestId: null,
+        source: 'agent',
+        outcome,
+      }),
+    { agentId: targetAgentId },
+  );
 }
 
 /** Resolve a `scope/key` secret ref into (scope, key). The key is the last segment. */

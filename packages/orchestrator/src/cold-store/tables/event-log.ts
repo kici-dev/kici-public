@@ -1,25 +1,19 @@
 /**
- * `event_log` cold-store adapter (Orchestrator side) —.
- *
- *  §2 row 6
- * and §10.
+ * `event_log` cold-store adapter (Orchestrator side).
  *
  * Contract:
  *   - tenant column: `routing_key` (NOT NULL on this side — no
  *     synthetic-tenant fallback like access_log / secret_audit_log)
  *   - partition column: `received_at`
- *   - warm TTL: 30 days (replaces the previous 30-day hard delete in
- *     `packages/orchestrator/src/webhook/event-log.ts:cleanup` +
- *     `packages/orchestrator/src/queue/cleanup.ts:runCleanup` step 4)
+ *   - warm TTL: 30 days (rows are archived, not hard-deleted)
  *
  * Per-row payload retention: rows on this table carry a `payload_key`
  * pointing at a gzipped webhook body in object storage (LogStorage).
  * Cold-store packages the row metadata — including `payload_key` —
  * but does NOT touch the body the key points to. The body remains in
  * S3 indefinitely so the dashboard delivery-detail page resolves
- * payload reads identically for hot and cold rows. The pre-Phase-E
- * cleanup that deleted both the row and the payload blob in
- * lock-step is retired.
+ * payload reads identically for hot and cold rows. Nothing deletes the
+ * row and the payload blob in lock-step.
  *
  * Recursive write: archiving event_log rows writes one access_log
  * audit row per chunk (the orchestrator's audit surface). The new
@@ -41,7 +35,7 @@ const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|event_log';
 /** Approximate per-row bytes for the minWarmTenantBytes floor check. */
 const APPROX_ROW_BYTES = 800;
 
-/** Per-table defaults (design §5 matrix row 6). */
+/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,
@@ -174,7 +168,7 @@ export class EventLogAdapter implements TableAdapter<EventLogColdStoreRow> {
 
       await trx.deleteFrom('event_log').where('id', 'in', ids).execute();
 
-      // Orchestrator-side audit goes to access_log (mirrors design §8 —
+      // Orchestrator-side audit goes to access_log (the audit split —
       // Platform → audit_log, Orchestrator → access_log).
       await trx
         .insertInto('access_log')

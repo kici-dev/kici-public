@@ -93,8 +93,8 @@ interface ForkRunnerOptions {
   /**
    * Extra absolute host paths to bind read-only into the bwrap sandbox.
    * Used by the bare-metal sandbox to expose `file://` clone source dirs
-   * (internal provider, dev/E2E) to the workflow runner so its `git clone`
-   * step can read from them. Ignored when useBwrap=false.
+   * (the internal provider's local repositories) to the workflow runner so its
+   * `git clone` step can read from them. Ignored when useBwrap=false.
    */
   extraReadOnlyBinds?: string[];
   /**
@@ -299,7 +299,7 @@ export function buildRequest(
     upstreamInvokeResults: dispatch.upstreamInvokeResults as
       Record<string, import('@kici-dev/engine').InvokeResult[]> | undefined,
 
-    // Private-registry install auth (Phase 4 of private-registry plan).
+    // Private-registry install auth.
     npmRegistries: dispatch.npmRegistries,
     installEnvSecrets: dispatch.installEnvSecrets,
     jobIdShort: dispatch.jobId.slice(0, 8),
@@ -395,7 +395,7 @@ export function buildBwrapArgs(
   // Bind the host's name-resolution files read-only so sandboxed workflows can
   // resolve hostnames the same way the host does. bwrap auto-creates /etc with
   // ONLY the explicitly-bound files, so without these an /etc/hosts-only name
-  // (e.g. verdaccio.local -> 127.0.0.1, used by `npm install` in
+  // (e.g. registry.local -> 127.0.0.1, used by `npm install` in
   // KICI_SANDBOX_NETWORK=host mode) is invisible to glibc's `files` source and
   // the name silently resolves via mDNS/DNS to a different host — pointing the
   // install at the wrong registry and failing the run. /etc/nsswitch.conf pins
@@ -440,7 +440,7 @@ export function buildBwrapArgs(
   //
   // Two cases:
   //
-  // 1. **pnpm workspace install (dev/staging).** runnerPath lives somewhere
+  // 1. **pnpm workspace install (a source checkout).** runnerPath lives somewhere
   //    like /repo/packages/agent/dist/workflow-runner.js, and pnpm's
   //    symlinked node_modules point at sibling packages
   //    (e.g. /repo/packages/shared). We must bind the entire workspace

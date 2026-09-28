@@ -28,6 +28,7 @@ const mockReadFileSync = vi.fn(() => '');
 const DIGEST = 'a'.repeat(64);
 vi.mock('./image-digests.js', () => ({
   resolveImageRef: (name: string) => `quay.io/kici-dev/${name}:0.1.15@sha256:${DIGEST}`,
+  installerImageName: (component: string) => `kici-${component}`,
 }));
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -144,14 +145,29 @@ describe('ComposeServiceManager', () => {
       expect(content).not.toContain('docker.io/kici-dev');
     });
 
-    it('derives the image name from config.name (e.g., kici-agent maps to kici-agent)', async () => {
+    it('derives the image name from the component (an agent runs kici-agent)', async () => {
       const { ComposeServiceManager } = await import('./compose.js');
       const mgr = new ComposeServiceManager();
-      const agentConfig: ServiceConfig = { ...testConfig, name: 'kici-agent' };
+      const agentConfig: ServiceConfig = { ...testConfig, name: 'kici-agent', component: 'agent' };
       await mgr.install(agentConfig);
 
       const [, content] = mockWriteFileSync.mock.calls[0];
       expect(content).toContain(`image: quay.io/kici-dev/kici-agent:0.1.15@sha256:${DIGEST}`);
+    });
+
+    // fails-when: the image is named after the service, so a custom --name pins
+    // an image repository that is never published.
+    it('pins the published image for a custom service name', async () => {
+      const { ComposeServiceManager } = await import('./compose.js');
+      const mgr = new ComposeServiceManager();
+      await mgr.install({ ...testConfig, name: 'build-farm-a', component: 'orchestrator' });
+
+      const [, content] = mockWriteFileSync.mock.calls[0];
+      expect(content).toContain(
+        `image: quay.io/kici-dev/kici-orchestrator:0.1.15@sha256:${DIGEST}`,
+      );
+      expect(content).not.toContain('kici-dev/build-farm-a');
+      expect(content).toContain('container_name: build-farm-a');
     });
 
     it("grants the orchestrator more stop grace than compose's 10s default", async () => {

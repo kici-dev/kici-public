@@ -39,8 +39,8 @@ export function createWorkflowBundleConfig(options: WorkflowBundleOptions) {
       format: 'es' as const,
       sourcemap: options.sourcemap ?? false,
       // Force a single output chunk even when transitive deps use dynamic
-      // `import()` (e.g. our staging deploy workflow imports library modules
-      // that lazy-load `pg` / `@aws-sdk/client-s3`). Without this, Rolldown
+      // `import()` (e.g. a deploy workflow that imports library modules
+      // which lazy-load `pg` / `@aws-sdk/client-s3`). Without this, Rolldown
       // hits "output.dir required for multiple chunks" — and switching to
       // output.dir would break the single-file `executeConfig()` flow in the
       // compiler's hot path. `inlineDynamicImports: true` is deprecated in

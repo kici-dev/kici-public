@@ -26,6 +26,7 @@
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { tryResolveVerifiedIssuer, type VerifiedIssuerReader } from './verified-issuer.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'orch:verified-issuer-poller' });
 
@@ -47,7 +48,7 @@ export function startVerifiedIssuerPoller(opts: VerifiedIssuerPollerOptions): ()
   const timer = setInterval(() => {
     if (reading) return;
     reading = true;
-    void (async () => {
+    runDetached(logger, 'Verified issuer re-read', async () => {
       try {
         const read = await tryResolveVerifiedIssuer(opts.reader);
         if (!read.ok) {
@@ -66,7 +67,7 @@ export function startVerifiedIssuerPoller(opts: VerifiedIssuerPollerOptions): ()
       } finally {
         reading = false;
       }
-    })();
+    });
   }, opts.intervalMs);
   // Never hold the process open for a config poll.
   timer.unref?.();

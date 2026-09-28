@@ -158,11 +158,10 @@ The resolver emits structured log markers operators can grep for:
 - `Multi-provider fallback: fetcher threw, continuing` (warn) — when a
   fallback fetcher throws; processing continues with the next fallback.
 
-Staging deploys should look for both success markers during the
-`stg-ha-smoke` failover-dispatch test window — the fallback resolution
-marker and the dispatch bundle swap marker together confirm the full
-cross-provider pipeline is live. See `docs/internal/staging-deployment.md`
-for deploy-time verification steps.
+For one delivery, look for both success markers: the fallback resolution
+marker and the dispatch bundle swap marker. Together they confirm the whole
+cross-provider path. The fallback resolved the lock file, and the dispatch
+used the fallback's clone URL and token.
 
 ### Tests
 
@@ -192,10 +191,3 @@ covers the multi-provider lock-file fallback:
 9. **No repoUrlBuilder fallback** — fallback bundle has
    `lockFileFetcher` but no `repoUrlBuilder` → dispatched job's `repoUrl`
    is `''` (graceful degradation, no crash).
-
-E2E coverage via `e2e/tests/stg-ha-smoke.test.ts` failover-dispatch test
-which proves the end-to-end flow against deployed staging: real push webhook
-→ internal ingress → fallback resolves lock file via github bundle → trigger
-match → dispatch through coord B with `https://github.com/` clone URL →
-agent clones successfully → `scalerContext.scalerName.endsWith('-b')` →
-run reaches terminal `completed`.

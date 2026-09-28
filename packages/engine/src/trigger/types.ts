@@ -792,9 +792,15 @@ export interface ResolvedSandboxGrant {
   capabilities?: string[];
   /** Network override; when set it wins over the config network mode. */
   network?: SandboxNetworkMode;
-  /** Force a read-only rootfs (operator-config path only in Phase 2). */
+  /**
+   * Force a read-only rootfs. The orchestrator does not grant it; the agent's
+   * own config sets it.
+   */
   readonlyRootfs?: boolean;
-  /** Run the container as this user (operator-config path only in Phase 2). */
+  /**
+   * Run the container as this user. The orchestrator does not grant it; the
+   * agent's own config sets it.
+   */
   user?: string;
 }
 

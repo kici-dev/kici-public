@@ -132,7 +132,7 @@ In your CI pipeline, verify that the workflow source compiles without errors:
 kici compile --check
 ```
 
-This validates all workflows and generates the lock file in memory without writing it. If any workflow has syntax errors or invalid configuration, the command exits non-zero. Pair this with the agent-side hash verification (below) for full drift detection -- `--check` catches broken source, while the agent catches source-lock-file mismatches at run time.
+This validates all workflows and generates the lock file in memory without writing it. It also type-checks the workflow sources with `tsc --noEmit`. The type-check is skipped when `.kici/` has no `tsconfig.json`. If any workflow has syntax errors, type errors, or invalid configuration, the command exits non-zero. Pair this with the agent-side hash verification (below) for full drift detection -- `--check` catches broken source, while the agent catches source-lock-file mismatches at run time.
 
 ## Files the content hash skips (`.kici/.kiciignore`)
 

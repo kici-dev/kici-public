@@ -15,8 +15,7 @@
  * `kici verify-attestation` pins the token `iss` to the trust root supplied
  * out-of-band (default = the configured orchestrator's issuer), so a
  * `kici-local` bundle rejects structurally against a real trust root and only
- * verifies against a `kici local trust-root` export. See
- * `.claude/rules/platform-hosting-model.md`.
+ * verifies against a `kici local trust-root` export.
  *
  * This signer is constructed ONLY when the orchestrator runs in `independent`
  * mode with `KICI_INDEPENDENT_IDENTITY=1` (set solely by the local dev plane's

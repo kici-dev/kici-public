@@ -5,9 +5,8 @@
  * - Logs warnings for agents past the unhealthy threshold (90s).
  * - Forcibly disconnects agents past the disconnect threshold (180s).
  *
- * Follows the same pattern as the Platform HeartbeatMonitor
- * (packages/platform/src/ws/heartbeat.ts) for consistency across
- * the three-tier architecture.
+ * Follows the same pattern as the Platform's heartbeat monitor, for
+ * consistency across the three-tier architecture.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';

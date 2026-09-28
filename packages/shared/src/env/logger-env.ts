@@ -41,6 +41,8 @@ export const LoggerEnvSchema = z.object({
    * loads; defaults to the OS temp dir when unset.
    */
   KICI_TMPDIR: z.string().optional(),
+  /** Read by `@kici-dev/shared/load-service-env-file` before any config loads. */
+  KICI_ENV_FILE: z.string().optional(),
 });
 
 /** All env vars the logger reads, for the unknown-KICI-var scanner. */
@@ -53,6 +55,7 @@ export const LOGGER_ENV_VARS = [
   'KICI_AGENT_ID',
   'KICI_PLATFORM_INSTANCE_ID',
   'KICI_TMPDIR',
+  'KICI_ENV_FILE',
 ] as const;
 
 /** Doc-friendly description map (consumed by the env-reference generator). */
@@ -74,6 +77,15 @@ export const LOGGER_ENV_FIELD_SPECS: EnvFieldSpec[] = [
     type: 'string',
     description:
       'Stable agent identifier; appended to the agent log filename so multiple agents can share one KICI_LOG_DIR.',
+  },
+  {
+    envVar: 'KICI_ENV_FILE',
+    aliases: [],
+    fieldPath: 'KICI_ENV_FILE',
+    required: false,
+    type: 'string',
+    description:
+      'Path of an env file the orchestrator or agent loads when it starts, before it reads any other setting. The Windows service installer sets it, so the service registration carries the path and not the values. Each `KEY=value` line overrides the inherited value, and `PATH` lines go in front of the inherited PATH. The process removes the variable once the file is loaded. On Windows, when the file sets a variable that Node.js reads only as it starts, such as `NODE_OPTIONS` or `NODE_EXTRA_CA_CERTS`, the process starts again with the loaded environment.',
   },
   {
     envVar: 'KICI_LOG_DIR',

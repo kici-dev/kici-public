@@ -106,7 +106,7 @@ kici-admin firecracker teardown [--bridge <name>] [--cidr <cidr>] [--table <name
 Provisions and verifies the host-side bridge interface + NAT/egress-isolation rules a Firecracker scaler needs. These commands run on the Firecracker host (not against the orchestrator HTTP API) and typically require root — pass `--sudo` to wrap the privileged steps with `sudo -n` on a non-root host.
 
 - `provision` creates or heals a host bridge with a gateway address, NAT egress, and an nftables table. `--cidr` sets the gateway IP + prefix (e.g. `10.0.0.1/24`); `--host-iface` names the NAT egress interface (auto-detected when omitted). Pass `--persist` to install a systemd oneshot so the bridge survives a reboot.
-- `verify` checks that the named bridge is up with its address and nft table present. Use it after `provision` (or in a health check) to confirm host networking.
+- `verify` checks that the named bridge is up with its address and nft table present, and that the table NATs and isolates the bridge subnet. Use it after `provision` (or in a health check) to confirm host networking.
 - `teardown` removes the bridge interface and its nft table. It deliberately leaves the NetworkManager unmanaged-interface conf file in place, because that file is host-scoped and protects every `kici-*` interface on the host — removing it would let NetworkManager adopt the other bridges and strip their gateway IPs.
 
 See [Firecracker host setup](../firecracker/host-setup.md) and the [Firecracker scaler backend](../auto-scaler/firecracker.md) for the full host-networking walkthrough.
@@ -343,7 +343,7 @@ Synopsis: `kici-admin firecracker teardown [options]`
 
 ### `kici-admin firecracker verify`
 
-Check a Firecracker host bridge is up with its addr + nft table
+Check a Firecracker host bridge: its addr, nft table, and subnet NAT + isolation rules
 
 Synopsis: `kici-admin firecracker verify [options]`
 

@@ -10,7 +10,7 @@
  * - Request ID and logging middleware
  * - 25MB body size limit
  *
- * Pattern follows packages/platform/src/app.ts: returns { app, wss }.
+ * Same pattern as the Platform's app: returns { app, wss }.
  */
 
 import { Hono } from 'hono';
@@ -163,6 +163,7 @@ import { rejectWorkflow } from './pipeline/resume-workflow.js';
 import { stepsTotal, registerOrchestratorMetrics } from './metrics/prometheus.js';
 import { createLogChunkSink } from './reporting/log-chunk-sink.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
+import { runDetached } from './helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'app' });
 
@@ -276,7 +277,7 @@ export interface AppDependencies {
    */
   faultInjection?: import('./fault-injection-types.js').OrchestratorFaultInjection;
   /**
-   * Orchestrator-owned provenance signing (Phase 1 root of trust). Present when
+   * Orchestrator-owned provenance signing (the root of trust). Present when
    * `KICI_ORCHESTRATOR_PROVENANCE_ISSUER` is configured: the orchestrator mints +
    * signs identity tokens locally with its own ES256 key, and serves its own
    * OIDC discovery + JWKS + native verify endpoint. `resolveOrchestratorSigner`
@@ -422,7 +423,7 @@ export interface AppDependencies {
   globalWorkflowPolicy?: GlobalWorkflowPolicy;
   /** Inbound webhook delivery log writer. Optional -- if not set, deliveries are not persisted to event_log. */
   eventLogWriter?: EventLogWriter;
-  /** Cold-store handle (Phase E). Optional -- when present, admin event-log routes can serve archived rows. */
+  /** Cold-store handle. Optional -- when present, admin event-log routes can serve archived rows. */
   coldStore?: ColdStore | null;
   /** Read + mutation attribution log writer. Optional -- if not set, access_log rows are not written. */
   accessLogWriter?: AccessLogWriter;
@@ -962,15 +963,22 @@ export function createApp(deps: AppDependencies) {
               ...(msg.concurrencyKind !== undefined && { concurrencyKind: msg.concurrencyKind }),
               ...(msg.groupId !== undefined && { groupId: msg.groupId }),
             };
-            deps.executionTracker.onStepStatus(
-              msg.runId,
-              msg.jobId,
-              msg.stepIndex,
-              msg.stepName,
-              msg.state,
-              msg.timestamp,
-              data,
-              msg.logBytesStreamed,
+            const tracker = deps.executionTracker;
+            runDetached(
+              logger,
+              'Step status update',
+              () =>
+                tracker.onStepStatus(
+                  msg.runId,
+                  msg.jobId,
+                  msg.stepIndex,
+                  msg.stepName,
+                  msg.state,
+                  msg.timestamp,
+                  data,
+                  msg.logBytesStreamed,
+                ),
+              { runId: msg.runId, jobId: msg.jobId, stepIndex: msg.stepIndex },
             );
           }
 
@@ -1005,7 +1013,12 @@ export function createApp(deps: AppDependencies) {
         },
         onJobHeartbeat: deps.executionTracker
           ? (_agentId, msg) => {
-              deps.executionTracker!.updateJobHeartbeat(msg.runId, msg.jobId);
+              runDetached(
+                logger,
+                'Job heartbeat update',
+                () => deps.executionTracker!.updateJobHeartbeat(msg.runId, msg.jobId),
+                { runId: msg.runId, jobId: msg.jobId },
+              );
             }
           : undefined,
         onScalerAgentRegistered: async (agentId, labels) => {
@@ -1370,18 +1383,25 @@ export function createApp(deps: AppDependencies) {
     const tokenInfo = auth.tokenInfo;
 
     const recordAccess = (outcome: 'allowed' | 'denied' | 'error', errorMessage?: string) => {
-      if (!deps.accessLogWriter) return;
-      void deps.accessLogWriter.record({
-        orgId: null,
-        routingKey: null,
-        actor: { type: 'api_key', keyId: tokenInfo.id, ownerSub: tokenInfo.id },
-        action: 'run.cancel',
-        target: { type: 'run', id: runId },
-        requestId: null,
-        source: 'admin_http',
-        outcome,
-        errorMessage: errorMessage ?? null,
-      });
+      const accessLogWriter = deps.accessLogWriter;
+      if (!accessLogWriter) return;
+      runDetached(
+        logger,
+        'Access log write',
+        () =>
+          accessLogWriter.record({
+            orgId: null,
+            routingKey: null,
+            actor: { type: 'api_key', keyId: tokenInfo.id, ownerSub: tokenInfo.id },
+            action: 'run.cancel',
+            target: { type: 'run', id: runId },
+            requestId: null,
+            source: 'admin_http',
+            outcome,
+            errorMessage: errorMessage ?? null,
+          }),
+        { runId },
+      );
     };
 
     if (!deps.adminDeps.rbac.hasPermission(tokenInfo.role, 'run.cancel')) {
@@ -1814,8 +1834,8 @@ export function createApp(deps: AppDependencies) {
   }
 
   // Scheduled-jobs admin trigger route. Lets an admin force a registered
-  // scheduled job tick out of band (used by cold-store E2E smoke + future
-  // dashboard "Run now" buttons).
+  // scheduled job tick out of band, e.g. a cold-store archive without waiting
+  // for its hourly cadence.
   if (deps.adminDeps) {
     app.route(
       '',

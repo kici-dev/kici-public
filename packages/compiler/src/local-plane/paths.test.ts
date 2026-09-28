@@ -22,7 +22,7 @@ describe('local-plane paths', () => {
   });
 
   it('resolves a symlinked local dir to its durable target', () => {
-    // `pnpm deploy:stg` runs against a throwaway config dir that only symlinks
+    // A caller can run against a throwaway config dir that only symlinks
     // `local` at the real plane, so it carries no credentials while still
     // reusing the warm plane. Postgres is started with a data directory under
     // whatever planeRoot() returns and keeps it OPEN — so if it returned the

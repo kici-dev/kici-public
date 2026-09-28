@@ -43,8 +43,8 @@ export interface AccessLogRateLimiter {
 }
 
 /**
- * Policy table mirroring research-doc §2 verdicts (with the user's
- * §7 platform-operator override applied separately in `shouldRecordAccess`).
+ * Per-action recording policy (the platform-operator override is applied
+ * separately in `shouldRecordAccess`).
  *
  * Exhaustive over `AccessLogAction.options` — TypeScript catches additions.
  */
@@ -196,7 +196,7 @@ export function shouldRecordAccess(
   if (outcome !== 'allowed') return true;
 
   // Override 2: platform_operator activity always recorded
-  // (research §7 — operator break-glass is non-tenant-attributable).
+  // (operator break-glass is non-tenant-attributable).
   if (actor.type === 'platform_operator') return true;
 
   // Override 3: agent-attributed actions always recorded — the agent-provenance
@@ -258,6 +258,6 @@ export function shouldRecordSecretResolve(entry: SecretResolveSampleInput): bool
   // decision is stable for a given job's trace.
   const key = `system:${entry.runId ?? entry.jobId ?? entry.userId ?? 'unknown'}`;
   const h = fnv1a32(key);
-  // 1% sample rate per research §2 row 156–157.
+  // 1% sample rate.
   return h / 0x100000000 < 0.01;
 }

@@ -137,7 +137,10 @@ export function buildLocalProvenanceStatement(input: {
   };
 }
 
-/** Build a KiCI SLSA v1.0 provenance statement (validates against the P1.1 schema). */
+/**
+ * Build a KiCI SLSA v1.0 provenance statement (validates against
+ * `kiciProvenanceStatementSchema`).
+ */
 export function buildProvenanceStatement(input: BuildStatementInput): KiciProvenanceStatement {
   const c = input.tokenClaims;
   return {

@@ -944,7 +944,7 @@ describe('dynamicJob gitCredentials', () => {
   });
 
   it('accepts the options form with no needs — an event-only generator', () => {
-    // The wish's case is a sharding generator, which has no upstreams. Requiring
+    // The motivating case is a sharding generator, which has no upstreams. Requiring
     // `needs` here would leave it unable to declare credentials at all.
     const gen = dynamicJob('shards', {
       generate: newGenerate(),

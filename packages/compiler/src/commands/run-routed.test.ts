@@ -58,9 +58,9 @@ describe('readDispatchPayload', () => {
     const path = await import('node:path');
     const dir = mkdtempSync(path.join(os.tmpdir(), 'kici-payload-test-'));
     const file = path.join(dir, 'dispatch.json');
-    writeFileSync(file, JSON.stringify({ action: 'deploy-stg', client_payload: { mode: 'full' } }));
+    writeFileSync(file, JSON.stringify({ action: 'deploy-app', client_payload: { mode: 'full' } }));
     expect(readDispatchPayload(file)).toEqual({
-      action: 'deploy-stg',
+      action: 'deploy-app',
       clientPayload: { mode: 'full' },
     });
   });

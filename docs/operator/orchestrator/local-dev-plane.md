@@ -68,17 +68,17 @@ deployment.
 The plane persists its state under `~/.kici/local/` (or `$KICI_CONFIG_DIR/local` when
 `KICI_CONFIG_DIR` is set):
 
-| Path                                  | Contents                                                                                |
-| ------------------------------------- | --------------------------------------------------------------------------------------- |
-| `~/.kici/local/pgdata/`               | Embedded PostgreSQL data directory (persistent across restarts).                        |
-| `~/.kici/local/plane.pid`             | Orchestrator process id.                                                                |
-| `~/.kici/local/stamp.json`            | Boot record: pid, port, Postgres backend, `kici` version, build commit, layout version. |
-| `~/.kici/local/orchestrator.log`      | Orchestrator log (printed by `kici local logs`).                                        |
-| `~/.kici/local/orchestrator.log.1`    | Previous generation of the orchestrator log, kept after a rotation.                     |
-| `~/.kici/local/orchestrator.log.pg`   | PostgreSQL log of the plane's embedded cluster.                                         |
-| `~/.kici/local/orchestrator.log.pg.1` | Previous generation of the PostgreSQL log, kept after a rotation.                       |
-| `~/.kici/local/dev-identity/`         | Dev-signed identity keypair (private JWK at mode 0600, published public JWK).           |
-| `~/.kici/local/cache/`                | Filesystem cache + provenance bundle store for offline runs.                            |
+| Path                                  | Contents                                                                              |
+| ------------------------------------- | ------------------------------------------------------------------------------------- |
+| `~/.kici/local/pgdata/`               | Embedded PostgreSQL data directory (persistent across restarts).                      |
+| `~/.kici/local/plane.pid`             | Orchestrator process id.                                                              |
+| `~/.kici/local/stamp.json`            | Boot record: pid, port, Postgres backend, `kici` version, build date, layout version. |
+| `~/.kici/local/orchestrator.log`      | Orchestrator log (printed by `kici local logs`).                                      |
+| `~/.kici/local/orchestrator.log.1`    | Previous generation of the orchestrator log, kept after a rotation.                   |
+| `~/.kici/local/orchestrator.log.pg`   | PostgreSQL log of the plane's embedded cluster.                                       |
+| `~/.kici/local/orchestrator.log.pg.1` | Previous generation of the PostgreSQL log, kept after a rotation.                     |
+| `~/.kici/local/dev-identity/`         | Dev-signed identity keypair (private JWK at mode 0600, published public JWK).         |
+| `~/.kici/local/cache/`                | Filesystem cache + provenance bundle store for offline runs.                          |
 
 Default ports are `4319` for the orchestrator (HTTP + WebSocket) and `45432` for Postgres,
 overridable via `KICI_LOCAL_ORCH_PORT` and `KICI_LOCAL_PG_PORT`.
@@ -202,13 +202,13 @@ for the full trust model.
 
 ## Staleness on upgrade
 
-The plane stamps the `kici` build identity — its version **and** its git build commit — plus
+The plane stamps the `kici` build identity — its version **and** its build date — plus
 an on-disk layout version each time it boots. On the next `kici local up` **or**
 `kici run --local`, a running plane whose stamped build identity differs from the current
 `kici` build is self-healing:
 
 - **Different build identity, compatible layout** — a running plane booted from a different
-  `kici` build (a version bump, or a different build commit at the same version) is torn down
+  `kici` build (a version bump, or a different build at the same version) is torn down
   and rebooted from the current build, **keeping** its data directory; the orchestrator runs
   any pending schema migrations on boot. This is what stops a plane left over from an earlier
   build from serving runs at a stale version.

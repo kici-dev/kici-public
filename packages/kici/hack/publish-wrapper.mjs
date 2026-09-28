@@ -40,7 +40,7 @@ console.log(`[kici] Synced internal deps to ${version}: ${syncedDeps.join(', ')}
 
 // Strip publishConfig.registry (production npmjs.org target) — pnpm prefers
 // it over the --registry CLI flag and the npm_config_registry env var. For
-// the local Verdaccio publish (postpublish hook of @kici-dev/compiler), we
+// a publish to another registry (postpublish hook of @kici-dev/compiler), we
 // want pnpm to honor --registry / npm_config_registry instead.
 if (kiciPkg.publishConfig?.registry) {
   delete kiciPkg.publishConfig.registry;
@@ -54,17 +54,16 @@ if (kiciPkg.publishConfig?.registry) {
 registerRestore(kiciPkgPath, original);
 writeFileSync(kiciPkgPath, JSON.stringify(kiciPkg, null, 2) + '\n');
 
-// Default to npmjs.org for prod publishes. publish-verdaccio.mjs sets
-// KICI_PUBLISH_REGISTRY explicitly to point at the local Verdaccio for
-// dev publishes. The npm_config_registry fallback is dropped because npm
-// itself sets it inside lifecycle hooks to whatever the parent publish
-// resolved — which is verdaccio.local when the parent's effective
-// config is the repo's @kici-dev:registry= scope routing, sending the
-// kici wrapper to the wrong registry on a prod release.
+// Default to npmjs.org. A publish to another registry sets
+// KICI_PUBLISH_REGISTRY explicitly. The npm_config_registry fallback is
+// dropped because npm itself sets it inside lifecycle hooks to whatever the
+// parent publish resolved — which is a scoped registry when the parent's
+// effective config routes the @kici-dev scope elsewhere, sending the kici
+// wrapper to the wrong registry on a release.
 const registryUrl = process.env.KICI_PUBLISH_REGISTRY || 'https://registry.npmjs.org/';
 const registryArgs = `--registry ${registryUrl}`;
-// The npm publish for @kici-dev/compiler is launched with NPM_CONFIG_USERCONFIG
-// pointing at infra/ci/.npmrc (registry auth token). npm normalises the env
+// The npm publish for @kici-dev/compiler may be launched with NPM_CONFIG_USERCONFIG
+// pointing at a file that carries the registry auth token. npm normalises the env
 // var to lowercase `npm_config_userconfig` inside lifecycle hooks; read that
 // form so the inner npm publish keeps the auth-token userconfig instead of
 // falling back to the operator's ~/.npmrc.
@@ -93,8 +92,8 @@ try {
     stdout = e.stdout ? e.stdout.toString() : '';
     stderr = e.stderr ? e.stderr.toString() : '';
     const combined = stdout + stderr;
-    // E409 = version already exists in Verdaccio — not an error for the
-    // re-build / re-publish loop the E2E suite drives. pnpm emits the E409
+    // E409 = version already exists on the registry — not an error when a
+    // rebuild publishes the same version again. pnpm emits the E409
     // banner on stdout, not stderr, so check both streams.
     if (
       combined.includes('E409') ||

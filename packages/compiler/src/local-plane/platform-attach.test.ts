@@ -10,20 +10,18 @@ describe('derivePlatformWsUrl', () => {
   it('derives wss + /ws from an https prod base', () => {
     expect(derivePlatformWsUrl('https://api.kici.dev')).toBe('wss://api.kici.dev/ws');
   });
-  it('derives wss + /ws from an https staging sub-path base', () => {
-    expect(derivePlatformWsUrl('https://platform.example.com/kici-stg')).toBe(
-      'wss://platform.example.com/kici-stg/ws',
+  it('derives wss + /ws from an https sub-path base', () => {
+    expect(derivePlatformWsUrl('https://platform.example.com/kici')).toBe(
+      'wss://platform.example.com/kici/ws',
     );
   });
   it('is idempotent when the base already ends in /ws', () => {
-    expect(derivePlatformWsUrl('https://platform.example.com/kici-stg/ws')).toBe(
-      'wss://platform.example.com/kici-stg/ws',
+    expect(derivePlatformWsUrl('https://platform.example.com/kici/ws')).toBe(
+      'wss://platform.example.com/kici/ws',
     );
   });
   it('maps http → ws', () => {
-    expect(derivePlatformWsUrl('http://localhost:10142/kici-stg')).toBe(
-      'ws://localhost:10142/kici-stg/ws',
-    );
+    expect(derivePlatformWsUrl('http://localhost:10142/kici')).toBe('ws://localhost:10142/kici/ws');
   });
   it('rejects a non-http(s) base', () => {
     expect(() => derivePlatformWsUrl('ftp://x')).toThrow(/http/);
@@ -45,14 +43,14 @@ describe('mintOrchestratorKey', () => {
       json: async () => ({ key: 'kici_ok_secret', id: 'key-123', keyPrefix: 'kici_ok_' }),
     });
     const res = await mintOrchestratorKey({
-      apiBase: 'https://platform.example.com/kici-stg',
+      apiBase: 'https://platform.example.com/kici',
       pat: 'kici_pat_abc',
-      orgId: 'kiciStg00001',
+      orgId: 'acmeOrg00001',
     });
     expect(res).toEqual({ key: 'kici_ok_secret', keyId: 'key-123', keyPrefix: 'kici_ok_' });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe(
-      'https://platform.example.com/kici-stg/api/v1/orgs/kiciStg00001/orchestrator-keys',
+      'https://platform.example.com/kici/api/v1/orgs/acmeOrg00001/orchestrator-keys',
     );
     expect(init.method).toBe('POST');
     expect(init.headers.Authorization).toBe('Bearer kici_pat_abc');

@@ -127,7 +127,7 @@ describe('GitHubFileContentsFetcher', () => {
   it('decodes inline base64 content even when it exceeds 1 MiB (no cap in the fetcher)', async () => {
     // When GitHub DOES return inline base64 content, the fetcher decodes and
     // returns it verbatim regardless of size -- the 1 MiB match cap lives in
-    // the matcher (Task 8), not here.
+    // the matcher, not here.
     const big = 'x'.repeat(1024 * 1024 + 128);
     setupMockOctokit({
       data: {

@@ -1,7 +1,7 @@
 /**
- * Read-through helper for `secret_audit_log` (Orchestrator) — Phase D.
+ * Read-through helper for `secret_audit_log` (Orchestrator).
  *
- * Mirrors the Phase B/C reader pattern. Wraps `AuditLogger.query()`'s
+ * Mirrors the execution-table reader pattern. Wraps `AuditLogger.query()`'s
  * existing offset/limit shape; cold-store rows are fetched only when
  * `includeArchived === true`.
  *

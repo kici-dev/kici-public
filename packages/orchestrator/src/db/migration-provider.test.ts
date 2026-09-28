@@ -13,8 +13,8 @@ import { createMigrationProvider } from './migration-provider.js';
  * provider map. A missing registration ships a schema behind the code and only
  * surfaces at deploy time as a "corrupted migrations: … missing" error. This
  * test fails loudly the moment a migration file isn't registered, so the deploy
- * never goes out with a phantom migration. Mirrors the platform-side guard in
- * `packages/platform/src/db/migration-provider.test.ts`.
+ * never goes out with a phantom migration. The Platform's migrations carry
+ * the same guard.
  */
 describe('migration provider registration completeness', () => {
   const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), 'migrations');

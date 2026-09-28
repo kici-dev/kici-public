@@ -15,7 +15,7 @@ describe('encodeKeySegment', () => {
   const FIXTURES: ReadonlyArray<{ input: string; expected: string }> = [
     { input: 'plain-alphanumeric_123', expected: 'plain-alphanumeric_123' },
     { input: 'a.b.c', expected: 'a.b.c' },
-    { input: 'kici:stg:00001', expected: 'kici:stg:00001' },
+    { input: 'kici:eu:00001', expected: 'kici:eu:00001' },
     { input: 'hello world', expected: 'hello_20world' },
     { input: 'a/b/c', expected: 'a_2fb_2fc' },
     { input: '', expected: '' },
@@ -54,10 +54,10 @@ describe('tenantDayPrefix', () => {
         prefix: 'cold-store',
         db: 'platform',
         table: 'run_events',
-        tenantId: 'kici/stg',
+        tenantId: 'kici/eu',
         partitionDate: '2026-04-24',
       }),
-    ).toBe('cold-store/platform/run_events/kici_2fstg/2026/04/24');
+    ).toBe('cold-store/platform/run_events/kici_2feu/2026/04/24');
   });
 
   it('rejects non-YYYY-MM-DD partition dates', () => {
@@ -102,25 +102,25 @@ describe('chunkObjectKey', () => {
     ).toBe('cold-store/orchestrator/execution_jobs/rk1/2026/04/24/abcdef0123456789.manifest.json');
   });
 
-  it('inserts the bucket segment when bucket is provided (Phase 2 v2 chunks)', () => {
+  it('inserts the bucket segment when bucket is provided (v2 chunks)', () => {
     expect(
       chunkObjectKey({
         prefix: 'cold-store',
         db: 'orchestrator',
         table: 'access_log',
-        tenantId: 'kiciStg00001',
+        tenantId: 'acmeOrg00001',
         partitionDate: '2026-04-24',
         chunkId: 'abcdef0123456789',
         kind: 'data',
         bucket: '180d',
       }),
     ).toBe(
-      'cold-store/orchestrator/access_log/kiciStg00001/2026/04/24/180d/abcdef0123456789.jsonl.gz',
+      'cold-store/orchestrator/access_log/acmeOrg00001/2026/04/24/180d/abcdef0123456789.jsonl.gz',
     );
   });
 
   it('legacy v1 keys (no bucket) live at the day-prefix root for backward compatibility', () => {
-    // Pre-Phase-2 chunks omit the bucket segment. The framework still
+    // V1 chunks omit the bucket segment. The framework still
     // reads them via listRelevantManifests (recursive LIST under the
     // tenant prefix) and treats them as `'forever'` for the GC sweep.
     expect(
@@ -128,12 +128,12 @@ describe('chunkObjectKey', () => {
         prefix: 'cold-store',
         db: 'orchestrator',
         table: 'access_log',
-        tenantId: 'kiciStg00001',
+        tenantId: 'acmeOrg00001',
         partitionDate: '2026-04-24',
         chunkId: 'abcdef0123456789',
         kind: 'data',
       }),
-    ).toBe('cold-store/orchestrator/access_log/kiciStg00001/2026/04/24/abcdef0123456789.jsonl.gz');
+    ).toBe('cold-store/orchestrator/access_log/acmeOrg00001/2026/04/24/abcdef0123456789.jsonl.gz');
   });
 });
 
@@ -144,11 +144,11 @@ describe('tenantDayBucketPrefix', () => {
         prefix: 'cold-store',
         db: 'orchestrator',
         table: 'access_log',
-        tenantId: 'kiciStg00001',
+        tenantId: 'acmeOrg00001',
         partitionDate: '2026-04-24',
         bucket: '30d',
       }),
-    ).toBe('cold-store/orchestrator/access_log/kiciStg00001/2026/04/24/30d');
+    ).toBe('cold-store/orchestrator/access_log/acmeOrg00001/2026/04/24/30d');
   });
 
   it('rejects buckets with path-unsafe characters', () => {

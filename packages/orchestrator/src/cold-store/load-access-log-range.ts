@@ -1,11 +1,11 @@
 /**
- * Read-through helper for `access_log` (Orchestrator) — Phase D.
+ * Read-through helper for `access_log` (Orchestrator).
  *
  * Unlike `audit_log` and `secret_audit_log`, the `access_log` callers
  * (dashboard "Data access" tab, admin HTTP route, `kici-admin
  * access-log list` CLI) all use the same cursor-based pagination
- * already implemented by `AccessLogWriter.query()`. Phase D's design
- * §7 row 11 classifies access_log as "paginated/transparent" — there
+ * already implemented by `AccessLogWriter.query()`. access_log is
+ * "paginated/transparent" — there
  * is NO `--include-archived` flag. The helper merges cold rows
  * automatically when pagination crosses the warm cutoff or the caller
  * supplies a `from` timestamp older than warm.
@@ -198,8 +198,8 @@ export async function loadAccessLogRange(
   // `coldRemaining` rows are in hand and the next row is strictly older than
   // the last of them — every row that could still tie on `createdAt` has been
   // seen by then. Stopping there is what keeps a narrow filter from reading
-  // the tenant's whole archive: the earlier collect-everything-then-sort shape
-  // fetched 262 chunks for a five-row page on staging.
+  // the tenant's whole archive: collecting everything and then sorting would
+  // fetch every chunk in range even for a five-row page.
   const coldItems: AccessLogItem[] = [];
   let stoppedEarly = false;
   try {
@@ -334,7 +334,7 @@ function parseCursor(cursor: string): ParsedCursor | null {
     ) {
       return null;
     }
-    // Backward compat: pre-Phase-D cursors lack `source`; treat as hot.
+    // Backward compat: older cursors lack `source`; treat as hot.
     const source = parsed.source === 'cold' ? 'cold' : 'hot';
     return { source, createdAt: parsed.createdAt, id: parsed.id };
   } catch {

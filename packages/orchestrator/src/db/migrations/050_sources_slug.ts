@@ -10,7 +10,7 @@ import { type Kysely, sql } from 'kysely';
  * hasn't populated it yet (manual `--app-id` flow whose initial fetch failed,
  * or a row created before the rollout).
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so staging data is
+ * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
  * preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {

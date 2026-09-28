@@ -214,7 +214,7 @@ describe('resolveAdminInvocation', () => {
   it('leaves an ordinary install path unquoted', () => {
     // Quoting is conditional so the common case reads (and parses) exactly as
     // before — the field is consumed as a display string by the dashboard and
-    // parsed by the diagnostics E2E.
+    // parsed by tools that run the printed command.
     expect(resolveAdminInvocation(NODE_BIN, GLOBAL_ENTRY, (p) => p === GLOBAL_SHIM)).toBe(
       `${NODE_BIN} ${GLOBAL_SHIM}`,
     );

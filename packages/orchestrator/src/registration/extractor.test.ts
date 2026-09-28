@@ -4,7 +4,7 @@
  * Verifies that workflows with non-Git-provider triggers (kici_event, schedule,
  * lifecycle, generic_webhook, workflow_complete, job_complete) are extracted
  * AND that Git triggers (push, pr, tag, …) are extracted too — the latter
- * since phase 28.5 so cross-source dispatch can resolve them by repo.
+ * so cross-source dispatch can resolve them by repo.
  */
 import { describe, it, expect } from 'vitest';
 
@@ -98,14 +98,14 @@ describe('extractRegisterableWorkflows', () => {
     expect(result[0].name).toBe('after-test');
   });
 
-  it('should include workflows with only push triggers (phase 28.5 — cross-source repo lookup)', () => {
+  it('should include workflows with only push triggers (cross-source repo lookup)', () => {
     const wf = makeLockWorkflow('ci', [{ _type: 'push', branches: [], paths: [] }]);
     const result = extractRegisterableWorkflows(makeLockFile([wf]));
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe('ci');
   });
 
-  it('should include workflows with only pr triggers (phase 28.5 — cross-source repo lookup)', () => {
+  it('should include workflows with only pr triggers (cross-source repo lookup)', () => {
     const wf = makeLockWorkflow('pr-check', [
       {
         _type: 'pr',
@@ -120,7 +120,7 @@ describe('extractRegisterableWorkflows', () => {
     expect(result[0].name).toBe('pr-check');
   });
 
-  it('should include workflows with only tag triggers (phase 28.5 — cross-source repo lookup)', () => {
+  it('should include workflows with only tag triggers (cross-source repo lookup)', () => {
     const wf = makeLockWorkflow('release', [{ _type: 'tag', patterns: [] }]);
     const result = extractRegisterableWorkflows(makeLockFile([wf]));
     expect(result).toHaveLength(1);
@@ -169,11 +169,11 @@ describe('extractRegisterableWorkflows', () => {
     expect(REGISTERABLE_TRIGGER_TYPES.has('schedule')).toBe(true);
     expect(REGISTERABLE_TRIGGER_TYPES.has('lifecycle')).toBe(true);
     // webhook is registerable so cross-source delivery can find
-    // workflow registrations by (customerId, eventName) — see plan 28.4-01.
+    // workflow registrations by (customerId, eventName).
     expect(REGISTERABLE_TRIGGER_TYPES.has('webhook')).toBe(true);
   });
 
-  it('should include Git-provider trigger types as registerable (phase 28.5)', () => {
+  it('should include Git-provider trigger types as registerable', () => {
     const gitTypes = [
       'push',
       'pr',

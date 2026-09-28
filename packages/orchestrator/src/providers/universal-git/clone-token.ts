@@ -11,14 +11,11 @@
  * The value returned here is the raw secret material:
  *   - `credentialType === 'pat' | 'basic'`: the PAT / password string
  *   - `credentialType === 'ssh'`: the PEM-encoded private key (the agent
- *     materializes it to a tempfile and wires `GIT_SSH_COMMAND` — see
- *     Phase 4 dispatch protocol + agent work)
+ *     materializes it to a tempfile and wires `GIT_SSH_COMMAND`)
  *
  * The token's "kind" (basic vs ssh) is NOT carried through this interface;
- * it is propagated via `QueuedJobInput.gitAuth` in Phase 4. For Phase 2 we
- * expose a richer `issueGitAuth()` method on this class that the dispatcher
- * can call directly once Phase 4 adds `sourceAuth`/`workflowAuth` to the
- * dispatch schema.
+ * the richer `issueGitAuth()` method on this class returns it, and the
+ * dispatcher carries it in the dispatch's `sourceAuth`/`workflowAuth` fields.
  */
 
 import type { CloneTokenProvider, ProviderGitAuth } from '@kici-dev/engine';
@@ -32,7 +29,7 @@ const logger = createLogger({ prefix: 'universal-git:clone-token' });
 /**
  * Structured auth material the agent needs to clone a universal-git repo.
  *
- * Phase 4: serialized into the new `sourceAuth` / `workflowAuth` fields on
+ * Serialized into the `sourceAuth` / `workflowAuth` fields on
  * `jobDispatchSchema`. The shape matches `ProviderGitAuth` from
  * `@kici-dev/engine` with additional SSH fields pulled from the source
  * config (`sshHostKeyPolicy`, `sshKnownHostsPem`).
@@ -62,11 +59,10 @@ export class UniversalGitCloneTokenProvider implements CloneTokenProvider {
   /**
    * Create a clone token — the raw secret material (PAT / password / SSH key).
    *
-   * The orchestrator dispatch pipeline currently threads this string into
-   * `jobDispatch.token`, which the agent uses as HTTPS Basic-auth password
-   * via `http.extraHeader`. SSH support requires the Phase 4 dispatch-schema
-   * split (sourceAuth.kind = 'ssh') — which is where the agent gains the
-   * ability to materialize the PEM key and wire `GIT_SSH_COMMAND`.
+   * A bare token reaches `jobDispatch.token`, which the agent uses as HTTPS
+   * Basic-auth password via `http.extraHeader`. SSH needs the structured
+   * `sourceAuth` (`kind: 'ssh'`) from `issueGitAuth()` — which is where the
+   * agent materializes the PEM key and wires `GIT_SSH_COMMAND`.
    *
    * @returns The resolved secret string, or `null` when the secret is
    * missing (source misconfigured — caller treats this as a clone failure).
@@ -78,7 +74,7 @@ export class UniversalGitCloneTokenProvider implements CloneTokenProvider {
 
   /**
    * Richer variant that returns the full `UniversalGitAuth` shape instead
-   * of just the secret string. The Phase 4 dispatcher calls this via the
+   * of just the secret string. The dispatcher calls this via the
    * `CloneTokenProvider.issueGitAuth?` interface hook so the agent
    * receives the auth `kind` + `user` + SSH host-key policy alongside the
    * secret.

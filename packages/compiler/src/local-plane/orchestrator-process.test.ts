@@ -62,14 +62,14 @@ describe('spawnOrchestratorProcess / awaitOrchestratorReady', () => {
       secretKey: 'a'.repeat(64),
       scalerConfigFile: '/x/scaler.yaml',
       attach: {
-        platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
+        platformWsUrl: 'wss://platform.example.com/kici/ws',
         platformToken: 'kici_ok_secret',
       },
     });
     expect(res.pid).toBe(5252);
     const spawnOpts = spawnMock.mock.calls[0][2];
     expect(spawnOpts.env.KICI_MODE).toBe('hybrid');
-    expect(spawnOpts.env.KICI_PLATFORM_URL).toBe('wss://platform.example.com/kici-stg/ws');
+    expect(spawnOpts.env.KICI_PLATFORM_URL).toBe('wss://platform.example.com/kici/ws');
     expect(spawnOpts.env.KICI_PLATFORM_TOKEN).toBe('kici_ok_secret');
     // Hybrid mints with the orchestrator's own signing key under the plane's
     // own issuer — the dev-signed identity envs are deliberately absent so the

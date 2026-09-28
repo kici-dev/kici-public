@@ -5,7 +5,7 @@
  * Contract:
  *   - tenant column: `routing_key` (denormalized in migration 006)
  *   - partition column: `created_at`
- *   - warm TTL: 30 days (design §5 matrix row 8)
+ *   - warm TTL: 30 days
  *   - eligibility: terminal job status AND no live steps remain for this
  *     (run, job)
  *
@@ -36,7 +36,7 @@ const APPROX_ROW_BYTES = 1500;
 
 const TERMINAL_STATUS_LIST: readonly string[] = Array.from(TERMINAL_JOB_STATES);
 
-/** Per-table defaults (design §5 matrix row 8). */
+/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,

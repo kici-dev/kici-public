@@ -23,7 +23,7 @@
  *
  * `installEnvSecrets` is a separate channel for customers who prefer the
  * "commit a `.kici/.npmrc` with `${MY_TOKEN}` and supply MY_TOKEN as a
- * scoped secret" pattern (Option C in the design doc). Each entry becomes
+ * scoped secret" pattern. Each entry becomes
  * an env var on the install subprocess; the customer's existing `.npmrc`
  * uses it as `${MY_TOKEN}`.
  */

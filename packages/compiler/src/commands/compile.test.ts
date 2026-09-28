@@ -45,7 +45,7 @@ describe('kici compile: dep-reinstall gate', () => {
   it('skips reinstall when `.kici/package.json` is absent (workspace-managed deps)', async () => {
     // Setup: scaffold a `.kici/` with workflows + lock file, then remove the
     // `package.json` to simulate a workspace member whose deps live at the
-    // repo root (the kici monorepo's own dogfood `.kici/`).
+    // repo root (a monorepo whose `.kici/` is a workspace member).
     expect(await initCommand({ skipInstall: true })).toBe(true);
     expect(await compileCommand({ check: false, verbose: false })).toBe(true);
     await fs.rm(path.join(tempDir, '.kici', 'package.json'));

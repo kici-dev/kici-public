@@ -1,5 +1,5 @@
 /**
- * Plane auto-selection for `kici run --local` (design §5).
+ * Plane auto-selection for `kici run --local`.
  *
  * Rules:
  * - `--offline`   → force the independent (offline) plane.

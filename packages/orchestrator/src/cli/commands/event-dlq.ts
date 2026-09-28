@@ -6,12 +6,11 @@
  *   event-dlq retry <id>     — clear DLQ flag, schedule for retry, pg_notify
  *   event-dlq discard <id>   — permanently delete a DLQ event
  *
- * Operator dogfooding path for at-least-once event delivery. Customers
- * should generally never see anything in
- * the DLQ — when something lands here it usually means a workflow handler is
- * consistently failing and should be fixed at its root cause. This CLI is the
- * triage surface: inspect last_error, retry once a fix is deployed, or discard
- * if the event is no longer relevant.
+ * Operator triage path for at-least-once event delivery. Customers should
+ * generally never see anything in the DLQ — when something lands here it
+ * usually means a workflow handler is consistently failing and should be fixed
+ * at its root cause. This CLI is the triage surface: inspect last_error, retry
+ * once a fix is deployed, or discard if the event is no longer relevant.
  */
 import type { Command } from 'commander';
 import { toErrorMessage } from '@kici-dev/shared';

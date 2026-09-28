@@ -3,12 +3,12 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-  // Resolve the package's own name to source so a dogfood test that imports the
-  // public specifier (`@kici-dev/sdk/testing`) exercises the current working
-  // tree rather than a prebuilt `dist/`. Without this, the self-referencing
-  // import would resolve through the package `exports` map to `dist/` and fail
-  // whenever the SDK has not been built. The built-`dist/` path stays covered by
-  // the build check + the devex E2E test.
+  // Resolve the package's own name to source so a test that uses the package the
+  // way a user would, importing the public specifier (`@kici-dev/sdk/testing`),
+  // exercises the current working tree rather than a prebuilt `dist/`. Without
+  // this, the self-referencing import would resolve through the package
+  // `exports` map to `dist/` and fail whenever the SDK has not been built. These
+  // tests therefore do not exercise the built `dist/` path.
   resolve: {
     alias: {
       '@kici-dev/sdk/testing': fileURLToPath(new URL('./src/testing/index.ts', import.meta.url)),

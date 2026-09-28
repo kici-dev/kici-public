@@ -149,3 +149,67 @@ export function createDb<T>(pool: pg.Pool): Kysely<T> {
   const dialect = new PostgresDialect({ pool });
   return new Kysely<T>({ dialect });
 }
+
+/** How long {@link closeDatabase} waits for in-flight queries before it closes anyway. */
+export const DEFAULT_DB_DRAIN_TIMEOUT_MS = 5_000;
+
+const DB_DRAIN_POLL_MS = 25;
+
+/** What {@link closeDatabase} found when its drain window ended. */
+export interface CloseDatabaseResult {
+  /** Connections still checked out or connecting, plus acquires still queued, when the window ended. */
+  busyAtDeadline: number;
+}
+
+/** Make every later `pool.connect()` fail at once, in both its promise and callback forms. */
+function refuseNewAcquires(pool: pg.Pool): void {
+  pool.connect = function connect(cb?: unknown) {
+    const err = new Error('the database is closing');
+    if (typeof cb === 'function') {
+      process.nextTick(() => (cb as (e: Error) => void)(err));
+      return undefined;
+    }
+    return Promise.reject(err);
+  } as typeof pool.connect;
+}
+
+/**
+ * Close a Kysely database and the pg pool it runs on, without hanging.
+ *
+ * Kysely's PostgresDriver.destroy() drops its pool reference and then calls
+ * pool.end(). An acquire whose pool.connect() is still pending at that moment
+ * gets a client it can no longer wrap, so the client is never released, and
+ * pool.end(), which waits for every client, never returns. So this refuses new
+ * acquires first, waits for the in-flight ones to finish and every checked-out
+ * client to come back, and destroys the database only then.
+ *
+ * A query that outlives `drainTimeoutMs` is logged by count and left running:
+ * the process exits after its shutdown, and PostgreSQL ends the backend when
+ * the connection closes.
+ */
+export async function closeDatabase(
+  db: { destroy(): Promise<void> },
+  pool: pg.Pool,
+  options: { drainTimeoutMs?: number } = {},
+): Promise<CloseDatabaseResult> {
+  const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_DB_DRAIN_TIMEOUT_MS;
+  refuseNewAcquires(pool);
+  const busy = () => pool.totalCount - pool.idleCount + pool.waitingCount;
+  const deadline = Date.now() + drainTimeoutMs;
+  while (busy() > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, DB_DRAIN_POLL_MS));
+  }
+  const busyAtDeadline = busy();
+  if (busyAtDeadline > 0) {
+    getPoolLogger().warn('Closing the database with connections still in use', {
+      busy: busyAtDeadline,
+      drainTimeoutMs,
+    });
+    // pool.end() waits for the busy clients, so it is not awaited: the process
+    // exits after its shutdown whether or not they come back.
+    void db.destroy().catch(() => {});
+    return { busyAtDeadline };
+  }
+  await db.destroy();
+  return { busyAtDeadline: 0 };
+}

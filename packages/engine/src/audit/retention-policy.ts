@@ -8,9 +8,7 @@
  * `./access-log-policy.ts`; both modules classify by the same action
  * dimension, just for different downstream decisions.
  *
- * The classification table came from research-doc §5
- *  and the user's
- * `## Decisions` section. Two override layers apply uniformly:
+ * Two override layers apply uniformly:
  *
  * 1. `outcome` is `denied` or `error` → retain 180d (forensic value).
  * 2. `actor.type === 'platform_operator'` → retain 365d
@@ -126,7 +124,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'db.reindex': 180,
   'db.refresh_collation_version': 180,
 
-  // 180 days — event DLQ admin actions (Phase 5 — at-least-once delivery)
+  // 180 days — event DLQ admin actions (at-least-once delivery)
   'event_dlq.list.read': 30,
   'event_dlq.retry': 180,
   'event_dlq.discard': 180,
@@ -151,7 +149,7 @@ const PLATFORM_OPERATOR_DAYS = 365;
 
 /**
  * Default warm TTL for action strings outside `AccessLogAction.options`. Hit
- * by E2E synthetic action names and would-be-future enum additions on a
+ * by synthetic test action names and would-be-future enum additions on a
  * rolling deploy. Matches the conservative `180d` mutations bucket so
  * unknown rows are never archived sooner than a tenant-plane mutation.
  */
@@ -289,7 +287,7 @@ export function accessLogWarmSqlCase(): string {
   // The ELSE defaults genuinely-unknown actions to the same conservative TTL
   // the JS getter uses (UNKNOWN_ACTION_WARM_DAYS). Every known action lands in
   // an explicit WHEN clause below, so the ELSE is reached only by action
-  // strings outside the enum — E2E synthetic names, future enum additions on a
+  // strings outside the enum — synthetic test names, future enum additions on a
   // rolling deploy, post-rollback rows. For warm retention the conservative
   // choice is to keep those rows LONGER, not shorter: archiving an unknown row
   // early evicts it from PG (losing indexability) and the SQL pre-filter never
@@ -369,7 +367,7 @@ export function secretAuditLogWarmSqlCase(): string {
   return `CASE\n  ${whenClauses.join('\n  ')}\n  ELSE INTERVAL '365 days'\nEND`;
 }
 
-/* ──────────────────────────── Cold retention (Phase 2) ──────────────────── */
+/* ──────────────────────────── Cold retention ──────────────────────────── */
 
 /**
  * Cold-store retention horizon. Number of days a chunk lives in S3 after
@@ -472,7 +470,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'db.reindex': 730,
   'db.refresh_collation_version': 730,
 
-  // 730 days — event DLQ admin actions (Phase 5 — at-least-once delivery)
+  // 730 days — event DLQ admin actions (at-least-once delivery)
   'event_dlq.list.read': 180,
   'event_dlq.retry': 730,
   'event_dlq.discard': 730,

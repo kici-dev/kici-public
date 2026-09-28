@@ -34,7 +34,7 @@ describe('gcStaleAgentTmpDirs', () => {
     const staleWork = await seed(base, 'kici-Ab3xZ9', 2 * DAY_MS);
     const staleStore = await seed(base, 'kici-pnpm-store-XyZ123', 2 * DAY_MS);
     const freshWork = await seed(base, 'kici-Qw9rT2', 0.5 * DAY_MS);
-    const cache = await seed(base, 'kici-e2e-cache', 30 * DAY_MS);
+    const cache = await seed(base, 'kici-build-cache', 30 * DAY_MS);
 
     const removed = await gcStaleAgentTmpDirs(base);
 

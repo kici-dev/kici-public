@@ -10,7 +10,7 @@ import { type Kysely, sql } from 'kysely';
  *   default for every existing static / ephemeral token, which stay reusable
  *   until expiry).
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so staging data is
+ * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
  * preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {

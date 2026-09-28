@@ -96,9 +96,9 @@ function bridgePrefix(bridgeName: string): string {
  * serializes them.
  *
  * The command list NEVER deletes the table. It is a self-heal — `ensureHostReady`
- * runs it whenever `verifyBridge` reports unhealthy, which happens on any of
- * four conditions none of which knows how many VMs are live — so dropping the
- * table would leave every running VM fail-open, with full RFC1918 and
+ * runs it whenever `verifyBridge` reports unhealthy, and none of the
+ * conditions it checks says how many VMs are live — so dropping the table
+ * would leave every running VM fail-open, with full RFC1918 and
  * cloud-metadata reach, until it was destroyed. Instead the baseline lives in
  * its own regular chain (`baseline`, see {@link BASELINE_CHAIN}) that is flushed
  * and refilled, and the hooked `forward` chain keeps its per-VM rules
@@ -259,10 +259,9 @@ export const NM_CONF_CONTENT = [
   '#',
   '# The `+=` append operator is mandatory: NM merges conf.d drop-ins last-wins',
   '# per key, so a bare `unmanaged-devices=` here would be silently clobbered by',
-  "# (or would silently clobber) any other drop-in's unmanaged-devices line — e.g.",
-  '# the wifi drop-in from @kici-dev/util-linux-management. `+=` accumulates',
-  '# across files so every drop-in survives. See',
-  '# .claude/rules/networkmanager-unmanaged.md.',
+  "# (or would silently clobber) any other drop-in's unmanaged-devices line, such",
+  '# as a wifi drop-in another tool installs. `+=` accumulates across files so',
+  '# every drop-in survives.',
   '[keyfile]',
   ...FIRECRACKER_NET_INTERFACES.map((p) => `unmanaged-devices+=interface-name:${p}`),
   '',
@@ -316,6 +315,10 @@ export interface BridgeHealth {
   tablePresent: boolean;
   /** The regular baseline chain exists and `forward` ends in a jump to it. */
   baselineChainPresent: boolean;
+  /** The table's `postrouting` chain masquerades the bridge subnet — the guests' internet egress. */
+  natPresent: boolean;
+  /** The baseline chain holds the bridge subnet's rules, in the order the provisioner writes them. */
+  baselineRulesPresent: boolean;
   /** Every enslaved kici-* TAP carries bridge port isolation. */
   tapIsolationPresent: boolean;
   healthy: boolean;
@@ -514,6 +517,8 @@ export async function verifyBridge(
     misses.push(`could not read chain ip ${cfg.table} forward`);
   }
 
+  const { natPresent, baselineRulesPresent } = await checkSubnetRules(cfg, runner, misses);
+
   // Bridge port isolation is the only thing standing between two concurrent
   // tenants' VMs: their traffic is switched at L2 on this bridge and never
   // reaches the IP forward hook, so no nft rule can see it.
@@ -537,6 +542,8 @@ export async function verifyBridge(
     addrPresent &&
     tablePresent &&
     baselineChainPresent &&
+    natPresent &&
+    baselineRulesPresent &&
     tapIsolationPresent;
   return {
     bridgeName: cfg.bridgeName,
@@ -545,6 +552,8 @@ export async function verifyBridge(
     addrPresent,
     tablePresent,
     baselineChainPresent,
+    natPresent,
+    baselineRulesPresent,
     tapIsolationPresent,
     healthy,
     detail: healthy ? 'healthy' : misses.join('; '),
@@ -577,6 +586,173 @@ export function forwardEndsInBaselineJump(nftJson: string): boolean {
     const jump = (node as { jump?: { target?: unknown } }).jump;
     return jump?.target === BASELINE_CHAIN;
   });
+}
+
+/**
+ * Check the two chains that carry this bridge's subnet: the `postrouting` NAT
+ * that gives its guests internet egress, and the `baseline` rules that isolate
+ * them.
+ *
+ * The table, its chains and the tail jump can all be in place while neither
+ * rule set serves this subnet: a second bridge provisioned into the same table
+ * flushes both chains and refills them with its own subnet. Every guest on this
+ * bridge then loses internet access — no name resolves — and a check that stops
+ * at the chain layout still reads the host as healthy, so the self-heal never
+ * runs.
+ */
+async function checkSubnetRules(
+  cfg: FirecrackerBridgeConfig,
+  runner: CommandRunner,
+  misses: string[],
+): Promise<{ natPresent: boolean; baselineRulesPresent: boolean }> {
+  let subnet: string;
+  try {
+    subnet = cidrToNetwork(cfg.bridgeCidr);
+  } catch (err) {
+    misses.push(`invalid bridge CIDR ${cfg.bridgeCidr}: ${toErrorMessage(err)}`);
+    return { natPresent: false, baselineRulesPresent: false };
+  }
+  const listChain = async (chain: string): Promise<string | null> => {
+    try {
+      const { stdout } = await runner({
+        bin: 'nft',
+        args: ['-j', 'list', 'chain', 'ip', cfg.table, chain],
+      });
+      return stdout;
+    } catch {
+      misses.push(`could not read chain ip ${cfg.table} ${chain}`);
+      return null;
+    }
+  };
+
+  const postrouting = await listChain('postrouting');
+  const natPresent = postrouting !== null && postroutingMasqueradesSubnet(postrouting, subnet);
+  if (postrouting !== null && !natPresent) {
+    misses.push(`ip ${cfg.table} postrouting does not masquerade ${subnet}`);
+  }
+
+  const baseline = await listChain(BASELINE_CHAIN);
+  const baselineRulesPresent = baseline !== null && baselineHoldsBridgeRules(baseline, cfg);
+  if (baseline !== null && !baselineRulesPresent) {
+    misses.push(`ip ${cfg.table} ${BASELINE_CHAIN} does not hold the ${subnet} rules`);
+  }
+  return { natPresent, baselineRulesPresent };
+}
+
+/** The part of one rule the subnet checks compare: its addresses and its outcome. */
+interface RuleShape {
+  saddr: string | null;
+  daddr: string | null;
+  /** The rule's verdict or NAT statement; null for a rule with neither (the MSS clamp). */
+  verdict: RuleVerdict | null;
+}
+
+const RULE_VERDICTS = ['accept', 'drop', 'masquerade'] as const;
+type RuleVerdict = (typeof RULE_VERDICTS)[number];
+
+/** An nft JSON address operand as `a.b.c.d` or `a.b.c.d/len`; null for any other operand. */
+function nftAddress(operand: unknown): string | null {
+  if (typeof operand === 'string') return operand;
+  const prefix = (operand as { prefix?: { addr?: unknown; len?: unknown } } | null)?.prefix;
+  return typeof prefix?.addr === 'string' && typeof prefix.len === 'number'
+    ? `${prefix.addr}/${prefix.len}`
+    : null;
+}
+
+/** The rules of a `nft -j list chain` listing, in chain order; null when it does not parse. */
+function listedRuleShapes(nftJson: string): RuleShape[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(nftJson);
+  } catch {
+    return null;
+  }
+  const entries = (parsed as { nftables?: unknown[] })?.nftables;
+  if (!Array.isArray(entries)) return null;
+  const shapes: RuleShape[] = [];
+  for (const entry of entries) {
+    const expr = (entry as { rule?: { expr?: unknown } }).rule?.expr;
+    if (!Array.isArray(expr)) continue;
+    const shape: RuleShape = { saddr: null, daddr: null, verdict: null };
+    for (const node of expr as Array<Record<string, unknown>>) {
+      const match = node.match as
+        | {
+            op?: unknown;
+            left?: { payload?: { protocol?: unknown; field?: unknown } };
+            right?: unknown;
+          }
+        | undefined;
+      // nft writes an address match, prefix or not, as `==`. Any other
+      // operator (`!=`) does not name the address; a match without one is read
+      // as equality.
+      const positive = match?.op === undefined || match.op === '==';
+      const payload = match && positive ? match.left?.payload : undefined;
+      if (payload?.protocol === 'ip' && payload.field === 'saddr') {
+        shape.saddr = nftAddress(match!.right);
+      } else if (payload?.protocol === 'ip' && payload.field === 'daddr') {
+        shape.daddr = nftAddress(match!.right);
+      }
+      shape.verdict = RULE_VERDICTS.find((v) => v in node) ?? shape.verdict;
+    }
+    shapes.push(shape);
+  }
+  return shapes;
+}
+
+/** The shape of one `nft add rule` token list the provisioner builds. */
+function commandRuleShape(tokens: string[]): RuleShape {
+  const shape: RuleShape = { saddr: null, daddr: null, verdict: null };
+  for (let i = 0; i + 2 < tokens.length; i++) {
+    if (tokens[i] !== 'ip') continue;
+    if (tokens[i + 1] === 'saddr') shape.saddr = tokens[i + 2];
+    if (tokens[i + 1] === 'daddr') shape.daddr = tokens[i + 2];
+  }
+  shape.verdict = RULE_VERDICTS.find((v) => v === tokens.at(-1)) ?? null;
+  return shape;
+}
+
+/** `<daddr> <verdict>` for every subnet-scoped accept or drop, in chain order (`*`: any daddr). */
+function subnetVerdicts(rules: RuleShape[], subnet: string): string[] {
+  return rules
+    .filter((r) => r.saddr === subnet && (r.verdict === 'accept' || r.verdict === 'drop'))
+    .map((r) => `${r.daddr ?? '*'} ${r.verdict}`);
+}
+
+/**
+ * True when a `nft -j list chain … postrouting` listing masquerades traffic
+ * whose source is `subnet` (the network CIDR, e.g. `10.0.0.0/24`).
+ */
+export function postroutingMasqueradesSubnet(nftJson: string, subnet: string): boolean {
+  return (listedRuleShapes(nftJson) ?? []).some(
+    (r) => r.saddr === subnet && r.verdict === 'masquerade',
+  );
+}
+
+/**
+ * True when a `nft -j list chain … baseline` listing holds this bridge's
+ * subnet-scoped accepts and drops exactly as {@link buildBridgeCommands} writes
+ * them, in the same order.
+ *
+ * Order is part of the check: the internet accept is terminal, so ahead of the
+ * RFC1918 and metadata drops it would let the guests reach every private range.
+ */
+export function baselineHoldsBridgeRules(nftJson: string, cfg: FirecrackerBridgeConfig): boolean {
+  const listed = listedRuleShapes(nftJson);
+  if (listed === null) return false;
+  const subnet = cidrToNetwork(cfg.bridgeCidr);
+  // The egress interface is not part of the compared shape, so any name stands in.
+  const written = buildBridgeCommands({ ...cfg, hostIface: cfg.hostIface ?? 'egress' })
+    .filter(
+      (c) =>
+        c.bin === 'nft' &&
+        c.args[0] === 'add' &&
+        c.args[1] === 'rule' &&
+        c.args[3] === BASELINE_CHAIN,
+    )
+    .map((c) => commandRuleShape(c.args.slice(4)));
+  const want = subnetVerdicts(written, subnet);
+  const got = subnetVerdicts(listed, subnet);
+  return want.length === got.length && want.every((v, i) => v === got[i]);
 }
 
 /**

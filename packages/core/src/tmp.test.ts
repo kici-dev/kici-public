@@ -14,8 +14,8 @@ import {
 describe('makeTempDir', () => {
   it('creates a kici-<label>- dir under tmpdir and returns a path + cleanup', async () => {
     const h = await makeTempDir('unit-a');
-    // Against `kiciTmpBase()`, not `tmpdir()`: an ambient `KICI_TMPDIR` (the
-    // E2E executor slots set one) legitimately moves the base, and this case
+    // Against `kiciTmpBase()`, not `tmpdir()`: an ambient `KICI_TMPDIR` (a
+    // test runner may set one) legitimately moves the base, and this case
     // is about the dir landing under it — the resolution itself is covered by
     // the `KICI_TMPDIR resolution` block below, which controls the env var.
     expect(dirname(h.path)).toBe(kiciTmpBase());

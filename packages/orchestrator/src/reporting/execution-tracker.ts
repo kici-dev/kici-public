@@ -50,6 +50,7 @@ import {
 } from '../cluster/instance-heartbeat.js';
 import { evaluateDownstreams, checkSchedulerInvariant } from '../pipeline/needs-scheduler.js';
 import { evaluateWave } from '../pipeline/wave-scheduler.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'execution-tracker' });
 
@@ -2630,7 +2631,7 @@ export class ExecutionTracker {
   }
 
   /**
-   * Phase 9: stuck-jobs invariant check ( Layer 3).
+   * Phase 9: stuck-jobs invariant check (Layer 3).
    * Before declaring a run complete, verify no stuck jobs exist. If any are
    * found, fail them via recursive onJobStatus calls and signal the caller to
    * stop (returns true) — the recursive calls will re-enter and re-check
@@ -3109,8 +3110,8 @@ export class ExecutionTracker {
    * Create a failed execution run when the build timed out before onExecutionStarted
    * had a chance to insert the row (buildJobTrackedEarly was false).
    *
-   * Inserts a minimal execution_runs row with status='failed' directly so the E2E
-   * test (and dashboard) can observe the failure instead of a missing run.
+   * Inserts a minimal execution_runs row with status='failed' directly so the
+   * dashboard (and any run query) can observe the failure instead of a missing run.
    *
    * The fifth pre-dispatch recording site, and the third that writes the row and
    * returns. Its row is terminal with no resume path, so no invoke gate ever
@@ -4273,13 +4274,19 @@ export class ExecutionTracker {
   private openRegistrationWindow(runId: string): void {
     const instanceId = this.instanceId;
     if (!instanceId) return;
-    this.chainRegistrationWindowWrite(runId, async () => {
-      await this.db
-        .updateTable('execution_runs')
-        .set({ registration_window_instance_id: instanceId })
-        .where('run_id', '=', runId)
-        .execute();
-    });
+    runDetached(
+      logger,
+      'Registration window open',
+      () =>
+        this.chainRegistrationWindowWrite(runId, async () => {
+          await this.db
+            .updateTable('execution_runs')
+            .set({ registration_window_instance_id: instanceId })
+            .where('run_id', '=', runId)
+            .execute();
+        }),
+      { runId },
+    );
   }
 
   /**
@@ -4305,11 +4312,17 @@ export class ExecutionTracker {
       logger.error('Registration window write failed', { runId, error: toErrorMessage(err) });
     });
     this.registrationWindowWrites.set(runId, next);
-    void next.finally(() => {
-      if (this.registrationWindowWrites.get(runId) === next) {
-        this.registrationWindowWrites.delete(runId);
-      }
-    });
+    runDetached(
+      logger,
+      'Registration window write cleanup',
+      () =>
+        next.finally(() => {
+          if (this.registrationWindowWrites.get(runId) === next) {
+            this.registrationWindowWrites.delete(runId);
+          }
+        }),
+      { runId },
+    );
     return next;
   }
 

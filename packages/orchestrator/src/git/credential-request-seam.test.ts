@@ -3,12 +3,11 @@
  *
  * The relay, the job-context reader, the broker and the job secret gate are all
  * the real implementations here; only the database rows, the context store and
- * the secret backend are doubles. That is the seam the E2E
- * `secrets-pipeline` git-credential-relay block exercises against a deployed
- * stack, and the piece the per-module unit tests each stub out: the relay's own
- * suite hands the handler a fixed `jobContext`, so no test drove a real reader
- * into a real gate, and a legitimate request could be refused with every module
- * passing its own tests.
+ * the secret backend are doubles. That is the seam a deployed stack exercises
+ * on every git credential request, and the piece the per-module unit tests each
+ * stub out: the relay's own suite hands the handler a fixed `jobContext`, so no
+ * test drove a real reader into a real gate, and a legitimate request could be
+ * refused with every module passing its own tests.
  *
  * The fixture pins the ordering that broke it: the job's `execution_jobs` row is
  * ABSENT, because the pipeline sends the dispatch and persists the tracked row
@@ -62,7 +61,7 @@ function contextRow(name: string, overrides: Record<string, unknown> = {}) {
 
 /**
  * `ci` admits any branch; `locked` restricts to a branch this run cannot
- * present — the same pair the E2E block seeds.
+ * present.
  */
 const contextStore = {
   matchContext: vi.fn(async (_orgId: string, name: string) => {

@@ -1,0 +1,42 @@
+diff --git a/dist/chunks/index.DzobfTyw.js b/dist/chunks/index.DzobfTyw.js
+index 08c3c116fbf8fe4685b45dee57f0f645b1270d81..4906b2d144cf00c83004818a34949ba014e8030f 100644
+--- a/dist/chunks/index.DzobfTyw.js
++++ b/dist/chunks/index.DzobfTyw.js
+@@ -20498,7 +20498,9 @@ class Vitest {
+ 		this._fsCache = new FileSystemModuleCache(this);
+ 		this.snapshot = new SnapshotManager({ ...resolved.snapshotOptions });
+ 		this._resolver = new VitestResolver(this.viteConfig.cacheDir, resolved);
+-		this._fetcher = createFetchModuleFunction(this._resolver, resolved, this._fsCache, this._traces, this._tmpDir);
++		// a closed run removes the temp dir, so a restart must allocate a new one
++		const tmpDir = this._tmpDir ??= join(tmpdir(), nanoid());
++		this._fetcher = createFetchModuleFunction(this._resolver, resolved, this._fsCache, this._traces, tmpDir);
+ 	}
+ 	_restartPromise;
+ 	_restartQueued = false;
+@@ -21433,11 +21435,26 @@ class Vitest {
+ 				for (const error of errors) this.logger.error("error during close", error);
+ 				this._checkUnhandledErrors(errors);
+ 			});
++			// the pool is down: forked workers read tmp module copies from disk
++			await this._clearTmpDir();
+ 			await this._traces?.finish();
+ 		})();
+ 		return this.closingPromise;
+ 	}
+ 	/**
++	* Removes the root temp directory with the tmp module copies,
++	* mirroring `TestProject.clearTmpDir()`. The reference is cleared before
++	* the removal so a repeated close is a no-op.
++	*/
++	async _clearTmpDir() {
++		if (!this._tmpDir) return;
++		const tmpDir = this._tmpDir;
++		this._tmpDir = void 0;
++		try {
++			await rm(tmpDir, { recursive: true, force: true });
++		} catch {}
++	}
++	/**
+ 	* Closes all projects and exit the process
+ 	* @param force If true, the process will exit immediately after closing the projects.
+ 	*/

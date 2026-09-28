@@ -146,4 +146,23 @@ describe('LeaderGatedScheduler', () => {
     vi.advanceTimersByTime(5000);
     expect(tick).toHaveBeenCalledTimes(1);
   });
+
+  // fails-when: a leadership callback that lands after stop() runs the setup
+  // (cron's cache load queries the database) and starts the interval.
+  it('never starts another tenure after stop()', async () => {
+    const setup = vi.fn();
+    const tick = vi.fn();
+    const s = new LeaderGatedScheduler({
+      name: 't',
+      intervalMs: 1000,
+      onBecomeLeader: setup,
+      tick,
+    });
+    s.stop();
+    await s.onBecomeLeader();
+    vi.advanceTimersByTime(5000);
+    expect(setup).not.toHaveBeenCalled();
+    expect(tick).not.toHaveBeenCalled();
+    expect(s.isLeader).toBe(false);
+  });
 });

@@ -5,7 +5,9 @@ import { optionsToConfig, type ProvisionOptions } from './provision.js';
 export function registerVerify(group: Command): void {
   group
     .command('verify')
-    .description('Check a Firecracker host bridge is up with its addr + nft table')
+    .description(
+      'Check a Firecracker host bridge: its addr, nft table, and subnet NAT + isolation rules',
+    )
     .requiredOption('--bridge <name>', 'bridge interface name')
     .requiredOption('--cidr <cidr>', 'gateway IP + prefix')
     .option('--table <name>', 'nft table name', 'kici')

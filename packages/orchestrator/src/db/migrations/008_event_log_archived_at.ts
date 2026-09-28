@@ -4,13 +4,11 @@ import { type Kysely, sql } from 'kysely';
  * `event_log` cold-store schema additions plus removal of the
  * `expires_at`-based 30-day hard delete.
  *
- * Phase E of the cold-storage archival system. See
- *  §10
- * Phase E.
+ * Part of the cold-storage archival system.
  *
  * Adds the same `archived_at TIMESTAMPTZ NULL` /
- * `archive_object_key TEXT NULL` pair Phase D added on this side
- * (`007_audit_logs_archived_at.ts`). Set inside the archive
+ * `archive_object_key TEXT NULL` pair
+ * `007_audit_logs_archived_at.ts` added on this side. Set inside the archive
  * transaction before the DELETE; survivors carry NULL.
  *
  * Adds `idx_event_log_routing_received` on `(routing_key, received_at)`
@@ -21,7 +19,7 @@ import { type Kysely, sql } from 'kysely';
  * archiver scan.
  *
  * Drops `event_log.expires_at` and the matching
- * `event_log_expires_at_idx` index. Until Phase E, `expires_at`
+ * `event_log_expires_at_idx` index. Before this migration, `expires_at`
  * powered the 30-day hard-delete sweep in
  * `packages/orchestrator/src/webhook/event-log.ts:cleanup`, called
  * from `packages/orchestrator/src/queue/cleanup.ts:runCleanup` step 4
@@ -49,7 +47,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
       ON public.event_log (routing_key, received_at)
   `.execute(db);
 
-  // Drop the TTL machinery — Phase E replaces it with archive-then-delete.
+  // Drop the TTL machinery — archive-then-delete replaces it.
   await sql`DROP INDEX IF EXISTS public.event_log_expires_at_idx`.execute(db);
   await sql`
     ALTER TABLE public.event_log

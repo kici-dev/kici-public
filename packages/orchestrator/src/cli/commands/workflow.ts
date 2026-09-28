@@ -2,10 +2,9 @@
  * Workflow registration commands for kici-admin.
  *
  * Provides operator-facing read access to the workflow_registrations table
- * via the orchestrator's admin HTTP API. This is the dogfooded replacement
- * for "let me just psql the registration table" — every CLI subcommand here
- * goes through AdminApiClient and the existing /api/v1/admin/registrations
- * route.
+ * via the orchestrator's admin HTTP API. Use it instead of querying the
+ * registration table with psql: every CLI subcommand here goes through
+ * AdminApiClient and the existing /api/v1/admin/registrations route.
  *
  *   workflow list                List registered workflows (table or JSON)
  *
@@ -147,7 +146,7 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
   const wf = program.command('workflow').description('Inspect workflow registrations');
 
   wf.command('list')
-    .description('List workflow registrations (dogfooded via /api/v1/admin/registrations)')
+    .description('List workflow registrations (admin API: /api/v1/admin/registrations)')
     .option('--org <orgId>', 'Filter by customer/org id (server param: customerId)')
     .option('--routing-key <key>', 'Filter by routing key, e.g. github:42')
     .option('--repo <ownerRepo>', 'Filter by repo identifier (owner/repo)')

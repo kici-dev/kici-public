@@ -15,8 +15,8 @@ export interface StepTaskSlot {
  * that single slot. Under sequential execution that is correct (one step at a
  * time), but two concurrently-running steps would clobber each other's
  * secrets-audit trail. Keying every slot by the step's index keeps each step's
- * audit trail and teardown isolated — sequential behavior is identical, Phase 1
- * concurrency is correct.
+ * audit trail and teardown isolated — sequential behavior is identical, and
+ * concurrent `parallel()` children stay correct.
  */
 export class StepTaskRegistry {
   #slots = new Map<number, StepTaskSlot>();

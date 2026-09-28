@@ -47,6 +47,31 @@ describe('createScalerBackend', () => {
     expect((backend as unknown as { requireSudo: boolean }).requireSudo).toBe(false);
   });
 
+  it('passes extraHosts through to the firecracker backend, resolved against its gateway', async () => {
+    // fails-when: the factory drops the scaler's extraHosts for Firecracker,
+    // so an operator's opt-in never reaches the guest.
+    const backend = await createScalerBackend(
+      fcEntry({ extraHosts: ['registry.local:host-gateway'] }),
+      ctx({
+        scalerConfig: {
+          version: 1,
+          globalMaxAgents: 10,
+          scalers: [],
+          firecracker: { gateway: '10.9.0.1' },
+        } as unknown as never,
+      }),
+    );
+    // `guestExtraHosts` is private; assert via the field the option drives.
+    expect((backend as unknown as { guestExtraHosts?: string }).guestExtraHosts).toBe(
+      'registry.local:10.9.0.1',
+    );
+  });
+
+  it('gives a firecracker scaler with no extraHosts no guest mapping', async () => {
+    const backend = await createScalerBackend(fcEntry(), ctx());
+    expect((backend as unknown as { guestExtraHosts?: string }).guestExtraHosts).toBeUndefined();
+  });
+
   it('returns null for an event scaler when the host supplies no emitter', async () => {
     const entry = fcEntry({
       name: 'evt',

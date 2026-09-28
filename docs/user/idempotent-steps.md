@@ -114,7 +114,8 @@ error.
 ## Where outcomes show up
 
 A check-mode run is labeled in the dashboard with a **CHECK MODE — preview**
-badge on the run header. Each step shows its outcome chip — applied / in sync /
+badge at the top of the run's metadata panel. A fail-on-drift run shows
+**CHECK MODE — preview (fail on drift)** instead. Each step shows its outcome chip — applied / in sync /
 would change / no check — and, when drift was detected, the `summarize` line
 describing what would change. The rendering is read-only.
 

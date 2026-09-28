@@ -247,11 +247,11 @@ export async function computeMigrationsHash(provider: MigrationProvider): Promis
 /**
  * Marker row key used by the bundled-provider hash (`computeMigrationsHash`).
  *
- * Kept distinct from the legacy e2e file-based hash (which still writes to
- * the row keyed `'kysely_migration'`) so the two algorithms can coexist in
- * the same `_migration_content_hash` table without clobbering each other.
+ * Kept distinct from the older file-based hash (which writes to the row keyed
+ * `'kysely_migration'`) so the two algorithms can coexist in the same
+ * `_migration_content_hash` table without clobbering each other.
  * `kici-admin db check-schema` / `kici-platform-admin db check-schema` read
- * this row; the e2e `isSchemaCurrent` helper reads the other.
+ * this row; a caller of the file-based hash reads the other.
  */
 export const PROVIDER_HASH_KEY = 'kysely_migration_provider';
 
@@ -321,12 +321,12 @@ export async function purgeStaleExecutionDirect(
 ): Promise<PurgeStaleExecutionResult> {
   const pool = createPool(databaseUrl);
   try {
-    // Wipe stale concurrency_groups rows. Two reasons to delete:
+    // Wipe stale concurrency_groups rows. Reasons to delete:
     // 1. routing_key from a different deployment (mirrors execution_runs).
     // 2. run_id refers to an execution_run we're about to delete (orphans).
-    // 3. (E2E warm cleanup) any non-terminal status under THIS routing key
+    // 3. (restart cleanup) any non-terminal status under THIS routing key
     //    whose owning run is no longer 'running'/'pending'/'queued' — agents
-    //    from the previous test invocation are gone and the slot-release
+    //    from the previous orchestrator process are gone and the slot-release
     //    path would otherwise pick the orphan first by created_at ASC.
     // The table has no FK on run_id so we have to clean it explicitly.
     const concurrencyGroupsResult = await pool.query(
@@ -494,10 +494,9 @@ export async function purgeScopedSecretsDirect(
  * automatically (ON DELETE CASCADE). `held_runs` and `execution_runs` reference
  * `contexts(id)` with ON DELETE SET NULL, so deleting contexts alone
  * would leave orphaned `held_runs` rows carrying a null context reference;
- * this helper deletes the org's `held_runs` too so a warm-start reset gets a
- * clean slate. Runs in a transaction so both deletes commit atomically. Used by
- * the E2E warm-start reset (so seeded contexts don't leak between
- * categories) and exposed via `kici-admin context purge`.
+ * this helper deletes the org's `held_runs` too so a reset gets a clean slate.
+ * Runs in a transaction so both deletes commit atomically. Exposed via
+ * `kici-admin context purge`.
  */
 export async function purgeContextsDirect(
   databaseUrl: string,
@@ -527,11 +526,10 @@ export async function purgeContextsDirect(
 
 // ── context ops ────────────────────────────────────────────────────
 //
-// Direct-DB helpers backing `kici-admin context` (Stage 5a #1). These
-// abstract the `ON CONFLICT (org_id, name) DO UPDATE` upsert pattern that
-// the e2e setup helpers previously open-coded against `new pg.Pool`. Every
-// helper owns its own pool (max=1) and awaits `pool.end()` in finally —
-// callers pass a database URL, not a pool.
+// Direct-DB helpers backing `kici-admin context`. These abstract the
+// `ON CONFLICT (org_id, name) DO UPDATE` upsert pattern so no caller
+// open-codes it against `new pg.Pool`. Every helper owns its own pool (max=1)
+// and awaits `pool.end()` in finally — callers pass a database URL, not a pool.
 
 /**
  * Allowed policy field names for `setContextPolicyDirect`. Kept as an
@@ -1052,8 +1050,7 @@ export interface SetContextSecretOpts {
 
 /**
  * UPSERT a scoped_secrets row keyed by (org_id, scope=context, key).
- * Writes the value verbatim — the caller is responsible for encryption
- * (matches the stage-4 deferral noted in the plan).
+ * Writes the value verbatim — the caller is responsible for encryption.
  */
 export async function setContextSecretDirect(
   databaseUrl: string,
@@ -1079,7 +1076,7 @@ export async function setContextSecretDirect(
   }
 }
 
-// ── queue + execution read ops (stage-5a #3 /) ─────────────────────────
+// ── queue + execution read ops ─────────────────────────────────────────
 
 export interface DispatchQueueRow {
   id: string;
@@ -1115,7 +1112,7 @@ export interface ListQueueOpts {
 /**
  * READ-ONLY: SELECT from `dispatch_queue` with optional status + job-name
  * filters and a bounded limit (defaults to 100). Includes source_tar_url,
- * deps_url, and job_config so E2E tests can assert on cache metadata
+ * deps_url, and job_config so a caller can inspect cache metadata
  * without a second round-trip.
  */
 export async function listQueueDirect(
@@ -1437,7 +1434,7 @@ export async function showExecutionRunDirect(
   }
 }
 
-// ── workflow_registrations read ops (stage-5a #4) ──────────────────────────
+// ── workflow_registrations read ops ────────────────────────────────────────
 
 export interface WorkflowRegistrationRow {
   id: string;
@@ -1566,7 +1563,7 @@ export async function showRegistrationDirect(
   }
 }
 
-// ── workflow register-manual (stage-5a #6) ─────────────────────────────────
+// ── workflow register-manual ───────────────────────────────────────────────
 
 /**
  * Registerable trigger types. Kept in sync with
@@ -1624,9 +1621,8 @@ export interface RegisterWorkflowManualResult {
 /**
  * Transactionally upsert `workflow_registrations` rows from a lock file and
  * bump `registry_versions.version`. Mirrors the orchestrator's
- * RegistrationStore.replaceAll() path but runs offline — the E2E test helpers
- * `seedWorkflowRegistrationsFromLockFile` called this pattern via raw pg.Pool
- * before this helper existed.
+ * RegistrationStore.replaceAll() path but runs offline, straight against the
+ * database, without going through an orchestrator.
  *
  * Writes one row per registerable workflow (UPSERT by
  * (routing_key, repo_identifier, workflow_name)), then bumps
@@ -1762,12 +1758,11 @@ export interface EmitKiciEventOpts {
 
 /**
  * INSERT a row into `kici_events` and fire `pg_notify('kici_event_channel', <id>)`
- * so the orchestrator EventRouter picks it up immediately. Used by Bucket B/C
- * e2e helpers to simulate what `agent ctx.emit()` does from inside a step
- * execution — but without needing an actual running step. Returns the event id.
+ * so the orchestrator EventRouter picks it up immediately. Simulates what
+ * `agent ctx.emit()` does from inside a step execution — but without needing
+ * an actual running step. Returns the event id.
  *
- * Fixed `chain_depth=0` and `expires_at=NOW() + 1h` match emitLocalEvent()
- * in e2e/helpers/local-webhook.ts, which this helper supersedes.
+ * The event always gets `chain_depth=0` and `expires_at=NOW() + 1h`.
  */
 export async function emitKiciEventDirect(
   databaseUrl: string,
@@ -1842,17 +1837,17 @@ export async function isSchemaCurrent(
   return { current: true };
 }
 
-// ── Orchestrator DB direct helpers for e2e pg.Pool elimination (phase 28.10-03) ──
+// ── Orchestrator DB direct helpers ──────────────────────────────────
 
 /**
  * Purge backends whose encrypted `config` column can no longer be decrypted
- * (e.g. warm-start E2E where KICI_SECRET_KEY rotated between categories).
+ * (e.g. KICI_SECRET_KEY was rotated while the database was kept).
  *
  * Only rows with a non-empty `config_encrypted` are affected — the default
  * `pg` backend is seeded by the initial migration with `config_encrypted = ''`
  * as a sentinel (loadAllStores() skips decryption for it), so it is never the
  * source of the decryption failure and must be preserved. Deleting it breaks
- * downstream tests that rely on the default backend being registered.
+ * everything that relies on the default backend being registered.
  */
 export async function purgeSecretBackendsDirect(databaseUrl: string): Promise<{ deleted: number }> {
   const pool = createPool(databaseUrl);
@@ -1867,9 +1862,9 @@ export async function purgeSecretBackendsDirect(databaseUrl: string): Promise<{ 
 }
 
 /**
- * Delete peer_credentials rows whose instance_id does NOT match a pattern.
- * Used by cluster e2e to wipe stale staging peer credentials while leaving
- * e2e-* peers intact.
+ * Delete peer_credentials rows whose instance_id does NOT match a pattern
+ * (`keepInstanceIdPattern`, a SQL `LIKE` pattern), so stale peer credentials
+ * are wiped while the matching peers stay intact.
  */
 export async function prunePeerCredentialsDirect(
   databaseUrl: string,
@@ -1900,8 +1895,8 @@ export interface OrgSettingsRepoPatternEntry {
 
 /**
  * Wait for an orchestrator `event_log` row keyed by `delivery_id`.
- * Returns the full row (the webhook-pipeline e2e asserts many
- * columns) or null on timeout.
+ * Returns the full row (callers read many columns) or null on
+ * timeout.
  */
 export interface EventLogRow {
   org_id: string;

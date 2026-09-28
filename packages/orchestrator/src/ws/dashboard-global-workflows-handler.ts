@@ -37,6 +37,7 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'dashboard-global-workflows-handler' });
 
@@ -129,18 +130,25 @@ export class DashboardGlobalWorkflowsHandler {
     outcome: AccessLogOutcome,
     errorMessage?: string | null,
   ): void {
-    if (!this.accessLog) return;
-    void this.accessLog.record({
-      orgId: this.deps.customerId || null,
-      routingKey: null,
-      actor,
-      action,
-      target,
-      requestId,
-      source: 'platform_proxy',
-      outcome,
-      errorMessage: errorMessage ?? null,
-    });
+    const accessLog = this.accessLog;
+    if (!accessLog) return;
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        accessLog.record({
+          orgId: this.deps.customerId || null,
+          routingKey: null,
+          actor,
+          action,
+          target,
+          requestId,
+          source: 'platform_proxy',
+          outcome,
+          errorMessage: errorMessage ?? null,
+        }),
+      { requestId },
+    );
   }
 
   async handleMessage(msg: GlobalWorkflowsMessage): Promise<boolean> {

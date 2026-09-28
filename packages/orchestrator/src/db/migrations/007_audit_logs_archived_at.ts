@@ -4,13 +4,12 @@ import { type Kysely, sql } from 'kysely';
  * `secret_audit_log` and `access_log` cold-store schema additions, plus
  * the removal of `access_log`'s `expires_at`-based hard delete.
  *
- * Phase D of the cold-storage archival system. See
+ * Part of the cold-storage archival system.
  *
  * Both tables get the same `archived_at TIMESTAMPTZ NULL` /
- * `archive_object_key TEXT NULL` pair that Phase B added to `run_events`
- * (`packages/platform/src/db/migrations/004_run_events_archived_at.ts`)
- * and Phase C added to `execution_runs` / `execution_jobs` /
- * `execution_steps` (`006_runs_jobs_steps_archived_at.ts`). Set inside
+ * `archive_object_key TEXT NULL` pair that `run_events` carries
+ * (in the Platform's schema) and that `execution_runs` / `execution_jobs` /
+ * `execution_steps` got in `006_runs_jobs_steps_archived_at.ts`. Set inside
  * the archive transaction before the DELETE; survivors carry NULL.
  *
  * `secret_audit_log` gets a composite
@@ -24,7 +23,7 @@ import { type Kysely, sql } from 'kysely';
  * (range scans use either direction).
  *
  * Drops `access_log.expires_at` column and `access_log_expires_idx`.
- * Until Phase D, `expires_at` powered a 90-day hard-delete sweep in
+ * Before this migration, `expires_at` powered a 90-day hard-delete sweep in
  * `packages/orchestrator/src/audit/access-log.ts:cleanup` (called from
  * `packages/orchestrator/src/queue/cleanup.ts:runCleanup` step 5). With
  * cold-store, `access_log` rows older than 30 days are archived rather
@@ -32,11 +31,9 @@ import { type Kysely, sql } from 'kysely';
  * column would mean either (a) double-evicting rows or (b) silently
  * mismatching the new contract. Drop it.
  *
- * Per the project's "no backward compatibility (pre-release)" rule,
  * `down()` recreates `expires_at` with a default of `now() + 90 days`
  * — best effort; rows inserted between `up()` and a hypothetical
- * `down()` would not have meaningful retention bounds. Acceptable for
- * staging.
+ * `down()` would not have meaningful retention bounds.
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {
@@ -59,7 +56,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
       ADD COLUMN archive_object_key  TEXT        NULL
   `.execute(db);
 
-  // Drop the TTL machinery — Phase D replaces it with archive-then-delete.
+  // Drop the TTL machinery — archive-then-delete replaces it.
   await sql`DROP INDEX IF EXISTS public.access_log_expires_idx`.execute(db);
   await sql`
     ALTER TABLE public.access_log

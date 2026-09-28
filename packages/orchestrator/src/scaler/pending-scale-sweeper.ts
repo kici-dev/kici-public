@@ -1,4 +1,5 @@
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'pending-scale-sweeper' });
 
@@ -46,7 +47,7 @@ export class PendingScaleSweeper {
       intervalMs: this.intervalMs,
     });
     this.timer = setInterval(() => {
-      void this.tick();
+      runDetached(logger, 'Pending-scale sweeper tick', () => this.tick());
     }, this.intervalMs);
     this.timer.unref?.();
   }

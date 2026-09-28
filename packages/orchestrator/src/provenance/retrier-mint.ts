@@ -29,7 +29,7 @@ export interface RetrierMintDeps {
   provenanceSigning: { issuer: string; resolveSigner: () => Promise<Signer | null> } | undefined;
   /**
    * Test-only fault injection: the build-time test double supplies a predicate
-   * over the audience that forces a TERMINAL rejection, so an E2E can exercise
+   * over the audience that forces a TERMINAL rejection, so a test can exercise
    * the markRejected → gauge-exclusion → `--include-rejected` re-arm cycle with
    * a real deferred row. It returns before the real mint, so the signing choke
    * point is preserved. The shipped orchestrator leaves it undefined.

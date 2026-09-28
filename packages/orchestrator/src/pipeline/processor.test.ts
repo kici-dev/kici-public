@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock @kici-dev/shared to intercept logger calls for the
-// multi-provider fallback log-level elevation tests (Plan 28.6.2-07 Task 3).
+// multi-provider fallback log-level elevation tests.
 const { mockPipelineLogger } = vi.hoisted(() => {
   const mockPipelineLogger = {
     debug: vi.fn(),
@@ -2924,7 +2924,7 @@ describe('processWebhook', () => {
 /**
  * Build a provider bundle that mimics the real GenericWebhookNormalizer:
  *   - normalizeEvent returns event.type='generic_webhook' with the user
- *     event name in event.action (THIS is what creates Pitfall 1)
+ *     event name in event.action (THIS is what the synthetic event works around)
  *   - extractRepoIdentifier returns null (generic webhooks have no repo)
  */
 function createGenericProviderBundle(): ProviderBundle {
@@ -2942,7 +2942,7 @@ function createGenericProviderBundle(): ProviderBundle {
           // never accept this against a user-defined webhook trigger. The
           // cross-source branch in processWebhook MUST construct a synthetic
           // event with type=eventType (the user event name) before calling
-          // matchAllWorkflows. This is the Pitfall 1 fix.
+          // matchAllWorkflows.
           type: 'generic_webhook' as const,
           action: eventType !== 'default' ? eventType : undefined,
           targetBranch: '__generic__',
@@ -3042,8 +3042,8 @@ function makeWebhookRegistration(opts: {
 
 function baseGenericInfo(overrides: Partial<WebhookInfo> = {}): WebhookInfo {
   return {
-    routingKey: 'generic:kiciStg00001:stg-generic',
-    deliveryId: 'generic:kiciStg00001:stg-generic:delivery-1',
+    routingKey: 'generic:acmeOrg00001:src-generic',
+    deliveryId: 'generic:acmeOrg00001:src-generic:delivery-1',
     event: 'foo',
     action: null,
     provider: 'generic',
@@ -3052,7 +3052,7 @@ function baseGenericInfo(overrides: Partial<WebhookInfo> = {}): WebhookInfo {
   };
 }
 
-describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => {
+describe('processWebhook — cross-source webhook dispatch', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
@@ -3074,7 +3074,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
 
     const registry = new ProviderRegistry();
     // Register the inbound generic source by exact routing key
-    registry.registerByRoutingKey('generic:kiciStg00001:stg-generic', genericBundle);
+    registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', genericBundle);
     // Register the cross-source target bundle by exact routing key
     registry.registerByRoutingKey('github:42', registeredBundle);
 
@@ -3109,7 +3109,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     });
   }
 
-  // CS-1 (WHK-CROSS-01 happy path): single matched registration in same org
+  // CS-1 (happy path): single matched registration in same org
   it('CS-1: dispatches single matched cross-source registration', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-1',
@@ -3127,7 +3127,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     const call = (deps.dispatcher.dispatch as any).mock.calls[0][0];
     expect(call.workflowName).toBe('react-to-foo');
     expect(call.routingKey).toBe('github:42');
-    expect(call.deliveryId).toBe('generic:kiciStg00001:stg-generic:delivery-1:reg-1');
+    expect(call.deliveryId).toBe('generic:acmeOrg00001:src-generic:delivery-1:reg-1');
     expect(call.provider).toBe('github');
     // providerContext is the registration's context; the clone token is minted at dispatch
     expect(call.providerContext).toEqual({ installationId: 7 });
@@ -3136,10 +3136,10 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     // jobConfig carries the cross-source provenance fields
     expect(call.jobConfig.crossSource).toBe(true);
     expect(call.jobConfig.inboundEventName).toBe('foo');
-    expect(call.jobConfig.inboundRoutingKey).toBe('generic:kiciStg00001:stg-generic');
+    expect(call.jobConfig.inboundRoutingKey).toBe('generic:acmeOrg00001:src-generic');
   });
 
-  // CS-2 (WHK-CROSS-03): fan-out N>1 with distinct composite dedup keys
+  // CS-2: fan-out N>1 with distinct composite dedup keys
   it('CS-2: fans out to N>1 cross-source registrations with distinct dedup keys', async () => {
     const regs = [
       makeWebhookRegistration({
@@ -3175,23 +3175,23 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     const dispatchCalls = (deps.dispatcher.dispatch as any).mock.calls.map((c: any[]) => c[0]);
     const dedupKeys = dispatchCalls.map((c: any) => c.deliveryId).sort();
     expect(dedupKeys).toEqual([
-      'generic:kiciStg00001:stg-generic:delivery-1:reg-A',
-      'generic:kiciStg00001:stg-generic:delivery-1:reg-B',
-      'generic:kiciStg00001:stg-generic:delivery-1:reg-C',
+      'generic:acmeOrg00001:src-generic:delivery-1:reg-A',
+      'generic:acmeOrg00001:src-generic:delivery-1:reg-B',
+      'generic:acmeOrg00001:src-generic:delivery-1:reg-C',
     ]);
 
     // dedup.claim called once per registration with distinct composite keys
     const markCalls = (deps.dedup.claim as any).mock.calls.map((c: any[]) => c[0]);
-    expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-A');
-    expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-B');
-    expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-C');
+    expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-A');
+    expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-B');
+    expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-C');
   });
 
-  // CS-3 (Pitfall 1 regression — CRITICAL): synthetic SimulatedEvent has
+  // CS-3 (regression — CRITICAL): synthetic SimulatedEvent has
   // type=inboundEventName, NOT 'generic_webhook'. If the synthetic event
   // construction is ever removed, matchWebhookTrigger will reject every
   // cross-source registration and this test will fail loudly.
-  it('CS-3: PITFALL 1 — synthetic event has type=inboundEventName, not generic_webhook', async () => {
+  it('CS-3: synthetic event has type=inboundEventName, not generic_webhook', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-pitfall1',
       customerId: '__default__',
@@ -3204,7 +3204,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     const deps = makeCrossSourceDeps({ registrations: [reg] });
     // The matcher (matchAllWorkflows) is invoked inside processWebhook with a
     // synthetic event. We assert downstream behavior: if the synthetic event
-    // had type='generic_webhook' (Pitfall 1), the matcher would reject it
+    // had type='generic_webhook', the matcher would reject it
     // because the registration's webhook trigger lists events=['foo'], and
     // dispatcher.dispatch would NEVER be called. The fact that dispatch IS
     // called proves the synthetic event was built with type='foo'.
@@ -3216,7 +3216,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     // to event.type='generic_webhook' (the raw normalizer output that would
     // be REJECTED by matchWebhookTrigger if not corrected).
     const genericBundle = (deps.providerRegistry as ProviderRegistry).getByRoutingKey(
-      'generic:kiciStg00001:stg-generic',
+      'generic:acmeOrg00001:src-generic',
     )!;
     const rawNormalized = genericBundle.normalizer.normalizeEvent('foo', null, {
       hello: 'world',
@@ -3225,7 +3225,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     expect(rawNormalized?.action).toBe('foo');
   });
 
-  // CS-4 (WHK-CROSS-04): bundle resolved from REGISTRATION's routing key,
+  // CS-4: bundle resolved from REGISTRATION's routing key,
   // never from the inbound generic source.
   it('CS-4: resolves provider bundle from registration routing key, not inbound', async () => {
     const registeredBundle = createRegisteredBundle();
@@ -3291,7 +3291,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
   });
 
-  // CS-6 (WHK-CROSS-02 — cross-org isolation): orgB registrations are not
+  // CS-6 (cross-org isolation): orgB registrations are not
   // returned for an inbound webhook resolving to orgA. We exercise this at
   // the processor level by mocking getByOrgAndEvent so it ONLY returns orgA
   // entries when called with orgA — and asserting the call shape.
@@ -3332,7 +3332,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     expect(idx.getByOrgAndEvent).not.toHaveBeenCalledWith('orgB', 'foo');
   });
 
-  // CS-7 ( — legacy github→github path is byte-identical, never enters
+  // CS-7 (the github→github path is byte-identical, never enters
   // the cross-source branch).
   it('CS-7: inbound github webhook does NOT enter cross-source branch', async () => {
     const reg = makeWebhookRegistration({
@@ -3391,7 +3391,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     // fresh id and still wins so the pipeline proceeds to the cross-source step.
     const deps2 = makeCrossSourceDeps({ registrations: [reg] });
     (deps2.dedup.claim as any).mockImplementation(async (key: string) => {
-      return key !== 'generic:kiciStg00001:stg-generic:delivery-1:reg-replay';
+      return key !== 'generic:acmeOrg00001:src-generic:delivery-1:reg-replay';
     });
     await processWebhook(baseGenericInfo(), deps2);
     // dispatcher must NOT be called the second time
@@ -3490,12 +3490,12 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
       index: 0,
     });
     // Composite dedup key (cross-source override)
-    expect(call.deliveryId).toBe('generic:kiciStg00001:stg-generic:delivery-1:reg-cs10');
+    expect(call.deliveryId).toBe('generic:acmeOrg00001:src-generic:delivery-1:reg-cs10');
     // Registration's routing key, not inbound generic
     expect(call.routingKey).toBe('github:42');
     // Repo URL built via the registered bundle's repoUrlBuilder
     expect(call.repoUrl).toBe('https://github.com/orgA/repo-dyn.git');
-    // CS-10b regression guard for 28.4-VERIFICATION.md Gap 2: the dispatched
+    // CS-10b regression guard: the dispatched
     // ref MUST be the empty string (so the agent's gitClone falls through to
     // the default-branch clone path) and sha MUST be the registration's
     // commitSha (so post-clone SHA verification fetch-deepens to the right
@@ -3559,7 +3559,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     // BOTH dispatched jobs share the same composite deliveryId
     const dedupKeys = new Set(calls.map((c) => c.deliveryId));
     expect(dedupKeys.size).toBe(1);
-    expect([...dedupKeys][0]).toBe('generic:kiciStg00001:stg-generic:delivery-1:reg-cs11');
+    expect([...dedupKeys][0]).toBe('generic:acmeOrg00001:src-generic:delivery-1:reg-cs11');
 
     // BOTH dispatched jobs share the same runId (per-decision runId).
     const runIds = new Set(calls.map((c) => c.runId));
@@ -3568,10 +3568,10 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
 
   // CS-12 — a static job with dynamic context fields reached via
   // cross-source delivery queues an __init__ deferred-init job.
-  // Regression guard: deferred init dispatch ( two-phase init model)
-  // must work through the delegated path. Before the 28.4-06 refactor,
-  // this would never fire on cross-source delivery because the
-  // static-only loop never reached the deferred-init builder.
+  // Regression guard: deferred init dispatch (two-phase init model)
+  // must work through the delegated path. A static-only loop would never
+  // reach the deferred-init builder, so it would never fire on cross-source
+  // delivery.
   it('CS-12: static job with dynamic context queues __init__ job', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-cs12',
@@ -3623,14 +3623,14 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     );
     const initCall = calls.find((c) => c.jobName.startsWith('__init__'));
     expect(initCall).toBeDefined();
-    expect(initCall!.deliveryId).toBe('generic:kiciStg00001:stg-generic:delivery-1:reg-cs12');
+    expect(initCall!.deliveryId).toBe('generic:acmeOrg00001:src-generic:delivery-1:reg-cs12');
     expect(initCall!.routingKey).toBe('github:42');
     expect(initCall!.repoUrl).toBe('https://github.com/orgA/repo-init.git');
   });
 
   // CS-13 — multi-registration fan-out preserves one delegated dispatch per
   // matched registration with distinct composite dedup keys and distinct runIds.
-  // Re-asserts CS-2 invariant on the post-refactor delegated path. WHK-CROSS-06.
+  // Re-asserts CS-2 invariant on the delegated path.
   it('CS-13: multi-registration fan-out has distinct runIds and composite dedup keys (reg-A/reg-B/reg-C)', async () => {
     const regs = [
       makeWebhookRegistration({
@@ -3668,16 +3668,16 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     );
     const dedupKeys = calls.map((c) => c.deliveryId).sort();
     expect(dedupKeys).toEqual([
-      'generic:kiciStg00001:stg-generic:delivery-1:reg-A',
-      'generic:kiciStg00001:stg-generic:delivery-1:reg-B',
-      'generic:kiciStg00001:stg-generic:delivery-1:reg-C',
+      'generic:acmeOrg00001:src-generic:delivery-1:reg-A',
+      'generic:acmeOrg00001:src-generic:delivery-1:reg-B',
+      'generic:acmeOrg00001:src-generic:delivery-1:reg-C',
     ]);
 
     // dedup.claim called once per registration with distinct composite keys
     const markCalls = (deps.dedup.claim as any).mock.calls.map((c: unknown[]) => c[0]);
-    expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-A');
-    expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-B');
-    expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-C');
+    expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-A');
+    expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-B');
+    expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-C');
 
     // Distinct runIds (one per matched decision per registration)
     const runIds = new Set(calls.map((c) => c.runId));
@@ -3686,11 +3686,11 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
 
   // CS-14 — credentials and clone token come from the registration's bundle,
   // not the inbound generic bundle. regression guard, strengthened on
-  // the delegated path. WHK-CROSS-07. Reinforces CS-4 by asserting the
+  // the delegated path. Reinforces CS-4 by asserting the
   // registered bundle's token AND installationId propagate into the
   // dispatched QueuedJobInput.providerContext (CS-4 only asserted bundle
   // resolution, not credential propagation through the helper).
-  // CS-15 — Phase 3 affirmation for the universal-git provider work.
+  // CS-15 — cross-source dispatch to a universal-git-authored workflow.
   //
   // A universal-git-authored workflow is just a cross-source target whose
   // routing key is `generic:<orgId>:<sourceId>` and whose provider bundle
@@ -3698,8 +3698,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
   // full cloneTokenProvider + repoUrlBuilder). The cross-source dispatch
   // branch already uses `providerRegistry.getByRoutingKey(reg.routingKey)`
   // (processor.ts:3495), so it resolves the universal-git bundle with no
-  // code change — this test is the runtime verification required by the
-  // re-eval plan.
+  // code change — this test is the runtime verification of that path.
   //
   // The inbound webhook is a plain `generic:*` source (required to enter
   // the cross-source branch per the `info.provider === 'generic'` guard).
@@ -3737,7 +3736,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     // Registration points at a universal-git routing key; the helper will
     // call providerRegistry.getByRoutingKey(reg.routingKey) and get back
     // the universal-git bundle above.
-    const ugRoutingKey = 'generic:kiciStg00001:forgejo-wf-source';
+    const ugRoutingKey = 'generic:acmeOrg00001:forgejo-wf-source';
     const reg = makeWebhookRegistration({
       id: 'reg-cs15',
       customerId: '__default__',
@@ -3749,7 +3748,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
 
     const genericBundle = createGenericProviderBundle();
     const registry = new ProviderRegistry();
-    registry.registerByRoutingKey('generic:kiciStg00001:stg-generic', genericBundle);
+    registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', genericBundle);
     registry.registerByRoutingKey(ugRoutingKey, universalGitBundle);
 
     const mockRegistrationStore = { getVersion: vi.fn().mockResolvedValue(1) };
@@ -3804,7 +3803,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
 
     // Cross-source provenance: inbound routing key and event name recorded.
     expect(call.jobConfig.crossSource).toBe(true);
-    expect(call.jobConfig.inboundRoutingKey).toBe('generic:kiciStg00001:stg-generic');
+    expect(call.jobConfig.inboundRoutingKey).toBe('generic:acmeOrg00001:src-generic');
     expect(call.jobConfig.inboundEventName).toBe('foo');
     expect(call.jobConfig.workflowRepoIdentifier).toBe(
       'forgejo.example.com/kici-ci/shared-pipelines',
@@ -3846,7 +3845,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     // asserting the registered one was used is sufficient to prove no
     // fallback to the inbound bundle.
     const genericBundle = (deps.providerRegistry as ProviderRegistry).getByRoutingKey(
-      'generic:kiciStg00001:stg-generic',
+      'generic:acmeOrg00001:src-generic',
     )!;
     expect(genericBundle.cloneTokenProvider).toBeUndefined();
 
@@ -5398,11 +5397,11 @@ describe('PendingJobContext DB persistence', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// Plan 28.6.2-06: multi-provider lock-file fallback
+// Multi-provider lock-file fallback
 // ─────────────────────────────────────────────────────────────────────
 //
 // These tests cover the cross-provider lock-file resolution helper
-// `resolveLockFileWithFallback()` added by Plan 06. The helper lets a
+// `resolveLockFileWithFallback()`. The helper lets a
 // webhook whose inbound provider bundle cannot resolve a repo's lock
 // file fall back to the lock-file fetchers of OTHER provider bundles
 // registered against the SAME customer's registrations for the SAME
@@ -5416,14 +5415,14 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
   });
 
   /**
-   * Build a push-shaped webhook coming through the internal ingress.
-   * The staging stg-ha-smoke failover test sends this shape; the
+   * Build a push-shaped webhook coming through the internal ingress, the
+   * shape a failover-dispatch push arrives in. The
    * LocalWebhookNormalizer extracts repo.full_name and strips
    * refs/heads/ to produce a push SimulatedEvent.
    */
   function internalPushInfo(
     overrides: Partial<WebhookInfo> = {},
-    routingKey = 'generic:kiciStg00001:stg-generic',
+    routingKey = 'generic:acmeOrg00001:src-generic',
   ): WebhookInfo {
     return {
       routingKey,
@@ -5605,7 +5604,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     executionTracker?: ProcessingDeps['executionTracker'];
   }): Promise<ProcessingDeps> {
     const registry = new ProviderRegistry();
-    registry.registerByRoutingKey('generic:kiciStg00001:stg-generic', opts.inboundBundle);
+    registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', opts.inboundBundle);
     if (opts.githubBundle) {
       registry.registerByRoutingKey(opts.githubRoutingKey ?? 'github:42', opts.githubBundle);
     }
@@ -5795,7 +5794,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     const githubBundle2 = createMockGithubBundle(null);
 
     const registry = new ProviderRegistry();
-    registry.registerByRoutingKey('generic:kiciStg00001:stg-generic', inbound);
+    registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', inbound);
     registry.registerByRoutingKey('github:42', githubBundle1);
     registry.registerByRoutingKey('github:99', githubBundle2);
 
@@ -5858,7 +5857,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     const customerBGithub = createMockGithubBundle(helloFirecrackerLockFile());
 
     const registry = new ProviderRegistry();
-    registry.registerByRoutingKey('generic:kiciStg00001:stg-generic', inbound);
+    registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', inbound);
     registry.registerByRoutingKey('github:99', customerBGithub);
 
     // registrationIndex returns NO same-customer registrations for custA.
@@ -5952,8 +5951,8 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     expect((githubBundle.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
   });
 
-  // Test 6 (28.6.2-07 Task 3) — fallback no-same-customer log fires at INFO level.
-  it('Test 6-07: fallback no-same-customer registrations log fires at info level with full context', async () => {
+  // Fallback no-same-customer log fires at INFO level.
+  it('fallback no-same-customer registrations log fires at info level with full context', async () => {
     // Reset logger spies so earlier tests don't pollute assertions.
     mockPipelineLogger.info.mockClear();
     mockPipelineLogger.debug.mockClear();
@@ -5979,7 +5978,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     expect(infoLogCalls.length).toBe(1);
     const logContext = infoLogCalls[0][1] as Record<string, unknown>;
     expect(logContext).toMatchObject({
-      inboundRoutingKey: 'generic:kiciStg00001:stg-generic',
+      inboundRoutingKey: 'generic:acmeOrg00001:src-generic',
       customerId: 'custA',
       repoIdentifier: 'example-org/test-repo',
       attemptedFallbacks: 0,
@@ -6089,7 +6088,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     expect((inbound.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
   });
 
-  // Plan 28.6.2-08: cross-provider dispatch — fallback bundle propagation
+  // Cross-provider dispatch — fallback bundle propagation
   // ─────────────────────────────────────────────────────────────────────
   // These tests verify that when resolveLockFileWithFallback returns
   // resolvedVia='fallback', the dispatch site swaps to the winning bundle's

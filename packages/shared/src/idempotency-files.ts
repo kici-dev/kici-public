@@ -1,8 +1,8 @@
 /**
  * File-drift preview primitive for idempotent steps that copy or rsync
  * files to a remote target. Companion to `idempotency.ts`: a `check()`
- * that ships files can call into the helper layer (e.g. `previewRsync*`
- * in `packages/ci/src/deploy-prod/remote.ts`) to get a typed list of
+ * that ships files can call into a helper layer (an rsync preview, for
+ * example) to get a typed list of
  * per-file changes, then surface those entries inside the step's drift
  * value so the confirm prompt shows the operator exactly which files
  * would change and how.

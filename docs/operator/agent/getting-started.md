@@ -53,6 +53,8 @@ Build the image from the repository root:
 docker build -f packages/agent/Dockerfile -t kici-agent .
 ```
 
+The `.dockerignore` file at the repository root keeps local `node_modules`, `dist`, `.env` and key files out of the build context, so a checkout where you ran `pnpm install` does not copy them into the image.
+
 Run the container:
 
 ```bash

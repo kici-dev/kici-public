@@ -10,7 +10,7 @@ import {
 } from './peer-credentials.js';
 
 // --- File I/O tests ---
-// DB tests are covered by E2E (e2e/tests/cluster-peer-credentials.test.ts).
+// The end-to-end suite covers the DB paths.
 
 describe('credential file I/O', () => {
   let tempDir: string;

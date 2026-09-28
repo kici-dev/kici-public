@@ -18,7 +18,7 @@ The KiCI orchestrator runs in your infrastructure, giving you full control over 
 
 ## Four deployment modes
 
-The orchestrator supports four operating modes. Set the mode via the `KICI_MODE` environment variable (read at startup by `server.ts` / `standalone.ts`) or via `KICI_INSTANCE_MODE` / `instance.mode:` in a YAML config file (the resolver-based path documented in [configuration.md](configuration.md)). Both paths accept the same four values. **`kici-admin orchestrator install` writes `hybrid`**; an unset `KICI_MODE` falls back to `platform`. Either way the orchestrator refuses to boot if the credentials the chosen mode requires (see "Requirements" column below) aren't present.
+The orchestrator supports four operating modes. Set the mode with the `KICI_MODE` environment variable, which the orchestrator reads at startup. The orchestrator does not read the local YAML file's `instance.mode:` at startup, and a `KICI_INSTANCE_MODE` variable in its environment stops it from starting (see [Direct mappings](configuration.md#direct-mappings)). **`kici-admin orchestrator install` writes `hybrid`**; an unset `KICI_MODE` falls back to `platform`. Either way the orchestrator refuses to boot if the credentials the chosen mode requires (see "Requirements" column below) aren't present.
 
 ```
 Mode: hybrid (written by `kici-admin orchestrator install`)
@@ -69,7 +69,7 @@ Mode: independent
 
 ### Webhook secrets are per-source
 
-There is **no global `WEBHOOK_SECRET` env var**. Every webhook source has its own secret, registered via `kici-admin source add github ...` (or `source add generic ...`) and stored encrypted in the orchestrator DB. Direct HTTP webhook ingestion flows through `POST /webhook/:orgId/generic/:sourceId`, and the orchestrator reads the secret for that source from its `scoped_secrets` table on demand via `PgSecretStore`. See [Registering a GitHub App](#registering-a-github-app) below for the per-source registration flow.
+There is **no global `WEBHOOK_SECRET` env var**. Every webhook source has its own secret, registered via `kici-admin source add github ...` (or `source add generic ...`) and stored encrypted in the orchestrator DB. Direct HTTP webhook ingestion flows through `POST /webhook/:orgId/github/:sourceId` (GitHub App sources) or `POST /webhook/:orgId/generic/:sourceId` (generic sources), and the orchestrator reads the secret for that source from its `scoped_secrets` table on demand via `PgSecretStore`. See [Registering a GitHub App](#registering-a-github-app) below for the per-source registration flow.
 
 ## Prerequisites
 
@@ -302,7 +302,7 @@ Expected response:
 
 ## Webhook visibility
 
-Every inbound webhook the orchestrator handles (relay or direct) is recorded in the orchestrator's `event_log` table with metadata + a pointer to the gzipped payload in object storage. The dashboard's **Settings → Event log** tab exposes this surface, joined with the Platform-side delivery record on `(org_id, delivery_id)`. Operators can also dogfood it via `kici-admin event-log list` / `event-log show <deliveryId>`. See [`docs/operator/observability/observability.md`](../observability/observability.md) and [`docs/user/dashboard/settings.md#event-log`](../../user/dashboard/settings.md#event-log).
+Every inbound webhook the orchestrator handles (relay or direct) is recorded in the orchestrator's `event_log` table with metadata + a pointer to the gzipped payload in object storage. The dashboard's **Settings → Event log** tab exposes this surface, joined with the Platform-side delivery record on `(org_id, delivery_id)`. Operators can also read it with `kici-admin event-log list` / `event-log show <deliveryId>`. See [`docs/operator/observability/observability.md`](../observability/observability.md) and [`docs/user/dashboard/settings.md#event-log`](../../user/dashboard/settings.md#event-log).
 
 ## Prometheus metrics
 
@@ -335,6 +335,8 @@ Or with Podman:
 ```bash
 podman build -t kici-orchestrator:latest -f packages/orchestrator/Dockerfile .
 ```
+
+The `.dockerignore` file at the repository root keeps local `node_modules`, `dist`, `.env` and key files out of the build context, so a checkout where you ran `pnpm install` does not copy them into the image.
 
 The Dockerfile uses a multi-stage build: the first stage installs all dependencies and builds TypeScript, the second stage copies only production dependencies and compiled output.
 
@@ -400,7 +402,7 @@ The orchestrator keeps an idle keep-alive connection open for 130 seconds. That 
 
 ### One port for every source
 
-The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered webhook source (GitHub Apps and generic) is served from that one listener, distinguished by URL path (`/webhook/<orgId>/github`, `/webhook/<orgId>/generic/<sourceId>`) rather than by port number. There is no per-source port option in `kici-admin source add` and no `port` column on the source row. If you need different public URLs / hostnames / TLS certs per source, terminate that mapping at your reverse proxy and have it forward to the orchestrator's single port. See [Multi-provider setup](configuration.md#multi-provider-setup) for the full discussion.
+The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered webhook source (GitHub Apps and generic) is served from that one listener, distinguished by URL path (`/webhook/<orgId>/github/<sourceId>`, `/webhook/<orgId>/generic/<sourceId>`) rather than by port number. There is no per-source port option in `kici-admin source add` and no `port` column on the source row. If you need different public URLs / hostnames / TLS certs per source, terminate that mapping at your reverse proxy and have it forward to the orchestrator's single port. See [Multi-provider setup](configuration.md#multi-provider-setup) for the full discussion.
 
 ## Feature availability and keeping the orchestrator current
 

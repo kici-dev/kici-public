@@ -19,8 +19,8 @@ import { mockWs } from '../__test-helpers__/mock-ws.js';
  * used to log on none of them. That is what made a pinned, label-matching
  * queued job sitting undrained for a full minute after a host reconnect
  * indistinguishable from an idle orchestrator: the observable behaviour is
- * identical, and staging runs at `info`, so a `debug` line would not have
- * shown it either.
+ * identical, and an orchestrator logging at `info` would not have shown a
+ * `debug` line either.
  */
 function mockQueue(depth: number): JobQueue {
   return {

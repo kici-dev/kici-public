@@ -13,6 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
+import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 
 /**
  * Schema for the local YAML configuration file.
@@ -157,7 +158,7 @@ export const appConfigSchema = z
 
     // From LocalConfig
     databaseUrl: z.string().default(''),
-    port: z.coerce.number().default(4000),
+    port: z.coerce.number().default(ORCHESTRATOR_DEFAULT_PORT),
     basePath: z.string().default('/'),
     tlsCertPath: z.string().optional(),
     scalerConfigPath: z.string().optional(),

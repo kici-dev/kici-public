@@ -4,6 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 import { $ } from 'zx';
 import { splitAgentPlatform, serializeError, type AgentPlatform } from '@kici-dev/shared';
+import { NODE_RUNTIME_MEMBERS } from './node-runtime-members.js';
 
 export interface DownloadNodeOptions {
   version: string;
@@ -91,12 +92,7 @@ export async function downloadNodeBinary(opts: DownloadNodeOptions): Promise<voi
   const archivePath = path.join(prefixDir, filename);
   writeFileSync(archivePath, buf);
   const inner = `node-v${opts.version}-${nodeOs}-${nodeArch}`;
-  const members = [
-    `${inner}/bin/node`,
-    `${inner}/bin/npm`,
-    `${inner}/bin/npx`,
-    `${inner}/lib/node_modules/npm`,
-  ];
+  const members = NODE_RUNTIME_MEMBERS.map((member) => `${inner}/${member}`);
   const out = $.sync({
     nothrow: true,
     stdio: 'pipe',

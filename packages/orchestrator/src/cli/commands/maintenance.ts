@@ -14,9 +14,8 @@
  *
  *   Direct-DB mode: activated when `--database-url` is passed (or
  *   KICI_DATABASE_URL / DATABASE_URL is set). Opens its own pool and runs the
- *   SQL directly. Used by e2e/helpers/deploy.ts during warm-start cleanup,
- *   when the orchestrator is deliberately stopped so a stale scoped-secret
- *   can't crash it on boot.
+ *   SQL directly. Use it for cleanup while the orchestrator is deliberately
+ *   stopped, so a stale scoped-secret can't crash it on boot.
  */
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';

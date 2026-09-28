@@ -149,13 +149,12 @@ export type RuntimeSubtree = z.infer<typeof RuntimeSubtree>;
 /**
  * Name of the shared volume holding the KiCI runtime, keyed by image IDENTITY.
  *
- * Keyed by the image's content id, never its name:tag. A tag moves — `:stg`,
- * `:latest`, and every E2E tag are rebuilt in place — so a name-keyed volume is
- * reused after the image it was copied from has been replaced, which is exactly
- * the "silently reusing the previous version's binaries" failure this is
- * supposed to prevent. It bit: a volume populated from a pre-/opt/kici image was
- * reused after the rebuild, and every spawned container failed to start because
- * the runtime it mounted was empty.
+ * Keyed by the image's content id, never its name:tag. A moving tag such as
+ * `:latest` is rebuilt in place, so a name-keyed volume is reused after the
+ * image it was copied from has been replaced, which is exactly the "silently
+ * reusing the previous version's binaries" failure this is supposed to
+ * prevent: a reused volume populated from an older image can leave the mounted
+ * runtime empty, and every spawned container then fails to start.
  *
  * The subtree is part of the name for the same reason: an `all` volume and a
  * `node` volume have different roots, so sharing one name would mount a tree
@@ -350,8 +349,8 @@ async function materializeRuntimeVolume(
     // named volume is owned by root — so under rootful docker the copy fails
     // with a bare "exited 1" that says nothing about permissions. Rootless
     // podman maps the user and happens to work, which is exactly why this only
-    // showed up on the docker executor. The populator runs no customer code:
-    // it copies one tree and exits.
+    // shows up under rootful docker. The populator runs no customer code: it
+    // copies one tree and exits.
     User: '0:0',
     Cmd: ['sh', '-c', populatorCommand(subtree)],
     // Same reaper contract as the volume it fills.

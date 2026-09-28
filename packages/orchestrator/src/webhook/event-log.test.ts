@@ -284,7 +284,7 @@ describe('EventLogWriter', () => {
       expect(update).toHaveProperty('ref');
       // Body-derived fields: NOT present
       expect(update).not.toHaveProperty('payload_key');
-      // expires_at: removed by Phase E (cold-store replaces hard-delete TTL)
+      // expires_at: not a column (cold-store replaces the hard-delete TTL)
       expect(update).not.toHaveProperty('expires_at');
       expect(update).not.toHaveProperty('payload_hash');
       expect(update).not.toHaveProperty('payload_size_bytes');

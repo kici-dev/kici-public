@@ -19,6 +19,7 @@ import type {
   PendingAttestationsRepo,
   PendingAttestationRow,
 } from './pending-attestations-repo.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'attestation-retrier' });
 
@@ -95,18 +96,18 @@ export class AttestationRetrier {
   start(): void {
     if (this.interval) clearInterval(this.interval);
     this.interval = setInterval(() => {
-      void this.tick();
+      runDetached(logger, 'Attestation retrier tick', () => this.tick());
     }, this.deps.intervalMs);
-    void this.tick();
+    runDetached(logger, 'Attestation retrier tick', () => this.tick());
   }
 
   onBecomeLeader(): void {
     if (this.interval) clearInterval(this.interval);
     logger.info('Became leader, starting attestation retrier');
     this.interval = setInterval(() => {
-      void this.tick();
+      runDetached(logger, 'Attestation retrier tick', () => this.tick());
     }, this.deps.intervalMs);
-    void this.tick();
+    runDetached(logger, 'Attestation retrier tick', () => this.tick());
   }
 
   onLoseLeadership(): void {
@@ -122,7 +123,7 @@ export class AttestationRetrier {
 
   /** On-reconnect trigger (Platform WS re-authenticated). Leader-gated inside tick. */
   triggerNow(): void {
-    void this.tick();
+    runDetached(logger, 'Attestation retrier tick', () => this.tick());
   }
 
   async tick(): Promise<void> {

@@ -47,6 +47,7 @@ import {
 } from '@kici-dev/shared/net';
 import { FirecrackerApi } from './firecracker-api.js';
 import { resolveAgentHostAccess } from './host-access.js';
+import { renderGuestExtraHosts } from './firecracker-extra-hosts.js';
 import { tailFile } from './file-tail.js';
 import { forwardLine } from './log-forwarder.js';
 import { ScalerEventType } from './types.js';
@@ -84,6 +85,7 @@ import type {
   EffectiveLimits,
   SpawnContext,
 } from './types.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -128,16 +130,12 @@ const POSIX_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * Interface-name pattern for per-VM TAP devices.
  * Matches what {@link generateTapName} produces — `kici-` plus the LAST 8
  * characters of the VM id, which for a scaler-minted id is 8 lowercase hex.
+ * The orphan sweep considers only names of this shape, so the default bridge
+ * (`kici-br0`) and any other operator interface outside it are never
+ * candidates. The scaler's configured bridge is skipped by name as well, in
+ * case an operator named it in this shape: deleting it kills every running VM.
  */
 const VM_TAP_PATTERN = /^kici-[0-9a-f]{8}$/;
-
-/**
- * Infrastructure interfaces that share the `kici-` prefix but must NEVER be
- * deleted by the orphan sweep. Bridges (kici-br0/kici-br1) carry all VM
- * traffic; kici-m01 is the staging metadata interface. Losing any of these
- * kills all running VMs.
- */
-export const PROTECTED_INTERFACES: readonly string[] = ['kici-br0', 'kici-br1', 'kici-m01'];
 
 /** Convert a dotted IPv4 netmask ('255.255.255.0') to a CIDR prefix length (24). */
 function netmaskToPrefix(netmask: string): number {
@@ -203,6 +201,11 @@ export interface FirecrackerScalerBackendOptions {
   cidr?: string;
   /** Gateway IP for guest networking */
   gateway: string;
+  /**
+   * Extra `host:address` mappings the rootfs `/init` appends to each guest's
+   * `/etc/hosts`; `host-gateway` resolves to {@link gateway}. None by default.
+   */
+  extraHosts?: string[];
   /** Netmask for guest networking */
   netmask: string;
   /** nft table name for host-network diagnostics. @default 'kici' */
@@ -298,6 +301,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   private readonly bridgeName: string;
   private readonly cidr: string | undefined;
   private readonly gateway: string;
+  /** The MMDS `kici-extra-hosts` value, or undefined when the scaler maps no host. */
+  private readonly guestExtraHosts: string | undefined;
   /** Host services the orchestrator directed agents at, as `hostAccess` entries. */
   private readonly hostServices?: string[];
   private readonly netmask: string;
@@ -342,6 +347,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     this.bridgeName = options.bridgeName;
     this.cidr = options.cidr;
     this.gateway = options.gateway;
+    this.guestExtraHosts = renderGuestExtraHosts(options.extraHosts, options.gateway);
     this.hostServices = options.hostServices;
     this.netmask = options.netmask;
     this.table = options.table ?? 'kici';
@@ -479,7 +485,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     // with zero live VMs, and every sweep skips its IP, TAP and chroot because
     // `trackedVmIds` still names it.
     const onSpawnAbort = () => {
-      void this.abandonSpawn(agentId, alloc, 'spawn aborted (deadline or shutdown)');
+      this.abandonSpawnDetached(agentId, alloc, 'spawn aborted (deadline or shutdown)');
     };
     signal?.addEventListener('abort', onSpawnAbort, { once: true });
 
@@ -719,9 +725,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       const acceptedEnv = this.buildForwardedEnv(matchedLabelSet, agentId);
 
       // 14. PUT MMDS metadata: orchestrator URL, labels, scaler-managed flag, optional token,
-      // optional forwarded env. Labels and agent ID are needed by the agent at startup
-      // (before WS connection), since loadConfig() reads KICI_LABELS and KICI_AGENT_ID from
-      // environment.
+      // optional host mappings (the scaler's `extraHosts`), optional forwarded env. Labels
+      // and agent ID are needed by the agent at startup (before WS connection), since
+      // loadConfig() reads KICI_LABELS and KICI_AGENT_ID from environment.
       await api.putMmds({
         latest: {
           'meta-data': {
@@ -729,8 +735,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
             'kici-agent-id': agentId,
             'kici-labels': fullLabels.join(','),
             'kici-scaler-managed': '1', // Agent skips WS log streaming
-            'kici-gateway-ip': this.gateway, // Used by /init for verdaccio.local /etc/hosts entry
             ...(agentToken ? { 'kici-agent-token': agentToken } : {}),
+            ...(this.guestExtraHosts ? { 'kici-extra-hosts': this.guestExtraHosts } : {}),
             ...(matchedLabelSet.backpressureMode
               ? { 'kici-backpressure-mode': matchedLabelSet.backpressureMode }
               : {}),
@@ -781,6 +787,25 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     } catch (err) {
       logger.warn(`Cleanup after abandoned spawn ${agentId} failed: ${toErrorMessage(err)}`);
     }
+  }
+
+  /**
+   * {@link abandonSpawn} from a path that cannot await it (an abort listener, a
+   * process exit handler). A failure is logged.
+   */
+  private abandonSpawnDetached(
+    agentId: string,
+    alloc: IpAllocationResult | undefined,
+    reason: string,
+  ): void {
+    runDetached(
+      logger,
+      'Abandoned spawn teardown',
+      () => this.abandonSpawn(agentId, alloc, reason),
+      {
+        agentId,
+      },
+    );
   }
 
   getScalerContext(agentId: string): Record<string, unknown> | undefined {
@@ -1326,7 +1351,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
         }
         for (const name of ifaceNames) {
           if (!VM_TAP_PATTERN.test(name)) continue;
-          if (PROTECTED_INTERFACES.includes(name)) continue;
+          if (name === this.bridgeName) continue;
           if (allocatedTapsBefore.has(name)) continue;
           if (allocatedTapsAfter.has(name)) continue;
           if (trackedTapDevices.has(name)) continue;
@@ -1405,9 +1430,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   /**
    * Default interval for periodic orphan sweeps (15 minutes).
    *
-   * Long-running orchestrators need in-process orphan sweeps because the
-   * external kici-leak-sweep timer skips TAP cleanup while a staging
-   * orchestrator is active (to avoid racing spawns). Without this, leaked
+   * Long-running orchestrators need in-process orphan sweeps because a
+   * host-level cleanup job skips TAP cleanup while an orchestrator is active
+   * (to avoid racing spawns). Without this, leaked
    * TAPs accumulate until the orchestrator restarts — which can be weeks.
    */
   private static readonly ORPHAN_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
@@ -1924,10 +1949,20 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     const output = process.stdout;
 
     // Tail serial console log (Firecracker stdout = guest ttyS0)
-    this.tailAndForward(serialLogPath, agentId, 'firecracker-serial', signal, output);
+    runDetached(
+      logger,
+      'Serial console tail',
+      () => this.tailAndForward(serialLogPath, agentId, 'firecracker-serial', signal, output),
+      { agentId },
+    );
 
     // Tail VMM diagnostic log (Firecracker --log-path)
-    this.tailAndForward(vmmLogPath, agentId, 'firecracker-vmm', signal, output);
+    runDetached(
+      logger,
+      'VMM log tail',
+      () => this.tailAndForward(vmmLogPath, agentId, 'firecracker-vmm', signal, output),
+      { agentId },
+    );
 
     // Monitor for early jailer exit (boot failure detection)
     child.on('exit', (code, sig) => {
@@ -1957,7 +1992,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
           // that died during boot, and `cleanupOrphans` skips every one of them
           // because `trackedVmIds` still names the VM. Tear it down here and
           // report the failure so the manager releases its reservation.
-          void this.abandonSpawn(
+          this.abandonSpawnDetached(
             agentId,
             alloc,
             `jailer exited during boot (code ${code}${sig ? `, signal ${sig}` : ''}, ${failureType})`,

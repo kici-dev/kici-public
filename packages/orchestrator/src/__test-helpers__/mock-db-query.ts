@@ -1,12 +1,11 @@
 /**
  * Predicate + projection evaluation for the shared `createMockDb` harness.
  *
- * Kept BYTE-IDENTICAL in two places —
- * `packages/orchestrator/src/__test-helpers__/mock-db-query.ts` and
- * `packages/platform/src/__test-helpers__/mock-db-query.ts`. Each package owns an
+ * Kept BYTE-IDENTICAL in the orchestrator and the Platform, which each carry a
+ * copy. Each package owns an
  * independent `createMockDb` builder and neither package may import the other, so
- * the evaluator is duplicated rather than shared. `mock-db-mirror.test.ts` in both
- * packages fails the moment the copies diverge.
+ * the evaluator is duplicated rather than shared. A drift test fails the moment
+ * the copies diverge.
  *
  * `createMockDb` used to return its configured rows verbatim, whatever the
  * query asked for: a `.where(...)` or a `.select([...])` was recorded on a spy

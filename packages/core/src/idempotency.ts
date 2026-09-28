@@ -14,7 +14,6 @@
  *
  * The runner has no UI dependency. CLI consumers pass an inquirer-backed
  * confirm; future SDK / agent consumers pass their own policy function.
- * See `.claude/rules/idempotency.md` for the full rule and adopters.
  */
 
 export interface IdempotentStep<TDrift, TInSync = void, TApplied = void> {

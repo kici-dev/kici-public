@@ -5,8 +5,8 @@
  * Contract:
  *   - tenant column: `routing_key` (NULL → synthetic `__orchestrator__`)
  *   - partition column: `timestamp`
- *   - warm TTL: 90 days (longer window than other audit tables — design
- *     §5 matrix row 10. Volume is low, forensic value is high)
+ *   - warm TTL: 90 days (longer window than other audit tables — volume is
+ *     low, forensic value is high)
  *
  * Synthetic tenant: rows without `routing_key` (e.g. orchestrator-level
  * key rotations done before any source is bound) collapse to a single
@@ -202,7 +202,7 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
   }
 
   /**
-   * Phase 2 — per-row cold-retention TTL. Sampled `resolve` /
+   * Per-row cold-retention TTL. Sampled `resolve` /
    * `resolve_named` rows get 180d cold; mutations get `'forever'`. The
    * denied-outcome override promotes to 730d (forensic).
    *
@@ -236,7 +236,7 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
 
       await trx.deleteFrom('secret_audit_log').where('id', 'in', ids).execute();
 
-      // Orchestrator-side audit goes to access_log (mirrors design §8
+      // Orchestrator-side audit goes to access_log (the audit split
       // — Platform → audit_log, Orchestrator → access_log).
       await trx
         .insertInto('access_log')
@@ -271,9 +271,9 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
           last_archived_at = now()
       `.execute(trx);
 
-      // Phase 2 — record the chunk in `cold_store_chunks` so the GC
-      // sweep can find purge candidates without S3 LIST. Pre-Phase-2
-      // (v1) chunks omit `bucket` and are treated as `'forever'`.
+      // Record the chunk in `cold_store_chunks` so the GC
+      // sweep can find purge candidates without S3 LIST. V1
+      // chunks omit `bucket` and are treated as `'forever'`.
       if (args.chunkMeta.bucket !== undefined && args.chunkMeta.maxColdDays !== undefined) {
         const maxColdDaysSerialized = String(args.chunkMeta.maxColdDays);
         await trx

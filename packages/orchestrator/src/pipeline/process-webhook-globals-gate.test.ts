@@ -281,7 +281,7 @@ describe('global-workflow dispatch honours the event trust decision', () => {
     expect(dispatch).toHaveBeenCalled();
   });
 
-  // ── Phase J: the OTHER global-dispatch path, guarded independently ────────
+  // ── Phase J — the OTHER global-dispatch path, guarded independently ────────
   // `dispatchGlobalWorkflowsForOtherRepos` runs when a lock file DOES resolve.
   // It failed for a different reason than Phase F — it received the decision's
   // siblings but never the decision — so it needs its own falsifiable coverage.

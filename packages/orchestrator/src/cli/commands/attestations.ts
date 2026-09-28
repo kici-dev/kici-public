@@ -6,7 +6,7 @@
  *                                   unverifiable rows; `--all` re-evaluates
  *                                   every row. Direct DB + object storage.
  *
- * Classified `kici-admin` (orchestrator DB plane) per .claude/rules/platform-admin.md.
+ * Belongs to `kici-admin`: it works on the orchestrator's database.
  */
 import type { Command } from 'commander';
 import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';

@@ -18,8 +18,8 @@ import { AgentRegistry } from '../agent/registry.js';
  * could never find: the job re-queued and spawned again forever. The warm pool
  * hit the same defect through its GATE check and reported `ready: 0`.
  *
- * The unit layer is the only place this is coverable: our E2E hosts are x86
- * linux and derive no taint at all.
+ * The pool below is linux/arm64 on purpose: an x86 linux host derives no taint
+ * at all, so it would never exercise this path.
  */
 describe('platform taint reachability', () => {
   const platform: ScalerPlatform = { os: 'linux', arch: 'arm64' };

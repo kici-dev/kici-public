@@ -3,7 +3,7 @@
  *
  * Verifies the command registers under the expected namespace and that the
  * missing-DB-URL path fails loudly before opening a pool. Real-DB row-printing
- * is covered by the store's integration test + the E2E suite.
+ * is covered by the store's integration test.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Command } from 'commander';

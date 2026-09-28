@@ -17,6 +17,7 @@ import { loadLocalConfig } from './loader.js';
 import { appConfigSchema } from './schema.js';
 import { applyEnvOverrides, deepMerge } from './env-overlay.js';
 import type { AppConfig, SharedConfig } from './types.js';
+import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 
 /**
  * Phase 1 result: minimal config resolved from local sources only.
@@ -58,7 +59,7 @@ export async function resolveLocalConfig(configPath?: string): Promise<LocalPhas
   const mode = ((instance?.mode as string) || 'platform') as OrchestratorMode;
 
   const server = localWithEnv.server as Record<string, unknown> | undefined;
-  const port = (server?.port as number) || 4000;
+  const port = (server?.port as number) || ORCHESTRATOR_DEFAULT_PORT;
 
   return {
     local: localWithEnv,
@@ -177,7 +178,7 @@ function flattenToAppConfig(merged: Record<string, unknown>): Record<string, unk
 
   // Server
   const server = merged.server as Record<string, unknown> | undefined;
-  flat.port = server?.port ?? 4000;
+  flat.port = server?.port ?? ORCHESTRATOR_DEFAULT_PORT;
   flat.basePath = server?.basePath ?? '/';
   if (server?.tlsCertPath) flat.tlsCertPath = server.tlsCertPath;
 

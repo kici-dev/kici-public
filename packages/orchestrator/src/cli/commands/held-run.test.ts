@@ -5,8 +5,7 @@
  *
  * 1. **The registration seam.** The real `buildProgram()` is walked, so a
  *    command file that exists but is never registered fails here rather than
- *    silently shipping as no command at all. That seam is the recurring
- *    unmutated shape on this plan.
+ *    silently shipping as no command at all.
  * 2. **Hold resolution is the SHARED resolver.** The disambiguation error text
  *    is `resolveHeldRunId`'s own, so a second local resolver would show up as a
  *    different message.

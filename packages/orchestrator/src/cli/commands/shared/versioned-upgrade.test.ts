@@ -15,10 +15,12 @@
  * Strategy: stub the service manager's `list` method so we control what
  * the resolver sees; everything else (manifest read, index reconciliation,
  * refusal formatting) runs against real code in real tmpdirs. The
- * archive-extract + symlink-flip path is covered by E2E.
+ * archive-extract + symlink-flip path needs a real release archive and is
+ * out of scope here.
  */
 
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -33,14 +35,28 @@ import {
   checkPickFlagConflicts,
   planNpmSourceUpgrade,
   installGlobalPackage,
+  restartOntoInstalledPackage,
+  restartOnlyUpgrade,
+  performSelfDrivingInstall,
+  windowsShellCommand,
+  extractRelease,
+  installRelease,
+  npmReleaseReadsEnvFile,
 } from './versioned-upgrade.js';
-import { writeManifest, writeIndex } from '../../service/index.js';
+import { SERVICE_TEXT, writeManifest, writeIndex } from '../../service/index.js';
 import type {
-  DiscoveredInstance,
   InstanceManifest,
+  LaunchSpec,
+  ServiceConfig,
   ServiceManager,
   ServicePlatform,
 } from '../../service/index.js';
+import type { DiscoveredInstance } from '../../service/types.js';
+
+/** A bundle or an npm entry of a release that reads KICI_ENV_FILE. */
+const READS_ENV_FILE = 'import "@kici-dev/shared/load-service-env-file"; // KICI_ENV_FILE';
+/** A bundle or an npm entry of a release from before KICI_ENV_FILE. */
+const PREDATES_ENV_FILE = 'import "./app.js"; // no env-file loader';
 
 describe('getInstallBase — name-scoped', () => {
   it('systemd: /opt/kici/<name>/', () => {
@@ -92,6 +108,7 @@ function makeManager(
     logs: vi.fn().mockResolvedValue(undefined),
     isInstalled: vi.fn().mockResolvedValue(true),
     list: vi.fn(async () => listResult),
+    readLaunchSpec: vi.fn().mockResolvedValue(null),
     platform,
   } satisfies ServiceManager;
 }
@@ -172,6 +189,34 @@ describe('resolveUpgradeTarget — folder-anchored targeting', () => {
     expect(result.config.isUserLevel).toBe(true);
     expect(result.resolvedInstance.instanceDir).toBe(path.resolve(tmpInstanceDir));
   });
+
+  // fails-when: an upgrade that registers a Windows service again writes its
+  // own text, so the description differs from what install writes.
+  it.each(['orchestrator', 'agent'] as const)(
+    'gives the %s the display name and description install writes',
+    async (component) => {
+      writeManifest(
+        tmpInstanceDir,
+        makeManifest({
+          component,
+          name: `kici-${component}-text`,
+          platform: 'windows',
+          configDir: 'C:\\ProgramData\\kici\\x\\',
+          envFilePath: 'C:\\ProgramData\\kici\\x\\x.env',
+          installBase: 'C:\\Program Files\\KiCI\\x\\',
+        }),
+      );
+      const target = await resolveUpgradeTarget({
+        component,
+        opts: { instanceDir: tmpInstanceDir },
+        createManager: async () => makeManager([], 'windows'),
+        isUserLevel: true,
+        kiciRoot: tmpKiciRoot,
+      });
+      expect(target.config.displayName).toBe(SERVICE_TEXT[component].displayName);
+      expect(target.config.description).toBe(SERVICE_TEXT[component].description);
+    },
+  );
 
   it('resolves via --name', async () => {
     const manifest = makeManifest({
@@ -483,6 +528,319 @@ describe('switchToInstalledVersion — shared switch sequence', () => {
     expect(written.kiciVersion).toBe('0.1.2');
     expect(manager.start).toHaveBeenCalledTimes(1);
   });
+
+  it('on Windows re-registers through install, which refuses before the old service is removed', async () => {
+    // fails-when: the switch runs uninstall before install, so a launcher path
+    // install refuses leaves the instance with no service registration at all.
+    const manager = makeManager([], 'windows');
+    (manager.install as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('cannot run the launcher as a Windows service'),
+    );
+    const manifest = makeManifest({
+      name: 'kici-test',
+      platform: 'windows',
+      installBase,
+      kiciVersion: '0.1.1',
+    });
+    writeManifest(instanceDir, manifest);
+    const config = {
+      name: 'kici-test',
+      displayName: 'KiCI orchestrator',
+      description: 'x',
+      executablePath: '',
+      envFilePath: manifest.envFilePath,
+      workingDirectory: manifest.configDir,
+      isUserLevel: true,
+      restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+      component: 'orchestrator' as const,
+      instanceDir,
+    };
+
+    await expect(
+      switchToInstalledVersion({
+        component: 'orchestrator',
+        platform: 'windows',
+        installBase,
+        config,
+        manager,
+        resolvedInstance: {
+          manifest,
+          manifestPath: path.join(instanceDir, '.kici-orchestrator.json'),
+          instanceDir,
+        },
+        targetVersion: '0.1.2',
+      }),
+    ).rejects.toThrow(/cannot run the launcher/);
+
+    expect(manager.install).toHaveBeenCalledWith(
+      expect.objectContaining({
+        executablePath: path.join(
+          installBase,
+          'orchestrator-0.1.2',
+          'kici-orchestrator-standalone.cmd',
+        ),
+      }),
+    );
+    expect(manager.uninstall).not.toHaveBeenCalled();
+  });
+
+  describe('on Windows, a release from before KICI_ENV_FILE', () => {
+    /** A package release `<installBase>/orchestrator-<version>/`; returns its launcher. */
+    function writeRelease(version: string, bundle: string): string {
+      const dir = path.join(installBase, `orchestrator-${version}`);
+      fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
+      const launcher = path.join(dir, 'kici-orchestrator-standalone.cmd');
+      fs.writeFileSync(launcher, '@echo off\r\n');
+      fs.writeFileSync(path.join(dir, 'lib', 'kici-orchestrator-standalone.cjs'), bundle);
+      return launcher;
+    }
+
+    function windowsTarget() {
+      const manifest = makeManifest({
+        name: 'kici-test',
+        platform: 'windows',
+        installBase,
+        kiciVersion: '0.1.1',
+      });
+      writeManifest(instanceDir, manifest);
+      const config: ServiceConfig = {
+        name: 'kici-test',
+        ...SERVICE_TEXT.orchestrator,
+        executablePath: '',
+        envFilePath: manifest.envFilePath,
+        workingDirectory: manifest.configDir,
+        isUserLevel: true,
+        restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+        component: 'orchestrator',
+        instanceDir,
+      };
+      const resolvedInstance = {
+        manifest,
+        manifestPath: path.join(instanceDir, '.kici-orchestrator.json'),
+        instanceDir,
+      };
+      return { config, resolvedInstance, manager: makeManager([], 'windows') };
+    }
+
+    // --rollback and --pick both switch through switchToInstalledVersion.
+    // fails-when: a switch to a release that cannot read KICI_ENV_FILE is
+    // accepted, so the service starts without its configuration or with the
+    // env file's values on its command line.
+    it('is refused before the schema check, the stop or the registration', async () => {
+      writeRelease('0.1.2', PREDATES_ENV_FILE);
+      const { config, resolvedInstance, manager } = windowsTarget();
+      const migrationStatus = vi.fn();
+
+      await expect(
+        switchToInstalledVersion({
+          component: 'orchestrator',
+          platform: 'windows',
+          installBase,
+          config,
+          manager,
+          resolvedInstance,
+          targetVersion: '0.1.2',
+          hooks: { migrationStatus },
+        }),
+      ).rejects.toThrow(
+        /^refusing to switch "kici-test" to 0\.1\.2: version 0\.1\.2 predates KICI_ENV_FILE.*The service was not changed\.$/s,
+      );
+
+      expect(migrationStatus).not.toHaveBeenCalled();
+      expect(manager.status).not.toHaveBeenCalled();
+      expect(manager.stop).not.toHaveBeenCalled();
+      expect(manager.install).not.toHaveBeenCalled();
+      expect(manager.start).not.toHaveBeenCalled();
+      const written = JSON.parse(
+        fs.readFileSync(path.join(instanceDir, '.kici-orchestrator.json'), 'utf-8'),
+      );
+      expect(written.kiciVersion).toBe('0.1.1');
+      expect(fs.existsSync(path.join(installBase, 'orchestrator-current-version.txt'))).toBe(false);
+    });
+
+    // breaks-if-wrong: a switch to a release that reads KICI_ENV_FILE still
+    // registers the service on it and starts it.
+    it('does not stop a switch to a release that reads KICI_ENV_FILE', async () => {
+      const launcher = writeRelease('0.1.2', READS_ENV_FILE);
+      const { config, resolvedInstance, manager } = windowsTarget();
+
+      await switchToInstalledVersion({
+        component: 'orchestrator',
+        platform: 'windows',
+        installBase,
+        config,
+        manager,
+        resolvedInstance,
+        targetVersion: '0.1.2',
+      });
+
+      expect(manager.install).toHaveBeenCalledWith(
+        expect.objectContaining({ executablePath: launcher }),
+      );
+      expect(manager.start).toHaveBeenCalledTimes(1);
+      expect(
+        fs.readFileSync(path.join(installBase, 'orchestrator-current-version.txt'), 'utf-8'),
+      ).toBe('0.1.2');
+    });
+  });
+});
+
+describe('extractRelease — the release an archive upgrade installs', () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkTmp('kici-extract-release-');
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  /** A `.tar.gz` holding `orchestrator-0.9.0/` with the given launcher and bundle. */
+  function archive(launcherName: string, bundle: string): string {
+    const src = path.join(tmp, 'src');
+    const release = path.join(src, 'orchestrator-0.9.0');
+    fs.mkdirSync(path.join(release, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(release, launcherName), '@echo off\r\n');
+    fs.writeFileSync(
+      path.join(release, 'lib', `${launcherName.replace(/\.cmd$/, '')}.cjs`),
+      bundle,
+    );
+    const out = path.join(tmp, 'orchestrator-0.9.0.tar.gz');
+    execSync(`tar -czf "${out}" -C "${src}" orchestrator-0.9.0`);
+    return out;
+  }
+
+  const config: ServiceConfig = {
+    name: 'kici-test',
+    ...SERVICE_TEXT.orchestrator,
+    executablePath: '',
+    envFilePath: 'C:\\ProgramData\\kici\\kici-test\\kici-test.env',
+    workingDirectory: 'C:\\ProgramData\\kici\\kici-test',
+    isUserLevel: false,
+    restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+    component: 'orchestrator',
+  };
+
+  // fails-when: an archive upgrade accepts a release that cannot read
+  // KICI_ENV_FILE and goes on to copy it and stop the service.
+  it('on Windows refuses a release from before KICI_ENV_FILE', () => {
+    const archivePath = archive('kici-orchestrator-standalone.cmd', PREDATES_ENV_FILE);
+    expect(() =>
+      extractRelease({
+        archivePath,
+        tmpDir: tmp,
+        component: 'orchestrator',
+        platform: 'windows',
+        version: '0.9.0',
+        config,
+      }),
+    ).toThrow(
+      /^refusing to upgrade "kici-test" to 0\.9\.0: version 0\.9\.0 predates KICI_ENV_FILE, so a Windows service can run it only with the values of C:\\ProgramData\\kici\\kici-test\\kici-test\.env on its command line/,
+    );
+  });
+
+  // breaks-if-wrong: the archive of a release that reads KICI_ENV_FILE is extracted.
+  it('on Windows returns the folder of a release that reads KICI_ENV_FILE', () => {
+    const archivePath = archive('kici-orchestrator-standalone.cmd', READS_ENV_FILE);
+    const dir = extractRelease({
+      archivePath,
+      tmpDir: tmp,
+      component: 'orchestrator',
+      platform: 'windows',
+      version: '0.9.0',
+      config,
+    });
+    expect(dir).toBe(path.join(tmp, 'extract', 'orchestrator-0.9.0'));
+    expect(fs.existsSync(path.join(dir, 'kici-orchestrator-standalone.cmd'))).toBe(true);
+  });
+
+  // breaks-if-wrong: a systemd service reads its env file through the unit, so
+  // no release is refused there.
+  it('on systemd extracts a release whatever its bundle holds', () => {
+    const archivePath = archive('kici-orchestrator-standalone', PREDATES_ENV_FILE);
+    const dir = extractRelease({
+      archivePath,
+      tmpDir: tmp,
+      component: 'orchestrator',
+      platform: 'systemd',
+      version: '0.9.0',
+      config,
+    });
+    expect(dir).toBe(path.join(tmp, 'extract', 'orchestrator-0.9.0'));
+  });
+});
+
+describe('installRelease — an archive upgrade with --force', () => {
+  let tmp: string;
+  let installBase: string;
+  let versionedDirPath: string;
+  beforeEach(() => {
+    tmp = mkTmp('kici-install-release-');
+    installBase = path.join(tmp, 'base');
+    versionedDirPath = path.join(installBase, 'orchestrator-0.9.0');
+    // The folder --force would replace: the version the service may run now.
+    fs.mkdirSync(versionedDirPath, { recursive: true });
+    fs.writeFileSync(path.join(versionedDirPath, 'in-use'), 'x');
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  function archive(launcherName: string, bundle: string): string {
+    const src = path.join(tmp, 'src');
+    const release = path.join(src, 'orchestrator-0.9.0');
+    fs.mkdirSync(path.join(release, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(release, launcherName), '@echo off\r\n');
+    fs.writeFileSync(
+      path.join(release, 'lib', `${launcherName.replace(/\.cmd$/, '')}.cjs`),
+      bundle,
+    );
+    const out = path.join(tmp, 'orchestrator-0.9.0.tar.gz');
+    execSync(`tar -czf "${out}" -C "${src}" orchestrator-0.9.0`);
+    return out;
+  }
+
+  const config: ServiceConfig = {
+    name: 'kici-test',
+    ...SERVICE_TEXT.orchestrator,
+    executablePath: '',
+    envFilePath: 'C:\\ProgramData\\kici\\kici-test\\kici-test.env',
+    workingDirectory: 'C:\\ProgramData\\kici\\kici-test',
+    isUserLevel: false,
+    restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+    component: 'orchestrator',
+  };
+
+  // fails-when: --force removes the existing version folder before the release
+  // is checked, so a refused upgrade still deletes what the service may run.
+  it('on Windows refuses a release from before KICI_ENV_FILE and keeps the existing folder', () => {
+    const archivePath = archive('kici-orchestrator-standalone.cmd', PREDATES_ENV_FILE);
+    expect(() =>
+      installRelease({
+        archivePath,
+        tmpDir: path.join(tmp, 'work'),
+        installBase,
+        versionedDirPath,
+        component: 'orchestrator',
+        platform: 'windows',
+        version: '0.9.0',
+        config,
+      }),
+    ).toThrow(/predates KICI_ENV_FILE/);
+    expect(fs.readFileSync(path.join(versionedDirPath, 'in-use'), 'utf-8')).toBe('x');
+  });
+
+  // breaks-if-wrong: --force still replaces the folder with an accepted release.
+  it('replaces the existing folder with an accepted release', () => {
+    const archivePath = archive('kici-orchestrator-standalone', PREDATES_ENV_FILE);
+    installRelease({
+      archivePath,
+      tmpDir: path.join(tmp, 'work'),
+      installBase,
+      versionedDirPath,
+      component: 'orchestrator',
+      platform: 'systemd',
+      version: '0.9.0',
+      config,
+    });
+    expect(fs.existsSync(path.join(versionedDirPath, 'in-use'))).toBe(false);
+    expect(fs.existsSync(path.join(versionedDirPath, 'kici-orchestrator-standalone'))).toBe(true);
+  });
 });
 
 describe('checkPickFlagConflicts — --pick mutual exclusivity', () => {
@@ -584,7 +942,7 @@ describe('installGlobalPackage', () => {
     const calls: Array<[string, string[]]> = [];
     const run = (cmd: string, args: string[]) => {
       calls.push([cmd, args]);
-      return { status: 0, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
     };
     const res = installGlobalPackage(target, '0.1.27', run);
     expect(res.ok).toBe(true);
@@ -595,7 +953,7 @@ describe('installGlobalPackage', () => {
     let capturedEnv: NodeJS.ProcessEnv | undefined;
     const run = (_cmd: string, _args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
       capturedEnv = opts?.env;
-      return { status: 0, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
     };
     installGlobalPackage(target, '0.1.27', run);
     // The pinned node's bin dir must be the FIRST PATH entry so npm's
@@ -604,9 +962,386 @@ describe('installGlobalPackage', () => {
   });
 
   it('reports failure with captured stderr on non-zero exit', () => {
-    const run = () => ({ status: 1, stderr: 'npm ERR! code EACCES' });
+    const run = () => ({ status: 1, stdout: '', stderr: 'npm ERR! code EACCES' });
     const res = installGlobalPackage(target, '0.1.27', run);
     expect(res.ok).toBe(false);
     expect(res.stderr).toMatch(/EACCES/);
+  });
+});
+
+describe('restartOntoInstalledPackage — the end of every npm-source upgrade', () => {
+  // A launch command whose node and entry exist, as an npm install leaves them.
+  let tmp: string;
+  let spec: LaunchSpec;
+  beforeEach(() => {
+    tmp = mkTmp('kici-restart-');
+    const dist = path.join(
+      tmp,
+      'node_modules',
+      'kici-admin',
+      'node_modules',
+      '@kici-dev',
+      'agent',
+      'dist',
+    );
+    fs.mkdirSync(dist, { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'bin'));
+    fs.writeFileSync(path.join(tmp, 'bin', 'node'), '');
+    fs.writeFileSync(path.join(dist, 'server.js'), READS_ENV_FILE);
+    spec = { execPath: path.join(tmp, 'bin', 'node'), args: [path.join(dist, 'server.js')] };
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const config: ServiceConfig = {
+    name: 'kici-agent-x',
+    ...SERVICE_TEXT.agent,
+    executablePath: '',
+    envFilePath: 'C:\\ProgramData\\kici\\kici-agent-x\\kici-agent-x.env',
+    workingDirectory: 'C:\\ProgramData\\kici\\kici-agent-x',
+    isUserLevel: false,
+    restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+    component: 'agent',
+    instanceDir: 'C:\\deploy',
+  };
+  const running = (manager: ServiceManager) =>
+    (manager.status as ReturnType<typeof vi.fn>).mockResolvedValue({ state: 'running' });
+  const order = (manager: ServiceManager, name: 'stop' | 'install' | 'start') =>
+    (manager[name] as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+
+  // fails-when: the Windows npm-source upgrade only stops and starts, so the
+  // registration an older CLI wrote survives the upgrade.
+  it('on Windows registers the service again from its launch command, between stop and start', async () => {
+    const manager = makeManager([], 'windows');
+    running(manager);
+    await restartOntoInstalledPackage({ manager, config, platform: 'windows', spec });
+    expect(manager.install).toHaveBeenCalledWith({
+      ...config,
+      executablePath: spec.execPath,
+      args: spec.args,
+    });
+    expect(order(manager, 'stop')).toBeLessThan(order(manager, 'install'));
+    expect(order(manager, 'install')).toBeLessThan(order(manager, 'start'));
+  });
+
+  // breaks-if-wrong: systemd and launchd keep their unit and still restart.
+  it.each(['systemd', 'launchd'] as const)('on %s only stops and starts', async (platform) => {
+    const manager = makeManager([], platform);
+    running(manager);
+    await restartOntoInstalledPackage({ manager, config, platform, spec });
+    expect(manager.install).not.toHaveBeenCalled();
+    expect(manager.stop).toHaveBeenCalledTimes(1);
+    expect(manager.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('restarts without registering, and says so, when the launch command cannot be read', async () => {
+    const manager = makeManager([], 'windows');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let warned: unknown;
+    try {
+      await restartOntoInstalledPackage({ manager, config, platform: 'windows', spec: null });
+      warned = warn.mock.calls[0]?.[0];
+    } finally {
+      warn.mockRestore();
+    }
+    expect(manager.install).not.toHaveBeenCalled();
+    expect(manager.start).toHaveBeenCalledTimes(1);
+    expect(String(warned)).toMatch(/not registered again.*kici-admin agent install/);
+  });
+
+  // fails-when: a launch command read back wrong (sc.exe prints a non-ASCII
+  // path in the console code page, which decodes to U+FFFD) is registered, so
+  // the service is left pointing at a file that does not exist.
+  it('restarts without registering when the launch command names a file that does not exist', async () => {
+    const manager = makeManager([], 'windows');
+    running(manager);
+    const mangled = { ...spec, args: [spec.args[0]!.replace('node_modules', 'node_m\uFFFDdules')] };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let warned: unknown;
+    try {
+      await restartOntoInstalledPackage({ manager, config, platform: 'windows', spec: mangled });
+      warned = warn.mock.calls[0]?.[0];
+    } finally {
+      warn.mockRestore();
+    }
+    expect(manager.install).not.toHaveBeenCalled();
+    expect(manager.stop).toHaveBeenCalledTimes(1);
+    expect(manager.start).toHaveBeenCalledTimes(1);
+    expect(String(warned)).toMatch(/not registered again.*kici-admin agent install/);
+  });
+
+  it('names the remedy when the registration cannot be written, and does not start', async () => {
+    const manager = makeManager([], 'windows');
+    (manager.install as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('shawl add failed'));
+    await expect(
+      restartOntoInstalledPackage({ manager, config, platform: 'windows', spec }),
+    ).rejects.toThrow(
+      /could not register the service again: shawl add failed.*kici-admin agent install/,
+    );
+    expect(manager.start).not.toHaveBeenCalled();
+  });
+
+  // fails-when: the installed package is a release from before KICI_ENV_FILE
+  // and the restart stops the service before the driver refuses it, which
+  // leaves the service stopped.
+  it('on Windows refuses a package from before KICI_ENV_FILE before it stops the service', async () => {
+    fs.writeFileSync(spec.args[0]!, PREDATES_ENV_FILE);
+    const manager = makeManager([], 'windows');
+    running(manager);
+
+    await expect(
+      restartOntoInstalledPackage({ manager, config, platform: 'windows', spec }),
+    ).rejects.toThrow(`${spec.args[0]} predates KICI_ENV_FILE`);
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(manager.install).not.toHaveBeenCalled();
+  });
+});
+
+describe('npm-source paths end in restartOntoInstalledPackage', () => {
+  let tmp: string;
+  let entry: string;
+  beforeEach(() => {
+    tmp = mkTmp('kici-npm-upgrade-');
+    const pkgDir = path.join(
+      tmp,
+      'node_modules',
+      'kici-admin',
+      'node_modules',
+      '@kici-dev',
+      'agent',
+    );
+    fs.mkdirSync(path.join(pkgDir, 'dist'), { recursive: true });
+    fs.writeFileSync(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: '@kici-dev/agent', version: '0.2.0' }),
+    );
+    entry = path.join(pkgDir, 'dist', 'server.js');
+    fs.writeFileSync(entry, READS_ENV_FILE);
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  function fixture(platform: ServicePlatform) {
+    const manager = makeManager([], platform);
+    const spec = { execPath: path.join(tmp, 'bin', 'node'), args: [entry] };
+    fs.mkdirSync(path.join(tmp, 'bin'), { recursive: true });
+    fs.writeFileSync(spec.execPath, '');
+    manager.readLaunchSpec = vi.fn().mockResolvedValue(spec);
+    (manager.status as ReturnType<typeof vi.fn>).mockResolvedValue({ state: 'running' });
+    const manifest = makeManifest({ component: 'agent', name: 'kici-agent-x', platform });
+    writeManifest(tmp, manifest);
+    const resolvedInstance = {
+      manifest,
+      manifestPath: path.join(tmp, '.kici-agent.json'),
+      instanceDir: tmp,
+    };
+    const config: ServiceConfig = {
+      name: 'kici-agent-x',
+      ...SERVICE_TEXT.agent,
+      executablePath: '',
+      envFilePath: manifest.envFilePath,
+      workingDirectory: manifest.configDir,
+      isUserLevel: true,
+      restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+      component: 'agent',
+      instanceDir: tmp,
+    };
+    const action = {
+      target: { nodeExecPath: spec.execPath, npmPath: 'npm', owningPackage: 'kici-admin' },
+      version: '0.2.0',
+    };
+    return { manager, spec, resolvedInstance, config, action };
+  }
+
+  /** A runner whose `npm view … exports` answers `exportsJson`; every other npm call succeeds. */
+  function npmRunner(exportsJson: string, viewStatus = 0) {
+    return vi.fn((_cmd: string, args: string[]) =>
+      args[0] === 'view'
+        ? { status: viewStatus, stdout: exportsJson, stderr: viewStatus ? 'npm error 404' : '' }
+        : { status: 0, stdout: '', stderr: '' },
+    );
+  }
+  const READS_EXPORTS = JSON.stringify({ '.': {}, './load-service-env-file': {} });
+  const manifestVersion = () =>
+    JSON.parse(fs.readFileSync(path.join(tmp, '.kici-agent.json'), 'utf-8')).kiciVersion;
+
+  it('the self-driving install registers a Windows service again and persists the version', async () => {
+    const { manager, spec, resolvedInstance, config, action } = fixture('windows');
+    const run = npmRunner(READS_EXPORTS);
+    await performSelfDrivingInstall({
+      component: 'agent',
+      config,
+      resolvedInstance,
+      manager,
+      action,
+      opts: { yes: true },
+      platform: 'windows',
+      spec,
+      run,
+    });
+    expect(run).toHaveBeenCalledWith(
+      'npm',
+      ['view', '@kici-dev/shared@0.2.0', 'exports', '--json'],
+      expect.anything(),
+    );
+    expect(run).toHaveBeenCalledWith(
+      'npm',
+      ['install', '-g', 'kici-admin@0.2.0'],
+      expect.anything(),
+    );
+    expect(manager.install).toHaveBeenCalledWith(
+      expect.objectContaining({ executablePath: spec.execPath, args: spec.args }),
+    );
+    expect(manifestVersion()).toBe('0.2.0');
+  });
+
+  // fails-when: an npm-source downgrade to a release from before KICI_ENV_FILE
+  // installs it, so the service starts it with no configuration.
+  it('refuses a Windows downgrade to a release from before KICI_ENV_FILE before it installs anything', async () => {
+    const { manager, spec, resolvedInstance, config, action } = fixture('windows');
+    const run = npmRunner(JSON.stringify({ '.': {}, './env': {} }));
+    await expect(
+      performSelfDrivingInstall({
+        component: 'agent',
+        config,
+        resolvedInstance,
+        manager,
+        action,
+        opts: { yes: true },
+        platform: 'windows',
+        spec,
+        run,
+      }),
+    ).rejects.toThrow(
+      /^refusing to install kici-admin@0\.2\.0 for "kici-agent-x": kici-admin@0\.2\.0 predates KICI_ENV_FILE.*The service and the installed package were not changed\.$/s,
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(manager.install).not.toHaveBeenCalled();
+    expect(manifestVersion()).toBe('0.1.13');
+  });
+
+  it('refuses a Windows upgrade whose release npm cannot describe', async () => {
+    const { manager, spec, resolvedInstance, config, action } = fixture('windows');
+    const run = npmRunner('', 1);
+    await expect(
+      performSelfDrivingInstall({
+        component: 'agent',
+        config,
+        resolvedInstance,
+        manager,
+        action,
+        opts: { yes: true },
+        platform: 'windows',
+        spec,
+        run,
+      }),
+    ).rejects.toThrow(
+      /could not check whether kici-admin@0\.2\.0 reads KICI_ENV_FILE: npm error 404/,
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(manager.stop).not.toHaveBeenCalled();
+  });
+
+  it('--restart-only registers a Windows service again', async () => {
+    const { manager, spec, resolvedInstance, config } = fixture('windows');
+    await restartOnlyUpgrade({
+      component: 'agent',
+      config,
+      resolvedInstance,
+      manager,
+      verdict: { ok: true, version: '0.2.0', manifestVersion: '0.2.0' },
+      opts: { yes: true },
+      platform: 'windows',
+      spec,
+    });
+    expect(manager.install).toHaveBeenCalledTimes(1);
+    expect(manager.start).toHaveBeenCalledTimes(1);
+    expect(manifestVersion()).toBe('0.2.0');
+  });
+
+  // breaks-if-wrong: a systemd unit is left as it is, and no release is refused there.
+  it('the self-driving install leaves a systemd unit alone', async () => {
+    const { manager, spec, resolvedInstance, config, action } = fixture('systemd');
+    const run = npmRunner('');
+    await performSelfDrivingInstall({
+      component: 'agent',
+      config,
+      resolvedInstance,
+      manager,
+      action,
+      opts: { yes: true },
+      platform: 'systemd',
+      spec,
+      run,
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledWith(
+      'npm',
+      ['install', '-g', 'kici-admin@0.2.0'],
+      expect.anything(),
+    );
+    expect(manager.install).not.toHaveBeenCalled();
+    expect(manager.start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('npmReleaseReadsEnvFile — the registry check before a Windows npm-source upgrade', () => {
+  const target = {
+    nodeExecPath: '/n/bin/node',
+    npmPath: '/n/bin/npm',
+    owningPackage: 'kici-admin',
+  };
+  const answer =
+    (stdout: string, status = 0) =>
+    () => ({ status, stdout, stderr: '' });
+
+  it('reads the loader export from the exports of @kici-dev/shared', () => {
+    expect(
+      npmReleaseReadsEnvFile(
+        target,
+        '0.12.0',
+        answer(JSON.stringify({ './load-service-env-file': {} })),
+      ),
+    ).toEqual({ ok: true, reads: true });
+    expect(
+      npmReleaseReadsEnvFile(target, '0.11.0', answer(JSON.stringify({ './env': {} }))),
+    ).toEqual({ ok: true, reads: false });
+    expect(npmReleaseReadsEnvFile(target, '0.1.0', answer(''))).toEqual({ ok: true, reads: false });
+  });
+
+  // fails-when: a --version that matches several releases (npm prints an
+  // array) is reported as a release from before KICI_ENV_FILE.
+  it('asks for an exact version when npm matches several', () => {
+    const several = JSON.stringify([{ './load-service-env-file': {} }, { './env': {} }]);
+    const verdict = npmReleaseReadsEnvFile(target, '0.12', answer(several));
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.error).toMatch(/more than one version.*exact --version/);
+  });
+});
+
+describe('windowsShellCommand — npm through cmd.exe', () => {
+  // fails-when: the npm path is passed unquoted, and cmd.exe runs `C:\Program`.
+  it('quotes the npm path, which holds a space on every standard Node.js install', () => {
+    expect(
+      windowsShellCommand('C:\\Program Files\\nodejs\\npm.cmd', [
+        'install',
+        '-g',
+        'kici-admin@0.11.1-9934',
+      ]),
+    ).toBe('"C:\\Program Files\\nodejs\\npm.cmd" install -g kici-admin@0.11.1-9934');
+  });
+
+  it('accepts a scoped package, a version with build metadata and a flag', () => {
+    expect(
+      windowsShellCommand('npm', ['view', '@kici-dev/shared@1.0.0+b.1', 'exports', '--json']),
+    ).toBe('"npm" view @kici-dev/shared@1.0.0+b.1 exports --json');
+  });
+
+  it('refuses an argument cmd.exe would read as syntax', () => {
+    expect(() => windowsShellCommand('npm', ['install', '-g', 'kici-admin@1.0.0&calc'])).toThrow(
+      /cmd\.exe reads as syntax/,
+    );
+  });
+
+  it('refuses an npm path holding a double quote', () => {
+    expect(() => windowsShellCommand('C:\\a"b\\npm.cmd', [])).toThrow(/double quote/);
   });
 });

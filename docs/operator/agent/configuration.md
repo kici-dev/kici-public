@@ -3,7 +3,7 @@ title: 'Agent: configuration reference'
 description: Environment variables, labels, container executor setup
 ---
 
-> **See also:** [Environment variable reference](../env-reference.md) — shared env vars; agent-specific vars are listed below. Regenerate the generated table with `pnpm docs:env`. Unknown `KICI_*` env vars cause the agent to refuse to start (typo catcher); set `KICI_DEV=true` for warn-only behaviour during local development.
+> **See also:** [Environment variable reference](../env-reference.md) — shared env vars; agent-specific vars are listed below. Unknown `KICI_*` env vars cause the agent to refuse to start (typo catcher); set `KICI_DEV=true` for warn-only behaviour during local development.
 
 All agent configuration is provided via environment variables.
 
@@ -68,11 +68,11 @@ and the rotated-file logger live in the [environment variable reference](../env-
 
 The agent exposes three HTTP endpoints on the configured `KICI_PORT`:
 
-| Endpoint   | Purpose            | Response                                                                                                                                                                                                                                          |
-| ---------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/health`  | Liveness probe     | Always `200`. Body includes `agentId`, `activeJobs`, `connected` status, and the build identity (`version`, `buildCommit`, plus the SDK / shared / engine versions and bundle hashes) so operators can correlate deployed builds across services. |
-| `/ready`   | Readiness probe    | `200` when connected to orchestrator, `503` when disconnected.                                                                                                                                                                                    |
-| `/metrics` | Prometheus metrics | Prometheus text format with `kici_agent_` prefixed metrics.                                                                                                                                                                                       |
+| Endpoint   | Purpose            | Response                                                                                                                                                                                                                                                                                   |
+| ---------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/health`  | Liveness probe     | Always `200`. Body includes `agentId`, `activeJobs`, `connected` status, and the build identity (`version`, plus the SDK / shared / engine versions and bundle hashes) so operators can correlate deployed builds across services. The deprecated `buildCommit` field carries the version. |
+| `/ready`   | Readiness probe    | `200` when connected to orchestrator, `503` when disconnected.                                                                                                                                                                                                                             |
+| `/metrics` | Prometheus metrics | Prometheus text format with `kici_agent_` prefixed metrics.                                                                                                                                                                                                                                |
 
 ## Label-based routing
 
@@ -322,7 +322,7 @@ the operator chose:
 - the origins listed in `KICI_HOST_INSTALL_REGISTRIES`.
 
 `KICI_HOST_INSTALL_REGISTRIES` takes comma-separated origins, for example
-`http://verdaccio.local:4873,https://npm.example.internal`. Each entry is a
+`http://registry.local:4873,https://npm.example.internal`. Each entry is a
 scheme, a host and an optional port, with no path. The agent compares origins
 exactly after it normalizes them: the host is lower-cased and a default port is
 dropped. It never compares the addresses a name resolves to. An entry that is

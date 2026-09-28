@@ -6,7 +6,7 @@ import type { Database } from '../db/types.js';
  * The org-wide attestations base query: joins `attestations` to `execution_jobs`
  * (for the job name) and `execution_runs` (for repository / workflow context).
  *
- * `attestations.run_id` / `job_id` are TEXT (P1.5 schema) while the
+ * `attestations.run_id` / `job_id` are TEXT while the
  * `execution_*` keys are `uuid`; Postgres won't compare `uuid = text` implicitly,
  * so the join casts the uuid side to text — mirroring `resolveAttestationsForRun`.
  * The `execution_runs` join is a LEFT join so a row with no matching run still

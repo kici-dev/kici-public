@@ -29,6 +29,13 @@ The KiCI CLI reads the following environment variables to customize its behavior
 | `KICI_DEV_REGISTRY` | npm registry the `@kici-dev` scope points at when `KICI_DEV` is set. `kici init` writes it into `.npmrc`; with no value it writes no `.npmrc`.                             | unset   |
 | `KICI_DEBUG`        | Enable debug logging. When `true`, prints verbose diagnostics (SDK alias resolution, step-level debug logs, stack traces on errors). Equivalent to the `--debug` CLI flag. | unset   |
 
+## Output and temporary files
+
+| Variable          | Description                                                                                                                                                                | Default                             |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `KICI_LOG_FORMAT` | Format of the CLI's log lines: `json`, `plain`, or `auto`. `auto` prints plain text on a terminal and JSON when output is piped. Any other value behaves as `auto`.        | `auto`                              |
+| `KICI_TMPDIR`     | Base directory for the temporary directories the CLI creates, such as the isolated checkout of `kici run <event> --local`. The CLI creates the directory if it is missing. | The operating system temp directory |
+
 ## Local dev plane
 
 Read by the [local dev plane](./cli/authoring-and-local.md#kici-local) that `kici run <event> --local` dispatches through.

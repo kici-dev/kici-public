@@ -751,8 +751,8 @@ export interface ExecutionRunTable {
   check_mode: string | null;
   /**
    * Set inside the cold-store archive transaction before the row is
-   * DELETEd. Survivors carry NULL. Exists so a future
-   * "promote-chunk-back-into-PG" path (Phase F) can restore rows with
+   * DELETEd. Survivors carry NULL. Exists so the
+   * "promote-chunk-back-into-PG" path can restore rows with
    * their original archive pointer.
    */
   archived_at: Date | null;
@@ -1389,7 +1389,7 @@ export interface SecretAuditLogTable {
   metadata: string | null;
   /**
    * Set inside the archive transaction before the row is DELETEd.
-   * Survivors carry NULL. See cold-storage Phase D notes.
+   * Survivors carry NULL.
    */
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row; see `archived_at`. */
@@ -1429,9 +1429,8 @@ export interface AccessLogTable {
   created_at: Generated<Date>;
   /**
    * Set inside the archive transaction before the row is DELETEd.
-   * Survivors carry NULL. See cold-storage Phase D notes.
-   * Phase D removed the previous `expires_at`-based TTL — rows older
-   * than 30 days are archived to S3 instead of hard-deleted.
+   * Survivors carry NULL. The table has no `expires_at`-based TTL — rows
+   * older than 30 days are archived to S3 instead of hard-deleted.
    */
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row; see `archived_at`. */
@@ -2628,9 +2627,9 @@ export interface EventLogTable {
   error_message: string | null;
   /** When the delivery was received */
   received_at: Generated<Date>;
-  /** Phase E cold-store: set inside the archive transaction; NULL for hot rows. */
+  /** Cold-store: set inside the archive transaction; NULL for hot rows. */
   archived_at: Date | null;
-  /** Phase E cold-store: chunk object key when row is archived. */
+  /** Cold-store: chunk object key when row is archived. */
   archive_object_key: string | null;
 }
 
@@ -2643,8 +2642,8 @@ export type EventLogRowUpdate = Updateable<EventLogTable>;
  * Cold-store chunk counts table (cold_store_chunk_counts).
  * Tracks per-(db, table, tenant) archived-chunk metadata so the
  * `cold_store_chunks_total` gauge and the `kici-admin cold-store list-chunks`
- * CLI can report totals without S3 LIST calls. Phase A creates the table
- * empty; Phase B+ populates it transactionally on each chunk write.
+ * CLI can report totals without S3 LIST calls. The cold-store archiver
+ * populates it transactionally on each chunk write.
  */
 export interface ColdStoreChunkCountsTable {
   /** DbKind identifier ('orchestrator' on this side). */
@@ -2669,12 +2668,12 @@ export type NewColdStoreChunkCountsRow = Insertable<ColdStoreChunkCountsTable>;
 export type ColdStoreChunkCountsUpdate = Updateable<ColdStoreChunkCountsTable>;
 
 /**
- * Cold-store chunk index (cold_store_chunks). Phase 2.
+ * Cold-store chunk index (cold_store_chunks).
  *
  * One row per archived chunk that the GC sweep can later purge from S3.
  * Inserted inside `markArchivedAndDelete`'s transaction by adapters that
- * opt into the per-bucket layout via `coldTtlDays(row)`. Pre-Phase-2
- * (v1) chunks are NOT in this table — they're treated as
+ * opt into the per-bucket layout via `coldTtlDays(row)`. V1
+ * chunks are NOT in this table — they're treated as
  * `'forever'` and never purged.
  */
 export interface ColdStoreChunksTable {

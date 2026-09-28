@@ -30,13 +30,13 @@ Part 2 (GitHub-triggered runs) needs a GitHub App as well; its requirements are 
 
 ### 1. Sign up at app.kici.dev
 
-Go to [app.kici.dev](https://app.kici.dev) and create an account. Self-service sign-up is limited during the beta; see the [Docker quickstart](./compose.md#1-sign-up-at-appkicidev) for the beta-invite path.
+Go to [app.kici.dev](https://app.kici.dev) and create an account. Sign-up is open to everyone and free.
 
 After sign-up you'll have a personal organisation.
 
 ### 2. Mint an orchestrator registration token
 
-In the dashboard, open **Settings → Orchestrators → New orchestrator**, name it (e.g. `home-server`), and copy the `kici_ok_…` token. The token is shown **only once** — save it now. This authorises your orchestrator to connect to `wss://api.kici.dev/ws`.
+In the dashboard, open **Settings → Orchestrator keys → Create orchestrator key**, name it (e.g. `home-server`), and copy the `kici_ok_…` token. The token is shown **only once** — save it now. This authorises your orchestrator to connect to `wss://api.kici.dev/ws`.
 
 ### 3. Set up PostgreSQL and the orchestrator's database
 
@@ -266,7 +266,7 @@ cat > .kici/package.json <<'EOF'
   "private": true,
   "type": "module",
   "devDependencies": {
-    "@kici-dev/sdk": "^0.1.18"
+    "@kici-dev/sdk": "latest"
   }
 }
 EOF
@@ -396,7 +396,7 @@ kici-admin orchestrator upgrade --version <latest> --yes
 It installs the correct global package under the unit's own pinned node runtime, restarts, and verifies the unit now launches the new version. Scaler-spawned agents pick up the new agent code on the next job — they respawn fresh from `$(command -v kici-agent)` every time. DB migrations run automatically on first start of the new version.
 
 :::caution[Don't re-run `install` to upgrade]
-`kici-admin orchestrator upgrade` is the whole upgrade — it installs and restarts for you. Re-running `kici-admin orchestrator install` against an already-installed service is **not** the upgrade path — it's for first-time setup, and against an existing same-named instance it stops with `an orchestrator instance "…" is already installed`. If you see that error, you wanted `kici-admin orchestrator upgrade` instead.
+`kici-admin orchestrator upgrade` is the whole upgrade — it installs and restarts for you. Re-running `kici-admin orchestrator install` against an already-installed service is **not** the upgrade path — it's for first-time setup. In the same deploy folder, it registers the service again, but it installs no new release. On a terminal, it also runs the setup wizard again, which writes a new env file, unless you pass `--no-wizard`. Against a same-named instance in another deploy folder, it stops with `an orchestrator instance "…" is already installed`. If you see that error, you wanted `kici-admin orchestrator upgrade` instead.
 :::
 
 ## Where to next

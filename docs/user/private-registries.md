@@ -242,7 +242,7 @@ When the named install context carries a protection rule that holds — a requir
 - **Reviewer hold:** the run waits for an approver. On approval the dispatch resumes from the install gate, resolves the token, and dispatches its jobs as a normal run. On rejection the run transitions to `cancelled` — no jobs ever run.
 - **Wait timer:** the run waits out the timer and resumes automatically when it elapses.
 
-A `reject` protection outcome (for example a disabled context or a branch the context forbids) still fails the dispatch loudly with a clear reason, exactly as before — the orchestrator never dispatches a run with an unresolved install token.
+A `reject` protection outcome (for example a disabled context or a branch the context forbids) still fails the dispatch loudly with a clear reason — the orchestrator never dispatches a run with an unresolved install token.
 
 When `registries:` and `installEnv:` name more than one context, the install gate checks the rules of every context before it decides:
 
@@ -258,7 +258,7 @@ When `registries:` and `installEnv:` name more than one context, the install gat
 
 ## Observability
 
-The orchestrator exposes Prometheus counters and a histogram under the `kici_orch_install_secrets_*` prefix on its `/metrics` endpoint. They populate the **Install secrets resolution** Grafana dashboard and let operators graph install-secrets activity without digging through Loki.
+The orchestrator exposes Prometheus counters and a histogram under the `kici_orch_install_secrets_*` prefix on its `/metrics` endpoint. Operators can graph install-secrets activity from them without reading the logs.
 
 | Metric                                                        | Type      | Labels                         | What it tells you                                                                                                                                                                                                                                                                                   |
 | ------------------------------------------------------------- | --------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -266,8 +266,6 @@ The orchestrator exposes Prometheus counters and a histogram under the `kici_orc
 | `kici_orch_install_secrets_npm_registry_used_total`           | Counter   | `channel`, `provider`, `scope` | Per-channel + per-scope usage. `channel=registries` is Option A, `channel=install_env` is Option C. `scope=default` marks a no-scope default registry; `scope=-` marks Option C entries.                                                                                                            |
 | `kici_orch_install_secrets_contributor_stripped_total`        | Counter   | `trust_tier`                   | Number of dispatches where registry tokens were stripped because the contributor tier wasn't `trusted` (fork PRs). Expected to be 0 in single-tenant orgs.                                                                                                                                          |
 | `kici_orch_install_secrets_token_resolution_duration_seconds` | Histogram | `environment`                  | Latency of per-environment secret resolution. Pathological tails (>500ms) usually mean a Vault timeout or a slow Postgres replica.                                                                                                                                                                  |
-
-The dashboard JSON lives at `infra/terraform/modules/grafana/dashboards/install-secrets.json`; if you maintain your own monitoring stack, you can import it directly.
 
 ## See also
 

@@ -1,5 +1,5 @@
 /**
- * pentest repro: ephemeral agent token allows N-use across distinct
+ * regression: an ephemeral agent token must not be usable across distinct
  * agentIds (ghost-agent attack within the token's TTL + label-scope).
  *
  * Trust model the system claims to hold:
@@ -11,20 +11,19 @@
  *   static token is intentionally N-use (the same PSK can be distributed
  *   across many manually-registered agents).
  *
- *   Today the orchestrator's agent WS handler does NOT enforce the
- *   ephemeral-token-to-agentId binding at register-time. The collision
- *   check at agent-handler.ts:616 only blocks "same agentId presents a
- *   different token"; an attacker with a stolen ephemeral token can
- *   register a fresh `agent-ghost` and freely claim jobs (and receive the
- *   secrets dispatched with them) within the token's labels-scope. The
- * fix narrowed the labels but left the agentId-binding gap open.
+ *   The agentId-collision check only blocks "same agentId presents a
+ *   different token", and the label-scope check only bounds which labels
+ *   a token may claim. Without the register-time binding check
+ *   (`tokenCreatedBy === agentId` for an ephemeral token), an attacker with
+ *   a stolen ephemeral token could register a fresh `agent-ghost` and
+ *   freely claim jobs (and receive the secrets dispatched with them) within
+ *   the token's labels-scope.
  *
- *   An A10 stolen-credential attack requires one ephemeral token leakage
+ *   A stolen-credential attack requires one ephemeral token leakage
  *   (env file read on the scaler-spawned VM/container/bare-metal worker,
  *   agent process memory dump, accidental commit, log line). Within the
- *   token's TTL, an attacker without this fix could mint a parallel
- *   ghost agent that the orchestrator treated as a peer of the
- *   legitimate one.
+ *   token's TTL, an attacker could then mint a parallel ghost agent that
+ *   the orchestrator would treat as a peer of the legitimate one.
  *
  * Static-token N-use remains a covered counter-test: operators
  * deliberately distribute one static token across many agents, and that
@@ -101,7 +100,7 @@ function tokenStoreFor(opts: {
   } as unknown as AgentTokenStore;
 }
 
-describe(' ephemeral-token single-use binding (created_by → agentId)', () => {
+describe('ephemeral-token single-use binding (created_by → agentId)', () => {
   let registry: AgentRegistry;
   let dispatcher: Dispatcher;
 
@@ -141,11 +140,10 @@ describe(' ephemeral-token single-use binding (created_by → agentId)', () => {
     expect(registry.get('agent-real')).toBeDefined();
     expect(wsReal.close).not.toHaveBeenCalled();
 
-    // A10 attacker who stole the ephemeral token registers as a ghost
-    // agent under a different agentId. Same labels-scope (so
-    // doesn't catch it), same token (so the token validates), different
-    // agentId (so the agentId-collision check at agent-handler.ts:616
-    // doesn't fire).
+    // An attacker who stole the ephemeral token registers as a ghost
+    // agent under a different agentId. Same labels-scope (so the label-scope
+    // check doesn't catch it), same token (so the token validates), different
+    // agentId (so the agentId-collision check doesn't fire).
     const wsGhost = mockWs();
     handler.onOpen!(new Event('open'), wsGhost as any);
     await handler.onMessage!(makeMessageEvent(authRequestMsg()), wsGhost as any);
@@ -171,7 +169,7 @@ describe(' ephemeral-token single-use binding (created_by → agentId)', () => {
     // Counter-test: the legitimate scaler-spawned agent-real disconnects
     // (e.g. transient network blip) and reconnects within the token's
     // TTL. Same token, same agentId. Must succeed — agent reconnect is a
-    // normal operational flow and the fix MUST NOT break it.
+    // normal operational flow and the binding check MUST NOT break it.
     const tokenStore = tokenStoreFor({
       agentType: 'ephemeral',
       createdBy: 'agent-real',
@@ -268,7 +266,7 @@ describe(' ephemeral-token single-use binding (created_by → agentId)', () => {
   it('allows distinct agentIds to share a STATIC token (operator-issued N-use)', async () => {
     // Counter-test: static tokens are intentionally N-use. The operator
     // distributes one static PSK across many manually-registered agents.
-    // The fix MUST NOT break this — only ephemeral tokens carry the
+    // The binding check MUST NOT break this — only ephemeral tokens carry the
     // agentId-binding invariant.
     const tokenStore = tokenStoreFor({
       agentType: 'static',

@@ -30,8 +30,8 @@ const defaultLogger = createLogger({ prefix: 'admin-auth' });
  * The three admin-auth response bodies.
  *
  * A single map rather than string literals repeated across every admin router:
- * the 401 wordings are observed by operators and by E2E assertions, so they are
- * pinned in exactly one place.
+ * the 401 wordings are observed by operators and asserted on by tests, so they
+ * are pinned in exactly one place.
  */
 export const AUTH_ERROR = {
   missing: 'Missing authorization',

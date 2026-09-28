@@ -336,7 +336,7 @@ describe('bootstrapWorker agent-bind guard', () => {
     vi.clearAllMocks();
   });
 
-  it.each(['0.0.0.0', '::', '192.168.1.85'])(
+  it.each(['0.0.0.0', '::', '192.168.1.40'])(
     'refuses to start with agent auth disabled on bind %s',
     async (host) => {
       // A worker serves the same agent WebSocket endpoint a coordinator does,
@@ -359,7 +359,7 @@ describe('bootstrapWorker agent-bind guard', () => {
     },
   );
 
-  it.each(['0.0.0.0', '::', '192.168.1.85', '127.0.0.1'])(
+  it.each(['0.0.0.0', '::', '192.168.1.40', '127.0.0.1'])(
     'starts on bind %s under token auth',
     async (host) => {
       // A guard that refused every wildcard bind would take out every

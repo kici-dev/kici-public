@@ -2,8 +2,8 @@
  * Cold-store framework — public surface for @kici-dev/shared consumers.
  *
  * Multiple implementations extend `BaseColdStore` with their own
- * DB-specific adapters. Phase A ships framework types + the abstract
- * class with a no-op archive cycle; Phase B+ adds concrete
+ * DB-specific adapters: this module ships the framework types and the
+ * abstract class, and each package registers its concrete
  * `TableAdapter` implementations.
  */
 export {

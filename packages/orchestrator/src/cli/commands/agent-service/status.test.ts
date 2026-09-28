@@ -74,6 +74,7 @@ vi.mock('../../service/index.js', async () => {
 import { registerAgentStatusCommand } from './status.js';
 import { writeIndex, writeManifest } from '../../service/index.js';
 import type { InstanceManifest } from '../../service/index.js';
+import type { AgentLivenessInfo, LivenessResponse } from '@kici-dev/shared';
 
 function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -198,5 +199,186 @@ describe('agent status — folder-anchored', () => {
 
     expect(operatedPlatforms).toEqual(['systemd']);
     expect(mockStatus).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * A /health body in the agent's declared shape. The type is the one the agent's
+ * health route is annotated with, so a field renamed or dropped on the agent side
+ * stops this fixture compiling.
+ */
+function agentHealthBody(
+  overrides: Partial<LivenessResponse<AgentLivenessInfo>> = {},
+): LivenessResponse<AgentLivenessInfo> {
+  return {
+    status: 'ok',
+    timestamp: '2026-09-26T04:00:00.000Z',
+    uptime: 226.556527459,
+    agentId: 'agent-7f3a',
+    connected: true,
+    activeJobs: 2,
+    version: '9.8.7',
+    buildCommit: 'c0ffee123',
+    sdkVersion: '9.8.6',
+    sdkBundleHash: 'b012bd8bace3df9e574252bf290c652b',
+    sharedVersion: '9.8.5',
+    sharedBundleHash: 'c43dafa78ecdfdff530b94f7f0629d29',
+    engineVersion: '9.8.4',
+    engineBundleHash: '0253acfa2150e263bde9698a0d8e9595',
+    ...overrides,
+  };
+}
+
+describe('agent status — health section', () => {
+  let program: Command;
+  let tmpInstanceDir: string;
+  let tmpConfigRoot: string;
+  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let requestedUrls: string[];
+
+  function serveHealth(body: LivenessResponse<AgentLivenessInfo>): void {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL) => {
+        requestedUrls.push(String(input));
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }),
+    );
+  }
+
+  function installWithEnv(envContent: string): void {
+    const envFilePath = path.join(tmpInstanceDir, 'agent.env');
+    fs.writeFileSync(envFilePath, envContent);
+    writeManifest(tmpInstanceDir, makeManifest({ name: 'kici-test', envFilePath }));
+  }
+
+  async function runStatus(extraArgs: string[] = []): Promise<string> {
+    await program.parseAsync([
+      'node',
+      'agent',
+      'status',
+      '--instance-dir',
+      tmpInstanceDir,
+      ...extraArgs,
+    ]);
+    return consoleLogSpy.mock.calls.map((c: unknown[]) => c.join(' ')).join('\n');
+  }
+
+  beforeEach(() => {
+    tmpInstanceDir = mkTmp('kici-ag-health-i-');
+    tmpConfigRoot = mkTmp('kici-ag-health-c-');
+    mockKiciRoot = tmpConfigRoot;
+    mockStatusResult = { state: 'running', pid: 4343 };
+    mockStatus.mockClear();
+    requestedUrls = [];
+
+    program = new Command();
+    program.name('agent');
+    registerAgentStatusCommand(program);
+
+    consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    consoleLogSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+    mockStatusResult = { state: 'stopped' };
+    for (const dir of [tmpInstanceDir, tmpConfigRoot]) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('renders the fields the agent reports on /health', async () => {
+    // fails-when: the renderer reads fields the agent's /health does not send —
+    // a Labels or Current job line appears, stating a value no agent reported.
+    installWithEnv('KICI_PORT=5555\n');
+    serveHealth(agentHealthBody());
+
+    const text = await runStatus();
+    const lines = text.split('\n');
+
+    expect(requestedUrls).toEqual(['http://localhost:5555/health']);
+    expect(lines).toContain('Agent ID:     agent-7f3a');
+    expect(lines).toContain('Orchestrator: connected');
+    expect(lines).toContain('Active jobs:  2');
+    expect(lines).toContain('Version:      9.8.7');
+    // fails-when: the renderer prints the build commit an agent older than this
+    // CLI reports — a commit ID from the private repository.
+    expect(text).not.toContain('c0ffee123');
+    expect(lines).toContain('SDK:          9.8.6 (bundle b012bd8bace3)');
+    expect(lines).toContain('Uptime:       3m 46s');
+    expect(lines.some((l) => l.startsWith('Labels:'))).toBe(false);
+    expect(lines.some((l) => l.startsWith('Current job:'))).toBe(false);
+  });
+
+  it('reports a disconnected agent as disconnected', async () => {
+    // breaks-if-wrong: the connection line follows the reported value in both
+    // directions, not only the connected default.
+    installWithEnv('KICI_PORT=5555\n');
+    serveHealth(agentHealthBody({ connected: false, activeJobs: 0 }));
+
+    const lines = (await runStatus()).split('\n');
+
+    expect(lines).toContain('Orchestrator: disconnected');
+    expect(lines).toContain('Active jobs:  0');
+  });
+
+  it("queries the agent's default port when the env file sets no KICI_PORT", async () => {
+    // fails-when: the fallback is anything but the port the agent binds with
+    // KICI_PORT unset (8080). `kici-admin agent install` writes no KICI_PORT,
+    // so this env file is the default install's.
+    installWithEnv('KICI_ORCHESTRATOR_URL=ws://localhost:4000/ws\n');
+    serveHealth(agentHealthBody());
+
+    await runStatus();
+
+    expect(requestedUrls).toEqual(['http://localhost:8080/health']);
+  });
+
+  it('ignores KICI_AGENT_PORT, which the agent never reads', async () => {
+    // fails-when: status honours a variable the agent does not, and queries a
+    // port nothing listens on while the agent answers on its default.
+    installWithEnv('KICI_AGENT_PORT=1234\n');
+    serveHealth(agentHealthBody());
+
+    await runStatus();
+
+    expect(requestedUrls).toEqual(['http://localhost:8080/health']);
+  });
+
+  it('never prints the agent heading with nothing under it', async () => {
+    // fails-when: a /health body carrying no field this CLI knows (another
+    // service answering on the port) yields a bare heading.
+    installWithEnv('KICI_PORT=5555\n');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    );
+
+    const lines = (await runStatus()).split('\n');
+    const heading = lines.indexOf('--- KiCI agent ---');
+
+    expect(heading).toBeGreaterThanOrEqual(0);
+    expect(lines[heading + 1]).toMatch(/^Health: +\S/);
+  });
+
+  it('returns the /health body in --json, with the version in the deprecated buildCommit', async () => {
+    // fails-when: --json passes through the build commit an older agent reports.
+    // breaks-if-wrong: every other field of the body comes back unchanged.
+    installWithEnv('KICI_PORT=5555\n');
+    const body = agentHealthBody();
+    serveHealth(body);
+
+    const text = await runStatus(['--json']);
+    const json = JSON.parse(text) as { health: unknown };
+
+    expect(json.health).toEqual({ ...body, buildCommit: body.version });
+    expect(text).not.toContain('c0ffee123');
   });
 });

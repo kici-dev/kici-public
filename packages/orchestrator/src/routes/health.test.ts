@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { createHealthRoutes } from './health.js';
@@ -42,5 +42,33 @@ describe('orchestrator health routes — /ready warm gate', () => {
     const body = (await res.json()) as { checks: Record<string, boolean> };
     expect(body.checks.warm).toBe(true);
     expect(body.checks.database).toBe(true);
+  });
+});
+
+describe('orchestrator health routes — /health build identity', () => {
+  const GLOBALS = { KICI_PKG_VERSION: '9.8.7', KICI_BUILD_COMMIT: 'c0ffee123' } as const;
+
+  beforeEach(() => {
+    for (const [key, value] of Object.entries(GLOBALS)) {
+      (globalThis as Record<string, unknown>)[key] = value;
+    }
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(GLOBALS)) delete (globalThis as Record<string, unknown>)[key];
+  });
+
+  it('reports the release version in the deprecated buildCommit field, never a build commit', async () => {
+    // fails-when: the route reads a baked build commit — the private repository's
+    // commit ID then reaches every customer who reads /health.
+    // breaks-if-wrong: the deprecated key stays present, as a string, for a
+    // reader that still expects it.
+    const res = await createHealthRoutes({ db: stubDbOk() }).request('/health');
+    const text = await res.text();
+    const body = JSON.parse(text) as Record<string, unknown>;
+
+    expect(body.version).toBe(GLOBALS.KICI_PKG_VERSION);
+    expect(body.buildCommit).toBe(GLOBALS.KICI_PKG_VERSION);
+    expect(text).not.toContain(GLOBALS.KICI_BUILD_COMMIT);
   });
 });

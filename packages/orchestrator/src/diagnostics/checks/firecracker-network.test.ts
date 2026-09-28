@@ -33,6 +33,8 @@ describe('checkFirecrackerNetwork', () => {
       addrPresent: true,
       tablePresent: true,
       baselineChainPresent: true,
+      natPresent: true,
+      baselineRulesPresent: true,
       tapIsolationPresent: true,
       healthy: true,
       detail: 'healthy',
@@ -40,7 +42,7 @@ describe('checkFirecrackerNetwork', () => {
     const res = await checkFirecrackerNetwork(
       depsWith([
         {
-          name: 'stg-firecracker',
+          name: 'linux-firecracker',
           type: 'firecracker',
           bridge: { bridgeName: 'kici-br0', bridgeCidr: '10.0.0.1/24', table: 'kici' },
         },
@@ -55,7 +57,7 @@ describe('checkFirecrackerNetwork', () => {
     const res = await checkFirecrackerNetwork(
       depsWith([
         {
-          name: 'stg-firecracker',
+          name: 'linux-firecracker',
           type: 'firecracker',
           bridge: { bridgeName: 'kici-br0', bridgeCidr: '10.0.0.1/24', table: 'kici' },
         },
@@ -68,6 +70,8 @@ describe('checkFirecrackerNetwork', () => {
           addrPresent: false,
           tablePresent: false,
           baselineChainPresent: false,
+          natPresent: false,
+          baselineRulesPresent: false,
           tapIsolationPresent: false,
           healthy: false,
           detail: 'kici-br0 does not exist',
@@ -81,7 +85,7 @@ describe('checkFirecrackerNetwork', () => {
 
   it('warns when a firecracker backend exposes no bridge config', async () => {
     const res = await checkFirecrackerNetwork(
-      depsWith([{ name: 'stg-firecracker', type: 'firecracker' }]),
+      depsWith([{ name: 'linux-firecracker', type: 'firecracker' }]),
     );
     expect(res[0].status).toBe('warn');
     expect(res[0].message).toMatch(/unavailable/);

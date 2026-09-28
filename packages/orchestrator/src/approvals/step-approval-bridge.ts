@@ -25,9 +25,13 @@ import {
   approvalTimeoutSecondsSchema,
   type ApprovalRequirement,
 } from '@kici-dev/engine';
+import { createLogger } from '@kici-dev/shared';
 
 import type { HeldRunStore } from '../contexts/held-runs.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import { runDetached } from '../helpers/run-detached.js';
+
+const logger = createLogger({ prefix: 'step-approval-bridge' });
 
 /** Outcome relayed back to the waiting agent. */
 export type StepApprovalOutcome = 'approved' | 'rejected' | 'expired';
@@ -122,22 +126,28 @@ export class StepApprovalBridge {
     // Audit the step-hold creation. The agent requested the hold while
     // executing the step (no Keycloak user context), so the actor is the
     // dispatcher system component.
-    void this.deps.accessLogWriter?.record({
-      orgId,
-      routingKey: this.deps.routingKey ?? null,
-      actor: { type: 'system', component: 'dispatcher' },
-      action: 'held_run.request',
-      target: { type: 'held_run', id: hold.id },
-      requestId: null,
-      source: 'platform_proxy',
-      outcome: 'allowed',
-      meta: {
-        runId: req.runId,
-        jobId: req.jobId,
-        holdScope: HoldScope.enum.step,
-        stepIndex: req.stepIndex,
-      },
-    });
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        this.deps.accessLogWriter?.record({
+          orgId,
+          routingKey: this.deps.routingKey ?? null,
+          actor: { type: 'system', component: 'dispatcher' },
+          action: 'held_run.request',
+          target: { type: 'held_run', id: hold.id },
+          requestId: null,
+          source: 'platform_proxy',
+          outcome: 'allowed',
+          meta: {
+            runId: req.runId,
+            jobId: req.jobId,
+            holdScope: HoldScope.enum.step,
+            stepIndex: req.stepIndex,
+          },
+        }),
+      { runId: req.runId, heldRunId: hold.id },
+    );
 
     return new Promise<{ outcome: StepApprovalOutcome; reason?: string }>((resolve, reject) => {
       this.pending.set(hold.id, { agentId: req.agentId, resolve, reject });

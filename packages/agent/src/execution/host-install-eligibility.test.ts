@@ -15,7 +15,7 @@ import {
 import { allowedRegistries, loadNpmIni } from './npmrc-allowlist.js';
 
 /** The public npm registry plus one private registry the config names. */
-const REGISTRIES = allowedRegistries([{ '@s:registry': 'http://verdaccio.local:4873/' }], []);
+const REGISTRIES = allowedRegistries([{ '@s:registry': 'http://registry.local:4873/' }], []);
 /** The registries a plan carries when the operator configured none: npm's public one. */
 const PUBLIC_REGISTRY = [new URL('https://registry.npmjs.org/')];
 
@@ -71,7 +71,7 @@ describe('lockfile scanners', () => {
         resolved: 'https://registry.npmjs.org/a/-/a-1.0.0.tgz',
         version: '1.0.0',
       },
-      'node_modules/@s/b': { resolved: 'http://verdaccio.local:4873/@s/b/-/b-2.0.0.tgz' },
+      'node_modules/@s/b': { resolved: 'http://registry.local:4873/@s/b/-/b-2.0.0.tgz' },
     };
     const scan = (lock: Record<string, unknown>) => findNonRegistryNpmLockEntry(lock, REGISTRIES);
     // breaks-if-wrong: tarballs on the public and a configured registry pass.
@@ -148,7 +148,7 @@ describe('lockfile scanners', () => {
         '@s/b@2.0.0': {
           resolution: {
             integrity: 'sha512-y',
-            tarball: 'http://verdaccio.local:4873/@s/b/-/b-2.0.0.tgz',
+            tarball: 'http://registry.local:4873/@s/b/-/b-2.0.0.tgz',
           },
         },
       },
@@ -277,14 +277,14 @@ describe('checkHostInstallEligibility', () => {
     await write('.kici/.npmrc', '@s:registry=https://npm.acme.internal/private/\n');
     const result = await check(repo, {
       hostInstallRegistries: ['https://npm.acme.internal'],
-      operatorNpmrc: 'registry=http://verdaccio.local:4873/\n',
+      operatorNpmrc: 'registry=http://registry.local:4873/\n',
     });
     // fails-when: the plan carries no registries, or the repository's, so the
     // lockfile check reads tarball origins against a set the operator did not choose.
     expect(result.eligible && result.plan.registries.map((u) => u.href)).toEqual([
       'https://registry.npmjs.org/',
       'https://npm.acme.internal/',
-      'http://verdaccio.local:4873/',
+      'http://registry.local:4873/',
     ]);
   });
 
@@ -457,7 +457,7 @@ describe('checkHostInstallEligibility', () => {
   });
 
   /** The origin an operator lists in KICI_HOST_INSTALL_REGISTRIES. */
-  const VERDACCIO = 'http://verdaccio.local:4873';
+  const VERDACCIO = 'http://registry.local:4873';
   const workflowRegistry = (url: string) => [{ url, alwaysAuth: false, token: 't' }];
   const lock = (url: string) =>
     write(
@@ -468,7 +468,7 @@ describe('checkHostInstallEligibility', () => {
   it.each([
     ['on the agent loopback', 'http://127.0.0.1:4873/'],
     ['on localhost', 'http://localhost:4873/'],
-    ['on a .local name', 'http://verdaccio.local:4873/'],
+    ['on a .local name', 'http://registry.local:4873/'],
     ['on the LAN', 'http://192.168.1.50:4873/'],
     ['on the cloud metadata address', 'http://169.254.169.254/'],
   ])('leaves the install to the container for a workflow registry %s', async (_name, url) => {
@@ -490,7 +490,7 @@ describe('checkHostInstallEligibility', () => {
     // listing at all.
     expect(
       await check(repo, {
-        workflowRegistries: workflowRegistry('http://verdaccio.local:4873/'),
+        workflowRegistries: workflowRegistry('http://registry.local:4873/'),
         hostInstallRegistries: [VERDACCIO],
       }),
     ).toMatchObject({ eligible: true });
@@ -500,7 +500,7 @@ describe('checkHostInstallEligibility', () => {
   });
 
   it('accepts a lockfile tarball only on an allowed origin', async () => {
-    await lock('http://verdaccio.local:4873/x/-/x-1.0.0.tgz');
+    await lock('http://registry.local:4873/x/-/x-1.0.0.tgz');
     expect(await check(repo)).toMatchObject({
       eligible: false,
       refusal: HostInstallRefusal.NonRegistryDependency,
@@ -508,7 +508,7 @@ describe('checkHostInstallEligibility', () => {
     // fails-when: a workflow registry on the tarball's origin admits it, so a
     // repository picks the origins its lockfile fetches from.
     expect(
-      await check(repo, { workflowRegistries: workflowRegistry('http://verdaccio.local:4873/') }),
+      await check(repo, { workflowRegistries: workflowRegistry('http://registry.local:4873/') }),
     ).toMatchObject({ eligible: false });
     // breaks-if-wrong: the same tarball passes once the operator lists its
     // origin, or the operator's own config names its registry.
@@ -516,14 +516,14 @@ describe('checkHostInstallEligibility', () => {
       eligible: true,
     });
     expect(
-      await check(repo, { operatorNpmrc: '@s:registry=http://verdaccio.local:4873/\n' }),
+      await check(repo, { operatorNpmrc: '@s:registry=http://registry.local:4873/\n' }),
     ).toMatchObject({ eligible: true });
   });
 
   it.each([
     ['registry on the agent loopback', 'registry=http://127.0.0.1:4873/\n'],
     ['a scoped registry on the LAN', '@x:registry=http://192.168.1.50:4873/\n'],
-    ['a registry on a port the operator did not list', 'registry=http://verdaccio.local:4874/\n'],
+    ['a registry on a port the operator did not list', 'registry=http://registry.local:4874/\n'],
     ['a registry that is not an http(s) URL', 'registry=file:///etc/\n'],
     ['a registry that is not a string', 'registry=true\n'],
   ])('refuses a .kici/.npmrc that sets %s', async (_name, npmrc) => {
@@ -539,7 +539,7 @@ describe('checkHostInstallEligibility', () => {
   it('accepts a .kici/.npmrc registry on an allowed origin or the public one', async () => {
     await write(
       '.kici/.npmrc',
-      'registry=http://verdaccio.local:4873/\n@s:registry=https://registry.npmjs.org/\n',
+      'registry=http://registry.local:4873/\n@s:registry=https://registry.npmjs.org/\n',
     );
     // fails-when: the repository's own registry admits itself.
     expect(await check(repo)).toMatchObject({
@@ -552,7 +552,7 @@ describe('checkHostInstallEligibility', () => {
       eligible: true,
     });
     expect(
-      await check(repo, { operatorNpmrc: 'registry=http://verdaccio.local:4873/\n' }),
+      await check(repo, { operatorNpmrc: 'registry=http://registry.local:4873/\n' }),
     ).toMatchObject({ eligible: true });
   });
 

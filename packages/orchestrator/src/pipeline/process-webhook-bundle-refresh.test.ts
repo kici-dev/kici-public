@@ -13,10 +13,9 @@ import type { WebhookInfo } from '../webhook/handler.js';
  * present at the moment a delivery arrives, and the miss used to be silent:
  * the lookup fell back to the shared `generic:default` bundle, whose
  * normalizer reports every payload as carrying no repository, so the pipeline
- * dropped the delivery at its no-repo exit. Observed on staging as a
- * repo-bearing `push` answered 202 and recorded only as `received` with
- * `matched_count = 0` — no run, no dispatch, and nothing above `debug` to say
- * why.
+ * dropped the delivery at its no-repo exit. The symptom: a repo-bearing `push`
+ * answered 202 and recorded only as `received` with `matched_count = 0` — no
+ * run, no dispatch, and nothing above `debug` to say why.
  */
 const ROUTING_KEY = 'generic:org-1:source-1';
 

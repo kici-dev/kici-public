@@ -307,12 +307,12 @@ describe('CheckRunReporter', () => {
     });
 
     it('ignores a step-progress update that arrives after the job completed', async () => {
-      // Observed on staging: `kici/e2e-fail/job/fail-job` sat at
-      // `status: in_progress` with `conclusion: failure` already attached,
-      // because a step status arriving after the completion scheduled a fresh
-      // debounce timer that then PATCHed the check run back open. A check run
-      // stuck in a non-terminal status is the very state this reporter exists
-      // to avoid, so completion has to be a one-way latch.
+      // The failure mode: a check run sits at `status: in_progress` with
+      // `conclusion: failure` already attached, because a step status arriving
+      // after the completion schedules a fresh debounce timer that then
+      // PATCHes the check run back open. A check run stuck in a non-terminal
+      // status is the very state this reporter exists to avoid, so completion
+      // has to be a one-way latch.
       const reporter = new CheckRunReporter({ githubConfig });
 
       reporter.setPending({

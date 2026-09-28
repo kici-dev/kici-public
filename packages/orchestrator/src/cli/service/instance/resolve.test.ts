@@ -396,17 +396,17 @@ describe('listInstances — reconcile cache vs scan', () => {
         managers: [
           fakeManager([
             {
-              name: 'kici-dogfood',
+              name: 'kici-edge',
               platform: 'systemd',
               isUserLevel: true,
               component: 'orchestrator',
-              instanceDir: '/home/u/kici-dogfood',
+              instanceDir: '/home/u/kici-edge',
             },
           ]),
         ],
       });
       expect(found).toEqual([
-        expect.objectContaining({ name: 'kici-dogfood', instanceDir: '/home/u/kici-dogfood' }),
+        expect.objectContaining({ name: 'kici-edge', instanceDir: '/home/u/kici-edge' }),
       ]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -424,11 +424,11 @@ describe('listInstances — reconcile cache vs scan', () => {
         managers: [
           fakeManager([
             {
-              name: 'kici-dogfood',
+              name: 'kici-edge',
               platform: 'systemd',
               isUserLevel: true,
               component: 'orchestrator',
-              instanceDir: '/home/u/kici-dogfood',
+              instanceDir: '/home/u/kici-edge',
             },
           ]),
         ],
@@ -437,10 +437,10 @@ describe('listInstances — reconcile cache vs scan', () => {
       expect(idx).toEqual([
         {
           component: 'orchestrator',
-          name: 'kici-dogfood',
+          name: 'kici-edge',
           platform: 'systemd',
           isUserLevel: true,
-          instanceDir: '/home/u/kici-dogfood',
+          instanceDir: '/home/u/kici-edge',
         },
       ]);
     } finally {
@@ -518,7 +518,7 @@ describe('listInstances — reconcile cache vs scan', () => {
     }
   });
 
-  it('surfaces scan-only units (no index entry — e.g. dogfood pre-migration)', async () => {
+  it('surfaces scan-only units (no index entry — e.g. a pre-index install)', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-r-'));
     try {
       writeIndex(root, []);

@@ -14,8 +14,8 @@
  *
  *   Without this check, a token issued for `[ci, build]` could register as
  *   `[ci, build, prod, secret-vault]` and harvest secrets resolved for the
- *   `prod` environment at dispatch time — see attacker model A5 in
- *   and the finding record at
+ *   `prod` environment at dispatch time — the path a compromised agent
+ *   would take.
  *
  * Production stores `agent_tokens.labels` as `text` containing
  * `JSON.stringify(string[])` (or `null`). The mock here mirrors that
@@ -87,7 +87,7 @@ function tokenStoreWithLabels(authorizedLabels: string[] | null): AgentTokenStor
   } as unknown as AgentTokenStore;
 }
 
-describe(' agent register-time label-scope enforcement', () => {
+describe('agent register-time label-scope enforcement', () => {
   let registry: AgentRegistry;
   let dispatcher: Dispatcher;
 
@@ -114,7 +114,7 @@ describe(' agent register-time label-scope enforcement', () => {
     handler.onOpen!(new Event('open'), ws as any);
     await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
 
-    // A5 attacker with a `[ci, build]`-scoped token claims an elevated set
+    // A compromised agent with a `[ci, build]`-scoped token claims an elevated set
     // including `prod` and `secret-vault`.
     await handler.onMessage!(
       makeMessageEvent(

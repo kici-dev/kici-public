@@ -74,10 +74,10 @@ describe('chunkReplayRuns', () => {
     expect(REPLAY_CHUNK_MAX_RUNS).toBeLessThanOrEqual(STATE_REPLAY_MAX_RUNS);
   });
 
-  it('never emits a chunk breaching the wire cap, for the payload that broke staging', () => {
-    // 827 runs is the exact count that wedged the staging orchestrator: the
-    // Platform rejects any frame above STATE_REPLAY_MAX_RUNS (500) with a 4003
-    // close, and the orchestrator reconnects and resends the identical frame.
+  it('never emits a chunk breaching the wire cap, for a replay far above it', () => {
+    // An unchunked 827-run replay wedges the orchestrator: the Platform rejects
+    // any frame above STATE_REPLAY_MAX_RUNS (500) with a 4003 close, and the
+    // orchestrator reconnects and resends the identical frame.
     const runs = Array.from({ length: 827 }, (_, i) => ({ runId: `r${i}` }));
     const chunks = chunkReplayRuns(runs);
     expect(chunks.every((c) => c.length <= 500)).toBe(true);

@@ -69,6 +69,33 @@ export class RaftStateStore {
   }
 
   /**
+   * Upsert full Raft state unless the stored term is newer. A coordinator that
+   * leaves the cluster saves through this: the row is shared, and the remaining
+   * coordinators may already have elected a leader in a newer term.
+   */
+  async saveUnlessNewerTerm(state: RaftPersistentState): Promise<void> {
+    await this.db
+      .insertInto('raft_state')
+      .values({
+        cluster_id: this.clusterId,
+        current_term: state.currentTerm,
+        voted_for: state.votedFor,
+        leader_id: state.leaderId,
+      })
+      .onConflict((oc) =>
+        oc
+          .column('cluster_id')
+          .doUpdateSet({
+            current_term: state.currentTerm,
+            voted_for: state.votedFor,
+            leader_id: state.leaderId,
+          })
+          .where('raft_state.current_term', '<=', state.currentTerm),
+      )
+      .execute();
+  }
+
+  /**
    * Update just the leader and term fields (lightweight update for heartbeat acceptance).
    */
   async updateLeader(leaderId: string, term: number): Promise<void> {

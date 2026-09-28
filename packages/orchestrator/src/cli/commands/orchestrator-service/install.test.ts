@@ -30,6 +30,7 @@ let mockListResult: DiscoveredInstance[] = [];
 /** The compose driver's scan — a compose install the systemd driver cannot see. */
 let mockComposeListResult: DiscoveredInstance[] = [];
 const mockInstall = vi.fn().mockResolvedValue(undefined);
+const mockRestrict = vi.fn();
 const mockList = vi.fn(async (_isUserLevel: boolean) => mockListResult);
 const mockComposeList = vi.fn(async (_isUserLevel: boolean) => mockComposeListResult);
 let mockConfigDir = '';
@@ -58,6 +59,7 @@ vi.mock('../../service/index.js', async () => {
     getLogDir: vi.fn(() => mockLogDir),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
+    restrictEnvFileAccess: (...args: unknown[]) => mockRestrict(...args),
     // Substitute the drivers so the host's real systemd and compose registries
     // stay out of the test. A caller that names its own driver set keeps it,
     // mapped one-for-one onto doubles — so a guard that asks for a single
@@ -79,7 +81,7 @@ vi.mock('../../service/index.js', async () => {
 
 // Import after mocks so the action picks up the mocked module.
 import { registerOrchestratorInstall } from './install.js';
-import { readIndex, manifestPath } from '../../service/index.js';
+import { readIndex, manifestPath, readKiciVersion } from '../../service/index.js';
 
 function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -104,6 +106,7 @@ describe('orchestrator install — folder-anchored', () => {
     mockListResult = [];
     mockComposeListResult = [];
     mockInstall.mockClear();
+    mockRestrict.mockReset();
     mockList.mockClear();
     mockComposeList.mockClear();
     mockConfigDir = tmpServiceConfigDir;
@@ -294,6 +297,51 @@ describe('orchestrator install — folder-anchored', () => {
     });
   });
 
+  // fails-when: the Windows install writes the env file into a folder that
+  // still grants BUILTIN\Users read.
+  it('restricts the config folder on Windows before it writes the env file', async () => {
+    const { detectPlatform, resolveUserLevel } = await import('../../service/index.js');
+    const envFile = path.join(tmpServiceConfigDir, 'kici-test.env');
+    let envFileExistedAtRestrict: boolean | undefined;
+    mockRestrict.mockImplementation((envFilePath: string) => {
+      envFileExistedAtRestrict = fs.existsSync(envFilePath);
+    });
+    vi.mocked(detectPlatform).mockReturnValue('windows');
+    vi.mocked(resolveUserLevel).mockReturnValue(false);
+    try {
+      await runInstall();
+    } finally {
+      vi.mocked(detectPlatform).mockReturnValue('systemd');
+      vi.mocked(resolveUserLevel).mockReturnValue(true);
+    }
+
+    expect(mockRestrict).toHaveBeenCalledWith(envFile);
+    expect(envFileExistedAtRestrict).toBe(false);
+    // Positive control: the install wrote the env file after the restriction.
+    expect(fs.existsSync(envFile)).toBe(true);
+  });
+
+  // breaks-if-wrong: a systemd, launchd or compose install runs no icacls.
+  it('never restricts through icacls on other platforms', async () => {
+    await runInstall();
+    expect(mockInstall).toHaveBeenCalledTimes(1);
+    expect(mockRestrict).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: a user-level folder in the profile of its user is already
+  // private, and restricting it would lock that user out of it.
+  it('leaves a user-level Windows folder to the ACL of the profile', async () => {
+    const { detectPlatform } = await import('../../service/index.js');
+    vi.mocked(detectPlatform).mockReturnValue('windows');
+    try {
+      await runInstall();
+    } finally {
+      vi.mocked(detectPlatform).mockReturnValue('systemd');
+    }
+    expect(mockInstall).toHaveBeenCalledTimes(1);
+    expect(mockRestrict).not.toHaveBeenCalled();
+  });
+
   it('passes component: orchestrator to manager.install()', async () => {
     await runInstall();
 
@@ -341,10 +389,13 @@ describe('orchestrator install — folder-anchored', () => {
     expect(exitSpy).toHaveBeenCalledWith(1);
     const errArgs = consoleErrorSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(errArgs).toContain('already installed at /other/place');
-    // The error must point at the upgrade path (restart / upgrade) as well as
-    // the second-instance collision overrides (--name / --instance-dir / --force).
-    expect(errArgs).toContain('restart');
-    expect(errArgs).toContain('upgrade');
+    // The error must point at the upgrade path, for an npm install and for a
+    // versioned-directory install, as well as the second-instance collision
+    // overrides (--name / --instance-dir / --force).
+    expect(errArgs).toContain('kici-admin orchestrator upgrade --version <version>');
+    expect(errArgs).toContain(
+      'kici-admin orchestrator upgrade --from <archive> --version <version>',
+    );
     expect(errArgs).toContain('--name');
     expect(errArgs).toContain('--instance-dir');
     expect(errArgs).toContain('--force');
@@ -504,6 +555,64 @@ describe('orchestrator install — folder-anchored', () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]!.instanceDir).toBe(resolvedInstanceDir);
     expect(fs.existsSync(manifestPath(tmpInstanceDir, 'orchestrator'))).toBe(true);
+  });
+
+  // fails-when: install writes its fresh manifest over the one in the folder,
+  // dropping the heads the rollback schema guard reads and the creation time.
+  it('re-running install keeps the migration heads and creation time it recorded', async () => {
+    fs.writeFileSync(
+      manifestPath(tmpInstanceDir, 'orchestrator'),
+      JSON.stringify({
+        component: 'orchestrator',
+        name: 'kici-test',
+        platform: 'systemd',
+        isUserLevel: true,
+        envFilePath: '/old/kici-test.env',
+        configDir: '/old/',
+        logDir: '/old/logs/',
+        installBase: '/opt/kici/kici-test/',
+        createdAt: '2026-01-02T03:04:05.000Z',
+        kiciVersion: '0.9.0',
+        migrationHeads: { '0.9.0': '040_previous_head' },
+      }),
+    );
+
+    await runInstall();
+
+    const manifest = JSON.parse(
+      fs.readFileSync(manifestPath(tmpInstanceDir, 'orchestrator'), 'utf-8'),
+    );
+    expect(manifest.migrationHeads).toEqual({ '0.9.0': '040_previous_head' });
+    expect(manifest.createdAt).toBe('2026-01-02T03:04:05.000Z');
+    // `--binary node` shows no version, so the recorded one stands.
+    expect(manifest.kiciVersion).toBe('0.9.0');
+    // Everything install derives comes from this install.
+    expect(manifest.configDir).toBe(tmpServiceConfigDir);
+    expect(manifest.logDir).toBe(tmpLogDir);
+    expect(manifest.envFilePath).toBe(path.join(tmpServiceConfigDir, 'kici-test.env'));
+    expect(consoleWarnSpy).not.toHaveBeenCalledWith(expect.stringContaining('manifest'));
+  });
+
+  // breaks-if-wrong: a first install still records the CLI's own version.
+  it('a first install records the version of the CLI that ran it', async () => {
+    const started = Date.now();
+    await runInstall();
+    const manifest = JSON.parse(
+      fs.readFileSync(manifestPath(tmpInstanceDir, 'orchestrator'), 'utf-8'),
+    );
+    expect(manifest.kiciVersion).toBe(readKiciVersion());
+    expect(Date.parse(manifest.createdAt)).toBeGreaterThanOrEqual(started - 1_000);
+    expect(manifest.migrationHeads).toBeUndefined();
+  });
+
+  it('warns when it replaces a manifest it cannot read', async () => {
+    fs.writeFileSync(manifestPath(tmpInstanceDir, 'orchestrator'), '{ not json');
+    await runInstall();
+    const warns = consoleWarnSpy.mock.calls.map((c: unknown[]) => c.join(' ')).join('\n');
+    expect(warns).toMatch(/malformed instance manifest/i);
+    expect(
+      JSON.parse(fs.readFileSync(manifestPath(tmpInstanceDir, 'orchestrator'), 'utf-8')).name,
+    ).toBe('kici-test');
   });
 
   it('defaults --instance-dir to the current working directory', async () => {

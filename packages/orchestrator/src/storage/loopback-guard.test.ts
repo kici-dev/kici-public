@@ -64,7 +64,7 @@ describe('isLoopbackBind', () => {
     ['0.0.0.0', false],
     ['::', false],
     ['[::]', false],
-    ['192.168.1.85', false],
+    ['192.168.1.40', false],
     ['10.0.0.4', false],
     ['', false],
     ['not a host', false],
@@ -75,7 +75,7 @@ describe('isLoopbackBind', () => {
     ['::ffff:7f00:1', true],
     ['::ffff:0.0.0.0', false],
     ['::ffff:0:0', false],
-    ['::ffff:192.168.1.85', false],
+    ['::ffff:192.168.1.40', false],
   ])('isLoopbackBind(%s) === %s', (host, expected) => {
     expect(isLoopbackBind(host)).toBe(expected);
   });
@@ -340,7 +340,7 @@ describe('assertAgentAuthBindSafe', () => {
     return { agentAuth, host } as unknown as AppConfig;
   }
 
-  it.each(['0.0.0.0', '::', '192.168.1.85', '::ffff:0.0.0.0', '::ffff:192.168.1.85'])(
+  it.each(['0.0.0.0', '::', '192.168.1.40', '::ffff:0.0.0.0', '::ffff:192.168.1.40'])(
     'refuses agentAuth=none on the bind %s',
     (host) => {
       expect(() => assertAgentAuthBindSafe(authConfig('none', host))).toThrow(
@@ -365,7 +365,7 @@ describe('assertAgentAuthBindSafe', () => {
     },
   );
 
-  it.each(['0.0.0.0', '::', '192.168.1.85', '127.0.0.1'])(
+  it.each(['0.0.0.0', '::', '192.168.1.40', '127.0.0.1'])(
     'is a no-op on %s whenever agent auth is enabled',
     (host) => {
       expect(() => assertAgentAuthBindSafe(authConfig('token', host))).not.toThrow();

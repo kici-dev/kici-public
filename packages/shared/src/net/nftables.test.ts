@@ -390,7 +390,7 @@ describe('parseHostAccess grammar', () => {
   });
 
   it('reads a bare address as every port on that address', () => {
-    expect(parseHostAccess('192.168.1.85')).toEqual({ daddr: '192.168.1.85', port: null });
+    expect(parseHostAccess('192.168.1.40')).toEqual({ daddr: '192.168.1.40', port: null });
   });
 
   it('reads an explicit port wildcard the same way', () => {
@@ -457,9 +457,9 @@ describe('buildHostAccessRuleOps', () => {
   });
 
   it('emits a single unported accept for an address with no port', () => {
-    expect(buildHostAccessRuleOps(match, ['192.168.1.85'])).toEqual([
+    expect(buildHostAccessRuleOps(match, ['192.168.1.40'])).toEqual([
       CT,
-      [...match, 'ip', 'daddr', '192.168.1.85', 'accept'],
+      [...match, 'ip', 'daddr', '192.168.1.40', 'accept'],
       [...match, 'drop'],
     ]);
   });

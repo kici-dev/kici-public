@@ -6,7 +6,7 @@ const SAMPLE: ChunkManifest = {
   schemaVersion: 1,
   db: 'platform',
   table: 'run_events',
-  tenantId: 'kiciStg00001',
+  tenantId: 'acmeOrg00001',
   partitionDate: '2026-04-24',
   rowCount: 12_450,
   byteCount: 8_234_112,
@@ -28,7 +28,7 @@ describe('manifest', () => {
     // V1 round-trip: parseManifest backfills the v2 cold-purge fields
     // with `'forever'` so the GC sweep can rely on them always being
     // present. The serialized form on disk omits them (compatible with
-    // pre-Phase-2 chunks).
+    // v1 chunks).
     expect(parsed).toEqual({ ...SAMPLE, bucket: 'forever', maxColdDays: 'forever' });
   });
 

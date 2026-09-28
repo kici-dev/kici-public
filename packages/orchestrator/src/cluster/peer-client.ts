@@ -54,6 +54,7 @@ import {
 } from './peer-crypto.js';
 import type { CredentialFileData } from './peer-credentials.js';
 import type { PeerAuthCoordinator } from './peer-auth-coordinator.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'peer-client' });
 
@@ -471,7 +472,7 @@ export class PeerClient {
 
     try {
       this.ws = new WebSocket(this.url, {
-        //: cap maximum decompressed frame size so a rogue or
+        // Cap the maximum decompressed frame size so a rogue or
         // compromised peer orchestrator cannot OOM us via a compression bomb.
         // Without this, ws@8.x defaults to 100 MiB.
         maxPayload: WS_MAX_PAYLOAD_BYTES,
@@ -760,22 +761,27 @@ export class PeerClient {
     // Delegate the file decision to the coordinator before closing, so the
     // file operation completes before scheduleReconnect fires via the close
     // event listener (no sync-I/O race with the reconnect backoff).
-    void (async () => {
-      try {
-        const action = await this.authCoordinator.reportRejection(
-          provedCredential,
-          reason as string,
-        );
-        logger.info('Coordinator rejection action', { reason, action });
-      } catch (err) {
-        logger.warn('Coordinator rejection handling failed', {
-          error: toErrorMessage(err),
-          reason,
-        });
-      } finally {
-        finish();
-      }
-    })();
+    runDetached(
+      logger,
+      'Peer auth rejection handling',
+      async () => {
+        try {
+          const action = await this.authCoordinator.reportRejection(
+            provedCredential,
+            reason as string,
+          );
+          logger.info('Coordinator rejection action', { reason, action });
+        } catch (err) {
+          logger.warn('Coordinator rejection handling failed', {
+            error: toErrorMessage(err),
+            reason,
+          });
+        } finally {
+          finish();
+        }
+      },
+      { reason },
+    );
   }
 
   /**
@@ -1034,7 +1040,12 @@ export class PeerClient {
       }
 
       case 'peer.logs.collect.request': {
-        void this.onLogsCollectRequest?.(msg, (out) => this.send(out));
+        runDetached(
+          logger,
+          'Peer logs collect request',
+          () => this.onLogsCollectRequest?.(msg, (out) => this.send(out)),
+          { messageType: msg.type, peerId: this._targetInstanceId },
+        );
         break;
       }
 

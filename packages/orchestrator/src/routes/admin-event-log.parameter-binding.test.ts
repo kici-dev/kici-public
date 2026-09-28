@@ -27,7 +27,7 @@
  *
  * Trust model (must hold):
  *
- *   For attacker A10 (operator-token holder), the parameter-binding
+ *   For an attacker holding an operator token, the parameter-binding
  *   gate is what prevents an authenticated-but-low-privilege role
  *   from escaping into restricted tables. Single-tenant orchestrator
  *   means there's no per-row authorization layer to leak via timing
@@ -36,7 +36,7 @@
  *   (cross-table read) and the order-of-operations vector (RBAC
  *   before DB work) are the two that matter.
  *
- *   For attacker A1 (external, unauthenticated), the bearer-token
+ *   For an external, unauthenticated attacker, the bearer-token
  *   middleware is the perimeter gate; this test
  *   layers the RBAC + parameter-binding invariants on top.
  */

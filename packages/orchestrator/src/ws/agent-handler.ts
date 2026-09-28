@@ -218,6 +218,51 @@ export function truncateCloseReason(reason: string): string {
   return bytes.subarray(0, 123).toString('utf-8').replace(/�+$/, '');
 }
 
+/** What a failed frame is about, for the failure log. */
+export interface FrameIdentity {
+  messageType?: string;
+  agentId?: string;
+  runId?: string;
+  jobId?: string;
+}
+
+/** Longest id a failure log copies from a frame. */
+const FRAME_ID_MAX = 128;
+
+/**
+ * Read the type and ids from a raw agent frame, for logging a failure. Only
+ * string fields are copied, each capped at 128 characters; anything that is
+ * not a JSON object yields nothing. Runs on the failure path only.
+ */
+export function frameIdentity(data: unknown): FrameIdentity {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(typeof data === 'string' ? data : String(data));
+  } catch {
+    return {};
+  }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const fields = raw as Record<string, unknown>;
+  const identity: FrameIdentity = {};
+  const copy = (from: string, to: keyof FrameIdentity): void => {
+    const value = fields[from];
+    if (typeof value === 'string') identity[to] = value.slice(0, FRAME_ID_MAX);
+  };
+  copy('type', 'messageType');
+  copy('agentId', 'agentId');
+  copy('runId', 'runId');
+  copy('jobId', 'jobId');
+  return identity;
+}
+
+/**
+ * The agent WebSocket handler. `onMessage` resolves once the frame is handled
+ * and never rejects: the WebSocket server does not await it.
+ */
+export interface AgentWsEvents extends Omit<WSEvents, 'onMessage'> {
+  onMessage(evt: MessageEvent<WSMessageReceive>, ws: WSContext): Promise<void>;
+}
+
 function enforceRegisterAuthGates(
   authState: AuthState | undefined,
   payload: { agentId: string; labels: string[]; runningAsUid?: number },
@@ -625,15 +670,6 @@ export interface AgentWsHandlerDeps {
 }
 
 /**
- * Create a Hono WS event handler for agent connections.
- *
- * Flow:
- * 1. onOpen: start 10-second register timer
- * 2. First onMessage: must be agent.register with labels and capacity
- * 3. Subsequent onMessage: validated against protocol schemas, routed by type
- * 4. onClose: cleanup from pending registration or dispatcher
- */
-/**
  * Reconcile in-flight jobs reported by a reconnecting agent.
  *
  * For each job the agent claims is still running, attempt to reclaim the
@@ -706,7 +742,6 @@ async function reconcileInFlightJobs(
  * SYNC INVARIANT: This manual validator MUST match the Zod schema
  * `agentLogChunkSchema` in packages/engine/src/protocol/messages/orchestrator-agent.ts.
  * If you change the schema, update this validator in the same commit.
- * See CLAUDE.md rule: "Zod fast-path sync invariant".
  */
 export function isValidLogChunk(raw: unknown): raw is {
   type: 'log.chunk';
@@ -740,7 +775,6 @@ export function isValidLogChunk(raw: unknown): raw is {
  * SYNC INVARIANT: This manual validator MUST match the Zod schema
  * `heartbeatSchema` in packages/engine/src/protocol/messages/common.ts.
  * If you change the schema, update this validator in the same commit.
- * See CLAUDE.md rule: "Zod fast-path sync invariant".
  */
 function isValidHeartbeat(raw: unknown): raw is { type: 'heartbeat'; timestamp: number } {
   if (typeof raw !== 'object' || raw === null) return false;
@@ -794,7 +828,19 @@ function acceptLogChunk(
   return handled;
 }
 
-export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
+/**
+ * Create a Hono WS event handler for agent connections.
+ *
+ * Flow:
+ * 1. onOpen: start 10-second register timer
+ * 2. First onMessage: must be agent.register with labels and capacity
+ * 3. Subsequent onMessage: validated against protocol schemas, routed by type
+ * 4. onClose: cleanup from pending registration or dispatcher
+ *
+ * A frame whose handling fails is logged with its type and ids; the
+ * connection stays open.
+ */
+export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
   const {
     registry,
     dispatcher,
@@ -893,7 +939,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
        * to schedule a per-token kick timer via
        * `AgentRegistry.scheduleExpiryKick(tokenId, expiresAt)` so that
        * in-flight WS connections close when the token's TTL elapses
-       * naturally — sister to the revoke kick path. See
+       * naturally — sister to the revoke kick path.
        */
       tokenExpiresAt?: Date | null;
     }
@@ -1052,7 +1098,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     };
   }
 
-  return {
+  const events = {
     onOpen(_evt: Event, ws: WSContext) {
       // Create per-connection rate limiter
       rateLimiters.set(ws, new WsRateLimiter(rateLimiterConfig));
@@ -1482,7 +1528,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         // TTL by design (`expires_at = null`) so this is effectively
         // ephemeral-only. The scheduler is idempotent per tokenId, so
         // an agent reconnect under the same token is a no-op (the
-        // token's `expires_at` doesn't shift across reconnects). See
+        // token's `expires_at` doesn't shift across reconnects).
         if (
           regEntry.tokenId !== undefined &&
           regEntry.tokenExpiresAt !== undefined &&
@@ -1578,7 +1624,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
 
       // -- FAST PATH for high-frequency messages on authenticated connections --
       // Skip full Zod safeParse for log.chunk and heartbeat (most frequent message types).
-      // These manual validators are kept in sync with their Zod schemas per CLAUDE.md rule.
+      // These manual validators are kept in sync with their Zod schemas.
 
       if (isValidHeartbeat(raw)) {
         registry.updateHeartbeat(agentId);
@@ -1865,7 +1911,20 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               // can't leak (mirrors the dispatcher's own per-job cleanup).
               dispatchCacheRefs?.delete(jobId);
               setAgentsActive(registry.getActiveCount());
-              await dispatcher.onAgentAvailable(agentId);
+              // A failed drain must not end this frame: the finished job's
+              // status below still has to reach the scaler and the execution
+              // tracker, and the agent does not send it again. The periodic
+              // re-drive offers the queue to this agent later.
+              try {
+                await dispatcher.onAgentAvailable(agentId);
+              } catch (err) {
+                logger.error('Failed to drain the queue after a job finished', {
+                  agentId,
+                  runId,
+                  jobId,
+                  error: toErrorMessage(err),
+                });
+              }
 
               // Notify scaler of job completion
               onScalerJobComplete?.(agentId);
@@ -2760,7 +2819,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             // only the data object — not the metadata sidecar `CacheStorage.get`
             // requires (a metadata-less object reads back as missing). Write the
             // companion metadata here, mirroring the `cache.upload.complete`
-            // two-phase finalize, so the P1.7 dashboard read can inline the
+            // two-phase finalize, so the dashboard attestations read can inline the
             // bundle.
             if (provenanceStorage) {
               await provenanceStorage.initMeta(storageKey);
@@ -3231,5 +3290,41 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     onError(_evt: Event, _ws: WSContext) {
       logger.error('Agent WebSocket error');
     },
+  } satisfies AgentWsEvents;
+
+  return {
+    ...events,
+    // Nothing awaits a frame's handling (the WebSocket server discards the
+    // promise), so a failure is logged here with the frame's type, agent and
+    // run, and the connection stays open. A rejection left unhandled would stop
+    // the orchestrator: its shutdown hook treats one as fatal.
+    onMessage: (evt, ws) =>
+      events.onMessage(evt, ws).catch((err: unknown) => {
+        const identity = frameIdentity(evt.data);
+        logger.error('Failed to handle an agent message', {
+          ...identity,
+          agentId: wsToAgentId.get(ws) ?? identity.agentId,
+          error: toErrorMessage(err),
+        });
+        // A connection that is in none of the states (awaiting auth, awaiting
+        // registration, registering, registered) failed between leaving one
+        // state and entering the next, for example on a token-store query.
+        // No timer is left to close it and no answer will come, so close it
+        // with the retryable internal-error code: the agent reconnects.
+        if (
+          !wsToAgentId.has(ws) &&
+          !pendingAuth.has(ws) &&
+          !pendingRegistration.has(ws) &&
+          !registering.has(ws)
+        ) {
+          try {
+            ws.close(WS_CLOSE_INTERNAL_ERROR, 'Internal error');
+          } catch (closeErr) {
+            logger.debug('Closing a failed connection failed', {
+              error: toErrorMessage(closeErr),
+            });
+          }
+        }
+      }),
   };
 }

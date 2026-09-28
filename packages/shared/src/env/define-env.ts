@@ -404,13 +404,12 @@ function suggestClosest(name: string, candidates: string[]): string | undefined 
  *   (on POSIX it's a shell-local var that doesn't leak).
  * - `KICI_DEV`: the dev-mode toggle itself — read by the scanner to flip
  *   to warn-only, so it must not trip the scanner.
- * - `KICI_BUILD_COUNTER_NO_COMMIT`: a build-tooling flag read only by
- *   `hack/lib/commit-build-counter.mjs` (skip the per-build `.build-counter`
- *   commit on a force-synced checkout, e.g. a remote E2E executor). Set in the
- *   ambient shell for `pnpm build`; the native orchestrator spawn inherits it.
+ * - `KICI_BUILD_COUNTER_NO_COMMIT`: a build-tooling flag read only by the
+ *   repository's build counter (skip the per-build `.build-counter` commit on
+ *   a force-synced checkout). Set in the ambient shell for `pnpm build`; the
+ *   native orchestrator spawn inherits it.
  * - `KICI_CONFIG_DIR`: the isolated, empty config directory the vitest harness
- *   sets at config-eval time (`hack/lib/vitest-isolation.ts`, enforced by
- *   `hack/check-vitest-isolation.ts`) so the CLI's `getConfigDir` reads a
+ *   sets at config-eval time (`hack/lib/vitest-isolation.ts`) so the CLI's `getConfigDir` reads a
  *   throwaway dir instead of the developer machine's ambient `~/.kici`. It is a
  *   real CLI var (not a config typo) inherited by every service a test spawns —
  *   which do not read it — same leak-by-inheritance shape as the `KICI_E2E_`
@@ -432,15 +431,14 @@ export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
 
 /**
  * `KICI_*` prefixes that are entirely outside the service-config namespace —
- * usually set by our own test / dev tooling and inherited into a child
+ * usually set by test or development tooling and inherited into a child
  * orchestrator/agent/platform process by mistake of inheritance rather than
  * design. Any env var starting with one of these prefixes is treated as
  * known, regardless of the specific suffix.
  *
- * - `KICI_E2E_`: the E2E framework's namespace (`KICI_E2E_PROVIDER`,
- *   `KICI_E2E_MODE`, future E2E toggles). Set by `e2e/vitest.*.config.ts`
- *   files. The native orchestrator spawn in `e2e/helpers/deploy.ts`
- *   inherits the test runner's process.env, so these leak in.
+ * - `KICI_E2E_`: reserved for a test harness's own toggles
+ *   (`KICI_E2E_PROVIDER`, `KICI_E2E_MODE`, …). An orchestrator a harness
+ *   spawns natively inherits the harness's process.env, so these leak in.
  * - `KICI_AGENT_ENV_`: the agent-env forwarding namespace (see
  *   `@kici-dev/engine` → `KICI_AGENT_ENV_PREFIX`). Any env var set on the
  *   orchestrator process with this prefix is stripped and forwarded into
@@ -464,12 +462,12 @@ export const RESERVED_NON_SCHEMA_KICI_PREFIXES: readonly string[] = [
  *
  * - `_ENV_PROBE`: diagnostic probe vars (see `packages/agent/src/server.ts` —
  *   the agent collects every `KICI_*_ENV_PROBE` var and logs its value in
- *   "Agent startup env probes (diagnostic)"). The E2E firecracker-pipeline
- *   test uses `KICI_AGENT_ENV_KICI_FC_ENV_PROBE=fc-probe-value` which flows
- *   through the scaler's env-forwarding path and lands in the agent's
- *   process.env as `KICI_FC_ENV_PROBE`. Without this suffix allowlist the
- *   validator rejects it as an unknown KICI_* var and the agent refuses to
- *   start — defeating the test's entire purpose.
+ *   "Agent startup env probes (diagnostic)"). A probe set on the orchestrator
+ *   as `KICI_AGENT_ENV_KICI_FC_ENV_PROBE=fc-probe-value` flows through the
+ *   scaler's env-forwarding path and lands in the agent's process.env as
+ *   `KICI_FC_ENV_PROBE`. Without this suffix allowlist the validator rejects
+ *   it as an unknown KICI_* var and the agent refuses to start — defeating
+ *   the probe's entire purpose.
  *
  * As with RESERVED_NON_SCHEMA_KICI_VARS / _PREFIXES, keep this short. Every
  * suffix widens the set of names we can no longer catch as typos.
@@ -503,7 +501,7 @@ export interface ValidateUnknownKiciVarsOptions {
  * see options) with a single combined message listing every unknown var and
  * its closest legitimate match (when the Levenshtein distance is small).
  *
- * Production mode (the default): throws — staging deploys should never reach
+ * Production mode (the default): throws — a deployment should never reach
  * runtime with a typo'd KICI_* variable. Set `KICI_DEV=true` (or pass
  * `warnOnly: true`) to downgrade to a warning during local development.
  */

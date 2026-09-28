@@ -168,7 +168,7 @@ describe('GenericSourceManager', () => {
       expect(db.insertInto).not.toHaveBeenCalled();
     });
 
-    // Phase 5 — admin-API sanitation contract.
+    // Admin-API sanitation contract.
     //
     // The universal-git schema intentionally has NO field for inline secret
     // material (no `password`, `token`, `privateKey`, `pem`). The only secret

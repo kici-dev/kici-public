@@ -245,9 +245,9 @@ export function createCommitMessageTraceEntry(args: {
  * What a withheld trace field is replaced with when the reader does not hold
  * `event_log:read_payload`.
  *
- * Lives here rather than beside the Platform's redactor because three packages
- * read it: the Platform writes it, the dashboard renders it, and the E2E suite
- * asserts the permission boundary against it. A literal repeated at each site
+ * Lives here rather than beside the Platform's redactor because it crosses
+ * packages: the Platform writes it, the dashboard renders it, and tests assert
+ * the permission boundary against it. A literal repeated at each site
  * would drift into a marker one of them no longer recognizes.
  */
 export const REDACTED_TRACE_FIELD = '[redacted — requires event_log:read_payload]';

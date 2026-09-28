@@ -30,12 +30,12 @@ describe('buildLocalTriggerRequest', () => {
       ref: 'refs/heads/master',
       sha: 'abc123',
       defaultBranch: 'master',
-      action: 'deploy-stg',
+      action: 'deploy-app',
       clientPayload: { mode: 'full', skipBuild: true },
     });
     expect(req.headers['x-event-type']).toBe('dispatch');
     const body = JSON.parse(req.body);
-    expect(body.action).toBe('deploy-stg');
+    expect(body.action).toBe('deploy-app');
     expect(body.client_payload).toEqual({ mode: 'full', skipBuild: true });
     // Provenance fields are still present.
     expect(body.after).toBe('abc123');

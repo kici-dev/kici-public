@@ -4,7 +4,7 @@
  *
  * A leaf module on purpose: it imports nothing, so an out-of-package consumer
  * can read the constant without pulling the orchestrator runtime graph in with
- * it. The NetworkManager drift watchdog (`hack/lib/nm-watchdog.ts`) derives its
+ * it. A NetworkManager drift watchdog derives its
  * expected-pattern set from here rather than re-typing the patterns — a second
  * copy desyncs silently the moment a pattern is added. `host-network.ts`
  * re-exports it and renders `NM_CONF_CONTENT` from it, so the drop-in and the

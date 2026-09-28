@@ -155,6 +155,7 @@ export async function createScalerBackend(
       cidr,
       gateway,
       netmask,
+      extraHosts: s.extraHosts,
       table: fcNet?.table ?? 'kici',
       autoProvisionHost: fcNet?.autoProvisionHost ?? true,
       // Rootless hosts reach `ip` / `chown` / `chmod` / `nft` through `sudo -n`.

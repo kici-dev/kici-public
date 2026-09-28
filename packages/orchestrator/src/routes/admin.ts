@@ -802,7 +802,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       return c.json({ error: 'Agent token management not available' }, 503);
     }
     if (!deps.agentRegistry) {
-      //: refuse to revoke without the kick path. A 204 here would
+      // Refuse to revoke without the kick path. A 204 here would
       // be a silent regression — the DB row would flip but every
       // in-flight WS authenticated by this token would retain
       // data-plane authority until it disconnected.

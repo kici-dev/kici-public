@@ -1,11 +1,9 @@
 /**
  * In-process size-bounded LRU cache.
  *
- * Used by the cold-store rehydrate path (Phase B+) to keep recently-read
+ * Used by the cold-store rehydrate path to keep recently-read
  * chunks hot in memory, so that e.g. a user paginating a 90-day audit
- * window doesn't re-fetch the same S3 chunks for each page. Phase A
- * ships the primitive so Phase B's first consumer gets a debugged
- * LRU rather than having to write one.
+ * window doesn't re-fetch the same S3 chunks for each page.
  *
  * Size is tracked in bytes via a caller-supplied `sizeOf` function.
  * Eviction happens on `set()` when the accumulated byte count exceeds

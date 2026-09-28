@@ -16,6 +16,7 @@ import { toErrorMessage } from '@kici-dev/shared';
 import { loadLocalConfig } from '../../config/loader.js';
 import { loadScalerConfig } from '../../scaler/config.js';
 import { reapAllOrphans } from '../../scaler/reap-orphans.js';
+import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 
 /** Probe the local orchestrator /health endpoint. Healthy => it reaps itself. */
 export async function isOrchestratorHealthy(port: number, basePath: string): Promise<boolean> {
@@ -60,7 +61,8 @@ export function registerScalerCommands(program: Command): void {
         }
         const scalerConfig = await loadScalerConfig(scalerConfigPath, scalerConfigDir);
 
-        const port = local.server?.port ?? Number(process.env.KICI_PORT ?? '4000');
+        const port =
+          local.server?.port ?? Number(process.env.KICI_PORT ?? ORCHESTRATOR_DEFAULT_PORT);
         const basePath = local.server?.basePath ?? process.env.KICI_BASE_PATH ?? '/';
         const healthy = opts.force ? false : await isOrchestratorHealthy(port, basePath);
 

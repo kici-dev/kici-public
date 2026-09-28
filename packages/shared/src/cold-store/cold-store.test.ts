@@ -456,7 +456,7 @@ describe('BaseColdStore', () => {
     expect(getsAfterSecond).toBe(getsAfterFirst);
   });
 
-  // ── Phase F: replayChunk / replayRow ────────────────────────────────
+  // ── replayChunk / replayRow ─────────────────────────────────────────
 
   it('replayChunk: passes decoded rows to adapter.replayInsert and returns counts', async () => {
     const mock = makeMockS3();
@@ -674,7 +674,7 @@ describe('BaseColdStore', () => {
     expect(result.inserted).toBe(0);
   });
 
-  // ── Phase 2: per-bucket chunk grouping ─────────────────────────────
+  // ── Per-bucket chunk grouping ──────────────────────────────────────
   it('archives one chunk per bucket when adapter implements coldTtlDays', async () => {
     const mock = makeMockS3();
     const markArchivedAndDelete = vi.fn(async () => undefined);

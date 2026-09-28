@@ -25,19 +25,21 @@ import {
 } from './platform-attach.js';
 
 declare const KICI_VERSION: string;
-declare const KICI_BUILD_COMMIT: string;
+declare const KICI_BUILD_DATE: string;
 
 /**
- * The current CLI build's identity — semver plus git build commit — read at
- * call time from the Rolldown-injected build constants (`scripts/build-ts.mjs`).
- * Read on each call rather than captured in a module const so unit tests can
- * inject the constants via `globalThis`. Falls back to `0.0.0` / `unknown` when
- * running from source (unbuilt tree / vitest), where the defines are absent.
+ * The current CLI build's identity — semver plus build date — read at call time
+ * from the Rolldown-injected build constants (`scripts/build-ts.mjs`). The
+ * build date tells two builds at the same semver apart; the CLI is rebuilt
+ * whenever it or the orchestrator and agent it runs change. Read on each call
+ * rather than captured in a module const so unit tests can inject the constants
+ * via `globalThis`. Falls back to `0.0.0` / `unknown` when running from source
+ * (unbuilt tree / vitest), where the defines are absent.
  */
-export function currentBuildIdentity(): { version: string; buildCommit: string } {
+export function currentBuildIdentity(): { version: string; buildDate: string } {
   return {
     version: typeof KICI_VERSION !== 'undefined' ? KICI_VERSION : '0.0.0',
-    buildCommit: typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : 'unknown',
+    buildDate: typeof KICI_BUILD_DATE !== 'undefined' ? KICI_BUILD_DATE : 'unknown',
   };
 }
 
@@ -66,8 +68,8 @@ export interface PlaneStamp {
   port: number;
   pgKind: 'embedded' | 'podman';
   kiciVersion: string;
-  /** Git build commit of the CLI that booted this plane (see planeBuildIsStale). */
-  buildCommit: string;
+  /** Build date of the CLI that booted this plane (see planeBuildIsStale). */
+  buildDate: string;
   stampVersion: number;
   /** Offline (independent) vs attached (hybrid). Absent (legacy) reads as independent. */
   mode?: PlaneMode;
@@ -252,19 +254,19 @@ export function clearStamp(): void {
 
 /**
  * Whether a running plane described by `existing` was booted from a different
- * CLI build than the current one — a semver bump OR a git-commit change (the
- * latter covers intermediate staging/E2E commits that share a semver). Returns
+ * CLI build than the current one — a semver bump OR a different build date (the
+ * latter covers intermediate builds that share a semver). Returns
  * false when there is no stamp, or when the current build has no concrete
- * identity (`buildCommit === 'unknown'`, i.e. running from source / a test),
- * so a source-context `planeUp` never reboots a healthy plane spuriously. An
- * old stamp with no `buildCommit` field reads as `undefined` and therefore
- * triggers a one-time reboot on the first upgrade past this feature.
+ * identity (`buildDate === 'unknown'`, i.e. running from source / a test),
+ * so a source-context `planeUp` never reboots a healthy plane spuriously. A
+ * stamp an older CLI wrote has no `buildDate` field, reads as `undefined`,
+ * and therefore triggers a one-time reboot on the first upgrade.
  */
 export function planeBuildIsStale(existing: PlaneStamp | null): boolean {
   if (!existing) return false;
-  const { version, buildCommit } = currentBuildIdentity();
-  if (buildCommit === 'unknown') return false;
-  return existing.kiciVersion !== version || existing.buildCommit !== buildCommit;
+  const { version, buildDate } = currentBuildIdentity();
+  if (buildDate === 'unknown') return false;
+  return existing.kiciVersion !== version || existing.buildDate !== buildDate;
 }
 
 function orchestratorUrl(port: number): string {
@@ -392,8 +394,8 @@ async function prepareForBoot(
       return null;
 
     case 'ours-ready': {
-      // A running plane booted from a different CLI build (semver OR git build
-      // commit) is stale — reuse would serve `kici run --local` at the old
+      // A running plane booted from a different CLI build (semver OR build
+      // date) is stale — reuse would serve `kici run --local` at the old
       // version. Reboot from the current dist, KEEPING the Postgres data dir:
       // an identity change is not an on-disk layout change, so the
       // orchestrator's boot migration (KICI_AUTO_MIGRATE=true) reconciles it.
@@ -480,13 +482,13 @@ export async function planeUp(opts: PlaneUpOptions = {}): Promise<PlaneStatus> {
     });
   }
 
-  const { version: stampVersionSemver, buildCommit: stampBuildCommit } = currentBuildIdentity();
+  const { version: stampVersionSemver, buildDate: stampBuildDate } = currentBuildIdentity();
   const stamp: PlaneStamp = {
     orchestratorPid: orch.pid,
     port: orch.port,
     pgKind: pg.kind,
     kiciVersion: stampVersionSemver,
-    buildCommit: stampBuildCommit,
+    buildDate: stampBuildDate,
     stampVersion: PLANE_STAMP_VERSION,
     mode: requestedMode,
   };

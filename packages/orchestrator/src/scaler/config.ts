@@ -21,6 +21,7 @@ import {
   scalerPlatformSchema,
 } from '@kici-dev/engine';
 import { ImagePullPolicy } from './types.js';
+import { parseExtraHost } from './firecracker-extra-hosts.js';
 import type { ScalerConfig } from './types.js';
 import { parseHostAccess } from '@kici-dev/shared/net';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -224,6 +225,12 @@ const scalerEntrySchema = z
     socketPath: z.string().optional(),
     runtime: z.enum(['docker', 'podman', 'auto']).default('auto'),
     orchestratorUrl: z.string().optional(),
+    /**
+     * Extra `host:address` name mappings for spawned agents. A container scaler
+     * passes them to the runtime; a Firecracker scaler writes them into each
+     * guest's `/etc/hosts`, with `host-gateway` resolved to the bridge gateway.
+     * None by default.
+     */
     extraHosts: z.array(z.string()).optional(),
     networkIsolation: z.boolean().default(true),
     warmPool: warmPoolSchema,
@@ -438,6 +445,19 @@ const scalerEntrySchema = z
           path: ['gid'],
         });
       }
+      // The rootfs /init writes each entry into the guest's /etc/hosts, so a
+      // malformed one fails here, at startup, not at spawn time.
+      (data.extraHosts ?? []).forEach((entry, i) => {
+        try {
+          parseExtraHost(entry);
+        } catch (err) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Firecracker scaler "${data.name}" extraHosts[${i}]: ${toErrorMessage(err)}`,
+            path: ['extraHosts', i],
+          });
+        }
+      });
       // Per-label-set required fields
       data.labelSets.forEach((ls, i) => {
         if (!ls.rootfsPath) {

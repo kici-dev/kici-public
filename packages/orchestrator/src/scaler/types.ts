@@ -503,7 +503,10 @@ export interface ScalerEntry {
   runtime?: 'docker' | 'podman' | 'auto';
   /** Orchestrator URL for spawned agents to connect back to */
   orchestratorUrl?: string;
-  /** Extra host:IP mappings injected into spawned containers (e.g. ["verdaccio.local:host-gateway"]) */
+  /**
+   * Extra host:IP mappings for spawned agents (e.g. ["registry.local:host-gateway"]): the
+   * container runtime's ExtraHosts, or each Firecracker guest's /etc/hosts.
+   */
   extraHosts?: string[];
   /** Disable nftables-based network isolation for container backend (default: true). Set to false when nft is unavailable. */
   networkIsolation?: boolean;

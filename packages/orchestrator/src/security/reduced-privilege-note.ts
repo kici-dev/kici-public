@@ -58,9 +58,8 @@ export const REDUCED_PRIVILEGE_MARKER = '**Reduced privileges (untrusted ref).**
  *   event, and an untrusted tier also reaches an internal-event child run that
  *   inherited it.
  *
- * Kept in step with the dashboard's reduced-privilege banner
- * (`packages/dashboard/src/components/run-detail/degraded-run-banner.tsx`),
- * which describes the same run and may be read beside these checks.
+ * Kept in step with the dashboard's reduced-privilege banner, which
+ * describes the same run and may be read beside these checks.
  */
 export function buildReducedPrivilegeNote(
   tier: string | null | undefined,

@@ -2,9 +2,9 @@
  * Access log commands for kici-admin.
  *
  * Operator-facing read access to the orchestrator's access_log table
- * (read + mutation attribution with ActorPrincipal). Dogfood replacement
- * for raw psql when an operator asks "who read this run's payload last
- * Tuesday" or "show me everything a platform_operator actor did".
+ * (read + mutation attribution with ActorPrincipal). Use it instead of raw
+ * psql when an operator asks "who read this run's payload last Tuesday" or
+ * "show me everything a platform_operator actor did".
  *
  *   access-log list   List access-log rows with filters (cursor-paginated)
  *   access-log show   Show a single entry by id
@@ -73,7 +73,7 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
 
   accessLog
     .command('list')
-    .description('List access-log rows (dogfooded via /api/v1/admin/access-log)')
+    .description('List access-log rows (admin API: /api/v1/admin/access-log)')
     .option('--org-id <orgId>', 'Filter by org/tenant ID')
     .option(
       '--actor-type <t>',

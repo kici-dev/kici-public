@@ -210,7 +210,7 @@ describe('PeerRegistry', () => {
             platform: 'linux',
             arch: 'x64',
             mandatoryLabels: [],
-            scalerName: 'stg-container',
+            scalerName: 'linux-container',
           },
           {
             agentId: 'static-agent',
@@ -229,7 +229,7 @@ describe('PeerRegistry', () => {
 
       const peer = registry.getPeer('orch-1');
       expect(peer!.agents.find((a) => a.agentId === 'scaler-agent')!.scalerName).toBe(
-        'stg-container',
+        'linux-container',
       );
       expect(peer!.agents.find((a) => a.agentId === 'static-agent')!.scalerName).toBeNull();
     });

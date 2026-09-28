@@ -38,8 +38,8 @@ describe('isProductionEntry', () => {
     // `file://C:\...\kici-orchestrator.cjs` — never string-equal to
     // pathToFileURL(argv[1]).href (`file:///C:/.../kici-orchestrator.cjs`). The
     // orchestrator then loaded and exited 0 without starting the server.
-    const argv = 'C:\\kici-stg\\service\\lib\\kici-orchestrator.cjs';
-    const moduleUrl = 'file://C:\\kici-stg\\service\\lib\\kici-orchestrator.cjs';
+    const argv = 'C:\\kici\\service\\lib\\kici-orchestrator.cjs';
+    const moduleUrl = 'file://C:\\kici\\service\\lib\\kici-orchestrator.cjs';
     expect(isProductionEntry(argv, moduleUrl)).toBe(true);
   });
 

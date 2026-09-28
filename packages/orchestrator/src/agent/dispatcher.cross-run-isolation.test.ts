@@ -10,8 +10,8 @@
  * Trust model (must hold):
  *   An agent token's WS-connection lifetime spans many runs (KiCI has
  *   no per-run token). Per-run authority is enforced at message-time
- *   by the (agentId, jobId) ownership gate. A compromised agent
- *   (attacker model A5 / A10) holding a token that previously serviced
+ *   by the (agentId, jobId) ownership gate. A compromised agent, or an
+ *   attacker with a stolen agent token, whose token previously serviced
  *   run R1 cannot, after R1 completes:
  *
  *   1. Send a message claiming a jobId owned by another agent

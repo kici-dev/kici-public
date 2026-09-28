@@ -2,8 +2,8 @@
  * Concurrency-aware scheduler for `parallel()` step groups.
  *
  * A parallel group's children each run as their own observable step (own logs,
- * status, timing, retry, cache, hooks — all task-scoped by the Phase 0 per-task
- * isolation) through the same `runStepIteration` machinery the sequential loop
+ * status, timing, retry, cache, hooks — all task-scoped per child) through the
+ * same `runStepIteration` machinery the sequential loop
  * uses. Children launch behind a `maxParallel` window (queued children report
  * `pending`); the group joins at a barrier. On the first non-`continueOnError`
  * child failure when `failFast`, every in-flight sibling's per-task abort

@@ -68,7 +68,7 @@ export interface SandboxHardeningOptions {
    * namespace by request.
    */
   jobNetworkName?: string;
-  /** Optional dispatch-resolved escape hatch (Sub-wish B populates this at dispatch). */
+  /** Optional escape hatch the orchestrator resolves at dispatch. */
   grant?: ResolvedSandboxGrant;
 }
 

@@ -3,8 +3,7 @@
  *
  * An 8-core machine running four packages' suites at vitest's default width
  * spawns ~28 workers. Starved workers miss timers, so tests that pass in 4.4s
- * serially fail with timeout-shaped errors — and inside a drain that false RED
- * costs a full re-verify under the exclusive mutex.
+ * serially fail with timeout-shaped errors.
  *
  * The cap is a claim against a machine-wide budget rather than a constant,
  * because the contention is not all ours: concurrent sessions run this same
@@ -25,8 +24,7 @@
  *  - A cap is never widened once claimed. A suite that starts while the box is
  *    busy keeps its narrow share for its whole run, and stays throttled long
  *    after the box frees: measured 6.85 s solo at cap 7 against 12.49 s at cap
- *    3, a 1.82x cost that in a drain lands on the exclusive VERIFY stage and so
- *    extends the mutex hold that serialises every other wish. There is no cheap
+ *    3, a 1.82x cost. There is no cheap
  *    mitigation — vitest reads VITEST_MAX_WORKERS exactly once during config
  *    resolution, and `pool.setMaxWorkers` takes the already-resolved config, so
  *    no config hook can reach a running pool.
@@ -41,8 +39,7 @@ import path from 'node:path';
 
 /**
  * Outside the repository on purpose: it can never appear in a diff, can never be
- * committed, and dies with the machine rather than outliving a run. Same
- * reasoning as the drain's VERIFY mutex at `/tmp/kici-drain-verify.lock`.
+ * committed, and dies with the machine rather than outliving a run.
  */
 export const REGISTRY_DIR = '/tmp/kici-vitest-workers';
 

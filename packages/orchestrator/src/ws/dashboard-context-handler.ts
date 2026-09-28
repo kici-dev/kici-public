@@ -78,6 +78,7 @@ import {
   DashboardSealedWriteError,
   type DashboardSealedEnvelope,
 } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'dashboard-context-handler' });
 
@@ -154,7 +155,7 @@ export interface DashboardContextHandlerDeps {
 /** Dependencies enabling the resolver-backed approve/reject + resume path. */
 export interface ApprovalHandlerDeps {
   store: HeldRunStore;
-  /** Team name → member user ids (Plan-1 trust-policy cache). */
+  /** Team name → member user ids (trust-policy cache). */
   teamMembershipLookup: TeamMembershipLookup;
   /** Re-dispatch a released job hold (consumes its pending context). */
   resumeJob: (signal: ReleaseSignal) => Promise<void>;
@@ -292,18 +293,25 @@ export class DashboardContextHandler {
     outcome: AccessLogOutcome,
     errorMessage?: string | null,
   ): void {
-    if (!this.accessLog) return;
-    void this.accessLog.record({
-      orgId: this.deps.orgId,
-      routingKey: this.routingKey,
-      actor,
-      action,
-      target,
-      requestId,
-      source: 'platform_proxy',
-      outcome,
-      errorMessage: errorMessage ?? null,
-    });
+    const accessLog = this.accessLog;
+    if (!accessLog) return;
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        accessLog.record({
+          orgId: this.deps.orgId,
+          routingKey: this.routingKey,
+          actor,
+          action,
+          target,
+          requestId,
+          source: 'platform_proxy',
+          outcome,
+          errorMessage: errorMessage ?? null,
+        }),
+      { requestId },
+    );
   }
 
   /**
@@ -1874,7 +1882,8 @@ export class DashboardContextHandler {
     // "already resolved".
     this.deps.send({ type: responseType, requestId: msg.requestId });
 
-    if (!result.consequence) {
+    const consequence = result.consequence;
+    if (!consequence) {
       // Nothing followed the record — a non-satisfying approve leaves the hold
       // pending, so the audit entry is complete as soon as it is written.
       this.recordAccess(
@@ -1898,16 +1907,22 @@ export class DashboardContextHandler {
     // and completes the check runs it stranded. The entry is not awaited — a
     // consequence can outlive this handler's turn, and blocking the dashboard
     // message loop on it is exactly the coupling being removed.
-    void result.consequence.then((outcome) => {
-      this.recordAccess(
-        msg.actor,
-        auditAction,
-        { type: 'held_run', id: msg.heldRunId },
-        msg.requestId,
-        outcome.ok ? AccessLogOutcome.enum.allowed : AccessLogOutcome.enum.error,
-        outcome.ok ? undefined : outcome.error,
-      );
-    });
+    runDetached(
+      logger,
+      'Held-run decision audit',
+      () =>
+        consequence.then((outcome) => {
+          this.recordAccess(
+            msg.actor,
+            auditAction,
+            { type: 'held_run', id: msg.heldRunId },
+            msg.requestId,
+            outcome.ok ? AccessLogOutcome.enum.allowed : AccessLogOutcome.enum.error,
+            outcome.ok ? undefined : outcome.error,
+          );
+        }),
+      { requestId: msg.requestId, heldRunId: msg.heldRunId },
+    );
   }
 
   private async handleHeldRunApprove(msg: HeldRunApproveRequest): Promise<void> {

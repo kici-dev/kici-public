@@ -58,6 +58,10 @@ import type {
   SpawnContext,
 } from './types.js';
 
+// One logger for the module: with KICI_LOG_DIR set, each createLogger() call opens
+// its own log file stream, so a logger per spawn would leak one per agent.
+const logger = createLogger({ prefix: 'bare-metal-backend' });
+
 /** Extended ManagedAgent that includes the ChildProcess reference */
 interface BareMetalManagedAgent extends ManagedAgent {
   /** Absent for a container-backed agent, which has no local child process. */
@@ -145,7 +149,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
     this.hostServices = options.hostServices;
 
     // One-time startup warning about bare-metal trust model
-    const logger = createLogger({ prefix: 'bare-metal-backend' });
     logger.warn(
       `Bare-metal scaler "${options.name}" configured. Bare-metal agents run as child processes ` +
         `with full host filesystem and network access. This mode is intended for trusted environments only.`,
@@ -167,7 +170,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
       );
     }
 
-    this.warnNetworkPolicy(options.labelSets, logger);
+    this.warnNetworkPolicy(options.labelSets);
   }
 
   /**
@@ -178,10 +181,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
    * network, where the policy IS applied — warning about it tells an operator
    * their working configuration does nothing, which invites them to remove it.
    */
-  private warnNetworkPolicy(
-    labelSets: LabelSetConfig[],
-    logger: ReturnType<typeof createLogger>,
-  ): void {
+  private warnNetworkPolicy(labelSets: LabelSetConfig[]): void {
     const count = labelSets.filter(
       (ls) => ls.networkPolicy && !(ls.image !== undefined && !ls.binaryPath),
     ).length;
@@ -378,7 +378,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
     // validation surface): a trusted agent runs steps with the ambient host env
     // passed through, so the decision is auditable at spawn time.
     if (trustedEnv) {
-      const logger = createLogger({ prefix: 'bare-metal-backend' });
       logger.info(
         `Spawning TRUSTED-ENV agent "${agentId}" for scaler "${this.name}" ` +
           `(label set [${labelSet.join(', ')}]). Ambient host env is passed through to ` +
@@ -652,10 +651,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
         // rules above never see.
         await addHostIsolationRules(containerIp, args.hostAccess, 'saddr');
       } else {
-        createLogger({ prefix: 'bare-metal-backend' }).warn(
-          'Could not determine container IP for nftables rules',
-          { agentId },
-        );
+        logger.warn('Could not determine container IP for nftables rules', { agentId });
       }
     } catch (err) {
       this.agents.delete(managed.id);
@@ -814,10 +810,10 @@ export class BareMetalScalerBackend implements ScalerBackend {
     });
     if (found.length === 0) return false;
 
-    createLogger({ prefix: 'bare-metal-backend' }).warn(
-      'bare-metal: reclaiming an unowned agent container',
-      { managedId, containers: found.length },
-    );
+    logger.warn('bare-metal: reclaiming an unowned agent container', {
+      managedId,
+      containers: found.length,
+    });
 
     let reaped = false;
     for (const info of found) {
@@ -869,7 +865,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
     if (opts?.maxAgents !== undefined) {
       this.maxAgents = opts.maxAgents;
     }
-    this.warnNetworkPolicy(labelSets, createLogger({ prefix: 'bare-metal-backend' }));
+    this.warnNetworkPolicy(labelSets);
     return { valid: true };
   }
 

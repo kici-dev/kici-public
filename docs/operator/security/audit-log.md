@@ -103,7 +103,7 @@ The single-source CLI endpoint stays live because `kici-admin access-log list` c
 
 ## Querying `access_log` from `kici-admin`
 
-`kici-admin access-log` is the dogfooded operator-facing way to query the same data the dashboard's Data access tab shows, over the orchestrator's admin HTTP surface (`/api/v1/admin/access-log`). The caller needs a Bearer token whose role grants the `access_log.read` permission (granted to `owner`, `admin`, and `auditor`).
+`kici-admin access-log` is the operator-facing way to query the same data the dashboard's Data access tab shows, over the orchestrator's admin HTTP surface (`/api/v1/admin/access-log`). The caller needs a Bearer token whose role grants the `access_log.read` permission (granted to `owner`, `admin`, and `auditor`).
 
 ### Common invocations
 

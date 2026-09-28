@@ -195,7 +195,7 @@ export const AccessLogAction = z.enum([
    */
   'attestation.retry',
   'access_log.list.read',
-  /** Event DLQ admin actions (Phase 5 — at-least-once event delivery). */
+  /** Event DLQ admin actions (at-least-once event delivery). */
   'event_dlq.list.read',
   'event_dlq.retry',
   'event_dlq.discard',

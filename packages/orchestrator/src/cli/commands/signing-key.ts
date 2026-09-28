@@ -1,7 +1,6 @@
 /**
  * `kici-admin signing-key` — orchestrator-owned provenance signing key
- * management (orchestrator DB plane; classified `kici-admin` per
- * .claude/rules/platform-admin.md).
+ * management (orchestrator DB plane, so it belongs to `kici-admin`).
  *
  *   signing-key list                      List keys (kid / status / created_at).
  *                                         Reads the database when a database URL

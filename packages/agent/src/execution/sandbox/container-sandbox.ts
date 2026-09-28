@@ -987,10 +987,10 @@ export class ContainerSandbox implements ExecutionSandbox {
     // CapDrop ALL, no-new-privileges, and the cgroup caps — because the runtime
     // copies the container's process spec into each exec; the dockerode exec API
     // exposes no per-exec capability/no-new-privileges fields to re-assert them.
-    // The scaler-container `sandbox-hardening-defaults` E2E probes /proc/self/status
-    // from inside this exec, so a runtime that ever stopped inheriting the posture
-    // would fail that test loudly. Re-apply the resolved user explicitly since some
-    // runtimes do not inherit the container's configured user into exec.
+    // A step can confirm the inherited posture by reading /proc/self/status
+    // (CapEff, NoNewPrivs) from inside this exec. Re-apply the resolved user
+    // explicitly since some runtimes do not inherit the container's configured
+    // user into exec.
     const exec = await this.container!.exec({
       Cmd: this.resolvedRuntimeNode
         ? runnerLaunchArgv(this.runnerMountPath)

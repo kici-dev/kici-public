@@ -21,7 +21,6 @@ export interface StampIdentity {
 export interface KiciHealth {
   uptime: number;
   version?: string;
-  buildCommit?: string;
 }
 
 export type PlaneState = 'stopped' | 'ready' | 'unready' | 'foreign-kici' | 'foreign-unknown';

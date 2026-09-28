@@ -30,6 +30,7 @@ import type { PendingBuildTracker } from './pending-builds.js';
 import type { PendingDynamicTracker } from './pending-dynamics.js';
 import type { PendingInitTracker } from './pending-inits.js';
 import { settlePendingPrecursor } from './precursor-result.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'pending-precursor-db-watcher' });
 
@@ -83,7 +84,7 @@ export class PendingPrecursorDbWatcher {
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.tick();
+      runDetached(logger, 'Pending precursor DB watcher tick', () => this.tick());
     }, this.intervalMs);
     this.timer.unref?.();
     logger.info('Pending precursor DB watcher started', { intervalMs: this.intervalMs });

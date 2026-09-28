@@ -1,4 +1,21 @@
-import { toErrorMessage } from '@kici-dev/core';
+import { flushLogFiles, toErrorMessage } from '@kici-dev/core';
+
+/**
+ * How long an exit waits for the log files to take their last lines. The
+ * forced path adds it to the shutdown ceiling, inside the init system's stop
+ * grace (`shutdown-grace.ts` in the orchestrator's service CLI).
+ */
+const LOG_FLUSH_TIMEOUT_MS = 2_000;
+
+/**
+ * Exit once the rotated log files hold every line logged so far. A flush that
+ * fails does not keep the process from exiting. The exit code is read after
+ * the flush, so a fatal trigger that lands while it runs still raises it.
+ */
+async function exitAfterLogFlush(code: () => number): Promise<void> {
+  await flushLogFiles(LOG_FLUSH_TIMEOUT_MS).catch(() => {});
+  process.exit(code());
+}
 
 /**
  * A single teardown step in the graceful shutdown sequence.
@@ -69,6 +86,12 @@ export interface ShutdownHandle {
  * while a clean shutdown is already in progress still raises the final
  * exit code to 1.
  *
+ * Every exit this makes first waits (up to 2 s) for the rotated log files to
+ * take the lines logged so far and then closes them, so after a completed
+ * shutdown a file ends with the same line as stdout. On the forced path the
+ * file stops at the lines logged when the timer fired, and an `onForceExit`
+ * that exits by itself gets no flush.
+ *
  * A force-exit timer ensures the process terminates even if a step hangs.
  * The force-exit honors the same sticky exit code as a clean completion: a
  * slow SIGTERM/SIGINT stop that merely overran the grace period still exits 0,
@@ -106,7 +129,7 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
         // 1 for a fatal trigger) rather than a blanket 1 — a slow-but-clean
         // stop must not surface to systemd as exit-code FAILURE, which marks
         // the unit `failed` and breaks `systemctl restart` recovery.
-        process.exit(exitCode);
+        void exitAfterLogFlush(() => exitCode);
       }
     }, timeoutMs);
 
@@ -126,14 +149,14 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
 
       clearTimeout(forceExitTimeout);
       logger.info('Graceful shutdown complete', { exitCode });
-      process.exit(exitCode);
+      await exitAfterLogFlush(() => exitCode);
     } catch (error) {
       logger.error('Error during graceful shutdown', {
         error: toErrorMessage(error),
         stack: error instanceof Error ? error.stack : undefined,
       });
       clearTimeout(forceExitTimeout);
-      process.exit(1);
+      await exitAfterLogFlush(() => Math.max(exitCode, 1));
     }
   }
 

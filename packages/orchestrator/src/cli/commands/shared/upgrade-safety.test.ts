@@ -92,6 +92,9 @@ describe('schemaGuardVerdict', () => {
     expect(v.message).toContain('WARNING');
     expect(v.message).toContain('KICI_AUTO_MIGRATE=false');
     expect(v.message).toContain('kici-admin db backup');
+    // An upgrade without admin access records no head either, so the warning
+    // names that cause beside the old install.
+    expect(v.message).toContain('KICI_ADMIN_TOKEN');
   });
 });
 

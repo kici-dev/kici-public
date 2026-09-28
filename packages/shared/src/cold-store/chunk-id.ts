@@ -5,7 +5,7 @@
  * `(db, table, tenantId, partitionDate, minRowId, maxRowId)` so that
  * re-running an interrupted archival pass always produces the same ID
  * and therefore the same S3 object key. This is the core of the
- * idempotency guarantee documented in the design doc section 3.
+ * idempotency guarantee.
  *
  * 16 hex characters (64 bits of sha256) is enough to avoid collisions:
  * at a trillion chunks, birthday probability is ~5e-8.

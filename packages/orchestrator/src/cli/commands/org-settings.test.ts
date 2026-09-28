@@ -20,7 +20,7 @@ interface CommandResult {
   exitCode: number | null;
 }
 
-const ORG = 'kiciStg00001';
+const ORG = 'acmeOrg00001';
 
 const SAMPLE_SETTINGS = {
   customerId: ORG,
@@ -288,7 +288,7 @@ describe('kici-admin org-settings global-workflows', () => {
   // key as an opaque string in the qualifier, so provider-prefixed keys round
   // trip exactly as github:* keys do.
   it('allow-add supports a universal-git --source qualifier', async () => {
-    const genericKey = 'generic:kiciStg00001:src-abc';
+    const genericKey = 'generic:acmeOrg00001:src-abc';
     mockGet.mockResolvedValueOnce({
       settings: { ...SAMPLE_SETTINGS, allowedRepos: null },
     });

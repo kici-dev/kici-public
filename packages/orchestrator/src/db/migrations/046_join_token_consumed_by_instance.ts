@@ -11,7 +11,7 @@ import { type Kysely, sql } from 'kysely';
  *   join token already in its env — no operator action, no cluster redeploy.
  *
  * Idempotent (`ADD COLUMN IF NOT EXISTS`): re-running on a DB that already has
- * the column is a no-op. Staging data is preserved (additive nullable column).
+ * the column is a no-op. Existing data is preserved (additive nullable column).
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.join_tokens

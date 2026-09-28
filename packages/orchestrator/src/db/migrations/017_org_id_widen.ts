@@ -16,8 +16,7 @@ import { type Kysely, sql } from 'kysely';
  * They are orphans by design — once Platform's migration runs, the
  * dashboard queries the orchestrator API with the new prefixed IDs
  * and the orchestrator's `WHERE org_id = $1` filter naturally hides
- * the old rows. Staging E2E regenerates fresh rows during the next
- * test run.
+ * the old rows. New activity writes fresh rows under the prefixed IDs.
  *
  * Tables widened: `access_log`, `environment_bindings`,
  * `environment_source_overrides`, `environment_variables`,

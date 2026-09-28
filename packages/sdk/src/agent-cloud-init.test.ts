@@ -95,7 +95,7 @@ describe('buildAgentCloudInit — customization axes', () => {
     expect(out).toContain('CACHE_URL=http://cache');
   });
 
-  it('stamps an arbitrary correlation env via agentEnv (no dedicated e2e field)', () => {
+  it('stamps an arbitrary correlation env via agentEnv (no dedicated correlation field)', () => {
     const out = buildAgentCloudInit(
       { claimCode: 'c', agentId: 'a1', orchestratorUrl: 'http://o', labels: [] },
       { maxLifetimeMinutes: 30, agentEnv: { KICI_E2E_RUN_ID: 'run-xyz' } },

@@ -1,7 +1,7 @@
 /**
  * Shared vitest `globalSetup` that gives the real-Postgres suites a database.
  *
- * The orchestrator and Platform suites that exercise real SQL — per-migration
+ * The suites that exercise real SQL — per-migration
  * schema tests, repositories, stores, and everything downstream of them — read
  * the admin connection string from `KICI_TEST_ADMIN_DATABASE_URL` at module
  * scope and skip when it is absent. This setup starts a throwaway PostgreSQL
@@ -10,8 +10,8 @@
  *
  * It is selection-aware: the container starts only when the run's selected
  * specs actually include a gated module, so `vitest run src/routes` costs
- * nothing. Both packages reference this file by relative path from their own
- * vitest config; they never import each other's code.
+ * nothing. Each package with such suites references this file by relative
+ * path from its own vitest config.
  */
 import { readFileSync } from 'node:fs';
 import { $ } from 'zx';
@@ -43,9 +43,8 @@ const READY_ATTEMPTS = 120;
 const READY_INTERVAL_MS = 500;
 
 /**
- * Reap leaked containers older than this. Matches the 6h age gate every
- * kici-leak-sweep pass uses; a live test's container is seconds to minutes old,
- * never hours, so the gate cannot reach one.
+ * Reap leaked containers older than this. A live test's container is seconds
+ * to minutes old, never hours, so the gate cannot reach one.
  */
 const STALE_CONTAINER_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 

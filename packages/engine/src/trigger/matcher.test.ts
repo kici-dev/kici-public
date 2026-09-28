@@ -119,13 +119,13 @@ describe('matchPathPatterns', () => {
     expect(matchPathPatterns(['src/**', '!src/temp/**'], ['src/temp/cache.ts'])).toBe(false);
   });
 
-  it('matches include when excluded files are also present (regression C-1)', () => {
+  it('matches include when excluded files are also present', () => {
     // src/app.ts matches src/** and does NOT match **/*.md
     // README.md matches **/*.md but should be filtered out, not veto the trigger
     expect(matchPathPatterns(['src/**', '!**/*.md'], ['src/app.ts', 'README.md'])).toBe(true);
   });
 
-  it('rejects when all files are excluded even if they match includes (regression C-1)', () => {
+  it('rejects when all files are excluded even if they match includes', () => {
     // src/app.md matches src/** but also matches **/*.md -- after filtering, no files remain
     expect(matchPathPatterns(['src/**', '!**/*.md'], ['src/app.md'])).toBe(false);
   });

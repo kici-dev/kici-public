@@ -28,6 +28,7 @@
 import type { Logger } from '@kici-dev/shared';
 import { DispatchQueueStatus, type JobQueue } from './job-queue.js';
 import { setDispatchQueueDepthBreakdown } from '../metrics/prometheus.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 export interface DepthRefresherOptions {
   queue: JobQueue;
@@ -116,9 +117,9 @@ export function createDepthRefresher(options: DepthRefresherOptions): DepthRefre
       if (timer) return;
       // Kick off an immediate refresh so the gauge is non-zero the moment
       // Prometheus scrapes after startup, then let the interval take over.
-      void tick();
+      runDetached(options.logger, 'Queue depth refresh', () => tick());
       timer = setInterval(() => {
-        void tick();
+        runDetached(options.logger, 'Queue depth refresh', () => tick());
       }, intervalMs);
       // Allow process to exit even if the timer is still running (tests,
       // graceful shutdown edge cases).

@@ -3,7 +3,7 @@
  *
  * Pluggable storage backends:
  *   - S3CacheStorage         — production / multi-host
- *   - FilesystemCacheStorage — single-host / E2E sandbox
+ *   - FilesystemCacheStorage — single-host / test sandbox
  *
  * Use createCacheStorage() to instantiate from a discriminated config.
  */

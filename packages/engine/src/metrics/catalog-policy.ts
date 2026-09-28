@@ -2,8 +2,7 @@
  * Hand-maintained label-value policy on top of the auto-generated
  * `MetricLabels` / `MetricKind` allow-list in
  * `./metric-catalog.generated.ts`. Consumed by the Platform's
- * orchestrator-metrics filter (`packages/platform/src/ws/metrics-filter.ts`)
- * to harden the WS `orch.metrics` push path against pollution of the
+ * orchestrator-metrics filter to harden the WS `orch.metrics` push path against pollution of the
  * monitoring system.
  *
  * Three layers compose:
@@ -270,7 +269,7 @@ export const METRIC_LABEL_POLICY: Partial<
     },
   },
   kici_platform_orch_metrics_filtered_total: {
-    // Mirrors the FilterReason const in packages/platform/src/ws/metrics-filter.ts.
+    // Mirrors the Platform metrics filter's reasons.
     reason: {
       values: [
         'unknown_metric',

@@ -1,0 +1,20 @@
+# The build context of every KiCI image is the repository root
+# (`docker build -f packages/<name>/Dockerfile .`). podman reads an ignore
+# file only at the root of the build context, so this file is the one that
+# both podman and Docker apply to every COPY. Each image installs its
+# dependencies and compiles inside the build. The host's dependency trees,
+# build output, local environment files and keys stay out of the context.
+.git
+**/node_modules
+**/dist
+**/dist.tmp
+**/dist.tmp-*
+**/.turbo
+**/coverage
+**/*.tsbuildinfo
+**/sbom.spdx.json
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key

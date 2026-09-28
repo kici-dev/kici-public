@@ -68,12 +68,12 @@ export function tenantDayPrefix(args: {
 const BUCKET_SEGMENT_RE = /^[a-z0-9]+$/;
 
 /**
- * Compose a tenant-day prefix that includes the cold-bucket segment
- * introduced in Phase 2. Layout:
+ * Compose a tenant-day prefix that includes the cold-bucket segment.
+ * Layout:
  *
  *   `<prefix>/<db>/<table>/<tenantId>/<YYYY>/<MM>/<DD>/<bucket>`
  *
- * Phase-1 (v1 manifest) chunks live at the day-prefix root and are
+ * V1-manifest chunks live at the day-prefix root and are
  * addressed via `tenantDayPrefix` directly — those legacy chunks are
  * treated as the `'forever'` bucket by `parseManifest` but DO NOT carry
  * a `forever` segment in their key (the chunk-purge sweep keys off the

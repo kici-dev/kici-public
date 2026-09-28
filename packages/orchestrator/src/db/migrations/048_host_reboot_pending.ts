@@ -12,7 +12,7 @@ import { type Kysely, sql } from 'kysely';
  * (3) clears on the next reconnect (down-then-up), releasing the held job. NULL
  * = no reboot pending.
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so staging data is
+ * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
  * preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {

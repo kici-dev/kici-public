@@ -225,7 +225,7 @@ describe('jobDispatchSchema', () => {
     expect(parsed.runPublicKey).toBeUndefined();
   });
 
-  // --- Phase 4: structured sourceAuth / workflowAuth ---
+  // --- structured sourceAuth / workflowAuth ---
 
   it('accepts structured sourceAuth with kind=basic', () => {
     const msg = {

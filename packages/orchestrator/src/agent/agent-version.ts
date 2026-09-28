@@ -4,8 +4,8 @@
  * An agent reports its own package version in `agent.register`
  * (`agentRegisterSchema.version`), and the field is optional — an agent old
  * enough to omit it predates every feature this module gates on. The
- * orchestrator and the agent are deployed and upgraded independently
- * (`.claude/rules/compatibility.md`), so a feature the orchestrator ships is
+ * orchestrator and the agent are deployed and upgraded independently,
+ * so a feature the orchestrator ships is
  * routinely dispatched to a fleet that cannot run it, and the version is the
  * only fact the orchestrator has about what the fleet understands.
  */
@@ -18,9 +18,9 @@ type VersionBase = [number, number, number];
  * the string is not a version at all.
  *
  * The prerelease suffix is dropped rather than ordered because the suffixes in
- * play are build counters from the dev registry (`0.5.0-9159`), not semver
- * release candidates. Strict semver orders those BELOW `0.5.0`, which would
- * read every staging agent as too old for a feature it in fact carries.
+ * play are build counters (`0.5.0-9159`), not semver release candidates. Strict
+ * semver orders those BELOW `0.5.0`, which would read every agent on a
+ * prerelease build as too old for a feature it in fact carries.
  */
 export function parseVersionBase(version: string): VersionBase | null {
   const parts = version.trim().split('-')[0].split('.');

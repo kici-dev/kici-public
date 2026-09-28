@@ -935,9 +935,8 @@ describe('AgentRegistry', () => {
   });
 
   // sister to disconnectByTokenId: scheduleExpiryKick fires the
-  // same kick path on natural TTL expiration. Closes the
-  // `token-expiry-stale-ws` finding (sister to the revoke
-  // `agent-token-revocation-stale-ws`).
+  // same kick path on natural TTL expiration, so an expired token's
+  // in-flight WS closes the way a revoked token's does.
   describe('scheduleExpiryKick / TTL kick timer', () => {
     beforeEach(() => {
       vi.useFakeTimers();

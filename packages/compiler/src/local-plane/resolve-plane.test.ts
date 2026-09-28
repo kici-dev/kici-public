@@ -15,9 +15,9 @@ vi.mock('./platform-attach.js', () => ({
 }));
 
 const ATTACHMENT = {
-  platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
-  platformApiBase: 'https://platform.example.com/kici-stg',
-  orgId: 'kiciStg00001',
+  platformWsUrl: 'wss://platform.example.com/kici/ws',
+  platformApiBase: 'https://platform.example.com/kici',
+  orgId: 'acmeOrg00001',
   keyId: 'key-1',
 };
 
@@ -49,9 +49,9 @@ describe('resolvePlaneForRun', () => {
     planeUp.mockResolvedValue({ running: true, url: 'http://127.0.0.1:4319', mode: 'hybrid' });
     const { resolvePlaneForRun } = await import('./resolve-plane.js');
     const r = await resolvePlaneForRun({ connected: true });
-    expect(r).toMatchObject({ kind: 'attached', orgId: 'kiciStg00001' });
+    expect(r).toMatchObject({ kind: 'attached', orgId: 'acmeOrg00001' });
     expect(planeUp).toHaveBeenCalledWith({
-      attach: expect.objectContaining({ platformToken: 'kici_ok_secret', orgId: 'kiciStg00001' }),
+      attach: expect.objectContaining({ platformToken: 'kici_ok_secret', orgId: 'acmeOrg00001' }),
     });
   });
 

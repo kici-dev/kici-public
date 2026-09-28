@@ -166,7 +166,7 @@ describe('peer CLI commands', () => {
         '--routing-key',
         'github:json',
         '--created-by',
-        'deploy-stg',
+        'deploy-app',
         '--json',
       ]);
 
@@ -185,7 +185,7 @@ describe('peer CLI commands', () => {
       expect(stdout).not.toContain('only be used once');
       expect(mockCreateToken).toHaveBeenCalledWith(
         expect.objectContaining({
-          createdBy: 'deploy-stg',
+          createdBy: 'deploy-app',
           role: 'worker',
           expiryMs: 2 * 3600_000,
         }),

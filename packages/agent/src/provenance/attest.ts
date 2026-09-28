@@ -33,7 +33,7 @@ export interface DeferredAttestationReport {
 }
 
 export interface AttestDeps {
-  /** P1.4 relay: returns a minted KiCI ID token or a transient `deferred` signal. */
+  /** Relay: returns a minted KiCI ID token or a transient `deferred` signal. */
   getIdToken: (opts: { audience: string }) => Promise<OidcTokenResult>;
   /** Upload the serialized bundle; returns the storage key it was written to. */
   persist: (bundle: KiciBundle, subjectDigest: string) => Promise<string>;

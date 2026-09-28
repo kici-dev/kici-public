@@ -1,5 +1,5 @@
 /**
- * Read-through helper for `event_log` (Orchestrator) — Phase E.
+ * Read-through helper for `event_log` (Orchestrator).
  *
  * Mirrors the Platform-side `load-event-log-range.ts`. Tenant column is
  * `routing_key` (NOT NULL on this side) so cold-store partitioning

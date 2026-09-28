@@ -1,8 +1,7 @@
 /**
  * Implementations for `kici-admin cold-store` subcommands.
  *
- * Mirrors the Platform-side implementation in
- * `packages/platform/src/admin/cold-store-commands.ts` — same shape,
+ * Mirrors the Platform-side implementation — same shape,
  * just builds an `OrchestratorColdStore` against the orchestrator
  * Postgres + S3 instead of a `PlatformColdStore`.
  *

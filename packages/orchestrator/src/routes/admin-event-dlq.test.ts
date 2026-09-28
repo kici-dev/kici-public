@@ -216,10 +216,10 @@ describe('admin event-DLQ routes', () => {
   // ── Retry ───────────────────────────────────────────────────────
 
   it('resets a DLQ event and writes the access log entry', async () => {
-    // Note: pg_notify behavior with a real DB is covered by E2E. A mocked
-    // Kysely executor is incomplete enough that the sql template execution
-    // path throws and the route swallows it (the retry scanner is the
-    // safety net) — the unit test verifies the row reset + access log,
+    // Note: pg_notify behavior needs a real DB, which this file does not use.
+    // A mocked Kysely executor is incomplete enough that the sql template
+    // execution path throws and the route swallows it (the retry scanner is
+    // the safety net) — the unit test verifies the row reset + access log,
     // and "still returns 200 when pg_notify fails" covers the swallow path.
     const res = await request(app, '/api/v1/admin/event-dlq/evt-1/retry', {
       method: 'POST',

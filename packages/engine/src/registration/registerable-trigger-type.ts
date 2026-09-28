@@ -15,7 +15,7 @@ import { z } from 'zod';
  *      matched via the per-event lock file pipeline on the same-source path
  *      (e.g. a real GitHub push webhook). Registering them in addition is
  *      what makes cross-source dispatch work for a generic webhook that
- *      targets an externally-hosted repo (phase 28.5): the cross-source
+ *      targets an externally-hosted repo: the cross-source
  *      branch looks up `(customer_id, repo_identifier)` and reuses the
  *      stored `provider_context` (installation id, app id, …) to mint
  *      credentials for the actual provider bundle that owns the repo.
@@ -35,7 +35,7 @@ export const RegisterableTriggerType = z.enum([
   'schedule',
   'lifecycle',
   'webhook',
-  // Git-provider triggers (indexed for cross-source dispatch — see phase 28.5).
+  // Git-provider triggers (indexed for cross-source dispatch).
   // These continue to be evaluated via the per-event lock file pipeline on the
   // same-source path; registration is an additive index, not a replacement.
   'push',

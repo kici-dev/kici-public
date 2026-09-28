@@ -286,7 +286,7 @@ export class S3CacheStorage implements CacheStorage {
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: objectKey,
-        // No Metadata in pre-signed URL -- two-phase approach per research Pitfall 1
+        // No Metadata in pre-signed URL -- two-phase approach
         // Orchestrator will set metadata via initMeta() after agent confirms upload
       }),
       { expiresIn: UPLOAD_URL_EXPIRY_SECONDS },

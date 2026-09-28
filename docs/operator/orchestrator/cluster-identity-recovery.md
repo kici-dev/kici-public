@@ -90,10 +90,11 @@ database**:
 kici-admin cluster reconcile-identity --adopt-db --bucket my-cache-bucket
 ```
 
-## Automatic reconciliation during staging deploys
+## Reconciling in a deploy script
 
-KiCI's own staging deploy runs this reconciliation automatically before the
-orchestrator starts: a fresh-database deploy pushes the sentinel to follow the
-database (the database is authoritative), while a warm deploy whose database has
-diverged from the durable sentinel restores the database from the sentinel — so
-a pre-existing mismatch self-heals instead of crash-looping the deploy.
+A deploy script can run this reconciliation with `--yes` before it starts the
+orchestrator. After a deploy with a fresh database, pass `--adopt-db` so the
+sentinel follows the database: the database is authoritative. After a deploy
+that keeps its database, use the default direction, so a database that has
+diverged from the durable sentinel is restored from it. A mismatch then heals
+itself instead of crash-looping the deploy.

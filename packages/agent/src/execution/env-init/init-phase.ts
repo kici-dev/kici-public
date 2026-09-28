@@ -1,6 +1,6 @@
 import type { $ as Shell } from 'zx';
 import type { GenericInitConfig, CacheSpec } from '@kici-dev/sdk';
-import { ExecutionStepStatus, TimeoutReason } from '@kici-dev/engine';
+import { ExecutionStepStatus, LogStream, TimeoutReason } from '@kici-dev/engine';
 import { toErrorMessage } from '@kici-dev/shared';
 import type { RunnerToAgentMessage } from '../sandbox/ipc-protocol.js';
 
@@ -115,6 +115,55 @@ function withInitTimeout<T>(run: Promise<T>, timeoutMs: number): Promise<T> {
   ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Restore an init's cache, treating any failure as a miss. The cache only saves
+ * time, so a failed download (a network error, a checksum mismatch) runs the
+ * command cold exactly as a miss does, the way the declarative job/step cache
+ * phase treats one. A line on the init step says why. A failed download never
+ * half-writes the tree: the archive is extracted into a scratch dir first.
+ */
+async function restoreInitCache(
+  spec: CacheSpec,
+  cache: InitCachePort,
+  stepIndex: number,
+  sendIpc: RunInitPhaseOptions['sendIpc'],
+): Promise<boolean> {
+  try {
+    return (await cache.restore(spec)).hit;
+  } catch (e) {
+    sendIpc({
+      type: 'log.line',
+      stepIndex,
+      stream: LogStream.enum.stderr,
+      line: `cache restore failed for key ${spec.key}; running without the cache: ${toErrorMessage(e)}`,
+    });
+    return false;
+  }
+}
+
+/**
+ * Save an init's cache after its command succeeded. A failed save costs only
+ * the next run's cache hit, so it is reported on the init step rather than
+ * failing a job whose toolchain is already in place.
+ */
+async function saveInitCache(
+  spec: CacheSpec,
+  cache: InitCachePort,
+  stepIndex: number,
+  sendIpc: RunInitPhaseOptions['sendIpc'],
+): Promise<void> {
+  try {
+    await cache.save(spec);
+  } catch (e) {
+    sendIpc({
+      type: 'log.line',
+      stepIndex,
+      stream: LogStream.enum.stderr,
+      line: `cache save failed for key ${spec.key}; the next run starts without it: ${toErrorMessage(e)}`,
+    });
+  }
+}
+
 async function runOneInit(
   spec: GenericInitConfig,
   index: number,
@@ -131,8 +180,7 @@ async function runOneInit(
     // we skip a redundant save afterward.
     let cacheHit = false;
     if (spec.cache && opts.cache) {
-      const r = await opts.cache.restore(spec.cache);
-      cacheHit = r.hit;
+      cacheHit = await restoreInitCache(spec.cache, opts.cache, stepIndex, opts.sendIpc);
     }
     // Allocate fresh KICI_ENV/KICI_PATH files and point the shell env at them so
     // the command can export env + PATH additions to subsequent steps (P1).
@@ -150,7 +198,7 @@ async function runOneInit(
     await withInitTimeout($`${shell} -c ${spec.run}`, timeoutMs);
     // Save the cache after a successful command, but only on a key miss.
     if (spec.cache && opts.cache && !cacheHit) {
-      await opts.cache.save(spec.cache);
+      await saveInitCache(spec.cache, opts.cache, stepIndex, opts.sendIpc);
     }
     // Apply the captured KICI_ENV/KICI_PATH delta after the command succeeds and
     // after the cache save, so this init's env + PATH reach later inits + steps.

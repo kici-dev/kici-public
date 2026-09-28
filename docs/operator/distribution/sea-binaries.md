@@ -1,18 +1,16 @@
 ---
 title: KiCI packaging guide
-description: Build, distribute, and install the full and light KiCI packages for each supported platform
+description: Download, verify and run the full and light KiCI packages for each supported platform
 ---
 
-This guide covers building, distributing, and using KiCI packages for deployment.
+Every KiCI release publishes standalone packages of its components. Use them where npm is not available, or where you do not want to install Node.js.
 
 ## Package types
 
-KiCI produces two types of packages:
+- **Full packages** include the Node.js runtime with its npm, the application bundle and a launcher script. The target machine needs no Node.js or npm installation.
+- **Light packages** include only the application bundle and a launcher script. They run on a Node.js runtime cached on the target machine (see [Light package](#light-package)).
 
-- **Full packages** -- Include the Node.js runtime binary, CJS bundle, and launcher script. No Node.js installation needed on the target machine.
-- **Light packages** -- Include only the CJS bundle and launcher script. Require a Node.js binary to be cached on the target machine.
-
-KiCI packages four executables:
+KiCI packages these components:
 
 | Component                      | Purpose                                               |
 | ------------------------------ | ----------------------------------------------------- |
@@ -23,90 +21,63 @@ KiCI packages four executables:
 
 ## Target platforms
 
-Each component is packaged for 6 platform/architecture combinations:
+Each component is packaged for these platforms:
 
-| Platform | Architecture          | Archive format | Launcher extension |
-| -------- | --------------------- | -------------- | ------------------ |
-| Linux    | x64 (amd64)           | .tar.gz        | (none)             |
-| Linux    | arm64 (aarch64)       | .tar.gz        | (none)             |
-| macOS    | x64 (Intel)           | .tar.gz        | (none)             |
-| macOS    | arm64 (Apple Silicon) | .tar.gz        | (none)             |
-| Windows  | x64                   | .zip           | .cmd               |
-| Windows  | arm64                 | .zip           | .cmd               |
+| Platform | Architecture          | Platform name  | Archive format | Launcher extension |
+| -------- | --------------------- | -------------- | -------------- | ------------------ |
+| Linux    | x64 (amd64)           | `linux-x64`    | .tar.gz        | (none)             |
+| Linux    | arm64 (aarch64)       | `linux-arm64`  | .tar.gz        | (none)             |
+| macOS    | x64 (Intel)           | `darwin-x64`   | .tar.gz        | (none)             |
+| macOS    | arm64 (Apple Silicon) | `darwin-arm64` | .tar.gz        | (none)             |
+| Windows  | x64                   | `win-x64`      | .zip           | .cmd               |
+| Windows  | arm64                 | `win-arm64`    | .zip           | .cmd               |
 
-## Building packages
+## Download a package
 
-### Prerequisites
+Each release attaches every package to its [GitHub release](https://github.com/kici-dev/kici-public/releases), with a `SHA256SUMS` file that holds the checksum of each package. The release notes name the Node.js version of the packages. A package name has this form:
 
-- Node.js 24 LTS
-- pnpm (workspace dependencies must be installed)
-
-### Build command
-
-```bash
-node scripts/package.mjs [options]
+```
+{component}-{version}-{platform}[-light].{tar.gz|zip}
 ```
 
-Options:
+For example, `kici-agent-{version}-linux-x64.tar.gz` is the full agent package for Linux x64, and `kici-admin-{version}-win-x64-light.zip` is the light `kici-admin` package for Windows x64. [Release artifacts](release-artifacts.md) gives the commands for the current release.
 
-| Flag                   | Description                                       | Default           |
-| ---------------------- | ------------------------------------------------- | ----------------- |
-| `--target <name>`      | Build a specific target (e.g., `kici-admin`)      | All targets       |
-| `--platform <plat>`    | Build for a specific platform (e.g., `linux-x64`) | All platforms     |
-| `--light`              | Build only light packages (no Node binary)        | Both types        |
-| `--full`               | Build only full packages (with Node binary)       | Both types        |
-| `--output-dir <path>`  | Output directory for packages                     | `dist/packages/`  |
-| `--node-version <ver>` | Node.js version to embed                          | Current runtime   |
-| `--version <ver>`      | Package version string                            | From package.json |
+Always verify a package before you extract it. Do not use a package that fails the check.
 
-### Examples
+### Linux and macOS
+
+Set `VERSION` to the KiCI version and `PKG` to the package you need:
 
 ```bash
-# Build all targets for all platforms (full + light)
-node scripts/package.mjs
+VERSION=<version>
+PKG=kici-agent-$VERSION-linux-x64.tar.gz
+BASE=https://github.com/kici-dev/kici-public/releases/download/v$VERSION
 
-# Build only kici-admin for Linux x64
-node scripts/package.mjs --target kici-admin --platform linux-x64
-
-# Build light packages only (smaller, faster transfers)
-node scripts/package.mjs --light
-
-# Custom output directory
-node scripts/package.mjs --output-dir ./release/
+curl -fsSLO "$BASE/$PKG"
+curl -fsSLO "$BASE/SHA256SUMS"
+grep " $PKG\$" SHA256SUMS | sha256sum -c -
+tar -xzf "$PKG"
 ```
 
-### Build pipeline
+On macOS, use `shasum -a 256 -c -` in place of `sha256sum -c -`. The check prints `OK` for a correct package.
 
-The packaging script follows a 4-step process:
+### Windows
 
-1. **Bundle** -- The bundler combines all TypeScript/JavaScript into a single CJS file with tree-shaking
-2. **Download Node binary** (full packages only) -- Downloads the official Node.js binary from nodejs.org with SHA-256 verification, cached locally at `~/.cache/kici/node-binaries/`
-3. **Assemble package** -- Creates the package directory with the CJS bundle, launcher script, and optionally the Node binary
-4. **Create archive** -- Produces .tar.gz (Unix) or .zip (Windows) archive
+In PowerShell:
 
-### pnpm shortcuts
+```powershell
+$version = '<version>'
+$pkg = "kici-agent-$version-win-x64.zip"
+$base = "https://github.com/kici-dev/kici-public/releases/download/v$version"
 
-```bash
-pnpm package                    # All targets, all platforms
-pnpm package:linux-x64          # All targets, Linux x64
-pnpm package:linux-arm64        # All targets, Linux ARM64
-pnpm package:darwin-x64         # All targets, macOS Intel
-pnpm package:darwin-arm64       # All targets, macOS Apple Silicon
-pnpm package:win-x64            # All targets, Windows x64
-pnpm package:win-arm64          # All targets, Windows ARM64
+Invoke-WebRequest "$base/$pkg" -OutFile $pkg
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+$expected = ((Select-String -Path SHA256SUMS -SimpleMatch "  $pkg").Line -split ' ')[0]
+if ((Get-FileHash $pkg -Algorithm SHA256).Hash -ne $expected) { throw "Checksum mismatch for $pkg" }
+Expand-Archive $pkg -DestinationPath .
 ```
 
-## Cross-platform builds
-
-Unlike SEA binaries (which must be built on the target platform), KiCI packages can be built from any machine for any platform. The Node.js binary for the target platform is downloaded from nodejs.org automatically.
-
-```bash
-# Build macOS ARM64 packages from a Linux machine
-node scripts/package.mjs --platform darwin-arm64
-
-# Build Windows packages from a Linux machine
-node scripts/package.mjs --platform win-x64
-```
+The GitHub release page also shows the SHA-256 digest of each file.
 
 ## Package structure
 
@@ -114,12 +85,31 @@ node scripts/package.mjs --platform win-x64
 
 ```
 kici-admin-{version}-linux-x64/
-  kici-admin            # Launcher script (shell or .cmd)
-  bin/node              # Node.js binary
-  lib/kici-admin.cjs    # Bundled application
+  kici-admin              # Launcher script
+  bin/node                # Node.js binary
+  bin/npm, bin/npx        # npm launchers
+  lib/kici-admin.cjs      # Bundled application
+  lib/node_modules/npm/   # npm, from the Node.js archive
+  LICENSE                 # License of the component
+  LICENSES.md             # How the KiCI packages are licensed
+  THIRD-PARTY-NOTICES     # Licenses of the software bundled into the package
+  SOURCE                  # Where to get the source code of this release
+  NODE-LICENSE            # License of Node.js and its npm
 ```
 
-The launcher executes the CJS bundle using the bundled Node binary.
+A Windows package keeps npm beside `node.exe`, as the official Node.js zip does:
+
+```
+kici-admin-{version}-win-x64/
+  kici-admin.cmd          # Launcher script
+  bin/node.exe            # Node.js binary
+  bin/npm.cmd, bin/npx.cmd
+  bin/node_modules/npm/   # npm, from the Node.js archive
+  lib/kici-admin.cjs      # Bundled application
+  LICENSE, LICENSES.md, THIRD-PARTY-NOTICES, SOURCE, NODE-LICENSE
+```
+
+The launcher executes the CJS bundle using the bundled Node binary. A `kici-agent` started from a full package finds npm beside that binary, so its builder role needs no npm on the host.
 
 ### Light package
 
@@ -127,6 +117,7 @@ The launcher executes the CJS bundle using the bundled Node binary.
 kici-admin-{version}-linux-x64-light/
   kici-admin            # Launcher script (shell or .cmd)
   lib/kici-admin.cjs    # Bundled application
+  LICENSE, LICENSES.md, THIRD-PARTY-NOTICES, SOURCE
 ```
 
 The launcher looks for a cached Node.js binary at:
@@ -134,12 +125,59 @@ The launcher looks for a cached Node.js binary at:
 - **Linux/macOS:** `$XDG_CACHE_HOME/kici/node-binaries/v{VERSION}/bin/node` (default: `~/.cache/...`)
 - **Windows:** `%LOCALAPPDATA%\kici\node-binaries\v{VERSION}\node.exe`
 
-If the Node binary is not found, the launcher prints an error with download instructions.
+`{VERSION}` is the Node.js version the package was built with. The release notes of each KiCI version name it, and the launcher prints it when the binary is missing. If the Node binary is not found, the launcher prints the steps below for its version and platform, and exits with status 1.
+
+#### Install Node.js into the cache
+
+Extract the official Node.js archive for the version into the cache directory. The archive carries npm beside the Node binary, which a `kici-agent` needs for its builder role. Do not copy the `node` binary alone.
+
+On Linux or macOS (replace `linux-x64` with your platform, e.g. `darwin-arm64`):
+
+```bash
+NODE_VERSION=<node-version>
+ARCHIVE=node-v$NODE_VERSION-linux-x64.tar.gz
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kici/node-binaries/v$NODE_VERSION"
+
+curl -fsSLO "https://nodejs.org/dist/v$NODE_VERSION/$ARCHIVE"
+curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt" | grep " $ARCHIVE\$" | sha256sum -c -
+mkdir -p "$CACHE"
+tar -xzf "$ARCHIVE" --strip-components=1 -C "$CACHE"
+```
+
+On macOS, use `shasum -a 256 -c -` in place of `sha256sum -c -`.
+
+On Windows (PowerShell; replace `win-x64` with `win-arm64` on ARM):
+
+```powershell
+$nodeVersion = '<node-version>'
+$folder = "node-v$nodeVersion-win-x64"
+$cache = Join-Path $env:LOCALAPPDATA "kici\node-binaries\v$nodeVersion"
+
+Invoke-WebRequest "https://nodejs.org/dist/v$nodeVersion/$folder.zip" -OutFile "$folder.zip"
+(Get-FileHash "$folder.zip" -Algorithm SHA256).Hash   # compare with SHASUMS256.txt
+Expand-Archive "$folder.zip" -DestinationPath $env:TEMP -Force
+New-Item -ItemType Directory -Force $cache | Out-Null
+Copy-Item -Recurse -Force "$env:TEMP\$folder\*" $cache
+```
+
+A service reads the cache of the account it runs as. A Windows service that runs as LocalSystem, the Windows default, reads `C:\Windows\system32\config\systemprofile\AppData\Local\kici\node-binaries\v{VERSION}\`, so install Node.js there as well.
+
+### License files
+
+Every package has these files at its root:
+
+| File                  | Content                                                                                                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `LICENSE`             | The license of the component. Each component above is AGPL-3.0-only.                                                  |
+| `LICENSES.md`         | How each KiCI package is licensed.                                                                                    |
+| `THIRD-PARTY-NOTICES` | Each software package with code in this package: its version, the license it declares and its license text.           |
+| `SOURCE`              | Where to get the source code of the release: the `kici-dev/kici-public` repository at the release tag.                |
+| `NODE-LICENSE`        | Full packages only. The license of the Node.js runtime and of the npm it includes, from the official Node.js archive. |
 
 ## Package size
 
-- **Full packages:** ~30-40 MB per archive (Node binary ~80 MB + bundle ~15-30 MB, compressed)
-- **Light packages:** ~5-10 MB per archive (bundle only)
+- **Full packages:** ~35-50 MB per archive (Node binary, npm and bundle, compressed)
+- **Light packages:** ~2-5 MB per archive (bundle only)
 
 Light packages are ideal for repeated deployments where the Node binary is already cached on the target machine.
 
@@ -158,54 +196,14 @@ These are **excluded from the bundle** because native addons cannot be inlined. 
 
 For most deployments, the pure-JS fallbacks work correctly and no additional files are needed.
 
-## Distribution
-
-### Hosting recommendations
-
-KiCI packages can be hosted on:
-
-- **GitHub Releases** -- attach archives to tagged releases
-- **CDN** (e.g., CloudFront, Cloudflare R2) -- for fast global distribution
-- **Object storage** (e.g., S3, SeaweedFS) -- for self-hosted deployments
-- **Package managers** -- Homebrew formula, winget manifest, apt/rpm packages
-
-### Naming convention
-
-```
-{target}-{version}-{os}-{arch}[-light].{tar.gz|zip}
-```
-
-Examples:
-
-```
-kici-orchestrator-0.1.0-linux-x64.tar.gz
-kici-orchestrator-0.1.0-linux-arm64-light.tar.gz
-kici-admin-0.1.0-darwin-arm64.tar.gz
-kici-agent-0.1.0-win-x64.zip
-```
-
-## Verification
-
-### Check package works
+## Check a package works
 
 ```bash
 # Extract and run (full package)
-tar xzf kici-admin-0.1.0-linux-x64.tar.gz
-./kici-admin-0.1.0-linux-x64/kici-admin --help
+tar xzf kici-admin-{version}-linux-x64.tar.gz
+./kici-admin-{version}-linux-x64/kici-admin --help
 
 # Light package (requires Node cached)
-tar xzf kici-admin-0.1.0-linux-x64-light.tar.gz
-./kici-admin-0.1.0-linux-x64-light/kici-admin --help
-```
-
-### Verify integrity
-
-When distributing packages, provide SHA-256 checksums:
-
-```bash
-# Generate checksums
-sha256sum dist/packages/*.tar.gz dist/packages/*.zip > checksums.sha256
-
-# Verify a downloaded package
-sha256sum -c checksums.sha256
+tar xzf kici-admin-{version}-linux-x64-light.tar.gz
+./kici-admin-{version}-linux-x64-light/kici-admin --help
 ```

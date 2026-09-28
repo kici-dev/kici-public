@@ -105,7 +105,9 @@ Values are sanitized to filesystem-safe characters. If none of these env vars is
 
 Rotated files are compressed (gzip). Old files are automatically deleted when they exceed the retention period.
 
-**Example — a typical staging stack:** every process writes to `${KICI_LOG_DIR}/` with a per-instance filename, e.g. `orchestrator-<host>-stg-YYYY-MM-DD.log`, `orchestrator-worker-orch-stg-YYYY-MM-DD.log`, `agent-stg-stateful-agent-YYYY-MM-DD.log`. The reference dogfooding setup wires these env vars in two places: the native orchestrator's own service environment, and the Platform's compose environment.
+At the end of a graceful shutdown, a service writes every line logged so far to the file before the process exits. So the file ends with the same line as the service's standard output: `Graceful shutdown complete`. When the orchestrator's shutdown time limit forces the exit, the orchestrator first writes the lines logged until that moment to the file.
+
+**Example — a coordinator, a worker and a stateful agent on one host:** every process writes to `${KICI_LOG_DIR}/` with its own filename, e.g. `orchestrator-coordinator-1-YYYY-MM-DD.log`, `orchestrator-worker-1-YYYY-MM-DD.log`, `agent-stateful-agent-1-YYYY-MM-DD.log`. Set each instance ID in that process's own environment: the orchestrator's service environment, and the agent's.
 
 ## Diagnostic tools
 

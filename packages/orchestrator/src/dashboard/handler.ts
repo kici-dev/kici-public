@@ -105,6 +105,7 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'dashboard-handler' });
 
@@ -124,7 +125,7 @@ interface DashboardHandlerDeps {
    * so the dashboard verifies it client-side without a second fetch. Optional —
    * when absent (e.g. orchestrators without provenance configured) the handler
    * replies with an `error` and an empty list. Reuses the cache storage backend
-   * (the same one P1.5 writes bundles to).
+   * (the same one attestation bundles are written to).
    */
   provenanceStorage?: CacheStorage | null;
   /**
@@ -156,14 +157,14 @@ interface DashboardHandlerDeps {
    * Long-lived cold-store handle for read fallback. When set, run /
    * job / step lookups fall through to S3 if the row has aged out of
    * PG. `null` means the orchestrator is running without cold-store
-   * configured — handler then returns its pre-Phase-C behavior.
+   * configured — handler then serves PG rows only.
    */
   coldStore?: ColdStore | null;
   /**
    * Callback for handling re-run requests.
    * Returns { newRunId } on success or throws on failure.
    *
-   * Phase F — `routingKey` is forwarded from the Platform (read from
+   * `routingKey` is forwarded from the Platform (read from
    * Platform's denormalized `execution_runs.routing_key`) so the
    * orchestrator can probe its cold-store under the right tenant
    * prefix when the run row is missing from PG. Optional for back-
@@ -222,7 +223,7 @@ interface DashboardHandlerDeps {
   /**
    * **Test-only fault injection**, supplied only by the build-time test double:
    * `handleRerunRequest` awaits this hook before invoking `onRerun`, so an HA
-   * E2E can force a slow first coordinator and trigger a relay failover.
+   * test can force a slow first coordinator and trigger a relay failover.
    * Undefined (the shipped default) means no delay.
    */
   beforeRerun?: () => Promise<void>;
@@ -311,7 +312,7 @@ export class DashboardHandler {
    * Resolve the org owning a routing key by consulting both source tables
    * (GitHub-app `sources` first, then `generic_webhook_sources`). Used
    * directly for `handleRerunRequest` (which gets a `routingKey` hint from
-   * Platform — Phase F denormalization) and indirectly via
+   * Platform's denormalized copy) and indirectly via
    * `resolveOrgForRun`.
    */
   private async resolveOrgForRoutingKey(
@@ -424,18 +425,25 @@ export class DashboardHandler {
     outcome: AccessLogOutcome,
     errorMessage?: string | null,
   ): void {
-    if (!this.accessLog) return;
-    void this.accessLog.record({
-      orgId: ctx.orgId,
-      routingKey: ctx.routingKey,
-      actor,
-      action,
-      target,
-      requestId,
-      source: 'platform_proxy',
-      outcome,
-      errorMessage: errorMessage ?? null,
-    });
+    const accessLog = this.accessLog;
+    if (!accessLog) return;
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        accessLog.record({
+          orgId: ctx.orgId,
+          routingKey: ctx.routingKey,
+          actor,
+          action,
+          target,
+          requestId,
+          source: 'platform_proxy',
+          outcome,
+          errorMessage: errorMessage ?? null,
+        }),
+      { requestId },
+    );
   }
 
   /**
@@ -524,7 +532,7 @@ export class DashboardHandler {
         .orderBy('step_index', 'asc')
         .execute();
 
-      // Phase C: cold-store fallback. If PG has 0 jobs, the run was
+      // Cold-store fallback. If PG has 0 jobs, the run was
       // archived (jobs + steps moved to S3 in the same archive cycle).
       // Pull the chunk rows back to populate the response so the
       // dashboard run-detail page works for any run the orchestrator
@@ -670,7 +678,7 @@ export class DashboardHandler {
 
   /**
    * Handle a dashboard.run.structured request — the user-plane equivalent of
-   * the orchestrator-admin `/runs/:id/structured` endpoint. Reuses the Phase-1
+   * the orchestrator-admin `/runs/:id/structured` endpoint. Reuses the
    * aggregator + provenance mapper so the result is byte-identical to the admin
    * surface; emits an `access_log` `run.structured.read` row (carrying the
    * agent label when the actor came through an agent PAT).
@@ -1510,7 +1518,7 @@ export class DashboardHandler {
    * job name. Ordered oldest-first so the dashboard table is stable.
    */
   private async resolveAttestationsForRun(runId: string) {
-    // `attestations.run_id` / `job_id` are TEXT (P1.5 schema), while
+    // `attestations.run_id` / `job_id` are TEXT, while
     // `execution_jobs.run_id` / `job_id` are `uuid`. Postgres won't compare
     // `uuid = text` implicitly, so cast the uuid side to text in the join.
     return this.db
@@ -2332,7 +2340,7 @@ export class DashboardHandler {
    * Handle a run.rerun.request.
    * Delegates to the onRerun callback which invokes handleRerun from the rerun module.
    *
-   * Resolution: prefer `msg.routingKey` (Phase F denormalization hint from
+   * Resolution: prefer `msg.routingKey` (denormalization hint from
    * Platform — `execution_runs.routing_key` mirror). The hint is the ONLY
    * org context we have when the run row has been cold-archived out of PG,
    * so consult sources/generic_webhook_sources directly. If the hint is
@@ -2349,7 +2357,7 @@ export class DashboardHandler {
 
     try {
       // Test-only: the build-time test double injects `beforeRerun` to slow the
-      // first coordinator so an HA E2E can force a relay failover and exercise
+      // first coordinator so an HA test can force a relay failover and exercise
       // the requestId idempotency claim. The shipped orchestrator leaves it
       // undefined, so no delay is applied.
       if (this.beforeRerun) await this.beforeRerun();
@@ -2389,7 +2397,7 @@ export class DashboardHandler {
         'error',
         toErrorMessage(err),
       );
-      // Phase C: surface a stable code for archived-run rerun attempts so
+      // Surface a stable code for archived-run rerun attempts so
       // the Platform proxy can map to HTTP 410 instead of a generic 400.
       // We detect by structural shape (`code === 'runArchivedNotRerunnable'`)
       // rather than `instanceof` so the orchestrator package doesn't have
@@ -2772,7 +2780,7 @@ export class DashboardHandler {
   async handleEventLogDetail(msg: DashboardEventLogDetailRequest): Promise<void> {
     const ctx = { orgId: msg.orgId, routingKey: msg.routingKey ?? this.routingKey };
     try {
-      // Phase E: hot lookup first; on miss falls back to cold-store
+      // Hot lookup first; on miss falls back to cold-store
       // (scoped by `routingKey` hint from Platform when available).
       const row = await loadEventLogByDeliveryId({
         db: this.db,
@@ -3380,7 +3388,7 @@ export class DashboardHandler {
   }
 
   /**
-   * Phase C cold-store fallback: fetch the run + its jobs + its steps
+   * Cold-store fallback: fetch the run + its jobs + its steps
    * from S3 when the PG copy has been archived. Bounded scan: stops at
    * the warm cutoff (older entries don't exist in cold-store yet by
    * construction). Each row is filtered by `run_id` because chunks

@@ -1,7 +1,7 @@
 /**
  * Runtime backstop for the KICI_ env-var allowlist.
  *
- * Walks the source tree under `packages/`, `scripts/`, and `e2e/` and
+ * Walks the source tree under every `SCAN_ROOTS` directory and
  * matches every `process.env.NAME` and `process.env['NAME']` access
  * against `IS_ALLOWED_ENV_NAME(NAME)` from `./allowlist.ts`. Any
  * unmatched name fails the test with a clear error pointing at the file
@@ -18,9 +18,7 @@
  *     file-wide. The backstop walks the tree regardless of disable
  *     comments.
  *
- * Modeled on the dep-graph walker in
- * `packages/platform/src/admin/actor-factory.test.ts`. Same shape:
- * recursive directory walk, ignore node_modules / dist / *.test.ts,
+ * Shape: recursive directory walk, ignore node_modules / dist / *.test.ts,
  * collect violations, expect [] at the end.
  */
 import { describe, it, expect } from 'vitest';
@@ -58,9 +56,9 @@ const SCAN_ROOTS = ['packages', 'scripts', 'e2e'];
  */
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.cache', 'coverage', '.git']);
 /**
- * Gitignored scratch trees a gate materialises next to the sources it checks
- * (`e2e/.tmp-template-check-*` renders every workflow template — fixtures that
- * read arbitrary env names on purpose). They are not source, and a tree left
+ * Gitignored scratch trees a check materialises next to the sources it checks
+ * (`.tmp-*` directories of rendered workflow templates — fixtures that read
+ * arbitrary env names on purpose). They are not source, and a tree left
  * behind by a killed run must not fail an unrelated package's tests.
  */
 const SCRATCH_DIR = /^\.tmp-/;
@@ -126,10 +124,9 @@ const ACCESS_RE = /process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[['"]([A-Z_][A-Z0-9_]*)[
  * Strip the contents of every backtick-bounded template literal before
  * scanning, while preserving line counts so violation line numbers stay
  * accurate. Template literals frequently embed workflow source code that
- * the host file emits to disk (`ensureInternalSecretsWorkflow`,
- * `ensureInternalDynamicEnvWorkflow`, etc.) — those `process.env.NAME`
- * occurrences belong to the *generated* file, not to the host, so they
- * must not trigger the allowlist check here.
+ * the host file emits to disk — those `process.env.NAME` occurrences
+ * belong to the *generated* file, not to the host, so they must not
+ * trigger the allowlist check here.
  *
  * The replacement keeps each newline intact so that `upTo.split('\n').length`
  * elsewhere still reports the correct line. We approximate "template
@@ -170,10 +167,9 @@ function scanFile(file: string): Violation[] {
     return [];
   }
   // Strip template-literal contents first so that `process.env.NAME`
-  // occurrences embedded in workflow-source-code fixtures (emitted to
-  // disk by helpers like `ensureInternalDynamicEnvWorkflow`) do not
-  // get attributed to the host file. Newlines inside the literal are
-  // preserved so violation line numbers stay accurate.
+  // occurrences embedded in workflow-source-code fixtures the host file
+  // emits to disk do not get attributed to the host file. Newlines inside
+  // the literal are preserved so violation line numbers stay accurate.
   const scrubbed = stripTemplateLiteralContents(src);
   const violations: Violation[] = [];
   // Reset per-file because the regex is `g`-flagged and shared.

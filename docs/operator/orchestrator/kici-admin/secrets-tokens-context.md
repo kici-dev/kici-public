@@ -27,7 +27,7 @@ kici-admin secret scope delete <orgId> <scope> [--yes] [--json]
 - Value sources (mutually exclusive; first matching wins): `--prompt` (interactive no-echo, default on TTY), `--from-stdin` (read piped stdin until EOF; default when stdin is a pipe), `--from-file <path>` (file body, trailing newline trimmed unless `--no-trim`), `--from-env <var>` (named env var), `--value <plaintext>` (visible in shell history — discouraged).
 - `--confirm-fingerprint <sha256hex>` refuses the write unless `SHA-256(value)` matches the supplied 64-hex string. Pair with a value source for unattended automation.
 - `--dry-run` parses + validates the value, prints fingerprint + length, and skips the write.
-- `--database-url` (on `set`) switches to direct-DB mode and writes the caller-supplied `encrypted_value` verbatim into `scoped_secrets` — used by E2E `globalSetup` helpers that need to seed secrets before the orchestrator is up.
+- `--database-url` (on `set`) switches to direct-DB mode and writes the caller-supplied `encrypted_value` verbatim into `scoped_secrets` — for a test setup that seeds secrets before the orchestrator is up.
 - `delete` asks for confirmation unless `--yes` is passed.
 - `scope create`, `scope rename` and `scope delete` act on a whole scope. They are the operator path for the dashboard's scope writes (`secrets.scope.*` in the [dashboard-write policy](../../security/dashboard-write-policy.md)). Only the PG backend supports them; a scope in another backend gets an error that names the backend.
   - `scope create` makes an empty scope. An existing scope stays unchanged.
@@ -183,7 +183,7 @@ kici-admin context source-override set --org <id> --env <name> --routing-key <ke
 kici-admin context source-override delete --org <id> --env <name> --routing-key <key> --key <key> [--json]
 ```
 
-Seeds and mutates context rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — used by E2E `globalSetup` helpers that need to seed contexts before the orchestrator is up.
+Seeds and mutates context rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — for a test setup that seeds contexts before the orchestrator is up.
 
 - `create` upserts a context (idempotent by `org + name`). On a new context, an omitted policy flag leaves that rule unset. On an existing context, an omitted policy flag leaves the stored value unchanged in both modes, and an explicit empty value (`'[]'`, an empty CSV, or `--minimum-trust null`) clears it. `--glob-pattern` is required when `--type glob` and sets the match pattern that resolves run scopes to this context; passing it with any other `--type` is an error. `--repo-patterns` limits the context to repositories whose `owner/repo` matches one of the globs (see [Repository patterns](../../../user/contexts.md#repository-patterns)).
 - `create` prints a warning on stderr when the context it created or updated is a fixed or glob context with no binding, because such a context delivers no secrets to the jobs that list it in `contexts:`. For a fixed context, the warning also names the deprecated fallback a `<context>:<key>` reference takes to the scope named after the context. The warning names the `kici-admin context bind` command. The exit code stays 0.

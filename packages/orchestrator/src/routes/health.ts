@@ -1,4 +1,7 @@
-import { createHealthRoutes as createBaseHealthRoutes } from '@kici-dev/shared';
+import {
+  createHealthRoutes as createBaseHealthRoutes,
+  type BuildFingerprint,
+} from '@kici-dev/shared';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 
@@ -7,13 +10,21 @@ import type { Database } from '../db/types.js';
 // agent.sdkBundleHash against orchestrator.sdkBundleHash in one curl pair.
 declare const KICI_PKG_VERSION: string;
 declare const KICI_BUILD_DATE: string;
-declare const KICI_BUILD_COMMIT: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 declare const KICI_SHARED_VERSION: string;
 declare const KICI_SHARED_BUNDLE_HASH: string;
 declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
+
+/**
+ * The fields the orchestrator adds to its `/health` body. The route below
+ * returns this type, and `kici-admin orchestrator status` renders it.
+ */
+export interface OrchestratorLivenessInfo extends BuildFingerprint {
+  /** ISO-8601 time the orchestrator bundle was built. */
+  buildDate: string;
+}
 
 export interface HealthRoutesDeps {
   /** Optional DB instance for readiness checks */
@@ -43,19 +54,24 @@ export interface HealthRoutesDeps {
  */
 export function createHealthRoutes(deps: HealthRoutesDeps = {}) {
   return createBaseHealthRoutes({
-    livenessInfo: () => ({
-      version: typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : 'unknown',
-      buildDate: typeof KICI_BUILD_DATE !== 'undefined' ? KICI_BUILD_DATE : 'unknown',
-      buildCommit: typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : 'unknown',
-      sdkVersion: typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown',
-      sdkBundleHash: typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown',
-      sharedVersion: typeof KICI_SHARED_VERSION !== 'undefined' ? KICI_SHARED_VERSION : 'unknown',
-      sharedBundleHash:
-        typeof KICI_SHARED_BUNDLE_HASH !== 'undefined' ? KICI_SHARED_BUNDLE_HASH : 'unknown',
-      engineVersion: typeof KICI_ENGINE_VERSION !== 'undefined' ? KICI_ENGINE_VERSION : 'unknown',
-      engineBundleHash:
-        typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown',
-    }),
+    livenessInfo: (): OrchestratorLivenessInfo => {
+      const version = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : 'unknown';
+      return {
+        version,
+        buildDate: typeof KICI_BUILD_DATE !== 'undefined' ? KICI_BUILD_DATE : 'unknown',
+        // Deprecated: carries the version (BuildFingerprint.buildCommit).
+        buildCommit: version,
+        sdkVersion: typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown',
+        sdkBundleHash:
+          typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown',
+        sharedVersion: typeof KICI_SHARED_VERSION !== 'undefined' ? KICI_SHARED_VERSION : 'unknown',
+        sharedBundleHash:
+          typeof KICI_SHARED_BUNDLE_HASH !== 'undefined' ? KICI_SHARED_BUNDLE_HASH : 'unknown',
+        engineVersion: typeof KICI_ENGINE_VERSION !== 'undefined' ? KICI_ENGINE_VERSION : 'unknown',
+        engineBundleHash:
+          typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown',
+      };
+    },
     readinessCheck: deps.db
       ? async () => {
           const checks: Record<string, boolean> = {};

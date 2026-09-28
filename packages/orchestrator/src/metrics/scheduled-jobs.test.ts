@@ -26,9 +26,8 @@ describe('orchestrator scheduled-job metrics', () => {
   // statically at the top of the orchestrator entry points, which evaluates
   // this module before initTelemetry() sets the global MeterProvider — so a
   // module-eval instrument binds to the no-op provider and never reaches the
-  // Prometheus exporter (the cold-store-framework-smoke E2E caught exactly
-  // this: kici_orch_job_last_success_timestamp_seconds stayed absent after a
-  // successful cold-store-archive tick).
+  // Prometheus exporter (symptom: kici_orch_job_last_success_timestamp_seconds stays absent
+  // after a successful cold-store-archive tick).
   it('records reach the Prometheus exporter after a job tick', async () => {
     const { getPrometheusExporter } = await import('@kici-dev/shared');
     const m = await import('./scheduled-jobs.js');

@@ -46,6 +46,8 @@ firecracker:
 
 With `autoProvisionHost` at its default (`true`), the orchestrator verifies and, if needed, provisions this host bridge when it starts — a fresh host needs no manual `kici-admin firecracker provision` step. Set it `false` to keep explicit operator control and provision the host network yourself. See [Firecracker host setup](../firecracker/host-setup.md#automatic-host-provisioning-on-startup) for the full behavior and the manual/`--persist` opt-out flow.
 
+Give each bridge on a host its own `table`, for example when two orchestrators run Firecracker scalers on one host. Provisioning replaces the NAT and baseline rules in its table, so a second bridge in the same table removes the NAT of the first, and the VMs on the first bridge lose internet access. `kici-admin firecracker verify` and `kici-admin diagnose` report the missing NAT. Provisioning the first bridge again only moves the problem to the second bridge: the fix is a separate `table` for each bridge.
+
 ## Firecracker-specific fields
 
 **Scaler-level fields:**
@@ -57,6 +59,10 @@ With `autoProvisionHost` at its default (`true`), the orchestrator verifies and,
 - `uid` / `gid` — Jailer UID / GID. Required.
 - `vcpuCount` — Default vCPU count for VMs. Optional; default `2`.
 - `memSizeMib` — Default memory in MiB for VMs. Optional; default `512`.
+- `extraHosts` — Extra `host:address` mappings that each VM adds to its `/etc/hosts`, for example `registry.local:host-gateway` or `cache.example.internal:10.1.2.3`. The address is an IPv4 or IPv6 address, or `host-gateway`, which stands for the bridge `gateway`: the address a VM reaches its host at. Optional; a VM gets no mapping by default.
+  - Write each entry as `host:address`. The container runtime also accepts `host=address` and a bracketed IPv6 address, but a Firecracker scaler does not. An entry that is not a hostname and an address stops the orchestrator at startup.
+  - A mapping names a host; it does not open a path to it. The per-VM chain blocks private (RFC 1918) addresses, the gateway included, unless the label set's [`networkPolicy`](./common-config.md#network-policy) allows them.
+  - The VM `/init` applies the mappings. A rootfs built before a KiCI release that supports this field ignores them: refresh it with `build-agent-rootfs.sh --agent-only <the rootfsPath image>` from a checkout of the current release (see [Firecracker rootfs](../firecracker/rootfs.md#upgrading)).
 - `requireSudo` — Wrap the privileged commands the backend runs (`ip`, `chown`, `chmod`, and `nft` for per-VM network isolation) with `sudo -n`. Optional; default `false`. Set it `true` when the orchestrator runs as a non-root user (for example a user-mode systemd unit) and the operator has a NOPASSWD sudoers entry for those binaries. Leave it unset when the orchestrator is root or already holds the required capabilities — `-n` fails fast rather than prompting, so an unnecessary `true` turns a working setup into a spawn failure.
 
 **Label-set-level fields:**
@@ -93,7 +99,7 @@ scalers:
     orchestratorUrl: 'ws://10.0.0.1:8080/ws'
     labelSets:
       - labels: [linux, vm]
-        rootfsPath: /var/lib/kici/rootfs-alpine.ext4
+        rootfsPath: /var/lib/kici/agent-rootfs.ext4
 ```
 
 Key differences from container/bare-metal:
@@ -122,24 +128,25 @@ The Firecracker backend requires the `ip_allocations` PostgreSQL table for DB-ba
 
 Firecracker VMs use a hybrid credential model to prevent customer workflow code from reading orchestrator credentials:
 
-1. **Boot:** The orchestrator URL, agent ID, labels, scaler-managed flag, gateway IP, and optionally an auth token and backpressure mode are injected via MMDS metadata at VM startup
+1. **Boot:** The orchestrator URL, agent ID, labels, scaler-managed flag, and optionally an auth token, a backpressure mode and the scaler's `extraHosts` mappings are injected via MMDS metadata at VM startup
 2. **Registration:** The agent connects via WebSocket and sends `agent.register`
 3. **Config delivery:** The orchestrator replies with `register.ack` containing the agent's confirmed config (labels, max concurrent jobs, scaler-managed flag)
 4. **Agent-side blocking:** After receiving `register.ack`, the agent blocks MMDS access via `iptables -A OUTPUT -d 169.254.169.254 -j DROP`
 5. **Agent acknowledgment:** The agent sends `config.ack` to confirm it received and applied the config
 6. **Host-side clearing:** The orchestrator clears MMDS data via the Firecracker API after receiving `config.ack`
 
-This two-sided approach (agent blocks + orchestrator clears) ensures MMDS data is inaccessible to customer code even if one side fails. The MMDS contains only agent bootstrap data (orchestrator URL, agent ID, labels including auto-injected `kici:agent:*`, `kici:scaler:*`, and `kici:role:*` labels, scaler-managed flag, gateway IP, optionally an ephemeral agent token, optionally a backpressure mode, and optionally `KICI_AGENT_ENV_*`-forwarded env vars under `meta-data/kici-env/`) -- no long-lived API keys or secrets.
+This two-sided approach (agent blocks + orchestrator clears) ensures MMDS data is inaccessible to customer code even if one side fails. The MMDS contains only agent bootstrap data, and no long-lived API keys or secrets. It holds the orchestrator URL, the agent ID, the labels (including the auto-injected `kici:agent:*`, `kici:scaler:*` and `kici:role:*` labels) and the scaler-managed flag. It can also hold an ephemeral agent token, the scaler's `extraHosts` mappings, a backpressure mode, and `KICI_AGENT_ENV_*`-forwarded env vars under `meta-data/kici-env/`.
 
 ## Helper scripts
 
-KiCI provides host-setup tooling — `kici-admin firecracker` for networking, plus helper scripts in `scripts/firecracker/`:
+KiCI provides host-setup tooling: `kici-admin firecracker` for networking, plus helper scripts in `scripts/firecracker/` of the source repository, [github.com/kici-dev/kici-public](https://github.com/kici-dev/kici-public), from KiCI 0.12.0 on. Run the scripts from a checkout of the release tag that matches your orchestrator:
 
-| Tool                               | Purpose                                                              |
-| ---------------------------------- | -------------------------------------------------------------------- |
-| `validate.sh`                      | Check host prerequisites (KVM, binaries, network)                    |
-| `kici-admin firecracker provision` | Create bridge interface + NAT rules; `--persist` for reboot survival |
-| `jailer-setup.sh`                  | Prepare jailer directory structure and cgroups                       |
-| `rootfs-builder.sh`                | Convert Docker images to ext4 rootfs                                 |
+| Tool                               | Purpose                                                                      |
+| ---------------------------------- | ---------------------------------------------------------------------------- |
+| `validate.sh`                      | Check host prerequisites (KVM, binaries, network)                            |
+| `install-firecracker.sh`           | Install the pinned Firecracker and jailer binaries, with jailer capabilities |
+| `kici-admin firecracker provision` | Create bridge interface + NAT rules; `--persist` for reboot survival         |
+| `jailer-setup.sh`                  | Prepare jailer directory structure and cgroups                               |
+| `build-agent-rootfs.sh`            | Build the agent rootfs image; needs the workspace installed and built        |
 
 For the complete setup guide, see [Firecracker host setup](../firecracker/host-setup.md).

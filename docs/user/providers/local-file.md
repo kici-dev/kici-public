@@ -37,7 +37,10 @@ kici-admin source add local \
 - `--path` must be an **absolute** directory on the agent filesystem. It is
   the base path the orchestrator's lock-file fetcher reads
   (`<path>/.kici/kici.lock.json`) and the base for the `file://` clone the
-  agent performs.
+  agent performs. The path must also be a directory on the orchestrator's
+  own host. An orchestrator that finds no directory there skips the source
+  and logs `Skipping local source — repoBasePath not a directory on this peer`.
+  In a cluster, only the orchestrators that host the path serve the source.
 - `--clone-url-base <url>` is optional. By default the agent clones via
   `file://<path>`. Supply a `git://` or `http://` base when the agent does
   **not** share the orchestrator's filesystem and must fetch the repo over a
@@ -53,8 +56,10 @@ kici-admin source update-local <id> --name new-name
 Remove it:
 
 ```bash
-kici-admin source remove <routingKey> --local
+kici-admin source remove <id> --local
 ```
+
+With `--local`, the argument is the source id that `source add local` printed, not a routing key.
 
 List and inspect (local sources render their `repoBasePath`):
 

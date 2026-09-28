@@ -6,7 +6,7 @@ import { SecretNotFoundError } from './errors.js';
 export interface SecretMeta {
   /** The resolved secret value. */
   value: string;
-  /** Backend name that provided the secret (e.g., 'pg', 'openbao-stg'). */
+  /** Backend name that provided the secret (e.g., 'pg', 'openbao'). */
   backend: string;
   /** Full prefixed scope path (e.g., 'pg:production/db'). */
   scope: string;

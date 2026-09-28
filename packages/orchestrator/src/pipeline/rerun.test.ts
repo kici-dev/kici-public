@@ -802,7 +802,7 @@ describe('handleRerun', () => {
   });
 
   it('throws RunArchivedNotRerunnableError on PG miss when cold-store cannot replay', async () => {
-    // Phase F: PG miss now goes through cold-store replay before failing.
+    // A PG miss goes through cold-store replay before failing.
     // With deps.coldStore=null (the default test harness) replay is skipped
     // and the gate surfaces the structured archive error so the Platform
     // proxy can map to HTTP 410.
@@ -886,13 +886,13 @@ describe('handleRerun', () => {
 
   it('routes via the cluster coordinator when one is available (cross-peer rerun)', async () => {
     // Coordinator stubbed so it answers with one locally-dispatched job and one
-    // rerouted to a peer. This is the exact failure mode from staging: the
-    // Platform proxies the rerun to a peer that cannot satisfy the labels, and
-    // without coordinator routing the job sits in dispatch_queue forever.
+    // rerouted to a peer. The failure mode it guards: the Platform proxies the
+    // rerun to a peer that cannot satisfy the labels, and without coordinator
+    // routing the job sits in dispatch_queue forever.
     const coordinator = {
       routeJobs: vi.fn().mockResolvedValue({
         localJobs: [{ jobName: 'test', jobId: 'local-job-1' }],
-        reroutedJobs: [{ jobName: 'other', peerId: 'host-1-stg' }],
+        reroutedJobs: [{ jobName: 'other', peerId: 'host-1-eu' }],
         failedJobs: [],
       }),
     };
@@ -929,15 +929,14 @@ describe('handleRerun', () => {
 
   // ── `run.rerun.request` orchestrator-side trust model (security invariant) ──
   //
-  // Pentest catalog at
-  // — Platform→Orchestrator dispatch surface under attacker model A10 (compromised
-  // Platform credential / rogue Platform process). The orchestrator's rerun
+  // Threat: a compromised Platform credential or a rogue Platform process
+  // driving the Platform→Orchestrator dispatch surface. The orchestrator's rerun
   // pipeline trusts Platform on user-identity attribution (`actor` / `triggeredBy`
   // are Platform-supplied; orch has no independent OIDC trust to Keycloak) — that
   // is by-design under the 3-tier auth model and out of scope here. The
   // tenant-isolation invariants below ARE in scope; the tests pin them so a
   // future regression that erodes them shows up as a loud test failure.
-  describe('tenant-isolation invariants under rogue Platform (A10)', () => {
+  describe('tenant-isolation invariants under a rogue Platform', () => {
     it('rejects with RunArchivedNotRerunnableError when cold-store is wired but returns chunkId=null', async () => {
       // Tenant-isolation invariant 1: a runId Platform names that is missing
       // from the orchestrator DB AND has no cold-store match must NOT lead to

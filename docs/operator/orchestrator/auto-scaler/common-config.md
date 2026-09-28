@@ -223,7 +223,7 @@ scalers:
 
 The ledger lives at `${KICI_MACHINE_LEDGER_DIR}/<pool-name>.json`. When `KICI_MACHINE_LEDGER_DIR` is unset, the directory is resolved by trying, in order, the first writable of: `/var/lib/kici/scaler-ledger`, then `${XDG_STATE_HOME:-~/.local/state}/kici/scaler-ledger`, then `${TMPDIR}/kici-scaler-ledger` (last resort, e.g. CI sandboxes). Set `KICI_MACHINE_LEDGER_DIR` to override.
 
-Cross-orchestrator coordination is mandatory for staging+test setups that run two orchestrator processes against the same host — without a shared pool, both can each spawn up to their own caps and OOM the host. Reference the same pool name in both orchestrator config files and the ledger keeps them honest.
+Cross-orchestrator coordination is mandatory when two orchestrator processes run against the same host, for example two environments on one machine. Without a shared pool, both can each spawn up to their own caps and OOM the host. Reference the same pool name in both orchestrator config files and the ledger keeps them honest.
 
 ## Warm pool
 
@@ -493,7 +493,7 @@ is a port:
 | `5000`             | Port 5000 on any of the host's addresses  |
 | `*:10143`          | The same, written explicitly              |
 | `10.98.0.0/24:443` | Port 443, only on addresses in that range |
-| `192.168.1.85`     | Every port on that one address            |
+| `192.168.1.40`     | Every port on that one address            |
 | `10.0.0.0/8:*`     | Every port on that range                  |
 
 A port entry admits both TCP and UDP. Host names are rejected: nftables matches

@@ -59,7 +59,7 @@ describe('UniversalGitCloneTokenProvider', () => {
       secretResolver: resolver,
     });
     const auth = await provider.issueGitAuth();
-    // Phase 4: PAT maps to `kind: 'basic'` on the wire (universal-git's
+    // A PAT maps to `kind: 'basic'` on the wire (universal-git's
     // credentialType 'pat' is just Basic auth with a known username).
     expect(auth).toEqual({ kind: 'basic', user: 'x-access-token', secret: 'the-secret' });
   });

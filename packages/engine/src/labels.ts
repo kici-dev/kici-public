@@ -14,7 +14,7 @@ import { z } from 'zod';
  *   kici:os:      — operating system (kici:os:linux, kici:os:macos, kici:os:windows)
  *   kici:arch:    — CPU architecture (kici:arch:x64, kici:arch:amd64, kici:arch:arm64)
  *   kici:agent:   — scaler/execution backend type (kici:agent:container, kici:agent:bare-metal, kici:agent:firecracker)
- *   kici:scaler:  — scaler backend name (kici:scaler:stg-container, kici:scaler:prod-firecracker)
+ *   kici:scaler:  — scaler backend name (kici:scaler:linux-container, kici:scaler:prod-firecracker)
  *   kici:host:    — hostname of the machine running the agent (kici:host:<hostname>)
  *   kici:role:    — agent role (kici:role:builder, kici:role:init-runner)
  *

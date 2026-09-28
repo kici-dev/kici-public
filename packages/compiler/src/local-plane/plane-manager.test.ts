@@ -38,7 +38,7 @@ vi.mock('./scaler-config.js', () => ({
   writeScalerConfig: vi.fn().mockReturnValue('/tmp/scaler.yaml'),
 }));
 vi.mock('./platform-attach.js', () => ({
-  derivePlatformWsUrl: vi.fn().mockReturnValue('wss://platform.example.com/kici-stg/ws'),
+  derivePlatformWsUrl: vi.fn().mockReturnValue('wss://platform.example.com/kici/ws'),
   mintOrchestratorKey: vi
     .fn()
     .mockResolvedValue({ key: 'kici_ok_secret', keyId: 'key-123', keyPrefix: 'kici_ok_' }),
@@ -83,7 +83,7 @@ describe('planeUp / planeStatus / planeDown', () => {
   // no globals to be set).
   afterEach(() => {
     delete (globalThis as Record<string, unknown>).KICI_VERSION;
-    delete (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT;
+    delete (globalThis as Record<string, unknown>).KICI_BUILD_DATE;
     fs.rmSync(configDir, { recursive: true, force: true });
     delete process.env.KICI_CONFIG_DIR;
   });
@@ -147,7 +147,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     const paths = planePaths();
     // Concrete current identity, different from the seeded stamp below.
     (globalThis as Record<string, unknown>).KICI_VERSION = '0.1.28';
-    (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT = 'newcommit';
+    (globalThis as Record<string, unknown>).KICI_BUILD_DATE = '2026-09-27T00:00:00.000Z';
     fs.mkdirSync(paths.pgData, { recursive: true });
     fs.writeFileSync(path.join(paths.pgData, 'marker'), 'keep-me');
     fs.mkdirSync(path.dirname(paths.stampFile), { recursive: true });
@@ -158,7 +158,7 @@ describe('planeUp / planeStatus / planeDown', () => {
         port: 4319,
         pgKind: 'embedded',
         kiciVersion: '0.1.26',
-        buildCommit: 'oldcommit',
+        buildDate: '2026-09-01T00:00:00.000Z',
         stampVersion: PLANE_STAMP_VERSION, // current layout: only the identity is stale
       }),
     );
@@ -169,7 +169,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     // pgdata is PRESERVED on an identity reboot (unlike a stampVersion wipe).
     expect(fs.existsSync(path.join(paths.pgData, 'marker'))).toBe(true);
     delete (globalThis as Record<string, unknown>).KICI_VERSION;
-    delete (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT;
+    delete (globalThis as Record<string, unknown>).KICI_BUILD_DATE;
   });
 
   it('planeUp reuses a running plane when the build identity matches', async () => {
@@ -180,7 +180,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
     const paths = planePaths();
     (globalThis as Record<string, unknown>).KICI_VERSION = '0.1.28';
-    (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT = 'samecommit';
+    (globalThis as Record<string, unknown>).KICI_BUILD_DATE = '2026-09-15T00:00:00.000Z';
     fs.mkdirSync(path.dirname(paths.stampFile), { recursive: true });
     fs.writeFileSync(
       paths.stampFile,
@@ -189,7 +189,7 @@ describe('planeUp / planeStatus / planeDown', () => {
         port: 4319,
         pgKind: 'embedded',
         kiciVersion: '0.1.28',
-        buildCommit: 'samecommit',
+        buildDate: '2026-09-15T00:00:00.000Z',
         stampVersion: PLANE_STAMP_VERSION,
         mode: 'independent',
       }),
@@ -199,7 +199,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     expect(st.running).toBe(true);
     expect(spawnOrchestratorProcess).not.toHaveBeenCalled(); // reused
     delete (globalThis as Record<string, unknown>).KICI_VERSION;
-    delete (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT;
+    delete (globalThis as Record<string, unknown>).KICI_BUILD_DATE;
   });
 
   it('planeUp does not reboot on a stale stamp when the current identity is unknown', async () => {
@@ -209,7 +209,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { planeUp } = await import('./plane-manager.js');
     const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
     const paths = planePaths();
-    // No globals set → current buildCommit resolves to 'unknown' → guard holds.
+    // No globals set → current buildDate resolves to 'unknown' → guard holds.
     fs.mkdirSync(path.dirname(paths.stampFile), { recursive: true });
     fs.writeFileSync(
       paths.stampFile,
@@ -218,7 +218,7 @@ describe('planeUp / planeStatus / planeDown', () => {
         port: 4319,
         pgKind: 'embedded',
         kiciVersion: '0.1.26',
-        buildCommit: 'oldcommit',
+        buildDate: '2026-09-01T00:00:00.000Z',
         stampVersion: PLANE_STAMP_VERSION,
         mode: 'independent',
       }),
@@ -229,77 +229,120 @@ describe('planeUp / planeStatus / planeDown', () => {
   });
 
   describe('planeBuildIsStale', () => {
-    const setIdentity = (version: string, buildCommit: string) => {
+    const setIdentity = (version: string, buildDate: string) => {
       (globalThis as Record<string, unknown>).KICI_VERSION = version;
-      (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT = buildCommit;
+      (globalThis as Record<string, unknown>).KICI_BUILD_DATE = buildDate;
     };
     const clearIdentity = () => {
       delete (globalThis as Record<string, unknown>).KICI_VERSION;
-      delete (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT;
+      delete (globalThis as Record<string, unknown>).KICI_BUILD_DATE;
     };
     afterEach(clearIdentity);
 
     it('is false when there is no existing stamp', async () => {
-      setIdentity('9.9.9', 'newcommit');
+      setIdentity('9.9.9', '2026-09-27T00:00:00.000Z');
       const { planeBuildIsStale } = await import('./plane-manager.js');
       expect(planeBuildIsStale(null)).toBe(false);
     });
 
     it('is true when the stamped version differs', async () => {
-      setIdentity('0.1.28', 'samecommit');
+      setIdentity('0.1.28', '2026-09-15T00:00:00.000Z');
       const { planeBuildIsStale } = await import('./plane-manager.js');
       const stamp = {
         orchestratorPid: 1,
         port: 4319,
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.26',
-        buildCommit: 'samecommit',
+        buildDate: '2026-09-15T00:00:00.000Z',
         stampVersion: 3,
       };
       expect(planeBuildIsStale(stamp)).toBe(true);
     });
 
-    it('is true when the stamped build commit differs (same semver)', async () => {
-      setIdentity('0.1.28', 'newcommit');
+    it('is true when the stamped build date differs (same semver)', async () => {
+      setIdentity('0.1.28', '2026-09-27T00:00:00.000Z');
       const { planeBuildIsStale } = await import('./plane-manager.js');
       const stamp = {
         orchestratorPid: 1,
         port: 4319,
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.28',
-        buildCommit: 'oldcommit',
+        buildDate: '2026-09-01T00:00:00.000Z',
         stampVersion: 3,
       };
       expect(planeBuildIsStale(stamp)).toBe(true);
     });
 
-    it('is false when version and commit both match', async () => {
-      setIdentity('0.1.28', 'samecommit');
+    it('is false when version and build date both match', async () => {
+      setIdentity('0.1.28', '2026-09-15T00:00:00.000Z');
       const { planeBuildIsStale } = await import('./plane-manager.js');
       const stamp = {
         orchestratorPid: 1,
         port: 4319,
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.28',
-        buildCommit: 'samecommit',
+        buildDate: '2026-09-15T00:00:00.000Z',
         stampVersion: 3,
       };
       expect(planeBuildIsStale(stamp)).toBe(false);
     });
 
     it('is false when the current build identity is unknown (source/test)', async () => {
-      clearIdentity(); // no globals → buildCommit resolves to 'unknown'
+      clearIdentity(); // no globals → buildDate resolves to 'unknown'
       const { planeBuildIsStale } = await import('./plane-manager.js');
       const stamp = {
         orchestratorPid: 1,
         port: 4319,
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.26',
-        buildCommit: 'oldcommit',
+        buildDate: '2026-09-01T00:00:00.000Z',
         stampVersion: 3,
       };
       expect(planeBuildIsStale(stamp)).toBe(false);
     });
+
+    it('is true for a stamp an older kici wrote, which carries a build commit and no build date', async () => {
+      // breaks-if-wrong: the first plane boot after the upgrade replaces the old
+      // plane once, as a different build identity does.
+      setIdentity('0.1.28', '2026-09-15T00:00:00.000Z');
+      const { planeBuildIsStale } = await import('./plane-manager.js');
+      const olderStamp = JSON.parse(
+        JSON.stringify({
+          orchestratorPid: 1,
+          port: 4319,
+          pgKind: 'embedded',
+          kiciVersion: '0.1.28',
+          buildCommit: '3e5f7a9c1',
+          stampVersion: 3,
+        }),
+      ) as Parameters<typeof planeBuildIsStale>[0];
+      expect(planeBuildIsStale(olderStamp)).toBe(true);
+    });
+  });
+
+  it('planeUp stamps the build date and no build commit', async () => {
+    // fails-when: the CLI bakes and stamps a build commit — a commit ID from the
+    // private repository, written into every customer's stamp.json.
+    const { classifyPlane } = await import('./plane-liveness.js');
+    vi.mocked(classifyPlane).mockResolvedValue({ kind: 'free' });
+    const { planeUp } = await import('./plane-manager.js');
+    const { planePaths } = await import('./paths.js');
+    Object.assign(globalThis, {
+      KICI_VERSION: '0.1.28',
+      KICI_BUILD_DATE: '2026-09-15T00:00:00.000Z',
+      KICI_BUILD_COMMIT: '3e5f7a9c1',
+    });
+    try {
+      await planeUp();
+      const text = fs.readFileSync(planePaths().stampFile, 'utf-8');
+      expect(JSON.parse(text)).toMatchObject({
+        kiciVersion: '0.1.28',
+        buildDate: '2026-09-15T00:00:00.000Z',
+      });
+      expect(text).not.toContain('3e5f7a9c1');
+    } finally {
+      delete (globalThis as Record<string, unknown>).KICI_BUILD_COMMIT;
+    }
   });
 
   it('planeUp generates a dev-signed identity keypair and passes it to the orchestrator', async () => {
@@ -348,21 +391,21 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { attachPlane, readAttachment, readPlatformToken } = await import('./plane-manager.js');
     const { planePaths } = await import('./paths.js');
     const st = await attachPlane({
-      apiBase: 'https://platform.example.com/kici-stg',
+      apiBase: 'https://platform.example.com/kici',
       pat: 'kici_pat_abc',
-      orgId: 'kiciStg00001',
+      orgId: 'acmeOrg00001',
     });
     expect(st.mode).toBe('hybrid');
     expect(st.attachment).toMatchObject({
-      platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
-      platformApiBase: 'https://platform.example.com/kici-stg',
-      orgId: 'kiciStg00001',
+      platformWsUrl: 'wss://platform.example.com/kici/ws',
+      platformApiBase: 'https://platform.example.com/kici',
+      orgId: 'acmeOrg00001',
       keyId: 'key-123',
     });
     // Orchestrator booted hybrid with the minted token.
     const call = vi.mocked(spawnOrchestratorProcess).mock.calls.at(-1);
     expect(call?.[1].attach).toMatchObject({
-      platformWsUrl: 'wss://platform.example.com/kici-stg/ws',
+      platformWsUrl: 'wss://platform.example.com/kici/ws',
       platformToken: 'kici_ok_secret',
     });
     // Token persisted 0600, NOT in the stamp; durable attachment written.
@@ -759,7 +802,7 @@ describe('planeUp / planeStatus / planeDown', () => {
         port: 4319,
         pgKind: 'embedded',
         kiciVersion: '0.0.0',
-        buildCommit: 'unknown',
+        buildDate: 'unknown',
         stampVersion: 1,
         mode: 'independent',
       }),

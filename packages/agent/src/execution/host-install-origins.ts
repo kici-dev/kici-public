@@ -42,9 +42,9 @@ export function parseRegistryOrigin(entry: string): RegistryOriginParse {
     return { ok: false, reason: 'is not an http or https URL' };
   }
   if (url.username || url.password) return { ok: false, reason: 'carries credentials' };
-  // fails-when: `http://verdaccio.local:4873/npm/` is accepted, so an operator
+  // fails-when: `http://registry.local:4873/npm/` is accepted, so an operator
   // reads the path as a narrower grant than the origin match applies.
-  // breaks-if-wrong: `http://verdaccio.local:4873` and its trailing-slash form
+  // breaks-if-wrong: `http://registry.local:4873` and its trailing-slash form
   // both parse.
   if (url.pathname !== '/' || url.search || url.hash) {
     return { ok: false, reason: 'names more than an origin (a path, query or fragment)' };

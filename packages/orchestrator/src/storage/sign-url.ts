@@ -10,7 +10,8 @@
  * Signature input: `${method}:${key}:${expiresUnixMs}` with HMAC-SHA256 keyed
  * by a per-orchestrator-process secret (random 32-byte hex at boot, persists
  * for the lifetime of the process). Tokens become invalid on orchestrator
- * restart — fine for the filesystem backend's E2E / single-host use case.
+ * restart — fine for the filesystem backend's single-host / test-sandbox use
+ * case.
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';

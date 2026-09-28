@@ -10,7 +10,7 @@ import { type Kysely, sql } from 'kysely';
  *   fully-resolved list when a deferred-init agent eval resolves dynamic
  *   elements. NULL = the job binds no environment.
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so staging data is
+ * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
  * preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {

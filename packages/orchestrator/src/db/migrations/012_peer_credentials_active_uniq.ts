@@ -13,13 +13,11 @@ import { type Kysely, sql } from 'kysely';
  * nothing and both `INSERT`s succeeded, leaving 2+ ACTIVE rows for the same
  * `instance_id`. The peer's local credential file then ended up holding a
  * hash that a later concurrent `save()` had revoked, causing an endless
- * "Peer HMAC proof invalid" loop. See
- *  for the
- * full incident write-up (DB rows + log evidence from real staging deploys).
+ * "Peer HMAC proof invalid" loop.
  *
  * The `up()` first dedupes any pre-existing duplicates (revoke all but the
  * newest active row per `instance_id`) — required because earlier migrations
- * predate the constraint and existing staging DBs already have the dupes.
+ * predate the constraint and existing databases may already hold the dupes.
  *
  * `down()` only drops the index; it does NOT undo the dedupe (there's no
  * safe way to recreate revoked rows, and the dedupe is monotonic).

@@ -55,7 +55,7 @@ export const dashboardRunDetailRequestSchema = z.object({
 /**
  * Request the machine-first, provenance-tagged structured run result from the
  * orchestrator (user-plane equivalent of the orchestrator-admin
- * `/runs/:id/structured` endpoint). Reuses the Phase-1 `AgentRunResult` shape.
+ * `/runs/:id/structured` endpoint). Reuses the `AgentRunResult` shape.
  */
 export const dashboardRunStructuredRequestSchema = z.object({
   type: z.literal('dashboard.run.structured'),
@@ -763,7 +763,7 @@ export const runRerunRequestSchema = z.object({
   actor: actorPrincipalSchema,
   runId: z.string(),
   /**
-   * Phase F — Platform forwards the original run's `routing_key` so the
+   * The Platform forwards the original run's `routing_key` so the
    * orchestrator can probe its cold-store under the right tenant prefix
    * when the run is missing from PG. Optional for backwards compatibility
    * with older Platform versions in mixed deploys; if absent, the
@@ -940,7 +940,7 @@ export const dashboardEventLogDetailRequestSchema = z.object({
   orgId: z.string(),
   deliveryId: z.string(),
   /**
-   * Phase E cold-store hint: when the Platform side has resurrected the
+   * Cold-store hint: when the Platform side has resurrected the
    * archived `event_log` row, it forwards the `routing_key` so the
    * orchestrator can scope its own cold-store fetch to a single tenant
    * prefix instead of scanning every routing_key for the org.
@@ -1055,7 +1055,7 @@ export const dashboardEventLogPayloadStreamRequestSchema = z.object({
   orgId: z.string(),
   deliveryId: z.string(),
   /**
-   * Phase E cold-store hint: when Platform has resurrected the archived
+   * Cold-store hint: when Platform has resurrected the archived
    * `event_log` row, it forwards `routing_key` so the orchestrator can scope
    * its own cold-store fetch to a single tenant prefix instead of scanning
    * every routing_key for the org. Mirrors `dashboardEventLogDetailRequestSchema`.
@@ -1810,7 +1810,7 @@ const heldRunsListResponseSchema = z.object({
         // relayed message, and because `dashboard.held-runs.list.response` is a
         // type the Platform recognizes, the relay treats that failure as
         // malformed rather than version skew and CLOSES the orchestrator's
-        // WebSocket (`packages/platform/src/ws/handler.ts`). That is exactly
+        // WebSocket. That is exactly
         // what `released` did: one released wait-timer hold dropped the whole
         // control-plane connection, in a reconnect loop.
         //

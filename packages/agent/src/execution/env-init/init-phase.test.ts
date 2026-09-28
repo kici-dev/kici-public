@@ -142,6 +142,79 @@ describe('runInitPhase', () => {
     expect(saveSpy).not.toHaveBeenCalled();
   });
 
+  it('runs the command without the cache when the restore fails, and still saves on the miss', async () => {
+    const { send, msgs } = collectIpc();
+    // fails-when: a restore error propagates — the init fails with
+    // `fetch failed` although a miss would have run the command cold.
+    const restoreSpy = vi.fn().mockRejectedValue(new Error('fetch failed'));
+    const saveSpy = vi.fn().mockResolvedValue(undefined);
+    const { $, calls } = fakeShell();
+    const spec = {
+      run: 'mise install',
+      cache: { key: 'm', paths: ['~/.local/share/mise'] },
+    } as GenericInitConfig;
+    const result = await runInitPhase({
+      specs: [spec],
+      shellFor: () => $,
+      sendIpc: send,
+      stepIndexBase: 7,
+      cache: { restore: restoreSpy, save: saveSpy },
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(saveSpy).toHaveBeenCalledWith(spec.cache);
+    const warning = msgs.find((m) => m.type === 'log.line');
+    expect(warning).toMatchObject({ type: 'log.line', stepIndex: 7, stream: 'stderr' });
+    expect(warning && 'line' in warning ? warning.line : '').toMatch(
+      /cache restore failed.*m.*fetch failed/,
+    );
+    expect(msgs.at(-1)).toMatchObject({ type: 'step.complete', status: 'success', stepIndex: 7 });
+  });
+
+  it('does not fail an init whose command succeeded when the cache save fails', async () => {
+    const { send, msgs } = collectIpc();
+    const restoreSpy = vi.fn().mockResolvedValue({ hit: false });
+    const saveSpy = vi.fn().mockRejectedValue(new Error('upload HTTP 503'));
+    const applyDelta = vi.fn().mockResolvedValue(undefined);
+    const spec = {
+      run: 'mise install',
+      cache: { key: 'm', paths: ['~/.local/share/mise'] },
+    } as GenericInitConfig;
+    const result = await runInitPhase({
+      specs: [spec],
+      shellFor: () => fakeShell().$,
+      sendIpc: send,
+      stepIndexBase: 0,
+      cache: { restore: restoreSpy, save: saveSpy },
+      env: { beginCapture: vi.fn().mockResolvedValue(undefined), applyDelta },
+    });
+    // fails-when: a save error propagates past a command that already put the
+    // toolchain in place, failing the job over a lost cache entry.
+    expect(result.ok).toBe(true);
+    // The installed toolchain still reaches later steps.
+    expect(applyDelta).toHaveBeenCalledTimes(1);
+    const warning = msgs.find((m) => m.type === 'log.line');
+    expect(warning && 'line' in warning ? warning.line : '').toMatch(
+      /cache save failed.*upload HTTP 503/,
+    );
+  });
+
+  it('still fails the init when the command fails after a failed restore', async () => {
+    // breaks-if-wrong: degrading the cache must not mask a real init failure.
+    const { send } = collectIpc();
+    const saveSpy = vi.fn().mockResolvedValue(undefined);
+    const result = await runInitPhase({
+      specs: [{ run: 'mise install', cache: { key: 'm', paths: ['x'] } } as GenericInitConfig],
+      shellFor: () => fakeShell({ exitCode: 2 }).$,
+      sendIpc: send,
+      stepIndexBase: 0,
+      cache: { restore: vi.fn().mockRejectedValue(new Error('fetch failed')), save: saveSpy },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/exit 2/);
+    expect(saveSpy).not.toHaveBeenCalled();
+  });
+
   it('skips cache calls entirely when spec has no cache', async () => {
     const { send } = collectIpc();
     const restoreSpy = vi.fn();

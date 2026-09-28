@@ -24,7 +24,7 @@
  *   non-optional audit-log row.
  *
  *   context_variables (non-secret config per docs/user/contexts.md
- *   §31: "Variables — non-secret key-value configuration") are
+ *   § "Overview": "Variables — non-secret key-value configuration") are
  *   intentionally plaintext-readable via
  *   `GET /api/v1/admin/contexts/:name`; that's outside the
  *   no-readback scope.

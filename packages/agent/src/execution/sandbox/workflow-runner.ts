@@ -436,15 +436,15 @@ const pendingEmitResponses = new Map<
   }
 >();
 
-/** Default timeout for event.emit responses (5 seconds per research doc). */
+/** Default timeout for event.emit responses (5 seconds). */
 const EMIT_RESPONSE_TIMEOUT_MS = 5_000;
 
 /**
  * Wait for an event.emit.response from the agent with the given requestId.
  *
  * On timeout, resolves with a synthetic success receipt and logs a warning
- * (per research doc pitfall 5: event was already persisted by orchestrator,
- * so it will still be routed even if the ack is lost).
+ * (the orchestrator already persisted the event, so it is still routed even
+ * if the ack is lost).
  */
 
 /** In-flight git write-grant requests, keyed by requestId. */
@@ -1723,7 +1723,7 @@ export function createSandboxStepContext(
         ),
     },
     // Build, sign, and persist a provenance attestation. The identity token is
-    // relayed via ctx.kici.oidc.token (P1.4); the bundle is uploaded over the
+    // relayed via ctx.kici.oidc.token; the bundle is uploaded over the
     // provenance.request IPC -> agent WS -> orchestrator presigned PUT.
     attestProvenance: buildAttestProvenanceFn(request, workDir, (o) => kici.oidc.token(o)),
     ...(rawPayload && { rawPayload }),
@@ -2850,9 +2850,7 @@ async function applyEnvFilesDelta(
  * single shared pair truncated between steps — each step still sees only its own
  * delta. The pair is now per-step so two concurrently-running steps cannot
  * corrupt each other's delta file. `process.env.KICI_ENV` / `process.env.KICI_PATH`
- * remain process-global, so Phase 1 forbids `setEnv` / `addPath` / `$KICI_ENV`
- * writes inside `parallel()` children (compile-time validation); Phase 0 only
- * makes the file pair per-task.
+ * remain process-global: only the file pair is per-task.
  */
 export function buildStepEnvFileHooks(
   operatorSecretKeys: Set<string>,
@@ -3172,9 +3170,9 @@ async function main(): Promise<void> {
   // `ctx.secrets.exposeFile`), keyed by step index so concurrent steps keep
   // independent secrets-audit trails.
   const stepTasks = new StepTaskRegistry();
-  // Per-step abort controllers. Today they are only aborted via the composed
-  // `ctx.signal` when the job is cancelled / times out; Phase 1 fail-fast aborts
-  // an individual step's controller to cancel one in-flight sibling.
+  // Per-step abort controllers. The composed `ctx.signal` aborts them when the
+  // job is cancelled / times out, and a `parallel()` group's fail-fast aborts an
+  // individual step's controller to cancel one in-flight sibling.
   const stepAbortControllers = new Map<number, AbortController>();
   // The single job-scoped allocator behind every step's `ctx.mktemp` /
   // `ctx.mktempFile` — created here, after all prepare-phase early exits
@@ -3246,9 +3244,9 @@ async function main(): Promise<void> {
     jobDeadlineSignal: jobDeadlineAbort.signal,
     startTime: jobStartTime,
     // Run each step body (and its hooks) inside an async-context capture scope so
-    // console output attributes to that step's index even under Phase 1
-    // concurrency. The flush below runs inside this scope, so a step's trailing
-    // partial line is still attributed to it.
+    // console output attributes to that step's index even when `parallel()`
+    // children run concurrently. The flush below runs inside this scope, so a
+    // step's trailing partial line is still attributed to it.
     runWithStepCapture: runInStepCapture,
     getSecretsAccessLog: (stepIndex) => {
       // Flush any remaining console output buffered for this step. Called inside

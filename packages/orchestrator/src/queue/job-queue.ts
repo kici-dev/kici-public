@@ -1273,12 +1273,12 @@ export class JobQueue {
    * declared failed, so any dispatch_queue row still in `Pending`,
    * `Recovering`, or `Dispatched` is by definition orphaned and must
    * also be moved to `Failed` — leaving a `Dispatched` row in place
-   * keeps the row in a non-terminal state forever, which the build-timeout
-   * E2E (and any operator query for "is this run actually done") relies
-   * on never happening. The complementary {@link markCompleted} status
-   * guard ensures a late `job.complete` from the agent that was still
-   * working when the run was declared failed cannot flip the row back
-   * to `Completed`.
+   * keeps the row in a non-terminal state forever, which any caller
+   * polling for a terminal state (and any operator query for "is this
+   * run actually done") relies on never happening. The complementary
+   * {@link markCompleted} status guard ensures a late `job.complete` from
+   * the agent that was still working when the run was declared failed
+   * cannot flip the row back to `Completed`.
    *
    * @returns Number of affected rows.
    */

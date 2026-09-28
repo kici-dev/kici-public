@@ -54,6 +54,13 @@ export async function waitForQuiesce(
   }
 }
 
+/**
+ * What a version switch prints when it cannot read the live migration ledger,
+ * so it could not compare the schema to the recorded head.
+ */
+export const SCHEMA_NOT_CHECKED =
+  'The running service could not be reached, so the schema was not checked.';
+
 /** One entry of `GET /api/v1/admin/db/migrate/status`. */
 export interface MigrationStatusRow {
   name: string;
@@ -87,11 +94,12 @@ export type SchemaGuardVerdict =
  * Decide whether the version pointer may move.
  *
  * Three outcomes, and the middle one is the compatibility shim: an instance
- * installed before `migrationHeads` existed has no recorded head, and refusing
- * there would break the documented `--rollback` on exactly the installs that
- * predate the guard. So an unknown head warns loudly and falls through to the
- * existing confirmation prompt; the map is populated at the next version
- * change, arming the guard one upgrade later.
+ * installed before `migrationHeads` existed, or one whose upgrade away from the
+ * target ran without admin access, has no recorded head, and refusing there
+ * would break the documented `--rollback` on exactly those installs. So an
+ * unknown head warns loudly and falls through to the existing confirmation
+ * prompt; the map is populated at the next version change with admin access,
+ * arming the guard one upgrade later.
  */
 export function schemaGuardVerdict(input: {
   targetVersion: string;
@@ -104,14 +112,16 @@ export function schemaGuardVerdict(input: {
       kind: 'unknown-head',
       message:
         `WARNING: no migration head is recorded for ${targetVersion}.\n` +
-        `  This instance was installed before the schema guard existed, so it cannot be\n` +
-        `  checked whether the database is ahead of that version. If it is, the older\n` +
-        `  binary will refuse to boot with "corrupted migrations" and restart in a loop.\n` +
+        `  Either this instance was installed before the schema guard existed, or the\n` +
+        `  upgrade away from ${targetVersion} ran without admin access (KICI_ADMIN_TOKEN).\n` +
+        `  So it cannot be checked whether the database is ahead of that version. If it\n` +
+        `  is, the older binary will refuse to boot with "corrupted migrations" and\n` +
+        `  restart in a loop.\n` +
         `  Take a dump first ("kici-admin db backup"). If the switch does loop, start the\n` +
         `  older version with KICI_AUTO_MIGRATE=false — it boots only if every newer\n` +
         `  migration was purely additive.\n` +
-        `  The head is recorded from this version change on, so the guard is armed for\n` +
-        `  the next one.`,
+        `  A version change with admin access records the head, which arms the guard\n` +
+        `  for the next one.`,
     };
   }
 

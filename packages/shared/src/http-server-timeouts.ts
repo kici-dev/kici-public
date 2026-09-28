@@ -9,9 +9,9 @@
  * hint Node sends. So the proxy can pick a pooled connection at the very
  * instant Node is closing it, write the request, and read EOF. Go retries
  * that for an idempotent request; for a POST it answers 502, and a
- * provider webhook is not redelivered. One staging push webhook landed
- * exactly six seconds after the previous delivery on the same connection
- * and was lost this way.
+ * provider webhook is not redelivered. A push webhook that reuses a pooled
+ * connection a few seconds after the previous delivery, just as Node closes
+ * it, is lost this way.
  *
  * The listener therefore outlives every common proxy pool: the proxy always
  * closes first, on its own schedule, and never writes into a socket the

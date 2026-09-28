@@ -17,8 +17,7 @@ describe('heartbeat-health policy', () => {
 
   it('pins the two teardown boundaries', () => {
     // ws/heartbeat.ts applies these verbatim, so changing either moves live
-    // teardown timing and requires re-running the reconnect and WS relay E2E
-    // categories.
+    // teardown timing, which WebSocket reconnect and relay behaviour depend on.
     expect(HEARTBEAT_UNHEALTHY_MARK_MS).toBe(90_000);
     expect(HEARTBEAT_CLOSE_MS).toBe(180_000);
   });

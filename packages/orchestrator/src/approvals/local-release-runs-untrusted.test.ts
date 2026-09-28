@@ -7,7 +7,7 @@
  * 1. **It actually dispatches.** The approve is driven through the real admin
  *    route → the real `applyDecision` → the real `routeRelease` → the real
  *    `resumeWorkflow`, and the assertion is on `dispatchMatchedWorkflow` being
- *    called with the held run's own id. Task 11b's lesson is that a release
+ *    called with the held run's own id. A release
  *    which flips the row and never dispatches is indistinguishable from a
  *    working one if you assert on the row.
  * 2. **The dispatch it produces is still degraded.** The context the replay

@@ -52,8 +52,8 @@ export interface LocalTriggerRequest {
 /**
  * Build the GitHub-shaped webhook request the plane's local provider normalizer
  * expects. Mirrors `buildLocalTriggerRequest` in the orchestrator's
- * `cli/commands/local-trigger.ts` (kept local to honour the compiler-only scope
- * of this phase — no orchestrator export is added).
+ * `cli/commands/local-trigger.ts` (kept local, so the compiler imports no
+ * orchestrator export for it).
  */
 export function buildLocalTriggerRequest(input: LocalTriggerInput): LocalTriggerRequest {
   // A dispatch event carries `action` (the `types` matcher key) + `client_payload`

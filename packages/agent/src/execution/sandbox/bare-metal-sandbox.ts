@@ -128,7 +128,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
    */
   async executeJob(options: JobExecutionOptions): Promise<JobExecutionResult> {
     // When bwrap is enabled and the dispatch repo URL is a `file://` clone
-    // (used by the internal provider in dev/E2E), expose the source dir
+    // (the internal provider clones local repositories), expose the source dir
     // read-only inside the sandbox so the workflow runner's `git clone`
     // step can read it. Without this the clone fails inside bwrap with
     // `does not appear to be a git repository`.

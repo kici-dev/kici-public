@@ -328,7 +328,7 @@ describe('StaleRunDetector', () => {
     const mocks = createDeps();
     // The job's worker peer is currently connected.
     mocks.peerRegistry.getPeer.mockReturnValue({ connected: true });
-    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+    const job = staleJob({ rerouted_to_peer: 'arm-worker' });
 
     const db = createSequentialDb({
       selects: [
@@ -350,9 +350,9 @@ describe('StaleRunDetector', () => {
 
   it('scan() still fails a job rerouted to a DISCONNECTED worker peer', async () => {
     const mocks = createDeps();
-    // No peer named 'arm-stg' is connected — a dead worker must not hang the job.
+    // No peer named 'arm-worker' is connected — a dead worker must not hang the job.
     mocks.peerRegistry.getPeer.mockReturnValue(undefined);
-    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+    const job = staleJob({ rerouted_to_peer: 'arm-worker' });
 
     const db = createSequentialDb({
       selects: [
@@ -379,7 +379,7 @@ describe('StaleRunDetector', () => {
     // disconnected but its last heartbeat is recent, so it will reconnect and
     // replay the job's buffered terminal status. The run must NOT be failed.
     mocks.peerRegistry.getPeer.mockReturnValue({ connected: false, lastHeartbeatAt: Date.now() });
-    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+    const job = staleJob({ rerouted_to_peer: 'arm-worker' });
 
     const db = createSequentialDb({
       selects: [
@@ -407,7 +407,7 @@ describe('StaleRunDetector', () => {
       connected: false,
       lastHeartbeatAt: Date.now() - 10 * 60 * 1000,
     });
-    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+    const job = staleJob({ rerouted_to_peer: 'arm-worker' });
 
     const db = createSequentialDb({
       selects: [

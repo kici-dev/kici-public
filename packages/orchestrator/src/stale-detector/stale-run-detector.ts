@@ -56,6 +56,7 @@ import { DispatchQueueStatus } from '../queue/job-queue.js';
 import type { PeerRegistry } from '../cluster/peer-registry.js';
 import { shouldDeferReroutedJob } from '../cluster/rerouted-job-guard.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'stale-detector' });
 
@@ -342,21 +343,27 @@ export class StaleRunDetector {
           // Audit the expiry. The stale detector expires the hold automatically
           // (no human / Keycloak user context), so the actor is the stale-detector
           // system component.
-          void this.accessLogWriter?.record({
-            orgId: hold.org_id,
-            routingKey: null,
-            actor: { type: 'system', component: 'stale-detector' },
-            action: 'held_run.expire',
-            target: { type: 'held_run', id: hold.id },
-            requestId: null,
-            source: 'platform_proxy',
-            outcome: 'allowed',
-            meta: {
-              runId: hold.run_id,
-              jobId: hold.job_id,
-              holdScope: hold.hold_scope,
-            },
-          });
+          runDetached(
+            logger,
+            'Access log write',
+            () =>
+              this.accessLogWriter?.record({
+                orgId: hold.org_id,
+                routingKey: null,
+                actor: { type: 'system', component: 'stale-detector' },
+                action: 'held_run.expire',
+                target: { type: 'held_run', id: hold.id },
+                requestId: null,
+                source: 'platform_proxy',
+                outcome: 'allowed',
+                meta: {
+                  runId: hold.run_id,
+                  jobId: hold.job_id,
+                  holdScope: hold.hold_scope,
+                },
+              }),
+            { heldRunId: hold.id },
+          );
         } catch (err) {
           logger.error('Error routing expired hold', {
             holdId: hold.id,
@@ -470,7 +477,7 @@ export class StaleRunDetector {
    * After all sub-scans, checks run completion for affected runs.
    *
    * Note: jobs in 'recovering' state are NOT scanned -- they have their own
-   * per-job recovery timers managed by the Dispatcher (see Phase 15).
+   * per-job recovery timers managed by the Dispatcher.
    * All sub-scans filter on status='running' or status='dispatched',
    * so recovering jobs are naturally excluded.
    */

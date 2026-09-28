@@ -24,10 +24,9 @@
  *
  * The phased rename that introduced this rule (P0–P8) is complete: the
  * `MIGRATING_ENV_VARS` ratchet is gone and `KICI_*` is the only accepted
- * project-internal namespace. New env vars MUST use `KICI_*` — see
- * `.claude/rules/env-vars.md` for the convention and how to add one
- * (always `KICI_*`, register in the relevant package's `defineEnv`
- * envMap, regenerate `docs/operator/env-reference.md`, done).
+ * project-internal namespace. New env vars MUST use `KICI_*`: register the
+ * name in the relevant package's `defineEnv` envMap and regenerate
+ * `docs/operator/env-reference.md`.
  */
 
 /**
@@ -55,15 +54,16 @@
  *                           sets to drive cloned / overlay workspaces).
  *   - Postgres libpq      — PGHOST, PGPORT, PGUSER, PGPASSWORD,
  *                           PGDATABASE, PGSERVICEFILE, PGSSLMODE.
- *   - Forgejo dev server  — FORGEJO_URL, FORGEJO_CONTAINER (read by the
- *                           staging Forgejo bootstrap script; conventional
+ *   - Forgejo server      — FORGEJO_URL, FORGEJO_CONTAINER (read by a
+ *                           Forgejo bootstrap script; conventional
  *                           names owned by Forgejo, not KiCI).
  *   - Keycloak admin CLI  — KEYCLOAK_* (Keycloak's own admin tooling and
  *                           docs use unprefixed `KEYCLOAK_BASE_URL`,
  *                           `KEYCLOAK_ADMIN_CLIENT_ID`,
- *                           `KEYCLOAK_ADMIN_CLIENT_SECRET`, etc. — the
- *                           E2E admin helpers honour those names as a
- *                           fallback after `KICI_KEYCLOAK_*`).
+ *                           `KEYCLOAK_ADMIN_CLIENT_SECRET`, etc. — tooling
+ *                           that drives the Keycloak admin API honours
+ *                           those names as a fallback after
+ *                           `KICI_KEYCLOAK_*`).
  *   - Vite client config  — VITE_* (Vite reserves this prefix for env
  *                           vars exposed to client bundles; `VITE_BASE`
  *                           and `VITE_DOCS_BASE_URL` flow through this

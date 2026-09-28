@@ -137,7 +137,7 @@ The filter receives a `FilterContext`:
 | `env`                | `Record<string, string\|undefined>`       | Environment variables.                                                                     |
 | `$`                  | zx shell                                  | Shell executor.                                                                            |
 
-`RepoInfo` carries `path` (an absolute path to the checkout on the evaluating agent) plus optional `ref` and `sha`. **Both are optional** — an event that carries no single ref leaves them undefined, so guard before reading them.
+`RepoInfo` carries `identifier` (the repo's `owner/repo` name) and `path` (an absolute path to the checkout on the evaluating agent), plus optional `ref` and `sha`. **`ref` and `sha` are optional** — an event that carries no single ref leaves them undefined, so guard before reading them.
 
 **`sourceRepo.path` is not stable across evaluations.** Its _contents_ are: the evaluating agent and the later run see the same tree at the same commit. The path itself is not — a different working directory, and possibly a different machine. Read _through_ it; never embed it in a job name, an output, or anything compared across calls.
 
@@ -264,7 +264,7 @@ The gate is a standard job. Tolerate a failed invoked run with `continueOnError`
 job('repo-tests', {
   invoke: invokeSource('myorg.repo-tests'),
   continueOnError: true,
-  timeout: '1h',
+  timeout: 60 * 60 * 1000, // one hour, in milliseconds
   maxParallel: 10,
   failFast: true,
 });

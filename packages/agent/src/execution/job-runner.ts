@@ -528,11 +528,11 @@ function determineExecutionMode(
  * - Default: a fresh `mkdtemp` the agent clones into and removes after the job.
  * - **In-place profile** (`inPlace` config + a `file://` source): the source's
  *   real repo path used directly as the workDir, with **no clone** and **no
- *   removal**. This is the routed `deploy:stg` profile — the operator runs their
- *   own already-built working tree (module-relative `MONOREPO_ROOT`,
- *   `node_modules`, `dist` all present). Gated to `file://` so a
- *   Platform-connected agent (https sources) can never be pushed onto a tree,
- *   and read only from agent config (never a dispatch/wire value).
+ *   removal**. The operator runs their own already-built working tree
+ *   (module-relative `MONOREPO_ROOT`, `node_modules`, `dist` all present).
+ *   Gated to `file://` so a Platform-connected agent (https sources) can never
+ *   be pushed onto a tree, and read only from agent config (never a
+ *   dispatch/wire value).
  */
 export async function resolveJobWorkDir(
   inPlace: boolean,
@@ -1320,11 +1320,10 @@ export class JobRunner {
     }
 
     // Log the sandbox failure with its actual cause so a remote-agent failure
-    // is diagnosable from the agent log alone (shipped to Loki for persistent
-    // peers, dumped by the E2E run-id grep for ephemeral runs). For an
-    // init-phase failure there are no step results, so result.error is the only
-    // place the cause lives; for step failures we also list each failed step's
-    // error message.
+    // is diagnosable from the agent log alone, for persistent and ephemeral
+    // agents alike. For an init-phase failure there are no step results, so
+    // result.error is the only place the cause lives; for step failures we also
+    // list each failed step's error message.
     if (result.status === ExecutionJobStatus.enum.failed) {
       const stepErrors = result.stepResults
         .filter((r) => r.error)
@@ -1396,8 +1395,8 @@ export class JobRunner {
       // target so a stock rescue box boots on its vendored Node. The PRIMARY
       // source is the orchestrator's own cache bucket (pulled via a presigned
       // URL over `kici.presignAgentPackage`); KICI_AGENT_PAYLOAD_DIR selects the
-      // air-gap local-dir fallback; KICI_AGENT_COMMAND (golden image) skips
-      // staging entirely.
+      // air-gap local-dir fallback; KICI_AGENT_COMMAND (golden image) skips the
+      // payload copy entirely.
       const transport = async (method: string, params: Record<string, unknown>) =>
         this._sendApiRequest!(method, params);
       const payloadSource = this.config.agentPayloadDir

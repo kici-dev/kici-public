@@ -678,9 +678,9 @@ describe('buildRequest - job timeout', () => {
 
 // --- buildBwrapArgs tests ---
 //
-// The splice logic that adds `/lib64` when it exists on the host is the
-// source of a regression seen in E2E: an off-by-one caused bwrap to receive
-// `--ro-bind /lib --ro-bind /lib64 /lib64 /lib` which bwrap parsed as
+// The splice logic that adds `/lib64` when it exists on the host once
+// regressed: an off-by-one caused bwrap to receive
+// `--ro-bind /lib --ro-bind /lib64 /lib64 /lib`, which bwrap parsed as
 // "mount /lib at --ro-bind, then exec the command /lib64", crashing with
 // `bwrap: execvp /lib64: No such file or directory`. These tests lock in
 // the correct argument layout on both x86_64 (/lib64 present) and arm64
@@ -737,8 +737,8 @@ describe('buildBwrapArgs', () => {
     assertBindInvariant(args);
 
     // /lib and /lib64 are both bound, in the right order, with correct
-    // source/destination pairing. This is the exact layout that broke in
-    // E2E before the splice fix.
+    // source/destination pairing. This is the exact layout that broke
+    // before the splice fix.
     const joined = args.join(' ');
     expect(joined).toContain('--ro-bind /lib /lib --ro-bind /lib64 /lib64');
 
@@ -784,7 +784,7 @@ describe('buildBwrapArgs', () => {
     const joined = args.join(' ');
     // /etc/hosts must be exposed read-only: bwrap auto-creates /etc with only the
     // explicitly-bound files, so without it a host-net sandbox cannot resolve names
-    // that live only in /etc/hosts (e.g. verdaccio.local -> 127.0.0.1). Absent the
+    // that live only in /etc/hosts (e.g. registry.local -> 127.0.0.1). Absent the
     // bind, glibc's nsswitch falls through to mDNS/DNS and resolves the name to a
     // DIFFERENT host, so `npm install` hits the wrong registry and the run fails.
     expect(joined).toContain('--ro-bind /etc/hosts /etc/hosts');
@@ -820,7 +820,7 @@ describe('buildBwrapArgs', () => {
     // Distributions like nvm/mise/asdf colocate `npm` under
     // $NODE_ROOT/lib/node_modules. Without binding the entire root, the
     // workflow runner's `npm install` step crashes with `Cannot find module
-    // .../lib/node_modules/npm/bin/npm-cli.js`. Regression seen in E2E.
+    // .../lib/node_modules/npm/bin/npm-cli.js`. Regression guard.
     mockExistsSync.mockReturnValue(false);
     const { buildBwrapArgs } = await import('./fork-runner.js');
 
@@ -868,7 +868,7 @@ describe('buildBwrapArgs', () => {
     // No pnpm-workspace.yaml found walking up — production tarball case.
     // Without this bind, bwrap'd Node crashes with `Cannot find module
     // '/home/.../workflow-runner.js'` because the host install path is not
-    // mapped into the sandbox. Regression seen in E2E (kici-e2e-orch-restart.log).
+    // mapped into the sandbox.
     mockExistsSync.mockReturnValue(false);
     const { buildBwrapArgs } = await import('./fork-runner.js');
 
@@ -941,7 +941,7 @@ describe('buildBwrapArgs', () => {
     // pnpm symlinks point to sibling packages outside of node_modules. The
     // only way to make those resolve inside the sandbox is to bind the
     // entire workspace root. Without this the runner crashes with
-    // `Cannot find package '@kici-dev/shared'`. Regression seen in E2E.
+    // `Cannot find package '@kici-dev/shared'`. Regression guard.
     mockExistsSync.mockImplementation(
       (p: string) => p === '/home/u/devel/repo/pnpm-workspace.yaml',
     );
@@ -1010,10 +1010,10 @@ describe('buildBwrapArgs', () => {
   });
 
   it('appends extraReadOnlyBinds (e.g. file:// clone source dirs)', async () => {
-    // Internal-provider E2E uses `file:///path/to/test-repo` as the clone
-    // URL. The test repo lives outside the workspace root, so without
+    // The internal provider can use `file:///path/to/repo` as the clone
+    // URL. That repo lives outside the workspace root, so without
     // mounting it into the sandbox the workflow runner's git clone fails
-    // with `does not appear to be a git repository`. Regression seen in E2E.
+    // with `does not appear to be a git repository`. Regression guard.
     mockExistsSync.mockImplementation((p: string) => p === '/srv/test-repos/myrepo');
     const { buildBwrapArgs } = await import('./fork-runner.js');
 

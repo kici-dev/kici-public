@@ -13,10 +13,9 @@
  * `mkdir` succeeds for exactly one caller when the directory does not exist,
  * so it works as a portable `flock` substitute without any native dependency.
  *
- * The plan considered `proper-lockfile` and `fs-ext` first; neither is a
- * transitive dep today (`pnpm why proper-lockfile` and `pnpm why fs-ext`
- * both empty), so we use the documented `mkdir` fallback. This avoids
- * adding a native binding for the sake of a single locking primitive.
+ * Neither `proper-lockfile` nor `fs-ext` is a dependency, so this uses the
+ * `mkdir` lock instead. This avoids adding a native binding for the sake of
+ * a single locking primitive.
  *
  * ## Crash safety
  *
@@ -40,6 +39,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createLogger } from '@kici-dev/shared';
 import type { ResourceCap } from './types.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'machine-ledger' });
 
@@ -425,7 +425,7 @@ export class MachineLedger {
   start(intervalMs = 30_000): void {
     if (this.reaperTimer !== null) return;
     this.reaperTimer = setInterval(() => {
-      void this.reapAllPools();
+      runDetached(logger, 'Machine ledger reap', () => this.reapAllPools());
     }, intervalMs);
     // Don't keep the event loop alive solely for the reaper.
     if (typeof this.reaperTimer === 'object' && 'unref' in this.reaperTimer) {

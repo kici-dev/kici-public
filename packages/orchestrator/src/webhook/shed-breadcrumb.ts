@@ -5,8 +5,8 @@
  * status, so without this row a shed delivery leaves nothing queryable by
  * delivery id: the durable overflow row is internal to the replayer and is
  * deleted the moment a replay succeeds, and the shed itself survives only as a
- * log line. An operator (and an E2E assertion) then cannot tell a delivery that
- * was shed and is waiting for replay from one that never arrived at all.
+ * log line. An operator then cannot tell a delivery that was shed and is
+ * waiting for replay from one that never arrived at all.
  *
  * The row is written with `onlyIfAbsent`, so it never overwrites an outcome the
  * pipeline already reached for the same delivery — a re-shed of an

@@ -57,9 +57,9 @@ describe('gcStaleTmpDirs', () => {
     expect(await exists(young)).toBe(true);
   });
 
-  it('spares old NON-matching directories (kici-e2e-cache, kici-data)', async () => {
+  it('spares old NON-matching directories (kici-build-cache, kici-data)', async () => {
     const base = await makeBase();
-    const cache = await seed(base, 'kici-e2e-cache', 30 * DAY_MS);
+    const cache = await seed(base, 'kici-build-cache', 30 * DAY_MS);
     const data = await seed(base, 'kici-data', 30 * DAY_MS);
     const removed = await gcStaleTmpDirs({ base, pattern: RUN_PATTERN, maxAgeMs: 3 * DAY_MS });
     expect(removed).toEqual([]);

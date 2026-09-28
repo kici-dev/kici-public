@@ -2,7 +2,7 @@ import type { JSONWebKeySet } from 'jose';
 
 /**
  * Derive the JWKS URI for a provenance OIDC issuer. Identical to the Platform's
- * own derivation (`packages/platform/src/dashboard/routes/runs.ts`) so a bundle
+ * own derivation so a bundle
  * verified client-side and at ingest resolve the same key set.
  */
 export function deriveJwksUri(issuer: string): string {
@@ -22,8 +22,8 @@ export interface ProvenanceTrustRoot {
 }
 
 /**
- * A trust root backed by the orchestrator's OWN signing keys (Phase 1
- * orchestrator-owned attestations). Verify-at-ingest resolves the key set from
+ * A trust root backed by the orchestrator's OWN signing keys
+ * (orchestrator-owned attestations). Verify-at-ingest resolves the key set from
  * the `orchestrator_signing_keys` table so fresh rotations / revocations are
  * reflected immediately, and the issuer is the orchestrator's own configured
  * provenance issuer. The key set is read fresh from the DB each resolve (a cheap

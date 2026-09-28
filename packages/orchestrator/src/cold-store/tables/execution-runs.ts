@@ -5,7 +5,7 @@
  * Contract:
  *   - tenant column: `routing_key`
  *   - partition column: `created_at`
- *   - warm TTL: 30 days (design §5 matrix row 7)
+ *   - warm TTL: 30 days
  *   - eligibility: terminal run status AND no live jobs reference this run
  *
  * Order: registered LAST in the orchestrator cold-store. Within one
@@ -31,7 +31,7 @@ const APPROX_ROW_BYTES = 1000;
 
 const TERMINAL_STATUS_LIST: readonly string[] = Array.from(TERMINAL_RUN_STATES);
 
-/** Per-table defaults (design §5 matrix row 7). */
+/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,
@@ -158,7 +158,7 @@ export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
   }
 
   /**
-   * Phase F — natural-key extractor used by `replayRow` so callers
+   * Natural-key extractor used by `replayRow` so callers
    * (the rerun pipeline) can locate the chunk holding a given UUID
    * `run_id` without knowing the internal SERIAL `id` returned by
    * `rowId()`.
@@ -168,10 +168,10 @@ export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
   }
 
   /**
-   * Phase F — replay a chunk's `execution_runs` rows back into
+   * Replay a chunk's `execution_runs` rows back into
    * Orchestrator PG. Mirrors the Platform-side replayInsert; the
    * audit row goes to `access_log` (not `audit_log`) because the
-   * orchestrator's audit surface is access_log per design §8.
+   * orchestrator's audit surface is access_log.
    *
    * Idempotent on duplicate replays via `ON CONFLICT (run_id) DO
    * NOTHING`. Decrements `cold_store_chunk_counts` (floored at 0).

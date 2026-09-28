@@ -127,7 +127,7 @@ kici-admin workflow register-manual --lock-file <path> --repo <ident> --routing-
 
 `list` inspects workflow registrations from the `workflow_registrations` table. All filters are optional and combinable.
 
-`register-manual` seeds `workflow_registrations` rows straight from a compiled lock file — used by local-only / non-Git deployments and E2E helpers that can't rely on a webhook-driven compile-and-register flow. Dual-mode (HTTP via admin API, or direct DB via `--database-url`).
+`register-manual` seeds `workflow_registrations` rows straight from a compiled lock file — used by local-only / non-Git deployments and by test setups that can't rely on a webhook-driven compile-and-register flow. Dual-mode (HTTP via admin API, or direct DB via `--database-url`).
 
 ### event -- internal event emission
 
@@ -135,7 +135,7 @@ kici-admin workflow register-manual --lock-file <path> --repo <ident> --routing-
 kici-admin event emit <name> --payload-file <path> [--source-routing-key <k>] [--source-repo <r>] [--database-url <url>] [--json]
 ```
 
-Inserts a row into `kici_events` and fires `pg_notify('kici_event_channel', <id>)` so the orchestrator's `EventRouter` picks it up immediately. Dogfooded landing pad for `e2e/helpers/internal-webhook.ts#emitInternalEvent()` — simulates what an agent's `ctx.emit()` does from within a step execution. Dual-mode: HTTP (`POST /api/v1/admin/events/emit`) or direct DB via `emitKiciEventDirect` from `@kici-dev/shared`.
+Inserts a row into `kici_events` and fires `pg_notify('kici_event_channel', <id>)` so the orchestrator's `EventRouter` picks it up immediately. It does what an agent's `ctx.emit()` does from within a step execution. Dual-mode: HTTP (`POST /api/v1/admin/events/emit`) or direct DB via `emitKiciEventDirect` from `@kici-dev/shared`.
 
 - `<name>` is the event name (e.g. `deploy.completed`).
 - `--payload-file` is required and must contain a JSON object (not an array).
@@ -501,7 +501,7 @@ Synopsis: `kici-admin runs ephemeral-key <runId> [options]`
 
 ### `kici-admin runs jobs`
 
-List jobs for a run (dogfooded via /api/v1/admin/runs/:runId/jobs)
+List jobs for a run (admin API: /api/v1/admin/runs/:runId/jobs)
 
 Synopsis: `kici-admin runs jobs <runId> [options]`
 
@@ -520,7 +520,7 @@ Synopsis: `kici-admin runs jobs <runId> [options]`
 
 ### `kici-admin runs list`
 
-List execution runs (dogfooded via /api/v1/admin/runs)
+List execution runs (admin API: /api/v1/admin/runs)
 
 Synopsis: `kici-admin runs list [options]`
 
@@ -539,7 +539,7 @@ Synopsis: `kici-admin runs list [options]`
 
 ### `kici-admin runs logs`
 
-Print a page of a step log (dogfooded via /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)
+Print a page of a step log (admin API: /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)
 
 Synopsis: `kici-admin runs logs <runId> [options]`
 
@@ -623,7 +623,7 @@ Synopsis: `kici-admin workflow`
 
 ### `kici-admin workflow list`
 
-List workflow registrations (dogfooded via /api/v1/admin/registrations)
+List workflow registrations (admin API: /api/v1/admin/registrations)
 
 Synopsis: `kici-admin workflow list [options]`
 

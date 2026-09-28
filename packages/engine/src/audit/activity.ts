@@ -2,8 +2,7 @@
  * Unified Activity row + filter schemas for the dashboard's federated
  * "Activity" view. Federates Platform `audit_log` (mutation events,
  * free-form target_type) with orchestrator `access_log` (reads + admin
- * mutations, strict-enum target_type) at the query layer — see plan
- * `~/.claude/plans/ui-audit-logs-page-sleepy-wave.md`.
+ * mutations, strict-enum target_type) at the query layer.
  *
  * The `source` discriminator on each row tells the UI whether to render
  * the audit_log or access_log column set. Fields unique to access_log

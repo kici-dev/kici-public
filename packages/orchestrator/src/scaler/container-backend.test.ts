@@ -468,12 +468,12 @@ describe('ContainerScalerBackend', () => {
 
     it('passes extraHosts to HostConfig.ExtraHosts', async () => {
       const backend = await createBackend({
-        extraHosts: ['verdaccio.local:host-gateway'],
+        extraHosts: ['registry.local:host-gateway'],
       });
       await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
 
       const args = mockCreateContainer.mock.calls[0][0];
-      expect(args.HostConfig.ExtraHosts).toEqual(['verdaccio.local:host-gateway']);
+      expect(args.HostConfig.ExtraHosts).toEqual(['registry.local:host-gateway']);
     });
 
     it('does NOT set ExtraHosts when extraHosts is not configured', async () => {
@@ -588,7 +588,7 @@ describe('ContainerScalerBackend', () => {
           {
             labels: ['linux', 'docker'],
             image: 'test:latest',
-            networkPolicy: { hostAccess: ['192.168.1.85:5000'] },
+            networkPolicy: { hostAccess: ['192.168.1.40:5000'] },
           },
         ],
       });
@@ -596,18 +596,18 @@ describe('ContainerScalerBackend', () => {
 
       expect(mockAddHostIsolationRules).toHaveBeenCalledWith(
         '172.30.0.5',
-        ['192.168.1.85:5000'],
+        ['192.168.1.40:5000'],
         'saddr',
       );
     });
 
     it('folds the orchestrator host services into the default', async () => {
-      const backend = await createBackend({ hostServices: ['192.168.1.85:9000'] });
+      const backend = await createBackend({ hostServices: ['192.168.1.40:9000'] });
       await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
 
       expect(mockAddHostIsolationRules).toHaveBeenCalledWith(
         '172.30.0.5',
-        ['172.30.0.1:53', '*:4000', '192.168.1.85:9000'],
+        ['172.30.0.1:53', '*:4000', '192.168.1.40:9000'],
         'saddr',
       );
     });

@@ -32,6 +32,7 @@ let mockListResult: DiscoveredInstance[] = [];
 /** The compose driver's scan — a compose install the systemd driver cannot see. */
 let mockComposeListResult: DiscoveredInstance[] = [];
 const mockInstall = vi.fn().mockResolvedValue(undefined);
+const mockRestrict = vi.fn();
 const mockList = vi.fn(async (_isUserLevel: boolean) => mockListResult);
 const mockComposeList = vi.fn(async (_isUserLevel: boolean) => mockComposeListResult);
 let mockConfigDir = '';
@@ -60,6 +61,7 @@ vi.mock('../../service/index.js', async () => {
     getLogDir: vi.fn(() => mockLogDir),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
+    restrictEnvFileAccess: (...args: unknown[]) => mockRestrict(...args),
     // Substitute the drivers so the host's real systemd and compose registries
     // stay out of the test. A caller that names its own driver set keeps it,
     // mapped one-for-one onto doubles — so a guard that asks for a single
@@ -90,7 +92,7 @@ vi.mock('../../wizard/agent-wizard.js', () => ({
 
 // Import after mocks so the action picks up the mocked module.
 import { registerAgentInstall } from './install.js';
-import { readIndex, manifestPath } from '../../service/index.js';
+import { readIndex, manifestPath, readKiciVersion } from '../../service/index.js';
 
 function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -115,6 +117,7 @@ describe('agent install — folder-anchored', () => {
     mockListResult = [];
     mockComposeListResult = [];
     mockInstall.mockClear();
+    mockRestrict.mockReset();
     mockList.mockClear();
     mockComposeList.mockClear();
     mockConfigDir = tmpServiceConfigDir;
@@ -199,6 +202,51 @@ describe('agent install — folder-anchored', () => {
       isUserLevel: true,
       instanceDir: path.resolve(tmpInstanceDir),
     });
+  });
+
+  // fails-when: the Windows install writes the env file into a folder that
+  // still grants BUILTIN\Users read.
+  it('restricts the config folder on Windows before it writes the env file', async () => {
+    const { detectPlatform, resolveUserLevel } = await import('../../service/index.js');
+    const envFile = path.join(tmpServiceConfigDir, 'kici-test.env');
+    let envFileExistedAtRestrict: boolean | undefined;
+    mockRestrict.mockImplementation((envFilePath: string) => {
+      envFileExistedAtRestrict = fs.existsSync(envFilePath);
+    });
+    vi.mocked(detectPlatform).mockReturnValue('windows');
+    vi.mocked(resolveUserLevel).mockReturnValue(false);
+    try {
+      await runInstall();
+    } finally {
+      vi.mocked(detectPlatform).mockReturnValue('systemd');
+      vi.mocked(resolveUserLevel).mockReturnValue(true);
+    }
+
+    expect(mockRestrict).toHaveBeenCalledWith(envFile);
+    expect(envFileExistedAtRestrict).toBe(false);
+    // Positive control: the install wrote the env file after the restriction.
+    expect(fs.existsSync(envFile)).toBe(true);
+  });
+
+  // breaks-if-wrong: a systemd, launchd or compose install runs no icacls.
+  it('never restricts through icacls on other platforms', async () => {
+    await runInstall();
+    expect(mockInstall).toHaveBeenCalledTimes(1);
+    expect(mockRestrict).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: a user-level folder in the profile of its user is already
+  // private, and restricting it would lock that user out of it.
+  it('leaves a user-level Windows folder to the ACL of the profile', async () => {
+    const { detectPlatform } = await import('../../service/index.js');
+    vi.mocked(detectPlatform).mockReturnValue('windows');
+    try {
+      await runInstall();
+    } finally {
+      vi.mocked(detectPlatform).mockReturnValue('systemd');
+    }
+    expect(mockInstall).toHaveBeenCalledTimes(1);
+    expect(mockRestrict).not.toHaveBeenCalled();
   });
 
   it('passes component: agent to manager.install()', async () => {
@@ -406,6 +454,38 @@ describe('agent install — folder-anchored', () => {
     expect(fs.existsSync(manifestPath(tmpInstanceDir, 'agent'))).toBe(true);
   });
 
+  // fails-when: the agent install writes its fresh manifest over the one there.
+  it('re-running install keeps the creation time and recorded version', async () => {
+    fs.writeFileSync(
+      manifestPath(tmpInstanceDir, 'agent'),
+      JSON.stringify({
+        component: 'agent',
+        name: 'kici-test',
+        platform: 'systemd',
+        isUserLevel: true,
+        envFilePath: '/old/kici-test.env',
+        configDir: '/old/',
+        logDir: '/old/logs/',
+        installBase: '/opt/kici/kici-test/',
+        createdAt: '2026-01-02T03:04:05.000Z',
+        kiciVersion: '0.9.0',
+      }),
+    );
+    await runInstall();
+    const manifest = JSON.parse(fs.readFileSync(manifestPath(tmpInstanceDir, 'agent'), 'utf-8'));
+    expect(manifest.createdAt).toBe('2026-01-02T03:04:05.000Z');
+    expect(manifest.kiciVersion).toBe('0.9.0');
+    expect(manifest.configDir).toBe(tmpServiceConfigDir);
+    expect(manifest.migrationHeads).toBeUndefined();
+  });
+
+  // breaks-if-wrong: a first install still records the CLI's own version.
+  it('a first install records the version of the CLI that ran it', async () => {
+    await runInstall();
+    const manifest = JSON.parse(fs.readFileSync(manifestPath(tmpInstanceDir, 'agent'), 'utf-8'));
+    expect(manifest.kiciVersion).toBe(readKiciVersion());
+  });
+
   it('defaults --instance-dir to the current working directory', async () => {
     const savedCwd = process.cwd();
     try {
@@ -441,8 +521,51 @@ describe('agent install — folder-anchored', () => {
     const content = fs.readFileSync(envFile, 'utf-8');
     expect(content).toContain('KICI_ORCHESTRATOR_URL=http://orch.example.com:4000');
     expect(content).toContain('KICI_AGENT_TOKEN=test-token-abc123');
-    expect(content).toContain('KICI_AGENT_LABELS=linux,x64');
+    // fails-when: the labels land under a key the agent does not read — its
+    // unknown-variable check then refuses to start.
+    expect(content).toContain('KICI_LABELS=linux,x64');
+    expect(content).not.toContain('KICI_AGENT_LABELS');
     expect(content).toContain('generated by setup wizard');
+  });
+
+  it('writes the flags into the variables the agent reads', async () => {
+    // fails-when: --labels or --port is written under a key the agent does not
+    // read. breaks-if-wrong: the orchestrator URL and token keep their keys.
+    await runInstall([
+      '--orchestrator-url',
+      'ws://orch.example.com:4000/ws',
+      '--token',
+      'tok-1',
+      '--labels',
+      'linux,gpu',
+      '--port',
+      '8181',
+    ]);
+
+    const content = fs.readFileSync(path.join(tmpServiceConfigDir, 'kici-test.env'), 'utf-8');
+    expect(content.split('\n')).toEqual(
+      expect.arrayContaining([
+        'KICI_ORCHESTRATOR_URL=ws://orch.example.com:4000/ws',
+        'KICI_AGENT_TOKEN=tok-1',
+        'KICI_LABELS=linux,gpu',
+        'KICI_PORT=8181',
+      ]),
+    );
+    expect(content).not.toContain('KICI_AGENT_LABELS');
+  });
+
+  it.each([['0'], ['65536'], ['80a'], ['-1']])('rejects --port %s', async (port) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+
+    await expect(runInstall(['--port', port])).rejects.toThrow('process.exit called');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      `Error: --port must be a TCP port between 1 and 65535 (got "${port}")`,
+    );
+    exitSpy.mockRestore();
   });
 
   // fails-when: the env file is written under the ambient umask while holding

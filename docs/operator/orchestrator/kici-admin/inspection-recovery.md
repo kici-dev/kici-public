@@ -141,7 +141,7 @@ kici-admin access-log list [--org-id <orgId>] [--actor-type <t>] [--actor-id <id
 kici-admin access-log show <id> [--org-id <orgId>] [--json]
 ```
 
-Operator-facing read access to the orchestrator's `access_log` table — every read / admin-mutation attributed to an `ActorPrincipal` (user, api_key, service_account, platform_operator, system). Dogfood replacement for raw `psql` when an operator asks "who read this run's payload last Tuesday" or "show me everything a platform_operator actor did".
+Operator-facing read access to the orchestrator's `access_log` table — every read / admin-mutation attributed to an `ActorPrincipal` (user, api_key, service_account, platform_operator, system). It replaces raw `psql` when an operator asks "who read this run's payload last Tuesday" or "show me everything a platform_operator actor did".
 
 Output includes actor (type + id + optional metadata), action, source, outcome, target (if any), request ID, and timestamps.
 
@@ -245,7 +245,7 @@ Synopsis: `kici-admin access-log`
 
 ### `kici-admin access-log list`
 
-List access-log rows (dogfooded via /api/v1/admin/access-log)
+List access-log rows (admin API: /api/v1/admin/access-log)
 
 Synopsis: `kici-admin access-log list [options]`
 
@@ -647,7 +647,7 @@ Synopsis: `kici-admin event-log`
 
 ### `kici-admin event-log list`
 
-List inbound webhook deliveries (dogfooded via /api/v1/admin/event-log)
+List inbound webhook deliveries (admin API: /api/v1/admin/event-log)
 
 Synopsis: `kici-admin event-log list [options]`
 

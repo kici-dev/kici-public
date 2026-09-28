@@ -394,7 +394,7 @@ describe('PeerClient', () => {
       // once by the first successful peer-client. Sibling peer-clients on the
       // same orchestrator connecting to DIFFERENT target URLs must still
       // accept that credential, because the server-side verifies by
-      // instanceId, not by requester URL. Plan 04 follow-up: the credential
+      // instanceId, not by requester URL. The credential
       // file no longer records `coordinatorUrl` at all — identity scope alone.
       mockReadCredentialFile.mockResolvedValue({
         instanceId: 'local-orch',
@@ -463,7 +463,7 @@ describe('PeerClient', () => {
       // share the same on-disk credential file. Only the first one uses the
       // join token; the other two read the shared credential.
       //
-      // plan 04 blocker: previously peer-client B would see
+      // Regression: peer-client B would see
       // peer-client A's credential (written with A's coordinatorUrl), reject
       // it due to URL mismatch, fall back to the token, and get permanently
       // rejected because the token was already consumed.
@@ -1332,11 +1332,9 @@ describe('PeerClient', () => {
 
   // ── `permessage-deflate` compression bomb defense (security invariant) ──
   //
-  // Invariant (per the pentest catalog at
-  // every WS endpoint MUST cap `maxPayload`. PeerClient connects orchestrator-
-  // to-orchestrator, so a rogue or compromised peer could otherwise OOM the
-  // initiating orchestrator with a compression bomb. Pre- fix this site
-  // had NO options at all (`new WebSocket(this.url)`).
+  // Invariant: every WS endpoint MUST cap `maxPayload`. PeerClient connects
+  // orchestrator-to-orchestrator, so a rogue or compromised peer could
+  // otherwise OOM the initiating orchestrator with a compression bomb.
   describe('compression bomb defense (security invariant)', () => {
     it('caps maxPayload on the WebSocket constructor (= WS_MAX_PAYLOAD_BYTES)', () => {
       const { client } = createPeerClient();

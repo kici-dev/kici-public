@@ -6,9 +6,8 @@
  *     Requires: scheduled_job.trigger role permission (owner + admin roles)
  *     Returns: { triggered: true, ok: boolean, durationMs: number, error?: string }
  *
- * Phase A's E2E smoke uses this endpoint to force a cold-store-archive
- * tick without waiting for the hourly cron. Future dashboard "Run now"
- * buttons use it too.
+ * Use it, for example, to force a cold-store-archive tick without waiting
+ * for the hourly cadence.
  *
  * The access_log row is written directly (not via the typed
  * AccessLogWriter) because `scheduled_job.trigger` is not in the

@@ -580,13 +580,13 @@ export interface JobExecutionRequest {
    */
   token?: string;
   /**
-   * Structured auth for the source repo clone (Phase 4). When set, the
+   * Structured auth for the source repo clone. When set, the
    * workflow runner uses this instead of `token`.
    */
   sourceAuth?: GitAuthDispatch;
   /**
-   * Structured auth for the workflow repo clone (global workflows only,
-   * Phase 4). Falls back to `sourceAuth` → `token` when absent.
+   * Structured auth for the workflow repo clone (global workflows only).
+   * Falls back to `sourceAuth` → `token` when absent.
    */
   workflowAuth?: GitAuthDispatch;
 

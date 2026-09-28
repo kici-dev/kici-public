@@ -18,7 +18,7 @@ import type {
   ClusterSettingsReader,
 } from '../cluster/cluster-settings-reader.js';
 
-const ORG = 'kiciStg00001';
+const ORG = 'acmeOrg00001';
 
 function makeMockDb(row: Record<string, unknown> | undefined) {
   return createMockDb({ selectFirstRow: row }).db;
@@ -208,7 +208,7 @@ describe('GlobalWorkflowPolicy', () => {
       // Different routing key — entry does NOT apply, allow list ends up empty
       // for this workflow's routing key, so repo is rejected.
       const otherKey = await policy.isWorkflowRepoAllowed(
-        'generic:kiciStg00001:src-b',
+        'generic:acmeOrg00001:src-b',
         'myorg/ci-deploy',
         ORG,
       );
@@ -224,7 +224,7 @@ describe('GlobalWorkflowPolicy', () => {
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
 
       const a = await policy.isWorkflowRepoAllowed('github:42', 'myorg/ci-x', ORG);
-      const b = await policy.isWorkflowRepoAllowed('generic:kiciStg00001:src-b', 'myorg/ci-x', ORG);
+      const b = await policy.isWorkflowRepoAllowed('generic:acmeOrg00001:src-b', 'myorg/ci-x', ORG);
       expect(a.allowed).toBe(true);
       expect(b.allowed).toBe(true);
     });
@@ -233,7 +233,7 @@ describe('GlobalWorkflowPolicy', () => {
       const db = makeMockDb({
         customer_id: ORG,
         global_workflow_allowed_repos: [
-          { routingKey: 'generic:kiciStg00001:deleted', pattern: 'myorg/ci-*' },
+          { routingKey: 'generic:acmeOrg00001:deleted', pattern: 'myorg/ci-*' },
         ],
         global_workflow_denied_repos: null,
       });
@@ -299,7 +299,7 @@ describe('GlobalWorkflowPolicy', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [
-          { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/main' },
+          { routingKey: 'generic:acmeOrg00001:src-b', pattern: 'myorg/main' },
         ],
       });
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);
@@ -310,7 +310,7 @@ describe('GlobalWorkflowPolicy', () => {
 
       // Event came from source B → deny entry applies.
       const fromB = await policy.isSourceRepoAllowed(
-        'generic:kiciStg00001:src-b',
+        'generic:acmeOrg00001:src-b',
         'myorg/main',
         ORG,
       );
@@ -337,7 +337,7 @@ describe('GlobalWorkflowPolicy', () => {
   // end with universal-git-style `repoIdentifier` values (forge host
   // prefix included) and GitLab-style subgroup paths.
   describe('universal-git routing keys', () => {
-    const routingKey = 'generic:kiciStg00001:5f9a1e47-8b2c-4c8a-9f4e-1234567890ab';
+    const routingKey = 'generic:acmeOrg00001:5f9a1e47-8b2c-4c8a-9f4e-1234567890ab';
 
     it('isWorkflowRepoAllowed: glob matches Forgejo-style "host/owner/name"', async () => {
       const db = makeMockDb({

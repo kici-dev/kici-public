@@ -271,8 +271,8 @@ export interface GlobalEvalAgentRegistry {
  * fails outright or reports success without the `globalEvalComplete` the
  * orchestrator is waiting for. Either way the round never settles.
  *
- * Customers upgrade their orchestrator and their agents on their own schedule
- * (`.claude/rules/compatibility.md`), so an orchestrator ahead of its fleet is
+ * Customers upgrade their orchestrator and their agents on their own schedule,
+ * so an orchestrator ahead of its fleet is
  * a supported state and not an error — but it is one this module has to
  * recognise, because the damage is not confined to the new feature. A global
  * workflow that merely *contains* a generator now routes through the round, so

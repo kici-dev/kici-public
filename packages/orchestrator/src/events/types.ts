@@ -32,7 +32,7 @@ export interface EventRouterConfig {
   /**
    * **Test-only.** Per-event-name fault injection: when `attempts <= N`,
    * the EventRouter throws a synthetic dispatch error to drive the retry /
-   * DLQ path. Used by the fault-injection E2E to prove the lease + retry
+   * DLQ path. Used by fault-injection tests to prove the lease + retry
    * loop dispatches a real run when the inner dispatch eventually
    * succeeds, and lands the row in the DLQ when N exceeds
    * `maxDispatchAttempts`.

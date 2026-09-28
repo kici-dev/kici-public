@@ -4,7 +4,7 @@
  * Records all secret access/denial events to the secret_audit_log table
  * for compliance and security monitoring.
  *
- * Phase D: query() supports cold-store read-through via the optional
+ * query() supports cold-store read-through via the optional
  * `coldStore` constructor argument and an `includeArchived` query
  * filter. Hot-only behavior is unchanged when neither is supplied.
  */
@@ -95,7 +95,7 @@ export class AuditLogger {
     limit?: number;
     offset?: number;
     /**
-     * Phase D opt-in. When true, falls through to cold-store via
+     * Opt-in. When true, falls through to cold-store via
      * `loadSecretAuditLogRange` for any portion of the requested
      * window past the warm cutoff. Default false preserves the
      * original semantics.

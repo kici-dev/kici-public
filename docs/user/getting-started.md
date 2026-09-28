@@ -282,7 +282,7 @@ If you are setting up a project manually (without `kici init`), create a minimal
   "private": true,
   "type": "module",
   "devDependencies": {
-    "@kici-dev/sdk": "^0.0.1"
+    "@kici-dev/sdk": "latest"
   }
 }
 ```

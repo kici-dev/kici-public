@@ -413,13 +413,13 @@ export const build = workflow('build', {
 
 **`GenericInitConfig` shape:**
 
-| Field     | Type                    | Required | Description                                                                                                                                    |
-| --------- | ----------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `run`     | `string`                | yes      | Command run after clone, before steps. Runs in the job's sandbox at the clone root. Must be a non-empty command.                               |
-| `shell`   | `string`                | no       | Shell used to run `run`. Defaults to `bash`.                                                                                                   |
-| `cache`   | `CacheSpec`             | no       | Cache spec for binaries the command installs -- restored before the command, saved after on a key miss. See [Caching](./caching.md).           |
-| `timeout` | `number`                | no       | Max wall-clock for this init command in milliseconds. Defaults to 10 minutes. On breach the init is aborted and the job is reported timed out. |
-| `env`     | `Record<string,string>` | no       | Static environment variables available to the command.                                                                                         |
+| Field     | Type                    | Required | Description                                                                                                                                                                                                                                                             |
+| --------- | ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run`     | `string`                | yes      | Command run after clone, before steps. Runs in the job's sandbox at the clone root. Must be a non-empty command.                                                                                                                                                        |
+| `shell`   | `string`                | no       | Shell used to run `run`. Defaults to `bash`.                                                                                                                                                                                                                            |
+| `cache`   | `CacheSpec`             | no       | Cache spec for binaries the command installs -- restored before the command, saved after on a key miss. A failed restore runs the command without the cache, and a failed save does not fail the job. The init step's log names the error. See [Caching](./caching.md). |
+| `timeout` | `number`                | no       | Max wall-clock for this init command in milliseconds. Defaults to 10 minutes. On breach the init is aborted and the job is reported timed out.                                                                                                                          |
+| `env`     | `Record<string,string>` | no       | Static environment variables available to the command.                                                                                                                                                                                                                  |
 
 **The `$KICI_ENV` / `$KICI_PATH` handoff.** The init command does not mutate the step environment directly. Instead it writes what it wants visible to later steps to two files the agent allocates and exposes as environment variables:
 

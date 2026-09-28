@@ -93,7 +93,7 @@ export interface ApplyDecisionResult {
 export interface ApplyDecisionDeps {
   orgId: string;
   store: HeldRunStore;
-  /** Team name → member user ids (from the Plan-1 trust-policy cache). */
+  /** Team name → member user ids (from the trust-policy cache). */
   teamMembershipLookup: TeamMembershipLookup;
   /** Whether the run triggerer may self-approve (org_settings.allow_self_approval). */
   allowSelfApproval: boolean;

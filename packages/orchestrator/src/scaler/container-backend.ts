@@ -168,7 +168,7 @@ export interface ContainerScalerBackendOptions {
   runtime?: 'docker' | 'podman' | 'auto';
   /** Default resource limits applied when label set has none */
   defaultResources?: ResourceRequest;
-  /** Extra host:IP mappings injected into spawned containers (e.g. ["verdaccio.local:host-gateway"]) */
+  /** Extra host:IP mappings injected into spawned containers (e.g. ["registry.local:host-gateway"]) */
   extraHosts?: string[];
   /** Disable nftables-based network isolation (default: true). Set to false when nft is unavailable (e.g. rootless containers without NET_ADMIN). */
   networkIsolation?: boolean;

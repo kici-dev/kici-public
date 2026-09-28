@@ -14,6 +14,7 @@ function createMockStateStore(): RaftStateStore {
       leaderId: null,
     }),
     save: vi.fn().mockResolvedValue(undefined),
+    saveUnlessNewerTerm: vi.fn().mockResolvedValue(undefined),
     updateLeader: vi.fn().mockResolvedValue(undefined),
   } as unknown as RaftStateStore;
 }
@@ -120,6 +121,139 @@ describe('RaftNode', () => {
       const callsAfter = (stateStore.save as ReturnType<typeof vi.fn>).mock.calls.length;
       // No additional saves from timers after stop
       expect(callsAfter).toBe(callsBefore);
+    });
+  });
+
+  describe('after stop', () => {
+    // fails-when: a stopped follower acts on its leader's peer.leaving, its
+    // peers dropping, or a newer-term heartbeat, and elects itself — the
+    // sequence a cluster-wide shutdown produces.
+    it('never becomes leader again, grants no vote and writes no state', async () => {
+      const { raft, peerRegistry, stateStore, broadcastToPeers, onBecomeLeader } = createRaftNode({
+        electionTimeoutMinMs: 5000,
+        electionTimeoutMaxMs: 6000,
+      });
+      peerRegistry.addPeer({
+        instanceId: 'orch-2',
+        connectionId: 'conn-2',
+        address: null,
+        routingKeys: [],
+        role: 'coordinator',
+      });
+      await raft.start();
+      raft.handleAppendEntries({ type: 'raft.append.entries', term: 1, leaderId: 'orch-2' });
+      await raft.stop();
+      const writes = () =>
+        vi.mocked(stateStore.save).mock.calls.length +
+        vi.mocked(stateStore.saveUnlessNewerTerm).mock.calls.length;
+      const saves = writes();
+      const broadcasts = broadcastToPeers.mock.calls.length;
+      const term = raft.getCurrentTerm();
+
+      raft.handlePeerLeaving('orch-2');
+      peerRegistry.removePeer('orch-2');
+      raft.onPeerDisconnected();
+      raft.handleAppendEntries({ type: 'raft.append.entries', term: 2, leaderId: 'orch-3' });
+      raft.handleVoteResponse({
+        type: 'raft.vote.response',
+        term: 3,
+        voteGranted: true,
+        voterId: 'orch-3',
+      });
+      const vote = raft.handleVoteRequest({
+        type: 'raft.vote.request',
+        term: 3,
+        candidateId: 'orch-3',
+        lastLogIndex: 0,
+        lastLogTerm: 0,
+      });
+      raft.resetElectionTimer();
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(vote.voteGranted).toBe(false);
+      expect(onBecomeLeader).not.toHaveBeenCalled();
+      expect(raft.isLeader()).toBe(false);
+      expect(raft.getCurrentTerm()).toBe(term);
+      expect(writes()).toBe(saves);
+      expect(broadcastToPeers.mock.calls.length).toBe(broadcasts);
+    });
+
+    // fails-when: a leader keeps its leader-only services running after its
+    // Raft stops. breaks-if-wrong: a second stop() must not end them twice.
+    it('ends leadership once when a leader stops', async () => {
+      const { raft, onLoseLeadership } = createRaftNode();
+      await raft.start();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(raft.isLeader()).toBe(true);
+
+      await raft.stop();
+      await raft.stop();
+
+      expect(raft.isLeader()).toBe(false);
+      expect(onLoseLeadership).toHaveBeenCalledOnce();
+    });
+
+    // fails-when: a leader that stops saves itself as the leader into the
+    // cluster's one raft_state row, over the leader the rest elect.
+    it('persists no leader when a leader stops', async () => {
+      const { raft, stateStore } = createRaftNode();
+      await raft.start();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(raft.getLeaderId()).toBe('orch-1');
+
+      await raft.stop();
+
+      expect(raft.getLeaderId()).toBeNull();
+      expect(vi.mocked(stateStore.saveUnlessNewerTerm)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ leaderId: null }),
+      );
+    });
+
+    // breaks-if-wrong: a follower that stops keeps the leader it knows.
+    it('persists the known leader when a follower stops', async () => {
+      const { raft, stateStore, peerRegistry } = createRaftNode({
+        electionTimeoutMinMs: 5000,
+        electionTimeoutMaxMs: 6000,
+      });
+      peerRegistry.addPeer({
+        instanceId: 'orch-2',
+        connectionId: 'conn-2',
+        address: null,
+        routingKeys: [],
+        role: 'coordinator',
+      });
+      await raft.start();
+      raft.handleAppendEntries({ type: 'raft.append.entries', term: 1, leaderId: 'orch-2' });
+
+      await raft.stop();
+
+      expect(vi.mocked(stateStore.saveUnlessNewerTerm)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ leaderId: 'orch-2' }),
+      );
+    });
+
+    // breaks-if-wrong: a follower that stops has no leadership to end.
+    it('does not report lost leadership when a follower stops', async () => {
+      const { raft, onLoseLeadership } = createRaftNode({
+        electionTimeoutMinMs: 5000,
+        electionTimeoutMaxMs: 6000,
+      });
+      await raft.start();
+      await raft.stop();
+      expect(onLoseLeadership).not.toHaveBeenCalled();
+    });
+
+    // breaks-if-wrong: start() after stop() makes the node take part in
+    // elections again, instead of leaving it silently inert.
+    it('takes part in elections again after a new start()', async () => {
+      const { raft, onBecomeLeader } = createRaftNode();
+      await raft.start();
+      await raft.stop();
+      await raft.start();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(raft.isLeader()).toBe(true);
+      expect(onBecomeLeader).toHaveBeenCalledOnce();
+      await raft.stop();
     });
   });
 
@@ -648,14 +782,15 @@ describe('RaftNode', () => {
       await raft.stop();
     });
 
-    it('should save state on stop', async () => {
+    it('should save state on stop, never over a newer term', async () => {
       const { raft, stateStore } = createRaftNode();
       await raft.start();
       (stateStore.save as ReturnType<typeof vi.fn>).mockClear();
 
       await raft.stop();
 
-      expect(stateStore.save).toHaveBeenCalled();
+      expect(stateStore.saveUnlessNewerTerm).toHaveBeenCalledOnce();
+      expect(stateStore.save).not.toHaveBeenCalled();
     });
   });
 

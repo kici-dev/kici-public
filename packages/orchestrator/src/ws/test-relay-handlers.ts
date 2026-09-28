@@ -14,6 +14,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
 import { ExecutionRunStatus, TERMINAL_RUN_STATES, stringifyActor } from '@kici-dev/engine';
+import { createLogger } from '@kici-dev/shared';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
 import type {
   TestRelayRequest,
@@ -30,6 +31,9 @@ import type { AccessLogWriter } from '../audit/access-log.js';
 import { initTestUpload } from '../routes/uploads.js';
 import { processTestTrigger } from '../pipeline/test-pipeline.js';
 import type { ProcessingDeps } from '../pipeline/processor.js';
+import { runDetached } from '../helpers/run-detached.js';
+
+const logger = createLogger({ prefix: 'test-relay' });
 
 // `TERMINAL_RUN_STATES` for the relay status/logs `done` flag comes from the
 // engine, not a local copy: a hand-written duplicate of the terminal set is how
@@ -159,17 +163,23 @@ export async function handleTestTrigger(
     deps,
   );
 
-  void deps.accessLog?.record({
-    orgId: deps.orgId ?? null,
-    routingKey: deps.routingKey ?? msg.routingKey,
-    actor: msg.actor,
-    action: 'run.trigger',
-    target: { type: 'run', id: result.runId },
-    requestId: msg.requestId,
-    source: 'platform_proxy',
-    outcome: result.status === 'accepted' ? 'allowed' : 'denied',
-    ...(result.reason ? { errorMessage: result.reason } : {}),
-  });
+  runDetached(
+    logger,
+    'Access log write',
+    () =>
+      deps.accessLog?.record({
+        orgId: deps.orgId ?? null,
+        routingKey: deps.routingKey ?? msg.routingKey,
+        actor: msg.actor,
+        action: 'run.trigger',
+        target: { type: 'run', id: result.runId },
+        requestId: msg.requestId,
+        source: 'platform_proxy',
+        outcome: result.status === 'accepted' ? 'allowed' : 'denied',
+        ...(result.reason ? { errorMessage: result.reason } : {}),
+      }),
+    { requestId: msg.requestId, runId: result.runId },
+  );
 
   return {
     runId: result.runId,
@@ -279,7 +289,7 @@ const LOG_PATH_RE = /job-([^/]+)\/step-(-?\d+)\.log$/;
 
 /**
  * Return the next chunk of a run's logs from a monotonic line-offset cursor
- * (spec §13a). The orchestrator concatenates every log line in a deterministic
+ * The orchestrator concatenates every log line in a deterministic
  * `(jobName ASC, stepIndex ASC, lineIndex ASC)` order; `cursor` is the count of
  * lines already delivered. `done` is true only when the run is terminal AND the
  * cursor has reached the end (the final tail-draining poll). A poll mid-step
@@ -429,16 +439,22 @@ export async function handleTestCancel(
     .where('run_id', '=', runId)
     .execute();
 
-  void deps.accessLog?.record({
-    orgId: deps.orgId ?? null,
-    routingKey: deps.routingKey ?? null,
-    actor: msg.actor,
-    action: 'run.cancel',
-    target: { type: 'run', id: runId },
-    requestId: msg.requestId,
-    source: 'platform_proxy',
-    outcome: 'allowed',
-  });
+  runDetached(
+    logger,
+    'Access log write',
+    () =>
+      deps.accessLog?.record({
+        orgId: deps.orgId ?? null,
+        routingKey: deps.routingKey ?? null,
+        actor: msg.actor,
+        action: 'run.cancel',
+        target: { type: 'run', id: runId },
+        requestId: msg.requestId,
+        source: 'platform_proxy',
+        outcome: 'allowed',
+      }),
+    { requestId: msg.requestId, runId },
+  );
 
   return { cancelled: true };
 }

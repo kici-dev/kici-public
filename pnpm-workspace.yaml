@@ -7,7 +7,7 @@ packages:
 # the persisted workspace state. In this repo that path can fire as
 # `pnpm install --production` and prune devDependencies (vitest, eslint,
 # husky, prettier) — destroying the dev environment as a side effect of
-# an unrelated `pnpm e2e:foo` / `pnpm typecheck` invocation.
+# an unrelated `pnpm <script>` invocation such as `pnpm typecheck`.
 #
 # `warn` keeps the diagnostic (you'll see "your node_modules are out of
 # sync with your lockfile" and know to run `pnpm install` explicitly)
@@ -17,10 +17,9 @@ packages:
 #
 # Note: `confirmModulesPurge` and `CI=true` are NOT substitutes — they
 # only suppress the "are you sure?" TTY prompt around the destructive
-# install; the install itself still runs and still prunes. The
-# `CI=true` use in packages/ci/src/deploy-prod/pack.ts is a different
-# code path (`pnpm deploy --prod` rebuilds a fresh staging dir) and
-# stays as-is.
+# install; the install itself still runs and still prunes. A
+# `pnpm deploy --prod` run under `CI=true` is a different code path (it
+# rebuilds a fresh output directory) and stays as-is.
 verifyDepsBeforeRun: warn
 
 allowBuilds:
@@ -29,9 +28,8 @@ allowBuilds:
   # the binary symlinks the embedded PG runtime needs. pnpm 11 errors
   # ERR_PNPM_IGNORED_BUILDS on any UNDECIDED build script, so every platform
   # variant that can be installed on a test/build machine must be decided here —
-  # not just the linux-x64 one the primary dev machine installs. The ARM
-  # cache-cross-platform tester installs @embedded-postgres/linux-arm64; leaving
-  # it undecided aborted its `pnpm install --frozen-lockfile`.
+  # not just linux-x64. An ARM64 machine installs @embedded-postgres/linux-arm64,
+  # and leaving it undecided aborts its `pnpm install --frozen-lockfile`.
   '@embedded-postgres/darwin-arm64': true
   '@embedded-postgres/darwin-x64': true
   '@embedded-postgres/linux-arm': true
@@ -191,3 +189,8 @@ minimumReleaseAgeExclude:
   # queued upgrade.
   - 'kysely@0.29.0'
   - 'kysely-ctl@0.21.0'
+
+# Dependency patches, each keyed to one exact version. patches/README.md
+# records the upstream fix each one carries and when to remove it.
+patchedDependencies:
+  vitest@5.0.1: patches/vitest@5.0.1.patch

@@ -583,9 +583,9 @@ describe('admin registration routes', () => {
     });
 
     it('accepts a binding to environments with no configured record (lenient)', async () => {
-      // Reproduces the scaler-container cross-source E2E: the lock binds env
-      // names that have no environment record in this orchestrator. matchContext
-      // returns null → the binding is satisfiable (lenient), so register-manual 200s.
+      // The lock binds env names that have no environment record in this
+      // orchestrator. matchContext returns null → the binding is satisfiable
+      // (lenient), so register-manual 200s.
       const matchContext = vi.fn(async () => null);
       deps = createMockDeps({
         registrationStore: {

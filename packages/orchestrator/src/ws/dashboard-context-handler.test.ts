@@ -985,28 +985,27 @@ describe('DashboardContextHandler', () => {
 
   // ── `dashboard.held-runs.approve` orch-side trust model (security invariant) ──
   //
-  // Pentest catalog at
-  // — Platform→Orchestrator dispatch surface under attacker model A10
-  // (compromised Platform credential / rogue Platform process). The handler
+  // Threat: a compromised Platform credential or a rogue Platform process
+  // driving the Platform→Orchestrator dispatch surface. The handler
   // performs a single SQL UPDATE on `held_runs` filtered by `id` + `org_id` +
   // `status='pending'`. Tenant isolation holds at the SQL filter layer: a
   // rogue Platform that names a `heldRunId` not in this orchestrator's tenant
   // yields zero updated rows and the response carries a non-actionable error
   // string with no further side effects.
   //
-  // Two known properties are NOT covered here because they are out of §3
-  // (customer-data-isolation) scope:
+  // Two known properties are NOT covered here because they fall outside
+  // customer-data isolation:
   //   (1) `approved_by: 'dashboard-user'` is hardcoded instead of derived
   //       from `stringifyActor(msg.actor)`. Attribution is lost in the
   //       `held_runs.approved_by` column but the access log still records
-  //       the Platform-supplied actor via `recordAccess`. Audit-integrity
-  // question — §10 territory if ever prioritised.
+  //       the Platform-supplied actor via `recordAccess`. That is an
+  //       audit-integrity question, not a tenant-isolation one.
   //   (2) No orch-side automatic dispatch resume mechanism was found wiring
   //       `held_runs.status -> approved` back into `dispatch_queue` /
   //       coordinator routing. A rogue Platform's approval has no immediate
   //       dispatch consequence on this orchestrator without a separate
   // webhook re-trigger or rerun.
-  describe('tenant-isolation invariants under rogue Platform (A10)', () => {
+  describe('tenant-isolation invariants under a rogue Platform', () => {
     it('SQL UPDATE filters by org_id, id, and status=pending (tenant-isolation gate)', async () => {
       // Drive the handler with a forged heldRunId. The mock db.where chain is
       // fluent (returns this), so we read `db.where.mock.calls` to confirm
@@ -1059,30 +1058,30 @@ describe('DashboardContextHandler', () => {
 
   // ── `dashboard.contexts.secrets.set` orch-side trust model (security invariant) ──
   //
-  // Pentest catalog at
-  // — Platform→Orchestrator dispatch surface under attacker model A10
-  // (compromised Platform credential / rogue Platform process). The wire
-  // schema (`packages/engine/src/protocol/messages/dashboard.ts:717`) carries
+  // Threat: a compromised Platform credential or a rogue Platform process
+  // driving the Platform→Orchestrator dispatch surface. The wire
+  // schema (`contextSecretSetRequestSchema` in
+  // `packages/engine/src/protocol/messages/dashboard.ts`) carries
   // `{requestId, actor, scope, key, value}` — no Platform-supplied `orgId`.
   // The orchestrator handler at
-  // `packages/orchestrator/src/ws/dashboard-context-handler.ts:845 handleSecretSet`
+  // `handleSecretSet` in `packages/orchestrator/src/ws/dashboard-context-handler.ts`
   // calls `store.setSecret(this.deps.orgId, scope, key, value)` where
   // `this.deps.orgId` is the orchestrator's OWN configured org. Cross-tenant
   // write is impossible by construction: this orchestrator process is bound
   // to one org; another tenant's secrets live in another orchestrator's DB.
   //
-  // The PG backend at `packages/orchestrator/src/secrets/pg-secret-store.ts:112`
+  // The PG backend in `packages/orchestrator/src/secrets/pg-secret-store.ts`
   // additionally binds AAD = orgId:scope:key on encryption — even if a
   // backend store somehow leaked rows across orgs (which it cannot, the
   // INSERT also hardcodes org_id), AAD verification would fail on decrypt.
   //
-  // Combined with (rerun) a rogue Platform CAN inject malicious
+  // Combined with a rerun request, a rogue Platform CAN inject malicious
   // values into THIS tenant's workflow execution. That is by-design under
   // the 3-tier auth model — Platform IS the authority for THIS tenant's
   // secret CRUD via the dashboard. The tenant-isolation invariant pinned
   // here is *cross-tenant impossibility*, not "Platform can't influence
   // this tenant's runs" (it can; that's the whole point of dashboards).
-  describe('tenant-isolation invariants under rogue Platform (A10)', () => {
+  describe('tenant-isolation invariants under a rogue Platform', () => {
     it('handleSecretSet always uses this.deps.orgId — never a Platform-supplied org hint', async () => {
       // Drive with a wire-shape that has only {scope, key, value} (the schema
       // does NOT include orgId on this message type). The handler MUST pass
@@ -1111,7 +1110,7 @@ describe('DashboardContextHandler', () => {
       // A rogue Platform attempts a path-traversal-style scope and an
       // SQL-shape scope. Both MUST flow into store.setSecret as plain
       // string data — never reinterpreted as a different orgId or scope.
-      // The store implementation uses parameterised SQL (pg-secret-store.ts:122)
+      // The store implementation uses parameterised SQL (pg-secret-store.ts)
       // so the strings are stored as-is in the `scope` column.
       const maliciousScopes = [
         '../org-other/aws/prod',

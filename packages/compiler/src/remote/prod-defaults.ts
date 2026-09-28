@@ -2,8 +2,7 @@
  * Production defaults for the `kici login` OAuth flow. When the matching
  * env var (or the `--platform-endpoint` flag) is unset, login resolves
  * these so a developer targeting the hosted KiCI Platform authenticates
- * with no setup. Setting the env var overrides the default — staging E2E
- * and other KiCI environments depend on that override path.
+ * with no setup. Setting the env var overrides the default.
  *
  * Resolution is login-local: these are read into locals in `oauthLogin`,
  * never written back into `process.env`, so the orchestrator's separate
@@ -23,7 +22,7 @@ export const PROD_OIDC_CLIENT_ID = 'kici-cli';
  * Provenance trust root for `kici verify-attestation` when `--trust-root` is
  * omitted: the hosted KiCI Platform's provenance issuer. The verifier appends
  * `/.well-known/openid-configuration` and pins the token issuer to it. Pass
- * `--trust-root` to verify against a different environment (e.g. staging) or an
- * offline `{ issuer, jwks }` file.
+ * `--trust-root` to verify against a different issuer (such as an orchestrator's
+ * own provenance issuer) or an offline `{ issuer, jwks }` file.
  */
 export const PROD_PROVENANCE_ISSUER = 'https://api.kici.dev';

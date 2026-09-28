@@ -80,7 +80,7 @@ The single-bucket setup (cache + logs share one bucket) is the default and works
 
 - **Production**: lifecycle TTL ≥ `KICI_CACHE_TTL_DAYS` (default 30 days, enforced minimum 30). The orchestrator relies on cache freshness; aggressive bucket-level expiration will cause cache misses.
 - **Staging**: 10-day TTL is reasonable.
-- **Dev / E2E**: 2-day TTL is reasonable — artifacts are disposable.
+- **Development and test**: 2-day TTL is reasonable — artifacts are disposable.
 
 Also configure `abort_incomplete_multipart_upload` after 1 day so failed uploads don't accumulate.
 

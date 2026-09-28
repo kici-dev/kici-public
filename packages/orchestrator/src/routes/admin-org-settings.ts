@@ -300,7 +300,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
     await next();
   });
 
-  // GET /api/v1/admin/org-settings/global-workflows?customerId=kiciStg00001
+  // GET /api/v1/admin/org-settings/global-workflows?customerId=acmeOrg00001
   app.get('/org-settings/global-workflows', async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'secret.read');

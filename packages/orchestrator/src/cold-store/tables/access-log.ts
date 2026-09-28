@@ -5,7 +5,7 @@
  * Contract:
  *   - tenant column: `org_id` (NULL → synthetic `__orchestrator__`)
  *   - partition column: `created_at`
- *   - warm TTL: 30 days (design §5 matrix row 11)
+ *   - warm TTL: 30 days
  *
  * Replaces the previous 90-day `expires_at`-based hard delete (removed
  * by migration 007). Rows older than 30 days now live in S3
@@ -49,7 +49,7 @@ const APPROX_ROW_BYTES = 500;
  * framework's index-friendly partition scan (`created_at < warmCutoff`) doesn't
  * pre-filter out rows the per-row CASE in `accessLogWarmSqlCase()` would
  * consider eligible. The CASE further tightens eligibility per row based on
- * action / outcome / actor_type — see the audit research §5 spec.
+ * action / outcome / actor_type.
  */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: minAccessLogWarmDays(),
@@ -203,7 +203,7 @@ export class AccessLogAdapter implements TableAdapter<AccessLogColdStoreRow> {
   }
 
   /**
-   * Phase 2 — per-row cold-retention TTL. Mirrors the warm-side override
+   * Per-row cold-retention TTL. Mirrors the warm-side override
    * layering: outcome=denied/error → 730d (forensic), platform_operator →
    * `'forever'` (compliance), otherwise per-action map. The framework
    * groups rows by `coldDaysToBucket(coldTtlDays(row))` at archive time.
@@ -269,10 +269,10 @@ export class AccessLogAdapter implements TableAdapter<AccessLogColdStoreRow> {
           last_archived_at = now()
       `.execute(trx);
 
-      // Phase 2 — record the chunk in `cold_store_chunks` so the GC
+      // Record the chunk in `cold_store_chunks` so the GC
       // sweep can find purge candidates without S3 LIST. Only chunks
       // written by the per-bucket layout (v2 manifest) get a row here;
-      // pre-Phase-2 (v1) chunks omit `bucket` and are treated as
+      // v1 chunks omit `bucket` and are treated as
       // `'forever'`.
       if (args.chunkMeta.bucket !== undefined && args.chunkMeta.maxColdDays !== undefined) {
         const maxColdDaysSerialized = String(args.chunkMeta.maxColdDays);

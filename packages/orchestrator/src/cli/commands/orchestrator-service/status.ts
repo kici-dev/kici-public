@@ -1,9 +1,9 @@
 /**
  * `kici-admin orchestrator status` command.
  *
- * Shows OS-level service status (state, PID, uptime) and queries
- * the running orchestrator's health API for KiCI-specific info
- * (mode, DB connectivity, agents, jobs, scaler).
+ * Shows OS-level service status (state, PID, uptime) and queries the
+ * running orchestrator's `/health` and `/ready` endpoints for its version,
+ * build fingerprint, uptime and readiness (database reachable, boot finished).
  *
  * Target resolution goes through resolveInstanceTarget — the same priority chain
  * every lifecycle command uses (--instance-dir > --name > CWD manifest >
@@ -22,38 +22,53 @@ import {
 } from '../../service/index.js';
 import { composeFilePath } from '../../service/compose-path.js';
 import { readEnvValue } from '../../service/backup-timer.js';
-import { formatUptime } from '@kici-dev/shared';
-import fs from 'node:fs';
-import { toErrorMessage } from '@kici-dev/shared';
+import {
+  formatUptime,
+  ReadinessStatus,
+  toErrorMessage,
+  type LivenessResponse,
+  type ReadinessResponse,
+} from '@kici-dev/shared';
+import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
+import { DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS } from '../../../config.js';
+import type { OrchestratorLivenessInfo } from '../../../routes/health.js';
+import {
+  buildInfoRows,
+  fetchLocalJson,
+  formatHealthSection,
+  hideBuildCommit,
+  readEnvContent,
+  readLocalEndpoint,
+  type StatusRow,
+} from '../service-health.js';
 
-/** KiCI health response shape (from GET /health). */
-interface HealthData {
-  status?: string;
-  mode?: string;
-  port?: number;
-  database?: string;
-  platformRelay?: string;
-  agents?: number;
-  scaler?: { type?: string; warm?: number; max?: number };
-  jobs?: { pending?: number; running?: number };
-  uptime?: number;
+/** Time `/ready` gets beyond the database-pool acquire timeout, for its query and its response. */
+const READINESS_MARGIN_MS = 3000;
+
+/**
+ * How long to wait for `/ready`. Its database check waits up to the pool's
+ * acquire timeout before it reports `database: false`, so the wait covers that
+ * timeout plus a margin. An acquire timeout of 0 lets the pool wait without
+ * limit; the default then bounds the wait.
+ */
+export function readinessTimeoutMs(envContent: string): number {
+  const configured = Number(readEnvValue(envContent, 'KICI_DB_POOL_ACQUIRE_TIMEOUT_MS'));
+  const acquire =
+    Number.isFinite(configured) && configured > 0 ? configured : DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS;
+  return acquire + READINESS_MARGIN_MS;
 }
 
-/** Read the env file, or empty content when it is missing or unreadable. */
-function readEnvContent(envFilePath: string): string {
-  try {
-    return fs.existsSync(envFilePath) ? fs.readFileSync(envFilePath, 'utf-8') : '';
-  } catch {
-    return '';
-  }
-}
+/** Column the values of the orchestrator section start at. */
+const VALUE_COLUMN = 12;
 
-/** Read the port from the service's env file (path from the manifest). */
-function readPortFromEnvFile(envFilePath: string): number {
-  const value = readEnvValue(readEnvContent(envFilePath), 'KICI_PORT');
-  const parsed = value === undefined ? NaN : parseInt(value, 10);
-  return isNaN(parsed) ? 4000 : parsed;
-}
+/**
+ * A `/health` body. Every field is optional: an orchestrator older than this
+ * CLI may report fewer of them.
+ */
+type OrchestratorHealth = Partial<LivenessResponse<OrchestratorLivenessInfo>>;
+
+/** A `/ready` body, which arrives with a 503 when a check fails. */
+type OrchestratorReadiness = Partial<ReadinessResponse>;
 
 /** The scaler config the env file names, by path first and directory second. */
 function readScalerConfig(envContent: string): string | undefined {
@@ -87,26 +102,20 @@ export function formatConfigPaths(args: {
   return lines;
 }
 
-/** Query orchestrator health API. */
-async function queryHealth(port: number): Promise<HealthData | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    const res = await fetch(`http://localhost:${port}/health`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!res.ok) return null;
-    return (await res.json()) as HealthData;
-  } catch {
-    return null;
-  }
+/** `yes` when every readiness check passed, otherwise `no` and the failing checks. */
+function formatReadiness(readiness: OrchestratorReadiness): string {
+  if (readiness.status === ReadinessStatus.Ready) return 'yes';
+  const failing = Object.entries(readiness.checks ?? {})
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  return failing.length > 0 ? `no (failing: ${failing.join(', ')})` : 'no';
 }
 
 /** Format the status output as a readable table. */
 function formatStatus(
   serviceStatus: ServiceStatus,
-  health: HealthData | null,
+  health: OrchestratorHealth | null,
+  readiness: OrchestratorReadiness | null,
   serviceName: string,
 ): string {
   const lines: string[] = [];
@@ -124,22 +133,14 @@ function formatStatus(
   }
 
   if (health) {
-    lines.push('');
-    lines.push('--- KiCI orchestrator ---');
-    if (health.mode) lines.push(`Mode:       ${health.mode}`);
-    if (health.port) lines.push(`Port:       ${health.port}`);
-    if (health.database) lines.push(`Database:   ${health.database}`);
-    if (health.platformRelay) lines.push(`Platform relay: ${health.platformRelay}`);
-    if (health.agents != null) lines.push(`Agents:     ${health.agents}`);
-    if (health.scaler) {
-      const s = health.scaler;
-      lines.push(`Scaler:     ${s.type ?? 'none'} (warm: ${s.warm ?? 0}, max: ${s.max ?? 0})`);
-    }
-    if (health.jobs) {
-      lines.push(
-        `Jobs:       ${health.jobs.pending ?? 0} pending, ${health.jobs.running ?? 0} running`,
-      );
-    }
+    const rows: StatusRow[] = [];
+    if (health.status) rows.push(['Health', health.status]);
+    rows.push([
+      'Ready',
+      readiness ? formatReadiness(readiness) : 'unknown (/ready did not answer)',
+    ]);
+    rows.push(...buildInfoRows(health));
+    lines.push(...formatHealthSection('--- KiCI orchestrator ---', rows, VALUE_COLUMN));
   } else if (serviceStatus.state === 'running') {
     lines.push('');
     lines.push('(Could not reach health API)');
@@ -151,7 +152,8 @@ function formatStatus(
 /** Build JSON output combining service + health data. */
 function buildJsonOutput(
   serviceStatus: ServiceStatus,
-  health: HealthData | null,
+  health: OrchestratorHealth | null,
+  readiness: OrchestratorReadiness | null,
   serviceName: string,
   configPaths: Record<string, string>,
 ): Record<string, unknown> {
@@ -159,7 +161,8 @@ function buildJsonOutput(
     service: serviceName,
     ...serviceStatus,
     configPaths,
-    health: health ?? undefined,
+    health: health ? hideBuildCommit(health) : undefined,
+    readiness: readiness ?? undefined,
   };
 }
 
@@ -233,11 +236,17 @@ export function registerStatusCommand(parent: Command): void {
           envContent,
         });
 
-        // Only query health API if service is running
-        let health: HealthData | null = null;
+        let health: OrchestratorHealth | null = null;
+        let readiness: OrchestratorReadiness | null = null;
         if (serviceStatus.state === 'running') {
-          const port = readPortFromEnvFile(config.envFilePath);
-          health = await queryHealth(port);
+          const endpoint = readLocalEndpoint(envContent, ORCHESTRATOR_DEFAULT_PORT);
+          [health, readiness] = await Promise.all([
+            fetchLocalJson<OrchestratorHealth>(endpoint, '/health'),
+            fetchLocalJson<OrchestratorReadiness>(endpoint, '/ready', {
+              acceptStatuses: [503],
+              timeoutMs: readinessTimeoutMs(envContent),
+            }),
+          ]);
         }
 
         const jsonConfigPaths: Record<string, string> = { envFile: config.envFilePath };
@@ -250,13 +259,13 @@ export function registerStatusCommand(parent: Command): void {
         if (opts.json) {
           console.log(
             JSON.stringify(
-              buildJsonOutput(serviceStatus, health, config.name, jsonConfigPaths),
+              buildJsonOutput(serviceStatus, health, readiness, config.name, jsonConfigPaths),
               null,
               2,
             ),
           );
         } else {
-          console.log(formatStatus(serviceStatus, health, config.name));
+          console.log(formatStatus(serviceStatus, health, readiness, config.name));
           console.log('');
           console.log(configPathLines.join('\n'));
         }

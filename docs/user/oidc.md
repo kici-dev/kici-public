@@ -81,6 +81,8 @@ const ORG = 'my-org';
 const REPO = 'my-repo';
 const REGISTRY = `https://npm.cloudsmith.io/${ORG}/${REPO}/`;
 const PACKAGES_API = `https://api.cloudsmith.io/v1/packages/${ORG}/${REPO}/`;
+const PACKAGE = '@my-org/oidc-probe';
+const LABEL = 'probe';
 const PREFIX = '[cloudsmith-oidc]';
 
 function decodeJwtPart(token: string, index: number): Record<string, unknown> {
@@ -126,8 +128,8 @@ export default workflow('publish', {
           //    made only of digits is numeric under semver and may not start with
           //    0, so a run id such as 01234567 would make npm refuse the version.
           const runIdShort = String(payload.kici_run_id).slice(0, 8);
-          const version = `0.0.0-e2e.r${runIdShort}.${Math.floor(Date.now() / 1000)}`;
-          const name = '@kici-e2e/oidc-probe';
+          const version = `0.0.0-${LABEL}.r${runIdShort}.${Math.floor(Date.now() / 1000)}`;
+          const name = PACKAGE;
           const pkgDir = await ctx.mktemp('oidc-probe');
           await writeFile(
             join(pkgDir.path, 'package.json'),
@@ -142,7 +144,7 @@ export default workflow('publish', {
           await ctx.$({
             cwd: pkgDir.path,
             env: { ...process.env, NPM_CONFIG_USERCONFIG: npmrc.path },
-          })`npm publish --registry ${REGISTRY} --tag e2e`;
+          })`npm publish --registry ${REGISTRY} --tag ${LABEL}`;
 
           // 4. Read it back through the API with the same token, then delete.
           //    The version is unique per run, so it is the whole query.
@@ -218,6 +220,8 @@ import {
 const REGION = 'eu-central-1';
 const ROLE_ARN = 'arn:aws:iam::123456789012:role/ci-uploader';
 const BUCKET = 'my-artifacts';
+const SESSION_PREFIX = 'ci-upload-';
+const KEY_PREFIX = 'oidc-probe';
 const PREFIX = '[aws-oidc]';
 
 function decodeJwtPart(token: string, index: number): Record<string, unknown> {
@@ -254,7 +258,7 @@ export default workflow('upload', {
             const out = await sts.send(
               new AssumeRoleWithWebIdentityCommand({
                 RoleArn: ROLE_ARN,
-                RoleSessionName: `kici-e2e-${runId.slice(0, 8)}`,
+                RoleSessionName: `${SESSION_PREFIX}${runId.slice(0, 8)}`,
                 WebIdentityToken: token,
                 DurationSeconds: 900,
               }),
@@ -282,7 +286,7 @@ export default workflow('upload', {
               sessionToken: creds.SessionToken,
             },
           });
-          const key = `e2e/${runId}/probe.txt`;
+          const key = `${KEY_PREFIX}/${runId}/probe.txt`;
           const body = `kici aws-oidc probe run=${runId} ts=${new Date().toISOString()}\n`;
           await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: body }));
           const got = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
@@ -294,10 +298,10 @@ export default workflow('upload', {
           // 4. Delete, then prove the prefix is empty.
           await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
           const left = await s3.send(
-            new ListObjectsV2Command({ Bucket: BUCKET, Prefix: `e2e/${runId}/` }),
+            new ListObjectsV2Command({ Bucket: BUCKET, Prefix: `${KEY_PREFIX}/${runId}/` }),
           );
           if ((left.KeyCount ?? 0) !== 0) {
-            throw new Error(`${left.KeyCount} object(s) left under e2e/${runId}/`);
+            throw new Error(`${left.KeyCount} object(s) left under ${KEY_PREFIX}/${runId}/`);
           }
           ctx.log.info(`${PREFIX} verdict=ok bucket=${BUCKET} key=${key} deleted=true`);
         }),

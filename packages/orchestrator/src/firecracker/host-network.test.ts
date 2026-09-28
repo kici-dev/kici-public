@@ -125,8 +125,7 @@ describe('NetworkManager unmanaged conf', () => {
   it('targets the host-scoped kici-* interface pattern', () => {
     expect(NM_CONF_PATH).toBe('/etc/NetworkManager/conf.d/90-kici-unmanaged.conf');
     // The += append operator is mandatory so this drop-in doesn't collide with
-    // other conf.d unmanaged-devices lines under NM's last-wins merge. See
-    // .claude/rules/networkmanager-unmanaged.md.
+    // other conf.d unmanaged-devices lines under NM's last-wins merge.
     expect(NM_CONF_CONTENT).toContain('unmanaged-devices+=interface-name:kici-*');
   });
 
@@ -198,6 +197,28 @@ describe('provisionBridge', () => {
 const HEALTHY_FORWARD_JSON =
   '{"nftables":[{"rule":{"handle":1,"expr":[{"jump":{"target":"baseline"}}]}}]}';
 
+// kici-br0's postrouting NAT and baseline rules for 10.0.0.0/24, in the shape
+// `nft -j` lists them (host-network.verify.test.ts pins the verbatim listing).
+const rule = (expr: unknown[]) => ({ rule: { expr } });
+const ipMatch = (field: 'saddr' | 'daddr', right: unknown) => ({
+  match: { op: '==', left: { payload: { protocol: 'ip', field } }, right },
+});
+const prefix = (addr: string, len: number) => ({ prefix: { addr, len } });
+const fromSubnet = ipMatch('saddr', prefix('10.0.0.0', 24));
+const HEALTHY_POSTROUTING_JSON = JSON.stringify({
+  nftables: [rule([fromSubnet, { masquerade: null }])],
+});
+const HEALTHY_BASELINE_JSON = JSON.stringify({
+  nftables: [
+    rule([fromSubnet, ipMatch('daddr', '10.0.0.1'), { accept: null }]),
+    rule([fromSubnet, ipMatch('daddr', prefix('10.0.0.0', 8)), { drop: null }]),
+    rule([fromSubnet, ipMatch('daddr', prefix('172.16.0.0', 12)), { drop: null }]),
+    rule([fromSubnet, ipMatch('daddr', prefix('192.168.0.0', 16)), { drop: null }]),
+    rule([fromSubnet, ipMatch('daddr', prefix('169.254.0.0', 16)), { drop: null }]),
+    rule([fromSubnet, { accept: null }]),
+  ],
+});
+
 describe('verifyBridge', () => {
   it('reports healthy when bridge up + addr + table present', async () => {
     const runner = async (spec: CommandSpec) => {
@@ -207,6 +228,9 @@ describe('verifyBridge', () => {
         return { stdout: '[{"addr_info":[{"local":"10.0.0.1","prefixlen":24}]}]' };
       if (line === 'nft list table ip kici') return { stdout: 'table ip kici {}' };
       if (line === 'nft -j list chain ip kici forward') return { stdout: HEALTHY_FORWARD_JSON };
+      if (line === 'nft -j list chain ip kici postrouting')
+        return { stdout: HEALTHY_POSTROUTING_JSON };
+      if (line === 'nft -j list chain ip kici baseline') return { stdout: HEALTHY_BASELINE_JSON };
       if (line.startsWith('ip -d -j link show master')) return { stdout: '[]' };
       return { stdout: '' };
     };
@@ -226,6 +250,9 @@ describe('verifyBridge', () => {
         return { stdout: '[{"addr_info":[{"local":"10.0.0.1","prefixlen":24}]}]' };
       if (line === 'nft list table ip kici') return { stdout: 'table ip kici {}' };
       if (line === 'nft -j list chain ip kici forward') return { stdout: HEALTHY_FORWARD_JSON };
+      if (line === 'nft -j list chain ip kici postrouting')
+        return { stdout: HEALTHY_POSTROUTING_JSON };
+      if (line === 'nft -j list chain ip kici baseline') return { stdout: HEALTHY_BASELINE_JSON };
       if (line.startsWith('ip -d -j link show master')) return { stdout: '[]' };
       return { stdout: '' };
     };

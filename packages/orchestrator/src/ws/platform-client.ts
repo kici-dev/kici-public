@@ -65,6 +65,7 @@ import {
   type ClusterMembership,
 } from '@kici-dev/engine';
 import type { PlanHeadroomStore } from '../cluster/plan-headroom-store.js';
+import { runDetached } from '../helpers/run-detached.js';
 import { EventBuffer } from './event-buffer.js';
 import { RelayBufferRegistry, type RelayStartMeta } from '../webhook/relay-buffer.js';
 import type { AdmitResult } from '../webhook/ingest-admission.js';
@@ -178,6 +179,13 @@ function toSourceRegistrationEntry(source: ProviderSource): SourceRegistrationEn
   };
 }
 
+/**
+ * A handler for one Platform frame. It may be async: the client runs it
+ * through {@link PlatformClient.runFrameHandler}, which logs a failure and
+ * keeps the connection.
+ */
+export type FrameHandler<M> = (msg: M) => void | Promise<void>;
+
 export interface PlatformClientOptions {
   /** WebSocket URL of the Platform relay. */
   url: string;
@@ -226,14 +234,14 @@ export interface PlatformClientOptions {
   /** Maximum event buffer size. Default: 10000. */
   maxBufferSize?: number;
   /** Optional callback for log pull requests from Platform. */
-  onLogPullRequest?: (msg: {
+  onLogPullRequest?: FrameHandler<{
     messageId: string;
     executionId: string;
     jobName?: string;
     stepIndex?: number;
     cursor?: number;
     limit?: number;
-  }) => void;
+  }>;
 
   /** Optional callback for peer discovery (from Platform matchmaker). */
   onPeerDiscover?: (peer: {
@@ -244,7 +252,7 @@ export interface PlatformClientOptions {
     orchRole?: OrchRole;
   }) => void;
   /** Optional callback invoked after successful authentication and source registration. */
-  onAuthenticated?: () => void;
+  onAuthenticated?: () => void | Promise<void>;
   /**
    * Returns this coordinator's currently-connected worker peers for the
    * `cluster.membership` snapshot. Undefined on a non-coordinator (or when
@@ -279,66 +287,66 @@ export interface PlatformClientOptions {
    */
   onProvenanceIssuer?: (issuer: string | null) => void;
   /** Optional callback for dashboard run detail requests from Platform. */
-  onDashboardRunDetail?: (msg: DashboardRunDetailRequest) => void;
+  onDashboardRunDetail?: FrameHandler<DashboardRunDetailRequest>;
   /** Optional callback for dashboard structured run-result requests from Platform. */
-  onDashboardRunStructured?: (msg: DashboardRunStructuredRequest) => void;
+  onDashboardRunStructured?: FrameHandler<DashboardRunStructuredRequest>;
   /** Optional callback for the run-state system reconciliation read from Platform. */
-  onDashboardRunState?: (msg: DashboardRunStateRequest) => void;
+  onDashboardRunState?: FrameHandler<DashboardRunStateRequest>;
   /** Optional callback for dashboard runs.list (operator console) requests from Platform. */
-  onDashboardRunsList?: (msg: DashboardRunsListRequest) => void;
+  onDashboardRunsList?: FrameHandler<DashboardRunsListRequest>;
   /** Optional callback for dashboard runs.filters (operator console) requests from Platform. */
-  onDashboardRunsFilters?: (msg: DashboardRunsFiltersRequest) => void;
+  onDashboardRunsFilters?: FrameHandler<DashboardRunsFiltersRequest>;
   /** Optional callback for dashboard sources.list (operator console) requests from Platform. */
-  onDashboardSourcesList?: (msg: DashboardSourcesListRequest) => void;
+  onDashboardSourcesList?: FrameHandler<DashboardSourcesListRequest>;
   /** Optional callback for dashboard admin-tokens.list (RBAC drift report) requests from Platform. */
-  onDashboardAdminTokensList?: (msg: DashboardAdminTokensListRequest) => void;
+  onDashboardAdminTokensList?: FrameHandler<DashboardAdminTokensListRequest>;
   /** Optional callback for dashboard step logs requests from Platform. */
-  onDashboardStepLogs?: (msg: DashboardStepLogsRequest) => void;
+  onDashboardStepLogs?: FrameHandler<DashboardStepLogsRequest>;
   /** Optional callback for dashboard attestations-list requests from Platform. */
-  onDashboardAttestationsList?: (msg: DashboardAttestationsListRequest) => void;
+  onDashboardAttestationsList?: FrameHandler<DashboardAttestationsListRequest>;
   /** Optional callback for org-wide attestations list (browser) requests from Platform. */
-  onDashboardAttestationsListAll?: (msg: DashboardAttestationsListAllRequest) => void;
+  onDashboardAttestationsListAll?: FrameHandler<DashboardAttestationsListAllRequest>;
   /** Optional callback for single-attestation detail requests from Platform. */
-  onDashboardAttestationGet?: (msg: DashboardAttestationGetRequest) => void;
-  onDashboardAttestationRetry?: (msg: DashboardAttestationRetryRequest) => void;
+  onDashboardAttestationGet?: FrameHandler<DashboardAttestationGetRequest>;
+  onDashboardAttestationRetry?: FrameHandler<DashboardAttestationRetryRequest>;
   /** Optional callback for dashboard artifacts-list requests from Platform. */
-  onDashboardArtifactsList?: (msg: DashboardArtifactsListRequest) => void;
+  onDashboardArtifactsList?: FrameHandler<DashboardArtifactsListRequest>;
   /** Optional callback for run re-run requests from Platform (dashboard action). */
-  onRunRerun?: (msg: RunRerunRequest) => void;
+  onRunRerun?: FrameHandler<RunRerunRequest>;
   /** Optional callback for manual schedule trigger requests from Platform (dashboard action). */
-  onManualSchedule?: (msg: ManualScheduleRequest) => void;
+  onManualSchedule?: FrameHandler<ManualScheduleRequest>;
   /** Optional callback for run cancel requests from Platform (dashboard action). */
-  onRunCancel?: (msg: RunCancelRequest) => void;
+  onRunCancel?: FrameHandler<RunCancelRequest>;
   /** Optional callback for dashboard payload requests from Platform. */
-  onDashboardPayload?: (msg: DashboardPayloadRequest) => void;
+  onDashboardPayload?: FrameHandler<DashboardPayloadRequest>;
   /** Optional callback for dashboard orchestration logs requests from Platform. */
-  onDashboardOrchLogs?: (msg: DashboardOrchLogsRequest) => void;
+  onDashboardOrchLogs?: FrameHandler<DashboardOrchLogsRequest>;
   /** Optional callback for dashboard environment/held-run messages from Platform. */
-  onDashboardEnvMessage?: (msg: DashboardPlatformToOrchMessage) => void;
+  onDashboardEnvMessage?: FrameHandler<DashboardPlatformToOrchMessage>;
   /**
    * Optional callback for Platform-first `kici run remote` control-plane relay
    * requests (upload-init, trigger, status, logs, cancel). The handler performs
    * the action and replies over the WS keyed by `requestId`.
    */
-  onTestRelay?: (msg: TestRelayRequest) => void;
+  onTestRelay?: FrameHandler<TestRelayRequest>;
   /** Optional callback for dashboard diagnostics requests from Platform. */
-  onDashboardDiagnostics?: (msg: DashboardDiagnosticsRequest) => void;
+  onDashboardDiagnostics?: FrameHandler<DashboardDiagnosticsRequest>;
   /** Optional callback for dashboard scaler capacity requests from Platform. */
-  onDashboardScalerCapacity?: (msg: DashboardScalerCapacityRequest) => void;
+  onDashboardScalerCapacity?: FrameHandler<DashboardScalerCapacityRequest>;
   /** Optional callback for dashboard scaler agents requests from Platform. */
-  onDashboardScalerAgents?: (msg: DashboardScalerAgentsRequest) => void;
+  onDashboardScalerAgents?: FrameHandler<DashboardScalerAgentsRequest>;
   /** Optional callback for fleet roster requests from Platform. */
-  onFleetHosts?: (msg: DashboardFleetHostsRequest) => void;
+  onFleetHosts?: FrameHandler<DashboardFleetHostsRequest>;
   /** Optional callback for fleet host-detail requests from Platform. */
-  onFleetHost?: (msg: DashboardFleetHostRequest) => void;
+  onFleetHost?: FrameHandler<DashboardFleetHostRequest>;
   /** Optional callback for fleet runsOnAll-preview requests from Platform. */
-  onFleetPreview?: (msg: DashboardFleetPreviewRequest) => void;
+  onFleetPreview?: FrameHandler<DashboardFleetPreviewRequest>;
   /** Optional callback for fleet workflows-for-host requests from Platform. */
-  onFleetWorkflowsForHost?: (msg: DashboardFleetWorkflowsForHostRequest) => void;
+  onFleetWorkflowsForHost?: FrameHandler<DashboardFleetWorkflowsForHostRequest>;
   /** Optional callback for trust policy updates pushed from Platform. */
-  onTrustPolicyUpdate?: (msg: TrustPolicyUpdate) => void;
+  onTrustPolicyUpdate?: FrameHandler<TrustPolicyUpdate>;
   /** Optional callback for stale check run cleanup requests from Platform. */
-  onStaleCheckrunCleanup?: (msg: StaleCheckrunCleanup) => void;
+  onStaleCheckrunCleanup?: FrameHandler<StaleCheckrunCleanup>;
   /** Optional callback for join requests relayed via Platform. */
   onJoinRequest?: (msg: JoinRequest) => Promise<JoinResponse>;
   /** Custom orchestrator capabilities to merge with ORCH_CAPABILITIES in auth.request. */
@@ -1202,7 +1210,7 @@ export class PlatformClient {
 
     try {
       this.ws = new WebSocket(this.url, {
-        //: cap maximum decompressed frame size so a rogue or
+        // Cap the maximum decompressed frame size so a rogue or
         // compromised Platform peer cannot OOM the orchestrator with a
         // compression bomb on the Platform→orch direction. Without this,
         // ws@8.x defaults to 100 MiB.
@@ -1286,6 +1294,11 @@ export class PlatformClient {
   }
 
   private handleMessage(data: WebSocket.Data): void {
+    // disconnect() ends this client's work: a frame still arriving on the
+    // closing socket must not start a handler the shutdown is tearing down
+    // under it. The Platform fails a relay over when the socket closes.
+    if (this.intentionalDisconnect) return;
+
     let raw: unknown;
     try {
       raw = JSON.parse(data.toString());
@@ -1313,7 +1326,7 @@ export class PlatformClient {
     // Try log pull messages (separate schema union)
     const logPullParsed = logPullPlatformToOrchSchema.safeParse(raw);
     if (logPullParsed.success) {
-      this.onLogPullRequest?.(logPullParsed.data);
+      this.runFrameHandler(logPullParsed.data, this.onLogPullRequest);
       return;
     }
 
@@ -1391,6 +1404,21 @@ export class PlatformClient {
   }
 
   /**
+   * Run the handler for one Platform frame. Nothing awaits a frame, so a throw
+   * or a rejection is logged with the frame's type and request id and the
+   * connection carries on; left unhandled it would stop the orchestrator.
+   */
+  private runFrameHandler<M>(msg: M, handler: FrameHandler<M> | undefined): void {
+    if (!handler) return;
+    const ids = msg as { type?: unknown; requestId?: unknown; runId?: unknown };
+    runDetached(logger, 'Platform frame handler', () => handler(msg), {
+      ...(typeof ids.type === 'string' && { messageType: ids.type }),
+      ...(typeof ids.requestId === 'string' && { requestId: ids.requestId }),
+      ...(typeof ids.runId === 'string' && { runId: ids.runId }),
+    });
+  }
+
+  /**
    * Dispatch a parsed platform message to the appropriate per-area
    * handler. Each `case` either inlines a tiny dispatch (for one-line
    * forwards to a callback) or delegates to a private method when the
@@ -1407,7 +1435,11 @@ export class PlatformClient {
         break;
 
       case 'plan.headroom':
-        void this.onPlanHeadroom(msg);
+        this.onPlanHeadroom(msg).catch((err) => {
+          logger.warn('Failed to apply the Platform worker ceiling', {
+            error: toErrorMessage(err),
+          });
+        });
         break;
 
       case 'webhook.relay.start':
@@ -1441,7 +1473,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardRunDetail?.(msg);
+        this.runFrameHandler(msg, this.onDashboardRunDetail);
         break;
 
       case 'dashboard.run.structured':
@@ -1449,7 +1481,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardRunStructured?.(msg);
+        this.runFrameHandler(msg, this.onDashboardRunStructured);
         break;
 
       case 'dashboard.runs.list':
@@ -1457,7 +1489,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           actor: msg.actor,
         });
-        this.onDashboardRunsList?.(msg);
+        this.runFrameHandler(msg, this.onDashboardRunsList);
         break;
 
       case 'dashboard.runs.filters':
@@ -1465,7 +1497,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           actor: msg.actor,
         });
-        this.onDashboardRunsFilters?.(msg);
+        this.runFrameHandler(msg, this.onDashboardRunsFilters);
         break;
 
       case 'dashboard.sources.list':
@@ -1473,7 +1505,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           actor: msg.actor,
         });
-        this.onDashboardSourcesList?.(msg);
+        this.runFrameHandler(msg, this.onDashboardSourcesList);
         break;
 
       case 'dashboard.admin-tokens.list':
@@ -1481,7 +1513,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           actor: msg.actor,
         });
-        this.onDashboardAdminTokensList?.(msg);
+        this.runFrameHandler(msg, this.onDashboardAdminTokensList);
         break;
 
       case 'dashboard.step.logs':
@@ -1491,7 +1523,7 @@ export class PlatformClient {
           jobId: msg.jobId,
           stepIndex: msg.stepIndex,
         });
-        this.onDashboardStepLogs?.(msg);
+        this.runFrameHandler(msg, this.onDashboardStepLogs);
         break;
 
       case 'dashboard.attestations.list':
@@ -1499,14 +1531,14 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardAttestationsList?.(msg);
+        this.runFrameHandler(msg, this.onDashboardAttestationsList);
         break;
 
       case 'dashboard.attestations.list.all':
         logger.debug('Dashboard org-wide attestations list request received', {
           requestId: msg.requestId,
         });
-        this.onDashboardAttestationsListAll?.(msg);
+        this.runFrameHandler(msg, this.onDashboardAttestationsListAll);
         break;
 
       case 'dashboard.attestation.get':
@@ -1514,7 +1546,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           attestationId: msg.attestationId,
         });
-        this.onDashboardAttestationGet?.(msg);
+        this.runFrameHandler(msg, this.onDashboardAttestationGet);
         break;
 
       case 'dashboard.attestation.retry':
@@ -1522,7 +1554,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardAttestationRetry?.(msg);
+        this.runFrameHandler(msg, this.onDashboardAttestationRetry);
         break;
 
       case 'dashboard.artifacts.list':
@@ -1530,7 +1562,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardArtifactsList?.(msg);
+        this.runFrameHandler(msg, this.onDashboardArtifactsList);
         break;
 
       case 'run.rerun.request':
@@ -1539,7 +1571,7 @@ export class PlatformClient {
           runId: msg.runId,
           actor: msg.actor,
         });
-        this.onRunRerun?.(msg);
+        this.runFrameHandler(msg, this.onRunRerun);
         break;
 
       case 'run.manual_schedule.request':
@@ -1548,7 +1580,7 @@ export class PlatformClient {
           registrationId: msg.registrationId,
           actor: msg.actor,
         });
-        this.onManualSchedule?.(msg);
+        this.runFrameHandler(msg, this.onManualSchedule);
         break;
 
       case 'run.cancel.request':
@@ -1557,7 +1589,7 @@ export class PlatformClient {
           runId: msg.runId,
           actor: msg.actor,
         });
-        this.onRunCancel?.(msg);
+        this.runFrameHandler(msg, this.onRunCancel);
         break;
 
       case 'dashboard.payload':
@@ -1565,7 +1597,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardPayload?.(msg);
+        this.runFrameHandler(msg, this.onDashboardPayload);
         break;
 
       case 'dashboard.orch.logs':
@@ -1574,19 +1606,19 @@ export class PlatformClient {
           runId: msg.runId,
           jobId: msg.jobId,
         });
-        this.onDashboardOrchLogs?.(msg);
+        this.runFrameHandler(msg, this.onDashboardOrchLogs);
         break;
 
       case 'trust_policy.update':
         logger.info('Trust policy updated', { orgId: msg.orgId });
-        this.onTrustPolicyUpdate?.(msg);
+        this.runFrameHandler(msg, this.onTrustPolicyUpdate);
         break;
 
       case 'stale.checkrun.cleanup':
         logger.info('Stale check run cleanup request received', {
           runCount: msg.runs.length,
         });
-        this.onStaleCheckrunCleanup?.(msg);
+        this.runFrameHandler(msg, this.onStaleCheckrunCleanup);
         break;
 
       case 'platform.capabilities':
@@ -1618,7 +1650,7 @@ export class PlatformClient {
         logger.debug('Dashboard diagnostics request received', {
           requestId: msg.requestId,
         });
-        this.onDashboardDiagnostics?.(msg);
+        this.runFrameHandler(msg, this.onDashboardDiagnostics);
         break;
 
       // Run-state system reconciliation read (Platform RunMirrorReconciler)
@@ -1627,34 +1659,34 @@ export class PlatformClient {
           requestId: msg.requestId,
           runId: msg.runId,
         });
-        this.onDashboardRunState?.(msg);
+        this.runFrameHandler(msg, this.onDashboardRunState);
         break;
 
       // Fleet read (roster, host detail, runsOnAll preview)
       case 'dashboard.fleet.hosts':
         logger.debug('Dashboard fleet hosts request received', { requestId: msg.requestId });
-        this.onFleetHosts?.(msg);
+        this.runFrameHandler(msg, this.onFleetHosts);
         break;
       case 'dashboard.fleet.host':
         logger.debug('Dashboard fleet host request received', {
           requestId: msg.requestId,
           agentId: msg.agentId,
         });
-        this.onFleetHost?.(msg);
+        this.runFrameHandler(msg, this.onFleetHost);
         break;
       case 'dashboard.fleet.preview':
         logger.debug('Dashboard fleet preview request received', {
           requestId: msg.requestId,
           workflowName: msg.workflowName,
         });
-        this.onFleetPreview?.(msg);
+        this.runFrameHandler(msg, this.onFleetPreview);
         break;
       case 'dashboard.fleet.workflows-for-host':
         logger.debug('Dashboard fleet workflows-for-host request received', {
           requestId: msg.requestId,
           agentId: msg.agentId,
         });
-        this.onFleetWorkflowsForHost?.(msg);
+        this.runFrameHandler(msg, this.onFleetWorkflowsForHost);
         break;
 
       // Scaler capacity
@@ -1662,7 +1694,7 @@ export class PlatformClient {
         logger.debug('Dashboard scaler capacity request received', {
           requestId: msg.requestId,
         });
-        this.onDashboardScalerCapacity?.(msg);
+        this.runFrameHandler(msg, this.onDashboardScalerCapacity);
         break;
 
       // Scaler agents (on-demand)
@@ -1671,7 +1703,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           scalerName: msg.scalerName,
         });
-        this.onDashboardScalerAgents?.(msg);
+        this.runFrameHandler(msg, this.onDashboardScalerAgents);
         break;
 
       // Read + mutation attribution (access_log)
@@ -1680,7 +1712,7 @@ export class PlatformClient {
           requestId: msg.requestId,
           orgId: msg.orgId,
         });
-        this.onDashboardEnvMessage?.(msg);
+        this.runFrameHandler(msg, this.onDashboardEnvMessage);
         break;
 
       // Registrations + event-log + environment CRUD all share the same
@@ -1736,7 +1768,7 @@ export class PlatformClient {
           type: msg.type,
           requestId: msg.requestId,
         });
-        this.onDashboardEnvMessage?.(msg);
+        this.runFrameHandler(msg, this.onDashboardEnvMessage);
         break;
 
       case 'test.relay.uploads.init':
@@ -1748,7 +1780,7 @@ export class PlatformClient {
           type: msg.type,
           requestId: msg.requestId,
         });
-        this.onTestRelay?.(msg);
+        this.runFrameHandler(msg, this.onTestRelay);
         break;
 
       default: {
@@ -2000,7 +2032,7 @@ export class PlatformClient {
     }
 
     // Invoke onAuthenticated after source registration is processed
-    this.onAuthenticated?.();
+    runDetached(logger, 'Platform authenticated hook', () => this.onAuthenticated?.());
   }
 
   private handlePeerDiscover(

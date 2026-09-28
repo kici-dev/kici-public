@@ -60,14 +60,14 @@ describe('systemRerunHint', () => {
   it('names the resolved node binary, the resolved script, and every argument', () => {
     const hint = systemRerunHint({
       execPath: '/home/op/.local/share/mise/installs/node/24.1.0/bin/node',
-      argv: ['node', process.argv[1] ?? '', 'orchestrator', 'stop', '--system', '--name', 'stg-b'],
+      argv: ['node', process.argv[1] ?? '', 'orchestrator', 'stop', '--system', '--name', 'orch-b'],
       platform: 'linux',
     });
     // fails-when: the literal `sudo kici-admin orchestrator install` comes back, or an
     // argument is dropped, or the bare `node` from argv[0] is printed instead of execPath.
     expect(hint).toContain(
       'sudo /home/op/.local/share/mise/installs/node/24.1.0/bin/node ' +
-        `${realpathSync(process.argv[1] ?? '')} orchestrator stop --system --name stg-b`,
+        `${realpathSync(process.argv[1] ?? '')} orchestrator stop --system --name orch-b`,
     );
     expect(hint).not.toContain('sudo kici-admin');
     expect(hint).toContain('version manager');

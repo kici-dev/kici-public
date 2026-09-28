@@ -217,6 +217,10 @@ The orchestrator closes an agent WebSocket with a specific close code:
   a version skew between agent and orchestrator builds), or a second agent tried
   to register with the same agent ID but a different token (`AgentId already
 registered with a different token`) — the later one is refused.
+- **4006 (internal error)** — the orchestrator could not read its own state while
+  the agent connected: the scaler's spawn record, or the agent token on a
+  database error. The agent connects again on its own. See
+  [Database errors while the orchestrator handles a message](#database-errors-while-the-orchestrator-handles-a-message).
 
 A different class never reaches the WebSocket at all: an **ephemeral agent that
 failed to provision** (missing `node` binary — `spawn node ENOENT` — unpullable
@@ -238,10 +242,30 @@ log around the connection attempt — the close code names the cause.
 - 4003: rebuild the agent so its protocol version matches the orchestrator; for an
   agent-ID collision, give each agent a distinct agent ID (or the same ID with the
   matching token).
+- 4006: fix the database or scaler-state condition. The agent registers once the
+  orchestrator can read it again.
 - Provisioning: fix the host-side root cause the captured error names (install
   the binary, make the image pullable, repair the microVM boot inputs) — the
   per-backend pages under [Auto-scaler](./orchestrator/auto-scaler.md) cover each
   backend's prerequisites.
+
+## Database errors while the orchestrator handles a message
+
+### Symptom
+
+The orchestrator log shows `Failed to handle an agent message`, `Failed to drain the queue after a job finished` or `Platform frame handler failed`, with the message type and the agent, run or request it concerns. The orchestrator keeps running, and registered agents stay connected. An agent whose token check fails on a database error is disconnected and connects again.
+
+### Cause
+
+A database query failed while the orchestrator handled the message: the database was unreachable, overloaded, or a query ran past the statement timeout. The orchestrator logs the failure and continues. Sometimes the failed query was part of sending a queued job to an agent, before the job reached the agent. Then the orchestrator puts the job back in the queue and frees the agent for other work. If that step fails too, the log shows `Could not return a claimed job to the queue`, and the job fails later with `No heartbeat -- dispatch never acknowledged`.
+
+### Diagnose
+
+Check the database: its health, free disk, and the orchestrator's connection pool metrics. Read the log lines around the failure for the query error.
+
+### Fix
+
+Fix the database condition. No orchestrator restart is needed: a job that went back to the queue is offered to a free agent again within about 10 seconds. Re-run a job that failed with `dispatch never acknowledged`.
 
 ## Lock-file drift at the orchestrator
 
@@ -345,7 +369,7 @@ The enriched drift error prints the agent's `sdkBundleHash` directly. Compare th
 
 ### Resolution
 
-- **Agent image stale:** rebuild the agent image against the current workspace: `podman build -f packages/agent/Dockerfile .` (or the relevant multi-arch target).
+- **Agent image stale:** rebuild the agent image against the current workspace: `podman build -f packages/agent/Dockerfile .`.
 - **Lock file stale:** run `kici compile` against the workflow repo and commit the updated `kici.lock.json`.
 - **SDK publish lagging behind:** republish `@kici-dev/sdk` so the host and agent compile against the same bundle.
 

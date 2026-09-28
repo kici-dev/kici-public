@@ -273,19 +273,19 @@ describe('loadConfig', () => {
     it('normalizes each entry to its origin', () => {
       process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
       process.env.KICI_HOST_INSTALL_REGISTRIES =
-        ' http://Verdaccio.LOCAL:4873/ , https://npm.acme.internal:443,,http://verdaccio.local:4873';
+        ' http://Registry.LOCAL:4873/ , https://npm.acme.internal:443,,http://registry.local:4873';
       // breaks-if-wrong: an origin written with a trailing slash, an upper-case
       // host or the scheme's default port parses to the same origin.
       expect(loadConfig().hostInstallRegistries).toEqual([
-        'http://verdaccio.local:4873',
+        'http://registry.local:4873',
         'https://npm.acme.internal',
       ]);
     });
 
     it.each([
-      ['a bare host:port', 'verdaccio.local:4873'],
+      ['a bare host:port', 'registry.local:4873'],
       ['a non-http scheme', 'ftp://mirror.example'],
-      ['a path', 'http://verdaccio.local:4873/npm/'],
+      ['a path', 'http://registry.local:4873/npm/'],
       ['credentials', 'https://user:pass@npm.acme.internal'],
       ['a query', 'https://npm.acme.internal/?x=1'],
       ['an env reference in the host', 'http://${REGISTRY_HOST}:4873'],

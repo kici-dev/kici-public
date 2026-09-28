@@ -178,7 +178,7 @@ describe('followRun', () => {
   it('does NOT time out on a long-but-progressing run (streamed lines reset the idle window)', async () => {
     // A run that stays "running" but streams a new line each tick must not trip
     // the idle timeout, even though total elapsed time far exceeds it — this is
-    // the deploy:stg case (tens of minutes of active output). It reaches success
+    // the long-deploy case (tens of minutes of active output). It reaches success
     // after several ticks well past the tiny idle window.
     let tick = 0;
     const emitted: string[] = [];

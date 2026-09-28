@@ -5,10 +5,9 @@
  * `OrchestratorColdStore`). Each wires the adapter map with its
  * package-specific adapters.
  *
- * Phase B: `runArchiveCycle()` now drives the per-adapter archive loop
- * (design §4). `fetchRange` / `hasRange` / `countRange` are real — they
- * resolve manifests via `ListObjectsV2` and GET overlapping chunks
- * through an in-process LRU.
+ * `runArchiveCycle()` drives the per-adapter archive loop.
+ * `fetchRange` / `hasRange` / `countRange` resolve manifests via
+ * `ListObjectsV2` and GET overlapping chunks through an in-process LRU.
  *
  * ## Advisory-lock namespace
  *
@@ -75,7 +74,7 @@ const CONTENT_HASH_META = 'content-hash';
  * Bound on the S3 GETs a single read-through keeps in flight. A read
  * over a tenant with one archived chunk per day used to issue one
  * manifest GET and one data GET per chunk, strictly one after the other:
- * 262 chunks cost 524 round trips and 34 s on staging, and the
+ * 262 chunks cost 524 round trips and 34 s, and the
  * `kici-admin access-log list` client gave up at 30 s.
  */
 const READ_THROUGH_CONCURRENCY = 16;
@@ -163,7 +162,7 @@ export interface ColdStoreReplayResult {
 }
 
 /**
- * Phase 2 — purge-sweep options.
+ * Purge-sweep options.
  *
  * `tableFilter` restricts to a single table (used by
  * `cold-store purge-now <table>`). `bucketFilter` further restricts to a
@@ -181,7 +180,7 @@ export interface PurgeExpiredChunksOpts {
 }
 
 /**
- * Phase 2 — one row per (chunk attempt, outcome). Returned from
+ * One row per (chunk attempt, outcome). Returned from
  * `purgeExpiredChunks` so callers (scheduled job, CLI) can log / report
  * what happened without re-querying the chunk index.
  */
@@ -208,7 +207,7 @@ export interface PurgeExpiredChunksSummary {
 }
 
 /**
- * Phase 2 — chunk-index row shape returned by
+ * Chunk-index row shape returned by
  * `BaseColdStore.listPurgeableChunks`. Mirrors `cold_store_chunks` row
  * with a normalized `maxColdDays` field.
  */
@@ -225,9 +224,8 @@ export interface PurgeableChunk {
 }
 
 /**
- * Public cold-store API. Phase B implements all four core methods.
- * Phase F adds `replayChunk` / `replayRow` for the rerun-from-archive
- * flow.
+ * Public cold-store API. `replayChunk` / `replayRow` serve the
+ * rerun-from-archive flow.
  */
 export interface ColdStore {
   /**
@@ -259,21 +257,21 @@ export interface ColdStore {
    */
   runArchiveCycle(opts?: { tableFilter?: string }): Promise<ArchiveCycleSummary>;
   /**
-   * Phase F — promote every row in a chunk back into PG transactionally.
+   * Promote every row in a chunk back into PG transactionally.
    * Idempotent on re-run via the adapter's `ON CONFLICT DO NOTHING`.
    * Throws if the adapter doesn't implement `replayInsert`, the chunk
    * is missing, or the contentHash check fails.
    */
   replayChunk(args: ColdStoreReplayChunkArgs): Promise<ColdStoreReplayResult>;
   /**
-   * Phase F — locate the chunk containing `rowId` (via manifest
+   * Locate the chunk containing `rowId` (via manifest
    * `minRowId`/`maxRowId` bounds) and replay it. Returns
    * `chunkId: null` when no manifest matches — caller handles as
    * "row truly does not exist anywhere".
    */
   replayRow(args: ColdStoreReplayRowArgs): Promise<ColdStoreReplayResult>;
   /**
-   * Phase 2 — purge expired chunks from S3.
+   * Purge expired chunks from S3.
    *
    * Looks up `cold_store_chunks` rows where
    * `now() > archived_at + max_cold_days * INTERVAL '1 day'` AND
@@ -554,7 +552,7 @@ export abstract class BaseColdStore implements ColdStore {
    * - Adapters WITHOUT `coldTtlDays`: legacy single-chunk path. Writes one
    *   chunk per partition at the day-prefix root with a v1 manifest. The
    *   GC sweep treats v1 chunks as `'forever'`.
-   * - Adapters WITH `coldTtlDays`: Phase 2 per-bucket path. Buffers all
+   * - Adapters WITH `coldTtlDays`: per-bucket path. Buffers all
    *   eligible rows, groups by `coldDaysToBucket(coldTtlDays(row))`,
    *   then emits one chunk per non-empty bucket under the bucket
    *   subprefix with a v2 manifest carrying `bucket` + `maxColdDays`.
@@ -629,7 +627,7 @@ export abstract class BaseColdStore implements ColdStore {
   }
 
   /**
-   * Phase 2 per-bucket flow. Buffers all eligible rows, groups by
+   * Per-bucket flow. Buffers all eligible rows, groups by
    * `coldDaysToBucket(coldTtlDays(row))`, then emits one chunk per
    * non-empty bucket.
    */
@@ -750,7 +748,7 @@ export abstract class BaseColdStore implements ColdStore {
     const label = { db: this.db, table: adapter.table };
 
     // Invariant: bucket and maxColdDays travel together. Either both are set
-    // (Phase 2 per-bucket path → v2 manifest) or both are undefined (legacy
+    // (per-bucket path → v2 manifest) or both are undefined (legacy
     // single-chunk path → v1 manifest). A misalignment would write a chunk
     // under a bucket subprefix with a v1 manifest (or vice versa), creating
     // data the read-through can't find. Surface it loudly.
@@ -1193,7 +1191,7 @@ export abstract class BaseColdStore implements ColdStore {
     return body;
   }
 
-  // ── Replay-into-PG (Phase F) ───────────────────────────────────────
+  // ── Replay-into-PG ─────────────────────────────────────────────────
 
   /**
    * Promote every row in a chunk back into PG. The adapter owns the
@@ -1376,7 +1374,7 @@ export abstract class BaseColdStore implements ColdStore {
     let exact: ChunkManifest | null = null;
     for (const key of manifestKeys) {
       const m = await this.getManifest(key);
-      // Phase F primary path: explicit natural-key lookup. Adapters that
+      // Primary path: explicit natural-key lookup. Adapters that
       // populate `replayLookupKeys` (e.g. execution_runs storing run_id
       // UUIDs) make replayRow exact even when the chunk's `minRowId` /
       // `maxRowId` are an unrelated SERIAL `id` the caller doesn't know.
@@ -1410,7 +1408,7 @@ export abstract class BaseColdStore implements ColdStore {
     return v instanceof Date ? v : new Date(v);
   }
 
-  // ── Phase 2: cold-store purge sweep ────────────────────────────────
+  // ── Cold-store purge sweep ─────────────────────────────────────────
 
   /**
    * Subclass hook — query the per-DB `cold_store_chunks` index for

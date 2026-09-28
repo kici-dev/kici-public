@@ -14,6 +14,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import type { Component } from './instance/types.js';
 
 const QUAY_PREFIX = 'quay.io/kici-dev';
 
@@ -42,23 +43,45 @@ function findRecordFile(startDir: string): string | null {
   return null;
 }
 
+/** The published image a component runs, whatever the service is named. */
+export function installerImageName(component: Component): string {
+  return `kici-${component}`;
+}
+
+/**
+ * The recorded release and digest of an installer image, or null when the
+ * record is missing, unreadable, or does not hold the image.
+ */
+function recordedImage(
+  name: string,
+  opts: { filePath?: string },
+): { version: string; digest: string } | null {
+  const file = opts.filePath ?? findRecordFile(import.meta.dirname);
+  if (!file || !existsSync(file)) return null;
+  try {
+    const rec = JSON.parse(readFileSync(file, 'utf8')) as DigestRecord;
+    const digest = rec.images?.[name];
+    return digest && rec.version ? { version: rec.version, digest } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The release {@link resolveImageRef} pins `name` at, or null when it falls
+ * back to the moving `:latest` tag.
+ */
+export function pinnedImageVersion(name: string, opts: { filePath?: string } = {}): string | null {
+  return recordedImage(name, opts)?.version ?? null;
+}
+
 /**
  * Resolve `quay.io/kici-dev/<name>:<version>@sha256:<digest>` for an installer
  * image. Falls back to `:latest` (with a warning) when no recorded digest exists.
  */
 export function resolveImageRef(name: string, opts: { filePath?: string } = {}): string {
-  const file = opts.filePath ?? findRecordFile(import.meta.dirname);
-  if (file && existsSync(file)) {
-    try {
-      const rec = JSON.parse(readFileSync(file, 'utf8')) as DigestRecord;
-      const digest = rec.images?.[name];
-      if (digest && rec.version) {
-        return `${QUAY_PREFIX}/${name}:${rec.version}@${digest}`;
-      }
-    } catch {
-      // Fall through to the :latest fallback below.
-    }
-  }
+  const pinned = recordedImage(name, opts);
+  if (pinned) return `${QUAY_PREFIX}/${name}:${pinned.version}@${pinned.digest}`;
   console.warn(
     `[kici] no recorded manifest-list digest for ${name}; pinning the mutable :latest tag. ` +
       `Reinstall from a released kici-admin to get a digest-pinned image.`,

@@ -3,11 +3,10 @@
  *
  * Each chunk is a newline-delimited JSON stream, gzipped. This format
  * is chosen for debuggability (grep + jq works on any chunk) over
- * columnar alternatives; see design doc section 3 for rationale.
+ * columnar alternatives.
  *
- * The encoder accumulates the gzipped body in memory. For Phase A that
- * is fine because we never call it (the framework has no adapters).
- * For Phase B, the eligibility SELECT is capped by `maxChunkBytes`
+ * The encoder accumulates the gzipped body in memory. The eligibility
+ * SELECT is capped by `maxChunkBytes`
  * (default 50 MB, ceiling 100 MB for `execution_steps` / `run_events`),
  * so one chunk never exceeds a few hundred MB of uncompressed rows —
  * well within Node heap budgets.
@@ -39,7 +38,7 @@ export interface EncodedChunk {
   /** ISO timestamp — max of partition column across rows. */
   maxTimestamp: string;
   /**
-   * Phase F — natural-key lookup tokens (e.g. UUID `run_id`) for every
+   * Natural-key lookup tokens (e.g. UUID `run_id`) for every
    * row in the chunk, populated only when the caller provided
    * `replayLookupKey`. Empty / undefined for tables that don't support
    * single-row replay.
@@ -54,7 +53,7 @@ export interface EncodeChunkArgs<TRow> {
   rowId: (row: TRow) => string | number;
   rowTimestamp: (row: TRow) => Date | string;
   /**
-   * Phase F — optional. When provided, the encoder collects the
+   * Optional. When provided, the encoder collects the
    * returned token for every row into `replayLookupKeys`, which the
    * archive flow persists on the chunk's manifest. Returning
    * `undefined` for a row omits it from the index.
@@ -126,8 +125,8 @@ export interface DecodeChunkArgs<TRow> {
  * Implemented as a one-shot gunzip + split rather than an incremental
  * streaming parser because chunks are capped at ~100 MB compressed
  * (~500 MB uncompressed worst case) — well within memory for our
- * single-chunk rehydrate access pattern. A streaming decoder is added
- * in Phase B+ only if profiling shows heap pressure.
+ * single-chunk rehydrate access pattern. A streaming decoder is worth
+ * adding only if profiling shows heap pressure.
  */
 export async function* decodeChunk<TRow>(args: DecodeChunkArgs<TRow>): AsyncIterable<TRow> {
   const { gunzipSync } = await import('node:zlib');

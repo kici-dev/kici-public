@@ -33,10 +33,7 @@ describe('isOrchestratorHealthy', () => {
   it('honours a non-root basePath when building the probe URL', async () => {
     const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-    await isOrchestratorHealthy(4000, '/kici-stg/');
-    expect(fetchMock).toHaveBeenCalledWith(
-      'http://127.0.0.1:4000/kici-stg/health',
-      expect.any(Object),
-    );
+    await isOrchestratorHealthy(4000, '/kici/');
+    expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:4000/kici/health', expect.any(Object));
   });
 });

@@ -2,6 +2,7 @@ export { toErrorMessage, serializeError } from './error.js';
 export { initZx } from './zx.js';
 export {
   createLogger,
+  flushLogFiles,
   guardStartup,
   logger,
   setServiceName,

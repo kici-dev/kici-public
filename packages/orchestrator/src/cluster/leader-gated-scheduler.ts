@@ -28,7 +28,8 @@ export interface LeaderGatedSchedulerOptions {
 /**
  * Raft-leader-only periodic scheduler. Encapsulates the become -> (optional async setup) ->
  * start-interval / lose -> stop lifecycle that the orchestrator's leader-gated schedulers share.
- * The interval runs only while this node is the leader.
+ * The interval runs only while this node is the leader. `stop()` is final: no
+ * later leadership change starts another tenure.
  */
 export class LeaderGatedScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -43,6 +44,11 @@ export class LeaderGatedScheduler {
    * would leak a timer running tick() while no longer leader.
    */
   private generation = 0;
+  /**
+   * Set by {@link stop}: the owning process is shutting down, so no later
+   * leadership change starts another tenure.
+   */
+  private stopped = false;
 
   constructor(private readonly opts: LeaderGatedSchedulerOptions) {
     this.logger = opts.logger ?? defaultLogger;
@@ -53,6 +59,7 @@ export class LeaderGatedScheduler {
   }
 
   async onBecomeLeader(): Promise<void> {
+    if (this.stopped) return;
     // Open a new tenure and capture it, so we can detect a leadership change
     // that lands while the awaited setup below is in flight.
     this.generation += 1;
@@ -98,6 +105,7 @@ export class LeaderGatedScheduler {
   }
 
   stop(): void {
+    this.stopped = true;
     // Bump the tenure so an in-flight onBecomeLeader setup does not resurrect a
     // timer after stop().
     this.generation += 1;

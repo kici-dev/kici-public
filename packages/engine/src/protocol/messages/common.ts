@@ -26,7 +26,6 @@ export const WS_MAX_PAYLOAD_BYTES = 25 * 1024 * 1024;
  * FAST-PATHED: A manual validator exists in
  * packages/orchestrator/src/ws/agent-handler.ts (isValidHeartbeat).
  * If you change this schema, update the manual validator in the same commit.
- * See CLAUDE.md rule: "Zod fast-path sync invariant".
  */
 export const heartbeatSchema = z.object({
   type: z.literal('heartbeat'),

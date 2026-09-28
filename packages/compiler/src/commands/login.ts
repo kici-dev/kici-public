@@ -81,10 +81,9 @@ function checkPatExpiry(expiresAt: string): void {
 async function oauthLogin(options: LoginOptions): Promise<boolean> {
   // Default to the hosted KiCI Platform so `kici login` works with zero
   // configuration. Each value is overridable: the --platform-endpoint flag
-  // and the KICI_* env vars take precedence (staging E2E and other
-  // KiCI environments set them). Resolution stays local — never written to
-  // process.env — so the orchestrator's WS reading of KICI_PLATFORM_URL is
-  // untouched.
+  // and the KICI_* env vars take precedence. Resolution stays local — never
+  // written to process.env — so the orchestrator's WS reading of
+  // KICI_PLATFORM_URL is untouched.
   const existing = await loadGlobalConfig();
   const platformUrl =
     options.platformEndpoint || process.env.KICI_PLATFORM_URL || PROD_PLATFORM_URL;
@@ -154,7 +153,7 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
   checkPatExpiry(patResult.expiresAt);
 
   // Offer to attach the local dev plane so `kici run --local` uses real
-  // Platform identity (design §5). Interactive + opt-out only.
+  // Platform identity. Interactive + opt-out only.
   await maybePromptAttach(options, {
     apiBase: platformUrl,
     pat: patResult.token,

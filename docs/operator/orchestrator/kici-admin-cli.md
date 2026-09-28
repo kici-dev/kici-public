@@ -21,7 +21,7 @@ npm install -g kici-admin
 
 The same package also installs a second binary, `kici-agent`, which runs the KiCI agent. That is what puts an agent on `PATH` for a bare-metal scaler's `binaryPath:` — see the [bare-metal quickstart](../../user/quickstart/bare-metal.md).
 
-For standalone (single-executable) deployments, see [Packaging guide](../distribution/sea-binaries.md).
+For standalone packages that need no npm, see the [Packaging guide](../distribution/sea-binaries.md).
 
 ## Authentication
 

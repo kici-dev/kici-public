@@ -302,7 +302,7 @@ describe('gitClone', () => {
     expect(execFileSyncCalls).toHaveLength(1);
   });
 
-  // --- Phase 4: structured GitAuth (basic + ssh) ---
+  // --- structured GitAuth (basic + ssh) ---
 
   it('uses gitAuth.user for Basic auth when kind=basic', async () => {
     await gitClone({

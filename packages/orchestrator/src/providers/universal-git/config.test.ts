@@ -1,7 +1,7 @@
 /**
  * Tests for the universal-git config Zod schema and preset expansion.
  *
- * These tests lock in three invariants that Phase 1 relies on downstream:
+ * These tests lock in three invariants the provider relies on downstream:
  *   1. Zod rejects configs that would otherwise blow up at runtime (missing
  *      pinned known_hosts, missing credential, missing payload paths on a
  *      custom preset).

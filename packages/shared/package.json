@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",
@@ -61,6 +61,14 @@
     "./ci-env": {
       "import": "./dist/ci-env.js",
       "types": "./dist/ci-env.d.ts"
+    },
+    "./service-env-file": {
+      "import": "./dist/service-env-file.js",
+      "types": "./dist/service-env-file.d.ts"
+    },
+    "./load-service-env-file": {
+      "import": "./dist/load-service-env-file.js",
+      "types": "./dist/load-service-env-file.d.ts"
     },
     "./idempotency-files": {
       "import": "./dist/idempotency-files.js",

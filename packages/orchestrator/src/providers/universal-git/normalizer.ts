@@ -228,9 +228,8 @@ export class UniversalGitWebhookNormalizer implements WebhookNormalizer {
   /**
    * Extension hook used by the processor's `isDefaultBranchPush` check so it
    * does not need to hardcode `payload.repository.default_branch`. The
-   * engine interface does not yet declare this method; it is consumed via
-   * an optional chain (`normalizer.extractDefaultBranch?.(payload)`), so it
-   * is safe to ship ahead of the interface change in Phase 3.
+   * engine interface declares it optional, so it is consumed via
+   * an optional chain (`normalizer.extractDefaultBranch?.(payload)`).
    */
   extractDefaultBranch(payload: unknown): string | null {
     const p = (payload as Record<string, unknown>) ?? {};

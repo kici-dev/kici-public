@@ -30,7 +30,7 @@ export interface OrchestratorFaultInjection {
   skipS3Sentinel?: boolean;
   /**
    * Predicate over an OIDC `audience`: when true, the *initial* provenance
-   * mint fails transiently (defer), so an E2E can exercise the
+   * mint fails transiently (defer), so a test can exercise the
    * deferred-attestation retry + per-run serve path.
    */
   initialMintFault?: (audience: string) => boolean;
@@ -41,7 +41,7 @@ export interface OrchestratorFaultInjection {
    */
   remintReject?: (audience: string) => boolean;
   /**
-   * Invoked by `handleRerunRequest` before `onRerun`, so an HA E2E can make
+   * Invoked by `handleRerunRequest` before `onRerun`, so an HA test can make
    * the first coordinator slow enough that the Platform relay fails over.
    */
   beforeRerun?: () => Promise<void>;

@@ -31,7 +31,7 @@ describe('recordShedBreadcrumb', () => {
     const body = Buffer.from('{"action":"closed"}', 'utf8');
 
     const wrote = await recordShedBreadcrumb(
-      { eventLog: writer, resolveOrgId: async () => 'org_kiciStg001' },
+      { eventLog: writer, resolveOrgId: async () => 'org_acmeOrg001' },
       makeMeta(),
       body,
       'loop_overload',
@@ -50,7 +50,7 @@ describe('recordShedBreadcrumb', () => {
     // The verbatim wire bytes, so the recorded hash matches what Platform hashed.
     expect((payload as { raw: Buffer }).raw.equals(body)).toBe(true);
     expect(outcome).toMatchObject({
-      orgId: 'org_kiciStg001',
+      orgId: 'org_acmeOrg001',
       source: 'relay',
       status: 'shed',
       errorMessage: 'ingest admission shed: loop_overload',
@@ -64,8 +64,8 @@ describe('recordShedBreadcrumb', () => {
     const { writer, record } = makeWriter();
 
     await recordShedBreadcrumb(
-      { eventLog: writer, resolveOrgId: async () => 'org_kiciStg001' },
-      makeMeta({ routingKey: 'generic:org_kiciStg001:abc', event: 'ping', action: null }),
+      { eventLog: writer, resolveOrgId: async () => 'org_acmeOrg001' },
+      makeMeta({ routingKey: 'generic:org_acmeOrg001:abc', event: 'ping', action: null }),
       Buffer.from('{}', 'utf8'),
       'queue_full',
     );
@@ -75,7 +75,7 @@ describe('recordShedBreadcrumb', () => {
 
   it('writes nothing when the wiring has no event-log writer', async () => {
     const wrote = await recordShedBreadcrumb(
-      { eventLog: undefined, resolveOrgId: async () => 'org_kiciStg001' },
+      { eventLog: undefined, resolveOrgId: async () => 'org_acmeOrg001' },
       makeMeta(),
       Buffer.from('{}', 'utf8'),
       'loop_overload',
@@ -88,7 +88,7 @@ describe('recordShedBreadcrumb', () => {
     const wrote = await recordShedBreadcrumb(
       {
         eventLog: { record } as unknown as EventLogWriter,
-        resolveOrgId: async () => 'org_kiciStg001',
+        resolveOrgId: async () => 'org_acmeOrg001',
       },
       makeMeta(),
       Buffer.from('{}', 'utf8'),

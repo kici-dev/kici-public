@@ -233,7 +233,7 @@ describe('kici-admin agent CLI', () => {
     expect(parsed).toEqual({ tokens: [], pendingAgents: [] });
   });
 
-  //: revoke output must surface the kick count so operators can
+  // The revoke output must surface the kick count so operators can
   // tell at a glance whether the revocation actually closed any
   // in-flight WS connections.
   it('revoke prints "(kicked N agent connections)" using the API kicked count', async () => {

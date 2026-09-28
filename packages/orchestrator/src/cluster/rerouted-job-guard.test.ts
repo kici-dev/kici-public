@@ -22,13 +22,13 @@ function peerStub(peer: { connected: boolean; lastHeartbeatAt: number } | undefi
 
 describe('shouldDeferReroutedJob', () => {
   it('defers when the owning peer is connected', () => {
-    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, registry(['arm-stg']))).toBe(
-      true,
-    );
+    expect(
+      shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, registry(['arm-worker'])),
+    ).toBe(true);
   });
 
   it('does not defer when the owning peer is absent (evicted / dead)', () => {
-    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, registry([]))).toBe(false);
+    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, registry([]))).toBe(false);
   });
 
   it('defers a disconnected peer whose last heartbeat is within the flap-grace window', () => {
@@ -37,7 +37,9 @@ describe('shouldDeferReroutedJob', () => {
     // and replays its buffered terminal status, so the run must NOT be failed.
     const now = 1_000_000;
     const reg = peerStub({ connected: false, lastHeartbeatAt: now - 5_000 });
-    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, reg, { nowMs: now })).toBe(true);
+    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, reg, { nowMs: now })).toBe(
+      true,
+    );
   });
 
   it('does not defer a disconnected peer gone longer than the flap-grace window', () => {
@@ -46,7 +48,7 @@ describe('shouldDeferReroutedJob', () => {
       connected: false,
       lastHeartbeatAt: now - DEFAULT_REROUTE_FLAP_GRACE_MS - 1,
     });
-    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, reg, { nowMs: now })).toBe(
+    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, reg, { nowMs: now })).toBe(
       false,
     );
   });
@@ -55,13 +57,13 @@ describe('shouldDeferReroutedJob', () => {
     const now = 1_000_000;
     const reg = peerStub({ connected: false, lastHeartbeatAt: now - 10_000 });
     expect(
-      shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, reg, {
+      shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, reg, {
         nowMs: now,
         flapGraceMs: 5_000,
       }),
     ).toBe(false);
     expect(
-      shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, reg, {
+      shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, reg, {
         nowMs: now,
         flapGraceMs: 30_000,
       }),
@@ -70,10 +72,12 @@ describe('shouldDeferReroutedJob', () => {
 
   it('does not defer a disconnected peer with no recorded heartbeat', () => {
     const reg = { getPeer: () => ({ connected: false }) } as unknown as PeerRegistry;
-    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-stg' }, reg)).toBe(false);
+    expect(shouldDeferReroutedJob({ rerouted_to_peer: 'arm-worker' }, reg)).toBe(false);
   });
 
   it('does not defer a local (non-rerouted) job', () => {
-    expect(shouldDeferReroutedJob({ rerouted_to_peer: null }, registry(['arm-stg']))).toBe(false);
+    expect(shouldDeferReroutedJob({ rerouted_to_peer: null }, registry(['arm-worker']))).toBe(
+      false,
+    );
   });
 });

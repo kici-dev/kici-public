@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Component, InstanceManifest } from './types.js';
 import type { LaunchSpec } from '../types.js';
+import { installerImageName, pinnedImageVersion } from '../image-digests.js';
 
 const REQUIRED_FIELDS: readonly (keyof InstanceManifest)[] = [
   'component',
@@ -135,6 +136,117 @@ export function resolveVersionFromLaunchSpec(
     dir = parent;
   }
   return null;
+}
+
+/**
+ * The version of the launcher a service definition starts, or null when the
+ * launch command does not show one.
+ *
+ * An npm-installed entry script names its version in its package.json
+ * ({@link resolveVersionFromLaunchSpec}). A launcher under the instance's
+ * install base resolves into the `<component>-<version>` folder an archive
+ * upgrade extracted: through the `<component>` symlink on Linux and macOS, or
+ * directly where Windows registers it. A `--binary` anywhere else shows none.
+ */
+export function resolveLauncherVersion(
+  spec: LaunchSpec,
+  component: Component,
+  installBase: string,
+): string | null {
+  const fromPackage = resolveVersionFromLaunchSpec(spec, component);
+  if (fromPackage) return fromPackage;
+
+  let base: string;
+  try {
+    base = fs.realpathSync(installBase);
+  } catch {
+    return null;
+  }
+  const prefix = `${component}-`;
+  for (const token of [spec.execPath, ...spec.args]) {
+    if (!path.isAbsolute(token)) continue;
+    let real: string;
+    try {
+      real = fs.realpathSync(token);
+    } catch {
+      continue;
+    }
+    // Outside the base the first segment is `..` (or another drive on
+    // Windows), which never names a version folder.
+    const [folder = '', ...rest] = path.relative(base, real).split(path.sep);
+    if (rest.length > 0 && folder.startsWith(prefix) && folder.length > prefix.length) {
+      return folder.slice(prefix.length);
+    }
+  }
+  return null;
+}
+
+/** What {@link writeInstallManifest} wrote. */
+export interface InstallManifestWrite {
+  file: string;
+  manifest: InstanceManifest;
+  /** Set when the folder held a manifest the install replaced instead of updating. */
+  warning?: string;
+}
+
+/**
+ * Write the manifest `install` built into `instanceDir`.
+ *
+ * A first install writes `fresh` as it is. A re-install of the same instance
+ * (the folder holds a readable manifest of this component and name) updates
+ * that manifest: it keeps what the instance recorded over time — `createdAt`,
+ * the `migrationHeads` the rollback schema guard reads, and any field a newer
+ * CLI wrote — and takes every other field from `fresh`. Its `kiciVersion` is
+ * the version of the launcher `launch` starts; when the launcher shows none,
+ * the recorded version stands, because the CLI that ran `install` need not
+ * be the version the service runs. A compose service runs the image its
+ * compose file pins, whatever `launch` names, so a compose re-install records
+ * the release of that image (`opts.digestRecordPath` overrides the digest
+ * record it reads, for tests).
+ *
+ * A manifest that cannot be read, or that names another instance, is
+ * replaced, and the result carries a warning.
+ */
+export function writeInstallManifest(
+  instanceDir: string,
+  fresh: InstanceManifest,
+  launch: LaunchSpec,
+  opts: { digestRecordPath?: string } = {},
+): InstallManifestWrite {
+  let existing: InstanceManifest | null;
+  try {
+    existing = readManifest(instanceDir, fresh.component);
+  } catch (err) {
+    return {
+      file: writeManifest(instanceDir, fresh),
+      manifest: fresh,
+      warning:
+        `${(err as Error).message}. install replaced it, so the migration heads it ` +
+        `recorded, if any, are lost.`,
+    };
+  }
+  if (!existing) return { file: writeManifest(instanceDir, fresh), manifest: fresh };
+  if (existing.name !== fresh.name) {
+    return {
+      file: writeManifest(instanceDir, fresh),
+      manifest: fresh,
+      warning:
+        `${manifestPath(instanceDir, fresh.component)} described the instance ` +
+        `"${existing.name}". It now describes "${fresh.name}".`,
+    };
+  }
+  const launcherVersion =
+    fresh.platform === 'compose'
+      ? pinnedImageVersion(installerImageName(fresh.component), { filePath: opts.digestRecordPath })
+      : resolveLauncherVersion(launch, fresh.component, fresh.installBase);
+  const manifest: InstanceManifest = {
+    ...existing,
+    ...fresh,
+    createdAt: existing.createdAt,
+    kiciVersion: launcherVersion ?? existing.kiciVersion,
+  };
+  if (existing.migrationHeads) manifest.migrationHeads = existing.migrationHeads;
+  return { file: writeManifest(instanceDir, manifest), manifest };
 }
 
 /**

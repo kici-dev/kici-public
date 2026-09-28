@@ -198,8 +198,8 @@ export class JoinTokenManager {
 /**
  * Build a JoinTokenManager backed by its own connection pool to the given
  * orchestrator database URL. Mirrors `createPeerCredentialStoreFromUrl`;
- * consumed by E2E tests that need to exercise token validation/reuse against
- * the real cluster DB.
+ * used by tests that need to exercise token validation/reuse against a real
+ * cluster DB.
  */
 export function createJoinTokenManagerFromUrl(
   databaseUrl: string,

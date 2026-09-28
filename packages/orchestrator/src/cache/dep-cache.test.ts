@@ -212,9 +212,9 @@ describe('DepCache', () => {
  * reader could not detect until the agent failed verification, durably, on
  * every retry.
  *
- * Observed in production of the `cache-cross-platform` E2E category: one webhook
- * triggers two workflows whose build jobs both run on linux-x64, and the reader
- * downloaded builder A's tarball while holding builder B's hash.
+ * One way to reach it: one webhook triggers two workflows whose build jobs both
+ * run on linux-x64, and the reader downloads builder A's tarball while holding
+ * builder B's hash.
  *
  * Content-addressing the tarball makes that state unrepresentable — the hash IS
  * the key, so any pair a reader can observe is self-consistent.

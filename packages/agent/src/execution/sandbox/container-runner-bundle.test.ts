@@ -10,7 +10,8 @@ import { describe, it, expect } from 'vitest';
 // inlined, not left as bare imports. This test guards that load-time contract
 // against a build-config regression that would silently ship a runner the job
 // container cannot load. (Dynamic `require()`s inside inlined deps are guarded
-// optional paths; the real end-to-end soak is the container-sandbox E2E.)
+// optional paths; running the bundle in a real job container needs a container
+// runtime, which this file does not start.)
 const bundlePath = join(
   dirname(fileURLToPath(import.meta.url)),
   '../../../dist/workflow-runner-bundle.js',

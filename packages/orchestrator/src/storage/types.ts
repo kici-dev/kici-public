@@ -7,7 +7,7 @@
  *
  * Backends:
  *   - `S3CacheStorage` for production / multi-host deployments
- *   - `FilesystemCacheStorage` for single-host / E2E sandboxes
+ *   - `FilesystemCacheStorage` for single-host / test sandboxes
  */
 
 /**
@@ -137,7 +137,7 @@ export type S3CacheStorageConfig = SharedS3Config & {
  * mints HMAC-signed `http://baseUrl<routePrefix>...` URLs that the
  * orchestrator's `/api/v1/cache/blob/*` route verifies before serving.
  *
- * Intended for single-host / E2E sandboxes where standing up an
+ * Intended for single-host / test sandboxes where standing up an
  * S3-compatible service is overkill.
  */
 export interface FilesystemCacheStorageConfig {

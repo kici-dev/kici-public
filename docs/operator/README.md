@@ -7,7 +7,7 @@ Documentation for teams deploying and operating the KiCI orchestrator and agent 
 
 ## Quick reference
 
-- [KiCI environment variable reference](env-reference.md) — auto-generated catalog of the env vars shared across the orchestrator, agent, and shared logger; per-service variables are documented in each service's configuration reference. Regenerated from each service's Zod schema by `pnpm docs:env`.
+- [KiCI environment variable reference](env-reference.md) — auto-generated catalog of the env vars shared across the orchestrator, agent, and shared logger; per-service variables are documented in each service's configuration reference.
 
 ## Orchestrator
 
@@ -47,12 +47,12 @@ The customer-deployable agent is the execution tier. It connects to the orchestr
 
 ## Distribution
 
-How KiCI packages are distributed and deployed. Covers all three distribution channels (npm packages, OCI container images, Firecracker rootfs), orchestrator deployment modes (container, systemd, launchd, Windows service), agent deployment formats, and agent runtime dependencies.
+How KiCI packages are distributed and deployed. Covers the distribution channels (npm packages, OCI container images, standalone packages, Firecracker rootfs), orchestrator deployment modes (container, systemd, launchd, Windows service), agent deployment formats, and agent runtime dependencies.
 
 - [Distribution](./distribution/distribution.md) -- channels, deployment modes, runtime dependencies
-- [Multi-architecture builds](./distribution/multi-arch-builds.md) -- build script, manifests, cross-arch deployment
+- [Multi-architecture images](./distribution/multi-arch-builds.md) -- published multi-arch images, mixed-architecture clusters
 - [Service installation guide](./distribution/service-installation.md) -- systemd, launchd, service management
-- [KiCI packaging guide](./distribution/sea-binaries.md) -- package types, distribution
+- [KiCI packaging guide](./distribution/sea-binaries.md) -- download, verify and run the standalone packages
 - [Release artifacts](./distribution/release-artifacts.md) -- manifest-list digests and npm integrity for the current release
 
 ## Operations

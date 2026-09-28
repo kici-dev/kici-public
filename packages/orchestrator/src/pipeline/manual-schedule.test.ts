@@ -281,7 +281,7 @@ describe('handleManualSchedule', () => {
     const coordinator = {
       routeJobs: vi.fn().mockResolvedValue({
         localJobs: [],
-        reroutedJobs: [{ jobName: 'beat', peerId: 'host-1-stg' }],
+        reroutedJobs: [{ jobName: 'beat', peerId: 'host-1-eu' }],
         failedJobs: [],
       }),
     };
@@ -308,10 +308,10 @@ describe('handleManualSchedule', () => {
 
   // ── `run.manual_schedule.request` orch-side trust model (security invariant) ──
   //
-  // Pentest catalog at
-  // — Platform→Orchestrator dispatch surface under attacker model A10
-  // (compromised Platform credential / rogue Platform process). The wire schema
-  // (`packages/engine/src/protocol/messages/dashboard.ts:145`) carries only
+  // Threat: a compromised Platform credential or a rogue Platform process
+  // driving the Platform→Orchestrator dispatch surface. The wire schema
+  // (`manualScheduleRequestSchema` in `packages/engine/src/protocol/messages/dashboard.ts`)
+  // carries only
   // `requestId`, `actor`, and `registrationId` — no Platform-supplied routing
   // data, lock-file content, or commit SHA. The orchestrator looks up the
   // registration in its OWN local `registrationIndex` (single-tenant), and all
@@ -326,9 +326,9 @@ describe('handleManualSchedule', () => {
   // *side-effect-freeness* invariant explicitly — a rejected request MUST
   // NOT call `dispatcher.dispatch`, `executionTracker.onExecutionStarted`,
   // or `eventRouter.emit`. The audit-attribution caveat (`triggeredBy` is
-  // Platform-supplied) is identical to and is by-design under the
-  // 3-tier auth model — out of scope for §3 customer isolation.
-  describe('tenant-isolation invariants under rogue Platform (A10)', () => {
+  // Platform-supplied) is identical to the rerun request's, and is by-design
+  // under the 3-tier auth model — outside customer-data isolation.
+  describe('tenant-isolation invariants under a rogue Platform', () => {
     it('forged registrationId (not in local index) is side-effect-free', async () => {
       const h = makeDeps(null);
       await expect(

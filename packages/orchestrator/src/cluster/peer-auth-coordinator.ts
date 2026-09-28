@@ -16,6 +16,7 @@ import {
   writeCredentialFile,
   type CredentialFileData,
 } from './peer-credentials.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'peer-auth-coordinator' });
 
@@ -110,13 +111,19 @@ export class PeerAuthCoordinator {
 
   private makeComplete(join: Deferred<CredentialFileData | null>) {
     return (issued: CredentialFileData | null): void => {
-      void this.withLock(async () => {
-        if (issued) {
-          await writeCredentialFile(this.credentialFile, issued);
-        }
-        if (this.inFlightJoin === join) this.inFlightJoin = null;
-        join.resolve(issued);
-      });
+      runDetached(
+        logger,
+        'Peer token-join completion',
+        () =>
+          this.withLock(async () => {
+            if (issued) {
+              await writeCredentialFile(this.credentialFile, issued);
+            }
+            if (this.inFlightJoin === join) this.inFlightJoin = null;
+            join.resolve(issued);
+          }),
+        { instanceId: this.instanceId },
+      );
     };
   }
 

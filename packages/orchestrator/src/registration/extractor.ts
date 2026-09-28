@@ -7,7 +7,7 @@ import { RegisterableTriggerType } from '@kici-dev/engine';
  * Non-Git-provider triggers (kici_event, schedule, webhook, …) live in the
  * registration table because they have no per-repo lock file pipeline to
  * fall back to. Git-provider triggers (push, pr, tag, …) ALSO live in the
- * registration table so that the cross-source dispatch path (phase 28.5)
+ * registration table so that the cross-source dispatch path
  * can resolve them by (customer_id, repo_identifier) when a generic webhook
  * targets an externally-hosted repo. The per-event lock file pipeline still
  * handles same-source dispatch for git triggers; registration is an additive

@@ -30,7 +30,6 @@ import {
   pruneOrphanDeclarations,
 } from './lib/atomic-dist.mjs';
 import { builtinModules } from 'node:module';
-import { execSync } from 'node:child_process';
 
 /**
  * The container-sandbox runner is delivered to the customer job container as a
@@ -124,6 +123,57 @@ export function readDepMeta(depName, opts = {}) {
   return { version, bundleHash };
 }
 
+/**
+ * The version a service bundle reports as `KICI_PKG_VERSION`. A published
+ * package carries the release version in its own package.json (the
+ * single-version invariant). A private one — the Platform — keeps a placeholder
+ * version that never moves, so it reports the release it was built with: the
+ * repository root's version. A version bump writes the root and the published
+ * packages together, and the private package depends on those, so its task hash
+ * moves with the root version.
+ *
+ * @param {{ version: string, private?: boolean }} pkg the package's package.json
+ * @param {() => string} readReleaseVersion reads the repository root's version;
+ *   called for a private package only
+ * @returns {string}
+ */
+export function serviceVersion(pkg, readReleaseVersion) {
+  return pkg.private ? readReleaseVersion() : pkg.version;
+}
+
+/**
+ * The build-time constants baked into a service bundle: its version (see
+ * {@link serviceVersion}), the build date, and the version and bundle hash of
+ * the sdk, shared and engine packages it carries. Each value is JSON-encoded, so
+ * rolldown replaces the identifier with a string literal. `scripts/package.mjs`
+ * bakes the same set into the standalone packages.
+ *
+ * No build commit: it names a commit in the private repository, and every
+ * service shows its constants to customers (`/health`, the startup log,
+ * `kici-admin … status`).
+ *
+ * @param {{ version: string, buildDate: string,
+ *   sdkMeta: { version: string, bundleHash: string },
+ *   sharedMeta: { version: string, bundleHash: string },
+ *   engineMeta: { version: string, bundleHash: string } }} input
+ * @returns {Record<string, string>}
+ */
+export function serviceDefines({ version, buildDate, sdkMeta, sharedMeta, engineMeta }) {
+  return {
+    KICI_PKG_VERSION: JSON.stringify(version),
+    KICI_BUILD_DATE: JSON.stringify(buildDate),
+    // Workspace dep drift diagnostics: a log grep answers "did agent and
+    // orchestrator ship the same @kici-dev/sdk bundle?" — see
+    // docs/operator/troubleshooting.md.
+    KICI_SDK_VERSION: JSON.stringify(sdkMeta.version),
+    KICI_SDK_BUNDLE_HASH: JSON.stringify(sdkMeta.bundleHash),
+    KICI_SHARED_VERSION: JSON.stringify(sharedMeta.version),
+    KICI_SHARED_BUNDLE_HASH: JSON.stringify(sharedMeta.bundleHash),
+    KICI_ENGINE_VERSION: JSON.stringify(engineMeta.version),
+    KICI_ENGINE_BUNDLE_HASH: JSON.stringify(engineMeta.bundleHash),
+  };
+}
+
 async function main() {
   const cwd = process.cwd();
   const pkg = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
@@ -138,8 +188,8 @@ async function main() {
   // fault injection) are built ONLY behind an explicit gate — `--dev` or
   // KICI_BUILD_DEV_ENTRIES=1 — so a release/publish build (which passes
   // neither) never emits them into dist/, and they therefore never reach a
-  // published npm tarball or a container image. Staging / E2E builds opt in
-  // via the gate (see scripts/build-pipeline.ts's deploy-stg scope).
+  // published npm tarball or a container image. Test builds opt in via the
+  // gate.
   const includeDevEntries =
     process.argv.includes('--dev') || process.env.KICI_BUILD_DEV_ENTRIES === '1';
   const devEntries = pkg.build?.devEntries;
@@ -149,22 +199,22 @@ async function main() {
       : entries;
 
   // Build-time constants (hardcoded into every service bundle).
-  // KICI_BUILD_COMMIT env var is set by container builds (git unavailable in containers);
-  // falls back to git rev-parse when building locally.
   const buildDate = new Date().toISOString();
-  let buildCommit = process.env.KICI_BUILD_COMMIT || 'unknown';
-  if (buildCommit === 'unknown') {
-    try {
-      buildCommit = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim();
-    } catch {
-      // git not available
-    }
-  }
 
   const repoRoot = findRepoRoot(cwd);
   const sdkMeta = readDepMeta('sdk', { repoRoot, selfName: pkg.name });
   const sharedMeta = readDepMeta('shared', { repoRoot, selfName: pkg.name });
   const engineMeta = readDepMeta('engine', { repoRoot, selfName: pkg.name });
+  const defines = serviceDefines({
+    version: serviceVersion(
+      pkg,
+      () => JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf-8')).version,
+    ),
+    buildDate,
+    sdkMeta,
+    sharedMeta,
+    engineMeta,
+  });
 
   // Build into a staging directory and move each entry onto its destination
   // with an atomic rename, so a concurrent reader never sees a missing module.
@@ -173,7 +223,7 @@ async function main() {
   // ESM shim for modules that reference __filename/__dirname (e.g. peer cluster
   // code). It pulls in node:url + node:path, so it is prepended ONLY to entries
   // whose bundled output actually references __filename/__dirname. Browser-safe
-  // subpaths (e.g. @kici-dev/platform/legal, imported by the dashboard) carry no
+  // subpaths (an entry a web app imports) carry no
   // such references and therefore stay free of node built-in imports, so a
   // browser bundler can resolve them.
   const esmCjsShimBanner = `import { fileURLToPath as __cjs_fileURLToPath } from 'node:url';
@@ -188,8 +238,7 @@ const __dirname = __cjs_dirname(__filename);
   // offsets the chunk's sourcemap by the banner's line count by construction —
   // a manual string concat after rolldown computed the map would shift every
   // mapping down and break stack-trace resolution. Chunks without the globals
-  // (e.g. the browser-safe @kici-dev/platform/legal subpath imported by the
-  // dashboard) are returned unchanged, so they stay free of node:url/node:path
+  // (a browser-safe subpath a web app imports) are returned unchanged, so they stay free of node:url/node:path
   // imports and a browser bundler can resolve them.
   const conditionalCjsShimPlugin = {
     name: 'conditional-cjs-shim',
@@ -221,22 +270,7 @@ const __dirname = __cjs_dirname(__filename);
       // Every other entry keeps its bare imports external and stays unshaken.
       treeshake: isBundleEntry,
       plugins: [conditionalCjsShimPlugin],
-      transform: {
-        define: {
-          KICI_PKG_VERSION: JSON.stringify(pkg.version),
-          KICI_BUILD_DATE: JSON.stringify(buildDate),
-          KICI_BUILD_COMMIT: JSON.stringify(buildCommit),
-          // Workspace dep drift diagnostics (build-time): six strings baked per bundle.
-          // Purpose: a 5-second log-grep can answer "did agent and orchestrator ship
-          // the same @kici-dev/sdk bundle?" — see docs/operator/troubleshooting.md.
-          KICI_SDK_VERSION: JSON.stringify(sdkMeta.version),
-          KICI_SDK_BUNDLE_HASH: JSON.stringify(sdkMeta.bundleHash),
-          KICI_SHARED_VERSION: JSON.stringify(sharedMeta.version),
-          KICI_SHARED_BUNDLE_HASH: JSON.stringify(sharedMeta.bundleHash),
-          KICI_ENGINE_VERSION: JSON.stringify(engineMeta.version),
-          KICI_ENGINE_BUNDLE_HASH: JSON.stringify(engineMeta.bundleHash),
-        },
-      },
+      transform: { define: defines },
       output: {
         file: outputPath,
         format: 'es',

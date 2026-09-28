@@ -2,8 +2,8 @@
  * Tests for `kici-admin access-log` CLI subcommands.
  *
  * Covers flag forwarding to the admin API client for the agent-attribution
- * filters (--agent-label / --agent-only). Integration coverage lives in the
- * E2E suite against a live orchestrator.
+ * filters (--agent-label / --agent-only). The HTTP round trip needs a live
+ * orchestrator; this file covers argument parsing and flag forwarding.
  */
 
 import { describe, expect, it } from 'vitest';

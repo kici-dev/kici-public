@@ -28,17 +28,13 @@ Part 2 (GitHub-triggered runs) needs a GitHub App as well; its requirements are 
 
 ### 1. Sign up at app.kici.dev
 
-Go to [app.kici.dev](https://app.kici.dev) and create an account.
-
-:::note[Beta access]
-Self-service sign-up is limited during the beta. If the dashboard shows a "waitlist" message, open a [GitHub issue](https://github.com/kici-dev/kici-public/issues) titled "beta invite request" and we'll send you an invite — usually within a business day.
-:::
+Go to [app.kici.dev](https://app.kici.dev) and create an account. Sign-up is open to everyone and free.
 
 After sign-up you'll have a personal organisation. Future-you can invite teammates and create additional orgs from the dashboard.
 
 ### 2. Mint an orchestrator registration token
 
-In the dashboard, open **Settings → Orchestrators → New orchestrator**, give it a name (e.g. `home-server`), and copy the token the dialog shows. The token starts with `kici_ok_` and is shown **only once** — save it now.
+In the dashboard, open **Settings → Orchestrator keys → Create orchestrator key**, give it a name (e.g. `home-server`), and copy the token the dialog shows. The token starts with `kici_ok_` and is shown **only once** — save it now.
 
 This token authorises your orchestrator to connect to `wss://api.kici.dev/ws` and identify itself as belonging to your organisation.
 
@@ -80,7 +76,7 @@ You should see something like this within ~5 seconds:
 
 `Ctrl-C` to stop tailing logs; the stack keeps running in the background.
 
-The dashboard's **Orchestrators** page now shows your registration as **online**. No agent container is running yet — the scaler will spawn one when your first job arrives in step 5.
+The dashboard's **Infrastructure** page now lists your orchestrator as **Connected**. No agent container is running yet — the scaler will spawn one when your first job arrives in step 5.
 
 :::note[Container socket trust]
 `docker-compose.yaml` bind-mounts the host's container runtime socket (`/var/run/docker.sock`) into the orchestrator so it can spawn agent containers per job. This grants the orchestrator the ability to manage other containers on this host — the same trust boundary as any CI runner that uses a Docker-in-Docker pattern.
@@ -117,7 +113,7 @@ cat > .kici/package.json <<'EOF'
   "private": true,
   "type": "module",
   "devDependencies": {
-    "@kici-dev/sdk": "^0.1.18"
+    "@kici-dev/sdk": "latest"
   }
 }
 EOF

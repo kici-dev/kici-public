@@ -148,6 +148,7 @@ import {
   type ProcessingDeps,
 } from './processor.js';
 import { buildReducedPrivilegeNote } from '../security/reduced-privilege-note.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -1617,8 +1618,8 @@ async function recordBuildFailure(args: {
   // because the build-coordinator timeout fired before the closure's
   // `onExecutionStarted` await returned). Without this, the row
   // stays in `Dispatched` indefinitely until the agent eventually
-  // sends `job.complete` — and the build-timeout E2E (which polls
-  // for `failed`/`expired`) would never observe a terminal state.
+  // sends `job.complete` — and a caller polling for
+  // `failed`/`expired` would never observe a terminal state.
   if (buildJobId) {
     try {
       await deps.dispatcher.cancelQueuedJob(buildJobId, `Build failed: ${toErrorMessage(err)}`);
@@ -3981,23 +3982,29 @@ async function persistJobHold(args: {
   // operator can be asked to approve, with no audit trail saying it was raised,
   // is a gap regardless of what else was raised alongside it.
   for (const written of heldRows) {
-    void deps.accessLogWriter?.record({
-      orgId: ctx.resolvedOrgId,
-      routingKey: ctx.effectiveRoutingKey ?? ctx.info.routingKey ?? null,
-      actor: { type: 'system', component: 'dispatcher' },
-      action: 'held_run.request',
-      target: { type: 'held_run', id: written.row.id },
-      requestId: null,
-      source: 'platform_proxy',
-      outcome: 'allowed',
-      meta: {
-        runId,
-        jobId: jobName,
-        holdScope: written.scope,
-        triggerSource: written.triggerSource,
-        holdType: written.holdType,
-      },
-    });
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        deps.accessLogWriter?.record({
+          orgId: ctx.resolvedOrgId,
+          routingKey: ctx.effectiveRoutingKey ?? ctx.info.routingKey ?? null,
+          actor: { type: 'system', component: 'dispatcher' },
+          action: 'held_run.request',
+          target: { type: 'held_run', id: written.row.id },
+          requestId: null,
+          source: 'platform_proxy',
+          outcome: 'allowed',
+          meta: {
+            runId,
+            jobId: jobName,
+            holdScope: written.scope,
+            triggerSource: written.triggerSource,
+            holdType: written.holdType,
+          },
+        }),
+      { runId, heldRunId: written.row.id },
+    );
   }
   // Register a synthetic placeholder so the run is not considered complete
   // while the job awaits approval. Uses the same `needs-pending-` prefix as the
@@ -6204,7 +6211,7 @@ function startDeferredInitDispatch(args: {
       })
       .finally(() => {
         if (!held) return;
-        void executionTracker?.releasePendingJobsHold(runId).catch((err: unknown) => {
+        executionTracker?.releasePendingJobsHold(runId).catch((err: unknown) => {
           logger.error('Failed to release pending-jobs hold', {
             runId,
             error: toErrorMessage(err),
@@ -7758,7 +7765,7 @@ function startDeferredDynamicDispatch(args: {
       })
       .finally(() => {
         if (!held) return;
-        void executionTracker?.releasePendingJobsHold(ctx.runId).catch((err: unknown) => {
+        executionTracker?.releasePendingJobsHold(ctx.runId).catch((err: unknown) => {
           logger.error('Failed to release pending-jobs hold', {
             runId: ctx.runId,
             error: toErrorMessage(err),

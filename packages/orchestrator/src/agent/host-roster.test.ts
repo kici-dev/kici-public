@@ -598,10 +598,10 @@ describeDb('HostRosterStore', () => {
 
     it('KEEPS an ephemeral-classed host that no scaler spawned', async () => {
       // The auth-none guard. `lifecycle_class` snapshots the auth TOKEN's type,
-      // and every agent registers as `ephemeral` when the auth mode is `none` —
-      // which staging and every E2E deploy use. Keying fan-out eligibility on
-      // the class would match nothing there and fail every `runsOnAll` with
-      // "matched zero usable hosts". Eligibility keys on `scaler_managed`, so an
+      // and every agent registers as `ephemeral` when the auth mode is `none`.
+      // Keying fan-out eligibility on the class would match nothing in an
+      // auth-none deployment and fail every `runsOnAll` with "matched zero
+      // usable hosts". Eligibility keys on `scaler_managed`, so an
       // ephemeral-classed fleet host stays a target.
       await store.upsert(host({ agentId: 'authnone-1', lifecycleClass: 'ephemeral' }));
 

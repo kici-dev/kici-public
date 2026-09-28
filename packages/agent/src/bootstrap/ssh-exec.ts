@@ -234,7 +234,7 @@ export async function sshPushFile(
  * `/tmp/ssh-XXXX`. `ssh-agent` daemonizes into its own session, so it does NOT
  * die with this process — a SIGKILL of the agent (routine when an ephemeral
  * bring-up runner is torn down) skips the `finally` and orphans the daemon.
- * The namespaced socket path is how `kici-leak-sweep` reaps such orphans
+ * The namespaced socket path lets a host cleanup job reap such orphans
  * precisely: it can distinguish a KiCI bring-up agent from an operator's login
  * agent, which a bare `/tmp/ssh-XXXX` socket cannot. The private dir is removed
  * in an outer `finally` so the normal path leaves nothing behind.
@@ -265,8 +265,8 @@ async function withEphemeralAgent<T>(
     // Only ever carry the ephemeral agent's own PID. If parseAgentPid could not
     // extract one, delete any SSH_AGENT_PID inherited from a parent/login agent
     // so the `finally` teardown's `ssh-agent -k` can never signal the wrong
-    // agent (with no PID it no-ops; the orphaned ephemeral agent is reaped by
-    // kici-leak-sweep via the kici-bootstrap-ssh socket).
+    // agent (with no PID it no-ops; a host cleanup job can reap the orphaned
+    // ephemeral agent by its kici-bootstrap-ssh socket).
     if (pid) {
       agentEnv.SSH_AGENT_PID = pid;
     } else {
@@ -285,12 +285,12 @@ async function withEphemeralAgent<T>(
     } finally {
       await spawnFn('ssh-agent', ['-k'], { env: agentEnv }).catch(() => {
         // Best-effort teardown; if this process is SIGKILLed before it runs,
-        // kici-leak-sweep reaps the orphan via the kici-bootstrap-ssh socket.
+        // a host cleanup job can reap the orphan by its kici-bootstrap-ssh socket.
       });
     }
   } finally {
     await cleanup().catch(() => {
-      // Best-effort; a leaked dir is swept by kici-leak-sweep.
+      // Best-effort; a host cleanup job can sweep a leaked dir.
     });
   }
 }

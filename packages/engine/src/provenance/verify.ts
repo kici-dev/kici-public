@@ -102,7 +102,7 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
   const failures: string[] = [];
 
   // Dispatch on media type. Anything that is not the KiCI Mode-A media type is
-  // a Sigstore-style bundle this verifier does not yet handle (P1.5b).
+  // a Sigstore-style bundle this verifier does not yet handle.
   const mediaType = (opts.bundle as { mediaType?: unknown } | null)?.mediaType;
   if (mediaType !== KICI_PROVENANCE_BUNDLE_MEDIA_TYPE) {
     return { verified: false, mode: 'sigstore', checks, failures: ['mode_b_unsupported'] };

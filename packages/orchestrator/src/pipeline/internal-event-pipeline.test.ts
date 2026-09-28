@@ -669,7 +669,7 @@ describe('dispatchInternalEventViaPipeline', () => {
   });
 
   /**
-   * The plan's headline claim: the bespoke path filtered to `_type: 'static'`
+   * The headline claim: the bespoke path filtered to `_type: 'static'`
    * and dropped every dynamic job on the floor. The shared pipeline defers them
    * to the agent init round instead, so the workflow actually runs.
    */

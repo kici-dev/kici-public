@@ -830,12 +830,12 @@ describe('peerUpdateSchema', () => {
 // --- Direction-specific union tests ---
 
 describe('platformToOrchestratorMessageSchema', () => {
-  it('rejects single-frame webhook.relay (security invariant —)', () => {
+  it('rejects single-frame webhook.relay (security invariant)', () => {
     // The legacy single-frame `webhook.relay` schema is intentionally
     // excluded from the wire union: it carries an attacker-controlled
     // `payload` and pre-existed the chunked relay's on-orch HMAC
     // verification, so accepting it on the wire would let a compromised
-    // Platform (A10) fabricate webhook deliveries that bypass the only
+    // Platform fabricate webhook deliveries that bypass the only
     // trust boundary against a malicious Platform (the orchestrator-side
     // `verifyInboundWebhook` invoked from `onVerifyInbound` on the chunked
     // path). See the docblock on `webhookRelaySchema` and migration

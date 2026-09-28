@@ -3,7 +3,7 @@
  * (`cluster_meta.cluster_id`) and the durable S3 sentinel
  * (`<prefix>/.kici-cluster-id`).
  *
- * Used by `kici-admin cluster reconcile-identity` and the staging deploy's
+ * Used by `kici-admin cluster reconcile-identity`, which a deploy can run as a
  * pre-orchestrator-start self-heal step. Talks DB + S3 directly (never the
  * orchestrator HTTP admin API) so it works while the orchestrator process is
  * down — which is exactly when a "Cluster identity mismatch" boot failure needs

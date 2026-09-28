@@ -57,7 +57,6 @@ import type { AppConfig } from './config.js';
 // SDK drift diagnostic is visible on worker startup too — workers accept
 // dispatched jobs and would hit the same lock-file drift class.
 declare const KICI_PKG_VERSION: string;
-declare const KICI_BUILD_COMMIT: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 declare const KICI_SHARED_VERSION: string;
@@ -65,8 +64,6 @@ declare const KICI_SHARED_BUNDLE_HASH: string;
 declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
 const ORCHESTRATOR_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
-const WORKER_BUILD_COMMIT =
-  typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : 'unknown';
 const WORKER_SDK_VERSION = typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown';
 const WORKER_SDK_BUNDLE_HASH =
   typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown';
@@ -136,6 +133,7 @@ import type {
   JobProgress,
   WorkerClusterSettings,
 } from '@kici-dev/engine';
+import { runDetached } from './helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'worker' });
 const DRAIN_TIMEOUT_MS = 300_000; // 5 minutes
@@ -425,7 +423,6 @@ export async function bootstrapWorker(
   // SDK drift diagnostic (see docs/operator/troubleshooting.md).
   logger.info('orchestrator.build.info', {
     orchestratorVersion: ORCHESTRATOR_VERSION,
-    buildCommit: WORKER_BUILD_COMMIT,
     sdkVersion: WORKER_SDK_VERSION,
     sdkBundleHash: WORKER_SDK_BUNDLE_HASH,
     sharedVersion: WORKER_SHARED_VERSION,
@@ -534,7 +531,9 @@ export async function bootstrapWorker(
 
   const peerRegistry = new PeerRegistry({
     onClusterSettingsVersionBehind: (peerVersion: number) => {
-      void requestClusterSettings(peerVersion);
+      runDetached(logger, 'Cluster settings pull', () => requestClusterSettings(peerVersion), {
+        peerVersion,
+      });
     },
   });
 
@@ -705,7 +704,9 @@ export async function bootstrapWorker(
   // dispatcher single-flights the re-drive.
   if (scalerManager) {
     scalerManager.onCapacityFreed = () => {
-      void dispatcher.retryPendingScaleRequests();
+      runDetached(logger, 'Capacity-freed scale re-drive', () =>
+        dispatcher.retryPendingScaleRequests(),
+      );
     };
   }
 
@@ -823,7 +824,12 @@ export async function bootstrapWorker(
       onConnected: () => replayPending(outbox, (m) => client.send(m), rawUrl),
       // Coord ACKed a terminal job status — prune the matching outbox record.
       onJobProgressAck: (ack) => {
-        void outbox.ack(rawUrl, ack.runId, ack.jobId);
+        runDetached(
+          logger,
+          'Job progress outbox ack',
+          () => outbox.ack(rawUrl, ack.runId, ack.jobId),
+          { runId: ack.runId, jobId: ack.jobId },
+        );
       },
 
       getLocalInventory,
@@ -1007,7 +1013,8 @@ export async function bootstrapWorker(
     livenessInfo: () => ({
       role: 'worker',
       version: ORCHESTRATOR_VERSION,
-      buildCommit: WORKER_BUILD_COMMIT,
+      // Deprecated: carries the version (BuildFingerprint.buildCommit).
+      buildCommit: ORCHESTRATOR_VERSION,
       sdkVersion: WORKER_SDK_VERSION,
       sdkBundleHash: WORKER_SDK_BUNDLE_HASH,
       sharedVersion: WORKER_SHARED_VERSION,
@@ -1103,13 +1110,19 @@ export async function bootstrapWorker(
     agentAuthMode: config.agentAuth,
     fleetAgentCollector,
     onJobStatus: (_agentId, msg) => {
-      executionTracker.onJobStatus(
-        msg.runId,
-        msg.jobId,
-        msg.state,
-        msg.timestamp,
-        _agentId,
-        msg.data,
+      runDetached(
+        logger,
+        'Job status forward',
+        () =>
+          executionTracker.onJobStatus(
+            msg.runId,
+            msg.jobId,
+            msg.state,
+            msg.timestamp,
+            _agentId,
+            msg.data,
+          ),
+        { runId: msg.runId, jobId: msg.jobId },
       );
     },
     onLogChunk: (_agentId, msg) => {
@@ -1144,14 +1157,20 @@ export async function bootstrapWorker(
         ...(msg.concurrencyKind !== undefined && { concurrencyKind: msg.concurrencyKind }),
         ...(msg.groupId !== undefined && { groupId: msg.groupId }),
       };
-      executionTracker.onStepStatus(
-        msg.runId,
-        msg.jobId,
-        msg.stepIndex,
-        msg.stepName,
-        msg.state,
-        msg.timestamp,
-        data,
+      runDetached(
+        logger,
+        'Step status forward',
+        () =>
+          executionTracker.onStepStatus(
+            msg.runId,
+            msg.jobId,
+            msg.stepIndex,
+            msg.stepName,
+            msg.state,
+            msg.timestamp,
+            data,
+          ),
+        { runId: msg.runId, jobId: msg.jobId, stepIndex: msg.stepIndex },
       );
     },
     onScalerAgentRegistered: scalerManager
@@ -1276,9 +1295,11 @@ export async function bootstrapWorker(
       {
         name: 'Closing HTTP server',
         fn: () => {
-          // Force-close open sockets (peer WS, agent WS, dashboard streams)
-          // so server.close() can return immediately instead of waiting for
-          // long-lived connections to idle. Same rationale as orchestrator-core.
+          // End every plain HTTP connection (keep-alive health and status
+          // requests) so they do not hold the close open.
+          // closeAllConnections() does not touch upgraded WebSocket sockets,
+          // so server.close() is not awaited: an agent socket still closing
+          // cannot hold the shutdown.
           (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
           server.close();
         },

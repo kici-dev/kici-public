@@ -196,7 +196,7 @@ describe('agentWorkflowSummarySchema', () => {
       nextFireAt: null,
       source: {
         routingKey: 'generic:org:abc',
-        name: wrapUntrusted('stg-generic'),
+        name: wrapUntrusted('src-generic'),
         provider: 'generic',
       },
     };

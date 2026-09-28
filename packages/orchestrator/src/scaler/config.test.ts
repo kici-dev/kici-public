@@ -450,6 +450,68 @@ describe('scalerFileSchema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'uid' field/);
   });
 
+  describe('Firecracker extraHosts', () => {
+    const fcScaler = (extraHosts: string[]) => ({
+      version: 1,
+      scalers: [
+        {
+          name: 'fc-extra-hosts',
+          type: 'firecracker',
+          maxAgents: 5,
+          firecrackerPath: '/usr/bin/firecracker',
+          jailerPath: '/usr/bin/jailer',
+          kernelPath: '/opt/kici/vmlinux',
+          uid: 1000,
+          gid: 1000,
+          extraHosts,
+          labelSets: [{ labels: ['linux'], rootfsPath: '/opt/kici/rootfs.ext4' }],
+        },
+      ],
+    });
+
+    it('accepts host:address entries, including host-gateway and IPv6', () => {
+      // breaks-if-wrong: the forms the container backend accepts for the same
+      // field still load on a Firecracker scaler.
+      const result = scalerFileSchema.parse(
+        fcScaler(['registry.local:host-gateway', 'cache.example.internal:10.1.2.3', 'v6:fd00::1']),
+      );
+      expect(result.scalers[0].extraHosts).toEqual([
+        'registry.local:host-gateway',
+        'cache.example.internal:10.1.2.3',
+        'v6:fd00::1',
+      ]);
+    });
+
+    it('refuses an entry the guest /etc/hosts cannot take', () => {
+      // fails-when: a malformed entry loads and reaches the guest's /etc/hosts
+      // at spawn time instead of failing at startup, where the operator sees it.
+      expect(() => scalerFileSchema.parse(fcScaler(['registry.local']))).toThrow(
+        /fc-extra-hosts.*extraHosts\[0\].*host:address/s,
+      );
+      expect(() =>
+        scalerFileSchema.parse(fcScaler(['ok.local:10.0.0.9', 'two names:10.0.0.1'])),
+      ).toThrow(/extraHosts\[1\].*not a valid hostname/s);
+    });
+
+    it('leaves container extraHosts to the container runtime', () => {
+      // breaks-if-wrong: the Firecracker check must not start refusing entries
+      // the container runtime accepts in its own syntax.
+      const result = scalerFileSchema.parse({
+        version: 1,
+        scalers: [
+          {
+            name: 'container-linux',
+            type: 'container',
+            maxAgents: 1,
+            extraHosts: ['host.docker.internal=host-gateway'],
+            labelSets: [{ labels: ['linux'], image: 'ghcr.io/my/agent:latest' }],
+          },
+        ],
+      });
+      expect(result.scalers[0].extraHosts).toEqual(['host.docker.internal=host-gateway']);
+    });
+  });
+
   it('validates Firecracker network config with defaults', () => {
     const result = firecrackerNetworkSchema.parse({});
     expect(result).toEqual({
@@ -614,9 +676,9 @@ describe('networkPolicySchema', () => {
 
   it('accepts every hostAccess form', () => {
     const result = networkPolicySchema.parse({
-      hostAccess: ['5000', '10.98.0.0/24:443', '*:10143', '192.168.1.85'],
+      hostAccess: ['5000', '10.98.0.0/24:443', '*:10143', '192.168.1.40'],
     });
-    expect(result?.hostAccess).toEqual(['5000', '10.98.0.0/24:443', '*:10143', '192.168.1.85']);
+    expect(result?.hostAccess).toEqual(['5000', '10.98.0.0/24:443', '*:10143', '192.168.1.40']);
   });
 
   it('accepts an empty hostAccess as "reach nothing on the host"', () => {

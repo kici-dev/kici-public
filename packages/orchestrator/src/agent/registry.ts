@@ -167,7 +167,7 @@ export interface AgentEntry {
    * The `agent_tokens.id` row used to authenticate this connection, or
    * `null` when auth mode is `none`. Indexed by `tokenIdIndex` so a
    * synchronous revocation kick can enumerate every WS authenticated by
-   * a given token. in the pentest catalog.
+   * a given token.
    */
   tokenId: string | null;
   // --- Static OS metadata (from agent.register) ---
@@ -301,10 +301,9 @@ export class AgentRegistry {
    *
    * Idempotent: re-scheduling the same tokenId is a no-op as long as
    * a timer is still queued — a token's `expires_at` doesn't shift
-   * across reconnects of the same agent. Closes the sister gap
-   * to the revocation finding (`agent-token-revocation-stale-ws`,
-   * fixed in `993bc3d9d`) where natural TTL expiration had no
-   * propagation path to in-flight WS connections.
+   * across reconnects of the same agent. Revocation kicks a token's
+   * in-flight WS connections at once; these timers do the same when
+   * the token reaches its natural TTL.
    */
   private readonly tokenExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -577,10 +576,9 @@ export class AgentRegistry {
    * Caller is the agent WS handler at register-time, when the token's
    * `agent_tokens.expires_at` column is non-null. Static tokens have
    * `expires_at = null` and are skipped at the call site (they have
-   * no TTL by design). Closes the sister gap to the revocation
-   * finding (`agent-token-revocation-stale-ws`, fixed in `993bc3d9d`)
-   * where natural TTL expiration had no propagation path to
-   * in-flight WS connections.
+   * no TTL by design). Revocation kicks a token's in-flight WS
+   * connections at once; this timer does the same at the token's
+   * natural TTL.
    */
   scheduleExpiryKick(tokenId: string, expiresAt: Date): void {
     if (this.tokenExpiryTimers.has(tokenId)) return;

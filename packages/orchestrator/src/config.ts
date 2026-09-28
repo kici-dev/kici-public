@@ -18,9 +18,17 @@
 import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { defineEnv, validateUnknownKiciVars, LOGGER_ENV_VARS } from '@kici-dev/shared/env';
+import {
+  defineEnv,
+  ORCHESTRATOR_DEFAULT_PORT,
+  validateUnknownKiciVars,
+  LOGGER_ENV_VARS,
+} from '@kici-dev/shared/env';
 import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX } from './cluster/cluster-identity.js';
+
+/** How long the database pool waits for a connection when `KICI_DB_POOL_ACQUIRE_TIMEOUT_MS` is unset. */
+export const DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS = 5_000;
 
 /**
  * Default for `sealed_secrets_retry_backoff_ms`: how long a coordinator stops
@@ -36,7 +44,7 @@ const baseSchema = z.object({
   // Operating mode
   mode: OrchestratorMode.default('platform'),
   // Server
-  port: z.coerce.number().default(4000),
+  port: z.coerce.number().default(ORCHESTRATOR_DEFAULT_PORT),
   /**
    * Address the HTTP + WebSocket listener binds. Defaults to every interface,
    * matching the Platform's own `KICI_HOST`, because a real orchestrator
@@ -123,7 +131,11 @@ const baseSchema = z.object({
   // saturated (instead of queueing forever); the statement timeout stops a
   // single runaway query from holding a connection indefinitely.
   dbPoolMax: z.coerce.number().int().positive().default(20),
-  dbPoolAcquireTimeoutMs: z.coerce.number().int().nonnegative().default(5_000),
+  dbPoolAcquireTimeoutMs: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS),
   dbStatementTimeoutMs: z.coerce.number().int().nonnegative().default(30_000),
   // Lockfile cache
   lockfileCacheMax: z.coerce.number().default(500),
@@ -235,7 +247,7 @@ const baseSchema = z.object({
   // ingestQueueMaxWaitMs (W_max): hard sojourn ceiling (< the 5s WS ack timeout).
   ingestQueueMaxWaitMs: z.coerce.number().int().min(1).default(3000),
   // ingestLoopLagShedMs (L_shed): p99 event-loop delay shed threshold
-  // (generous; calibrate down on staging via the always-emitted p99 gauge).
+  // (generous; calibrate down against the always-emitted p99 gauge).
   ingestLoopLagShedMs: z.coerce.number().int().min(1).default(200),
   // ingestLoopLagResumeMs (L_resume): hysteresis re-open threshold — the gate
   // closes only when p99 falls below this, preventing bang-bang flapping.
@@ -271,9 +283,9 @@ const baseSchema = z.object({
   // bound, and it is what keeps the buffer safe now that a capacity refusal
   // costs no attempt: without it a permanently saturated org's rows would fill
   // ingestOverflowMax and capture would start dropping FRESH deliveries
-  // instead. The default is ~13x the worst convergence latency observed on
-  // staging (66.7s), so an overload has to be an order of magnitude worse than
-  // any measured one before a delivery is given up on. It may equal
+  // instead. The default is ~13x a measured worst-case convergence latency
+  // (66.7s), so an overload has to be an order of magnitude worse than that
+  // before a delivery is given up on. It may equal
   // ingestOverflowClaimTimeoutMs without the two interacting: expiry only ever
   // touches `buffered` rows, so a claimed row is reclaimed first and expired on
   // a later pass.
@@ -633,7 +645,7 @@ const baseSchema = z.object({
   eventRouterRetryMaxBackoffMs: z.coerce.number().default(300_000),
   eventRouterRetryScanIntervalMs: z.coerce.number().default(10_000),
   // Inbound webhook delivery log (event_log table). Default soft-cap 5MB.
-  // Phase E retired the row TTL: rows are now archived to cold-store after
+  // Rows have no TTL: they are archived to cold-store after
   // 30 days rather than hard-deleted. Oversized payloads are still recorded
   // with payload_omitted=true rather than 413'd.
   eventLogMaxPayloadBytes: z.coerce.number().default(5 * 1024 * 1024),
@@ -937,7 +949,7 @@ export type AppConfig = z.infer<typeof configSchema> & {
 
 /**
  * Env-var definition for the orchestrator. Exported so the docs generator and
- * the deploy-stg pre-validator can re-parse without going through process.env.
+ * config pre-validation can re-parse without going through process.env.
  *
  * Note: passes the inner `baseSchema` (a ZodObject) so describe() can walk
  * `.shape`, but uses the outer `configSchema` (with .superRefine) as the parser
@@ -1188,8 +1200,8 @@ const COLD_STORE_ENV_VARS = [
 ];
 
 /**
- * Deployment-identity env vars injected by the installer (and the staging
- * deploy) so the orchestrator can report its own deployment shape in
+ * Deployment-identity env vars injected by the installer (or other deploy
+ * tooling) so the orchestrator can report its own deployment shape in
  * `source.register`. Read directly from `process.env` by the deployment reader,
  * not threaded through the AppConfig schema — registered here so the
  * unknown-KICI_* validator at boot doesn't reject them.

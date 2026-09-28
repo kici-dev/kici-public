@@ -70,10 +70,39 @@ pnpm -r run build
 pnpm -r run test
 ```
 
-Requires Node 24 (pinned via `mise.toml` if you use mise) and pnpm 10+.
+Requires Node 24 and pnpm 11, both pinned in `.mise.toml` if you use mise.
 The quickstart at [`docs/user/quickstart.md`](docs/user/quickstart.md)
 covers the end-to-end "author a workflow, run it locally, optionally
 connect a hosted orchestrator" loop.
+
+## Building the standalone packages
+
+Each release attaches standalone packages of the orchestrator, `kici-admin`
+and the agent. `scripts/package.mjs` builds them from this repository. Check
+out the release tag, then build the workspace and package one component:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm -r run build
+node scripts/package.mjs --target kici-admin --platform linux-x64 --light
+```
+
+`node scripts/package.mjs --help` lists the components, the platforms and the
+options. A release also passes
+`--image-digest-record packages/orchestrator/installer-image-digests.json`, so
+the `kici-admin` packages pin the container images by digest.
+
+A full package embeds Node.js: the script downloads the official archive from
+nodejs.org and checks it against `SHASUMS256.txt`. A full Windows package also
+needs `unzip`.
+
+## Building the Firecracker agent rootfs
+
+`scripts/firecracker/` holds the Firecracker host setup scripts and the agent
+rootfs build. The build runs from a checkout of a release tag, after
+`pnpm install --frozen-lockfile` and `pnpm -r run build`, and needs root.
+[`docs/operator/orchestrator/firecracker/rootfs.md`](docs/operator/orchestrator/firecracker/rootfs.md)
+covers the steps.
 
 ## License
 

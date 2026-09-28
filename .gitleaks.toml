@@ -1,11 +1,9 @@
-# gitleaks configuration for the KiCI repos.
+# gitleaks configuration for the KiCI repositories.
 #
-# Authored in the private monorepo root and projected verbatim into
-# github.com/kici-dev/kici-public via ROOT_FILES_TO_COPY (see
-# packages/ci/src/project-public.ts), so the public repo's CI and the
-# sync-time secret gate in hack/sync-public.ts share one source of truth.
-# gitleaks auto-discovers a `.gitleaks.toml` at the scan source root, so
-# projecting it to the public repo root is all the wiring CI needs.
+# The public repository (github.com/kici-dev/kici-public) carries this file
+# verbatim, so a scan of it and the secret gate every release runs before
+# publishing it share one configuration. gitleaks auto-discovers a
+# `.gitleaks.toml` at the scan source root, so no other wiring is needed.
 #
 # It extends gitleaks' default rule set and allowlists the file
 # categories that are public-by-design and carry only placeholder /

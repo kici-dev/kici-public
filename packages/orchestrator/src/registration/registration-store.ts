@@ -126,16 +126,15 @@ export class RegistrationStore {
 
       // Self-heal: if any existing row has customer_id='__default__' AND the
       // incoming options.customerId is a real tenant, rewrite the stale rows
-      // in this same transaction. See Plan 28.6.2-07 / spike 2026-04-12.
+      // in this same transaction.
       //
       // Why this matters: workflow_registrations rows can be created with
       // customer_id='__default__' when processor.resolveOrgId() returned the
-      // sentinel because sources.customer_id was not yet populated. After
-      // deploy-stg.ts:updateSourcesCustomerId() rewrites sources.customer_id,
-      // those workflow_registrations rows stay stale because replaceAll()
-      // only re-runs on a real push event AND historically had no back-fill.
-      // The 2026-04-12 spike found 12 such rows in staging that broke
-      // Plan 06's cross-provider lock-file fallback.
+      // sentinel because sources.customer_id was not yet populated. Once
+      // sources.customer_id is set to the real tenant, those
+      // workflow_registrations rows stay stale until replaceAll() re-runs on
+      // a real push event, and a stale row breaks the cross-provider
+      // lock-file fallback.
       //
       // We do NOT rewrite __default__ to __default__ (no heal needed, no
       // noisy log). We do NOT rewrite real-to-real (the upsert loop already

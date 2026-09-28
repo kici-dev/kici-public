@@ -60,13 +60,13 @@ All peers will need new join tokens to reconnect. Use this for security incident
 
 ### Prune stale peer credentials (offline)
 
-During warm redeploys the e2e tooling sometimes needs to wipe rows left behind by a previous cluster while preserving the ones created by the current test run. `prune-credentials` is a direct-DB, destructive verb that deletes every `peer_credentials` row whose `instance_id` does **not** match the supplied SQL `LIKE` pattern:
+When you redeploy a cluster in place, rows left behind by the previous cluster stay in the database. Give the instances of the new cluster a common ID prefix, and keep only the rows that match it. `prune-credentials` is a direct-DB, destructive verb that deletes every `peer_credentials` row whose `instance_id` does **not** match the supplied SQL `LIKE` pattern:
 
 ```bash
-kici-admin peer prune-credentials --filter 'e2e-%' --database-url "$KICI_DATABASE_URL"
+kici-admin peer prune-credentials --filter 'cluster-b-%' --database-url "$KICI_DATABASE_URL"
 ```
 
-HTTP mode is intentionally unsupported — the call site is a preflight run while the orchestrator is stopped. Pair with `peer reset-raft-state` below when you also need the newly-booted orchestrator to self-elect with a clean Raft term.
+HTTP mode is intentionally unsupported: run it as a preflight step while the orchestrator is stopped. Pair with `peer reset-raft-state` below when you also need the newly-booted orchestrator to self-elect with a clean Raft term.
 
 ### Reset Raft state (offline)
 

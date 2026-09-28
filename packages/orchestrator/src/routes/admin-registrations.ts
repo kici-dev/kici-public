@@ -185,7 +185,7 @@ export function createAdminRegistrationRoutes(
   });
 
   // Manually upsert workflow_registrations from a lock file (for break-glass /
-  // E2E seeding). Transactional via RegistrationStore.replaceAll + bumpVersion.
+  // test seeding). Transactional via RegistrationStore.replaceAll + bumpVersion.
   app.post('/api/v1/admin/registrations/register-manual', async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'context.update');

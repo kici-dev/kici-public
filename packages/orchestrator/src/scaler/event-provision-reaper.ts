@@ -3,6 +3,7 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { setScalerReapBlocked, setScalerReapUnseenProvisions } from '../metrics/prometheus.js';
 import { ScaleDownReason } from './scaler-events.js';
 import type { ReapCandidate } from './scaler-state-store.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'event-provision-reaper' });
 
@@ -547,7 +548,7 @@ export class EventProvisionReaper {
     if (this.timer) clearInterval(this.timer);
     this.scheduledIntervalMs = intervalMs;
     this.timer = setInterval(() => {
-      void this.tick();
+      runDetached(logger, 'Event provision reaper tick', () => this.tick());
     }, intervalMs);
     this.timer.unref?.();
   }

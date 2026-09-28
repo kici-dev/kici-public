@@ -9,15 +9,15 @@
  * downstream secret resolution depends on.
  *
  * Trust model (must hold):
- *   For a pull-request event from attacker model A7 (untrusted workflow
- *   contributor — a fork PR sender), the orchestrator's trigger
+ *   For a pull-request event from an untrusted workflow contributor (a
+ *   fork PR sender), the orchestrator's trigger
  *   evaluation runs against the base branch's lock file — NOT the
- *   contributor's HEAD branch lock. This bounds what an A7 attacker can
+ *   contributor's HEAD branch lock. This bounds what such a contributor can
  *   claim about workflow triggers, jobs, `environment`, `env`, and
  *   `concurrencyGroup` fields, all of which feed downstream
  *   secret-resolution and protection-rule gates.
  *
- *   Removing this gate would let an A7 fork-PR sender publish a HEAD
+ *   Removing this gate would let a fork-PR sender publish a HEAD
  *   lock claiming `environment: 'prod'` and have the orchestrator
  *   resolve prod secrets at dispatch time before any human review.
  */
@@ -25,7 +25,7 @@ import { describe, it, expect } from 'vitest';
 import type { TrustTier } from '@kici-dev/engine';
 import { selectLockFileSource } from './lock-source.js';
 
-describe('lock-file source selection — A7 untrusted contributor cannot inject HEAD lock', () => {
+describe('lock-file source selection — untrusted contributor cannot inject HEAD lock', () => {
   it('returns "head" for non-PR events regardless of tier', () => {
     // Non-PR events (push, tag, schedule, etc.) come from someone with
     // direct write access to the repo; HEAD is correct.
@@ -37,7 +37,7 @@ describe('lock-file source selection — A7 untrusted contributor cannot inject 
   it('returns "base" for a PR event when trust resolution has not yet run', () => {
     // An absent tier is the fail-closed input: any caller that reaches
     // lock-file selection without a resolved tier is gated against an
-    // A7 attacker.
+    // untrusted contributor.
     expect(selectLockFileSource(true, undefined)).toBe('base');
   });
 
@@ -48,7 +48,7 @@ describe('lock-file source selection — A7 untrusted contributor cannot inject 
   });
 
   it('returns "head" only for a PR event on a trusted ref', () => {
-    // `trusted` means the head ref lives in the base repo, which an A7
+    // `trusted` means the head ref lives in the base repo, which a
     // fork-PR sender cannot arrange. Only this tier earns HEAD-branch
     // lock fetch.
     expect(selectLockFileSource(true, 'trusted')).toBe('head');

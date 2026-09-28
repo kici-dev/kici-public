@@ -23,7 +23,7 @@ vi.mock('../local-plane/plane-manager.js', () => ({
     port: 4319,
     url: 'http://127.0.0.1:4319',
     mode: 'hybrid',
-    attachment: { orgId: 'kiciStg00001' },
+    attachment: { orgId: 'acmeOrg00001' },
   }),
   detachPlane: vi.fn().mockResolvedValue({ running: true, mode: 'independent' }),
 }));
@@ -181,9 +181,9 @@ describe('kici local commands', () => {
   it('localLogsCommand prints the path on stdout and the rotation policy on stderr', async () => {
     // fails-when: the note is written to stdout instead. A caller reading the
     // command's stdout must get the path with no prose around it (the CLI
-    // banner is printed by cli.ts, not here), and the routed-local-offline E2E
-    // captures the first path-shaped token of the combined output, which the
-    // bare path on stdout keeps unambiguous.
+    // banner is printed by cli.ts, not here), and a script that takes the first
+    // path-shaped token of the combined output relies on the bare path on
+    // stdout to keep that token unambiguous.
     const { localLogsCommand } = await import('./local.js');
     await expect(localLogsCommand()).resolves.toBe(true);
     expect(spy.mock.calls).toEqual([['/tmp/x/orchestrator.log']]);
@@ -299,17 +299,17 @@ describe('kici local commands', () => {
   it('localAttachCommand attaches when logged in with an active org', async () => {
     loadGlobalConfig.mockResolvedValue({
       pat: 'kici_pat_abc',
-      platformEndpoint: 'https://platform.example.com/kici-stg',
-      activeOrgId: 'kiciStg00001',
+      platformEndpoint: 'https://platform.example.com/kici',
+      activeOrgId: 'acmeOrg00001',
     });
     const { localAttachCommand } = await import('./local.js');
     const { attachPlane } = await import('../local-plane/plane-manager.js');
     const ok = await localAttachCommand();
     expect(ok).toBe(true);
     expect(attachPlane).toHaveBeenCalledWith({
-      apiBase: 'https://platform.example.com/kici-stg',
+      apiBase: 'https://platform.example.com/kici',
       pat: 'kici_pat_abc',
-      orgId: 'kiciStg00001',
+      orgId: 'acmeOrg00001',
     });
   });
 

@@ -15,8 +15,8 @@
  * server is already serving. `IF NOT EXISTS` makes every build idempotent, and
  * a failed build retries on the next boot.
  *
- * `hack/check-migration-safety.ts` enforces that new indexes on those tables
- * land here rather than in a migration.
+ * A repository check enforces that new indexes on those tables land here
+ * rather than in a migration.
  */
 import type pg from 'pg';
 import { createLogger, type Logger } from '@kici-dev/shared';

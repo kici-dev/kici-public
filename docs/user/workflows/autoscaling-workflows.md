@@ -282,7 +282,71 @@ export default workflow('aws-autoscale-provision', {
 
 The teardown workflow mirrors this: it runs `DescribeInstances` filtered by the `kici-agent-id` tag, then `TerminateInstances` on the matches. "None found" logs and succeeds.
 
-The AWS reference lives at `e2e/fixtures/aws-autoscale/`. It is compiled and typechecked against the AWS EC2 SDK, but it is not run against real AWS — unlike the Hetzner reference, which has a real-cloud E2E. Adapt the AMI, instance type, subnet, and IAM instance profile for your account.
+```ts
+import {
+  workflow,
+  job,
+  kiciEvent,
+  SCALER_EVENT_NAMES,
+  ScalerScaleDownPayload,
+} from '@kici-dev/sdk';
+import {
+  EC2Client,
+  DescribeInstancesCommand,
+  TerminateInstancesCommand,
+} from '@aws-sdk/client-ec2';
+
+const SCALER_NAME = 'aws';
+const AWS_REGION = 'us-east-1';
+
+export default workflow('aws-autoscale-teardown', {
+  on: [kiciEvent({ name: SCALER_EVENT_NAMES.scaleDown, match: { '$.scalerName': SCALER_NAME } })],
+  jobs: [
+    job('teardown', {
+      runsOn: ['default'],
+      // Bind the context whose scope holds the credential this job reads.
+      // Without it `ctx.secrets` resolves nothing: the job option is `context`,
+      // and an unrecognised key is dropped at compile time rather than
+      // rejected, so the step would fail on a missing secret at run time.
+      context: 'aws-autoscale',
+      run: async (ctx) => {
+        const payload = ScalerScaleDownPayload.parse(ctx.rawPayload);
+
+        const client = new EC2Client({
+          region: AWS_REGION,
+          credentials: {
+            accessKeyId: await ctx.secrets.get('AWS_ACCESS_KEY_ID'),
+            secretAccessKey: await ctx.secrets.get('AWS_SECRET_ACCESS_KEY'),
+          },
+        });
+
+        const described = await client.send(
+          new DescribeInstancesCommand({
+            Filters: [{ Name: 'tag:kici-agent-id', Values: [payload.agentId] }],
+          }),
+        );
+
+        const instanceIds = (described.Reservations ?? [])
+          .flatMap((reservation) => reservation.Instances ?? [])
+          .map((instance) => instance.InstanceId)
+          .filter((id): id is string => typeof id === 'string');
+
+        if (instanceIds.length === 0) {
+          ctx.log.info(`No EC2 instance found for agent ${payload.agentId}; nothing to tear down`);
+          return;
+        }
+
+        await client.send(new TerminateInstancesCommand({ InstanceIds: instanceIds }));
+        for (const id of instanceIds) {
+          ctx.log.info(`Terminated EC2 instance ${id} for agent ${payload.agentId}`);
+        }
+      },
+    }),
+  ],
+});
+```
+
+The AWS reference workflows behind these snippets are compiled and typechecked against the AWS EC2 SDK, but they are not run against real AWS — unlike the Hetzner reference, which is tested against real Hetzner Cloud servers. Adapt the AMI, instance type, subnet, and IAM instance profile for your account.
 
 ## GitHub Actions runners
 

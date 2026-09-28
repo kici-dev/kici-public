@@ -14,7 +14,6 @@ const KICI_HEALTH = {
   timestamp: '2026-08-02T15:25:00.000Z',
   uptime: 5880.2,
   version: '0.1.28',
-  buildCommit: 'deadbeef',
   sdkVersion: '0.1.28',
   sdkBundleHash: 'abc123',
   sharedVersion: '0.1.28',

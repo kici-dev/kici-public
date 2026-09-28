@@ -709,7 +709,7 @@ describe('RegistrationIndex', () => {
       expect(result.map((r) => r.id).sort()).toEqual(['reg-1', 'reg-2']);
     });
 
-    it('Test B — cross-org isolation (WHK-CROSS-02): orgA lookup never returns orgB rows', async () => {
+    it('Test B — cross-org isolation: orgA lookup never returns orgB rows', async () => {
       const rows = [
         makeRegistrationRow({
           id: 'reg-X',

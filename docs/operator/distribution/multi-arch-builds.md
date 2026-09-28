@@ -1,241 +1,75 @@
 ---
-title: Multi-architecture builds
-description: Building and deploying KiCI images for x64 (amd64) and ARM64 (aarch64)
+title: Multi-architecture images
+description: Running KiCI on x64 (amd64) and ARM64 (aarch64) machines with the published multi-arch images
 ---
 
-KiCI supports deployment on both x64 (amd64) and ARM64 (aarch64) platforms. Images are built
-natively on each architecture for maximum performance -- no QEMU emulation is used.
+KiCI runs on x64 (amd64) and ARM64 (aarch64) machines. Every release publishes the orchestrator
+and agent images to `quay.io/kici-dev` as multi-arch manifest lists for `linux/amd64` and
+`linux/arm64`. Pull the same reference on each machine. The container runtime selects the image for
+the architecture of that machine.
 
-## Prerequisites
-
-Each build machine requires:
-
-- **Podman 5.x** (or Docker with equivalent commands)
-- **Git** and access to the KiCI source repository
-- **Node.js 24** and **pnpm 10.x** (for building TypeScript before containerization)
-
-The build script handles image creation and multi-arch manifest assembly. It runs from the
-repository root, where the Dockerfiles reference `packages/` paths relative to the workspace.
-
-## Building per-architecture images
-
-KiCI provides a build script at `scripts/build-multi-arch.sh` that automates the process.
-
-### On an x64 machine
+## Pull the published images
 
 ```bash
-# Clone the repository
-git clone https://github.com/kici-dev/kici-public.git && cd kici-public
-
-# Build all three services for amd64
-./scripts/build-multi-arch.sh orchestrator stg
-./scripts/build-multi-arch.sh agent stg
-./scripts/build-multi-arch.sh platform stg
+podman pull quay.io/kici-dev/kici-orchestrator:<version>
+podman pull quay.io/kici-dev/kici-agent:<version>
 ```
 
-This produces images tagged with the architecture suffix:
+[Release artifacts](./release-artifacts.md) lists the digest of each image for the current release.
+The digest is the manifest-list digest, so a digest-pinned reference also resolves on both
+architectures.
 
-- `localhost/kici-orchestrator:stg-amd64`
-- `localhost/kici-agent:stg-amd64`
-- `localhost/kici-platform:stg-amd64`
+## Build the images yourself
 
-### On an ARM64 machine
+[Distribution § Building images](./distribution.md#building-images) shows how to build an image
+from source. A build produces an image for the architecture of the build machine only. For both
+architectures, build on an x64 machine and on an ARM64 machine.
 
-```bash
-# Same commands -- architecture is auto-detected
-./scripts/build-multi-arch.sh orchestrator stg
-./scripts/build-multi-arch.sh agent stg
-./scripts/build-multi-arch.sh platform stg
-```
+## Clusters with x64 and ARM64 machines
 
-This produces:
+One cluster can run agents on both architectures. Give each architecture its own scaler, and set the
+architecture in the `platform` field of the scaler. An ARM64 pool accepts only the jobs whose
+`runsOn` includes `arm64`, so other jobs stay on the x64 pool.
+[Clustering § x64 + ARM64 pool](../orchestrator/clustering.md#x64--arm64-pool) shows the
+orchestrator configuration.
 
-- `localhost/kici-orchestrator:stg-arm64`
-- `localhost/kici-agent:stg-arm64`
-- `localhost/kici-platform:stg-arm64`
-
-### Overriding architecture
-
-Use `--arch` to force a specific architecture tag (the actual binary architecture still depends on
-the host machine):
-
-```bash
-./scripts/build-multi-arch.sh orchestrator stg --arch arm64
-```
-
-## Multi-arch manifests (optional)
-
-### What are manifests?
-
-An OCI multi-arch manifest (also called a manifest list or image index) is a pointer that maps a
-single image tag to multiple platform-specific images. When a container runtime pulls the image, it
-automatically selects the correct variant for its architecture.
-
-### When are they useful?
-
-Manifests are useful when you push images to a registry. A single tag like
-`registry.example.com/kici-orchestrator:stg` resolves to the correct amd64 or arm64 image
-depending on the pulling machine. Without a registry, the manifest serves as local verification
-that both architecture images are present and correctly tagged.
-
-### Creating a manifest
-
-Both per-arch images must exist in the same Podman store. Transfer images between machines if
-needed:
-
-```bash
-# Transfer from x64 to ARM64 machine (or vice versa)
-podman save localhost/kici-orchestrator:stg-amd64 | ssh arm64-host podman load
-podman save localhost/kici-orchestrator:stg-arm64 | ssh x64-host podman load
-```
-
-Then create the manifest:
-
-```bash
-./scripts/build-multi-arch.sh orchestrator stg --manifest-only
-```
-
-This creates `localhost/kici-orchestrator:stg` as a multi-arch manifest containing both the amd64
-and arm64 variants. The script validates that both images exist before creating the manifest.
-
-### Pushing to a registry
-
-When a private registry is available:
-
-```bash
-podman manifest push localhost/kici-orchestrator:stg \
-  docker://registry.example.com/kici-orchestrator:stg
-```
-
-## Deployment on heterogeneous clusters
-
-KiCI supports mixed-architecture deployments where x64 and ARM64 machines run together. The
-multi-orchestrator clustering feature (see [Clustering](../orchestrator/clustering.md)) enables this pattern.
-
-### Architecture-specific deployments
-
-Each machine runs the image built for its native architecture:
-
-```
-x64 Machine                          ARM64 Machine
-+---------------------------+        +---------------------------+
-| kici-orchestrator:stg-amd64 |      | kici-orchestrator:stg-arm64 |
-| kici-agent:stg-amd64       |      | kici-agent:stg-arm64        |
-+---------------------------+        +---------------------------+
-         |                                    |
-         +------------- Platform Relay -----------+
-```
-
-### Multi-orchestrator configuration
-
-Both orchestrators register the same routing key with the Platform relay. The Platform layer
-round-robins incoming webhooks across connected orchestrators. Each orchestrator dispatches jobs to
-its local agents, which run natively on the matching architecture.
-
-Key configuration points:
-
-- Both orchestrators register the same routing key (e.g., `github:12345`) via their shared GitHub App source configuration
-- Each orchestrator has its own agent pool with architecture-matched labels
-- Cluster mode enables job rerouting if one orchestrator cannot handle a job locally
-- See [Clustering](../orchestrator/clustering.md) for detailed configuration
-
-### Scalers configuration
-
-When using the auto-scaler, configure architecture-appropriate settings in `scalers.yaml` on each
-machine. The agent images referenced in scaler label-sets must match the host architecture:
+With the published images, the scalers on both machines use the same image reference:
 
 ```yaml
-# On x64 machine
-label_sets:
-  - labels: [linux, x64]
+# scalers.yaml on the ARM64 machine
+version: 1
+
+scalers:
+  - name: container-arm64
     type: container
-    container:
-      image: localhost/kici-agent:stg-amd64
+    maxAgents: 10
+    platform:
+      os: linux
+      arch: arm64
+    labelSets:
+      - labels: ['linux', 'container']
+        image: 'quay.io/kici-dev/kici-agent:<version>'
 ```
 
-```yaml
-# On ARM64 machine
-label_sets:
-  - labels: [linux, arm64]
-    type: container
-    container:
-      image: localhost/kici-agent:stg-arm64
-```
+On the x64 machine, name the scaler `container-x64` and set `arch: x64`. A job for the ARM64 pool
+sets `runsOn: ['linux', 'container', 'arm64']`.
 
 ## Container runtime requirements
 
-| Service      | Special Capabilities                                                                                       |
+| Service      | Special capabilities                                                                                       |
 | ------------ | ---------------------------------------------------------------------------------------------------------- |
 | Orchestrator | `NET_ADMIN` if using Firecracker (see [Firecracker host setup](../orchestrator/firecracker/host-setup.md)) |
 | Agent        | None (standard container)                                                                                  |
-| Platform     | None (standard container)                                                                                  |
 
-All three services run as non-root (`USER node`) inside their containers.
+Both services run as non-root (`USER node`) inside their containers.
 
-## ARM64 Firecracker support
+## Firecracker on ARM64
 
-Firecracker requires hardware virtualization support (KVM). On ARM64, this means the host machine
-must expose `/dev/kvm` with the necessary CPU features. Not all ARM64 hosting options provide KVM
-access.
+Firecracker needs hardware virtualization (KVM) on ARM64 too: the host must expose `/dev/kvm`. Many
+ARM64 cloud instances with shared vCPUs do not expose it. For example, Hetzner Cloud CAX instances
+do not. Bare-metal ARM64 hosts, such as AWS Graviton `.metal` instances, do.
 
-### Current status
+The container and bare-metal scaler backends do not need KVM, so they run on any ARM64 host.
 
-**Hetzner CAX11 (shared vCPU): KVM is NOT available.** Shared vCPU instances on Hetzner Cloud do
-not expose `/dev/kvm` to the guest. This is an infrastructure limitation of shared-tenancy cloud
-instances -- the hypervisor does not pass through nested virtualization to shared vCPU guests.
-
-Verified on 2026-02-19:
-
-- `/dev/kvm` does not exist
-- `lscpu` reports no virtualization capabilities
-- CPU features include `fp`, `asimd`, `aes`, `pmull`, `sha1`, `sha2`, `crc32`, `atomics` -- but no
-  SVE or nested virtualization extensions
-
-### Implications
-
-- **Firecracker cannot run on the ARM64 test machine** -- it exits immediately without KVM
-- **Container and bare-metal scaler backends work normally on ARM64** without KVM
-- ARM64 Firecracker E2E tests are deferred until a KVM-capable ARM64 machine is available
-
-### What is needed for ARM64 Firecracker
-
-To run Firecracker on ARM64, you need one of:
-
-| Option                    | KVM Available | Notes                                     |
-| ------------------------- | ------------- | ----------------------------------------- |
-| Hetzner CAX dedicated CPU | Likely yes    | Dedicated vCPU instances may expose KVM   |
-| Hetzner bare-metal ARM64  | Yes           | Full hardware access                      |
-| AWS Graviton bare-metal   | Yes           | `a1.metal` or `m6g.metal` instances       |
-| Ampere Altra bare-metal   | Yes           | Various hosting providers                 |
-| Raspberry Pi 4/5 (Linux)  | Yes           | Useful for development, limited resources |
-
-Once a KVM-capable ARM64 machine is available, the existing Firecracker E2E test suite
-(`cd e2e && pnpm e2e:firecracker`) should work with the ARM64 kernel and rootfs images.
-
-## Current limitations
-
-- **No private registry**: Images are local-only per machine. Cross-machine transfer requires
-  `podman save`/`podman load` or setting up a registry.
-- **No automated build pipeline**: The build process is manual (run the script on each machine).
-- **No cross-compilation**: Images must be built natively on each architecture. QEMU-based
-  cross-builds are not supported due to performance and reliability concerns.
-- **Manifest creation requires both images locally**: The `--manifest-only` flag needs both
-  per-arch images in the same Podman store, which typically means transferring one image.
-
-## Quick reference
-
-```bash
-# Build for current architecture
-./scripts/build-multi-arch.sh <service> <tag>
-
-# Force specific architecture tag
-./scripts/build-multi-arch.sh <service> <tag> --arch <amd64|arm64>
-
-# Create multi-arch manifest (both arch images must exist locally)
-./scripts/build-multi-arch.sh <service> <tag> --manifest-only
-
-# Transfer image to another machine
-podman save localhost/kici-<service>:<tag>-<arch> | ssh <host> podman load
-
-# Services: orchestrator, agent, platform
-```
+[Firecracker host setup](../orchestrator/firecracker/host-setup.md) shows how to check for KVM, and
+which kernel format ARM64 needs.

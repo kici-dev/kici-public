@@ -93,12 +93,12 @@ describe('dashboard attestations protocol', () => {
 
   it('validates the augmented REST API response (issuer configured)', () => {
     const api = {
-      trustedIssuer: 'https://platform.example.com/kici-stg',
-      jwksUri: 'https://platform.example.com/kici-stg/.well-known/jwks.json',
+      trustedIssuer: 'https://platform.example.com/kici',
+      jwksUri: 'https://platform.example.com/kici/.well-known/jwks.json',
       attestations: [],
     };
     const parsed = dashboardAttestationsApiResponseSchema.parse(api);
-    expect(parsed.trustedIssuer).toBe('https://platform.example.com/kici-stg');
+    expect(parsed.trustedIssuer).toBe('https://platform.example.com/kici');
   });
 
   it('validates the augmented REST API response (issuer unconfigured)', () => {

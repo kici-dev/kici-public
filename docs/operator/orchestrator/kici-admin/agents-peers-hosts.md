@@ -68,11 +68,11 @@ kici-admin peer reset-raft-state --database-url <url> [--json]
 Manages peer credentials for multi-orchestrator clusters. These commands access the database directly (not via the admin API). `create-token`, `list`, `revoke` and `revoke-all` read the database URL from `KICI_DATABASE_URL` only; `prune-credentials` and `reset-raft-state` also accept `--database-url`.
 
 - `create-token` generates a single-use join token (defaults: coordinator role, 1-hour expiry, org-id `default`, routing-key `default`, attribution `cli`).
-  - `--created-by <actor>` sets the `join_tokens.created_by` audit attribution. Defaults to `cli`; deploy scripts pass e.g. `deploy-stg` so staging join-tokens are distinguishable from ad-hoc operator ones.
+  - `--created-by <actor>` sets the `join_tokens.created_by` audit attribution. Defaults to `cli`; a deploy script can pass its own name, e.g. `deploy-script`, so its join tokens are distinguishable from ad-hoc operator ones.
   - `--json` prints a single JSON object (`{ token, role, orgId, routingKey, expiresAt }`) on stdout instead of the human-readable multi-line output, so callers can pipe it through `JSON.parse` without stripping prose. This is what lets a deploy script mint a token and hand it straight to a joining peer when bootstrapping an HA cluster unattended.
 - `revoke` disconnects a peer on its next heartbeat.
 - `revoke-all` requires `--confirm` as a safety guard.
-- `prune-credentials` (direct-DB only, destructive) deletes every `peer_credentials` row whose `instance_id` does **not** match the `--filter` SQL `LIKE` pattern (e.g. `--filter 'e2e-%'` keeps e2e peers and removes everything else). HTTP mode is intentionally unsupported — the call site is a warm-redeploy preflight run while the orchestrator is stopped.
+- `prune-credentials` (direct-DB only, destructive) deletes every `peer_credentials` row whose `instance_id` does **not** match the `--filter` SQL `LIKE` pattern (e.g. `--filter 'cluster-b-%'` keeps the peers of the new cluster and removes everything else). HTTP mode is intentionally unsupported: run it as a preflight step while the orchestrator is stopped.
 - `reset-raft-state` (direct-DB only, destructive) deletes every row from `raft_state` so a freshly-started orchestrator self-elects with a clean term. Same offline-only constraint as `prune-credentials`.
 
 See [Clustering](../clustering.md) for full setup details.
@@ -86,7 +86,7 @@ kici-admin join --token <join-token> --peer <https://orch-1:8080>
 
 Bootstraps a new orchestrator into an existing cluster. Connects via Platform relay or direct peer, receives an encrypted config bundle, and writes an env file the orchestrator boots from.
 
-- `--env-file <path>` sets the output path for that env file (default: `./kici-orchestrator.env`). It carries the cluster database URL, the object-storage settings and the secrets encryption key. On a POSIX host the file is written at mode 0600, readable by its owner only. On Windows the same call sets the read-only attribute and leaves the ACL unchanged, so restrict the file yourself. Hand it straight to the installer:
+- `--env-file <path>` sets the output path for that env file (default: `./kici-orchestrator.env`). It carries the cluster database URL, the object-storage settings and the secrets encryption key. On a POSIX host the file is written at mode 0600, readable by its owner only. On Windows the same call leaves the ACL unchanged, so restrict the file yourself. `kici-admin orchestrator install --env-file` copies it into the config folder of the instance, which only LocalSystem and Administrators can read. Delete the file after the copy. Hand it straight to the installer:
 
   ```bash
   kici-admin orchestrator install --env-file ./kici-orchestrator.env --mode independent
@@ -131,20 +131,21 @@ Synopsis: `kici-admin agent install [options]`
 
 **Options**
 
-| Option                     | Default      | Description                                                                                      |
-| -------------------------- | ------------ | ------------------------------------------------------------------------------------------------ |
-| `--platform <type>`        |              | Force the service platform (systemd, launchd, windows, compose). Default: detected from the host |
-| `--env-file <path>`        |              | Path to existing env/config file to use                                                          |
-| `--binary <path>`          |              | Path to agent binary (default: current executable)                                               |
-| `--name <name>`            | `kici-agent` | Service name                                                                                     |
-| `--orchestrator-url <url>` |              | URL of the orchestrator to connect to                                                            |
-| `--token <token>`          |              | Agent authentication token                                                                       |
-| `--labels <labels>`        |              | Comma-separated agent labels for routing                                                         |
-| `--wizard`                 |              | Interactive wizard for guided setup                                                              |
-| `--system`                 |              | Install as system-level service (requires root)                                                  |
-| `--user-level`             |              | Install as user-level service (no root required)                                                 |
-| `--instance-dir <path>`    |              | Deploy folder; the instance manifest is written here (default: current working directory)        |
-| `--force`                  |              | Overwrite an existing same-named foreign instance                                                |
+| Option                     | Default      | Description                                                                                                  |
+| -------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------ |
+| `--platform <type>`        |              | Force the service platform (systemd, launchd, windows, compose). Default: detected from the host             |
+| `--env-file <path>`        |              | Path to existing env/config file to use                                                                      |
+| `--binary <path>`          |              | Path to agent binary (default: current executable)                                                           |
+| `--name <name>`            | `kici-agent` | Service name                                                                                                 |
+| `--orchestrator-url <url>` |              | URL of the orchestrator to connect to                                                                        |
+| `--token <token>`          |              | Agent authentication token                                                                                   |
+| `--labels <labels>`        |              | Comma-separated agent labels for routing                                                                     |
+| `--port <port>`            |              | HTTP port for the agent's health and metrics endpoints; each agent on one host needs its own (default: 8080) |
+| `--wizard`                 |              | Interactive wizard for guided setup                                                                          |
+| `--system`                 |              | Install as system-level service (requires root)                                                              |
+| `--user-level`             |              | Install as user-level service (no root required)                                                             |
+| `--instance-dir <path>`    |              | Deploy folder; the instance manifest is written here (default: current working directory)                    |
+| `--force`                  |              | Overwrite an existing same-named foreign instance                                                            |
 
 ### `kici-admin agent list`
 

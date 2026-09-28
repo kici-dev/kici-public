@@ -91,7 +91,7 @@ When `cancelInProgress: false`, newer runs will wait until older runs complete:
 
 ```
 Run #1 starts deploying                -> running
-Run #2 arrives for same group          -> queued ("Waiting for deploy-main (1 ahead)")
+Run #2 arrives for same group          -> queued (waiting for a concurrency slot)
 Run #1 completes                       -> success
 Run #2 starts                          -> running
 ```
@@ -109,7 +109,7 @@ workflow('migrate-db', {
 });
 ```
 
-The dashboard will show a "Queued" badge with the reason: "Waiting for deploy-main (1 ahead)".
+The dashboard shows a "Queued (concurrency)" badge on the run, with the tooltip "Run is waiting for a concurrency slot".
 
 ## Max concurrent runs
 
@@ -129,7 +129,7 @@ workflow('test', {
 
 When `max: 1` (default), runs are fully serialized within the group.
 
-`max` is enforced by the orchestrator's database, so the limit is cluster-wide and survives a restart. A run holding a slot keeps it across an orchestrator restart. Every orchestrator in a cluster counts against the same limit, so a group with `max: 1` runs one job at a time no matter which orchestrator dispatched it.
+`max` is enforced by the orchestrator's database, so the limit is cluster-wide and survives a restart. A run holding a slot keeps it across an orchestrator restart. Every orchestrator in a cluster counts against the same limit, so a group with `max: 1` admits one run at a time no matter which orchestrator dispatched it. A slot belongs to the run, so the jobs of one run share it.
 
 ## Group key examples
 

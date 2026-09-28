@@ -642,7 +642,7 @@ export class ScalerStateStore {
    * the prune's verdict does not depend on it. It is written because the row
    * is the only surviving account of what became of a provision once the spawn
    * row is gone — which is what an operator investigating a torn-down
-   * provision, and the E2E that pins this behaviour, read it for.
+   * provision reads it for.
    */
   async recordProvisionCondemned(
     agentId: string,

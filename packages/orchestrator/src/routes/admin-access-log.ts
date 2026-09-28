@@ -4,7 +4,7 @@
  * Operator-facing read access to read + orchestrator-admin mutation attempts
  * captured with ActorPrincipal attribution. Mirrors the dashboard's
  * dashboard.access-log.list WS handler but exposed over HTTP + Bearer auth
- * so operators can dogfood from the CLI without going through the dashboard.
+ * so operators can read it from the CLI without going through the dashboard.
  *
  *   GET /api/v1/admin/access-log
  *     Filters: orgId, actorType, actorId, action, source, outcome,

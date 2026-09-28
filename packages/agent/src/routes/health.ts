@@ -2,13 +2,13 @@ import { Hono } from 'hono';
 import {
   createHealthRoutes as createBaseHealthRoutes,
   createMetricsRoutes,
+  type AgentLivenessInfo,
   type MetricsRoutesDeps,
 } from '@kici-dev/shared';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // Mirrored on /health so operators can correlate across services without tailing logs.
 declare const KICI_PKG_VERSION: string;
-declare const KICI_BUILD_COMMIT: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 declare const KICI_SHARED_VERSION: string;
@@ -22,8 +22,6 @@ function safe(name: string, fallback = 'unknown'): string {
   switch (name) {
     case 'version':
       return typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : fallback;
-    case 'buildCommit':
-      return typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : fallback;
     case 'sdkVersion':
       return typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : fallback;
     case 'sdkBundleHash':
@@ -70,14 +68,15 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Hono {
 
   // Mount shared health + readiness routes
   const baseRoutes = createBaseHealthRoutes({
-    livenessInfo: () => {
+    livenessInfo: (): AgentLivenessInfo => {
       const status = deps.getStatus();
       return {
         agentId: status.agentId,
         activeJobs: status.activeJobs,
         connected: status.connected,
         version: safe('version'),
-        buildCommit: safe('buildCommit'),
+        // Deprecated: carries the version (BuildFingerprint.buildCommit).
+        buildCommit: safe('version'),
         sdkVersion: safe('sdkVersion'),
         sdkBundleHash: safe('sdkBundleHash'),
         sharedVersion: safe('sharedVersion'),

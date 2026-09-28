@@ -7,9 +7,9 @@ import {
 
 describe('parseRegistryOrigin', () => {
   it.each([
-    ['http://verdaccio.local:4873', 'http://verdaccio.local:4873'],
-    ['http://verdaccio.local:4873/', 'http://verdaccio.local:4873'],
-    ['HTTP://Verdaccio.Local:4873', 'http://verdaccio.local:4873'],
+    ['http://registry.local:4873', 'http://registry.local:4873'],
+    ['http://registry.local:4873/', 'http://registry.local:4873'],
+    ['HTTP://Registry.Local:4873', 'http://registry.local:4873'],
     ['https://npm.acme.internal:443/', 'https://npm.acme.internal'],
     ['http://192.168.1.50:4873', 'http://192.168.1.50:4873'],
     ['http://[::1]:4873', 'http://[::1]:4873'],
@@ -21,11 +21,11 @@ describe('parseRegistryOrigin', () => {
   });
 
   it.each([
-    'verdaccio.local:4873',
-    'verdaccio.local',
+    'registry.local:4873',
+    'registry.local',
     'file:///srv/npm',
     'ftp://mirror.example',
-    'http://verdaccio.local:4873/npm/',
+    'http://registry.local:4873/npm/',
     'https://npm.acme.internal/?token=x',
     'https://npm.acme.internal/#x',
     'https://user:pass@npm.acme.internal',
@@ -42,10 +42,10 @@ describe('parseHostInstallRegistries', () => {
   it('splits on commas, skips blanks, dedupes and reports each invalid entry', () => {
     expect(
       parseHostInstallRegistries(
-        ' http://verdaccio.local:4873 ,, http://VERDACCIO.local:4873/,ftp://x,https://npm.acme.internal',
+        ' http://registry.local:4873 ,, http://REGISTRY.local:4873/,ftp://x,https://npm.acme.internal',
       ),
     ).toEqual({
-      origins: ['http://verdaccio.local:4873', 'https://npm.acme.internal'],
+      origins: ['http://registry.local:4873', 'https://npm.acme.internal'],
       invalid: [{ entry: 'ftp://x', reason: 'is not an http or https URL' }],
     });
     expect(parseHostInstallRegistries('')).toEqual({ origins: [], invalid: [] });
@@ -65,8 +65,8 @@ describe('redactRegistryEntry', () => {
     ['https://ci:s3cret@npm.acme.internal', 'https://npm.acme.internal'],
     ['https://ci:p@ss@npm.acme.internal:4873', 'https://npm.acme.internal:4873'],
     ['https://tok3n@npm.acme.internal', 'https://npm.acme.internal'],
-    ['ci:s3cret@verdaccio.local:4873', 'verdaccio.local:4873'],
-    ['//ci:s3cret@verdaccio.local', '//verdaccio.local'],
+    ['ci:s3cret@registry.local:4873', 'registry.local:4873'],
+    ['//ci:s3cret@registry.local', '//registry.local'],
     ['https://npm.acme.internal/?token=s3cret', 'https://npm.acme.internal/?[redacted]'],
     ['https://npm.acme.internal/#s3cret', 'https://npm.acme.internal/#[redacted]'],
   ])('removes the credentials from %j', (entry, redacted) => {
@@ -74,7 +74,7 @@ describe('redactRegistryEntry', () => {
     expect(redactRegistryEntry(entry)).toBe(redacted);
   });
 
-  it.each(['http://verdaccio.local:4873/npm/', 'verdaccio.local:4873', 'ftp://mirror.example'])(
+  it.each(['http://registry.local:4873/npm/', 'registry.local:4873', 'ftp://mirror.example'])(
     'keeps %j, which carries no credentials, as written',
     (entry) => {
       // breaks-if-wrong: an entry refused for its path or scheme is still named

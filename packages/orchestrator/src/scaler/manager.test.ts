@@ -3383,7 +3383,7 @@ describe('ScalerManager', () => {
       // five-minute wait for `pruneStaleSpawningEntries`.
       // fails-when: the local rows are rehydrated — the five reservations
       // then bill against `maxAgents: 5` and this reads `at-capacity`,
-      // exactly the verdict staging logged for five minutes.
+      // exactly the verdict a restarted scaler returned until the stale prune.
       expect((await restarted.requestScale(['default'], 'job-6', 'run-6')).action).toBe('spawning');
     });
 
@@ -5491,9 +5491,9 @@ describe('ScalerManager', () => {
       // registered its WS — so neither the spawn-failure path nor
       // onAgentDisconnected ever fires. The only cleanup is the stale-entry
       // prune, which must release the held reservation or the per-scaler cap
-      // leaks capacity forever (the cross-process machine-pool E2E's real
-      // failure: a warm-reused orch DB accumulated orphaned scaler_reservations
-      // and every requestScale was rejected at-capacity with zero agents).
+      // leaks capacity forever (a long-lived orchestrator DB then accumulates
+      // orphaned scaler_reservations and every requestScale is rejected
+      // at-capacity with zero agents).
       const slowBackend = createMockBackend({
         type: 'container',
         labelSets: [{ labels: ['linux', 'docker'], image: 'agent:latest' }],
@@ -6473,12 +6473,12 @@ describe('external-provision backoff', () => {
   });
 
   it('records the failure for diagnose on a coordinator that never held leadership', async () => {
-    // The wish's third consequence: `kici-admin diagnose scaler` was empty for
+    // The failure mode: `kici-admin diagnose scaler` was empty for
     // the one backend that was failing. `ScalerFailureTracker` is per-process
     // and the reaper is leader-gated, so a reaper-only report leaves an
     // operator running diagnose against any non-leader reading "0 spawn
-    // failures" for a scaler failing fleet-wide — the same wrong answer the
-    // wish exists to stop giving.
+    // failures" for a scaler failing fleet-wide — the wrong answer this
+    // test stops.
     const onScalerEvent = vi.fn();
     const manager = makeManagerWithEventBackend({
       instanceId: 'orch-follower',
@@ -6670,7 +6670,7 @@ describe('external-provision backoff', () => {
   });
 
   it('keeps a deferred scaler routable, so a job waiting it out is not called unroutable', async () => {
-    // The wish this backoff belongs to exists because a job whose provisioning
+    // This backoff exists because a job whose provisioning
     // failed was told its `runsOn` matched nothing. The deferral opens a new
     // window in which a job can expire without ever being attempted, so the
     // property has to be pinned rather than assumed: `classifyUnroutable` calls
@@ -6841,8 +6841,8 @@ describe('warm pool first fill on an event backend', () => {
 
 describe('resolveScalerOrchestratorUrl', () => {
   it('prefers the per-scaler config URL', () => {
-    expect(resolveScalerOrchestratorUrl('ws://192.168.1.85:4000/ws', 'ws://env:1/ws', '4000')).toBe(
-      'ws://192.168.1.85:4000/ws',
+    expect(resolveScalerOrchestratorUrl('ws://192.168.1.40:4000/ws', 'ws://env:1/ws', '4000')).toBe(
+      'ws://192.168.1.40:4000/ws',
     );
   });
 

@@ -121,7 +121,7 @@ function makeOrgSettingsDbStub() {
 }
 
 describe('org-settings/global-workflows — enabled projection (effective cluster value)', () => {
-  const ORG = 'kiciStg00001';
+  const ORG = 'acmeOrg00001';
 
   function buildWithDb(db: unknown, globalWorkflowsEnabledDefault: boolean) {
     const inner = createOrgSettingsRoutes({
@@ -225,7 +225,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET projects user-cache quota/TTL as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { settings: Record<string, unknown> };
     expect(body.settings.userCacheQuotaBytes).toBeNull();
@@ -239,17 +239,17 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         userCacheQuotaBytes: 1073741824,
         userCacheTtlMs: 3600000,
       }),
     });
     expect(patch.status).toBe(200);
     // Simulate pg returning BIGINT columns as strings on the next read.
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.user_cache_quota_bytes = String(stored.user_cache_quota_bytes);
     stored.user_cache_ttl_ms = String(stored.user_cache_ttl_ms);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.userCacheQuotaBytes).toBe(1073741824);
     expect(body.settings.userCacheTtlMs).toBe(3600000);
@@ -261,14 +261,14 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', userCacheQuotaBytes: 999 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', userCacheQuotaBytes: 999 }),
     });
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', userCacheQuotaBytes: null }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', userCacheQuotaBytes: null }),
     });
-    expect(rows.get('kiciStg00001')!.user_cache_quota_bytes).toBeNull();
+    expect(rows.get('acmeOrg00001')!.user_cache_quota_bytes).toBeNull();
   });
 
   it('PATCH rejects a non-positive quota (Zod)', async () => {
@@ -277,7 +277,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const res = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', userCacheQuotaBytes: -5 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', userCacheQuotaBytes: -5 }),
     });
     expect(res.status).toBe(400);
   });
@@ -285,7 +285,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET projects artifact max-bytes/max-per-run as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await res.json()) as { settings: Record<string, unknown> };
     expect(body.settings.artifactMaxBytes).toBeNull();
     expect(body.settings.artifactMaxPerRun).toBeNull();
@@ -298,17 +298,17 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         artifactMaxBytes: 500,
         artifactMaxPerRun: 3,
       }),
     });
     expect(patch.status).toBe(200);
     // Simulate pg returning BIGINT columns as strings on the next read.
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.artifact_max_bytes = String(stored.artifact_max_bytes);
     stored.artifact_max_per_run = String(stored.artifact_max_per_run);
-    let get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    let get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     let body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.artifactMaxBytes).toBe(500);
     expect(body.settings.artifactMaxPerRun).toBe(3);
@@ -317,11 +317,11 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', artifactMaxBytes: null }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', artifactMaxBytes: null }),
     });
-    expect(rows.get('kiciStg00001')!.artifact_max_bytes).toBeNull();
-    rows.get('kiciStg00001')!.artifact_max_per_run = String(3);
-    get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    expect(rows.get('acmeOrg00001')!.artifact_max_bytes).toBeNull();
+    rows.get('acmeOrg00001')!.artifact_max_per_run = String(3);
+    get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.artifactMaxBytes).toBeNull();
     expect(body.settings.artifactMaxPerRun).toBe(3);
@@ -333,7 +333,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const res = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', artifactMaxPerRun: 0 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', artifactMaxPerRun: 0 }),
     });
     expect(res.status).toBe(400);
   });
@@ -341,7 +341,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET projects dispatchAckTimeoutMs as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await res.json()) as { settings: Record<string, unknown> };
     expect(body.settings.dispatchAckTimeoutMs).toBeNull();
   });
@@ -352,13 +352,13 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const patch = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', dispatchAckTimeoutMs: 3000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', dispatchAckTimeoutMs: 3000 }),
     });
     expect(patch.status).toBe(200);
     // Simulate pg returning the BIGINT column as a string on the next read.
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.dispatch_ack_timeout_ms = String(stored.dispatch_ack_timeout_ms);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.dispatchAckTimeoutMs).toBe(3000);
   });
@@ -369,13 +369,13 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const patch = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', ingestMaxConcurrency: 12 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', ingestMaxConcurrency: 12 }),
     });
     expect(patch.status).toBe(200);
     // Simulate pg returning the BIGINT column as a string on the next read.
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.ingest_max_concurrency = String(stored.ingest_max_concurrency);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.ingestMaxConcurrency).toBe(12);
   });
@@ -386,14 +386,14 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', ingestMaxConcurrency: 8 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', ingestMaxConcurrency: 8 }),
     });
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', ingestMaxConcurrency: null }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', ingestMaxConcurrency: null }),
     });
-    expect(rows.get('kiciStg00001')!.ingest_max_concurrency).toBeNull();
+    expect(rows.get('acmeOrg00001')!.ingest_max_concurrency).toBeNull();
   });
 
   it('PATCH sets the sandbox allow-list (canonicalizing caps) and GET reads it back', async () => {
@@ -403,13 +403,13 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         sandboxAllowedCapabilities: ['CAP_NET_ADMIN', 'sys_ptrace'],
         sandboxAllowHostNetwork: true,
       }),
     });
     expect(patch.status).toBe(200);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.sandboxAllowedCapabilities).toEqual(['NET_ADMIN', 'SYS_PTRACE']);
     expect(body.settings.sandboxAllowHostNetwork).toBe(true);
@@ -422,7 +422,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         sandboxAllowedCapabilities: ['NOT_A_CAP'],
       }),
     });
@@ -434,7 +434,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET on an org with no row reports the safe deny-all sandbox default', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.sandboxAllowedCapabilities).toEqual([]);
     expect(body.settings.sandboxAllowHostNetwork).toBe(false);
@@ -446,14 +446,14 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', dispatchAckTimeoutMs: 5000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', dispatchAckTimeoutMs: 5000 }),
     });
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', dispatchAckTimeoutMs: null }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', dispatchAckTimeoutMs: null }),
     });
-    expect(rows.get('kiciStg00001')!.dispatch_ack_timeout_ms).toBeNull();
+    expect(rows.get('acmeOrg00001')!.dispatch_ack_timeout_ms).toBeNull();
   });
 
   it('PATCH rejects a dispatchAckTimeoutMs below the 1000ms floor (Zod)', async () => {
@@ -462,7 +462,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const res = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', dispatchAckTimeoutMs: 500 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', dispatchAckTimeoutMs: 500 }),
     });
     expect(res.status).toBe(400);
   });
@@ -470,7 +470,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET projects scalerSpawnTimeoutMs as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await res.json()) as { settings: Record<string, unknown> };
     expect(body.settings.scalerSpawnTimeoutMs).toBeNull();
   });
@@ -481,13 +481,13 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const patch = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: 45000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', scalerSpawnTimeoutMs: 45000 }),
     });
     expect(patch.status).toBe(200);
     // Simulate pg returning the BIGINT column as a string on the next read.
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.scaler_spawn_timeout_ms = String(stored.scaler_spawn_timeout_ms);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.scalerSpawnTimeoutMs).toBe(45000);
   });
@@ -498,14 +498,14 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: 60000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', scalerSpawnTimeoutMs: 60000 }),
     });
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: null }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', scalerSpawnTimeoutMs: null }),
     });
-    expect(rows.get('kiciStg00001')!.scaler_spawn_timeout_ms).toBeNull();
+    expect(rows.get('acmeOrg00001')!.scaler_spawn_timeout_ms).toBeNull();
   });
 
   it('PATCH rejects a scalerSpawnTimeoutMs below the 1000ms floor (Zod)', async () => {
@@ -514,7 +514,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const res = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: 500 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', scalerSpawnTimeoutMs: 500 }),
     });
     expect(res.status).toBe(400);
   });
@@ -522,7 +522,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET projects the reroute tunables as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await res.json()) as { settings: Record<string, unknown> };
     expect(body.settings.rerouteSpawnWindowMs).toBeNull();
     expect(body.settings.rerouteAckTimeoutMs).toBeNull();
@@ -536,7 +536,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         rerouteSpawnWindowMs: 120000,
         rerouteAckTimeoutMs: 20000,
         rerouteMaxHops: 5,
@@ -544,10 +544,10 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     });
     expect(patch.status).toBe(200);
     // Simulate pg returning the BIGINT columns as strings on the next read.
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.reroute_spawn_window_ms = String(stored.reroute_spawn_window_ms);
     stored.reroute_ack_timeout_ms = String(stored.reroute_ack_timeout_ms);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.rerouteSpawnWindowMs).toBe(120000);
     expect(body.settings.rerouteAckTimeoutMs).toBe(20000);
@@ -560,19 +560,19 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', rerouteSpawnWindowMs: 30000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', rerouteSpawnWindowMs: 30000 }),
     });
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         rerouteSpawnWindowMs: null,
         rerouteAckTimeoutMs: null,
         rerouteMaxHops: null,
       }),
     });
-    const row = rows.get('kiciStg00001')!;
+    const row = rows.get('acmeOrg00001')!;
     expect(row.reroute_spawn_window_ms).toBeNull();
     expect(row.reroute_ack_timeout_ms).toBeNull();
     expect(row.reroute_max_hops).toBeNull();
@@ -584,12 +584,12 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const patch = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', queueTimeoutMs: 120000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', queueTimeoutMs: 120000 }),
     });
     expect(patch.status).toBe(200);
-    const stored = rows.get('kiciStg00001')!;
+    const stored = rows.get('acmeOrg00001')!;
     stored.queue_timeout_ms = String(stored.queue_timeout_ms);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.queueTimeoutMs).toBe(120000);
   });
@@ -600,14 +600,14 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', queueTimeoutMs: 60000 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', queueTimeoutMs: 60000 }),
     });
     await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', queueTimeoutMs: null }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', queueTimeoutMs: null }),
     });
-    expect(rows.get('kiciStg00001')!.queue_timeout_ms).toBeNull();
+    expect(rows.get('acmeOrg00001')!.queue_timeout_ms).toBeNull();
   });
 
   it('PATCH rejects a rerouteSpawnWindowMs below the 1000ms floor (Zod)', async () => {
@@ -616,7 +616,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const res = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', rerouteSpawnWindowMs: 500 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', rerouteSpawnWindowMs: 500 }),
     });
     expect(res.status).toBe(400);
   });
@@ -624,7 +624,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   it('GET projects the approval defaults (86400s, self-approval true) when no row exists', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
-    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await res.json()) as { settings: Record<string, unknown> };
     expect(body.settings.approvalExpirySeconds).toBe(86400);
     expect(body.settings.allowSelfApproval).toBe(true);
@@ -637,13 +637,13 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         approvalExpirySeconds: 3600,
         allowSelfApproval: false,
       }),
     });
     expect(patch.status).toBe(200);
-    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
     const body = (await get.json()) as { settings: Record<string, unknown> };
     expect(body.settings.approvalExpirySeconds).toBe(3600);
     expect(body.settings.allowSelfApproval).toBe(false);
@@ -655,7 +655,7 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     const res = await app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', approvalExpirySeconds: 0 }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', approvalExpirySeconds: 0 }),
     });
     expect(res.status).toBe(400);
   });
@@ -674,7 +674,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
     const res = await app.request('/org-settings/dashboard-writes', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', reset: true }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', reset: true }),
     });
     expect(res.status).toBe(200);
     expect(resetDashboardWritePolicy).toHaveBeenCalledOnce();
@@ -687,7 +687,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: { 'secrets.set': 'disabled' },
       }),
     });
@@ -702,7 +702,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: { 'secrets.set': 'disabled' },
         reset: true,
       }),
@@ -720,7 +720,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: {},
         reset: true,
       }),
@@ -735,7 +735,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: { 'unknown.op': 'disabled' },
       }),
     });
@@ -754,7 +754,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: { 'held_runs.approve': 'disabled' },
       }),
     });
@@ -769,7 +769,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
     await app.request('/org-settings/dashboard-writes', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', updates: { 'secrets.set': 'disabled' } }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', updates: { 'secrets.set': 'disabled' } }),
     });
     expect(vi.mocked(setDashboardWritePolicy).mock.calls[0][3]).toMatchObject({
       mode: 'independent',
@@ -820,7 +820,7 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: { 'secrets.set': 'disabled', 'variables.set': 'disabled' },
       }),
     });
@@ -828,10 +828,10 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
     expect(stub.records).toHaveLength(2);
     for (const row of stub.records) {
       expect(row.action).toBe('org_settings.dashboard_write_policy.update');
-      expect(row.target).toEqual({ type: 'org_settings', id: 'kiciStg00001' });
+      expect(row.target).toEqual({ type: 'org_settings', id: 'acmeOrg00001' });
       expect(row.source).toBe('admin_http');
       expect(row.outcome).toBe('allowed');
-      expect(row.orgId).toBe('kiciStg00001');
+      expect(row.orgId).toBe('acmeOrg00001');
       expect(row.actor).toEqual({ type: 'service_account', id: 'tester' });
       expect(row.meta?.prior_state).toBe('permissive');
       expect(row.meta?.new_state).toBe('disabled');
@@ -849,7 +849,7 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
     const res = await app.request('/org-settings/dashboard-writes', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', reset: true }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', reset: true }),
     });
     expect(res.status).toBe(200);
     expect(stub.records).toHaveLength(2);
@@ -866,7 +866,7 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: 'kiciStg00001',
+        customerId: 'acmeOrg00001',
         updates: { 'secrets.set': 'disabled' },
       }),
     });
@@ -897,7 +897,7 @@ describe('org-settings/global-workflows — repo-pattern negation forms', () => 
     return app.request('/org-settings/global-workflows', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: 'kiciStg00001', ...body }),
+      body: JSON.stringify({ customerId: 'acmeOrg00001', ...body }),
     });
   }
 
@@ -910,7 +910,7 @@ describe('org-settings/global-workflows — repo-pattern negation forms', () => 
       const res = await patch(buildWithDb(db), { [list]: [{ pattern: bad }] });
       expect(res.status).toBe(400);
       expect(JSON.stringify(await res.json())).toContain(bad);
-      expect(rows.get('kiciStg00001')).toBeUndefined();
+      expect(rows.get('acmeOrg00001')).toBeUndefined();
     });
   }
 
@@ -927,6 +927,6 @@ describe('org-settings/global-workflows — repo-pattern negation forms', () => 
       deniedRepos: [{ pattern: '**' }],
     });
     expect(res.status).toBe(200);
-    expect(rows.get('kiciStg00001')).toBeDefined();
+    expect(rows.get('acmeOrg00001')).toBeDefined();
   });
 });

@@ -5,9 +5,9 @@ run-name: kici-agent ${{ inputs.agent_id }}
 # workflow. The agent exchanges its single-use claim code for an ephemeral
 # token, registers with the orchestrator, runs exactly one job, and exits.
 #
-# The real agent token never reaches this file. GitHub logs `workflow_dispatch`
-# inputs, so only the claim code travels here — it is single-use, short-lived,
-# and worthless once redeemed.
+# The real agent token never reaches this file. `workflow_dispatch` inputs are
+# ordinary event data, not secrets, so only the claim code travels here — it is
+# single-use, short-lived, and worthless once redeemed.
 #
 # The agent runs bare-metal on the runner rather than inside a container, so job
 # steps that need Docker use the runner's own daemon.

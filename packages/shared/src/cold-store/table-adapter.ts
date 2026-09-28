@@ -1,9 +1,8 @@
 /**
  * TableAdapter interface — the concrete per-table contract.
  *
- * Phase A shipped this interface with ZERO implementations. Phase B adds
- * `run_events`; Phase C adds `execution_runs` / `execution_jobs` /
- * `execution_steps`; etc. Each adapter lives next to its owning
+ * Each adapter (`run_events`, `execution_runs`, `execution_jobs`,
+ * `execution_steps`, …) lives next to its owning
  * package (`packages/{platform,orchestrator}/src/cold-store/tables/`)
  * and is registered on the respective `BaseColdStore` subclass.
  */
@@ -38,17 +37,17 @@ export interface ChunkCommitMetadata {
   gzipByteCount: number;
   objectKey: string;
   /**
-   * Phase 2 — present on chunks written by adapters that implement
+   * Present on chunks written by adapters that implement
    * `coldTtlDays(row)` (the per-bucket layout). Adapters use this to
    * INSERT a corresponding row into `cold_store_chunks` inside the same
    * transaction as the data delete + audit + rollup updates.
    *
-   * Pre-Phase-2 (v1) chunks omit both fields — adapters skip the
+   * V1 chunks omit both fields — adapters skip the
    * `cold_store_chunks` insert in that case and the GC sweep treats
    * the chunk as `'forever'`.
    */
   bucket?: string;
-  /** Phase 2 — see `bucket`. Numeric day-count or `'forever'`. */
+  /** See `bucket`. Numeric day-count or `'forever'`. */
   maxColdDays?: ColdRetention;
 }
 
@@ -122,7 +121,7 @@ export interface TableAdapter<TRow> {
   rowTimestamp(row: TRow): Date | string;
 
   /**
-   * Phase F — optional natural-key extractor used by
+   * Optional natural-key extractor used by
    * `BaseColdStore.replayRow()` to find a chunk by an externally
    * meaningful identifier (e.g. UUID `run_id`) rather than the internal
    * SERIAL `id` returned by `rowId()`. Adapters that implement this
@@ -150,7 +149,7 @@ export interface TableAdapter<TRow> {
   }): Promise<void>;
 
   /**
-   * Phase F — replay a chunk's rows back into PG.
+   * Replay a chunk's rows back into PG.
    *
    * Optional. Adapters that do NOT implement this method cannot be
    * promoted back into PG via `BaseColdStore.replayChunk()` /
@@ -185,7 +184,7 @@ export interface TableAdapter<TRow> {
   }): Promise<{ inserted: number; skipped: number }>;
 
   /**
-   * Phase 2 — per-row cold-retention TTL.
+   * Per-row cold-retention TTL.
    *
    * Returns the number of days the row's chunk should live in S3 after
    * archival, or `'forever'` to never purge. The framework groups rows by
@@ -204,7 +203,7 @@ export interface TableAdapter<TRow> {
   coldTtlDays?(row: TRow): ColdRetention;
 
   /**
-   * Phase 2 — transactionally purge a chunk's PG bookkeeping after the
+   * Transactionally purge a chunk's PG bookkeeping after the
    * S3 objects have been deleted.
    *
    * Implementations MUST run all three steps in one transaction so a

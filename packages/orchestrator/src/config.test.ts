@@ -527,9 +527,9 @@ describe('orchestrator loadConfig', () => {
 
   // Drift guard: the S3 storage prefix the orchestrator boots with (and thus the
   // cluster-identity sentinel key it validates) MUST match the shared
-  // DEFAULT_CACHE_STORAGE_S3_PREFIX that the reconcile paths — the
-  // `kici-admin cluster reconcile-identity` CLI and the staging deploy's
-  // self-heal step — fall back to when KICI_STORAGE_PREFIX is unset. A drift
+  // DEFAULT_CACHE_STORAGE_S3_PREFIX that the reconcile path — the
+  // `kici-admin cluster reconcile-identity` CLI, including a deploy's pre-start
+  // self-heal run of it — falls back to when KICI_STORAGE_PREFIX is unset. A drift
   // here (e.g. a hardcoded `kici-cache/` fallback) makes the reconcile step
   // anchor a different sentinel object than the one the orchestrator validates,
   // crash-looping the boot on a spurious "Cluster identity mismatch".

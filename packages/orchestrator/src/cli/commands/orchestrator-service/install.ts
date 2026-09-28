@@ -9,7 +9,6 @@
 import type { Command } from 'commander';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import {
@@ -19,13 +18,21 @@ import {
   getLogDir,
   kiciConfigRoot,
   listInstances,
-  writeManifest,
+  writeInstallManifest,
   appendIndexEntry,
   resolveUserLevel,
   DEFAULT_RESTART_POLICY,
+  SERVICE_TEXT,
   readKiciVersion,
+  restrictEnvFileAccess,
 } from '../../service/index.js';
-import { selectServerEntry, resolveServiceExecutable } from '../../service/entrypoint.js';
+import {
+  assertServerResolvable,
+  resolveServerScript,
+  resolveServiceExecutable,
+  selectServerEntry,
+  type ModuleResolver,
+} from '../../service/entrypoint.js';
 import { buildDeployEnvLines, upsertDeployEnvLines } from '../../service/deploy-env.js';
 import { detectRuntime } from '../../service/compose.js';
 import type { InstanceManifest, ServiceConfig, ServicePlatform } from '../../service/index.js';
@@ -159,6 +166,14 @@ Token vocabulary:
     .option('--force', 'Overwrite an existing same-named foreign instance')
     .action(async (opts: InstallOptions, command: Command) => {
       try {
+        // A kici-admin from a standalone package has no import.meta.resolve:
+        // without --binary it cannot locate the server, so it stops here,
+        // before the wizard or any file.
+        const resolveModule: ModuleResolver | undefined =
+          typeof import.meta.resolve === 'function'
+            ? (specifier) => import.meta.resolve(specifier)
+            : undefined;
+        assertServerResolvable('orchestrator', opts.binary, resolveModule);
         if (opts.wizard === true && opts.envFile) {
           console.error('Error: Cannot use --wizard with --env-file');
           process.exit(1);
@@ -216,9 +231,9 @@ Token vocabulary:
             `Error: an orchestrator instance "${serviceName}" is already installed at ${at}.\n` +
               `\n` +
               `Upgrading this service? Don't re-run install — installing again is for first-time\n` +
-              `setup, not upgrades. For an npm-global install run \`npm install -g kici-admin@latest\`\n` +
-              `then \`kici-admin orchestrator restart\`; for a versioned-directory install run\n` +
-              `\`kici-admin orchestrator upgrade\`.\n` +
+              `setup, not upgrades. For an npm-global install run\n` +
+              `\`kici-admin orchestrator upgrade --version <version>\`; for a versioned-directory install\n` +
+              `run \`kici-admin orchestrator upgrade --from <archive> --version <version>\`.\n` +
               `\n` +
               `Installing a second, separate instance? Pass a different --name or --instance-dir,\n` +
               `or --force to take over this one.`,
@@ -235,6 +250,12 @@ Token vocabulary:
         fs.mkdirSync(logDir, { recursive: true });
 
         const envFilePath = path.join(configDir, `${serviceName}.env`);
+
+        // On Windows a file mode protects nothing: restrict the folder before
+        // the first secret lands in it, so the env file and the temporary file
+        // its write stages through are never readable by other accounts. A
+        // user-level folder sits in the profile of its user, already private.
+        if (platform === 'windows' && !userLevel) restrictEnvFileAccess(envFilePath);
 
         // Handle --dev mode: spin up Postgres container
         let devDbUrl: string | undefined;
@@ -296,10 +317,10 @@ Token vocabulary:
         // exposes only the CLI bin, not a self-launching server binary.
         const entryScript = opts.binary
           ? undefined
-          : fileURLToPath(
-              import.meta.resolve(
-                `@kici-dev/orchestrator/${selectServerEntry(fs.readFileSync(envFilePath, 'utf-8'))}`,
-              ),
+          : resolveServerScript(
+              `@kici-dev/orchestrator/${selectServerEntry(fs.readFileSync(envFilePath, 'utf-8'))}`,
+              'orchestrator',
+              resolveModule,
             );
         const { executablePath, args } = resolveServiceExecutable({
           binary: opts.binary ? path.resolve(opts.binary) : undefined,
@@ -326,8 +347,7 @@ Token vocabulary:
         // Build ServiceConfig
         const config: ServiceConfig = {
           name: serviceName,
-          displayName: 'KiCI Orchestrator',
-          description: 'KiCI CI/CD workflow orchestrator service',
+          ...SERVICE_TEXT.orchestrator,
           executablePath,
           args,
           // The node running this install command is the node the spawned
@@ -347,7 +367,9 @@ Token vocabulary:
 
         // Write the instance manifest into the deploy folder. This is the
         // single source of truth every lifecycle command reads to reconstruct
-        // the ServiceConfig without re-deriving paths.
+        // the ServiceConfig without re-deriving paths. A re-install of this
+        // instance updates the manifest already there: it keeps the migration
+        // heads and creation time, and records the version the launcher runs.
         const manifest: InstanceManifest = {
           component: 'orchestrator',
           name: serviceName,
@@ -360,7 +382,12 @@ Token vocabulary:
           createdAt: new Date().toISOString(),
           kiciVersion: readKiciVersion(),
         };
-        const manifestFile = writeManifest(instanceDir, manifest);
+        const { file: manifestFile, warning: manifestWarning } = writeInstallManifest(
+          instanceDir,
+          manifest,
+          { execPath: executablePath, args },
+        );
+        if (manifestWarning) console.warn(`Warning: ${manifestWarning}`);
 
         // Register the instance in the host-wide index cache.
         try {

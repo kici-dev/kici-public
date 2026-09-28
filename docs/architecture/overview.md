@@ -135,13 +135,15 @@ User-facing SDK for defining workflows in TypeScript. Provides factory functions
 
 CLI tooling for workflow authors. Compiles `.kici/workflows/*.ts` to `.kici/kici.lock.json`, provides watch mode, local test execution, project initialization, and pre-commit hook integration.
 
+It also holds the `kici` CLI's remote commands: login, organization and orchestrator selection, run inspection, reruns and cancellation, approvals, notifications, and diagnostics. These commands call the hosted Platform's dashboard API, the same API the web UI uses.
+
 It also runs the **local dev plane** -- an on-demand, fully local execution stack (embedded PostgreSQL, an orchestrator process, and a bare-metal-scaled agent) that lets an author run a workflow end-to-end on their own machine. That is why the compiler depends on `@kici-dev/orchestrator` and `@kici-dev/agent`: it resolves and spawns their built entry points rather than reimplementing them. See [Local dev plane](../operator/orchestrator/local-dev-plane.md).
 
 > Source: `packages/compiler/src/` (`local-plane/` for the local dev plane)
 
 ### `@kici-dev/core`
 
-Light shared utilities with no server-side dependencies. It provides JSON-structured logging, error helpers, async-local-storage request context, and human-readable formatting (`formatBytes`/`formatDuration`/`formatUptime`). It also provides cryptographic helpers (`sha256`/`sha256File`/`deriveSharedSecret` plus symmetric encrypt/decrypt), retry-backoff computation, and the shared diagnostics-result contract. The rest of its surface ships as subpath entry points: the temp-directory allocator and its garbage collector, package-manager detection, CI-environment detection, and the idempotent-step runner (the check / confirm / apply primitive behind idempotent steps). One further subpath holds the `.kici/` source digest: the single content-hash definition the compiler writes into the lock file and the agent recomputes as its drift gate. It also owns the published docs host: `docsUrl()` builds every docs link a CLI prints or a template scaffolds from one `DOCS_SITE_URL` constant, so no other package spells the host. Finally it supplies zx initialization (`initZx()`) and the TypeScript loader hook that transforms TypeScript on import. It is the dependency-light core that the SDK, compiler, and `kici` CLI consume directly so they stay free of heavier server-only dependencies. `@kici-dev/shared` re-exports it, so existing `@kici-dev/shared` import paths keep working.
+Light shared utilities with no server-side dependencies. It provides JSON-structured logging, error helpers, async-local-storage request context, and human-readable formatting (`formatBytes`/`formatDuration`/`formatUptime`). It also provides cryptographic helpers (`sha256`/`sha256File`/`deriveSharedSecret` plus symmetric encrypt/decrypt), retry-backoff computation, the shared diagnostics-result contract, and the redaction primitives for diagnostic bundles (`redactConfig` for structured config, `scrubText` for free text). The rest of its surface ships as subpath entry points: the temp-directory allocator and its garbage collector, package-manager detection, CI-environment detection, and the idempotent-step runner (the check / confirm / apply primitive behind idempotent steps). One further subpath holds the `.kici/` source digest: the single content-hash definition the compiler writes into the lock file and the agent recomputes as its drift gate. It also owns the published docs host: `docsUrl()` builds every docs link a CLI prints or a template scaffolds from one `DOCS_SITE_URL` constant, so no other package spells the host. Finally it supplies zx initialization (`initZx()`) and the TypeScript loader hook that transforms TypeScript on import. It is the dependency-light core that the SDK, compiler, and `kici` CLI consume directly so they stay free of heavier server-only dependencies. `@kici-dev/shared` re-exports it, so existing `@kici-dev/shared` import paths keep working.
 
 > Source: `packages/core/src/`
 
@@ -157,13 +159,13 @@ Web UI for KiCI. A browser single-page application that provides the operator da
 
 ### `kici` (wrapper)
 
-Unscoped wrapper package that provides the `kici` CLI command. Re-exports `@kici-dev/compiler/cli` so users can install `kici` globally or use it via `npx kici`.
+Unscoped wrapper package that provides the `kici` CLI command. Its `kici` binary imports `runCli()` from `@kici-dev/compiler/cli` and runs it, so users can install `kici` globally or use it via `npx kici`.
 
 > Source: `packages/kici/`
 
 ### `kici-admin` (admin CLI wrapper)
 
-Unscoped wrapper package that ships two binaries: `kici-admin`, which re-exports `@kici-dev/orchestrator/cli` for orchestrator administration tasks, and `kici-agent`, which re-exports `@kici-dev/agent/server` to run an agent. It therefore depends on both `@kici-dev/orchestrator` and `@kici-dev/agent` (the `KICIADMIN → AGENT` edge in the graph below).
+Unscoped wrapper package that ships two binaries: `kici-admin`, which runs `runCli()` from `@kici-dev/orchestrator/cli` for orchestrator administration tasks, and `kici-agent`, which imports `@kici-dev/agent/server` to start an agent. It therefore depends on both `@kici-dev/orchestrator` and `@kici-dev/agent` (the `KICIADMIN → AGENT` edge in the graph below).
 
 > Source: `packages/kici-admin/`
 
@@ -227,7 +229,7 @@ The orchestrator connects outbound to the Platform WebSocket endpoint. After aut
 
 ### Orchestrator ↔ Orchestrator (P2P)
 
-When multiple orchestrators are deployed, they establish direct WebSocket connections to each other on the `/ws/peer` endpoint. Peers are discovered via the Platform matchmaker (Platform/hybrid modes) or static configuration (`KICI_CLUSTER_PEERS` env var, independent mode). Connections are authenticated with a mutual pre-shared key (PSK). Traffic includes agent inventory heartbeats, job rerouting, progress reporting, cancel propagation, and Raft leader election. These messages never transit the Platform tier.
+When multiple orchestrators are deployed, they establish direct WebSocket connections to each other on the `/ws/peer` endpoint. Peers are discovered via the Platform matchmaker (Platform/hybrid modes) or static configuration (`KICI_CLUSTER_PEERS` env var, independent mode). Each connection first sets up an ECDH-encrypted channel. A new peer then authenticates with a one-time join token, and the coordinator issues it a persistent peer credential. Later connections prove possession of that credential with an HMAC proof. Traffic includes agent inventory heartbeats, job rerouting, progress reporting, cancel propagation, and Raft leader election. These messages never transit the Platform tier.
 
 > See [Multi-Orchestrator Architecture](./clustering/multi-orchestrator.md) for clustering details and [Protocol Messages](protocol/dashboard.md#orchestrator---orchestrator-messages-peer-to-peer) for message schemas.
 

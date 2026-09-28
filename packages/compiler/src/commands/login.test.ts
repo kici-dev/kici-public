@@ -490,8 +490,8 @@ describe('kici login', () => {
 
     it('stale config does NOT redirect login — bare login resolves to prod default', async () => {
       await writeConfig({
-        platformEndpoint: 'https://stg.example.com/kici-stg',
-        oidcIssuer: 'https://auth.stg.example.com/realms/kici-internal',
+        platformEndpoint: 'https://platform.example.com/kici',
+        oidcIssuer: 'https://auth.example.com/realms/kici',
       });
 
       await loginCommand({});
@@ -533,9 +533,9 @@ describe('kici login', () => {
 
     it('clears activeOrgId + defaultClusters when the endpoint changes', async () => {
       await writeConfig({
-        platformEndpoint: 'https://stg.example.com/kici-stg',
-        activeOrgId: 'org_kiciStg00001',
-        defaultClusters: { org_kiciStg00001: 'cluster-5fbb07' },
+        platformEndpoint: 'https://platform.example.com/kici',
+        activeOrgId: 'org_acmeOrg00001',
+        defaultClusters: { org_acmeOrg00001: 'cluster-5fbb07' },
       });
 
       await loginCommand({}); // resolves to PROD_PLATFORM_URL — endpoint changed
@@ -549,15 +549,15 @@ describe('kici login', () => {
     it('preserves activeOrgId + defaultClusters when the endpoint is unchanged', async () => {
       await writeConfig({
         platformEndpoint: PROD_PLATFORM_URL,
-        activeOrgId: 'org_NXho-8YmATbZ',
-        defaultClusters: { 'org_NXho-8YmATbZ': 'cluster-prod' },
+        activeOrgId: 'org_q7Rt-2VbKmXa',
+        defaultClusters: { 'org_q7Rt-2VbKmXa': 'cluster-prod' },
       });
 
       await loginCommand({}); // resolves to PROD_PLATFORM_URL — endpoint unchanged
 
       const config = await loadGlobalConfig();
-      expect(config.activeOrgId).toBe('org_NXho-8YmATbZ');
-      expect(config.defaultClusters).toEqual({ 'org_NXho-8YmATbZ': 'cluster-prod' });
+      expect(config.activeOrgId).toBe('org_q7Rt-2VbKmXa');
+      expect(config.defaultClusters).toEqual({ 'org_q7Rt-2VbKmXa': 'cluster-prod' });
     });
   });
 

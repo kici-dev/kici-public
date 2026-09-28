@@ -114,9 +114,8 @@ describe('computeMigrationsHash', () => {
 // ── context *Direct helpers ──────────────────────────────────────────
 //
 // These use a mocked pg.Pool — we assert the SQL text and parameter bindings
-// without hitting a real DB. The integration-level coverage (ON CONFLICT
-// semantics, JSONB serialisation round-trip) lives in the downstream e2e
-// suites that exercise these helpers against the local compose stack.
+// without hitting a real DB. ON CONFLICT semantics and the JSONB serialisation
+// round-trip need a real PostgreSQL, so this file does not cover them.
 
 interface MockQueryResult {
   rows: Record<string, unknown>[];

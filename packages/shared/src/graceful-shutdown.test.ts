@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { setupGracefulShutdown } from './graceful-shutdown.js';
 
+const { flushLogFiles } = vi.hoisted(() => ({
+  flushLogFiles: vi.fn(async (_timeoutMs?: number) => {}),
+}));
+vi.mock('@kici-dev/core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@kici-dev/core')>()),
+  flushLogFiles,
+}));
+
 function createLogger() {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
@@ -123,6 +131,7 @@ describe('setupGracefulShutdown', () => {
     // Let the async IIFE schedule the setTimeout
     await Promise.resolve();
     vi.advanceTimersByTime(5_000);
+    await flushMicrotasks();
 
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('forcing exit'), {
       exitCode: 0,
@@ -147,6 +156,7 @@ describe('setupGracefulShutdown', () => {
     (signalListeners['uncaughtException'][0] as (err: Error) => void)(new Error('boom'));
     await Promise.resolve();
     vi.advanceTimersByTime(5_000);
+    await flushMicrotasks();
 
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('forcing exit'), {
       exitCode: 1,
@@ -252,5 +262,162 @@ describe('setupGracefulShutdown', () => {
     });
     expect(exitSpy).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  describe('log file flush', () => {
+    beforeEach(() => flushLogFiles.mockClear());
+
+    function recordOrder(): string[] {
+      const order: string[] = [];
+      flushLogFiles.mockImplementationOnce(async () => void order.push('flush'));
+      exitSpy.mockImplementation(
+        ((code?: number) => void order.push(`exit ${code}`)) as typeof process.exit,
+      );
+      return order;
+    }
+
+    // fails-when: the process exits before the log files take their last line.
+    it('flushes the log files before a completed shutdown exits', async () => {
+      const order = recordOrder();
+      const handle = setupGracefulShutdown({
+        logger: createLogger(),
+        steps: [],
+        skipErrorHandlers: true,
+      });
+      await handle.shutdown('SIGTERM');
+      expect(order).toEqual(['flush', 'exit 0']);
+    });
+
+    // fails-when: a forced exit skips the flush.
+    it('flushes the log files before a forced exit', async () => {
+      const order = recordOrder();
+      const handle = setupGracefulShutdown({
+        logger: createLogger(),
+        timeoutMs: 1_000,
+        steps: [{ name: 'hangs', fn: () => new Promise<void>(() => {}) }],
+        skipErrorHandlers: true,
+      });
+      void handle.shutdown('SIGTERM');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushMicrotasks();
+      expect(order).toEqual(['flush', 'exit 0']);
+    });
+
+    // fails-when: the error path exits without the flush.
+    it('flushes the log files before an exit on a shutdown error', async () => {
+      const order = recordOrder();
+      const logger = createLogger();
+      logger.info.mockImplementation((msg: string) => {
+        if (msg === 'Graceful shutdown complete') throw new Error('logger broke');
+      });
+      const handle = setupGracefulShutdown({ logger, steps: [], skipErrorHandlers: true });
+      await handle.shutdown('SIGTERM');
+      expect(order).toEqual(['flush', 'exit 1']);
+    });
+
+    // fails-when: the exit uses the code copied before the flush, so a fatal
+    // trigger that lands while the log files are flushing no longer raises it.
+    it('exits 1 when a fatal trigger lands while the log files flush', async () => {
+      let releaseFlush!: () => void;
+      flushLogFiles.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseFlush = resolve;
+          }),
+      );
+      const handle = setupGracefulShutdown({ logger: createLogger(), steps: [] });
+      const done = handle.shutdown('SIGTERM');
+      await flushMicrotasks();
+      expect(flushLogFiles).toHaveBeenCalledOnce();
+      (signalListeners['unhandledRejection'][0] as (reason: unknown) => void)(new Error('late'));
+      releaseFlush();
+      await done;
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    // fails-when: the forced path exits with the code copied before its flush.
+    it('exits 1 when a fatal trigger lands while a forced exit flushes', async () => {
+      let releaseFlush!: () => void;
+      flushLogFiles.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseFlush = resolve;
+          }),
+      );
+      const handle = setupGracefulShutdown({
+        logger: createLogger(),
+        timeoutMs: 1_000,
+        steps: [{ name: 'hangs', fn: () => new Promise<void>(() => {}) }],
+      });
+      void handle.shutdown('SIGTERM');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(flushLogFiles).toHaveBeenCalledOnce();
+      (signalListeners['unhandledRejection'][0] as (reason: unknown) => void)(new Error('late'));
+      releaseFlush();
+      await flushMicrotasks();
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    // breaks-if-wrong: with no fatal trigger during the flush, a clean stop still exits 0.
+    it('exits 0 when nothing fatal lands while the log files flush', async () => {
+      let releaseFlush!: () => void;
+      flushLogFiles.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseFlush = resolve;
+          }),
+      );
+      const handle = setupGracefulShutdown({ logger: createLogger(), steps: [] });
+      const done = handle.shutdown('SIGTERM');
+      await flushMicrotasks();
+      releaseFlush();
+      await done;
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+
+    // fails-when: a failing flush leaves the forced path without an exit.
+    it('still exits when the flush fails', async () => {
+      flushLogFiles.mockRejectedValueOnce(new Error('disk gone'));
+      const handle = setupGracefulShutdown({
+        logger: createLogger(),
+        timeoutMs: 1_000,
+        steps: [{ name: 'hangs', fn: () => new Promise<void>(() => {}) }],
+        skipErrorHandlers: true,
+      });
+      void handle.shutdown('SIGTERM');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushMicrotasks();
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+
+    // breaks-if-wrong: the flush is bounded, so a forced exit still lands
+    // inside the init system's stop grace.
+    it('bounds the flush it waits for', async () => {
+      const handle = setupGracefulShutdown({
+        logger: createLogger(),
+        steps: [],
+        skipErrorHandlers: true,
+      });
+      await handle.shutdown('SIGTERM');
+      expect(flushLogFiles).toHaveBeenCalledWith(2_000);
+    });
+
+    // breaks-if-wrong: onForceExit that exits by itself is left to do so.
+    it('does not flush or exit when onForceExit handles the forced exit', async () => {
+      const handle = setupGracefulShutdown({
+        logger: createLogger(),
+        timeoutMs: 1_000,
+        steps: [{ name: 'hangs', fn: () => new Promise<void>(() => {}) }],
+        onForceExit: () => true,
+        skipErrorHandlers: true,
+      });
+      void handle.shutdown('SIGTERM');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushMicrotasks();
+      expect(flushLogFiles).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
   });
 });

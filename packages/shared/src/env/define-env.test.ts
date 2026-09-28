@@ -396,9 +396,9 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('allowlists RESERVED_NON_SCHEMA_KICI_PREFIXES (test-framework namespace)', () => {
-    // KICI_E2E_* is set by e2e/vitest.*.config.ts and leaks into the
-    // native orchestrator spawn via inherited process.env. Not a config
-    // typo — the whole KICI_E2E_ prefix is test-framework namespace.
+    // A test harness may set KICI_E2E_* variables, which leak into a spawned
+    // orchestrator through the inherited process.env. Not a config typo — the
+    // whole KICI_E2E_ prefix is test-framework namespace.
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],

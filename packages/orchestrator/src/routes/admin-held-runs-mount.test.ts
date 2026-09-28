@@ -2,9 +2,9 @@
  * The `createAdminRoutes` mount seam for the held-run routes.
  *
  * `admin-held-runs.test.ts` drives the route factory directly, which proves
- * nothing about whether `admin.ts` ever mounts it — the recurring failure shape
- * on this plan is a test driving one layer while the defect sits in the layer
- * beside it. So these go through `createAdminRoutes` with real bearer auth, and
+ * nothing about whether `admin.ts` ever mounts it — a test driving one layer
+ * misses a defect in the layer beside it. So these go through
+ * `createAdminRoutes` with real bearer auth, and
  * assert the three-part mount condition: a database, an audit sink, AND the
  * release wiring.
  *

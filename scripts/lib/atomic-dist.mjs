@@ -3,8 +3,8 @@
  *
  * A build that clears `dist/` before writing it leaves a window in which a
  * module is genuinely absent, and any concurrent reader resolving it dies with
- * ERR_MODULE_NOT_FOUND. Readers are not all under this repo's control — the
- * trusted in-place agent that runs the deploy workflow, a second shell running
+ * ERR_MODULE_NOT_FOUND. Readers are not all under this repo's control — a CI
+ * agent building in the same checkout, a second shell running
  * `pnpm build`, an editor's TypeScript server, and build-service.mjs itself
  * reading a peer's dist/index.js all resolve built artifacts while a build may
  * be running.
@@ -13,8 +13,8 @@
  * after its own process, `<pkg>/dist.tmp-<pid>`, so two builds of one package
  * never share a staging tree;
  * each artifact is moved onto its destination with a single rename(2) — atomic
- * within one filesystem, and staging is a sibling of `dist/` so it always is —
- * and only afterwards are artifacts this run did not produce removed.
+ * within one filesystem, and the staging directory is a sibling of `dist/` so it
+ * always is — and only afterwards are artifacts this run did not produce removed.
  *
  * The guarantee is per path, not per generation: every path the run still
  * produces stays continuously readable — a reader gets the old bytes or the new
@@ -40,8 +40,8 @@ const LEGACY_STAGE_NAME = 'dist.tmp';
  * owner that still looks alive.
  *
  * A staging tree lives for exactly one package's bundler run. The slowest
- * cache-miss `build` task any of these scripts drives is about 25 seconds on the
- * development machine, and that figure also covers the declaration emit that
+ * cache-miss `build` task any of these scripts drives is about 25 seconds on a
+ * fast workstation, and that figure also covers the declaration emit that
  * runs after the staging window closes. Ten times that for the slowest
  * architecture that builds this repo, four times again for a loaded box, is
  * about 17 minutes; two hours is several times that bound.
@@ -217,8 +217,8 @@ export function orderForPublish(distDir, relPaths) {
 
 /**
  * Move every staged file onto its `dist/` destination and return the published
- * paths, relative to `dist/`. A failure part-way through leaves the staging
- * directory in place; the next `stageDir` clears it.
+ * paths, relative to `dist/`. A failure part-way through leaves the
+ * staging directory in place; the next `stageDir` clears it.
  */
 export function publishStagedDist(pkgDir, opts = {}) {
   const stage = stagePath(pkgDir, opts.pid ?? process.pid);

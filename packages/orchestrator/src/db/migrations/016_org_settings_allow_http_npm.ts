@@ -6,8 +6,8 @@ import { type Kysely, sql } from 'kysely';
  * Operators flip this on a per-org basis to permit `http://` (non-HTTPS)
  * registry URLs in workflow `registries:` declarations. By default only
  * `https://` registries are accepted, with an automatic exemption for
- * loopback / `*.local` / private link-local hosts so dev fixtures
- * (Verdaccio at `http://verdaccio.local:4873`) keep working.
+ * loopback / `*.local` / private link-local hosts so a local registry
+ * (for example `http://registry.local:4873`) keeps working.
  *
  * Idempotent: a re-run on a DB that already has the column is a no-op.
  */

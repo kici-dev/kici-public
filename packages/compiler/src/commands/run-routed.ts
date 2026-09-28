@@ -1,10 +1,9 @@
 /**
  * `kici run --local [event]` — a real routed dispatch with this machine as the
- * ephemeral agent, through the warm local dev plane. In this phase only the
- * offline (independent) plane is wired; Platform attachment (`--connected` /
- * auto-select hybrid) lands with the attachment work.
+ * ephemeral agent, through the warm local dev plane. `resolvePlaneForRun`
+ * picks the offline (independent) plane or the Platform-attached one.
  *
- * The offline path reuses the real orchestrator + agent pipeline end-to-end, so
+ * The run reuses the real orchestrator + agent pipeline end-to-end, so
  * the execution parity dividend (emit / cache / needs / parallel / `KICI_SOURCE_*`)
  * holds by construction — there is no second engine.
  */
@@ -48,8 +47,8 @@ export interface RunRoutedOptions {
   /**
    * Path to a dispatch payload JSON `{ action?, client_payload? }`. Only read
    * when the event is `dispatch`: `action` becomes the dispatch `types` matcher
-   * key and `client_payload` reaches the workflow. This is how `packages/ci`
-   * targets a single `dispatch()` workflow (e.g. deploy-stg) on the routed path.
+   * key and `client_payload` reaches the workflow. This lets a caller target a
+   * single `dispatch()` workflow on the routed path.
    */
   payload?: string;
   kiciDir?: string;
@@ -170,7 +169,7 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     // appending the `self-hosted` routing label to the workdir lock the plane
     // reads. With `--in-place`, ALSO append `in-place` so the run lands on the
     // trusted IN-PLACE label set (the agent uses the real working tree directly,
-    // no clone) — the routed `deploy:stg` profile. restore()s un-dirty an
+    // no clone) — the in-place profile. restore()s un-dirty an
     // in-place tree in the finally below (an isolated clone is removed by cleanup
     // regardless).
     if (trusted) {

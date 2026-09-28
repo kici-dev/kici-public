@@ -820,7 +820,7 @@ async function dispatchCrossSourceWorkflows(
   event: SimulatedEvent,
   resolvedOrgId: string,
 ): Promise<{ handled: boolean }> {
-  // Pitfall 5 guard: the inbound event name lives in event.action for generic
+  // Guard: the inbound event name lives in event.action for generic
   // webhooks (the generic normalizer sets event.type = 'generic_webhook').
   // Fall back to info.event if action is unset.
   const inboundEventName = event.action ?? info.event;
@@ -1626,8 +1626,8 @@ function repoFilterRejectionOf(decision: WorkflowDecision): string | undefined {
  *
  * This is the answer to "the workflow is registered and enabled, so why has it
  * never run for this repo?" — without it that outcome is byte-identical to the
- * workflow never having been registered, which is what made it cost a full
- * staging investigation to diagnose.
+ * workflow never having been registered, so diagnosing it takes a full
+ * investigation.
  *
  * Aggregated deliberately. An org whose globals declare `repos:
  * ['myorg/service-*']` drops all of them on every delivery from every other
@@ -3684,11 +3684,11 @@ async function processWebhookPipeline(
       decisions: globals.decisionSummaries,
     });
     // Terminal summary at parity with the lock-file path's `Webhook processed`
-    // line below. This branch previously logged only a `debug` entry, so on
-    // staging (which does not capture `debug`) a delivery that resolved no
-    // per-repo lock file and matched no global workflow produced no run with
-    // nothing above `debug` to say why — the class of silent drop that made a
-    // gate-not-reached / no-match delivery undiagnosable from Loki.
+    // line below. With only a `debug` entry, a deployment that does not capture
+    // `debug` sees a delivery that resolved no per-repo lock file and matched
+    // no global workflow produce no run, with nothing to say why — the class of
+    // silent drop that makes a gate-not-reached / no-match delivery
+    // undiagnosable from the logs.
     logger.info('Webhook processed (no per-repo lock file)', {
       deliveryId: info.deliveryId,
       event: info.event,

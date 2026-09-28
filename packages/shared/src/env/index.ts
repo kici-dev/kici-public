@@ -21,3 +21,5 @@ export {
 } from './define-env.js';
 
 export { LoggerEnvSchema, LOGGER_ENV_VARS, LOGGER_ENV_FIELD_SPECS } from './logger-env.js';
+
+export { ORCHESTRATOR_DEFAULT_PORT, AGENT_DEFAULT_PORT } from './default-ports.js';

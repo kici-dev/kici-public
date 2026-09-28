@@ -22,6 +22,7 @@ import {
 } from '@kici-dev/engine';
 import {
   createAgentWsHandler,
+  frameIdentity,
   isValidLogChunk,
   truncateCloseReason,
   type AgentWsHandlerDeps,
@@ -40,6 +41,7 @@ import {
   ORCH_AGENT_CAPABILITIES,
   PROTOCOL_VERSION,
   WS_CLOSE_PROTOCOL_ERROR,
+  WS_CLOSE_INTERNAL_ERROR,
 } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
@@ -1194,7 +1196,7 @@ describe('createAgentWsHandler', () => {
       // The agent uploads the bundle via a presigned PUT (data object only).
       // CacheStorage.get is metadata-gated, so the handler MUST write the
       // metadata sidecar via initMeta(key) before the dashboard read can inline
-      // the bundle — otherwise the P1.7 attestations API reads it back as
+      // the bundle — otherwise the dashboard attestations read gets it back as
       // missing and returns an empty list despite a recorded DB row.
       const dispatchCacheRefs = new DispatchCacheRefTracker();
       dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
@@ -1746,7 +1748,7 @@ describe('createAgentWsHandler', () => {
     });
   });
 
-  // ── User-cache WS handlers (Task 7) ─────────────────────────────
+  // ── User-cache WS handlers ──────────────────────────────────────
 
   describe('user-cache WS handlers', () => {
     /** A UserCache-shaped stub recording the refs it was called with. */
@@ -3722,6 +3724,183 @@ describe('createAgentWsHandler', () => {
     it('both registry rejection classes construct as Errors', () => {
       expect(new UnknownApiMethodError('a.b')).toBeInstanceOf(Error);
       expect(new ApiRoleDeniedError('a.b', 'write', ['read'])).toBeInstanceOf(Error);
+    });
+  });
+
+  describe('a frame whose handling fails', () => {
+    // fails-when: the rejection escapes onMessage. The WebSocket server
+    // discards the promise, so it becomes an unhandled rejection and the
+    // shutdown hook stops the orchestrator (a drain query failed under a full
+    // disk).
+    it('logs the frame and its agent, keeps the socket open, and resolves', async () => {
+      vi.useRealTimers();
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        const failing = mockDispatcher();
+        (failing.onAgentAvailable as ReturnType<typeof vi.fn>).mockRejectedValue(
+          new Error('Connection terminated unexpectedly'),
+        );
+        const handler = createAgentWsHandler({
+          registry,
+          dispatcher: failing,
+          agentAuthMode: 'none',
+          onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        });
+        const ws = mockWs();
+        handler.onOpen!(new Event('open'), ws as any);
+
+        await expect(
+          handler.onMessage(makeMessageEvent(registerMsg()), ws as any),
+        ).resolves.toBeUndefined();
+        await new Promise((resolve) => setImmediate(resolve));
+
+        expect(mockLogError).toHaveBeenCalledWith(
+          'Failed to handle an agent message',
+          expect.objectContaining({
+            messageType: 'agent.register',
+            agentId: 'agent-1',
+            error: 'Connection terminated unexpectedly',
+          }),
+        );
+        expect(ws.close).not.toHaveBeenCalled();
+        expect(unhandled).not.toHaveBeenCalled();
+
+        // breaks-if-wrong: the connection still works — the next frame is handled.
+        (failing.onAgentAvailable as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+        await handler.onMessage(
+          makeMessageEvent({
+            type: 'agent.status',
+            messageId: 'msg-2',
+            agentId: 'agent-1',
+            activeJobs: 0,
+          }),
+          ws as any,
+        );
+        expect(failing.onAgentAvailable).toHaveBeenCalledTimes(2);
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
+    // fails-when: the failed drain ends the frame, so the finished job's status
+    // never reaches the execution tracker or the scaler. The agent does not
+    // resend it, and the job stays running until the stale scan fails it.
+    it('still forwards a finished job when the drain after it fails', async () => {
+      vi.useRealTimers();
+      const failing = mockDispatcher();
+      const onScalerJobComplete = vi.fn();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher: failing,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        onScalerJobComplete,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage(makeMessageEvent(registerMsg()), ws as any);
+      (failing.onAgentAvailable as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error('Connection terminated unexpectedly'),
+      );
+
+      await handler.onMessage(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: 'msg-7',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+          timestamp: Date.now(),
+        }),
+        ws as any,
+      );
+
+      expect(onScalerJobComplete).toHaveBeenCalledWith('agent-1');
+      expect(onJobStatus).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ runId: 'run-1', jobId: 'job-1', state: 'success' }),
+      );
+      expect(mockLogError).toHaveBeenCalledWith(
+        'Failed to drain the queue after a job finished',
+        expect.objectContaining({
+          agentId: 'agent-1',
+          runId: 'run-1',
+          jobId: 'job-1',
+          error: 'Connection terminated unexpectedly',
+        }),
+      );
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+
+    // fails-when: a token-store failure during auth leaves the connection in no
+    // state: its auth timer is already cleared, so nothing ever closes it and
+    // the agent waits for an answer that never comes.
+    it('closes a connection whose token check fails, so the agent reconnects', async () => {
+      vi.useRealTimers();
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        const handler = createAgentWsHandler({
+          registry,
+          dispatcher,
+          agentAuthMode: 'token',
+          tokenStore: mockTokenStore({
+            validate: vi.fn().mockRejectedValue(new Error('Connection terminated unexpectedly')),
+          }),
+          onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        });
+        const ws = mockWs();
+        handler.onOpen!(new Event('open'), ws as any);
+
+        await expect(
+          handler.onMessage(makeMessageEvent(authRequestMsg()), ws as any),
+        ).resolves.toBeUndefined();
+        await new Promise((resolve) => setImmediate(resolve));
+
+        expect(mockLogError).toHaveBeenCalledWith(
+          'Failed to handle an agent message',
+          expect.objectContaining({
+            messageType: 'auth.request',
+            error: 'Connection terminated unexpectedly',
+          }),
+        );
+        // A retryable close, never the permanent auth-failure code.
+        expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_INTERNAL_ERROR, expect.any(String));
+        expect(ws.close).not.toHaveBeenCalledWith(WS_CLOSE_AGENT_AUTH_FAILED, expect.anything());
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+  });
+
+  describe('frameIdentity', () => {
+    it('names the type, agent, run and job a frame carries', () => {
+      expect(
+        frameIdentity(
+          JSON.stringify({
+            type: 'job.status',
+            agentId: 'a1',
+            runId: 'r1',
+            jobId: 'j1',
+            state: 'running',
+          }),
+        ),
+      ).toEqual({ messageType: 'job.status', agentId: 'a1', runId: 'r1', jobId: 'j1' });
+    });
+
+    it('returns nothing for a frame that is not a JSON object', () => {
+      expect(frameIdentity('not json')).toEqual({});
+      expect(frameIdentity('null')).toEqual({});
+      expect(frameIdentity('"text"')).toEqual({});
+      expect(frameIdentity('[1,2]')).toEqual({});
+    });
+
+    it('drops non-string ids and caps long ones', () => {
+      const id = frameIdentity(JSON.stringify({ type: 'x'.repeat(500), runId: 42 }));
+      expect(id.messageType).toHaveLength(128);
+      expect(id).not.toHaveProperty('runId');
     });
   });
 });

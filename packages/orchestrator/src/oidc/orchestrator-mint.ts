@@ -249,7 +249,7 @@ export function createOrchestratorOidcTokenHandler(
     }
     // Test-only fault injection: the build-time test double supplies
     // `initialMintFault` to force the initial agent mint to defer for a marker
-    // audience, so an E2E can exercise the deferred-attestation retry path with
+    // audience, so a test can exercise the deferred-attestation retry path with
     // a REAL run. The shipped orchestrator leaves it undefined, so this branch
     // is never reached.
     if (deps.initialMintFault?.(audience)) {

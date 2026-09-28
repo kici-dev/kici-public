@@ -466,7 +466,7 @@ async function executeStepInLoop(
   // `timedOut` marks the step's own abort as self-inflicted. The timeout aborts
   // `ctx.signal` through `opts.abortStep`, which is the same controller the
   // fail-fast path uses, so without this flag the step would report `cancelled`
-  // instead of the timeout message the loop (and the E2E suite) expects.
+  // instead of the timeout message the loop expects.
   let timedOut = false;
   // The race's timeout branch, rejected explicitly rather than through an abort
   // listener. A step body that resolves when it observes `ctx.signal` settles in

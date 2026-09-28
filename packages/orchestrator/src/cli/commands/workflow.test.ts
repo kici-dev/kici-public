@@ -114,11 +114,11 @@ describe('kici-admin workflow CLI commands', () => {
 
   describe('workflow list', () => {
     it('W-1: --org and --event build the right query string', async () => {
-      await runCommand(['workflow', 'list', '--org', 'kiciStg00001', '--event', 'foo'], client);
+      await runCommand(['workflow', 'list', '--org', 'acmeOrg00001', '--event', 'foo'], client);
 
       expect(mockGet).toHaveBeenCalledTimes(1);
       const path = mockGet.mock.calls[0][0] as string;
-      expect(path).toBe('/api/v1/admin/registrations?customerId=kiciStg00001&event=foo');
+      expect(path).toBe('/api/v1/admin/registrations?customerId=acmeOrg00001&event=foo');
     });
 
     it('W-2: --routing-key encodes the colon', async () => {

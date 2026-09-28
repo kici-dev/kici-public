@@ -4,11 +4,15 @@
  * Implements only leader election (no log replication) for cluster coordination.
  * State machine: follower -> candidate -> leader. State is persisted to Postgres
  * via RaftStateStore for crash recovery. Election timeout is 5-10s with randomized
- * jitter (WAN-appropriate per research). Leader sends heartbeats every 2s.
+ * jitter (WAN-appropriate). Leader sends heartbeats every 2s.
  *
  * Dormant mode: When peerRegistry has 0 connected peers, the node self-elects
  * immediately (single-orchestrator deployment). If peers connect later, normal
  * election resumes.
+ *
+ * `stop()` takes the node out of every election until the next `start()`: it
+ * ends the node's leadership and ignores every election input afterwards, so a
+ * process that is shutting down cannot be elected again.
  *
  * Raft heartbeat (raft.append.entries every 2s) is separate from peer inventory
  * heartbeat (peer.heartbeat every 30s). Raft heartbeat is purely for leader
@@ -55,6 +59,13 @@ export class RaftNode {
   private votedFor: string | null = null;
   private leaderId: string | null = null;
   private role: RaftRole = 'follower';
+  /**
+   * Set by {@link stop}. A stopped node takes no further part in any election:
+   * it belongs to a process that is shutting down, and an election would restart
+   * the leader-only services the shutdown is stopping and write Raft state to a
+   * database that is being closed.
+   */
+  private stopped = false;
 
   private electionTimer: ReturnType<typeof setTimeout> | null = null;
   private leaderHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -93,6 +104,7 @@ export class RaftNode {
     this.votedFor = state.votedFor;
     this.leaderId = state.leaderId;
     this.role = 'follower';
+    this.stopped = false;
     this.startedAt = Date.now();
 
     logger.info('Raft node started', {
@@ -105,19 +117,32 @@ export class RaftNode {
   }
 
   /**
-   * Stop the Raft node. Clears all timers and persists state.
+   * Stop the Raft node. Clears its timers, ends its leadership (so the
+   * leader-only services stop with it), and persists its state. Every election
+   * input after this is ignored until the next {@link start}. A second call does
+   * nothing.
    */
   async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
     this.clearElectionTimer();
     this.clearLeaderHeartbeat();
+    const wasLeader = this.role === 'leader';
+    this.role = 'follower';
+    if (wasLeader) {
+      this.leaderId = null;
+      this.onLoseLeadership();
+    }
 
-    await this.stateStore.save({
+    // The cluster shares one raft_state row, and the remaining coordinators may
+    // already have elected a new leader in a newer term: never overwrite it.
+    await this.stateStore.saveUnlessNewerTerm({
       currentTerm: this.currentTerm,
       votedFor: this.votedFor,
       leaderId: this.leaderId,
     });
 
-    logger.info('Raft node stopped', { instanceId: this.instanceId });
+    logger.info('Raft node stopped', { instanceId: this.instanceId, wasLeader });
   }
 
   /** Whether this node is the current leader. */
@@ -149,6 +174,7 @@ export class RaftNode {
    * is done by the caller before calling this method).
    */
   handlePeerLeaving(instanceId: string): void {
+    if (this.stopped) return;
     if (this.role === 'leader') {
       logger.debug('Ignoring peer.leaving (we are leader)', { leavingPeer: instanceId });
       return;
@@ -176,6 +202,7 @@ export class RaftNode {
    */
   resetElectionTimer(): void {
     this.clearElectionTimer();
+    if (this.stopped) return;
 
     const timeout =
       this.electionTimeoutMinMs +
@@ -201,6 +228,7 @@ export class RaftNode {
    * before discovering all peers are gone.
    */
   onPeerDisconnected(): void {
+    if (this.stopped) return;
     if (this.role !== 'leader' && this.peerRegistry.getConnectedCoordinatorPeerCount() === 0) {
       // Respect grace period: if still within grace period, use normal election timer
       if (this.gracePeriodMs > 0 && Date.now() - this.startedAt < this.gracePeriodMs) {
@@ -222,6 +250,7 @@ export class RaftNode {
    * (dormant mode for single-orchestrator deployments).
    */
   private startElection(): void {
+    if (this.stopped) return;
     this.currentTerm++;
     this.votedFor = this.instanceId;
     this.role = 'candidate';
@@ -308,6 +337,15 @@ export class RaftNode {
    * Handle an incoming vote request from another candidate.
    */
   handleVoteRequest(msg: RaftVoteRequest): RaftVoteResponse {
+    if (this.stopped) {
+      return {
+        type: 'raft.vote.response',
+        term: this.currentTerm,
+        voteGranted: false,
+        voterId: this.instanceId,
+      };
+    }
+
     // Step down if message has higher term
     if (msg.term > this.currentTerm) {
       this.stepDown(msg.term);
@@ -360,6 +398,7 @@ export class RaftNode {
    * Handle a vote response from a peer.
    */
   handleVoteResponse(msg: RaftVoteResponse): void {
+    if (this.stopped) return;
     // Higher term: step down
     if (msg.term > this.currentTerm) {
       this.stepDown(msg.term);
@@ -409,6 +448,7 @@ export class RaftNode {
    * call onBecomeLeader callback.
    */
   private becomeLeader(): void {
+    if (this.stopped) return;
     this.role = 'leader';
     this.leaderId = this.instanceId;
     this.consecutiveUnansweredElections = 0;
@@ -443,6 +483,7 @@ export class RaftNode {
    * Step down from leader/candidate to follower.
    */
   private stepDown(newTerm: number, newLeaderId?: string): void {
+    if (this.stopped) return;
     const wasLeader = this.role === 'leader';
 
     this.currentTerm = newTerm;
@@ -522,6 +563,7 @@ export class RaftNode {
    * Handle an incoming append entries (heartbeat) from a leader.
    */
   handleAppendEntries(msg: RaftAppendEntries): void {
+    if (this.stopped) return;
     // Receiving a heartbeat proves connectivity — reset unanswered counter
     this.consecutiveUnansweredElections = 0;
 

@@ -203,7 +203,7 @@ export class JoinClient {
 
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url, {
-        //: cap maximum decompressed frame size so a rogue or
+        // Cap the maximum decompressed frame size so a rogue or
         // compromised Platform peer cannot OOM the joiner with a compression
         // bomb during the join handshake. Without this, ws@8.x defaults
         // to 100 MiB.

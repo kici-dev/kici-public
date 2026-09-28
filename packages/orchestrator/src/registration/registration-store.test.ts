@@ -9,7 +9,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { LockWorkflow } from '@kici-dev/engine';
 
 // Mock @kici-dev/shared so we can assert against the logger from the
-// self-heal block added in Plan 28.6.2-07 Task 2. Only createLogger is
+// self-heal block. Only createLogger is
 // mocked — the store does not use anything else from @kici-dev/shared.
 const { mockLogger } = vi.hoisted(() => {
   const mockLogger = {
@@ -459,16 +459,14 @@ describe('RegistrationStore', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────
-  // Plan 28.6.2-07 Task 2 — replaceAll self-heal for stale __default__
-  // customer_id rows.
+  // replaceAll self-heal for stale __default__ customer_id rows.
   //
-  // Background: the 2026-04-12 staging failover-routing spike found 12
-  // workflow_registrations rows stuck at customer_id='__default__' for
-  // routing_key='github:2848097'. The rows were written before the
-  // matching sources.customer_id was back-filled to 'kiciStg00001', and
-  // there is no code path that re-stamps them after the fact. The
-  // stale rows broke Plan 06's cross-provider lock-file fallback
-  // because the registration index is keyed by `${customerId}|${repo}`.
+  // Background: workflow_registrations rows written before the matching
+  // sources.customer_id was back-filled to a real tenant stay stuck at
+  // customer_id='__default__', and there is no code path that re-stamps
+  // them after the fact. The stale rows break the cross-provider
+  // lock-file fallback because the registration index is keyed by
+  // `${customerId}|${repo}`.
   //
   // The self-heal detects this specific stale pattern inside the same
   // replaceAll transaction: if any existing row for (routing_key,
@@ -478,7 +476,7 @@ describe('RegistrationStore', () => {
   // and incoming customerIds are '__default__' (preserves legacy
   // unresolved-source behavior and avoids journal noise).
   // ─────────────────────────────────────────────────────────────────
-  describe('replaceAll self-heal (28.6.2-07)', () => {
+  describe('replaceAll self-heal', () => {
     beforeEach(() => {
       mockLogger.info.mockClear();
       mockLogger.debug.mockClear();
@@ -548,7 +546,7 @@ describe('RegistrationStore', () => {
         [makeLockWorkflow('wf-1'), makeLockWorkflow('wf-2'), makeLockWorkflow('wf-3')],
         'github:42',
         {},
-        { customerId: 'kiciStg00001' },
+        { customerId: 'acmeOrg00001' },
       );
 
       // The self-heal INFO log fires exactly once with the expected marker
@@ -563,16 +561,16 @@ describe('RegistrationStore', () => {
       expect(healContext.routingKey).toBe('github:42');
       expect(healContext.repoIdentifier).toBe('owner/repo');
       expect(healContext.oldCustomerId).toBe('__default__');
-      expect(healContext.newCustomerId).toBe('kiciStg00001');
+      expect(healContext.newCustomerId).toBe('acmeOrg00001');
       expect(healContext.rowsHealed).toBe(2);
 
       // The heal UPDATE was issued inside the transaction. We can assert
       // this by looking for an updateTable+set call whose set payload
-      // contains `customer_id: 'kiciStg00001'`.
+      // contains `customer_id: 'acmeOrg00001'`.
       const setCalls = mocks.trxUpdateSet.mock.calls as unknown[][];
       const healSetCalls = setCalls.filter((call) => {
         const arg = call[0] as Record<string, unknown>;
-        return arg.customer_id === 'kiciStg00001';
+        return arg.customer_id === 'acmeOrg00001';
       });
       expect(healSetCalls.length).toBe(1);
 
@@ -649,7 +647,7 @@ describe('RegistrationStore', () => {
         workflow_name: 'wf-1',
         routing_key: 'github:42',
         repo_identifier: 'owner/repo',
-        customer_id: 'kiciStg00001',
+        customer_id: 'acmeOrg00001',
       });
       const { db, mocks } = createMockDb({ trxSelectResult: [alreadyHealed] });
       const store = new RegistrationStore(db);
@@ -663,14 +661,14 @@ describe('RegistrationStore', () => {
           [makeLockWorkflow('wf-1')],
           'github:42',
           {},
-          { customerId: 'kiciStg00001' },
+          { customerId: 'acmeOrg00001' },
         ),
         store.replaceAll(
           'owner/repo',
           [makeLockWorkflow('wf-1')],
           'github:42',
           {},
-          { customerId: 'kiciStg00001' },
+          { customerId: 'acmeOrg00001' },
         ),
       ]);
 
@@ -681,7 +679,7 @@ describe('RegistrationStore', () => {
       );
       expect(healLogs.length).toBe(0);
 
-      // No bulk UPDATE setting customer_id='kiciStg00001' was issued.
+      // No bulk UPDATE setting customer_id='acmeOrg00001' was issued.
       const setCalls = mocks.trxUpdateSet.mock.calls as unknown[][];
       const healSetCalls = setCalls.filter((call) => {
         const arg = call[0] as Record<string, unknown>;

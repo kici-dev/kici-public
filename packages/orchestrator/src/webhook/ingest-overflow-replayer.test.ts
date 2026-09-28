@@ -251,10 +251,10 @@ describe('IngestOverflowReplayer', () => {
   });
 
   it('skips the drain on a per-key queue_full refusal, with isShedding() false', async () => {
-    // The state that actually occurs. Every shed measured on staging was a
-    // per-key `queue_full` from the layer-2 caps, and `isShedding()` was false
-    // for every one of them — so the test above covers a state the failure
-    // population never entered, and this one covers the state it always did.
+    // The state that actually occurs: a shed is typically a per-key
+    // `queue_full` from the layer-2 caps, with `isShedding()` false. The test
+    // above covers the latch; this one covers the common case, which the
+    // latch cannot observe.
     const rows = [row(1)];
     const reinject = vi.fn(async () => WebhookIngestOutcome.enum.processed);
     const controller = makeController({ shedding: false, headroom: false });

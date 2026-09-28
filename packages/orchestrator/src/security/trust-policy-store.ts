@@ -197,9 +197,9 @@ export class TrustPolicyStore {
 
 /**
  * Build a TrustPolicyStore backed by its own connection pool to the given
- * orchestrator database URL. Mirrors `createHeldRunStoreFromUrl`; consumed by
- * E2E tests that assert the pushed policy is persisted in the real deployed
- * orchestrator DB rather than held in process memory.
+ * orchestrator database URL. Mirrors `createHeldRunStoreFromUrl`; exported for
+ * tests that assert the pushed policy is persisted in a real orchestrator DB
+ * rather than held in process memory.
  */
 export function createTrustPolicyStoreFromUrl(
   databaseUrl: string,

@@ -71,8 +71,8 @@ describe('sshExec', () => {
     await sshExec(reach, KEY, 'true', {}, { spawnFn });
 
     // ssh-agent is started with `-a <sock>` pointing at a kici-bootstrap-ssh-*
-    // private dir — never the default /tmp/ssh-XXXX. kici-leak-sweep keys off
-    // this prefix to reap orphans a SIGKILL left behind.
+    // private dir — never the default /tmp/ssh-XXXX. A host cleanup job keys
+    // off this prefix to reap orphans a SIGKILL left behind.
     const start = calls.find((c) => c.command === 'ssh-agent' && c.args[0] !== '-k');
     const bindIdx = start!.args.indexOf('-a');
     expect(bindIdx).toBeGreaterThanOrEqual(0);

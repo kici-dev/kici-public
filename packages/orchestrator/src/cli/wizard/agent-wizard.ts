@@ -40,7 +40,7 @@ export async function runAgentWizard(): Promise<AgentInstallConfig> {
   // 3. Labels
   console.log('');
   const labelsInput = await input({
-    message: 'Agent labels (comma-separated, empty = accept all jobs):',
+    message: 'Agent labels (comma-separated; empty = only the kici:* labels every agent reports):',
     default: '',
   });
   const labels = labelsInput
@@ -52,7 +52,7 @@ export async function runAgentWizard(): Promise<AgentInstallConfig> {
   console.log('Configuration complete. Summary:');
   console.log(`  Orchestrator: ${orchestratorUrl}`);
   console.log(
-    `  Labels:       ${labels.length > 0 ? labels.join(', ') : '(none - accepts all jobs)'}`,
+    `  Labels:       ${labels.length > 0 ? labels.join(', ') : '(none; only the kici:* labels every agent reports)'}`,
   );
   console.log('');
 

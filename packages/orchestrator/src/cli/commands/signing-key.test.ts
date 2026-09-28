@@ -6,9 +6,8 @@ import { registerSigningKeyCommands } from './signing-key.js';
  * The `kici-admin signing-key` command tree wiring: list / generate / rotate /
  * retire / revoke / export are all registered. The DB-direct behavior
  * (generate/rotate/export against real rows) is covered by the repo unit tests
- * (signing-keys-repo.test.ts), the DbSigner tests, and the
- * provenance-orchestrator-signing E2E. `list` in both its database and
- * admin-API modes is covered by signing-key-list.test.ts.
+ * (signing-keys-repo.test.ts) and the DbSigner tests. `list` in both its
+ * database and admin-API modes is covered by signing-key-list.test.ts.
  *
  * Surface ids exercised here (needled by the coverage gate):
  *   cli:kici-admin:signing-key

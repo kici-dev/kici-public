@@ -114,8 +114,8 @@ export interface CleanupExtras {
  * as terminal status updates so the Platform execution_jobs projection
  * stays in sync.
  *
- * Event-log row + payload retention used to live here too, but Phase E
- * replaced the 30-day hard-delete with cold-store archive-then-delete
+ * Event-log row + payload retention is not here: event_log rows are
+ * archived to cold-store and then deleted
  * (see `packages/orchestrator/src/cold-store/tables/event-log.ts`).
  *
  * @returns Counts of cleaned entries.

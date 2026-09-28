@@ -313,9 +313,8 @@ describe('formatDirectory', () => {
  * severity tracks whether a refresh can arrive at all.
  *
  * The disconnected case is the one the whole feature exists for and is covered
- * here only — reproducing it end-to-end would mean partitioning staging's
- * Platform, so `e2e/tests/ci-security.test.ts` asserts the rendering and says
- * so.
+ * here only — reproducing it end-to-end would mean partitioning a live
+ * Platform, so the end-to-end suite asserts only the connected rendering.
  */
 describe('formatDirectory staleness rendering', () => {
   /** Three days after DIRECTORY.updatedAt. */

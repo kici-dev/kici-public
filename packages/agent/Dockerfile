@@ -1,7 +1,6 @@
-# DHI base-image registry prefix. Default `dhi.io` keeps staging / local / dev
-# builds pulling the upstream Docker Hardened Image verbatim; the prod publish
-# (`packages/ci/src/publish-images.ts`) overrides it to the byte-locked
-# `<ECR>/dhi` namespace via `--build-arg DHI_PREFIX=<ecr>/dhi`. Declared before
+# DHI base-image registry prefix. The default, `dhi.io`, pulls the upstream
+# Docker Hardened Image verbatim; a build that pulls the base images from its
+# own mirror overrides it with `--build-arg DHI_PREFIX=<registry>/dhi`. Declared before
 # the first FROM so this one global ARG resolves every `FROM ${DHI_PREFIX}/…`
 # stage below (standard Docker global-ARG semantics).
 ARG DHI_PREFIX=dhi.io
@@ -31,6 +30,9 @@ RUN corepack enable \
 
 # Copy workspace configuration and root package files
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
+# pnpm reads every patch listed under patchedDependencies on install, so the
+# patches must be in place before the first `pnpm install`.
+COPY patches/ patches/
 
 # Throttle pnpm's network concurrency for the in-container installs below. The
 # build resolves dependencies from npmjs through the host's resolver; pnpm's
@@ -41,13 +43,12 @@ COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
 # container build — the host's own .npmrc is unchanged.
 RUN printf '\nnetwork-concurrency=6\nfetch-retries=6\nfetch-timeout=120000\n' >> .npmrc
 
-# Route the in-container install through a Verdaccio pull-through cache when the
-# build passes KICI_NPM_REGISTRY (e.g. http://verdaccio.local:4873/, set by the
-# E2E deploy when Verdaccio is reachable). Empty — the default / production
-# build — leaves the default registry as npmjs, unchanged. The copied .npmrc
-# already scopes @kici-dev to Verdaccio; this additionally routes the public
-# tree through Verdaccio so cached tarballs are served from its disk instead of
-# re-downloaded from npmjs on every build-layer cache miss.
+# Route the in-container install through an npm pull-through cache when the
+# build passes KICI_NPM_REGISTRY (e.g. http://registry.example.com:4873/).
+# Empty — the default — leaves the default registry as npmjs, unchanged. A
+# scope route in the copied .npmrc still applies; this routes every other
+# package through the cache, so cached tarballs are served from its disk
+# instead of re-downloaded from npmjs on every build-layer cache miss.
 ARG KICI_NPM_REGISTRY=
 RUN if [ -n "$KICI_NPM_REGISTRY" ]; then \
       printf '\nregistry=%s\n' "$KICI_NPM_REGISTRY" >> .npmrc; \
@@ -80,15 +81,12 @@ COPY packages/engine/ packages/engine/
 COPY packages/sdk/ packages/sdk/
 COPY packages/agent/ packages/agent/
 
-# Build-time git commit (passed via --build-arg since git is unavailable in builder stage)
-ARG KICI_BUILD_COMMIT=unknown
-
 # Build packages in dependency order
 RUN pnpm -C packages/core build && \
     pnpm -C packages/shared build && \
     pnpm -C packages/engine build && \
     pnpm -C packages/sdk build && \
-    KICI_BUILD_COMMIT=${KICI_BUILD_COMMIT} pnpm -C packages/agent build
+    pnpm -C packages/agent build
 
 # Re-install production-only deps so the runtime stage's copy carries no
 # devDependencies. `pnpm prune --prod` does NOT recurse across workspace

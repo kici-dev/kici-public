@@ -106,11 +106,10 @@ export class AccessLogWriter {
 
   async record(entry: AccessLogRecord): Promise<void> {
     // The whole body runs under a single try/catch so the documented
-    // best-effort contract holds for every call site. Every consumer
-    // uses `void this.accessLog.record(...)` (fire-and-forget), so a
-    // throw from the policy gate or the limiter would surface as an
-    // unhandled promise rejection — which crashes the orchestrator
-    // under Node's default rejection handling.
+    // best-effort contract holds for every call site. Callers do not
+    // await it (they run it through `runDetached`), and a throw from the
+    // policy gate or the limiter must not reach the process as an
+    // unhandled rejection, which the shutdown hook treats as fatal.
     try {
       await this.insert(this.db, entry);
     } catch (err) {
@@ -189,11 +188,10 @@ export class AccessLogWriter {
   }
 
   /**
-   * Phase D: delegates to `loadAccessLogRange` so cold-store rows are
+   * Delegates to `loadAccessLogRange` so cold-store rows are
    * merged transparently when pagination crosses the warm cutoff. The
    * caller-visible `{items, nextCursor}` shape is preserved. NO
-   * --include-archived flag — access_log is "paginated/transparent"
-   * per design §7 row 11.
+   * --include-archived flag — access_log is "paginated/transparent".
    */
   async query(filter: AccessLogQueryFilter): Promise<AccessLogQueryResult> {
     const limit = Math.max(1, Math.min(filter.limit ?? 50, 200));

@@ -8,7 +8,7 @@ import { type Kysely, sql } from 'kysely';
  *   lock file). The dashboard renders a "Local machine" badge for these runs
  *   and avoids building an external repository link from the repo identifier.
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive with a default, so staging
+ * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive with a default, so existing
  * data is preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {

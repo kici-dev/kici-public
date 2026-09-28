@@ -728,7 +728,7 @@ function handleRunError(
 /**
  * Poll the Platform for run completion, streaming log lines as they arrive.
  *
- * Advances a monotonic line-offset cursor (spec §13a): each `runLogs(cursor)`
+ * Advances a monotonic line-offset cursor: each `runLogs(cursor)`
  * returns the next chunk + `nextCursor`; the run is done only when the status
  * is terminal and the log stream has drained.
  */

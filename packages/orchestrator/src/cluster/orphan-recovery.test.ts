@@ -246,7 +246,7 @@ describe('OrphanRecovery', () => {
           {
             run_id: 'run-live',
             routing_key: 'generic:__default__:src-1',
-            workflow_name: 'deploy-stg',
+            workflow_name: 'deploy-app',
             provider: 'generic',
             repo_identifier: '.',
             sha: 'HEAD',
@@ -423,14 +423,14 @@ describe('OrphanRecovery', () => {
       const raft = createMockRaft(true);
       const tracker = createMockExecutionTracker();
 
-      // A stuck (stale-heartbeat) job that was rerouted to worker peer 'arm-stg'.
+      // A stuck (stale-heartbeat) job that was rerouted to worker peer 'arm-worker'.
       const stuckRerouted = [
         {
           job_id: 'job-1',
           job_name: 'test',
           status: 'running',
           last_heartbeat_at: new Date('2026-02-18T11:50:00Z'), // 10 min ago = stale
-          rerouted_to_peer: 'arm-stg',
+          rerouted_to_peer: 'arm-worker',
         },
       ];
 
@@ -451,7 +451,7 @@ describe('OrphanRecovery', () => {
       // The worker peer is currently connected (different routing key from the
       // coordinator, so the run is still considered orphaned).
       peerRegistry.addPeer({
-        instanceId: 'arm-stg',
+        instanceId: 'arm-worker',
         connectionId: 'conn-arm',
         address: 'ws://arm:8080',
         routingKeys: ['github:99'],
@@ -488,7 +488,7 @@ describe('OrphanRecovery', () => {
           job_name: 'test',
           status: 'running',
           last_heartbeat_at: new Date('2026-02-18T11:50:00Z'), // stale heartbeat
-          rerouted_to_peer: 'arm-stg',
+          rerouted_to_peer: 'arm-worker',
         },
       ];
 
@@ -511,13 +511,13 @@ describe('OrphanRecovery', () => {
       // so it is within the flap-grace window and the job must NOT be failed —
       // the worker will reconnect and replay its buffered terminal status.
       peerRegistry.addPeer({
-        instanceId: 'arm-stg',
+        instanceId: 'arm-worker',
         connectionId: 'conn-arm',
         address: 'ws://arm:8080',
         routingKeys: ['github:99'],
         role: 'worker',
       });
-      peerRegistry.markDisconnected('arm-stg');
+      peerRegistry.markDisconnected('arm-worker');
 
       const recovery = new OrphanRecovery({
         db: mockDb.db,
@@ -542,14 +542,14 @@ describe('OrphanRecovery', () => {
       const raft = createMockRaft(true);
       const tracker = createMockExecutionTracker();
 
-      // Rerouted to 'arm-stg', but that peer is absent from the registry.
+      // Rerouted to 'arm-worker', but that peer is absent from the registry.
       const stuckRerouted = [
         {
           job_id: 'job-1',
           job_name: 'test',
           status: 'running',
           last_heartbeat_at: new Date('2026-02-18T11:50:00Z'), // 10 min ago = stale
-          rerouted_to_peer: 'arm-stg',
+          rerouted_to_peer: 'arm-worker',
         },
       ];
 
@@ -567,7 +567,7 @@ describe('OrphanRecovery', () => {
         jobs: stuckRerouted,
       });
 
-      // No peer named 'arm-stg' is connected -> a dead worker must not hang the job.
+      // No peer named 'arm-worker' is connected -> a dead worker must not hang the job.
       const recovery = new OrphanRecovery({
         db: mockDb.db,
         raft,
@@ -611,7 +611,7 @@ describe('OrphanRecovery', () => {
             job_name: 'test',
             status: 'running',
             last_heartbeat_at: new Date('2026-02-18T11:50:00Z'),
-            rerouted_to_peer: 'arm-stg',
+            rerouted_to_peer: 'arm-worker',
           },
         ],
       });

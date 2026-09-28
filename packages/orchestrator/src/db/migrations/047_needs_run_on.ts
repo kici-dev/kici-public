@@ -11,8 +11,7 @@ import { type Kysely, sql } from 'kysely';
  * - Drop `if_failed`.
  *
  * Idempotent: column-exists guarded so re-running on a DB that already has
- * `run_on` (and no `if_failed`) is a no-op. Existing rows are preserved
- * (staging data is not dropped).
+ * `run_on` (and no `if_failed`) is a no-op. Existing rows are preserved.
  */
 
 // Mirrors the engine keyword→status-set mapping for `always`

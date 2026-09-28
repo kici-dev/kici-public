@@ -4,12 +4,12 @@ import { type Kysely, sql } from 'kysely';
  * `execution_runs` / `execution_jobs` / `execution_steps` cold-store
  * schema additions.
  *
- * Phase C of the cold-storage archival system. See
+ * Part of the cold-storage archival system.
  *
  * Each table gets `archived_at TIMESTAMPTZ NULL` and
  * `archive_object_key TEXT NULL` (set inside the archive tx before the
- * DELETE; survivors carry NULL — same pattern as Phase B's migration
- * 004 for `run_events`).
+ * DELETE; survivors carry NULL — the same pattern `run_events` carries
+ * in the Platform's schema).
  *
  * Tenant column denormalization: the orchestrator side partitions by
  * `routing_key`, but only `execution_runs` carries the column today.
@@ -18,7 +18,7 @@ import { type Kysely, sql } from 'kysely';
  * denormalize `routing_key` onto both tables and backfill from the
  * existing run rows. Backfill is one-shot inside this migration. New
  * inserts must populate the column going forward (enforced at the
- * application layer in the same phase).
+ * application layer).
  *
  * The denormalized column is left NULLable for safety: if an insert
  * site is missed in the rollout, the row still lands in PG; the

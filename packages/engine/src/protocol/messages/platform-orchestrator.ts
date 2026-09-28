@@ -203,12 +203,12 @@ export type TrustPolicyUpdate = z.infer<typeof trustPolicyUpdateSchema>;
  *
  * NOT a wire-parseable schema: this shape is intentionally absent from the
  * `platformToOrchestratorMessageSchema` discriminated union so that a rogue
- * or compromised Platform process (A10) cannot fabricate one and bypass the
+ * or compromised Platform process cannot fabricate one and bypass the
  * on-orchestrator HMAC verification gate. The only legitimate construction
  * site is `completeChunkedRelay` in `packages/orchestrator/src/ws/platform-client.ts`,
  * which synthesizes this shape AFTER `onVerifyInbound` returns `'accepted'`.
  *
- * Migration `packages/platform/src/db/migrations/012_drop_webhook_secret_columns.ts`
+ * The Platform migration that dropped the webhook secret columns
  * makes the orch-side `verifyInboundWebhook` (called from `onVerifyInbound` on
  * the chunked relay path `webhook.relay.start` / `webhook.relay.chunk`) the
  * sole trust boundary against a malicious Platform; keeping this schema OUT
@@ -414,7 +414,7 @@ export type PlatformCapabilitiesMessage = z.infer<typeof platformCapabilitiesMes
  * Platform's monitoring system: a malformed or hostile push fails Zod
  * parse at the WS edge and never reaches the aggregator or the Mimir
  * relay. The content-level allow-list (catalog) is enforced one step
- * deeper — see `packages/platform/src/ws/metrics-filter.ts`.
+ * deeper, in the Platform's orchestrator-metrics filter.
  *
  * Caps:
  * - 2000 metric data points per push (one orch ships ~60 today)
@@ -609,10 +609,10 @@ export type OrchCapabilitiesUpdate = z.infer<typeof orchCapabilitiesUpdateSchema
  * The single-frame `webhookRelaySchema` is intentionally NOT a member of this
  * union: that shape carries an attacker-controlled `payload` and pre-existed
  * the chunked relay's on-orch HMAC verification, so accepting it on the wire
- * would let a compromised Platform (A10) fabricate webhook deliveries that
+ * would let a compromised Platform fabricate webhook deliveries that
  * bypass the only trust boundary against a malicious Platform (see the
- * docblock on `webhookRelaySchema` above and migration
- * `packages/platform/src/db/migrations/012_drop_webhook_secret_columns.ts`).
+ * docblock on `webhookRelaySchema` above and the Platform migration that
+ * dropped the webhook secret columns).
  * The chunked path `webhook.relay.start` + `webhook.relay.chunk` is the sole
  * legitimate route from Platform to `onWebhookRelay`. */
 export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', [

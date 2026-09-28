@@ -7,9 +7,7 @@
  * READ-ONLY — mutations (purge-stale) live in `maintenance.ts` instead.
  * Dual-mode: HTTP (via AdminApiClient) or `--database-url` (direct DB).
  *
- * supersedes the original `cache list|show` framing: the real tables
- * the E2E call sites touch are execution_runs / execution_jobs, not
- * dedup_cache.
+ * The rows come from execution_runs / execution_jobs, not dedup_cache.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';

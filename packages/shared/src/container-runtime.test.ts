@@ -207,8 +207,8 @@ function runtimeDocker(
 
 describe('runtimeVolumeName', () => {
   it('keys the volume by image CONTENT, so a rebuild gets a fresh runtime', () => {
-    // A tag moves — :stg, :latest and every E2E tag are rebuilt in place — so
-    // keying by name would reuse a volume populated from the OLD image.
+    // A moving tag such as :latest is rebuilt in place, so keying by name
+    // would reuse a volume populated from the OLD image.
     const a = runtimeVolumeName('sha256:' + 'a'.repeat(64));
     const b = runtimeVolumeName('sha256:' + 'b'.repeat(64));
     expect(a).not.toBe(b);
@@ -261,7 +261,7 @@ describe('ensureRuntimeVolume', () => {
     // The agent image runs as `node`, and a fresh named volume is root-owned:
     // under rootful docker a non-root copy fails with a bare "exited 1".
     // Rootless podman maps the user and happens to work, which is why this only
-    // appeared on the docker executor.
+    // appears under rootful docker.
     expect((createContainer.mock.calls[0][0] as { User?: string }).User).toBe('0:0');
   });
 

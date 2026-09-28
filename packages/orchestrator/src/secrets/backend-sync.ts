@@ -9,6 +9,7 @@ import picomatch from 'picomatch';
 import { serializeError } from '@kici-dev/shared';
 import type { Logger } from '@kici-dev/shared';
 import type { BackendRegistry } from './backend-registry.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 /**
  * Filter scopes against a glob pattern (scopeFilter).
@@ -59,9 +60,9 @@ export class BackendSyncManager {
         };
       }
 
-      // Discover all leaf scopes. VaultSecretStore.listScopes now recurses
+      // Discover all leaf scopes. VaultSecretStore.listScopes recurses
       // into directories, so listScopes('') returns full paths like
-      // 'kiciStg00001/cloud/aws'. PG stores return flat scope names.
+      // 'acmeOrg00001/cloud/aws'. PG stores return flat scope names.
       const rawScopes = await store.listScopes('');
 
       // Apply scope filter
@@ -123,7 +124,9 @@ export class BackendSyncManager {
     this.stopPeriodicSync();
 
     // Start async to load backends, but don't block
-    void this.startPeriodicSyncAsync();
+    runDetached(this.logger, 'Secret backend periodic sync start', () =>
+      this.startPeriodicSyncAsync(),
+    );
   }
 
   private async startPeriodicSyncAsync(): Promise<void> {

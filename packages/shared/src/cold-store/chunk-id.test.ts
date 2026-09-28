@@ -5,7 +5,7 @@ describe('computeChunkId', () => {
   const BASE = {
     db: 'platform' as const,
     table: 'run_events',
-    tenantId: 'kiciStg00001',
+    tenantId: 'acmeOrg00001',
     partitionDate: '2026-04-24',
     minRowId: 1000,
     maxRowId: 2000,

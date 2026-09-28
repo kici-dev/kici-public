@@ -4,7 +4,7 @@
  * Browser-safe (zod only) so they live in the shared engine barrel. Each export
  * is a Zod *raw shape* (a plain object of Zod fields) so it can be passed
  * directly as an MCP tool `inputSchema`. The Platform-hosted developer MCP
- * server (packages/platform/src/mcp/server.ts) is the consumer.
+ * server is the consumer.
  */
 import { z } from 'zod';
 

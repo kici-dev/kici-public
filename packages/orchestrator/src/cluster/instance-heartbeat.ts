@@ -1,6 +1,7 @@
 import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'instance-heartbeat' });
 
@@ -89,7 +90,9 @@ export class InstanceHeartbeat {
   async start(): Promise<void> {
     await this.beat({ processStart: true });
     this.timer = setInterval(() => {
-      void this.beat();
+      runDetached(logger, 'Coordinator heartbeat', () => this.beat(), {
+        instanceId: this.instanceId,
+      });
     }, this.intervalMs);
     this.timer.unref?.();
     logger.info('Coordinator heartbeat started', {

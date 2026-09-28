@@ -2,7 +2,7 @@
  * Always-on startup banner for a routed `kici run --local` invocation. States
  * the selected plane, where the agent runs, the secret + identity source, the
  * control commands, and the flags that force a different behavior — so a
- * developer always knows which plane a run used and why (design §5).
+ * developer always knows which plane a run used and why.
  *
  * Three variants:
  * - `offline`  — independent plane, local secrets, dev-signed identity.

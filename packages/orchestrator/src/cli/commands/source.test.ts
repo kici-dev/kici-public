@@ -2,7 +2,7 @@
  * Tests for `kici-admin source` CLI subcommands.
  *
  * Coverage focus is the `list-presets` subcommand — the rest of the `source`
- * surface is exercised via the E2E tests (needs a live admin API).
+ * surface needs a live admin API and is out of scope here.
  */
 
 import { describe, expect, it, vi } from 'vitest';

@@ -9,9 +9,8 @@ import { planePaths, planePorts } from './paths.js';
 import { rotatePlaneLogIfOversized } from './plane-log.js';
 
 /**
- * Podman fallback Postgres image for the local dev plane. Pinned via
- * `TS_CONST_PINS` in hack/containers-lock.ts (identity
- * docker.io/library/postgres+alpine), so a lock bump rewrites it in place.
+ * Podman fallback Postgres image for the local dev plane. The repository's
+ * container-pin tooling rewrites this pin in place when the image is bumped.
  */
 export const PLANE_PG_IMAGE = 'docker.io/library/postgres:18.6-alpine';
 

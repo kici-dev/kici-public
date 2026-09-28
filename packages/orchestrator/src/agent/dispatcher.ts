@@ -582,9 +582,19 @@ export class Dispatcher {
       };
 
       this.trackJobForAgent(agent.agentId, jobId, queuedJob.runId);
+      let sent: boolean;
+      try {
+        sent = await this.deliver(agent.agentId, queuedJob);
+      } catch (err) {
+        // Not sent: free the agent and hand the failure to the caller, which
+        // owns the job after a throw. The row stays dispatched with no ack
+        // deadline, and the stale-dispatch scan settles it.
+        this.releaseTrackedClaim(agent.agentId, jobId);
+        throw err;
+      }
       // Arm the ack deadline only after the dispatch is actually sent, so the
       // deadline doesn't include the secret-merge / token-mint prep above.
-      if (await this.deliver(agent.agentId, queuedJob)) {
+      if (sent) {
         await this.armAckDeadline(agent.agentId, queuedJob);
         this.metrics.incJobsDispatched('dispatched');
       }
@@ -845,7 +855,17 @@ export class Dispatcher {
         pinnedAgentId: agentId,
       };
       this.trackJobForAgent(agentId, jobId, queuedJob.runId);
-      if (await this.deliver(agentId, queuedJob)) {
+      let sent: boolean;
+      try {
+        sent = await this.deliver(agentId, queuedJob);
+      } catch (err) {
+        // Not sent: free the agent and hand the failure to the caller, which
+        // owns the job after a throw. The row stays dispatched with no ack
+        // deadline, and the stale-dispatch scan settles it.
+        this.releaseTrackedClaim(agentId, jobId);
+        throw err;
+      }
+      if (sent) {
         await this.armAckDeadline(agentId, queuedJob);
         this.metrics.incJobsDispatched('dispatched');
       }
@@ -934,14 +954,7 @@ export class Dispatcher {
     }
     if (!job) return BoundClaimOutcome.NotClaimed;
 
-    await this.queue.markDispatched(job.id, agentId);
-    this.trackJobForAgent(agentId, job.id, job.runId);
-
-    const sent = await this.deliverInRequestContext(agentId, job);
-    if (sent) {
-      await this.armAckDeadline(agentId, job);
-      this.metrics.incJobsDispatched('dispatched');
-    }
+    const sent = await this.sendClaimedJob(agentId, job);
     await this.updateQueueDepthMetric();
 
     // fails-when: a claimed job that was refused or put back reads as sent, and counts as a placement
@@ -1144,15 +1157,7 @@ export class Dispatcher {
     }
     if (!job) return AgentDrainDecline.NoMatchingJob;
 
-    // Mark dispatched in DB
-    await this.queue.markDispatched(job.id, agentId);
-    this.trackJobForAgent(agentId, job.id, job.runId);
-
-    // Notify caller to send to agent -- restore request context for queue-drained jobs
-    if (await this.deliverInRequestContext(agentId, job)) {
-      await this.armAckDeadline(agentId, job);
-      this.metrics.incJobsDispatched('dispatched');
-    }
+    await this.sendClaimedJob(agentId, job);
     return null;
   }
 
@@ -1298,6 +1303,90 @@ export class Dispatcher {
     if (agentId === undefined) return;
     if (this.registry.get(agentId)) this.registry.decrementActiveJobs(agentId);
     this.untrackJob(agentId, jobId);
+  }
+
+  /**
+   * Release the slot and tracking `jobId` holds on `agentId`, if the job is
+   * still tracked there. Returns false when another path (a refusal, a
+   * put-back, a disconnect) already took it.
+   */
+  private releaseTrackedClaim(agentId: string, jobId: string): boolean {
+    if (this.jobToAgent.get(jobId) !== agentId) return false;
+    this.releaseClaimAccounting(agentId, jobId);
+    return true;
+  }
+
+  /**
+   * Hand a job this coordinator just claimed from the queue to `agentId`,
+   * whose slot the claim took. A query that fails before the job is sent
+   * returns the claim ({@link returnUndeliveredClaim}) and rethrows, so the
+   * agent is not left holding a slot for a job it never received.
+   *
+   * @returns whether the job was sent.
+   */
+  private async sendClaimedJob(agentId: string, job: QueuedJob): Promise<boolean> {
+    let tracked = false;
+    let sent: boolean;
+    try {
+      await this.queue.markDispatched(job.id, agentId);
+      this.trackJobForAgent(agentId, job.id, job.runId);
+      tracked = true;
+      // Restore the request context for a queue-drained job.
+      sent = await this.deliverInRequestContext(agentId, job);
+    } catch (err) {
+      await this.returnUndeliveredClaim(agentId, job, tracked, err);
+      throw err;
+    }
+    // The job reached the agent: a failure from here on keeps the claim.
+    if (sent) {
+      await this.armAckDeadline(agentId, job);
+      this.metrics.incJobsDispatched('dispatched');
+    }
+    return sent;
+  }
+
+  /**
+   * Put back a job a queue claim took but did not send: a query failed between
+   * the claim and the send. The agent's slot (and the job's tracking, once
+   * taken) is released so the agent takes work again, and the row returns to
+   * pending without spending a dispatch attempt, since no agent saw it. The
+   * next drain or the pending re-drive offers it again. A job a refusal or a
+   * disconnect already took is left to that path. If the put-back fails too,
+   * the row stays dispatched with no ack deadline and the stale-dispatch scan
+   * reaps it.
+   */
+  private async returnUndeliveredClaim(
+    agentId: string,
+    job: QueuedJob,
+    tracked: boolean,
+    cause: unknown,
+  ): Promise<void> {
+    if (tracked) {
+      if (!this.releaseTrackedClaim(agentId, job.id)) return;
+    } else if (this.registry.get(agentId)) {
+      this.registry.decrementActiveJobs(agentId);
+    }
+    const fields = { agentId, jobId: job.id, runId: job.runId, error: toErrorMessage(cause) };
+    try {
+      if ((await this.queue.requeue(job.id, { countAttempt: false })) !== null) {
+        logger.warn('Returned a claimed job to the queue after its dispatch failed', fields);
+      } else if (await this.queue.settleClaimOfStoppedRun(job.id, job.runId)) {
+        logger.warn('Settled the claimed job of a stopped run after its dispatch failed', fields);
+      } else {
+        // Another path (a disconnect, a cancel) already moved the row on.
+        logger.warn('Released a claimed job whose dispatch failed; its row had moved on', fields);
+      }
+    } catch (err) {
+      logger.error(
+        'Could not return a claimed job to the queue; the stale-dispatch scan reaps it',
+        {
+          agentId,
+          jobId: job.id,
+          runId: job.runId,
+          error: toErrorMessage(err),
+        },
+      );
+    }
   }
 
   /** Record that a job began executing on its agent. */

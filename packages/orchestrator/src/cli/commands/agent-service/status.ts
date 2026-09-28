@@ -1,9 +1,9 @@
 /**
  * `kici-admin agent status` command.
  *
- * Shows OS-level service status (state, PID, uptime) and queries
- * the running agent's health API for agent-specific info (labels,
- * orchestrator connection, current job).
+ * Shows OS-level service status (state, PID, uptime) and queries the
+ * running agent's `/health` endpoint for its ID, orchestrator connection,
+ * active job count, version, build fingerprint and uptime.
  *
  * Target resolution goes through resolveInstanceTarget — the same priority chain
  * every lifecycle command uses (--instance-dir > --name > CWD manifest >
@@ -20,63 +20,35 @@ import {
   type ServicePlatform,
   type ServiceStatus,
 } from '../../service/index.js';
-import { formatUptime } from '@kici-dev/shared';
-import fs from 'node:fs';
-import { toErrorMessage } from '@kici-dev/shared';
+import { AGENT_DEFAULT_PORT } from '@kici-dev/shared/env';
+import {
+  formatUptime,
+  toErrorMessage,
+  type AgentLivenessInfo,
+  type LivenessResponse,
+} from '@kici-dev/shared';
+import {
+  buildInfoRows,
+  fetchLocalJson,
+  formatHealthSection,
+  hideBuildCommit,
+  readEnvContent,
+  readLocalEndpoint,
+  type StatusRow,
+} from '../service-health.js';
 
-/** Agent health response shape. */
-interface AgentHealthData {
-  status?: string;
-  labels?: string[];
-  orchestratorConnection?: string;
-  currentJob?: { id?: string; workflow?: string; startedAt?: string } | null;
-  uptime?: number;
-}
+/** Column the values of the agent section start at. */
+const VALUE_COLUMN = 14;
 
-/** Read the port from the agent's env file (path from the manifest). */
-function readPortFromEnvFile(envFilePath: string): number {
-  if (!fs.existsSync(envFilePath)) return 4001;
-
-  try {
-    const content = fs.readFileSync(envFilePath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('#') || !trimmed.includes('=')) continue;
-      const [key, ...rest] = trimmed.split('=');
-      if (key?.trim() === 'KICI_AGENT_PORT' || key?.trim() === 'KICI_PORT') {
-        const val = rest
-          .join('=')
-          .trim()
-          .replace(/^["']|["']$/g, '');
-        const parsed = parseInt(val, 10);
-        if (!isNaN(parsed)) return parsed;
-      }
-    }
-  } catch {
-    // Ignore
-  }
-  return 4001;
-}
-
-/** Query agent health API. */
-async function queryHealth(port: number): Promise<AgentHealthData | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    const res = await fetch(`http://localhost:${port}/health`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!res.ok) return null;
-    return (await res.json()) as AgentHealthData;
-  } catch {
-    return null;
-  }
-}
+/**
+ * A `/health` body. Every field is optional: an agent older than this CLI may
+ * report fewer of them.
+ */
+type AgentHealth = Partial<LivenessResponse<AgentLivenessInfo>>;
 
 function formatStatus(
   serviceStatus: ServiceStatus,
-  health: AgentHealthData | null,
+  health: AgentHealth | null,
   serviceName: string,
 ): string {
   const lines: string[] = [];
@@ -94,23 +66,16 @@ function formatStatus(
   }
 
   if (health) {
-    lines.push('');
-    lines.push('--- KiCI agent ---');
-    if (health.labels && health.labels.length > 0) {
-      lines.push(`Labels:       ${health.labels.join(', ')}`);
-    } else {
-      lines.push('Labels:       (none - accepts all jobs)');
+    const rows: StatusRow[] = [];
+    if (health.agentId) rows.push(['Agent ID', health.agentId]);
+    if (typeof health.connected === 'boolean') {
+      rows.push(['Orchestrator', health.connected ? 'connected' : 'disconnected']);
     }
-    if (health.orchestratorConnection) {
-      lines.push(`Orchestrator: ${health.orchestratorConnection}`);
+    if (typeof health.activeJobs === 'number') {
+      rows.push(['Active jobs', String(health.activeJobs)]);
     }
-    if (health.currentJob) {
-      lines.push(
-        `Current job:  ${health.currentJob.id ?? 'unknown'} (${health.currentJob.workflow ?? ''})`,
-      );
-    } else {
-      lines.push('Current job:  idle');
-    }
+    rows.push(...buildInfoRows(health));
+    lines.push(...formatHealthSection('--- KiCI agent ---', rows, VALUE_COLUMN));
   } else if (serviceStatus.state === 'running') {
     lines.push('');
     lines.push('(Could not reach agent health API)');
@@ -121,13 +86,13 @@ function formatStatus(
 
 function buildJsonOutput(
   serviceStatus: ServiceStatus,
-  health: AgentHealthData | null,
+  health: AgentHealth | null,
   serviceName: string,
 ): Record<string, unknown> {
   return {
     service: serviceName,
     ...serviceStatus,
-    health: health ?? undefined,
+    health: health ? hideBuildCommit(health) : undefined,
   };
 }
 
@@ -181,10 +146,13 @@ export function registerAgentStatusCommand(parent: Command): void {
 
         const serviceStatus = await manager.status(config);
 
-        let health: AgentHealthData | null = null;
+        let health: AgentHealth | null = null;
         if (serviceStatus.state === 'running') {
-          const port = readPortFromEnvFile(config.envFilePath);
-          health = await queryHealth(port);
+          const endpoint = readLocalEndpoint(
+            readEnvContent(config.envFilePath),
+            AGENT_DEFAULT_PORT,
+          );
+          health = await fetchLocalJson<AgentHealth>(endpoint, '/health');
         }
 
         if (opts.json) {

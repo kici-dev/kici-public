@@ -23,10 +23,11 @@ companion at [Operator troubleshooting](../operator/troubleshooting.md).
 
 ## No jobs dispatched
 
-**Symptom.** A trigger matched a workflow, but the run ends immediately with
-`No jobs dispatched (all matched workflows had no static jobs or dispatch was
-rejected)`, or a job sits queued and the dashboard shows `No matching agent
-available`.
+**Symptom.** A trigger matched a workflow, but a `kici run` invocation ends
+immediately with `No jobs dispatched (all matched workflows had no static jobs or
+dispatch was rejected)`. Or a job sits queued, and the run page in the dashboard
+warns that the job is `waiting with no matching agent`, under the labels that no
+agent in the fleet matches.
 
 **Cause.** A job's `runsOn` label set matches **no agent** the orchestrator's
 scaler can provide. The orchestrator evaluates the lock file, finds the matching
@@ -66,9 +67,9 @@ kici.lock.json ...`
   compatibility window: `Lock file schema vX predates the oldest supported
 version vY — recompile with a current SDK ('kici compile') and push again.`
 - a schema-version message for a lock **newer** than the window, naming the
-  orchestrator version it needs: `Lock file requires orchestrator schema vX or
-newer but this orchestrator understands up to vY — upgrade the orchestrator to a
-newer version.`
+  orchestrator version it needs: `Lock file requires orchestrator schema >= vX
+but this orchestrator understands <= vY — upgrade the orchestrator to a newer
+version.`
 - a "stale or compiled by an older engine — recompile with `kici compile`"
   message about an invalid label matcher.
 

@@ -12,7 +12,7 @@ import type {
   ClusterSettingsReader,
 } from '../cluster/cluster-settings-reader.js';
 
-const ORG = 'kiciStg00001';
+const ORG = 'acmeOrg00001';
 const ACTOR = { type: 'user', sub: 'u1' } as const;
 
 /** A ClusterSettingsReader stand-in that returns a fixed read outcome. */
@@ -211,9 +211,9 @@ describe('DashboardGlobalWorkflowsHandler', () => {
 
     it('setOrgId updates the customer_id used for queries', async () => {
       const { handler, mocks } = makeHandler({ row: undefined });
-      handler.setOrgId('kiciStg99999');
+      handler.setOrgId('acmeOrg99999');
       await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r' });
-      expect(mocks.selectWhere).toHaveBeenCalledWith('customer_id', '=', 'kiciStg99999');
+      expect(mocks.selectWhere).toHaveBeenCalledWith('customer_id', '=', 'acmeOrg99999');
     });
   });
 
@@ -292,7 +292,7 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         customer_id: ORG,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [
-          { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/blocked-*' },
+          { routingKey: 'generic:acmeOrg00001:src-b', pattern: 'myorg/blocked-*' },
         ],
         created_at: new Date(),
         updated_at: new Date(),
@@ -300,7 +300,7 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       const projected = rowToSettings(ORG, row, true);
       expect(projected.enabled).toBe(true);
       expect(projected.deniedRepos).toEqual([
-        { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/blocked-*' },
+        { routingKey: 'generic:acmeOrg00001:src-b', pattern: 'myorg/blocked-*' },
       ]);
       expect(projected.allowedRepos).toBeNull();
     });

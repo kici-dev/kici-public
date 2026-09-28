@@ -46,10 +46,10 @@ The full walkthrough, including the provisioning and teardown workflows, is in
 
 ## The token never travels
 
-GitHub logs `workflow_dispatch` inputs. So the dispatch carries only a **claim code** —
-single-use, short-lived, and worthless once redeemed. The agent exchanges it for its own
-short-lived token over the WebSocket it has to open anyway. Never put an agent token in a
-dispatch input.
+GitHub treats `workflow_dispatch` inputs as ordinary event data, not secrets. So the
+dispatch carries only a **claim code** — single-use, short-lived, and worthless once
+redeemed. The agent exchanges it for its own short-lived token over the WebSocket it has
+to open anyway. Never put an agent token in a dispatch input.
 
 ## Installing the agent
 

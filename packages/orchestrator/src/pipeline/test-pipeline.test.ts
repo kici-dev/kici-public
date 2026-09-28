@@ -797,7 +797,7 @@ describe('processTestTrigger', () => {
       expect(jobConfig.fullRepo).toBe(true);
     });
 
-    it('sets repoUrl to empty string for fullRepo (pitfall 2)', async () => {
+    it('sets repoUrl to empty string for fullRepo', async () => {
       const lockFile = createMockLockFile([createMockWorkflow('ci')]);
       const input = createMockInput({
         inlineLockFile: JSON.stringify(lockFile),

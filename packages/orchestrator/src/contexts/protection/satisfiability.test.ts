@@ -53,8 +53,8 @@ describe('checkBindingSatisfiable', () => {
   });
 
   it('treats a single bound missing context as satisfiable', () => {
-    // The exact E2E shape: a job binds one static env the orchestrator never
-    // seeded → no record → lenient (the dispatch gate handles it at run time).
+    // A job binds one static env the orchestrator never seeded → no record →
+    // lenient (the dispatch gate handles it at run time).
     const r = checkBindingSatisfiable('deploy', [undefined], ['production']);
     expect(r).toBeNull();
   });

@@ -2919,7 +2919,7 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
   });
 
   it('gates every child of a dynamic matrix against the context concurrency limit', async () => {
-    // The wish's defect: `dispatchResolvedDynamicMatrix` expands AFTER the gate
+    // The defect: `dispatchResolvedDynamicMatrix` expands AFTER the gate
     // ran once for the un-expanded placeholder, and each child inherited the
     // base job's already-decided data via `{ ...baseEnvData }` without being
     // gated again — so all N combinations dispatched against one checked slot.
@@ -6018,9 +6018,10 @@ describe('resolveGeneratedJobConfigs gitCredentials', () => {
 describe('dispatchMatchedWorkflow — a routed job carries the test-run provenance', () => {
   // The coordinator persists a routed job through the BASE dispatcher (on this
   // instance or a peer), so the dispatcher wrapper's extraJobConfig merge never
-  // runs for it. On the staging fleet every relayed `kici run remote` took this
-  // path and reached the agent with no fullRepo / tarballUrl / isTestRun: the
-  // agent cloned an empty repoUrl instead of unpacking the overlay.
+  // runs for it. Wherever a coordinator routes jobs, every relayed `kici run
+  // remote` takes this path; without the bake it reaches the agent with no
+  // fullRepo / tarballUrl / isTestRun, and the agent clones an empty repoUrl
+  // instead of unpacking the overlay.
   it('bakes ctx.extraJobConfig into the JobToRoute jobConfig', async () => {
     const routeJobs = vi.fn().mockResolvedValue({
       localJobs: [{ jobName: 'build', jobId: 'routed-1' }],

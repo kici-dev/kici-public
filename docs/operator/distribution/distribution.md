@@ -3,11 +3,9 @@ title: Distribution
 description: How KiCI packages are distributed and deployed
 ---
 
-KiCI distributes via three channels: **npm packages**, **OCI container images**, and **Firecracker rootfs**. This guide covers what each channel provides, when to use it, and how to obtain artifacts.
+KiCI distributes through these channels: **npm packages**, **OCI container images**, **standalone packages** and **Firecracker rootfs**. This guide covers what each channel provides, when to use it, and how to obtain artifacts.
 
 > **Note:** The Platform relay tier is internal-only -- it is not distributed to customers. Customers connect to the hosted Platform or use independent orchestrator mode.
-
-> **Note:** KiCI also offers standalone packages with an embedded Node.js binary for deployments where npm is not available. See the [Packaging guide](sea-binaries.md) for details on full and light package types.
 
 ---
 
@@ -93,21 +91,30 @@ The agent container image is self-contained -- it includes all required runtime 
 
 ### Multi-architecture support
 
-Images are built natively for **amd64** and **arm64** platforms. No QEMU emulation is used -- each architecture is built on its native hardware.
+Each published image is a multi-arch manifest list for **amd64** and **arm64**. The same reference pulls the correct image on either architecture.
+
+See [Multi-architecture images](multi-arch-builds.md) for mixed-architecture clusters and for Firecracker on ARM64.
+
+### Base image provenance
+
+Each published image carries a build provenance attestation. The attestation names each base image by its public `dhi.io` reference and its digest. To read it:
 
 ```bash
-# Build on the current architecture
-scripts/build-multi-arch.sh agent <tag>
-
-# Create a multi-arch manifest after building on both architectures
-scripts/build-multi-arch.sh agent <tag> --manifest-only
+docker buildx imagetools inspect quay.io/kici-dev/kici-orchestrator:<version> \
+  --format '{{json .Provenance}}'
 ```
 
-See [Multi-architecture builds](multi-arch-builds.md) for the full workflow including cross-machine image transfer and manifest creation.
+Each platform lists its base images under `resolvedDependencies`, in the form `pkg:docker/dhi.io/node@<tag>?digest=sha256:<digest>&platform=linux%2F<arch>`. A pull of `dhi.io/node@sha256:<digest>` gives the same base image.
 
 ### Building images
 
-Build from the monorepo root:
+The Dockerfiles use Docker Hardened Images from `dhi.io` as their base images. `dhi.io` refuses anonymous pulls, so sign in with a Docker account (a free account is sufficient) before you build:
+
+```bash
+podman login dhi.io
+```
+
+Build from the repository root:
 
 ```bash
 # Agent image
@@ -116,6 +123,8 @@ podman build -t kici-agent:<version> -f packages/agent/Dockerfile .
 # Orchestrator image
 podman build -t kici-orchestrator:<version> -f packages/orchestrator/Dockerfile .
 ```
+
+The `.dockerignore` file at the repository root keeps local `node_modules`, `dist`, `.env` and key files out of the build context, so a checkout where you ran `pnpm install` does not copy them into the image.
 
 Both Dockerfiles use multi-stage builds: a builder stage with full dev dependencies produces the compiled output, and a slim runtime stage contains only production dependencies.
 
@@ -128,6 +137,14 @@ The container registry is configurable -- images are built locally and can be pu
 podman tag kici-agent:latest registry.example.com/kici-agent:latest
 podman push registry.example.com/kici-agent:latest
 ```
+
+---
+
+## Standalone packages
+
+Every release attaches standalone packages of the orchestrator, `kici-admin` and the agent to its [GitHub release](https://github.com/kici-dev/kici-public/releases), for Linux, macOS and Windows on x64 and arm64. A full package includes Node.js and npm, so the host needs neither. A light package runs on a Node.js runtime in a local cache. A `SHA256SUMS` file on each release lets you verify every package.
+
+See the [KiCI packaging guide](sea-binaries.md) to download, verify and run them.
 
 ---
 
@@ -325,7 +342,7 @@ Every agent deployment requires the following runtime dependencies, regardless o
 | **npm**                                      | `.kici/` dependency installation                                                                 | Ships with Node.js                                                                                                         |
 | **TypeScript loader binding**                | TS transform on `import()` (native NAPI bindings, consumed by `@kici-dev/shared/ts-loader-hook`) | Must be in `node_modules`, not lazy-downloaded                                                                             |
 
-The container image and Firecracker rootfs include all required dependencies. For bare-metal deployment, the operator must ensure these are available on the host.
+The container image and Firecracker rootfs include all required dependencies. A full standalone `kici-agent` package includes node, npm and the TypeScript loader binding, so the host provides git and the shell. For any other bare-metal deployment, the operator must ensure these are available on the host.
 
 npm is the only package manager used -- pnpm is not bundled. npm ships with Node.js and the agent resolves `npm-cli.js` from the Node installation directory.
 
@@ -342,12 +359,12 @@ These are not bundled in any deployment format -- they are host-level tools the 
 
 ## Choosing a deployment model
 
-| Scenario                         | Orchestrator               | Agent                      |
-| -------------------------------- | -------------------------- | -------------------------- |
-| **Quick start (single machine)** | Container image            | Container image            |
-| **Production Linux server**      | npm + systemd              | Container or bare-metal    |
-| **macOS CI runner**              | npm + launchd              | Bare-metal (npm)           |
-| **Windows CI runner**            | npm + Windows service      | Bare-metal (npm)           |
-| **Kubernetes cluster**           | Container image            | Container image            |
-| **High-security isolation**      | Container or systemd       | Firecracker rootfs         |
-| **Multi-architecture**           | Container image (per-arch) | Container image (per-arch) |
+| Scenario                         | Orchestrator                 | Agent                        |
+| -------------------------------- | ---------------------------- | ---------------------------- |
+| **Quick start (single machine)** | Container image              | Container image              |
+| **Production Linux server**      | npm + systemd                | Container or bare-metal      |
+| **macOS CI runner**              | npm + launchd                | Bare-metal (npm)             |
+| **Windows CI runner**            | npm + Windows service        | Bare-metal (npm)             |
+| **Kubernetes cluster**           | Container image              | Container image              |
+| **High-security isolation**      | Container or systemd         | Firecracker rootfs           |
+| **Multi-architecture**           | Container image (multi-arch) | Container image (multi-arch) |

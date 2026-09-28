@@ -82,7 +82,7 @@ export class RegistrationIndex {
 
   /**
    * Quinary index: registrations keyed by `${customerId}|${repoIdentifier}`.
-   * Drives the cross-source repo lookup (phase 28.5): when a generic webhook
+   * Drives the cross-source repo lookup: when a generic webhook
    * carries a repository identifier in its payload, the dispatcher looks up
    * registrations for that (org, repo) pair across ALL routing keys and uses
    * each registration's stored `providerContext` + `routingKey` to reach the
@@ -177,7 +177,7 @@ export class RegistrationIndex {
       // registration that has a concrete repo (skip repo patterns — those are
       // global workflows without a fixed repo). Drives cross-source dispatch
       // for git-trigger workflows (push, pr, tag, …) when a generic webhook
-      // carries the repo identifier in its payload — phase 28.5.
+      // carries the repo identifier in its payload.
       if (registered.repoIdentifier) {
         const repoKey = `${registered.customerId}|${registered.repoIdentifier}`;
         const repoList = byOrgAndRepo.get(repoKey);

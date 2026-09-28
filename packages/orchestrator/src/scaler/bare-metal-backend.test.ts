@@ -42,8 +42,16 @@ vi.mock('node:child_process', () => ({
   ),
 }));
 
+// Count logger construction: with KICI_LOG_DIR set, every createLogger() call
+// opens a log file stream of its own.
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return { ...actual, createLogger: vi.fn(actual.createLogger) };
+});
+
 // Import after mocking
 const { BareMetalScalerBackend } = await import('./bare-metal-backend.js');
+const { createLogger } = await import('@kici-dev/shared');
 const childProcessModule = await import('node:child_process');
 
 const defaultLabelSets: LabelSetConfig[] = [
@@ -413,6 +421,27 @@ describe('BareMetalScalerBackend', () => {
       // The orchestrator's OWN control-plane secrets are still scrubbed.
       expect(env).not.toHaveProperty('KICI_SECRET_KEY');
       expect(env).not.toHaveProperty('KICI_BOOTSTRAP_ADMIN_TOKEN');
+    });
+
+    // fails-when: a spawn builds a logger of its own, which with KICI_LOG_DIR
+    // set opens a log file stream that nothing closes, one per agent.
+    it('logs a trusted-env spawn without creating a logger per spawn', async () => {
+      const backend = createBackend({
+        labelSets: [
+          {
+            labels: ['default', 'self-hosted'],
+            binaryPath: '/opt/kici/kici-agent',
+            env: { KICI_TRUSTED_ENV: 'true', KICI_SANDBOX: 'false' },
+          },
+        ],
+      });
+      const loggersBefore = vi.mocked(createLogger).mock.calls.length;
+      await backend.spawn(['default', 'self-hosted'], 'trusted-agent-1', 'ws://orch:8080');
+      // Control: the spawn took the trusted-env branch that logs its decision.
+      expect(getSpawnEnv().KICI_TRUSTED_ENV).toBe('true');
+      mockChildProcess = createMockChildProcess(12346);
+      await backend.spawn(['default', 'self-hosted'], 'trusted-agent-2', 'ws://orch:8080');
+      expect(vi.mocked(createLogger).mock.calls.length).toBe(loggersBefore);
     });
 
     it('default (non-trusted) label set does NOT forward ambient host env (byte-identical to today)', async () => {

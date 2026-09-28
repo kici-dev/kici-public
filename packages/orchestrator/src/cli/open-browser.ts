@@ -8,7 +8,7 @@ import { platform } from 'node:os';
  * blocked launcher) just falls back to copy-paste.
  *
  * `KICI_BROWSER_CMD` overrides the launcher: `none` suppresses it entirely
- * (E2E / headless capture), any other value is run with `{url}` substituted —
+ * (automated tests / headless capture), any other value is run with `{url}` substituted —
  * mirroring the `kici login` convention.
  */
 export function openBrowserBestEffort(url: string): void {

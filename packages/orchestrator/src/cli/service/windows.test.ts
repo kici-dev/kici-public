@@ -5,14 +5,18 @@
  * lifecycle commands via shawl + sc.exe without requiring Windows.
  */
 
+import path from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ServiceConfig } from './types.js';
 import { DEFAULT_RESTART_POLICY } from './types.js';
+import { restrictDirArgs } from './windows-acl.js';
 
 // Mock child_process
 const mockExecSync = vi.fn();
+const mockExecFileSync = vi.fn();
 vi.mock('node:child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
+  execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
 
 // Mock fs
@@ -74,6 +78,7 @@ const testConfig: ServiceConfig = {
 describe('WindowsServiceManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockExecFileSync.mockReset();
     mockExistsSync.mockReturnValue(false);
     // Fresh-box default: no pre-existing service, so `sc.exe query` throws
     // (exit non-zero). This makes install()'s serviceExists() guard return
@@ -109,14 +114,6 @@ describe('WindowsServiceManager', () => {
     });
 
     it('runs shawl add with correct arguments', async () => {
-      // Mock env file as existing so --env KEY=value pairs are included
-      mockExistsSync.mockReturnValue(true);
-      const mockReadFileSync = vi
-        .fn()
-        .mockReturnValue('DATABASE_URL=postgres://localhost\nPORT=8080\n');
-      const fs = await import('node:fs');
-      vi.spyOn(fs.default, 'readFileSync').mockImplementation(mockReadFileSync as never);
-
       const { WindowsServiceManager } = await import('./windows.js');
       const mgr = new WindowsServiceManager();
       await mgr.install(testConfig);
@@ -135,6 +132,182 @@ describe('WindowsServiceManager', () => {
       expect(cmd).toContain('--env');
     });
 
+    /** Serve `files` through existsSync and readFileSync; every other path is absent. */
+    async function serveFiles(files: Record<string, string>): Promise<void> {
+      mockExistsSync.mockImplementation(((p: unknown) => String(p) in files) as never);
+      const fs = await import('node:fs');
+      vi.spyOn(fs.default, 'readFileSync').mockImplementation(((p: unknown, enc?: unknown) => {
+        const content = files[String(p)];
+        if (content === undefined) {
+          throw Object.assign(new Error(`ENOENT: ${String(p)}`), { code: 'ENOENT' });
+        }
+        return enc ? content : Buffer.from(content);
+      }) as never);
+    }
+
+    // fails-when: any env-file value reaches the shawl command line, which any
+    // local account reads back with `sc.exe qc`.
+    it('registers the env file path and none of its values', async () => {
+      const SENTINEL = 'sentinel-secret-5d1e0b';
+      await serveFiles({
+        [testConfig.envFilePath]:
+          `KICI_SECRET_KEY=${SENTINEL}\nKICI_DATABASE_URL=postgres://u:${SENTINEL}@db/k\n` +
+          `PATH=C:\\${SENTINEL}\n`,
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      await new WindowsServiceManager().install(testConfig);
+
+      const cmd = shawlAddCommand();
+      // Positive control: the registration does carry an environment, the pointer.
+      expect(cmd).toContain(`--env "KICI_ENV_FILE=${testConfig.envFilePath}"`);
+      expect(cmd).not.toContain(SENTINEL);
+      expect(cmd).not.toContain('--path-prepend');
+      for (const call of [...mockExecSync.mock.calls, ...mockExecFileSync.mock.calls]) {
+        expect(JSON.stringify(call)).not.toContain(SENTINEL);
+      }
+    });
+
+    /** The icacls in the Windows system folder, never one found on the current folder. */
+    const ICACLS = expect.stringMatching(/\\System32\\icacls\.exe$/);
+
+    it('restricts the env file folder before it creates the log folder and registers the service', async () => {
+      const { WindowsServiceManager } = await import('./windows.js');
+      await new WindowsServiceManager().install(testConfig);
+
+      const dir = path.win32.dirname(testConfig.envFilePath);
+      expect(mockExecFileSync.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+        restrictDirArgs(dir),
+      ]);
+      expect(mockExecFileSync).toHaveBeenCalledWith(ICACLS, expect.any(Array), expect.anything());
+      const aclOrder = mockExecFileSync.mock.invocationCallOrder[0]!;
+      const shawlIndex = mockExecSync.mock.calls.findIndex((c: unknown[]) =>
+        String(c[0]).includes('shawl.exe" add'),
+      );
+      expect(aclOrder).toBeLessThan(mockExecSync.mock.invocationCallOrder[shawlIndex]!);
+      const logMkdirIndex = mockMkdirSync.mock.calls.findIndex((c: unknown[]) =>
+        String(c[0]).endsWith('logs'),
+      );
+      expect(aclOrder).toBeLessThan(mockMkdirSync.mock.invocationCallOrder[logMkdirIndex]!);
+    });
+
+    // fails-when: the folder is restricted after the old service is removed, so
+    // an icacls failure during an upgrade leaves the host with no service.
+    it('leaves the installed service in place when the folder cannot be restricted', async () => {
+      mockExecSync.mockImplementation(() => Buffer.from('')); // the service exists
+      mockExecFileSync.mockImplementation(() => {
+        throw new Error('Access is denied.');
+      });
+      const { WindowsServiceManager } = await import('./windows.js');
+
+      await expect(new WindowsServiceManager().install(testConfig)).rejects.toThrow(
+        /could not restrict access to C:\\ProgramData\\kici: Access is denied/,
+      );
+      const calls = mockExecSync.mock.calls.map((c: unknown[]) => String(c[0]));
+      expect(calls.some((c) => c.includes('sc.exe stop') || c.includes('sc.exe delete'))).toBe(
+        false,
+      );
+      expect(calls.some((c) => c.includes('shawl'))).toBe(false);
+    });
+
+    // breaks-if-wrong: a user-level folder in the profile of its user is
+    // already private, and restricting it would lock that user out.
+    it('leaves the ACL of a user-level folder alone', async () => {
+      const { WindowsServiceManager } = await import('./windows.js');
+      await new WindowsServiceManager().install({ ...testConfig, isUserLevel: true });
+
+      expect(mockExecFileSync).not.toHaveBeenCalled();
+      expect(shawlAddCommand()).toContain('--env "KICI_ENV_FILE=');
+    });
+
+    describe('a KiCI package launcher', () => {
+      const PKG = 'C:\\Program Files\\KiCI\\kici-orchestrator\\orchestrator-0.11.0';
+      const LAUNCHER = `${PKG}\\kici-orchestrator-standalone.cmd`;
+      const BUNDLE = `${PKG}\\lib\\kici-orchestrator-standalone.cjs`;
+
+      // fails-when: a release that cannot read KICI_ENV_FILE is registered, with
+      // the pointer (the service starts without its configuration) or with the
+      // values on its command line (any local account reads them).
+      it('refuses a release that predates KICI_ENV_FILE before it changes anything', async () => {
+        mockExecSync.mockImplementation(() => Buffer.from('')); // the service exists
+        await serveFiles({
+          [BUNDLE]: 'require("node:fs"); // a bundle with no env-file loader',
+          [testConfig.envFilePath]: 'KICI_PORT=10043\n',
+        });
+
+        const { WindowsServiceManager } = await import('./windows.js');
+        await expect(
+          new WindowsServiceManager().install({ ...testConfig, executablePath: LAUNCHER }),
+        ).rejects.toThrow(`cannot register ${testConfig.name}: ${LAUNCHER} predates KICI_ENV_FILE`);
+
+        // The installed service, its folder and its ACL are left as they were.
+        expect(mockExecSync).not.toHaveBeenCalled();
+        expect(mockExecFileSync).not.toHaveBeenCalled();
+        expect(mockMkdirSync).not.toHaveBeenCalled();
+      });
+
+      // fails-when: the npm entry of a release from before KICI_ENV_FILE is
+      // registered, which an npm-source downgrade would otherwise do.
+      it('refuses an npm entry that predates KICI_ENV_FILE', async () => {
+        const ENTRY =
+          'C:\\npm\\node_modules\\kici-admin\\node_modules\\@kici-dev\\agent\\dist\\server.js';
+        await serveFiles({ [ENTRY]: 'import "./app.js"; // no env-file loader' });
+
+        const { WindowsServiceManager } = await import('./windows.js');
+        await expect(
+          new WindowsServiceManager().install({
+            ...testConfig,
+            executablePath: 'C:\\Program Files\\nodejs\\node.exe',
+            args: [ENTRY],
+          }),
+        ).rejects.toThrow(`${ENTRY} predates KICI_ENV_FILE`);
+        expect(mockExecSync).not.toHaveBeenCalled();
+      });
+
+      // breaks-if-wrong: the npm entry of every release that reads
+      // KICI_ENV_FILE is registered with the pointer.
+      it('registers the pointer for an npm entry that imports the env-file loader', async () => {
+        const ENTRY =
+          'C:\\npm\\node_modules\\kici-admin\\node_modules\\@kici-dev\\agent\\dist\\server.js';
+        await serveFiles({ [ENTRY]: 'import "@kici-dev/shared/load-service-env-file";' });
+
+        const { WindowsServiceManager } = await import('./windows.js');
+        await new WindowsServiceManager().install({
+          ...testConfig,
+          executablePath: 'C:\\Program Files\\nodejs\\node.exe',
+          args: [ENTRY],
+        });
+
+        expect(shawlAddCommand()).toContain(`--env "KICI_ENV_FILE=${testConfig.envFilePath}"`);
+      });
+
+      // breaks-if-wrong: the launcher of every release that reads KICI_ENV_FILE
+      // keeps its values off the command line.
+      it('registers the pointer for a release whose bundle reads KICI_ENV_FILE', async () => {
+        await serveFiles({
+          [BUNDLE]: 'const SERVICE_ENV_FILE_VAR = "KICI_ENV_FILE";',
+          [testConfig.envFilePath]: 'KICI_PORT=10043\n',
+        });
+
+        const { WindowsServiceManager } = await import('./windows.js');
+        await new WindowsServiceManager().install({ ...testConfig, executablePath: LAUNCHER });
+
+        const cmd = shawlAddCommand();
+        expect(cmd).toContain(`--env "KICI_ENV_FILE=${testConfig.envFilePath}"`);
+        expect(cmd).not.toContain('KICI_PORT');
+      });
+
+      it('registers the pointer for a batch file with no KiCI bundle beside it', async () => {
+        await serveFiles({ [testConfig.envFilePath]: 'KICI_PORT=10043\n' });
+
+        const { WindowsServiceManager } = await import('./windows.js');
+        await new WindowsServiceManager().install({ ...testConfig, executablePath: LAUNCHER });
+
+        expect(shawlAddCommand()).toContain('--env "KICI_ENV_FILE=');
+        expect(shawlAddCommand()).not.toContain('KICI_PORT');
+      });
+    });
+
     it('appends args after the executable in the shawl command', async () => {
       const { WindowsServiceManager } = await import('./windows.js');
       const mgr = new WindowsServiceManager();
@@ -149,6 +322,126 @@ describe('WindowsServiceManager', () => {
       );
       const cmd = shawlCall![0] as string;
       expect(cmd).toContain('-- "C:\\Program Files\\nodejs\\node.exe" "C:\\kici\\dist\\server.js"');
+    });
+
+    /** The `shawl add` command line install() ran. */
+    function shawlAddCommand(): string {
+      const call = mockExecSync.mock.calls.find(
+        (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('shawl.exe" add'),
+      );
+      expect(call).toBeDefined();
+      return call![0] as string;
+    }
+
+    it("gives the process the component's shutdown grace before shawl kills it", async () => {
+      // fails-when: no --stop-timeout, so shawl kills the process 3000 ms after
+      // the ctrl-C, partway through the orchestrator's graceful shutdown.
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+
+      await mgr.install({ ...testConfig, component: 'orchestrator' });
+      expect(shawlAddCommand()).toContain(' --stop-timeout 45000 ');
+
+      mockExecSync.mockClear();
+      await mgr.install({ ...testConfig, name: 'kici-agent', component: 'agent' });
+      expect(shawlAddCommand()).toContain(' --stop-timeout 20000 ');
+    });
+
+    it('runs a batch-file launcher through cmd.exe with stdin from NUL', async () => {
+      // fails-when: shawl runs the .cmd directly. The ctrl-C leaves cmd.exe
+      // waiting on "Terminate batch job (Y/N)?" after node exits, so every stop
+      // lasts the whole --stop-timeout and ends with shawl killing cmd.exe.
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await mgr.install({
+        ...testConfig,
+        executablePath: 'C:\\Program Files\\KiCI\\orch\\kici-orchestrator-standalone.cmd',
+      });
+
+      expect(shawlAddCommand()).toMatch(
+        /-- "C:\\Windows\\System32\\cmd\.exe" "\/d" "\/e:on" "\/v:off" "\/c" "call" "C:\\Program Files\\KiCI\\orch\\kici-orchestrator-standalone\.cmd" "<NUL"$/,
+      );
+    });
+
+    it('recognises a batch file by its extension in any case', async () => {
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await mgr.install({ ...testConfig, executablePath: 'C:\\kici\\run.BAT' });
+
+      expect(shawlAddCommand()).toContain('"call" "C:\\kici\\run.BAT" "<NUL"');
+    });
+
+    it('runs any other executable directly', async () => {
+      // breaks-if-wrong: node.exe (the install default) is wrapped in cmd.exe too.
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await mgr.install({
+        ...testConfig,
+        executablePath: 'C:\\node\\node.exe',
+        args: ['C:\\kici\\dist\\server.js'],
+      });
+
+      const cmd = shawlAddCommand();
+      expect(cmd).toMatch(/-- "C:\\node\\node\.exe" "C:\\kici\\dist\\server\.js"$/);
+      expect(cmd).not.toContain('cmd.exe');
+    });
+
+    it('refuses a batch-file path cmd.exe would re-read, before it touches the installed service', async () => {
+      // fails-when: the path reaches cmd.exe, which splits it at the `&`, the `(`
+      // or a `,` `;` `=` delimiter (the service then crash-loops) or expands the `%`.
+      // A service of this name is installed: the refusal must leave it in place.
+      mockExecSync.mockImplementation(() => Buffer.from(''));
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+
+      for (const executablePath of [
+        'C:\\a&b\\kici.cmd',
+        'C:\\100%\\kici.cmd',
+        'C:\\x^y\\k.cmd',
+        'C:\\tools(1)\\k.cmd',
+        'C:\\ci,prod\\k.cmd',
+        'C:\\a;b\\k.cmd',
+        'C:\\a=b\\k.cmd',
+      ]) {
+        await expect(mgr.install({ ...testConfig, executablePath })).rejects.toThrow(/cmd\.exe/);
+      }
+      expect(mockExecSync).not.toHaveBeenCalled();
+      expect(mockExecFileSync).not.toHaveBeenCalled();
+    });
+
+    it('runs the cmd.exe that COMSPEC names, and no other shell', async () => {
+      // breaks-if-wrong: a COMSPEC naming another shell gets cmd.exe's wrapper
+      // arguments, and readLaunchSpec no longer recognises the wrapper.
+      const saved = process.env.COMSPEC;
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      try {
+        process.env.COMSPEC = 'D:\\WINNT\\system32\\cmd.exe';
+        await mgr.install({ ...testConfig, executablePath: 'C:\\kici\\run.cmd' });
+        expect(shawlAddCommand()).toContain('-- "D:\\WINNT\\system32\\cmd.exe" "/d"');
+
+        mockExecSync.mockClear();
+        process.env.COMSPEC = 'C:\\tcc\\tcc.exe';
+        await mgr.install({ ...testConfig, executablePath: 'C:\\kici\\run.cmd' });
+        expect(shawlAddCommand()).toContain('-- "C:\\Windows\\System32\\cmd.exe" "/d"');
+      } finally {
+        if (saved === undefined) delete process.env.COMSPEC;
+        else process.env.COMSPEC = saved;
+      }
+    });
+
+    it('accepts a batch-file path whose special characters sit inside its quoted form', async () => {
+      // breaks-if-wrong: an install under "Program Files (x86)" is refused. A
+      // path with a space is quoted on the command line, where cmd.exe reads
+      // `(`, `)` and `&` literally.
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await mgr.install({
+        ...testConfig,
+        executablePath: 'C:\\Program Files (x86)\\A & B, C=D\\kici.cmd',
+      });
+
+      expect(shawlAddCommand()).toContain('"call" "C:\\Program Files (x86)\\A & B, C=D\\kici.cmd"');
     });
 
     it('configures auto-start via sc.exe', async () => {
@@ -291,6 +584,192 @@ describe('WindowsServiceManager', () => {
 
       mockExecSync.mockReset();
     });
+
+    /** The error `execSync` throws for a failed `sc.exe stop`: sc.exe prints its reason on stdout. */
+    function scFailure(code: number, reason: string): Error {
+      return Object.assign(new Error(`Command failed: sc.exe stop kici-orchestrator`), {
+        status: code,
+        stdout: Buffer.from(`[SC] ControlService FAILED ${code}:\r\n\r\n${reason}\r\n\r\n`),
+        stderr: Buffer.from(''),
+      });
+    }
+
+    it('succeeds on a service that is already stopped (1062, query confirms STOPPED)', async () => {
+      // fails-when: stop() runs `sc.exe stop` bare — 1062 propagates and the call rejects.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd === 'sc.exe stop kici-orchestrator') {
+          throw scFailure(1062, 'The service has not been started.');
+        }
+        if (cmd.includes('sc.exe query')) {
+          return Buffer.from('        STATE              : 1  STOPPED\r\n');
+        }
+        return Buffer.from('');
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await expect(mgr.stop(testConfig)).resolves.toBeUndefined();
+
+      const calls = mockExecSync.mock.calls.map((c: unknown[]) => c[0]);
+      expect(calls).toContain('sc.exe query kici-orchestrator');
+
+      mockExecSync.mockReset();
+    });
+
+    it('rethrows 1062 when the query does not confirm STOPPED', async () => {
+      // fails-when: 1062 is swallowed on the error code alone, without the state check.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd === 'sc.exe stop kici-orchestrator') {
+          throw scFailure(1062, 'The service has not been started.');
+        }
+        if (cmd.includes('sc.exe query')) {
+          return Buffer.from('        STATE              : 4  RUNNING\r\n');
+        }
+        return Buffer.from('');
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await expect(mgr.stop(testConfig)).rejects.toThrow(/sc\.exe stop kici-orchestrator/);
+
+      mockExecSync.mockReset();
+    });
+
+    /** `sc.exe query` answers STOP_PENDING until `stoppedAfterMs` has passed, then STOPPED. */
+    function stopsAfter(stoppedAfterMs: number): void {
+      const start = Date.now();
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes('sc.exe query')) {
+          const state = Date.now() - start >= stoppedAfterMs ? '1  STOPPED' : '3  STOP_PENDING';
+          return Buffer.from(`        STATE              : ${state}\r\n`);
+        }
+        return Buffer.from('');
+      });
+    }
+
+    it("waits for a shutdown as long as the component's grace", async () => {
+      // The orchestrator takes 40s to stop, within its 45s grace.
+      // fails-when: stop() gives up after 30s and reports a service that is
+      // still shutting down as hung.
+      vi.useFakeTimers();
+      try {
+        stopsAfter(40_000);
+        const { WindowsServiceManager } = await import('./windows.js');
+        const stopping = new WindowsServiceManager().stop({
+          ...testConfig,
+          component: 'orchestrator',
+        });
+        const assertion = expect(stopping).resolves.toBeUndefined();
+        await vi.advanceTimersByTimeAsync(41_000);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reports a service still stopping after its grace and a margin', async () => {
+      vi.useFakeTimers();
+      try {
+        stopsAfter(Number.MAX_SAFE_INTEGER);
+        const { WindowsServiceManager } = await import('./windows.js');
+        let rejection: unknown;
+        const stopping = new WindowsServiceManager()
+          .stop({ ...testConfig, name: 'kici-agent', component: 'agent' })
+          .catch((err: unknown) => {
+            rejection = err;
+          });
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(rejection).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(10_000);
+        await stopping;
+        expect(String(rejection)).toMatch(/did not reach STOPPED state within 35s/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('waits out a stop already in progress (1061 while STOP_PENDING), so restart succeeds', async () => {
+      // fails-when: 1061 is rethrown, so `restart` on a service that is already
+      // stopping fails instead of waiting for STOPPED and starting it again.
+      vi.useFakeTimers();
+      try {
+        const start = Date.now();
+        mockExecSync.mockImplementation((cmd: string) => {
+          if (cmd === 'sc.exe stop kici-orchestrator') {
+            throw scFailure(1061, 'The service cannot accept control messages at this time.');
+          }
+          if (cmd.includes('sc.exe query')) {
+            const state = Date.now() - start >= 5_000 ? '1  STOPPED' : '3  STOP_PENDING';
+            return Buffer.from(`        STATE              : ${state}\r\n`);
+          }
+          return Buffer.from('');
+        });
+        const { WindowsServiceManager } = await import('./windows.js');
+        const restarting = new WindowsServiceManager().restart(testConfig);
+        const assertion = expect(restarting).resolves.toBeUndefined();
+        await vi.advanceTimersByTimeAsync(6_000);
+        await assertion;
+        expect(mockExecSync).toHaveBeenCalledWith('sc.exe start kici-orchestrator', {
+          stdio: 'pipe',
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('succeeds on 1061 when the stop in progress has finished by the time it checks', async () => {
+      // fails-when: 1061 is accepted only while the query still reads
+      // STOP_PENDING, so a stop that finished between the two calls fails.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd === 'sc.exe stop kici-orchestrator') {
+          throw scFailure(1061, 'The service cannot accept control messages at this time.');
+        }
+        if (cmd.includes('sc.exe query')) {
+          return Buffer.from('        STATE              : 1  STOPPED\r\n');
+        }
+        return Buffer.from('');
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      await expect(new WindowsServiceManager().stop(testConfig)).resolves.toBeUndefined();
+    });
+
+    it('rethrows 1061 for a service that is starting', async () => {
+      // breaks-if-wrong: stop reports success for a service that goes on to run.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd === 'sc.exe stop kici-orchestrator') {
+          throw scFailure(1061, 'The service cannot accept control messages at this time.');
+        }
+        if (cmd.includes('sc.exe query')) {
+          return Buffer.from('        STATE              : 2  START_PENDING\r\n');
+        }
+        return Buffer.from('');
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await expect(mgr.stop(testConfig)).rejects.toThrow(/sc\.exe stop kici-orchestrator/);
+    });
+
+    it('surfaces any other sc.exe stop failure', async () => {
+      // fails-when: every stop error is swallowed, as restart() and uninstall() do.
+      // The query answers STOPPED, so only the error code keeps this failure visible.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd === 'sc.exe stop kici-orchestrator') {
+          throw scFailure(5, 'Access is denied.');
+        }
+        if (cmd.includes('sc.exe query')) {
+          return Buffer.from('        STATE              : 1  STOPPED\r\n');
+        }
+        return Buffer.from('');
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await expect(mgr.stop(testConfig)).rejects.toThrow(/sc\.exe stop kici-orchestrator/);
+
+      mockExecSync.mockReset();
+    });
   });
 
   describe('restart', () => {
@@ -405,6 +884,38 @@ describe('WindowsServiceManager', () => {
       const calls = mockExecSync.mock.calls.map((c: unknown[]) => c[0]);
       expect(calls).toContain('sc.exe stop kici-orchestrator');
       expect(calls).toContain('sc.exe delete kici-orchestrator');
+    });
+
+    it('lets a slow shutdown finish before the service is removed', async () => {
+      // The orchestrator takes 40s to stop, within its 45s grace; the SCM
+      // removes a deleted service once its process has exited.
+      // fails-when: uninstall deletes after a fixed 3s and gives up 30s later,
+      // while the process is still shutting down.
+      vi.useFakeTimers();
+      try {
+        const start = Date.now();
+        let deleted = false;
+        mockExecSync.mockImplementation((cmd: string) => {
+          const stopped = Date.now() - start >= 40_000;
+          if (cmd.includes('sc.exe delete')) deleted = true;
+          if (cmd.includes('sc.exe query')) {
+            if (deleted && stopped) throw new Error('service does not exist');
+            const state = stopped ? '1  STOPPED' : '3  STOP_PENDING';
+            return Buffer.from(`        STATE              : ${state}\r\n`);
+          }
+          return Buffer.from('');
+        });
+        const { WindowsServiceManager } = await import('./windows.js');
+        const uninstalling = new WindowsServiceManager().uninstall({
+          ...testConfig,
+          component: 'orchestrator',
+        });
+        const assertion = expect(uninstalling).resolves.toBeUndefined();
+        await vi.advanceTimersByTimeAsync(45_000);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -734,6 +1245,96 @@ describe('WindowsServiceManager', () => {
       });
     });
 
+    it('reads the batch-file launcher out of the cmd.exe wrapper', async () => {
+      // fails-when: the spec reports cmd.exe as the launch target, so an
+      // npm-source upgrade reads cmd.exe's version instead of the launcher's.
+      mockExecSync.mockReturnValueOnce(
+        Buffer.from(
+          'SERVICE_NAME: kici-orchestrator\n' +
+            '        BINARY_PATH_NAME   : C:\\shawl.exe run --name kici-orchestrator ' +
+            '--stop-timeout 45000 -- C:\\Windows\\System32\\cmd.exe /d /e:on /v:off /c call ' +
+            '"C:\\Program Files\\KiCI\\orch\\kici-orchestrator-standalone.cmd" <NUL\n',
+        ),
+      );
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      expect(await mgr.readLaunchSpec(testConfig)).toEqual({
+        execPath: 'C:\\Program Files\\KiCI\\orch\\kici-orchestrator-standalone.cmd',
+        args: [],
+      });
+    });
+
+    /** The PowerShell read of a service's ImagePath, in UTF-8. */
+    const IMAGE_PATH_READ =
+      'powershell -NoProfile -NonInteractive -Command "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; (Get-ItemProperty -LiteralPath \'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\kici-orchestrator\').ImagePath"';
+
+    /** sc.exe answers with `qc`; the ImagePath read answers with `image`. */
+    function serveRegistration(qc: () => Buffer, image: string): void {
+      mockExecSync.mockImplementation((cmd: unknown) => {
+        if (String(cmd).startsWith('sc.exe qc')) return qc();
+        if (String(cmd).startsWith('powershell')) {
+          expect(String(cmd)).toBe(IMAGE_PATH_READ);
+          return Buffer.from(`\uFEFF${image}\r\n`, 'utf-8');
+        }
+        return '';
+      });
+    }
+
+    // fails-when: readLaunchSpec gives up when sc.exe qc refuses a long command
+    // line, so an npm-source upgrade cannot register such a service again.
+    it('reads a command line too long for sc.exe qc from the registry', async () => {
+      const entry = 'C:\\x\\@kici-dev\\orchestrator\\dist\\server.js';
+      const value = 'v'.repeat(4200);
+      serveRegistration(
+        () => {
+          throw Object.assign(new Error('[SC] QueryServiceConfig FAILED 1734'), { status: 1734 });
+        },
+        `"C:\\shawl.exe" run --name "kici-orchestrator" --env "A=${value}" -- ` +
+          `"C:\\node\\node.exe" "${entry}"`,
+      );
+      const { WindowsServiceManager } = await import('./windows.js');
+      expect(await new WindowsServiceManager().readLaunchSpec(testConfig)).toEqual({
+        execPath: 'C:\\node\\node.exe',
+        args: [entry],
+      });
+    });
+
+    // fails-when: sc.exe's output, in the console code page, is decoded as
+    // UTF-8, so a path under a profile such as C:\Users\Jürgen comes back with
+    // U+FFFD and an upgrade would register a file that does not exist.
+    it('reads a command line sc.exe cannot print in UTF-8 from the registry', async () => {
+      const entry = 'C:\\Users\\J\u00fcrgen\\npm\\node_modules\\@kici-dev\\agent\\dist\\server.js';
+      serveRegistration(
+        () =>
+          Buffer.from(
+            `        BINARY_PATH_NAME   : "C:\\shawl.exe" run -- "C:\\node\\node.exe" "${entry.replace('\u00fc', '\uFFFD')}"\r\n`,
+          ),
+        `"C:\\shawl.exe" run -- "C:\\node\\node.exe" "${entry}"`,
+      );
+      const { WindowsServiceManager } = await import('./windows.js');
+      expect(await new WindowsServiceManager().readLaunchSpec(testConfig)).toEqual({
+        execPath: 'C:\\node\\node.exe',
+        args: [entry],
+      });
+    });
+
+    // fails-when: the command is split at the first " -- " anywhere in the line,
+    // so a quoted value holding it (an older CLI's inline --env, a --cwd path)
+    // becomes the launch command an upgrade registers.
+    it('splits at the separator shawl reads, not at a " -- " inside a quoted value', async () => {
+      mockExecSync.mockReturnValueOnce(
+        Buffer.from(
+          '        BINARY_PATH_NAME   : "C:\\shawl.exe" run --name "kici-orchestrator" ' +
+            '--cwd "C:\\a -- b" --env "NOTE=x -- y" -- "C:\\node\\node.exe" "C:\\x\\server.js"\r\n',
+        ),
+      );
+      const { WindowsServiceManager } = await import('./windows.js');
+      expect(await new WindowsServiceManager().readLaunchSpec(testConfig)).toEqual({
+        execPath: 'C:\\node\\node.exe',
+        args: ['C:\\x\\server.js'],
+      });
+    });
+
     it('returns null when there is no -- separator', async () => {
       mockExecSync.mockReturnValueOnce(
         Buffer.from('BINARY_PATH_NAME   : "C:\\\\custom\\\\opaque.exe"\n'),
@@ -750,6 +1351,57 @@ describe('WindowsServiceManager', () => {
       const { WindowsServiceManager } = await import('./windows.js');
       const mgr = new WindowsServiceManager();
       expect(await mgr.readLaunchSpec(testConfig)).toBeNull();
+    });
+  });
+
+  describe('registering again from the read-back launch command', () => {
+    /** The shawl `add` command install() ran, from its ` -- ` separator on. */
+    function shawlTail(): string {
+      const call = mockExecSync.mock.calls.find(
+        (c: unknown[]) => String(c[0]).includes('shawl') && String(c[0]).includes(' add '),
+      );
+      const cmd = String(call![0]);
+      return cmd.slice(cmd.indexOf(' -- ') + 4);
+    }
+
+    // An npm-source upgrade registers the service again from the command
+    // readLaunchSpec returns, so that command must round-trip.
+    it.each([
+      [
+        'a node entry',
+        {
+          executablePath: 'C:\\Program Files\\nodejs\\node.exe',
+          args: [
+            'C:\\npm\\node_modules\\kici-admin\\node_modules\\@kici-dev\\agent\\dist\\server.js',
+          ],
+        },
+      ],
+      [
+        'a batch-file launcher',
+        { executablePath: 'C:\\Program Files\\KiCI\\a\\kici-agent.cmd', args: [] },
+      ],
+    ])('reproduces the command install registered, for %s', async (_label, launch) => {
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await mgr.install({ ...testConfig, ...launch });
+      const first = shawlTail();
+
+      // shawl stores the command after its own `run` arguments.
+      mockExecSync.mockImplementation((cmd: unknown) => {
+        if (String(cmd).startsWith('sc.exe qc')) {
+          return Buffer.from(
+            `        BINARY_PATH_NAME   : "C:\\cache\\shawl.exe" run --name "kici-orchestrator" -- ${first}\r\n`,
+          );
+        }
+        if (String(cmd).includes('sc.exe query')) throw new Error('service does not exist');
+        return '';
+      });
+      const spec = await mgr.readLaunchSpec(testConfig);
+      mockExecSync.mockClear();
+      await mgr.install({ ...testConfig, executablePath: spec!.execPath, args: spec!.args });
+      // fails-when: reading the command back drops the batch wrapper or an
+      // argument, so an upgrade that registers the service again changes what it runs.
+      expect(shawlTail()).toBe(first);
     });
   });
 });

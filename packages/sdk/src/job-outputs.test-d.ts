@@ -7,7 +7,7 @@ import { isMatrixJobOutputs, isHostJobOutputs } from './context.js';
 import type { StepContext, MatrixJobOutputs, HostJobOutputs } from './context.js';
 import type { Job, JobOrFactory, OutputProxy } from './types.js';
 
-// Task 1 — Job<TOutputs> inferred from the steps tuple (merged-steps inference).
+// Job<TOutputs> inferred from the steps tuple (merged-steps inference).
 describe('Job<TOutputs> — merged-steps inference', () => {
   it('infers a nested output map keyed by step name for a multi-step job', () => {
     const build = step('build', { run: async () => ({ version: '1.0' }) });
@@ -111,7 +111,7 @@ describe('Job<void> — void run-shorthand assignability', () => {
   });
 });
 
-// Task 2 — typed ctx.needs threaded from reference-passing needs.
+// Typed ctx.needs threaded from reference-passing needs.
 describe('typed ctx.needs from job references', () => {
   const build = step('build', { run: async () => ({ version: '1.0' }) });
   const test_ = step('test', { run: async () => ({ passed: true }) });
@@ -166,7 +166,7 @@ describe('typed ctx.needs from job references', () => {
   });
 });
 
-// Task 3 — envelope-generic jobOutputs for typed job references.
+// Envelope-generic jobOutputs for typed job references.
 describe('envelope-generic jobOutputs for typed refs', () => {
   type CiOut = { readonly build: { version: string } };
   const build = step('build', { run: async () => ({ version: '1.0' }) });

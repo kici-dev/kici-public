@@ -281,8 +281,8 @@ describe('generic webhook routes', () => {
       return {
         id: 'src-int-1',
         customer_id: 'org-1',
-        name: 'stg-generic',
-        routing_key: 'generic:org-1:stg-generic',
+        name: 'src-generic',
+        routing_key: 'generic:org-1:src-generic',
         enabled: true,
         max_payload_bytes: 10485760,
         rate_limit_rpm: 600,
@@ -336,7 +336,7 @@ describe('generic webhook routes', () => {
       });
 
       const app = createGenericWebhookRoutes(deps);
-      const res = await app.request('http://localhost/webhook/org-1/generic/stg-generic', {
+      const res = await app.request('http://localhost/webhook/org-1/generic/src-generic', {
         method: 'POST',
         body: JSON.stringify({
           ref: 'refs/heads/master',
@@ -358,7 +358,7 @@ describe('generic webhook routes', () => {
       expect(res.status).toBe(202);
       expect(captured).toHaveLength(1);
       expect(captured[0].provider).toBe('local');
-      expect(captured[0].routingKey).toBe('generic:org-1:stg-generic');
+      expect(captured[0].routingKey).toBe('generic:org-1:src-generic');
       expect(captured[0].event).toBe('push');
       expect(captured[0].payload.ref).toBe('refs/heads/master');
     });
@@ -373,7 +373,7 @@ describe('generic webhook routes', () => {
       });
 
       const app = createGenericWebhookRoutes(deps);
-      const res = await app.request('http://localhost/webhook/org-1/generic/stg-generic', {
+      const res = await app.request('http://localhost/webhook/org-1/generic/src-generic', {
         method: 'POST',
         body: JSON.stringify({ ref: 'refs/heads/master' }),
         headers: { 'Content-Type': 'application/json' },
@@ -394,7 +394,7 @@ describe('generic webhook routes', () => {
       });
 
       const app = createGenericWebhookRoutes(deps);
-      const res = await app.request('http://localhost/webhook/org-1/generic/stg-generic', {
+      const res = await app.request('http://localhost/webhook/org-1/generic/src-generic', {
         method: 'POST',
         body: 'not-json',
         headers: {

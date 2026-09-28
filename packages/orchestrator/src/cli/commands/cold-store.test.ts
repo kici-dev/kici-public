@@ -8,10 +8,9 @@
  *   - rejects fast (exit 2) with an adapter-aware error when the table
  *     is unknown.
  *
- * Real archive / list-chunks behaviour is exercised end-to-end by the
- * Bucket-B `cold-store-execution-runs` E2E (which has a real
- * deployed-staging Postgres + S3 to talk to). These tests cover only
- * the CLI surface and argument plumbing.
+ * Real archive / list-chunks behaviour needs a live Postgres and S3 bucket
+ * to talk to. These tests cover only the CLI surface and argument
+ * plumbing.
  */
 import { describe, expect, it } from 'vitest';
 import { Command } from 'commander';

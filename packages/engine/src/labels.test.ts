@@ -81,7 +81,7 @@ describe('agentTypeLabel', () => {
 
 describe('scalerLabel', () => {
   it('prefixes with kici:scaler:', () => {
-    expect(scalerLabel('stg-container')).toBe('kici:scaler:stg-container');
+    expect(scalerLabel('linux-container')).toBe('kici:scaler:linux-container');
   });
 });
 

@@ -260,7 +260,7 @@ describe('CLI invoked through a bin symlink', () => {
   it(
     'runs (prints version) when launched via a symlink to dist/cli.js',
     () => {
-      // Reproduces the staging canary failure: `node <symlink-to-cli.js> ...`.
+      // Reproduces a launch through a bin symlink: `node <symlink-to-cli.js> ...`.
       // Before the symlink-tolerant guard, the main-module check failed and the
       // CLI silently exited 0 with no output (no command ran).
       const dir = mkdtempSync(path.join(tmpdir(), 'kici-cli-binlink-'));

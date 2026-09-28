@@ -1,7 +1,7 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Cold-store chunk index — Phase 2 (cold-store purge).
+ * Cold-store chunk index (cold-store purge).
  *
  * One row per archived chunk that the GC sweep can later purge from S3.
  * Inserted inside the same transaction as `markArchivedAndDelete` so a
@@ -26,7 +26,7 @@ import { type Kysely, sql } from 'kysely';
  *   uses this to issue `DeleteObject` directly without recomputing the
  *   key from the prefix.
  *
- * Pre-Phase-2 chunks (v1 manifest) are NOT in this table — they live
+ * V1-manifest chunks are NOT in this table — they live
  * forever. Adapters that don't opt into per-bucket archival via
  * `coldTtlDays` don't insert here either.
  */

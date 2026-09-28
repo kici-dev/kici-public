@@ -1565,7 +1565,7 @@ describe('PlatformClient', () => {
         type: 'dashboard.event-log.payload.stream',
         requestId: 'req-1',
         actor: { type: 'user', sub: 'sub-1' },
-        orgId: 'kiciStg00001',
+        orgId: 'acmeOrg00001',
         deliveryId: 'delivery-1',
       });
 
@@ -1574,7 +1574,7 @@ describe('PlatformClient', () => {
         expect.objectContaining({
           type: 'dashboard.event-log.payload.stream',
           requestId: 'req-1',
-          orgId: 'kiciStg00001',
+          orgId: 'acmeOrg00001',
           deliveryId: 'delivery-1',
         }),
       );
@@ -1589,7 +1589,7 @@ describe('PlatformClient', () => {
         type: 'dashboard.event-dlq.list',
         requestId: 'req-dlq-list',
         actor: { type: 'user', sub: 'sub-1' },
-        orgId: 'kiciStg00001',
+        orgId: 'acmeOrg00001',
         limit: 50,
       });
 
@@ -1598,7 +1598,7 @@ describe('PlatformClient', () => {
         expect.objectContaining({
           type: 'dashboard.event-dlq.list',
           requestId: 'req-dlq-list',
-          orgId: 'kiciStg00001',
+          orgId: 'acmeOrg00001',
           limit: 50,
         }),
       );
@@ -1613,7 +1613,7 @@ describe('PlatformClient', () => {
         type: 'dashboard.event-dlq.count',
         requestId: 'req-dlq-count',
         actor: { type: 'user', sub: 'sub-1' },
-        orgId: 'kiciStg00001',
+        orgId: 'acmeOrg00001',
       });
 
       expect(onDashboardEnvMessage).toHaveBeenCalledTimes(1);
@@ -1621,7 +1621,7 @@ describe('PlatformClient', () => {
         expect.objectContaining({
           type: 'dashboard.event-dlq.count',
           requestId: 'req-dlq-count',
-          orgId: 'kiciStg00001',
+          orgId: 'acmeOrg00001',
         }),
       );
     });
@@ -1635,7 +1635,7 @@ describe('PlatformClient', () => {
         type: 'dashboard.event-dlq.retry',
         requestId: 'req-dlq-retry',
         actor: { type: 'user', sub: 'sub-1' },
-        orgId: 'kiciStg00001',
+        orgId: 'acmeOrg00001',
         eventId: 'evt-1',
       });
 
@@ -1644,7 +1644,7 @@ describe('PlatformClient', () => {
         expect.objectContaining({
           type: 'dashboard.event-dlq.retry',
           requestId: 'req-dlq-retry',
-          orgId: 'kiciStg00001',
+          orgId: 'acmeOrg00001',
           eventId: 'evt-1',
         }),
       );
@@ -1659,7 +1659,7 @@ describe('PlatformClient', () => {
         type: 'dashboard.event-dlq.discard',
         requestId: 'req-dlq-discard',
         actor: { type: 'user', sub: 'sub-1' },
-        orgId: 'kiciStg00001',
+        orgId: 'acmeOrg00001',
         eventId: 'evt-1',
       });
 
@@ -1668,7 +1668,7 @@ describe('PlatformClient', () => {
         expect.objectContaining({
           type: 'dashboard.event-dlq.discard',
           requestId: 'req-dlq-discard',
-          orgId: 'kiciStg00001',
+          orgId: 'acmeOrg00001',
           eventId: 'evt-1',
         }),
       );
@@ -2113,19 +2113,16 @@ describe('PlatformClient', () => {
 
   // ── TLS chain trust (intentional non-implementation, accepted-risk) ─
   //
-  // Decision (2026-04-28): ACCEPTED RISK. The finding
-  // (`tls-chain-trust-orch-platform`, HIGH) was closed as `accepted-risk`
-  // rather than fixed via orch-side CA pinning. Rationale recorded in the
-  // handover at `
-  // isolation.md` (finding entry + chosen-mitigation bullet).
+  // Decision (2026-04-28): ACCEPTED RISK. The orchestrator does not pin the
+  // Platform's CA.
   //
   // Summary of the rejection: the threat (orch→Platform MITM with a
   // misissued leaf cert) requires extraordinary co-prerequisites — DNS/BGP
   // hijack of the Platform hostname AND a leaf cert for that hostname signed
   // by ANY system-trusted CA (e.g. ACME-DV via the same DNS hijack, coerced/
   // rogue public CA, customer-installed enterprise root). The bug is also a
-  // single-tenant cred-theft enabler, not a customer-isolation breach (the
-  // catalog's framing scope). Pinning only the orch leg leaves the dashboard,
+  // single-tenant cred-theft enabler, not a customer-isolation breach.
+  // Pinning only the orch leg leaves the dashboard,
   // `kici` developer CLI, `kici-admin` CLI, and provider-outbound legs on
   // system PKI, so a capable attacker just shifts to the weakest leg.
   // The chosen mitigation lives at the DNS layer instead (CAA record on
@@ -2192,13 +2189,12 @@ describe('PlatformClient', () => {
 
   // ── Legacy single-frame `webhook.relay` MUST NOT bypass on-orch HMAC ──
   //
-  // Invariant (per the pentest catalog at
-  // the post-`012_drop_webhook_secret_columns` design makes the orchestrator's
-  // `onVerifyInbound` (HMAC against pgSecretStore) the sole trust boundary
-  // against a rogue Platform (A9) or compromised Platform credential (A10) —
-  // Platform "never verifies webhook signatures and never stores customer
-  // signing material". Every Platform→Orch path that reaches `processWebhook`
-  // MUST therefore have passed `onVerifyInbound`.
+  // Invariant: the post-`012_drop_webhook_secret_columns` design makes the
+  // orchestrator's `onVerifyInbound` (HMAC against pgSecretStore) the sole
+  // trust boundary against a rogue Platform operator or a stolen Platform
+  // credential — Platform "never verifies webhook signatures and never stores
+  // customer signing material". Every Platform→Orch path that reaches
+  // `processWebhook` MUST therefore have passed `onVerifyInbound`.
   //
   // Enforcement: `webhookRelaySchema` is intentionally NOT a member of
   // `platformToOrchestratorMessageSchema`, so a forged single-frame
@@ -2219,8 +2215,9 @@ describe('PlatformClient', () => {
       authenticateClient(client);
 
       const mock = getLatestMock();
-      // Forge a single-frame webhook.relay as a rogue Platform (A9/A10)
-      // would. Payload is shaped to look like a GitHub push event so that,
+      // Forge a single-frame webhook.relay as a rogue Platform, or an
+      // attacker holding a stolen Platform credential, would. Payload is
+      // shaped to look like a GitHub push event so that,
       // post-dispatch, processWebhook would run trigger match against a
       // lock file and fan a job out to an agent — i.e. arbitrary workflow
       // code execution under the tenant's secrets.
@@ -2247,11 +2244,10 @@ describe('PlatformClient', () => {
 
   // ── `trust_policy.update` orch-side trust model (security invariant) ──
   //
-  // Pentest catalog at
-  // — Platform→Orchestrator dispatch surface under attacker model A10
-  // (compromised Platform credential / rogue Platform process). The Platform
+  // Threat: a compromised Platform credential or a rogue Platform process
+  // driving the Platform→Orchestrator dispatch surface. The Platform
   // pushes `trust_policy.update` carrying `identityLinks` + `memberCiTrustLevels`
-  // (consumed by `server.ts:798 onTrustPolicyUpdate` to update orchestrator
+  // (consumed by `onTrustPolicyUpdate` in `server.ts` to update orchestrator
   // in-memory state) and `policy.{forkPolicy,approvalExpiryHours}` (received
   // but DROPPED).
   //
@@ -2266,10 +2262,10 @@ describe('PlatformClient', () => {
       const client = createClient({ onTrustPolicyUpdate });
       const mock = authenticateClient(client);
 
-      // A rogue Platform (A10) pushes a maximally-permissive policy plus
+      // A rogue Platform pushes a maximally-permissive policy plus
       // forged identityLinks + admin ci_trust for an attacker. The wire
       // dispatcher just forwards; the orchestrator's onTrustPolicyUpdate
-      // callback at server.ts:798 reads only identityLinks +
+      // callback in server.ts reads only identityLinks +
       // memberCiTrustLevels and drops policy.* fields. The defense-in-depth
       // protections live downstream in trust-resolver.ts (provider API gate)
       // and dispatch-matched-workflow.ts (per-environment minimumTrust).
@@ -2547,6 +2543,75 @@ describe('plan ceiling and worker membership', () => {
     });
     await flush();
     expect(onPlanCeiling).toHaveBeenLastCalledWith(0, true);
+  });
+
+  // fails-when: a frame that arrives on the closing socket after disconnect()
+  // still runs its handler (the 2026-09-26 PlanHeadroomStore.write that raced
+  // the database close).
+  it('ignores a frame that arrives after disconnect()', async () => {
+    const store = makeFakeHeadroomStore();
+    const client = createClient({ planHeadroomStore: store as never });
+    const mock = authenticateClient(client);
+    client.disconnect();
+    simulateMessage(mock, {
+      type: 'plan.headroom',
+      maxWorkerPeers: 4,
+      orgLimit: 5,
+      orgTotal: 1,
+      evictExcess: false,
+    });
+    await flush();
+    expect(store.write).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: a client connected again after disconnect() handles frames.
+  it('handles frames again after a new connect()', async () => {
+    const store = makeFakeHeadroomStore();
+    const client = createClient({ planHeadroomStore: store as never });
+    authenticateClient(client);
+    client.disconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    const mock = authenticateClient(client);
+    simulateMessage(mock, {
+      type: 'plan.headroom',
+      maxWorkerPeers: 4,
+      orgLimit: 5,
+      orgTotal: 1,
+      evictExcess: false,
+    });
+    await flush();
+    expect(store.write).toHaveBeenCalledOnce();
+  });
+
+  // fails-when: a failing ceiling write escapes as an unhandled rejection,
+  // which a shutdown in progress turns into exit code 1.
+  it('contains a failing ceiling write', async () => {
+    vi.useRealTimers();
+    const store = {
+      read: vi.fn(async () => null),
+      write: vi.fn(async () => {
+        throw new TypeError("Cannot read properties of undefined (reading 'Client')");
+      }),
+    };
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const client = createClient({ planHeadroomStore: store as never });
+      const mock = authenticateClient(client);
+      simulateMessage(mock, {
+        type: 'plan.headroom',
+        maxWorkerPeers: 4,
+        orgLimit: 5,
+        orgTotal: 1,
+        evictExcess: false,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(store.write).toHaveBeenCalledOnce();
+      expect(unhandled).not.toHaveBeenCalled();
+      client.disconnect();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
   });
 
   it('reports connected worker peers on cluster.membership', () => {

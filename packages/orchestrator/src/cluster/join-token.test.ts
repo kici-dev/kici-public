@@ -126,7 +126,7 @@ describe('JoinTokenManager', () => {
       expires_at: new Date(Date.now() - 1000), // expired
     });
 
-    await expect(manager.validateAndConsumeToken(token, 'me', 'arm-stg')).rejects.toThrow(
+    await expect(manager.validateAndConsumeToken(token, 'me', 'arm-worker')).rejects.toThrow(
       'expired',
     );
   });
@@ -152,7 +152,7 @@ describe('JoinTokenManager', () => {
       expires_at: new Date(Date.now() + 3600_000),
     });
 
-    await expect(manager.validateAndConsumeToken(token, 'me', 'win-stg')).rejects.toThrow(
+    await expect(manager.validateAndConsumeToken(token, 'me', 'win-worker')).rejects.toThrow(
       'already been used',
     );
   });
@@ -172,7 +172,7 @@ describe('JoinTokenManager', () => {
     mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 0n });
     mocks.selectExecuteTakeFirst.mockResolvedValue(undefined);
 
-    await expect(manager.validateAndConsumeToken(token, 'me', 'arm-stg')).rejects.toThrow(
+    await expect(manager.validateAndConsumeToken(token, 'me', 'arm-worker')).rejects.toThrow(
       'Invalid join token',
     );
   });
@@ -190,7 +190,7 @@ describe('JoinTokenManager', () => {
     // Atomic claim wins: UPDATE returns numUpdatedRows: 1n.
     mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 1n });
 
-    const result = await manager.validateAndConsumeToken(token, 'new-orch-instance', 'arm-stg');
+    const result = await manager.validateAndConsumeToken(token, 'new-orch-instance', 'arm-worker');
     expect(result.routing.orgId).toBe('org-1');
     expect(result.routing.routingKey).toBe('github:42');
     expect(result.keys.encryptionKey).toBeInstanceOf(Buffer);
@@ -201,7 +201,7 @@ describe('JoinTokenManager', () => {
     const setCalls = mocks.updateSet.mock.calls;
     expect(setCalls.length).toBe(1);
     expect(setCalls[0][0]).toHaveProperty('consumed_by', 'new-orch-instance');
-    expect(setCalls[0][0]).toHaveProperty('consumed_by_instance', 'arm-stg');
+    expect(setCalls[0][0]).toHaveProperty('consumed_by_instance', 'arm-worker');
     expect(setCalls[0][0]).toHaveProperty('consumed_at');
     expect(setCalls[0][0].consumed_at).toBeInstanceOf(Date);
 
@@ -238,8 +238,8 @@ describe('JoinTokenManager', () => {
     });
 
     const settled = await Promise.allSettled([
-      manager.validateAndConsumeToken(token, 'coord-A', 'win-stg'),
-      manager.validateAndConsumeToken(token, 'coord-B', 'macos-stg'),
+      manager.validateAndConsumeToken(token, 'coord-A', 'win-worker'),
+      manager.validateAndConsumeToken(token, 'coord-B', 'macos-worker'),
     ]);
     const winners = settled.filter((s) => s.status === 'fulfilled');
     const losers = settled.filter((s) => s.status === 'rejected');
@@ -292,7 +292,7 @@ describe('JoinTokenManager', () => {
 
     mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 1n });
 
-    const result = await manager.validateAndConsumeToken(token, 'me', 'arm-stg');
+    const result = await manager.validateAndConsumeToken(token, 'me', 'arm-worker');
     expect(result.routing.role).toBe('worker');
   });
 
@@ -315,11 +315,11 @@ describe('JoinTokenManager', () => {
     mocks.selectExecuteTakeFirst.mockResolvedValue({
       token_hash: keys.validationHash,
       consumed_at: new Date(),
-      consumed_by_instance: 'arm-stg',
+      consumed_by_instance: 'arm-worker',
       expires_at: new Date(Date.now() + 3600_000),
     });
 
-    const result = await manager.validateAndConsumeToken(token, 'coord-A', 'arm-stg');
+    const result = await manager.validateAndConsumeToken(token, 'coord-A', 'arm-worker');
     expect(result.routing.role).toBe('worker');
     expect(result.routing.routingKey).toBe('github:42');
     expect(result.keys.encryptionKey).toBeInstanceOf(Buffer);
@@ -341,11 +341,11 @@ describe('JoinTokenManager', () => {
     mocks.selectExecuteTakeFirst.mockResolvedValue({
       token_hash: keys.validationHash,
       consumed_at: new Date(),
-      consumed_by_instance: 'arm-stg',
+      consumed_by_instance: 'arm-worker',
       expires_at: new Date(Date.now() + 3600_000),
     });
 
-    await expect(manager.validateAndConsumeToken(token, 'coord-A', 'win-stg')).rejects.toThrow(
+    await expect(manager.validateAndConsumeToken(token, 'coord-A', 'win-worker')).rejects.toThrow(
       'already been used',
     );
   });
@@ -366,11 +366,11 @@ describe('JoinTokenManager', () => {
     mocks.selectExecuteTakeFirst.mockResolvedValue({
       token_hash: keys.validationHash,
       consumed_at: new Date(Date.now() - 7200_000),
-      consumed_by_instance: 'arm-stg',
+      consumed_by_instance: 'arm-worker',
       expires_at: new Date(Date.now() - 1000), // expired
     });
 
-    await expect(manager.validateAndConsumeToken(token, 'coord-A', 'arm-stg')).rejects.toThrow(
+    await expect(manager.validateAndConsumeToken(token, 'coord-A', 'arm-worker')).rejects.toThrow(
       'expired',
     );
   });

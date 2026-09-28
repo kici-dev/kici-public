@@ -375,7 +375,10 @@ describe('FirecrackerScalerBackend', () => {
       // waitForSocket called
       expect(mockWaitForSocket).toHaveBeenCalledWith(5000);
 
-      // MMDS metadata injected (orchestrator URL, agent ID, labels, scaler-managed flag, gateway IP)
+      // MMDS metadata injected (orchestrator URL, agent ID, labels, scaler-managed
+      // flag). A scaler with no `extraHosts` gives the guest no host mapping.
+      // fails-when: the backend writes a gateway or a mapping into every guest's
+      // MMDS whether or not the operator configured one.
       expect(mockPutMmds).toHaveBeenCalledWith({
         latest: {
           'meta-data': {
@@ -384,7 +387,6 @@ describe('FirecrackerScalerBackend', () => {
             'kici-labels':
               'linux,firecracker,kici:agent:firecracker,kici:scaler:test-fc,kici:role:builder,kici:role:init-runner',
             'kici-scaler-managed': '1',
-            'kici-gateway-ip': '10.0.0.1',
           },
         },
       });
@@ -392,6 +394,27 @@ describe('FirecrackerScalerBackend', () => {
       // Tracking updated
       expect(managed.state).toBe('running');
       expect(managed.id).toBe('agent-1');
+    });
+
+    it('writes the scaler extraHosts into MMDS, host-gateway resolved to the bridge gateway', async () => {
+      // breaks-if-wrong: an operator who opts in gets exactly the mappings they
+      // configured, in the host:address form the rootfs /init reads.
+      const { backend } = createBackend({
+        extraHosts: ['registry.local:host-gateway', 'cache.example.internal:10.1.2.3'],
+      });
+
+      await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
+
+      const [payload] = mockPutMmds.mock.calls[0] as [
+        { latest: { 'meta-data': Record<string, unknown> } },
+      ];
+      expect(payload.latest['meta-data']['kici-extra-hosts']).toBe(
+        'registry.local:10.0.0.1,cache.example.internal:10.1.2.3',
+      );
+    });
+
+    it('refuses to construct with an extraHosts entry the guest cannot take', () => {
+      expect(() => createBackend({ extraHosts: ['registry.local'] })).toThrow(/host:address/);
     });
 
     it('uses label-set-specific rootfsPath', async () => {
@@ -1329,7 +1352,42 @@ describe('FirecrackerScalerBackend', () => {
       expect(cleaned).toBe(0);
     });
 
-    it('Pass 3: deletes orphan TAP devices, skips protected bridges and DB-allocated TAPs', async () => {
+    it('Pass 3: never deletes the configured bridge, even when its name has the TAP shape', async () => {
+      // fails-when: the sweep protects only a fixed list of names, so a bridge
+      // an operator named like a per-VM TAP is deleted and every VM loses its network.
+      const { backend, mockIpAllocator } = createBackend({ bridgeName: 'kici-0b1d9e00' });
+      mockIpAllocator.getAllocations.mockResolvedValue([]);
+      mockReaddir.mockResolvedValueOnce([]);
+      const ipBrLinkOutput =
+        'kici-0b1d9e00       UP             06:00:00:00:00:01 <BROADCAST,MULTICAST,UP,LOWER_UP>\n' +
+        'kici-deadbeef       DOWN           06:00:00:00:00:04 <NO-CARRIER,BROADCAST,MULTICAST>\n';
+      mockExecFile.mockImplementation((cmd, args, _opts, callback) => {
+        if (cmd === 'ip' && args[0] === '-br' && args[1] === 'link') {
+          callback(null, { stdout: ipBrLinkOutput, stderr: '' });
+        } else {
+          callback(null, { stdout: '', stderr: '' });
+        }
+      });
+
+      const cleaned = await backend.cleanupOrphans();
+
+      // breaks-if-wrong: the orphan TAP beside the bridge is still deleted.
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'ip',
+        ['link', 'del', 'kici-deadbeef'],
+        expect.any(Object),
+        expect.any(Function),
+      );
+      expect(mockExecFile).not.toHaveBeenCalledWith(
+        'ip',
+        ['link', 'del', 'kici-0b1d9e00'],
+        expect.any(Object),
+        expect.any(Function),
+      );
+      expect(cleaned).toBe(1);
+    });
+
+    it('Pass 3: deletes orphan TAP devices, skips other kici- interfaces and DB-allocated TAPs', async () => {
       const { backend, mockIpAllocator } = createBackend();
 
       mockIpAllocator.getAllocations.mockResolvedValueOnce([
@@ -1347,11 +1405,11 @@ describe('FirecrackerScalerBackend', () => {
       mockPidFile(String(process.pid));
       mockReaddir.mockResolvedValueOnce([]);
 
-      // Feed fake `ip -br link` output: 2 orphan TAPs, protected bridges, live DB TAP, and a non-matching iface
+      // Feed fake `ip -br link` output: 2 orphan TAPs, the bridge, an operator
+      // interface outside the TAP shape, a live DB TAP, and a non-kici iface
       const ipBrLinkOutput =
         'kici-br0            UP             06:00:00:00:00:01 <BROADCAST,MULTICAST,UP,LOWER_UP>\n' +
-        'kici-br1            UP             06:00:00:00:00:02 <BROADCAST,MULTICAST,UP,LOWER_UP>\n' +
-        'kici-m01            DOWN           06:00:00:00:00:03 <BROADCAST,MULTICAST>\n' +
+        'kici-mgmt0          DOWN           06:00:00:00:00:03 <BROADCAST,MULTICAST>\n' +
         'kici-aaaaaaaa       UP             06:00:AC:00:00:05 <BROADCAST,MULTICAST,UP,LOWER_UP>\n' +
         'kici-deadbeef       DOWN           06:00:00:00:00:04 <NO-CARRIER,BROADCAST,MULTICAST>\n' +
         'kici-cafebabe       DOWN           06:00:00:00:00:05 <NO-CARRIER,BROADCAST,MULTICAST>\n' +
@@ -1380,7 +1438,7 @@ describe('FirecrackerScalerBackend', () => {
         expect.any(Object),
         expect.any(Function),
       );
-      // Protected bridges and DB-allocated TAP are NOT deleted
+      // The bridge, the operator interface and the DB-allocated TAP are NOT deleted
       expect(mockExecFile).not.toHaveBeenCalledWith(
         'ip',
         ['link', 'del', 'kici-br0'],
@@ -1389,13 +1447,7 @@ describe('FirecrackerScalerBackend', () => {
       );
       expect(mockExecFile).not.toHaveBeenCalledWith(
         'ip',
-        ['link', 'del', 'kici-br1'],
-        expect.any(Object),
-        expect.any(Function),
-      );
-      expect(mockExecFile).not.toHaveBeenCalledWith(
-        'ip',
-        ['link', 'del', 'kici-m01'],
+        ['link', 'del', 'kici-mgmt0'],
         expect.any(Object),
         expect.any(Function),
       );
@@ -1940,6 +1992,8 @@ describe('FirecrackerScalerBackend', () => {
       addrPresent: true,
       tablePresent: true,
       baselineChainPresent: true,
+      natPresent: true,
+      baselineRulesPresent: true,
       tapIsolationPresent: true,
       healthy: true,
       detail: 'healthy',

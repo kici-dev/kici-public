@@ -1,19 +1,17 @@
 /**
  * Orchestrator scheduled-job wrapper.
  *
- * Mirrors `packages/platform/src/queue/scheduled-job.ts` in observable
+ * Mirrors the Platform's scheduled-job wrapper in observable
  * surface (5 Prometheus metrics + structured logs + audit row on
  * failure) but uses `setInterval` instead of pg-boss — the orchestrator
  * has no pg-boss dependency and we're not adding one.
  *
- * All future orchestrator periodic jobs MUST use this wrapper — per
- * CLAUDE.md "no workarounds", the legacy setInterval call sites in
- * queue/cleanup.ts and secrets/cleanup.ts migrate in the same phase
- * they'd otherwise be updated.
+ * Every orchestrator periodic job MUST use this wrapper, as the cleanup
+ * jobs in queue/cleanup.ts and secrets/cleanup.ts do.
  *
  * `triggerNow()` on the returned handle forces one off-cadence tick
  * (used by the admin `/api/v1/admin/scheduled-jobs/:name/trigger`
- * endpoint and by E2E harnesses). It does NOT reset the interval
+ * endpoint and by tests). It does NOT reset the interval
  * timer — a real tick still fires at the scheduled cadence after.
  */
 import { z } from 'zod';
@@ -27,6 +25,7 @@ import {
   jobLastSuccessTimestamp,
   jobRunsTotal,
 } from '../metrics/scheduled-jobs.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'scheduled-job' });
 
@@ -76,7 +75,7 @@ export interface OrchestratorScheduledJobHandle {
   stop(): void;
   /**
    * Force one off-cadence tick and await it (success or failure).
-   * Returns the tick's outcome so E2E and admin routes can report it.
+   * Returns the tick's outcome so callers such as the admin route can report it.
    */
   triggerNow(): Promise<{ ok: boolean; durationMs: number; error?: string }>;
 }
@@ -203,7 +202,7 @@ export function registerOrchestratorScheduledJob(
 
   const timer: NodeJS.Timeout = setInterval(() => {
     if (stopped) return;
-    void runOnce();
+    runDetached(logger, 'Scheduled job run', () => runOnce(), { job: opts.name });
   }, opts.intervalMs);
   if (opts.unref !== false) {
     timer.unref();
@@ -211,7 +210,7 @@ export function registerOrchestratorScheduledJob(
 
   if (opts.runOnStart === true) {
     // Kick synchronously so startup is responsive.
-    void runOnce();
+    runDetached(logger, 'Scheduled job run', () => runOnce(), { job: opts.name });
   }
 
   const handle: OrchestratorScheduledJobHandle = {

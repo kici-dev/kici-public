@@ -7,8 +7,7 @@
  * READ-ONLY — mutations live in `maintenance.ts` (queue clear) instead.
  * Dual-mode: HTTP (via AdminApiClient) or `--database-url` (direct DB).
  *
- * supersedes the original `cache list|show` framing — the E2E call
- * sites were actually querying dispatch_queue, not a dedup cache.
+ * The rows come from dispatch_queue, not a dedup cache.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';

@@ -13,7 +13,7 @@ import { type Kysely, sql } from 'kysely';
  *
  * All nullable: a host with no reach metadata simply cannot be bootstrapped and
  * behaves exactly as before. Idempotent (`ADD COLUMN IF NOT EXISTS`); additive,
- * so staging data is preserved.
+ * so existing data is preserved.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.host_roster

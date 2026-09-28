@@ -1,9 +1,9 @@
 /**
  * Tests for `kici-admin event-log` CLI subcommands.
  *
- * Covers flag forwarding to the admin API client (including the new --action
- * filter added for the E2E pollEventLog dogfooding refactor). Integration
- * coverage lives in the E2E suite against a live orchestrator.
+ * Covers flag forwarding to the admin API client (including the --action
+ * filter). The HTTP round trip needs a live orchestrator; this file covers
+ * argument parsing and flag forwarding.
  */
 
 import { describe, expect, it } from 'vitest';

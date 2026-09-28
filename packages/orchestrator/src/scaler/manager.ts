@@ -79,6 +79,8 @@ import type {
   SpawningAgentSnapshot,
 } from './scaler-state-store.js';
 import { PG_LOCK_NOT_AVAILABLE } from './scaler-state-store.js';
+import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'scaler' });
 
@@ -213,7 +215,7 @@ export function resolveScalerOrchestratorUrl(
 ): string {
   if (configUrl) return configUrl;
   if (envUrl) return envUrl;
-  return `ws://127.0.0.1:${port ?? '4000'}/ws`;
+  return `ws://127.0.0.1:${port ?? ORCHESTRATOR_DEFAULT_PORT}/ws`;
 }
 
 export interface ResolvedResources {
@@ -2657,7 +2659,12 @@ export class ScalerManager {
       // invisible to the customer's teardown workflow.
       const adopted = this.adoptedAgents.get(agentId);
       if (adopted) {
-        void this.emitScaleDownForSpec(adopted, agentId, ScaleDownReason.enum.shutdown);
+        runDetached(
+          logger,
+          'Scale-down emit',
+          () => this.emitScaleDownForSpec(adopted, agentId, ScaleDownReason.enum.shutdown),
+          { agentId },
+        );
       }
       this.managedAgentIndex.delete(agentId);
       this.warmAgents.delete(agentId);
@@ -2705,7 +2712,7 @@ export class ScalerManager {
     // A retiring scaler may have just lost its last agent. `backend.destroy`
     // above is fire-and-forget, so `getActiveCount()` may not have dropped yet;
     // the periodic sweep armed in `start()` is the backstop that catches it.
-    void this.sweepRetiredBackends();
+    runDetached(logger, 'Retired backend sweep', () => this.sweepRetiredBackends());
   }
 
   /**
@@ -2750,7 +2757,7 @@ export class ScalerManager {
     // like every other store write on this path: a failure here degrades to the
     // behaviour of having no record at all (the prune reports), never to a
     // wrong suppression.
-    void this.stateStore
+    this.stateStore
       ?.recordProvisionCondemned(candidate.agentId, candidate.scalerName, reason)
       .catch((err) => {
         logger.warn('scaler: failed to record the provision-condemned verdict', {
@@ -3782,7 +3789,7 @@ export class ScalerManager {
       this.machineLedger.start();
     }
     this.retirementSweep ??= setInterval(() => {
-      void this.sweepRetiredBackends();
+      runDetached(logger, 'Retired backend sweep', () => this.sweepRetiredBackends());
     }, RETIREMENT_SWEEP_INTERVAL_MS);
     this.retirementSweep.unref?.();
   }

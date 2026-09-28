@@ -177,7 +177,7 @@ Contexts can have protection rules that gate job execution:
 A job that does not start at once gets no context secrets while it waits. This applies to:
 
 - a job that a rule holds (required reviewers, a wait timer, minimum trust, or a concurrency limit);
-- a job that an approval gate (`requireApproval`) holds;
+- a job that an approval gate (`approval`) holds;
 - a job that waits for the jobs in its `needs` list.
 
 While the job waits, the orchestrator stores the names of its contexts, not their values. When the job is released, the orchestrator resolves the context's variables and secrets and dispatches the job with them. So a secret that you rotate while the job waits reaches the job with its new value. If that resolution fails, or a context is deleted or recreated while the job waits, the job fails with the error. It never runs without the secrets of its contexts.
@@ -214,7 +214,7 @@ The rejection reason says so:
 
 ```
 Context 'production' restricts branches: this internally-triggered run carries no
-branch, so no branch restriction can be satisfied - a scheduled run gains its
+branch, so no branch restriction can be satisfied — a scheduled run gains its
 branch after the next push to the default branch re-registers the workflow;
 alternatively bind a context without a branch restriction, or restrict by trigger
 type instead
@@ -309,7 +309,7 @@ Strategy: queue (or cancel-pending)
 
 The concurrency limit is a positive integer; leave it unset for unlimited concurrency.
 
-- **queue** -- new jobs wait in a FIFO queue (with configurable timeout, default 1 hour)
+- **queue** -- new jobs wait in a FIFO queue until a slot frees, or until the context's hold expiry passes (default one hour)
 - **cancel-pending** -- pending (queued) jobs are cancelled when the limit is reached
 
 The children of a matrix job count individually against the limit. A three-child
@@ -350,7 +350,7 @@ the concurrency group serializes one workflow against itself.
 
 ### Creating contexts
 
-Navigate to **Settings > Contexts** in the dashboard. Click **New context** to choose the context name and type (Fixed or Glob).
+Open **Contexts** in the dashboard navigation. Contexts belong to one orchestrator, so when more than one orchestrator is connected the dashboard asks which one you mean. Click **New context** to choose the context name and type (Fixed or Glob).
 
 - **Fixed** -- applies to jobs that declare exactly this context name, like `staging` or `production`
 - **Glob** -- applies to any context name a job declares that matches the pattern, e.g. `review/*` matches a job with `context: 'review/PR-123'`

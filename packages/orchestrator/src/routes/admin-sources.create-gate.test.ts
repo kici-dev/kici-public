@@ -9,8 +9,8 @@
  *     privateKey pair fails GitHub's `GET /app` JWT auth — i.e., the
  *     caller does not actually possess the App's private key), the
  *     handler returns 400 and the source is NOT persisted. Removing
- *     this gate would let an external (A1) or operator-token-holder
- *     (A10) attacker register a source for ANY GitHub App by App ID
+ *     this gate would let an external attacker, or one holding an
+ *     operator token, register a source for ANY GitHub App by App ID
  *     alone, then receive webhooks meant for that App's installations
  *     and resolve secrets against repo names that match its triggers.
  *
@@ -25,8 +25,8 @@
  *     `github:99999`) and intercept webhooks routed by that key.
  *
  * Trust model (must hold):
- *   For attacker model A1 (external, unauthenticated) and A10 (stolen
- *   admin token), the source-create handler's pre-DB validate call is
+ *   For an external, unauthenticated attacker and for one holding a
+ *   stolen admin token, the source-create handler's pre-DB validate call is
  *   the cryptographic gate that requires proof of GitHub App
  *   ownership. The webhook-routing layer sits on top
  *   of this — but if the source-create gate were bypassed, an attacker

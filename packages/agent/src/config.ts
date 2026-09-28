@@ -1,7 +1,12 @@
 import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { defineEnv, validateUnknownKiciVars, LOGGER_ENV_VARS } from '@kici-dev/shared/env';
+import {
+  AGENT_DEFAULT_PORT,
+  defineEnv,
+  validateUnknownKiciVars,
+  LOGGER_ENV_VARS,
+} from '@kici-dev/shared/env';
 import {
   KNOWN_ROLES,
   parseHostPropertyAssignments,
@@ -55,7 +60,7 @@ const configSchema = z.object({
       if (roles.length === 0) return [];
       return roles.filter((r) => r !== 'all');
     }),
-  port: z.coerce.number().default(8080),
+  port: z.coerce.number().default(AGENT_DEFAULT_PORT),
   logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   agentToken: z.string().optional(),
   githubToken: z.string().optional(),
@@ -96,11 +101,10 @@ const configSchema = z.object({
   // real repo path as the job workDir and skips the git clone (checkout=false)
   // instead of cloning into a throwaway tmpdir. This lets an operator run their
   // own already-built working tree directly (module-relative paths, node_modules,
-  // dist all present) — the profile KiCI's own routed `deploy:stg` uses. Gated to
-  // `file://` sources and set ONLY by the operator at agent/scaler launch (the
-  // local dev plane's trusted+in-place label set) — never derivable from a
-  // dispatch payload, so a Platform-connected agent (https sources) can never be
-  // pushed onto the operator's tree.
+  // dist all present). Gated to `file://` sources and set ONLY by the operator
+  // at agent/scaler launch (the local dev plane's trusted+in-place label set) —
+  // never derivable from a dispatch payload, so a Platform-connected agent
+  // (https sources) can never be pushed onto the operator's tree.
   inPlace: z
     .string()
     .default('false')
@@ -175,7 +179,7 @@ const configSchema = z.object({
   // Registry origins a container job's `.kici/` install on the agent host may
   // contact, beyond the public npm registry and the agent user's own
   // `~/.npmrc` registries: comma-separated origins such as
-  // `http://verdaccio.local:4873`, matched exactly after URL normalization.
+  // `http://registry.local:4873`, matched exactly after URL normalization.
   // The host install runs outside the job network's egress filter, so a
   // registry a workflow or repository names qualifies only when its origin is
   // listed here. Read only here, never from a dispatch payload or a workflow.
@@ -312,9 +316,9 @@ export type AppConfig = z.infer<typeof configSchema> & {
 };
 
 /**
- * Env-var definition for the agent. Exported so the docs generator and the
- * deploy-stg pre-validator can inspect / re-parse without round-tripping
- * through process.env.
+ * Env-var definition for the agent. Exported so the docs generator and config
+ * pre-validation can inspect / re-parse without round-tripping through
+ * process.env.
  */
 export const envDef = defineEnv({
   service: 'agent',
@@ -391,7 +395,7 @@ export const envDef = defineEnv({
  * - KICI_BACKPRESSURE_MODE (default: pause, options: pause | drop)
  * - KICI_SANDBOX (default: false) — enable bubblewrap (bwrap) namespace isolation for bare-metal execution
  * - KICI_TRUSTED_ENV (default: false) — trusted fleet-agent profile: pass the ambient host env (minus the agent's own KiCI identity secrets) through to steps
- * - KICI_IN_PLACE (default: false) — in-place no-clone profile: for a file:// source, use the real repo path as workDir and skip the clone (the routed deploy:stg profile)
+ * - KICI_IN_PLACE (default: false) — in-place no-clone profile: for a file:// source, use the real repo path as workDir and skip the clone
  * - KICI_SANDBOX_NETWORK (default: isolated, options: isolated | host) — sandbox network posture for BOTH backends: the bwrap network namespace (when sandbox=true) and the container job network. `host` shares the host network (container backend also binds host /etc/hosts read-only for name resolution); applies to the container backend under the default hardened posture (KICI_SANDBOX_HARDENED=true)
  * - KICI_SANDBOX_HARDENED (default: true) — hardened-by-default job containers (CapDrop ALL, no-new-privileges, cgroup caps, tmpfs /tmp); set false to roll back to the legacy unhardened posture
  * - KICI_SANDBOX_READONLY_ROOTFS (default: false) — opt-in read-only container rootfs (/tmp stays a writable tmpfs)

@@ -9,7 +9,8 @@
  * `cluster/peer-credentials.ts`.
  *
  * The guarantee is POSIX-only. Node maps a mode onto Windows by toggling the
- * read-only attribute and changes no ACL, so a Windows install must restrict
- * the file itself.
+ * read-only attribute and changes no ACL, so a Windows install restricts the
+ * folder that holds the file instead (`restrictEnvFileAccess`,
+ * `cli/service/windows-acl.ts`).
  */
 export const ENV_FILE_MODE = 0o600;

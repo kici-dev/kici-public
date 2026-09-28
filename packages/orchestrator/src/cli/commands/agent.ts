@@ -222,7 +222,7 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
     .action(async (id: string) => {
       try {
         const { kicked } = await getClient().revokeAgentToken(id);
-        //: surface the kick count so the operator knows the
+        // Surface the kick count so the operator knows the
         // revocation actually closed in-flight WS — a 0 count on a
         // token they expected to be live is a useful diagnostic
         // (token never connected, or already disconnected on its own).

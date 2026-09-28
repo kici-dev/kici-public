@@ -57,9 +57,9 @@ export default workflow('failed-workflow-slack-notifier', {
           const tags = route.tag.map((u) => `<@${u}>`).join(' ');
           const text = `❌ *${repo}* failed ${tags}`.trim();
 
-          // Under `kici run remote` / an E2E run, skip the real POST and log the
-          // intended message instead — so the example is safe to exercise
-          // without a live Slack workspace.
+          // Under `kici run remote` or any other test run, skip the real POST and
+          // log the intended message instead — so the example is safe to
+          // exercise without a live Slack workspace.
           if (ctx.isTestRun) {
             ctx.log.info(`[test-run] would post to ${route.channel}: ${text}`);
             return;

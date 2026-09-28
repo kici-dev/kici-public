@@ -17,7 +17,7 @@ export type {
   RestartPolicy,
   LogOptions,
 } from './types.js';
-export { DEFAULT_RESTART_POLICY } from './types.js';
+export { DEFAULT_RESTART_POLICY, SERVICE_TEXT } from './types.js';
 export {
   detectPlatform,
   isRoot,
@@ -27,6 +27,13 @@ export {
   getCacheDir,
 } from './platform-detect.js';
 export { resolveUserLevel, type PrivilegeOpts } from './privilege.js';
+export { restrictEnvFileAccess } from './windows-acl.js';
+export {
+  ENV_FILE_LOADER_EXPORT,
+  envFileRefusal,
+  launchReadsEnvFile,
+  launchedRelease,
+} from './windows-env-file.js';
 
 // Instance types + helpers (folder-anchored targeting).
 export type {
@@ -46,6 +53,9 @@ export {
   writeManifest,
   readKiciVersion,
   resolveVersionFromLaunchSpec,
+  resolveLauncherVersion,
+  writeInstallManifest,
+  type InstallManifestWrite,
   resolveNpmInstallTarget,
   type NpmInstallTarget,
 } from './instance/manifest.js';

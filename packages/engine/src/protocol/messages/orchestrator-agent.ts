@@ -522,7 +522,6 @@ export const jobAckSchema = z.object({
  * FAST-PATHED: A manual validator exists in
  * packages/orchestrator/src/ws/agent-handler.ts (isValidLogChunk).
  * If you change this schema, update the manual validator in the same commit.
- * See CLAUDE.md rule: "Zod fast-path sync invariant".
  */
 export const agentLogChunkSchema = z.object({
   type: z.literal('log.chunk'),

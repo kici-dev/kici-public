@@ -17,12 +17,15 @@
  * agent WS -> heartbeat -> HTTP -> DB
  */
 
+// First import: applies the env file a Windows service names in KICI_ENV_FILE
+// before any other module reads the environment.
+import '@kici-dev/shared/load-service-env-file';
+
 import { createLogger, guardStartup, setServiceName, initTelemetry } from '@kici-dev/shared';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // SDK drift diagnostic — see docs/operator/troubleshooting.md.
 declare const KICI_PKG_VERSION: string;
-declare const KICI_BUILD_COMMIT: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 declare const KICI_SHARED_VERSION: string;
@@ -30,7 +33,6 @@ declare const KICI_SHARED_BUNDLE_HASH: string;
 declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
 const ORCHESTRATOR_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
-const BUILD_COMMIT = typeof KICI_BUILD_COMMIT !== 'undefined' ? KICI_BUILD_COMMIT : 'unknown';
 const SDK_VERSION = typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown';
 const SDK_BUNDLE_HASH =
   typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown';
@@ -66,7 +68,6 @@ await guardStartup(logger, async () => {
   // SDK drift diagnostic (see docs/operator/troubleshooting.md).
   logger.info('orchestrator.build.info', {
     orchestratorVersion: ORCHESTRATOR_VERSION,
-    buildCommit: BUILD_COMMIT,
     sdkVersion: SDK_VERSION,
     sdkBundleHash: SDK_BUNDLE_HASH,
     sharedVersion: SHARED_VERSION,

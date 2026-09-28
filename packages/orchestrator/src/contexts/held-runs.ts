@@ -723,8 +723,8 @@ export class HeldRunStore {
 /**
  * Build a HeldRunStore backed by its own connection pool to the given
  * orchestrator database URL. Mirrors `createPeerCredentialStoreFromUrl` /
- * `createJoinTokenManagerFromUrl`; consumed by E2E tests that exercise the
- * PR-scoped hold selection against the real deployed orchestrator DB.
+ * `createJoinTokenManagerFromUrl`; used by tests that exercise the PR-scoped
+ * hold selection against a real orchestrator DB.
  */
 export function createHeldRunStoreFromUrl(
   databaseUrl: string,

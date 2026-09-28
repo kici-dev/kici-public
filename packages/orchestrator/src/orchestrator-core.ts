@@ -16,12 +16,15 @@ import { serve } from '@hono/node-server';
 import {
   applyProxyKeepAliveTimeouts,
   ChunkLru,
+  closeDatabase,
   createLogger,
   getRequestContext,
   parseDatabaseUrl,
   requestContext,
   setupGracefulShutdown,
+  stopHttpServer,
   toErrorMessage,
+  trackOpenSockets,
   validateRequiredTools,
   type ColdStore,
 } from '@kici-dev/shared';
@@ -318,6 +321,7 @@ import type { Database } from './db/types.js';
 import { JobKind } from './db/types.js';
 import { resolveDispatchCloneAuth } from './git/dispatch-git-auth.js';
 import type pg from 'pg';
+import { runDetached } from './helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'core' });
 
@@ -776,9 +780,9 @@ async function initializeScaler(
           error: toErrorMessage(err),
         });
       }
-      // Long-running orchestrators can't rely on startup-only cleanup:
-      // kici-leak-sweep skips interface cleanup while the orchestrator is
-      // active, so leaked TAPs accumulate until restart. A leaked TAP under
+      // Long-running orchestrators can't rely on startup-only cleanup: a
+      // host-level cleanup job skips interface cleanup while the orchestrator
+      // is active, so leaked TAPs accumulate until restart. A leaked TAP under
       // heavy churn can wedge NetworkManager (observed 2026-04-14). The
       // periodic sweep inside the backend closes that gap.
       fcBackend.startPeriodicOrphanSweep();
@@ -1089,7 +1093,7 @@ interface SecretsInfra {
   secretResolver: SecretResolver | null;
   adminDeps: AdminRouteDeps | undefined;
   pgSecretStore: PgSecretStore | undefined;
-  /** Phase D: exposed so the bootstrap can late-bind a cold-store handle. */
+  /** Exposed so the bootstrap can late-bind a cold-store handle. */
   auditLogger: AuditLogger | undefined;
   /**
    * The master key in both forms, resolved once from the env-then-file
@@ -2290,7 +2294,10 @@ function initializeCluster(
     },
     onPeerLogChunk: (chunk, _peerId) => {
       for (const group of normalizePeerLogChunk(chunk)) {
-        peerLogChunkSink(group);
+        runDetached(logger, 'Peer log chunk write', () => peerLogChunkSink(group), {
+          runId: group.runId,
+          jobId: group.jobId,
+        });
       }
     },
     onPeerCacheUploadRequest: async (req, _peerId) => {
@@ -2340,11 +2347,10 @@ function initializeCluster(
     onPeerLeaving: (msg) => raftNode.handlePeerLeaving(msg.instanceId),
     onAgentTokenRevoke: (msg) => {
       const kicked = agentRegistry.disconnectByTokenId(msg.tokenId);
-      // Always log on receipt (not just when kicked > 0): the staging
-      // operator-friendly Loki dogfood relies on these lines to confirm
-      // the fan-out reached every peer, and KICI_AGENT_AUTH=none deploys
-      // legitimately observe kicked=0 because no agent ever populated a
-      // tokenId in the registry.
+      // Always log on receipt (not just when kicked > 0): operators rely on
+      // these lines to confirm the fan-out reached every peer, and
+      // KICI_AGENT_AUTH=none deploys legitimately observe kicked=0 because no
+      // agent ever populated a tokenId in the registry.
       logger.info('Kicked agent connections after cross-peer revoke', {
         tokenId: msg.tokenId,
         senderInstanceId: msg.senderInstanceId,
@@ -2410,9 +2416,10 @@ function initializeCluster(
    * originating peer kicks itself synchronously inside the DELETE admin
    * route, so this fan-out reaches only the *other* peers in the cluster.
    *
-   * Fire-and-forget: matches's Valkey pub/sub semantics (no per-peer
-   * ACK, no aggregated kick count). Operators see per-peer detail in Loki
-   * via the `Kicked agent connections after cross-peer revoke` log line.
+   * Fire-and-forget, like the Platform's `kici:revoke-key` Valkey pub/sub
+   * (no per-peer ACK, no aggregated kick count). Operators see per-peer
+   * detail in Loki via the
+   * `Kicked agent connections after cross-peer revoke` log line.
    */
   function broadcastAgentTokenRevoke(tokenId: string): void {
     const msg = {
@@ -2750,8 +2757,8 @@ export async function bootstrapOrchestrator(
       : {
           type: 'filesystem',
           // Execution-log storage base. An explicit KICI_WEBHOOK_PAYLOAD_DIR
-          // still overrides (staging/E2E rely on this). Otherwise resolve a
-          // writable data root: KICI_DATA_DIR → /var/lib/kici → XDG state dir.
+          // still overrides. Otherwise resolve a writable data root:
+          // KICI_DATA_DIR → /var/lib/kici → XDG state dir.
           // A user-level orchestrator can't write /var/lib/kici, so the
           // resolver falls back instead of failing the first job with EACCES.
           basePath:
@@ -3088,7 +3095,7 @@ export async function bootstrapOrchestrator(
     logger.warn('cold-store singleton init skipped', { error: toErrorMessage(err) });
   }
 
-  // Phase D: late-bind the cold-store onto the AccessLogWriter so its
+  // Late-bind the cold-store onto the AccessLogWriter so its
   // query() path merges archived rows transparently when pagination
   // crosses the warm cutoff. (AuditLogger gets the same treatment
   // after initializeSecrets returns; that one is gated on
@@ -3199,11 +3206,11 @@ export async function bootstrapOrchestrator(
         intervalMs: 60_000,
         handler: async () => {
           // Defense-in-depth for the TTL-expiry kick (sister to
-          // the revoke kick fixed in 993bc3d9d). The per-token timer
+          // the revoke kick). The per-token timer
           // scheduled at register-time covers the common case; this
           // periodic sweep covers the corner case where the timer
           // map was wiped (process restart) but the in-flight WS
-          // survived the bounce. See
+          // survived the bounce.
           await tokenStore.cleanupExpired({
             onBeforeDelete: (tokenIds) => {
               for (const tokenId of tokenIds) {
@@ -3218,7 +3225,7 @@ export async function bootstrapOrchestrator(
         handler: createColdStoreArchiveHandler(config.instanceId, db),
       },
       coldStorePurge: {
-        // Phase 2 — runs hourly, offset 15 minutes from the archive
+        // Runs hourly, offset 15 minutes from the archive
         // sweep so its newly-inserted `cold_store_chunks` rows have
         // settled before the purge looks for expired ones.
         intervalMs: 60 * 60 * 1000,
@@ -3250,7 +3257,7 @@ export async function bootstrapOrchestrator(
     // yet at this point in the bootstrap.
   }
 
-  // Phase D: late-bind the cold-store onto the AuditLogger so its
+  // Late-bind the cold-store onto the AuditLogger so its
   // query() path can read archived rows.
   if (auditLogger) auditLogger.setColdStore(coldStoreSingleton);
 
@@ -3375,7 +3382,7 @@ export async function bootstrapOrchestrator(
   // deployment that set it before then is locked out right now, so say so.
   // Reported, never repaired: re-enabling a write the operator disabled on
   // purpose is theirs to decide.
-  void warnOnHeldRunLockouts(db, config.mode);
+  runDetached(logger, 'Held-run lockout check', () => warnOnHeldRunLockouts(db, config.mode));
 
   /**
    * Re-register one generic source's provider bundle from its database row.
@@ -3659,7 +3666,9 @@ export async function bootstrapOrchestrator(
   // sit until they time out. Fire-and-forget; the dispatcher single-flights it.
   if (scalerManager) {
     scalerManager.onCapacityFreed = () => {
-      void dispatcher.retryPendingScaleRequests();
+      runDetached(logger, 'Capacity-freed scale re-drive', () =>
+        dispatcher.retryPendingScaleRequests(),
+      );
     };
     pendingScaleSweeper = new PendingScaleSweeper({
       redrive: () => dispatcher.retryPendingScaleRequests(DEFAULT_REDRIVE_BATCH, 'sweep'),
@@ -4023,14 +4032,14 @@ export async function bootstrapOrchestrator(
   // first attempts return null; we retry until the elected leader generates the
   // key (or any node reads the row the leader wrote to the shared DB).
   if (dashboardEncryptionRepo) {
-    void (async () => {
+    runDetached(logger, 'Dashboard encryption key provisioning', async () => {
       for (let attempt = 0; attempt < 120; attempt++) {
         const resolved = await resolveDashboardEncryptionKey();
         if (resolved) return;
         await new Promise((res) => setTimeout(res, 500));
       }
       logger.warn('dashboard encryption key not provisioned after boot retries');
-    })();
+    });
   }
 
   // Provenance trust root: for orchestrator-owned signing, verify at ingest
@@ -4252,7 +4261,7 @@ export async function bootstrapOrchestrator(
   // is memoized; for db custody a non-leader waits out the leader grace, then
   // creates the key itself if none appeared).
   if (provenanceSigningEnabled) {
-    void (async () => {
+    runDetached(logger, 'Provenance signing key provisioning', async () => {
       for (let i = 0; i < 120; i++) {
         const resolved = await resolveOrchestratorSigner().catch(() => null);
         if (resolved) {
@@ -4266,7 +4275,7 @@ export async function bootstrapOrchestrator(
       logger.warn(
         'provenance signing key not provisioned after boot retries (still lazy on demand)',
       );
-    })();
+    });
   }
 
   // Start stale peer eviction timer (removes peers that miss heartbeats)
@@ -4279,23 +4288,20 @@ export async function bootstrapOrchestrator(
   });
 
   // 26. DB polling fallback for registry sync
-  const registryPollInterval = setInterval(async () => {
-    try {
-      const dbVersion = await registrationStore.getVersion();
-      const localVersion = registrationIndex.getVersion();
-      if (dbVersion > localVersion) {
-        logger.info('DB registry version ahead, refreshing index', {
-          dbVersion,
-          localVersion,
-        });
-        await registrationIndex.refreshIfNeeded(dbVersion);
-        cluster.peerRegistry.setLocalRegistryVersion(registrationIndex.getVersion());
-      }
-    } catch (err) {
-      logger.error('Registry version poll failed', {
-        error: toErrorMessage(err),
+  const pollRegistryVersion = async (): Promise<void> => {
+    const dbVersion = await registrationStore.getVersion();
+    const localVersion = registrationIndex.getVersion();
+    if (dbVersion > localVersion) {
+      logger.info('DB registry version ahead, refreshing index', {
+        dbVersion,
+        localVersion,
       });
+      await registrationIndex.refreshIfNeeded(dbVersion);
+      cluster.peerRegistry.setLocalRegistryVersion(registrationIndex.getVersion());
     }
+  };
+  const registryPollInterval = setInterval(() => {
+    runDetached(logger, 'Registry version poll', pollRegistryVersion);
   }, 30_000);
 
   // 26b. Per-coordinator safety-net re-drive of pending jobs onto connected
@@ -4683,6 +4689,9 @@ export async function bootstrapOrchestrator(
       },
     ),
   );
+  // Tracked from the first connection, so the shutdown can destroy an
+  // upgraded socket whose close never completes.
+  const openSockets = trackOpenSockets(server);
 
   // 29. Start heartbeat monitor
   const heartbeatMonitor = new AgentHeartbeatMonitor({
@@ -5103,24 +5112,24 @@ export async function bootstrapOrchestrator(
         name: 'Closing inbound peer WebSocket connections',
         fn: () => {
           // Close all server-side peer WS connections BEFORE stopping the HTTP
-          // server. Node's http.Server.closeAllConnections() does NOT touch
-          // upgraded protocols like WebSocket, so without this step the
-          // inbound peer sockets keep server.close() waiting forever and
-          // the 30s graceful shutdown timer force-exits the process with
-          // status=1. This destabilised systemd restarts during E2E HA chaos.
+          // server, so each peer receives a proper close frame and sees this
+          // coordinator leave. Node's http.Server.closeAllConnections() does
+          // not touch upgraded protocols like WebSocket; the HTTP stop destroys
+          // a peer socket that is still open after its grace period.
           cluster.peerHandler.closeAllInbound();
         },
       },
       {
+        // Ends every plain HTTP connection (dashboard SSE streams, long
+        // polling) at once, then waits a short grace for the upgraded
+        // WebSocket sockets whose close frames the earlier steps sent. A socket
+        // still open after the grace is destroyed and logged by its remote
+        // address, so a peer that never completes the closing handshake cannot
+        // hold the stop open until the shutdown ceiling.
         name: 'Stopping HTTP server',
-        fn: () =>
-          new Promise<void>((resolve) => {
-            // Also force-close any remaining plain HTTP connections (dashboard
-            // SSE streams, long polling, etc). Safe no-op on older Node
-            // versions that lack closeAllConnections.
-            (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
-            server.close(() => resolve());
-          }),
+        fn: async () => {
+          await stopHttpServer(server, openSockets, { logger });
+        },
       },
       {
         name: 'Stopping cron scheduler',
@@ -5174,13 +5183,12 @@ export async function bootstrapOrchestrator(
         fn: () => instanceHeartbeat.retire(),
       },
       {
+        // Waits for in-flight queries before it closes: a query acquiring a
+        // connection while the pool shuts down would otherwise leak it and hold
+        // the close open until the shutdown ceiling forces an exit.
         name: 'Closing database',
         fn: async () => {
-          try {
-            await db.destroy();
-          } catch (_e) {
-            // Ignore "Called end on pool more than once" during shutdown
-          }
+          await closeDatabase(db, pool);
         },
       },
       {

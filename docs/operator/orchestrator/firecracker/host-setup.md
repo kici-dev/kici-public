@@ -83,13 +83,13 @@ Using the wrong kernel format for your architecture causes silent boot failures.
 
 ### Running the validation script
 
-KiCI includes a host validation script that checks all prerequisites:
+KiCI includes a host validation script that checks all prerequisites. It is one of the setup scripts in the source repository you clone in [Step 3](#get-the-setup-scripts). From the root of that checkout, run it as the user that runs the orchestrator, because it checks that user's access to `/dev/kvm`:
 
 ```bash
 bash scripts/firecracker/validate.sh
 ```
 
-The script checks `/dev/kvm` existence and permissions, Firecracker and jailer binary availability, network tools (iproute2, nftables), IPv4 forwarding, and (with `--bridge-name`) the bridge interface. Pass custom binary paths with `--firecracker-path` / `--jailer-path`.
+The script checks `/dev/kvm` existence and permissions, Firecracker and jailer binary availability, network tools (iproute2, nftables), IPv4 forwarding, and (with `--bridge-name`) the bridge interface. It looks for the binaries where [Step 3](#step-3-install-firecracker-and-jailer-binaries) installs them, `/usr/local/bin`. Pass other binary paths with `--firecracker-path` / `--jailer-path`.
 
 ## Step 1: Install host system packages
 
@@ -105,6 +105,8 @@ is used for:
 | `libcap2-bin`     | `setcap` / `getcap` for granting jailer file capabilities (Step 4)                         |
 | `debootstrap`     | Builds the Debian agent rootfs (Step 7) without needing a container runtime                |
 | `e2fsprogs`       | `mkfs.ext4` to format the agent rootfs image                                               |
+| `util-linux`      | `flock`, `losetup` and `findmnt`, which the rootfs build uses (Step 7)                     |
+| `git`             | Clones the source repository that holds the setup scripts                                  |
 | `acl`             | `setfacl` if you need fine-grained `/dev/kvm` permissions (rarely needed)                  |
 | `curl`            | Downloads the Firecracker release tarball + kernel image                                   |
 | `ca-certificates` | TLS roots for `curl` against GitHub releases / S3                                          |
@@ -116,8 +118,8 @@ Debian 12+ / Ubuntu 22.04+:
 ```bash
 sudo apt update
 sudo apt install -y \
-  nftables iproute2 bridge-utils libcap2-bin debootstrap e2fsprogs acl \
-  curl ca-certificates xz-utils jq
+  nftables iproute2 bridge-utils libcap2-bin debootstrap e2fsprogs util-linux acl \
+  curl ca-certificates xz-utils jq git
 ```
 
 Fedora / RHEL 9+:
@@ -125,17 +127,22 @@ Fedora / RHEL 9+:
 ```bash
 sudo dnf install -y \
   nftables iproute bridge-utils libcap libcap-ng-utils \
-  e2fsprogs acl curl ca-certificates xz jq
-# debootstrap is Debian-only; on RPM hosts, build the rootfs from a Debian
-# container or use a pre-built rootfs (see the rootfs build guide).
+  e2fsprogs util-linux acl curl ca-certificates xz jq git
+# The rootfs build (Step 7) needs debootstrap. Where your distribution does not
+# package it, build the rootfs on a Debian or Ubuntu host of the same
+# architecture, and copy the image to this host.
 ```
 
-Verify everything is on `PATH`:
+Verify every tool is installed. Several of them live in `/usr/sbin`, which a
+regular user's `PATH` often lacks, so the check looks there too:
 
 ```bash
-for t in nft ip brctl setcap debootstrap mkfs.ext4 setfacl curl xz jq; do
-  command -v "$t" >/dev/null && echo "OK   $t" || echo "MISS $t"
-done
+(
+  PATH="$PATH:/usr/sbin:/sbin"
+  for t in nft ip brctl setcap debootstrap mkfs.ext4 flock losetup findmnt setfacl curl xz jq git; do
+    command -v "$t" >/dev/null && echo "OK   $t" || echo "MISS $t"
+  done
+)
 ```
 
 ## Step 2: Create the operator user
@@ -252,9 +259,38 @@ itself runs as `kici` via systemd.
 > it.
 
 After picking a variant, all further steps in this guide should be run as
-`kici`. To tear down later: `sudo userdel -r kici && sudo rm -f /etc/sudoers.d/kici`.
+`kici`, except the steps that use the setup scripts' checkout, which an
+administrator runs (see [Get the setup scripts](#get-the-setup-scripts)). To
+tear down later: `sudo userdel -r kici && sudo rm -f /etc/sudoers.d/kici`.
 
 ## Step 3: Install Firecracker and jailer binaries
+
+### Get the setup scripts
+
+The setup scripts this guide runs live in `scripts/firecracker/` of the KiCI
+source repository, [github.com/kici-dev/kici-public](https://github.com/kici-dev/kici-public).
+Steps 3, 7 and 9 run code from this checkout as root, so keep it owned by root:
+a checkout the `kici` user can change would let `kici` run code as root. Run
+those three steps from an administrator account with full `sudo`, or as root.
+Neither [Variant A1](#variant-a1-narrowed-nopasswd-allowlist-recommended) nor
+[Variant B](#variant-b-production-system-user-hardened-systemd-only) lets `kici`
+run them.
+
+Clone the repository at the release tag of your orchestrator:
+
+```bash
+sudo git clone --branch v<version> https://github.com/kici-dev/kici-public.git /usr/local/src/kici-public
+cd /usr/local/src/kici-public
+```
+
+Replace `<version>` with your orchestrator version, for example `v0.12.0`.
+The source repository carries these scripts from KiCI 0.12.0 on. For an older
+orchestrator, upgrade it first. Run every `scripts/firecracker/…` command in
+this guide from the root of this checkout. The validation, installer and jailer
+scripts run as they are. The rootfs build in [Step 7](#step-7-build-the-agent-rootfs)
+also needs the workspace installed and built.
+
+### Run the installer
 
 Run the pinned installer — it downloads the release for your architecture,
 installs the `firecracker` + `jailer` binaries to `/usr/local/bin`, and applies
@@ -306,32 +342,42 @@ above; using the wrong format causes silent boot failures.
 
 ```bash
 ARCH=$(uname -m)
-KERNEL_VERSION="5.10"
+KERNEL_VERSION="6.1.155"
+# amd64 boots an uncompressed ELF vmlinux, arm64 a PE Image
+case "$ARCH" in
+  aarch64) KERNEL=/opt/kici/Image ;;
+  *) KERNEL=/opt/kici/vmlinux.bin ;;
+esac
 
-# amd64: uncompressed ELF vmlinux
-curl -fSL -o /opt/kici/vmlinux.bin \
-  "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/${ARCH}/vmlinux-${KERNEL_VERSION}"
+sudo install -d -m 755 -o kici -g kici /opt/kici
+curl -fSL -o "$KERNEL" \
+  "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14/${ARCH}/vmlinux-${KERNEL_VERSION}"
 
-# Verify it's a valid ELF binary (amd64)
-file /opt/kici/vmlinux.bin
-# Expected: ELF 64-bit LSB executable...
-
-# arm64: download the PE-format Image instead and reference it as kernelPath
-# (e.g. /opt/kici/Image) in scalers.yaml.
+# Verify the format for your architecture
+file "$KERNEL"
+# Expected on amd64: ELF 64-bit LSB executable...
+# Expected on arm64: Linux kernel ARM64 boot executable Image...
 ```
+
+Firecracker's CI bucket names the arm64 kernel `vmlinux` too, but the file is
+already in the `Image` (PE) format that arm64 needs. Set `kernelPath` in
+`scalers.yaml` to the file you downloaded: `/opt/kici/vmlinux.bin` on amd64,
+`/opt/kici/Image` on arm64.
 
 Firecracker also publishes pre-built kernels for both architectures on their
 [releases page](https://github.com/firecracker-microvm/firecracker/releases).
 
 ## Step 7: Build the agent rootfs
 
-Each VM boots from a copy of an ext4 rootfs image containing the operating system and the KiCI agent binary. Build it with:
+Each VM boots from a copy of an ext4 rootfs image that holds a minimal Debian system, Node.js and the bundled KiCI agent. The build script bundles the agent from your checkout of the source repository, so install and build the workspace first. This needs Node.js 24 and pnpm 11 on your `PATH`: the repository's `.mise.toml` pins both, and on Node.js 24 `corepack enable` provides the pinned pnpm. `sudo env PATH="$PATH"` passes your `PATH` to root, so root runs the same Node.js and pnpm. As the administrator, from the root of the checkout:
 
 ```bash
-sudo bash scripts/firecracker/build-agent-rootfs.sh /opt/kici/agent-rootfs.ext4 1024
+sudo env PATH="$PATH" pnpm install --frozen-lockfile
+sudo env PATH="$PATH" pnpm build
+sudo env PATH="$PATH" bash scripts/firecracker/build-agent-rootfs.sh /opt/kici/agent-rootfs.ext4 1024
 ```
 
-See the [Firecracker rootfs build guide](./rootfs.md) for the full walkthrough — starting from a container image, including the agent binary, the MMDS-based bootstrap init script, and keeping images minimal. Build the rootfs on (or for) the same architecture as the host that will boot it.
+The first build takes several minutes: it bootstraps the Debian base, which later builds reuse. See the [Firecracker rootfs build guide](./rootfs.md) for the toolchain, the two build phases, the VM `/init`, the options and upgrades. Build the rootfs on the same architecture as the host that boots it.
 
 ## Step 8: Network setup
 
@@ -392,10 +438,15 @@ refills `baseline`, removes from `forward` only the rules no running VM owns,
 and re-adds the tail jump. It never deletes the table.
 
 That matters because the orchestrator re-provisions whenever it finds the bridge
-unhealthy — after NetworkManager strips the bridge address, for instance. It has
+unhealthy — after NetworkManager strips the bridge address, for instance, or
+after another bridge was provisioned into the same table. It has
 no way to know how many VMs are live at that moment. Deleting the table would
 leave every one of them with unrestricted network access until it was
 destroyed.
+
+In a table that two bridges share, re-provisioning one bridge removes the NAT
+of the other. Give each bridge its own table; see
+[Network configuration](../auto-scaler/firecracker.md#network-configuration).
 
 The ordering is also the security property: because per-VM rules precede the
 jump, a label set's `networkPolicy` decides a packet before the host baseline
@@ -419,7 +470,7 @@ systemctl is-enabled kici-fc-net-kici-br0.service   # -> enabled
 sudo kici-admin firecracker verify --bridge kici-br0 --cidr 10.0.0.1/24 --table kici
 ```
 
-`verify` exits `0` when healthy, and non-zero with a precise message on any miss. It checks the bridge is up, the address is assigned, the nft table exists, the `baseline` chain exists and is reached by the forward chain's last rule, and every enslaved TAP carries port isolation. `kici-admin diagnose` also reports a `firecracker:<bridge>` health row for every bridge the orchestrator's scaler config references, so a broken bridge surfaces in routine diagnostics.
+`verify` exits `0` when healthy, and non-zero with a precise message on any miss. It checks the bridge is up, the address is assigned, the nft table exists, the `baseline` chain exists and is reached by the forward chain's last rule, and every enslaved TAP carries port isolation. It also checks the rules for the bridge subnet: the `postrouting` chain masquerades the subnet, and the `baseline` chain holds the subnet's rules in the order `provision` writes them. Without the masquerade rule, a VM has no internet access and cannot resolve a host name. `kici-admin diagnose` also reports a `firecracker:<bridge>` health row for every bridge the orchestrator's scaler config references, so a broken bridge surfaces in routine diagnostics.
 
 To remove the bridge + its nft table (the host-scoped NetworkManager conf is left in place so other bridges keep their gateway IP):
 
@@ -560,7 +611,7 @@ scalers:
     maxAgents: 10
     firecrackerPath: /usr/local/bin/firecracker
     jailerPath: /usr/local/bin/jailer
-    kernelPath: /opt/kici/vmlinux.bin
+    kernelPath: /opt/kici/vmlinux.bin # /opt/kici/Image on arm64
     chrootBaseDir: /srv/jailer
     uid: 10000
     gid: 10000
@@ -657,11 +708,13 @@ If the host runs NetworkManager, it **must** be configured to leave `kici-*` int
 
 ```bash
 cat /etc/NetworkManager/conf.d/90-kici-unmanaged.conf
-# Should contain: unmanaged-devices=interface-name:kici-*
+# Should contain: unmanaged-devices+=interface-name:kici-*
 
 nmcli -t -f DEVICE,TYPE,STATE dev | grep kici-
 # Every kici-* device should show "unmanaged"
 ```
+
+The `+=` operator appends to the list. An `unmanaged-devices` line in another drop-in stays in effect, and this one is not replaced by it.
 
 The conf file is **host-scoped**, not bridge-scoped: the `interface-name:kici-*` pattern protects every kici-\* interface on the host (TAPs and any number of `kici-brN` bridges that coexist for separate orchestrators). Because of that, `kici-admin firecracker teardown` deliberately leaves the file in place — only the per-bridge state (the bridge interface itself + its nftables table) is removed. Removing the conf file from a per-bridge teardown would let NetworkManager adopt the bridges that aren't being torn down and silently strip their gateway IP, breaking every other Firecracker coordinator on the host.
 
@@ -680,7 +733,8 @@ getcap /usr/local/bin/jailer
 
 # 3. Bridge exists
 ip link show kici-br0
-# Should show the bridge interface in UP state
+# The flags in <...> should include UP. With no VM attached, the line also
+# shows NO-CARRIER and "state DOWN": that is normal for an idle bridge.
 
 # 4. nftables rules
 sudo nft list table kici
@@ -695,8 +749,8 @@ ls /sys/fs/cgroup/firecracker/
 # Should exist and be owned by the jailer user
 
 # 7. Kernel and rootfs
-file /opt/kici/vmlinux.bin
-# Expected: ELF 64-bit LSB executable (amd64)
+file /opt/kici/vmlinux.bin   # /opt/kici/Image on arm64
+# Expected: ELF 64-bit LSB executable (amd64), Linux kernel ARM64 boot executable Image (arm64)
 file /opt/kici/agent-rootfs.ext4
 # Expected: Linux rev 1.0 ext4 filesystem data
 
@@ -728,7 +782,7 @@ VM spawn times out or Firecracker exits immediately. Common causes:
 - Kernel or rootfs paths incorrect in config — the paths must exist on the host.
 - Jailer uid/gid does not have access to the chroot base directory. Re-check the `setcap` output (Step 4); file capabilities are cleared when the binary is replaced.
 
-Debug: run `bash scripts/firecracker/validate.sh`, check the orchestrator logs for Firecracker error output, and verify file permissions on the kernel and rootfs paths.
+Debug: run `bash scripts/firecracker/validate.sh` from your checkout of the source repository, check the orchestrator logs for Firecracker error output, and verify file permissions on the kernel and rootfs paths.
 
 ### Agent can't reach orchestrator
 
@@ -784,11 +838,9 @@ On every startup, and again on a 15-minute timer while it runs, the Firecracker 
 
 1. **DB allocations with dead processes** — the Firecracker process is gone (PID file check), so the TAP is deleted, the IP released, and the chroot removed.
 2. **Chroot directories without DB records** — directory removed.
-3. **Host TAP interfaces without DB allocations** — any interface matching `kici-[0-9a-f]{8}` that is not in `PROTECTED_INTERFACES` (`kici-br0`, `kici-br1`, `kici-m01`) and is not associated with a live DB allocation is deleted.
+3. **Host TAP interfaces without DB allocations** — any interface matching `kici-[0-9a-f]{8}` that is not the scaler's bridge (`bridgeName`) and is not associated with a live DB allocation is deleted.
 
-Pass 3 matters because NetworkManager polls every link on the host, so a handful of leaked TAPs from a SIGKILLed orchestrator can peg a CPU. The periodic timer exists because long-lived orchestrators (weeks of uptime is normal) would otherwise accumulate leaked TAPs — for example from a test worker SIGKILLed mid-destroy — until the next restart. If you add custom permanent kici-prefixed interfaces (e.g., additional bridges), add them to `PROTECTED_INTERFACES` in `packages/orchestrator/src/scaler/firecracker-backend.ts` so they survive sweeps. The per-VM pattern is narrow (`kici-<8-hex>`), so arbitrary operator-named interfaces like `kici-debug` are naturally ignored.
-
-This complements — but does not replace — the external host-level sweep (`kici-leak-sweep.timer`), which skips TAP cleanup while the orchestrator is active and therefore only catches orphans that survive an orchestrator stop.
+Pass 3 matters because NetworkManager polls every link on the host, so a handful of leaked TAPs from a SIGKILLed orchestrator can peg a CPU. The periodic timer exists because long-lived orchestrators (weeks of uptime is normal) would otherwise accumulate leaked TAPs — for example from a test worker SIGKILLed mid-destroy — until the next restart. The per-VM pattern is narrow (`kici-<8-hex>`), so the default bridge `kici-br0` and operator-named interfaces like `kici-br1` or `kici-debug` are never deleted. The sweep also never deletes the scaler's own bridge, even when `bridgeName` has the per-VM shape. Do not give any other permanent interface a `kici-<8-hex>` name: the sweep deletes it.
 
 ## Security considerations
 

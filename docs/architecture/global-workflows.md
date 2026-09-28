@@ -548,15 +548,15 @@ Operators enable the fleet-wide switch with `kici-admin cluster-settings`, then 
 # Fleet-wide master switch (once per cluster):
 kici-admin cluster-settings set --global-workflows-enabled true
 
-kici-admin org-settings global-workflows show --customer-id kiciStg00001
-kici-admin org-settings global-workflows allow-add 'myorg/ci-*' --customer-id kiciStg00001
-kici-admin org-settings global-workflows deny-add 'myorg/fork-*' --customer-id kiciStg00001
+kici-admin org-settings global-workflows show --customer-id acmeOrg00001
+kici-admin org-settings global-workflows allow-add 'myorg/ci-*' --customer-id acmeOrg00001
+kici-admin org-settings global-workflows deny-add 'myorg/fork-*' --customer-id acmeOrg00001
 
 # Pin an entry to one webhook source (qualified by routingKey):
 kici-admin org-settings global-workflows allow-add 'myorg/deploy' \
-  --customer-id kiciStg00001 --source github:42
+  --customer-id acmeOrg00001 --source github:42
 kici-admin org-settings global-workflows deny-add 'myorg/main' \
-  --customer-id kiciStg00001 --source generic:kiciStg00001:src-b
+  --customer-id acmeOrg00001 --source generic:acmeOrg00001:src-b
 ```
 
 `--org` is accepted as an alias for `--customer-id`. Omitting `--source`
@@ -640,4 +640,3 @@ source repo holds it.
 | SDK trigger types      | `packages/sdk/src/triggers/`                                     |
 | Engine trigger matcher | `packages/engine/src/trigger/matcher.ts`                         |
 | Org settings table     | `packages/orchestrator/src/db/types.ts` (OrgSettingsTable)       |
-| E2E test               | `e2e/tests/global-workflow.test.ts`                              |

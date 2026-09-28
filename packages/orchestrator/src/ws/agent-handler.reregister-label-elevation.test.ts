@@ -17,11 +17,11 @@
  *   authorized label set. The agent then receives prod-scoped secrets
  *   in the next `job.dispatch.secrets` envelope.
  *
- *   The re-register path also guards (a) the ephemeral identity-binding
+ *   The re-register path also re-runs (a) the ephemeral identity-binding
  *   check (`tokenCreatedBy === agentId` for ephemeral tokens) and
- *   (b) the static-token agentId-collision check. Both gates currently
- *   only run on the first register; a re-register can supply any
- *   `msg.agentId` and rebind the WS to it without re-validation.
+ *   (b) the static-token agentId-collision check. Without them, a
+ *   re-register could supply any `msg.agentId` and rebind the WS to it
+ *   without re-validation.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PROTOCOL_VERSION, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
@@ -200,8 +200,8 @@ describe('agent re-register-time label-scope enforcement', () => {
   it('accepts a strict-subset re-register (voluntary scope-narrowing remains legitimate)', async () => {
     // Positive control: an agent that voluntarily narrows its label set on
     // re-register (e.g. a scaler-managed agent dropping a transient label
-    // before draining) MUST continue to be accepted. The fix is a
-    // subset-not-equality check.
+    // before draining) MUST continue to be accepted. The check is
+    // subset, not equality.
     const tokenStore = tokenStoreWithLabels(['ci', 'build', 'prod']);
     const handler = createAgentWsHandler({
       registry,
@@ -235,7 +235,7 @@ describe('agent re-register-time label-scope enforcement', () => {
     // Back-compat carve-out: tokens issued before `agent_tokens.labels`
     // became an enforced authorization signal (column value `null`)
     // continue to accept any wire labels at register AND re-register
-    // time. The fix must preserve this exception for both paths.
+    // time. The check preserves this exception for both paths.
     const tokenStore = tokenStoreWithLabels(null);
     const handler = createAgentWsHandler({
       registry,
@@ -270,12 +270,12 @@ describe('agent re-register-time label-scope enforcement', () => {
   });
 
   it('rejects re-register with a different agentId for ephemeral tokens (tokenCreatedBy binding)', async () => {
-    // Adjacent gap: the ephemeral identity-binding check in Phase 2
-    // (`tokenCreatedBy === agentId`) is also bypassed on re-register.
-    // An A5 holding a leaked ephemeral token bound to agentId
+    // The ephemeral identity-binding check from Phase 2
+    // (`tokenCreatedBy === agentId`) also runs on re-register. Without it,
+    // a compromised agent holding a leaked ephemeral token bound to agentId
     // 'agent-original' could re-register as a different agentId on the
-    // same WS. Post-fix expectation: the re-register branch re-runs the
-    // identity-binding check and closes the WS with auth-failed.
+    // same WS. The re-register branch re-runs the identity-binding check
+    // and closes the WS with auth-failed.
     const tokenStore = tokenStoreWithLabels(null, {
       agent_type: 'ephemeral',
       created_by: 'agent-original',

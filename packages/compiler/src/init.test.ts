@@ -309,7 +309,7 @@ describe('kici init', () => {
   describe('development mode', () => {
     it('creates .npmrc pointing at KICI_DEV_REGISTRY when KICI_DEV=true', async () => {
       process.env.KICI_DEV = 'true';
-      process.env.KICI_DEV_REGISTRY = 'http://verdaccio.local:4873';
+      process.env.KICI_DEV_REGISTRY = 'http://registry.local:4873';
 
       const success = await initCommand({ skipInstall: true });
       expect(success).toBe(true);
@@ -318,17 +318,17 @@ describe('kici init', () => {
       const npmrcPath = path.join(tempDir, '.kici', '.npmrc');
       expect(await exists(npmrcPath)).toBe(true);
       const content = await fs.readFile(npmrcPath, 'utf-8');
-      expect(content).toContain('@kici-dev:registry=http://verdaccio.local:4873');
+      expect(content).toContain('@kici-dev:registry=http://registry.local:4873');
 
       // root .npmrc
       const rootNpmrcPath = path.join(tempDir, '.npmrc');
       expect(await exists(rootNpmrcPath)).toBe(true);
       const rootContent = await fs.readFile(rootNpmrcPath, 'utf-8');
-      expect(rootContent).toContain('@kici-dev:registry=http://verdaccio.local:4873');
+      expect(rootContent).toContain('@kici-dev:registry=http://registry.local:4873');
     });
 
     it('creates .npmrc when root package.json has kici.development flag', async () => {
-      process.env.KICI_DEV_REGISTRY = 'http://verdaccio.local:4873';
+      process.env.KICI_DEV_REGISTRY = 'http://registry.local:4873';
       // Write root package.json with dev flag
       await fs.writeFile(
         path.join(tempDir, 'package.json'),
@@ -516,7 +516,7 @@ describe('kici init', () => {
 
     it('dev mode writes the root .npmrc, not .kici/.npmrc', async () => {
       process.env.KICI_DEV = 'true';
-      process.env.KICI_DEV_REGISTRY = 'http://verdaccio.local:4873';
+      process.env.KICI_DEV_REGISTRY = 'http://registry.local:4873';
       try {
         await makePnpmWorkspace();
         await initCommand({ workspace: true, skipInstall: true });

@@ -169,12 +169,12 @@ describe('detectWorkflowModifications', () => {
         ],
       }),
       // deploy removed
-      makeWorkflow('e2e'), // e2e added
+      makeWorkflow('e2e'), // 'e2e' added
     ]);
 
     const result = detectWorkflowModifications(base, head);
 
-    // ci modified, deploy removed, lint removed, e2e added
+    // 'ci' modified, 'deploy' removed, 'lint' removed, 'e2e' added
     expect(result).toContainEqual({ workflowName: 'ci', changeType: 'modified' });
     expect(result).toContainEqual({ workflowName: 'e2e', changeType: 'added' });
     expect(result).toContainEqual({ workflowName: 'deploy', changeType: 'removed' });

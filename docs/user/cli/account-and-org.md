@@ -15,7 +15,7 @@ The browser flow completes by receiving a callback on `127.0.0.1`. If that callb
 
 After OAuth, the CLI exchanges the OIDC token for a personal access token (PAT) stored in the config directory (`~/.kici/config` by default, overridable with `KICI_CONFIG_DIR`).
 
-`kici login` targets the hosted KiCI Platform by default. To authenticate against another KiCI environment (staging, or a testing OIDC provider, for example), pass `--platform-endpoint` / `--oidc-issuer` or set `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
+`kici login` targets the hosted KiCI Platform by default. `--platform-endpoint` / `--oidc-issuer`, or `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`, override the endpoint and the OIDC issuer. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
 
 ```bash
 kici login [options]

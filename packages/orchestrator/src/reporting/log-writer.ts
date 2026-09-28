@@ -17,6 +17,7 @@ import { stepLogPath } from './step-log-path.js';
 import { LogStream } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { ObserverRegistry } from '../ws/observer-registry.js';
+import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'log-writer' });
 
@@ -204,11 +205,17 @@ export class LogWriter {
       this.pendingAppends.set(runId, runPending);
     }
     runPending.add(tracked);
-    void tracked.then(() => {
-      const set = this.pendingAppends.get(runId);
-      if (!set) return;
-      set.delete(tracked);
-      if (set.size === 0) this.pendingAppends.delete(runId);
-    });
+    runDetached(
+      logger,
+      'Pending append cleanup',
+      () =>
+        tracked.then(() => {
+          const set = this.pendingAppends.get(runId);
+          if (!set) return;
+          set.delete(tracked);
+          if (set.size === 0) this.pendingAppends.delete(runId);
+        }),
+      { runId },
+    );
   }
 }

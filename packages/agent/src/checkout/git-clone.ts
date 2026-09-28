@@ -35,9 +35,8 @@ interface CloneOptions {
   workDir: string;
   /**
    * Optional auth token (GitHub installation token or personal token).
-   * Deprecated in favour of `gitAuth`; retained for backward compatibility
-   * during the Phase 4 universal-git rollout. When both are set, `gitAuth`
-   * wins.
+   * Deprecated in favour of `gitAuth`; retained for backward compatibility.
+   * When both are set, `gitAuth` wins.
    */
   token?: string;
   /**
@@ -136,8 +135,8 @@ export async function gitClone(options: CloneOptions): Promise<void> {
   } = options;
 
   // Normalise the auth inputs:
-  //   - When both `gitAuth` and `token` are set, `gitAuth` wins (Phase 4 is
-  //     the structured path; `token` is a transition-window fallback).
+  //   - When both `gitAuth` and `token` are set, `gitAuth` wins (`gitAuth` is
+  //     the structured path; `token` is the backward-compatible fallback).
   //   - When only `token` is set, we synthesize a Basic-auth GitAuth so the
   //     rest of the function has a single code path.
   const auth: GitAuth | undefined = gitAuth

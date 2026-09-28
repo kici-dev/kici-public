@@ -1,8 +1,5 @@
 /**
  * Cold-store configuration types.
- *
- * section 5. Per-table defaults in DEFAULT_TABLE_CONFIG mirror the
- * design doc's table.
  */
 import type { SharedS3Config } from '../s3-client.js';
 
@@ -33,7 +30,7 @@ export interface ColdStoreTableConfig {
 }
 
 /**
- * Reasonable defaults — matches the design doc's section 5 table.
+ * Reasonable defaults.
  * Concrete adapters can override any subset of these.
  */
 export const DEFAULT_TABLE_CONFIG: ColdStoreTableConfig = {

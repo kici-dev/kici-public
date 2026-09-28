@@ -32,12 +32,12 @@ describe('renderRunBanner (attached)', () => {
   const banner = renderRunBanner({
     mode: 'attached',
     planeUrl: 'http://127.0.0.1:4319',
-    orgId: 'kiciStg00001',
+    orgId: 'acmeOrg00001',
   });
 
   it('states the hybrid/attached plane and REAL Platform identity', () => {
     expect(banner).toContain('local dev orchestrator (hybrid, attached)');
-    expect(banner).toContain('REAL scoped (org: kiciStg00001)');
+    expect(banner).toContain('REAL scoped (org: acmeOrg00001)');
     // The hybrid plane is its own issuer, like a deployed orchestrator — the
     // row names that issuer rather than the hosted Platform, which mints nothing.
     expect(banner).toContain('plane-signed OIDC + attestation (iss=http://127.0.0.1:4319)');

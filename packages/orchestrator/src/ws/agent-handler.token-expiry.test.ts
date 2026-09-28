@@ -1,7 +1,7 @@
 /**
- * pentest repro: natural TTL expiry does not close in-flight agent
- * WS connections (sister finding to the revoke-stale-WS finding,
- * with `expires_at` passing naturally as the trigger instead of
+ * regression: natural TTL expiry must close in-flight agent WS
+ * connections (the counterpart of the revocation case, with
+ * `expires_at` passing naturally as the trigger instead of
  * `revoked_at`).
  *
  * Trust model the system claims to hold:
@@ -10,17 +10,16 @@
  *   window. The agent must not retain data-plane access — job claims, log
  *   streaming, secret receipt — past the token's TTL.
  *
- *   Today the orchestrator's agent WS handler validates the token only
- *   once at the auth phase (agent-handler.ts:514, `tokenStore.validate`).
- * The revoke fix (`993bc3d9d`) added a synchronous local kick on
- *   the admin DELETE route, but there is NO equivalent kick path for
- *   natural TTL expiration: when `expires_at` passes without a revoke
- *   call, nothing closes the WS. An A10 attacker who stole an ephemeral
- *   token within its TTL connects, authenticates, and keeps the
- *   authenticated WS alive past expiry — same data-plane authority as
- *   before, even though the token is "expired" in the DB.
+ *   The orchestrator's agent WS handler validates the token only once, at
+ *   the auth phase (`tokenStore.validate`). A revoke kicks in-flight WS
+ *   synchronously from the admin DELETE route, but natural TTL expiry makes
+ *   no revoke call. Without an expiry kick, nothing would close the WS when
+ *   `expires_at` passes: an attacker who stole an ephemeral token within its
+ *   TTL could connect, authenticate, and keep the authenticated WS alive
+ *   past expiry — same data-plane authority, even though the token is
+ *   "expired" in the DB.
  *
- * The fix mirrors revoke's local-kick pattern with TTL as the
+ * The expiry kick mirrors revoke's local kick with TTL as the
  *   trigger: at register-time, the agent WS handler schedules a
  *   per-token kick timer keyed on `tokenRow.expires_at` via
  *   `AgentRegistry.scheduleExpiryKick(...)`. When the timer fires,
@@ -74,9 +73,8 @@ function registerMsg(opts: { agentId: string; labels: string[] }) {
  * clause `expires_at IS NULL OR expires_at > now()` in
  * `AgentTokenStore.validate()`.
  *
- * The fix's most natural shape is a per-token kick timer scheduled at
- * auth time keyed on `expires_at`. Whatever the fix mechanism, on TTL
- * firing it must (a) close the WS with an auth-failure code and (b)
+ * The kick is a per-token timer scheduled at register time and keyed on
+ * `expires_at`. Whatever the mechanism, on TTL firing it must (a) close the WS with an auth-failure code and (b)
  * unregister the agent from the registry.
  */
 function expiringEphemeralTokenStore(opts: {
@@ -114,7 +112,7 @@ function expiringEphemeralTokenStore(opts: {
   return { store, expiresAt };
 }
 
-describe(' ephemeral-token natural TTL expiry propagates to in-flight WS', () => {
+describe('ephemeral-token natural TTL expiry propagates to in-flight WS', () => {
   let registry: AgentRegistry;
   let dispatcher: Dispatcher;
 
@@ -155,15 +153,15 @@ describe(' ephemeral-token natural TTL expiry propagates to in-flight WS', () =>
     expect(registry.get('agent-expiring')).toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();
 
-    // Advance past the token's TTL. The fix's kick path (per-token
+    // Advance past the token's TTL. The kick path (per-token
     // timer / cleanup-cycle disconnect / poll loop) must observe the
     // expiration and kick the WS within a bounded window. We give it
     // generous slack (60s past TTL) so an implementation with a 30s
     // poll interval still passes.
     await vi.advanceTimersByTimeAsync(70_000);
 
-    // INVARIANT (, TTL): in-flight WS MUST be closed after natural
-    // TTL expiry. Same architectural rule as the revoke fix; just
+    // INVARIANT (TTL): in-flight WS MUST be closed after natural
+    // TTL expiry. Same architectural rule as the revoke kick; just
     // a different trigger.
     expect(ws.close).toHaveBeenCalled();
     expect(registry.get('agent-expiring')).toBeUndefined();
@@ -171,8 +169,8 @@ describe(' ephemeral-token natural TTL expiry propagates to in-flight WS', () =>
 
   it('does NOT close in-flight WS while the ephemeral token is still within its TTL', async () => {
     // Counter-test: a token with TTL=1h must remain connected after the
-    // same 70s advance used in the failing repro. Catches a regression
-    // where the fix's kick mechanism fires too aggressively (e.g., a
+    // same 70s advance the expiry test uses. Catches a regression
+    // where the kick mechanism fires too aggressively (e.g., a
     // poll loop that closes every WS instead of only the expired ones).
     const { store: tokenStore } = expiringEphemeralTokenStore({
       agentId: 'agent-stable',

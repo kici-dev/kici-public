@@ -17,9 +17,9 @@ import { packKiciSource } from './source-packer.js';
  * that tree survives the round trip. A `.kici/node_modules` symlink does not:
  * the packer drops the path by prefix, and the restore renames an
  * already-installed dependency directory into the extracted tree. So the
- * producer hashed a member that could not exist on the other side, and eight
- * consecutive staging runs failed the drift gate against source nobody had
- * touched. This reproduces that in milliseconds.
+ * producer hashed a member that could not exist on the other side, and every
+ * run failed the drift gate against source nobody had touched. This reproduces
+ * that in milliseconds.
  */
 describe('the digest survives pack → extract → dependency install', () => {
   let root: string;

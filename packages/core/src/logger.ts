@@ -62,13 +62,19 @@ installStreamErrorHandlers();
  */
 const _pendingFileTransportLoggers: Set<winston.Logger> = new Set();
 
+/** Every rotated-file transport this process built, so {@link flushLogFiles} can reach them. */
+const _fileTransports: Set<DailyRotateFile> = new Set();
+
+/** The flush in progress, shared by every caller that arrives while it runs. */
+let _flushInFlight: Promise<void> | null = null;
+
 function buildFileTransport(): DailyRotateFile | undefined {
   // Defensive: `process.env.KICI_LOG_DIR = undefined` coerces to the literal
   // string "undefined", which would create an `undefined/` directory at the
   // cwd. Treat that as unset to match operator intent.
   const dir = process.env.KICI_LOG_DIR;
   if (!dir || dir === 'undefined') return undefined;
-  return new DailyRotateFile({
+  const transport = new DailyRotateFile({
     dirname: dir,
     filename: buildLogFilename(_serviceName),
     datePattern: 'YYYY-MM-DD',
@@ -91,6 +97,54 @@ function buildFileTransport(): DailyRotateFile | undefined {
     ),
     zippedArchive: true,
   });
+  _fileTransports.add(transport);
+  return transport;
+}
+
+/**
+ * Write every line already logged to the rotated log files, then stop writing
+ * to them. A shutdown calls it right before process.exit(): the file transport
+ * writes through an asynchronous stream, and an exit that does not wait for it
+ * loses the last lines, which stdout (written synchronously) still has. Lines
+ * logged after the flush reach the other transports only. A caller that
+ * arrives while a flush runs waits for that flush. Resolves within
+ * `timeoutMs`.
+ */
+export function flushLogFiles(timeoutMs = 2_000): Promise<void> {
+  if (_flushInFlight) return _flushInFlight;
+  if (_fileTransports.size === 0) return Promise.resolve();
+  _flushInFlight = closeFileTransports(timeoutMs).finally(() => {
+    _flushInFlight = null;
+  });
+  return _flushInFlight;
+}
+
+async function closeFileTransports(timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  const flush = async (): Promise<void> => {
+    // A line handed to a logger reaches its transports on a later turn of the event loop.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const transports = [..._fileTransports];
+    _fileTransports.clear();
+    await Promise.all(
+      transports.map(
+        (transport) =>
+          new Promise<void>((resolve) => {
+            transport.once('finish', () => resolve());
+            transport.silent = true;
+            transport.close?.();
+          }),
+      ),
+    );
+  };
+  try {
+    await Promise.race([flush(), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Set the service name for all loggers in this process. Call once at startup. */

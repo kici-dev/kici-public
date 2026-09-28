@@ -10,7 +10,7 @@ import { type Kysely, sql } from 'kysely';
  *   the separate queryable host-vars dimension.
  *
  * Idempotent (`ADD COLUMN IF NOT EXISTS`): re-running on a DB that already has
- * the column is a no-op. Staging data is preserved (additive column).
+ * the column is a no-op. Existing data is preserved (additive column).
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.host_roster

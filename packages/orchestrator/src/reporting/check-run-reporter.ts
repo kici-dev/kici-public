@@ -57,6 +57,7 @@ import {
   CheckRunConclusion,
   type TerminalJobStatus,
 } from '@kici-dev/engine';
+import { runDetached } from '../helpers/run-detached.js';
 
 /**
  * Dependencies for the CheckRunReporter.
@@ -654,7 +655,12 @@ export class CheckRunReporter {
     // Stamp the DB-backed pending marker BEFORE kicking off the create.
     // A replacement coord that takes over mid-create can read this marker
     // and avoid issuing a duplicate `checks.create()` for the same SHA.
-    void this.persistBuildCreationPending(key, opts.runId);
+    runDetached(
+      logger,
+      'Build creation marker write',
+      () => this.persistBuildCreationPending(key, opts.runId),
+      { runId: opts.runId },
+    );
     this.trackRunKey(opts.runId, key);
 
     const creation = this.doSetBuildPending(opts).catch((err) => {
@@ -669,7 +675,12 @@ export class CheckRunReporter {
     });
 
     this.pendingBuildCreations.set(key, creation);
-    creation.finally(() => this.pendingBuildCreations.delete(key));
+    runDetached(
+      logger,
+      'Build creation tracking cleanup',
+      () => creation.finally(() => this.pendingBuildCreations.delete(key)),
+      { runId: opts.runId },
+    );
   }
 
   /**

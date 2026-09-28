@@ -1,14 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { Writable } from 'node:stream';
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import winston from 'winston';
 import {
   setServiceName,
   getServiceName,
   createLogger,
   buildLogFilename,
+  flushLogFiles,
   installStreamErrorHandlers,
 } from './logger.js';
 import { requestContext } from './request-context.js';
+import { makeTempDir } from './tmp.js';
 
 /**
  * Strip ANSI colour codes so plain-text assertions can match against the
@@ -258,13 +262,13 @@ describe('buildLogFilename', () => {
   });
 
   it('uses KICI_CLUSTER_INSTANCE_ID for the orchestrator tier', () => {
-    process.env.KICI_CLUSTER_INSTANCE_ID = 'host-1-stg';
-    expect(buildLogFilename('orchestrator')).toBe('orchestrator-host-1-stg-%DATE%.log');
+    process.env.KICI_CLUSTER_INSTANCE_ID = 'host-1-eu';
+    expect(buildLogFilename('orchestrator')).toBe('orchestrator-host-1-eu-%DATE%.log');
   });
 
   it('uses KICI_AGENT_ID for the agent tier', () => {
-    process.env.KICI_AGENT_ID = 'stg-stateful-agent';
-    expect(buildLogFilename('agent')).toBe('agent-stg-stateful-agent-%DATE%.log');
+    process.env.KICI_AGENT_ID = 'stateful-agent-1';
+    expect(buildLogFilename('agent')).toBe('agent-stateful-agent-1-%DATE%.log');
   });
 
   it('uses KICI_PLATFORM_INSTANCE_ID for the platform tier', () => {
@@ -280,8 +284,8 @@ describe('buildLogFilename', () => {
   });
 
   it('falls back to "kici" when the service name is undefined', () => {
-    process.env.KICI_CLUSTER_INSTANCE_ID = 'host-1-stg';
-    expect(buildLogFilename(undefined)).toBe('kici-host-1-stg-%DATE%.log');
+    process.env.KICI_CLUSTER_INSTANCE_ID = 'host-1-eu';
+    expect(buildLogFilename(undefined)).toBe('kici-host-1-eu-%DATE%.log');
   });
 
   it('sanitizes unsafe characters in the instance id', () => {
@@ -487,5 +491,101 @@ describe('KICI_LOG_STDERR routing', () => {
     delete process.env.KICI_LOG_STDERR;
     const t = consoleTransport(createLogger());
     expect(t?.stderrLevels?.info).toBeUndefined();
+  });
+});
+
+describe('flushLogFiles', () => {
+  function fileContent(dir: string): string {
+    return readdirSync(dir)
+      .filter((f) => f.endsWith('.log'))
+      .map((f) => readFileSync(path.join(dir, f), 'utf-8'))
+      .join('');
+  }
+
+  // fails-when: a line logged right before exit is still in the file stream's
+  // buffer when the process exits (the file log then ends one line early).
+  it('puts the last logged line in the file before it resolves', async () => {
+    const tmp = await makeTempDir('flush-test');
+    const origLogDir = process.env.KICI_LOG_DIR;
+    try {
+      process.env.KICI_LOG_DIR = tmp.path;
+      setServiceName('orchestrator');
+      const log = createLogger({ json: true });
+      log.info('last line before exit');
+      // Control: without a flush the line is not on disk yet.
+      expect(fileContent(tmp.path)).not.toContain('last line before exit');
+
+      await flushLogFiles();
+
+      expect(fileContent(tmp.path)).toContain('last line before exit');
+    } finally {
+      if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
+      else process.env.KICI_LOG_DIR = origLogDir;
+      await tmp.cleanup();
+    }
+  });
+
+  // fails-when: a second caller (the forced exit racing a completed shutdown)
+  // resolves before the first flush has written the file.
+  it('makes a caller that arrives during a flush wait for it', async () => {
+    const tmp = await makeTempDir('flush-test');
+    const origLogDir = process.env.KICI_LOG_DIR;
+    try {
+      process.env.KICI_LOG_DIR = tmp.path;
+      setServiceName('orchestrator');
+      const log = createLogger({ json: true });
+      log.info('logged before two flushes');
+      const first = flushLogFiles();
+      await flushLogFiles();
+      expect(fileContent(tmp.path)).toContain('logged before two flushes');
+      await first;
+    } finally {
+      if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
+      else process.env.KICI_LOG_DIR = origLogDir;
+      await tmp.cleanup();
+    }
+  });
+
+  // breaks-if-wrong: a line logged after the flush still reaches the logger's
+  // other transports, and the closed file transport raises no error.
+  it('leaves the logger usable after the flush', async () => {
+    const tmp = await makeTempDir('flush-test');
+    const origLogDir = process.env.KICI_LOG_DIR;
+    try {
+      process.env.KICI_LOG_DIR = tmp.path;
+      setServiceName('orchestrator');
+      const log = createLogger({ json: true });
+      const lines: string[] = [];
+      log.add(
+        new winston.transports.Stream({
+          stream: new Writable({
+            write(chunk, _encoding, callback) {
+              lines.push(chunk.toString());
+              callback();
+            },
+          }),
+        }),
+      );
+      const errors: unknown[] = [];
+      log.on('error', (err) => errors.push(err));
+      await flushLogFiles();
+      log.info('after the flush');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(lines.join('')).toContain('after the flush');
+      expect(fileContent(tmp.path)).not.toContain('after the flush');
+      expect(errors).toEqual([]);
+    } finally {
+      if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
+      else process.env.KICI_LOG_DIR = origLogDir;
+      await tmp.cleanup();
+    }
+  });
+
+  // breaks-if-wrong: with no file transport there is nothing to wait for.
+  it('resolves at once when no log file is open', async () => {
+    await flushLogFiles();
+    const started = Date.now();
+    await flushLogFiles();
+    expect(Date.now() - started).toBeLessThan(100);
   });
 });

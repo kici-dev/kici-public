@@ -29,6 +29,25 @@ export const DEFAULT_RESTART_POLICY: RestartPolicy = {
   windowSeconds: 300,
 };
 
+/**
+ * The display name and description a component's service is registered with.
+ * `install` and every upgrade that registers a service again use it, so an
+ * upgraded registration carries the same text as a fresh one.
+ */
+export const SERVICE_TEXT: Record<
+  'orchestrator' | 'agent',
+  { displayName: string; description: string }
+> = {
+  orchestrator: {
+    displayName: 'KiCI Orchestrator',
+    description: 'KiCI CI/CD workflow orchestrator service',
+  },
+  agent: {
+    displayName: 'KiCI Agent',
+    description: 'KiCI CI/CD workflow execution agent service',
+  },
+};
+
 /** Configuration for installing a service. */
 export interface ServiceConfig {
   /** Service identifier (e.g., "kici-orchestrator"). */

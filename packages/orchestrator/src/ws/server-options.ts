@@ -8,14 +8,14 @@ import { WS_MAX_PAYLOAD_BYTES } from '@kici-dev/engine';
  * here so it is unit-testable independently of the heavy `createApp` dependency
  * graph.
  *
- * The (`permessage-deflate` compression bombs) invariant lives here: any
+ * The `permessage-deflate` compression-bomb invariant lives here: any
  * field added to defend against compression-bomb DoS — `maxPayload`,
  * `serverNoContextTakeover`, etc. — MUST be set inside this helper so the
  * neighbouring test file can assert it.
  */
 export function configureSecureWsServer(wss: WebSocketServer): void {
-  //: cap maximum decompressed frame size so a fake/compromised agent
-  // (A6) cannot OOM the orch with a compression bomb. Without this, ws@8.x
+  // Cap the maximum decompressed frame size so a fake or compromised agent
+  // cannot OOM the orch with a compression bomb. Without this, ws@8.x
   // defaults to 100 MiB. See `WS_MAX_PAYLOAD_BYTES` doc-comment for sizing
   // rationale (matches `WEBHOOK_RELAY_MAX_BODY_BYTES`).
   wss.options.maxPayload = WS_MAX_PAYLOAD_BYTES;
@@ -27,7 +27,7 @@ export function configureSecureWsServer(wss: WebSocketServer): void {
   wss.options.perMessageDeflate = {
     concurrencyLimit: 10,
     threshold: 128, // Skip compressing tiny messages like heartbeats
-    //: drop the deflate dictionary state between server-sent messages so
+    // Drop the deflate dictionary state between server-sent messages so
     // per-connection memory does not accumulate under sustained traffic.
     // Server-side only; leaving `clientNoContextTakeover` unset preserves
     // compression ratio on patterns with repeated client→server payload
