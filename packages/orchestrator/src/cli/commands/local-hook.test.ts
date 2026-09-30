@@ -14,6 +14,12 @@ describe('renderPostReceiveHook', () => {
     expect(script).toContain('--ref');
     expect(script).toContain('--sha');
   });
+
+  // fails-when: the hook drops the pushed ref's old commit and every push reaches the orchestrator range-less
+  it('forwards the old commit as --before', () => {
+    const script = renderPostReceiveHook({ sourceId: 'src-1', baseUrl: 'http://127.0.0.1:10143' });
+    expect(script).toContain('--before "$_old"');
+  });
 });
 
 describe('installPostReceiveHook', () => {

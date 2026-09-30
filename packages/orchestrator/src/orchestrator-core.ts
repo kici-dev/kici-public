@@ -188,6 +188,11 @@ import {
   type UserCacheOrgLimitsReader,
 } from './cache/index.js';
 import {
+  InFlightCacheUploads,
+  createCacheUploadSettleTimeoutReader,
+  type CacheUploadSettle,
+} from './cache/cache-upload-settle.js';
+import {
   ArtifactStore,
   type ArtifactOrgLimits,
   type ArtifactOrgLimitsReader,
@@ -322,6 +327,7 @@ import { JobKind } from './db/types.js';
 import { resolveDispatchCloneAuth } from './git/dispatch-git-auth.js';
 import type pg from 'pg';
 import { runDetached } from './helpers/run-detached.js';
+import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
 
 const logger = createLogger({ prefix: 'core' });
 
@@ -2323,24 +2329,22 @@ function initializeCluster(
     onJobProgress: (msg, fromPeerId, reply) =>
       coordinator.onPeerJobProgress(msg, fromPeerId, reply),
     onPeerScalerEvent: (msg, fromPeerId) => coordinator.onPeerScalerEvent(msg, fromPeerId),
-    onJobCancel: (msg) => {
-      if (!msg.jobId) return;
-      const agentId = dispatcher.getAgentIdForJob(msg.jobId);
-      if (agentId) {
-        const entry = agentRegistry.get(agentId);
-        if (entry?.ws) {
-          entry.ws.send(
-            JSON.stringify({
-              type: 'job.cancel',
-              messageId: crypto.randomUUID(),
-              runId: msg.runId,
-              jobId: msg.jobId,
-              reason: msg.reason,
-            }),
-          );
-        }
-      }
-    },
+    onJobCancel: (msg) =>
+      runDetached(
+        logger,
+        'Peer job cancel',
+        () =>
+          deliverPeerJobCancel(
+            {
+              dispatcher: dispatcher,
+              registry: agentRegistry,
+              lookupDispatched: (runId, jobId) => readDispatchedAgents(db, runId, jobId),
+              logger,
+            },
+            msg,
+          ),
+        { runId: msg.runId, jobId: msg.jobId },
+      ),
     onRaftVoteRequest: (msg) => raftNode.handleVoteRequest(msg),
     onRaftVoteResponse: (msg) => raftNode.handleVoteResponse(msg),
     onRaftAppendEntries: (msg) => raftNode.handleAppendEntries(msg),
@@ -3575,6 +3579,13 @@ export async function bootstrapOrchestrator(
   // namespace server-side. Constructed before the dispatcher so buildOnDispatch
   // can capture it.
   const dispatchCacheRefs = new DispatchCacheRefTracker();
+  // The build-cache publishes in flight, per job, and the org's settle bound.
+  // The agent-WS handler holds a build's success until its publish finishes,
+  // so the jobs waiting on the build dispatch with the cache URL.
+  const cacheUploadSettle: CacheUploadSettle = {
+    uploads: new InFlightCacheUploads(),
+    timeoutMsFor: createCacheUploadSettleTimeoutReader(db, config.cacheUploadSettleTimeoutMs),
+  };
   const peerCoordinatorsRef: { current: (() => Promise<boolean>) | null } = { current: null };
   const dispatcher = new Dispatcher({
     registry: agentRegistry,
@@ -4563,6 +4574,7 @@ export async function bootstrapOrchestrator(
     artifactStore,
     dispatchCacheRefs,
     cacheStorage,
+    cacheUploadSettle,
     provenanceTrustRoot,
     localOidcSigner,
     // Test-only policy for the initial-mint provenance seam (undefined in prod).
@@ -4803,8 +4815,13 @@ export async function bootstrapOrchestrator(
     registry: agentRegistry,
     executionTracker,
     instanceId: config.instanceId,
-    cancelJobOnPeer: (peerId: string, jobRunId: string, jobId: string, cancelReason: string) =>
-      cluster.coordinator.cancelJobOnPeer(peerId, jobRunId, jobId, cancelReason),
+    cancelJobOnPeer: (
+      peerId: string,
+      jobRunId: string,
+      jobId: string,
+      cancelReason: string,
+      force?: boolean,
+    ) => cluster.coordinator.cancelJobOnPeer(peerId, jobRunId, jobId, cancelReason, force),
   };
   // Twice the recovery grace period: long enough for a graceful agent teardown
   // to finish on its own, short enough that a dropped cancel does not sit.
@@ -4812,7 +4829,8 @@ export async function bootstrapOrchestrator(
   cluster.stuckCancellingSweepRef.current = async () => {
     await sweepStuckCancelling({
       db,
-      cancelRun: (runId, reason) => cancelRunWithReason(cancelDeps, runId, reason),
+      cancelRun: (runId, reason, options) =>
+        cancelRunWithReason(cancelDeps, runId, reason, options),
       stuckAfterMs: stuckCancellingAfterMs,
     });
   };
@@ -4820,7 +4838,7 @@ export async function bootstrapOrchestrator(
   const workflowDeadlineDetector = new WorkflowDeadlineDetector({
     db,
     jobQueue: queue,
-    cancelRun: (runId, reason) => cancelRunWithReason(cancelDeps, runId, reason),
+    cancelRun: (runId, reason, options) => cancelRunWithReason(cancelDeps, runId, reason, options),
     scanIntervalMs: config.staleDetectorScanIntervalMs,
   });
   await workflowDeadlineDetector.start();

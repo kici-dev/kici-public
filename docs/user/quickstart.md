@@ -27,13 +27,13 @@ Native systemd services managed by `kici-admin orchestrator install` / `kici-adm
 
 ## Which should I pick?
 
-|                           | Docker / Podman                          | Bare metal                                                                            |
-| ------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------- |
-| Host requirements         | `docker` or `podman` with compose v2.20+ | systemd, Node.js 24+, PostgreSQL 18 (container — needs `docker`/`podman` — or native) |
-| First local run (Part 1)  | ~5 minutes                               | ~10 minutes                                                                           |
-| First GitHub run (Part 2) | + ~10 minutes                            | + ~10 minutes                                                                         |
-| Upgrades                  | `docker compose pull` + restart          | `kici-admin orchestrator restart` after `npm install -g kici-admin@latest`            |
-| Best for                  | Quick evaluation, ephemeral hosts        | Long-lived production hosts                                                           |
+|                           | Docker / Podman                          | Bare metal                                                                                |
+| ------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Host requirements         | `docker` or `podman` with compose v2.20+ | systemd, Node.js 24.5.0+, PostgreSQL 18 (container — needs `docker`/`podman` — or native) |
+| First local run (Part 1)  | ~5 minutes                               | ~10 minutes                                                                               |
+| First GitHub run (Part 2) | + ~10 minutes                            | + ~10 minutes                                                                             |
+| Upgrades                  | `docker compose pull` + restart          | `kici-admin orchestrator restart` after `npm install -g kici-admin@latest`                |
+| Best for                  | Quick evaluation, ephemeral hosts        | Long-lived production hosts                                                               |
 
 If you're not sure, pick Docker / Podman.
 

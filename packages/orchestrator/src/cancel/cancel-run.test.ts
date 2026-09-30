@@ -6,6 +6,7 @@ import {
   TERMINAL_RUN_STATES,
 } from '@kici-dev/engine';
 import { cancelRunWithReason, type CancelRunDeps } from './cancel-run.js';
+import { sweepStuckCancelling } from './sweep-stuck-cancelling.js';
 
 /**
  * Capture every updateTable(table) call's recorded `.set()` values and `.where()`
@@ -27,6 +28,8 @@ function createMockDb(opts?: {
       const chain: Record<string, any> = {};
       chain.select = vi.fn(() => chain);
       chain.where = vi.fn(() => chain);
+      chain.orderBy = vi.fn(() => chain);
+      chain.limit = vi.fn(() => chain);
       chain.executeTakeFirst = vi.fn(async () =>
         opts?.runStatus === null
           ? undefined
@@ -80,7 +83,13 @@ function makeDeps(
       ownerInstanceId: string | null;
     }>;
     instanceId: string;
-    cancelJobOnPeer: (peerId: string, runId: string, jobId: string, reason: string) => boolean;
+    cancelJobOnPeer: (
+      peerId: string,
+      runId: string,
+      jobId: string,
+      reason: string,
+      force?: boolean,
+    ) => boolean;
   }>,
 ): {
   deps: CancelRunDeps;
@@ -231,6 +240,97 @@ describe('cancelRunWithReason', () => {
         ),
     );
     expect(queueSweep?.where).toContainEqual(['job_id', 'not in', ['job-1']]);
+  });
+
+  it('forwards force to the coordinator that owns a sibling job', async () => {
+    // The sibling reads live through its `cluster_instances` row, as in the
+    // 'moves the run to cancelling…' case; otherwise no forward is attempted.
+    const mockDb = createMockDb({ rows: { cluster_instances: [{ instance_id: 'coord-b' }] } });
+    const forward = vi.fn().mockReturnValue(true);
+    const { deps } = makeDeps(mockDb, {
+      dispatchedJobs: [{ jobId: 'job-1', agentId: 'agent-1', ownerInstanceId: 'coord-b' }],
+      instanceId: 'coord-a',
+      cancelJobOnPeer: forward,
+    });
+
+    const result = await cancelRunWithReason(deps, 'run-1', 'force cancelled via API', {
+      force: true,
+    });
+
+    expect(result.agentsNotified).toBe(1);
+    // fails-when: the forward drops force and the sibling cancels gracefully.
+    expect(forward).toHaveBeenCalledWith(
+      'coord-b',
+      'run-1',
+      'job-1',
+      'force cancelled via API',
+      true,
+    );
+  });
+
+  describe('a forced cancel whose forward fails', () => {
+    /**
+     * The sibling owner is live but no link reaches it, so the first forward
+     * fails and the run is left `cancelling`. The sweep then reads the stuck
+     * run carrying whatever the first cancel stamped, and re-drives through
+     * the real cancel path.
+     */
+    async function cancelThenSweep(force: boolean) {
+      const forward = vi.fn().mockReturnValue(false);
+      const mockDb = createMockDb({ rows: { cluster_instances: [{ instance_id: 'coord-b' }] } });
+      const { deps, mock } = makeDeps(mockDb, {
+        dispatchedJobs: [{ jobId: 'job-1', agentId: 'agent-1', ownerInstanceId: 'coord-b' }],
+        instanceId: 'coord-a',
+        cancelJobOnPeer: forward,
+      });
+
+      const first = await cancelRunWithReason(deps, 'run-1', 'cancel', { force });
+      expect(first.unreachable).toBe(1);
+      const stamped = mock.updates.some(
+        (u) => u.table === 'execution_runs' && u.set.cancel_force === true,
+      );
+      // The sweep reads the stuck run back with what the first cancel wrote.
+      const sweepDb = createMockDb({
+        rows: { execution_runs: [{ run_id: 'run-1', cancel_force: stamped ? true : null }] },
+      });
+
+      forward.mockClear();
+      await sweepStuckCancelling({
+        db: sweepDb.db,
+        cancelRun: (runId, reason, options) => cancelRunWithReason(deps, runId, reason, options),
+        stuckAfterMs: 0,
+      });
+      return { stamped, forward };
+    }
+
+    it('stamps cancel_force, and the sweep re-sends the cancel forced', async () => {
+      const { stamped, forward } = await cancelThenSweep(true);
+
+      // fails-when: force is not recorded, or the sweep re-sends without it —
+      // the sibling then runs the job's graceful hooks the operator skipped.
+      expect(stamped).toBe(true);
+      expect(forward).toHaveBeenCalledWith(
+        'coord-b',
+        'run-1',
+        'job-1',
+        'run cancelled (re-driven: cancel did not complete)',
+        true,
+      );
+    });
+
+    it('leaves a graceful cancel graceful on the re-drive', async () => {
+      const { stamped, forward } = await cancelThenSweep(false);
+
+      // breaks-if-wrong: a graceful cancel must not be escalated by the sweep.
+      expect(stamped).toBe(false);
+      expect(forward).toHaveBeenCalledWith(
+        'coord-b',
+        'run-1',
+        'job-1',
+        'run cancelled (re-driven: cancel did not complete)',
+        false,
+      );
+    });
   });
 
   it('moves the run to cancelling when the owning coordinator is live but unreachable', async () => {

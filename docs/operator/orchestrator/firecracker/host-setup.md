@@ -37,7 +37,7 @@ Firecracker adds operational complexity compared to containers (kernel managemen
 | **Linux host**      | x86_64 or aarch64 with KVM support                       |
 | **Kernel 5.10+**    | Required by Firecracker; 6.1+ recommended                |
 | **KVM enabled**     | `/dev/kvm` must exist and be accessible                  |
-| **Node.js 24+**     | Runtime for the orchestrator process                     |
+| **Node.js 24.5.0+** | Runtime for the orchestrator process                     |
 | **System packages** | See [Step 1](#step-1-install-host-system-packages) below |
 
 ### Verify KVM support
@@ -369,7 +369,7 @@ Firecracker also publishes pre-built kernels for both architectures on their
 
 ## Step 7: Build the agent rootfs
 
-Each VM boots from a copy of an ext4 rootfs image that holds a minimal Debian system, Node.js and the bundled KiCI agent. The build script bundles the agent from your checkout of the source repository, so install and build the workspace first. This needs Node.js 24 and pnpm 11 on your `PATH`: the repository's `.mise.toml` pins both, and on Node.js 24 `corepack enable` provides the pinned pnpm. `sudo env PATH="$PATH"` passes your `PATH` to root, so root runs the same Node.js and pnpm. As the administrator, from the root of the checkout:
+Each VM boots from a copy of an ext4 rootfs image that holds a minimal Debian system, Node.js and the bundled KiCI agent. The build script bundles the agent from your checkout of the source repository, so install and build the workspace first. This needs Node.js 24.5.0 or later and pnpm 11 on your `PATH`: the repository's `.mise.toml` pins both, and on Node.js 24 `corepack enable` provides the pinned pnpm. `sudo env PATH="$PATH"` passes your `PATH` to root, so root runs the same Node.js and pnpm. As the administrator, from the root of the checkout:
 
 ```bash
 sudo env PATH="$PATH" pnpm install --frozen-lockfile

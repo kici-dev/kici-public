@@ -103,7 +103,7 @@ expiry and the full list of your tokens are managed from the dashboard (see
 
 ## Personal access tokens
 
-Personal access tokens (PATs) are created automatically when you log in via OAuth. You can also create and manage PATs through the dashboard.
+Personal access tokens (PATs) are created automatically when you log in via OAuth. You can also mint one with [`kici pat create`](./cli/account-and-org.md#kici-pat-create), and create and manage PATs through the dashboard.
 
 ### How PATs work
 
@@ -114,13 +114,13 @@ Personal access tokens (PATs) are created automatically when you log in via OAut
 
 ### PATs vs API keys
 
-|            | Personal access tokens | API keys        |
-| ---------- | ---------------------- | --------------- |
-| Scope      | User (cross-org)       | Organization    |
-| Prefix     | `kici_pat_`            | `kici_sk_`      |
-| Created by | CLI login or dashboard | Dashboard       |
-| Expiry     | 120 days (default)     | No expiry       |
-| Use case   | Developer CLI access   | CI/CD pipelines |
+|            | Personal access tokens                     | API keys        |
+| ---------- | ------------------------------------------ | --------------- |
+| Scope      | User (cross-org)                           | Organization    |
+| Prefix     | `kici_pat_`                                | `kici_sk_`      |
+| Created by | CLI login, `kici pat create`, or dashboard | Dashboard       |
+| Expiry     | 120 days (default)                         | No expiry       |
+| Use case   | Developer CLI access                       | CI/CD pipelines |
 
 ### Dashboard management
 

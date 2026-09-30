@@ -66,6 +66,57 @@ afterEach(() => {
 // --- Tests ----------------------------------------------------------------
 
 describe('runGlobalEvalRound', () => {
+  describe('deferred paths', () => {
+    // fails-when: a paths no-match loads the workflow module or reports run:true
+    it('reports run:false with a paths reason and loads no module when the diff misses', async () => {
+      const args = argsFor({}, [
+        { workflowName: 'a', sourceFile: 'a.ts', hasFilter: false, deferredPaths: [['src/**']] },
+      ]);
+      const result = await runGlobalEvalRound({
+        ...args,
+        changedFiles: ['docs/a.md'],
+        changedFilesStatus: 'fetched',
+      });
+
+      expect(result.candidates).toEqual([
+        { workflowName: 'a', run: false, reason: expect.stringMatching(/^paths: no match/) },
+      ]);
+    });
+
+    // breaks-if-wrong: a matching diff must still run the candidate
+    it('runs the candidate when the diff matches', async () => {
+      const wf = makeWorkflow({ name: 'a', jobs: [makeJob('static')] });
+      const args = argsFor({ 'a.ts': [wf] }, [
+        { workflowName: 'a', sourceFile: 'a.ts', hasFilter: false, deferredPaths: [['src/**']] },
+      ]);
+      const result = await runGlobalEvalRound({
+        ...args,
+        changedFiles: ['src/a.ts'],
+        changedFilesStatus: 'fetched',
+      });
+
+      expect(result.candidates).toEqual([{ workflowName: 'a', run: true }]);
+    });
+
+    it('checks paths before the filter', async () => {
+      let filterCalls = 0;
+      const wf = makeWorkflow({
+        name: 'a',
+        filter: () => {
+          filterCalls++;
+          return true;
+        },
+      });
+      const args = argsFor({ 'a.ts': [wf] }, [
+        { workflowName: 'a', sourceFile: 'a.ts', hasFilter: true, deferredPaths: [['src/**']] },
+      ]);
+      const result = await runGlobalEvalRound({ ...args, changedFiles: ['docs/a.md'] });
+
+      expect(result.candidates[0]?.run).toBe(false);
+      expect(filterCalls).toBe(0);
+    });
+  });
+
   it('reports run:false for a candidate whose filter returns false', async () => {
     const wf = makeWorkflow({ name: 'a', filter: () => false });
     const result = await runGlobalEvalRound(

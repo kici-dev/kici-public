@@ -29,7 +29,7 @@ Each agent:
 
 ## Prerequisites
 
-- **Node.js 24+** (or use the Docker image)
+- **Node.js 24.5.0 or later** (or use the Docker image)
 - **git** (required for repository cloning)
 - **Docker or Podman** (optional, required only for container-based jobs)
 - Network access to the orchestrator WebSocket endpoint

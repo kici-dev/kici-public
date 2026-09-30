@@ -17,6 +17,8 @@ After OAuth, the CLI exchanges the OIDC token for a personal access token (PAT) 
 
 `kici login` targets the hosted KiCI Platform by default. `--platform-endpoint` / `--oidc-issuer`, or `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`, override the endpoint and the OIDC issuer. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
 
+After a successful login in an interactive terminal, when an organization is active and the [local dev plane](./authoring-and-local.md#kici-local) is not attached yet, `kici login` asks whether to attach the plane to the Platform (`Attach now? [Y/n]`). An attached plane gives `kici run <event> --local` real Platform secrets and identity. Pass `--no-attach` to skip the prompt in scripted logins. A failed attach does not fail the login; run `kici local attach` later.
+
 ```bash
 kici login [options]
 ```

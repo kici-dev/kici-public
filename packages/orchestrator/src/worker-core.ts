@@ -134,6 +134,7 @@ import type {
   WorkerClusterSettings,
 } from '@kici-dev/engine';
 import { runDetached } from './helpers/run-detached.js';
+import { deliverPeerJobCancel } from './cancel/peer-job-cancel.js';
 
 const logger = createLogger({ prefix: 'worker' });
 const DRAIN_TIMEOUT_MS = 300_000; // 5 minutes
@@ -952,24 +953,21 @@ export async function bootstrapWorker(
         // Workers send progress to coordinator, not the other way around.
       },
 
-      onJobCancel: (msg: PeerJobCancel) => {
-        if (!msg.jobId) return;
-        const agentId = dispatcher.getAgentIdForJob(msg.jobId);
-        if (agentId) {
-          const entry = agentRegistry.get(agentId);
-          if (entry?.ws) {
-            entry.ws.send(
-              JSON.stringify({
-                type: 'job.cancel',
-                messageId: randomUUID(),
-                runId: msg.runId,
-                jobId: msg.jobId,
-                reason: msg.reason,
-              }),
-            );
-          }
-        }
-      },
+      onJobCancel: (msg: PeerJobCancel) =>
+        runDetached(
+          logger,
+          'Peer job cancel',
+          () =>
+            deliverPeerJobCancel(
+              {
+                dispatcher: dispatcher,
+                registry: agentRegistry,
+                logger,
+              },
+              msg,
+            ),
+          { runId: msg.runId, jobId: msg.jobId },
+        ),
 
       onAgentTokenRevoke: (msg) => {
         const kicked = agentRegistry.disconnectByTokenId(msg.tokenId);
@@ -1177,7 +1175,7 @@ export async function bootstrapWorker(
       ? (agentId, labels) => scalerManager.onAgentRegistered(agentId, labels)
       : undefined,
     onScalerAgentDisconnected: scalerManager
-      ? (agentId) => scalerManager.onAgentDisconnected(agentId)
+      ? (agentId, reason) => scalerManager.onAgentDisconnected(agentId, reason)
       : undefined,
     onScalerJobComplete: scalerManager
       ? (agentId) => scalerManager.onJobComplete(agentId)

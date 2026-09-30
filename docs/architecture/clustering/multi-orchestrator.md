@@ -63,7 +63,7 @@ The KiCI Platform is primarily a **webhook router and peer matchmaker**, not a g
 
 Peers discover each other through two mechanisms:
 
-1. **Platform matchmaker (every Platform-connected mode -- `platform`, `hybrid`, `observed`):** When an orchestrator sends `source.register`, the Platform responds with `source.register.ack` that includes a `peers` array listing all other orchestrators registered with overlapping routing keys. The Platform also sends `peer.discover` messages when new orchestrators connect. Peer matchmaking is independent of relay eligibility -- an `observed` orchestrator never receives a relayed webhook, but it still discovers and is discovered by its peers.
+1. **Platform matchmaker (every Platform-connected mode -- `platform`, `hybrid`, `observed`):** When an orchestrator sends `source.register`, the Platform responds with `source.register.ack` that includes a `peers` array listing all other orchestrators registered with overlapping routing keys. When an orchestrator registers, the Platform also sends `peer.update` with the full peer list to every orchestrator already in the pool. Peer matchmaking is independent of relay eligibility -- an `observed` orchestrator never receives a relayed webhook, but it still discovers and is discovered by its peers.
 
 2. **Static configuration (independent mode):** Operators configure `KICI_CLUSTER_PEERS` with comma-separated peer addresses. Each orchestrator creates `PeerClient` instances for all configured peers at startup.
 
@@ -88,11 +88,18 @@ sequenceDiagram
 
 - **Direct WS preferred** -- orchestrators proactively connect to all known peers
 - **ECDH encrypted channel** -- X25519 key exchange establishes an encrypted channel before any auth material is sent
-- **Join token or credential auth** -- first connection uses a one-time join token; subsequent connections use an HMAC credential proof
+- **Join token or credential auth** -- a worker authenticates its first connection with a one-time join token; a coordinator without a token issues its own credential on its first peer connection; every later connection uses an HMAC credential proof
 - **Protocol version check** -- a `protocolVersion` below `MIN_PROTOCOL_VERSION` is refused with `peer.auth.response { accepted: false }` and close code `WS_CLOSE_PROTOCOL_ERROR`; a newer version is accepted (forward compatibility)
 - **Auth timeout** -- incoming connections must authenticate within 15 seconds or get disconnected
 - **Rate limiting** -- 5 failed auth attempts per IP within 60 seconds triggers temporary block
 - **Auto-reconnect** -- exponential backoff with jitter (1s base, 1.5x multiplier, 60s max)
+
+### Which link carries a message
+
+Two orchestrators can share two links: the one A opened to B, and the one B opened to A. Each link carries messages in both directions once it is authenticated. A Raft broadcast or `peer.leaving` goes out over every link. A message addressed to one peer (`peer.job.cancel`, `job.reroute`) goes over the coordinator's own outbound link when that link is authenticated, and over the peer's link to it otherwise. A coordinator's outbound link is down while it reconnects, and stays down on a coordinator whose credential an operator revoked, which reaches every peer over that peer's link to it.
+
+- **Fire-and-forget messages** (`peer.job.cancel`) try the outbound link first. When that link sends nothing, the message goes over the peer's link. The outbound link reports a failure only when nothing left the process, so a message is never sent twice.
+- **A reroute** (`job.reroute`) picks its link before it sends. It is never sent again over the other link: a NAK or an ACK timeout from an authenticated peer is final for that peer, and a second send would deliver the job twice.
 
 ### Heartbeat
 
@@ -112,6 +119,8 @@ This inventory is the basis for routing decisions. The coordinator consults the 
 ## Rerouting protocol
 
 ### Job reroute flow
+
+The coordinator sends `job.reroute` over the link the [link rule](#which-link-carries-a-message) picks.
 
 ```mermaid
 sequenceDiagram
@@ -188,7 +197,11 @@ Two mechanisms prevent routing loops:
 
 ### Cancel propagation
 
-When a run is cancelled (via API or fail-fast), the coordinator sends `peer.job.cancel` to all peers with rerouted jobs for that run. Cancels are grouped by peer for efficient messaging.
+A run cancel reaches the agent of every job of the run, whichever coordinator receives the cancel. Each message travels over the link the [link rule](#which-link-carries-a-message) picks.
+
+- **Rerouted jobs.** When a run is cancelled (via API or fail-fast), the coordinator sends `peer.job.cancel` to every peer that holds a rerouted job of that run. Cancels are grouped by peer.
+- **Jobs whose agent is connected to a sibling.** The Platform relays `run.cancel.request` to any connected pool member, so the coordinator that receives it often did not dispatch the job. That coordinator reads, from the host roster, the coordinator each job's agent is connected to. It then sends `peer.job.cancel` for the job to that coordinator, with `force` when the cancel is forced. When that coordinator is alive but no link reaches it, the run stays `cancelling` and the leader's stuck-cancelling sweep sends the cancel again later. A forced cancel is recorded on the run (`execution_runs.cancel_force`), so the sweep sends it again with `force`.
+- **The receiver** finds the job's agent in its dispatcher first, and then in the job's dispatch record (`dispatch_queue.agent_id`). An agent that reconnected from a sibling, or one that is not back yet after a restart, is known only to the dispatch record. The receiver honours `force`, and a message with no `jobId` cancels every job of the run it knows. It logs each cancel it cannot deliver as `Peer job cancel not delivered`, with the reason.
 
 ### Post-accept spawn resilience
 
@@ -365,7 +378,7 @@ This allows different connection strings for the same logical resource (e.g., VP
 KiCI's design assumes **one cluster per org** for a given routing key. The Platform-side routing pool is keyed by `(orgId, routingKey)` only -- there is no notion of `cluster_id` on the Platform tier. If two distinct clusters in the same org register the same source (e.g., the same GitHub App installation), every orchestrator from both clusters lands in the same Platform pool. The resulting behavior is incoherent and is **not a supported deployment topology**:
 
 - **Webhook routing splits unpredictably.** Least-loaded routing picks one orchestrator from the merged pool per delivery. A given delivery may land on cluster A or cluster B, depending on momentary job counts and round-robin tie-breaking. The receiving orchestrator becomes the run coordinator and creates the run row in **its own** orchestrator DB; the other cluster never sees that delivery.
-- **Peer discovery cross-fires.** Peer discovery matches on routing-key prefix only, so when a cluster B orchestrator registers, cluster A orchestrators are told about it and attempt P2P connections. The ECDH handshake completes, but join-token / HMAC-credential authentication then fails because cluster B's peer-credential table has no entry for cluster A's instance ID (and vice versa). The result is permanent peer-discovery noise that never produces healthy peer links.
+- **Peer discovery cross-fires.** Peer discovery matches on routing-key prefix only, so when a cluster B orchestrator registers, cluster A orchestrators are told about it and attempt P2P connections. The ECDH handshake completes, but join-token / HMAC-credential authentication then fails because cluster B's peer-credential table has no entry for cluster A's instance ID (and vice versa). The result is permanent peer-discovery noise that never produces healthy peer links. A coordinator that issues its own credential also deletes it and issues a replacement after each proof the other cluster rejects.
 - **Webhook secrets must be duplicated.** Each orchestrator verifies signatures locally against its own scoped-secret store. Whichever cluster gets routed must already hold the source's signing material; otherwise signature verification fails inside the chosen coordinator and the delivery is rejected.
 - **Dashboard becomes split-view.** The dashboard run list mirrors lifecycle events from every connected orchestrator, so runs from both clusters appear mixed together. Run-detail and log proxy queries route via least-loaded selection, so a request for a run that lives in cluster A's DB can land on a cluster B orchestrator and return "not found".
 - **Cron / orphan recovery double-fires.** Each cluster's Raft leader independently evaluates schedules and orphan recovery on its own DB, so any cron registration loaded into both clusters fires twice per tick, and orphan-run finalization decisions diverge between the two clusters.
@@ -419,6 +432,8 @@ Same crypto protocol, but the new orchestrator connects directly to an existing 
 ### Peer credential issuance
 
 After successful join token validation, the coordinator issues a persistent session credential to the new peer. The credential is stored in the `peer_credentials` database table and saved to the peer's local credential file (`~/.kici/peer-credential`). Subsequent connections use the credential (via HMAC proof over the ECDH-encrypted channel) instead of a join token. Credentials can be revoked via `kici-admin peer revoke`.
+
+A coordinator without a join token issues its own credential instead, the first time it connects to a peer. It writes the credential hash to `peer_credentials` (marked as self-issued) and the credential to its local file. Then it proves possession like any joined peer. It retires the self-issued credential its previous run left in the same file, unless that instance still has a live heartbeat. It does not re-issue a credential that an operator revoked for its instance ID; a coordinator that restarts under a new instance ID issues a credential for the new ID. Every coordinator shares the cluster database, so issuing its own credential needs no access beyond what `kici-admin peer create-token` needs.
 
 ## Data flow: webhook to check run update
 

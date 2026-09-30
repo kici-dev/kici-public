@@ -15,7 +15,7 @@ import {
   decryptMessage,
 } from './peer-crypto.js';
 import { chunkBuffer } from '@kici-dev/shared';
-import { PeerClient, type PeerClientOptions } from './peer-client.js';
+import { NO_AUTH_METHOD_MESSAGE, PeerClient, type PeerClientOptions } from './peer-client.js';
 import { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 import { PeerRegistry } from './peer-registry.js';
 
@@ -65,6 +65,25 @@ vi.mock('ws', async () => {
   return {
     default: MockWS,
     WebSocket: MockWS,
+  };
+});
+
+// ── Capture the peer-client logger (wraps the real one) ────────────
+
+const loggerHolder = vi.hoisted(() => ({
+  peerClient: undefined as
+    undefined | { warn: (...a: unknown[]) => unknown; debug: (...a: unknown[]) => unknown },
+}));
+
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: (opts?: { prefix?: string }) => {
+      const real = actual.createLogger(opts);
+      if (opts?.prefix === 'peer-client') loggerHolder.peerClient = real as never;
+      return real;
+    },
   };
 });
 
@@ -1007,6 +1026,73 @@ describe('PeerClient', () => {
       );
 
       expect(onConnected).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('no auth method', () => {
+    // fails-when: the warning sits outside the once-guard and fires per reconnect.
+    // breaks-if-wrong: the first attempt warns, and an accepted auth re-arms it.
+    it('warns once per client across reconnects and again after an accepted auth', async () => {
+      const warn = vi.spyOn(loggerHolder.peerClient!, 'warn');
+      const debug = vi.spyOn(loggerHolder.peerClient!, 'debug');
+      const noAuthCalls = (spy: typeof warn) =>
+        spy.mock.calls.filter(([message]) => message === NO_AUTH_METHOD_MESSAGE).length;
+
+      const { client } = createPeerClient({ joinToken: undefined });
+
+      async function attempt(): Promise<MockWsInstance> {
+        const mock = getLatestMock();
+        simulateOpen(mock);
+        simulateServerHandshake(mock);
+        await vi.advanceTimersByTimeAsync(0);
+        return mock;
+      }
+
+      client.connect();
+      const first = await attempt();
+      expect(first.closeReason).toBe('No auth method');
+      await vi.advanceTimersByTimeAsync(60_000);
+      const second = await attempt();
+      expect(second).not.toBe(first);
+      expect(second.closeReason).toBe('No auth method');
+      expect(noAuthCalls(warn)).toBe(1);
+      expect(noAuthCalls(debug)).toBe(1);
+
+      mockReadCredentialFile.mockResolvedValue({
+        instanceId: 'local-orch',
+        credential: 'c'.repeat(64),
+        role: 'coordinator',
+        issuedAt: new Date(0).toISOString(),
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const third = getLatestMock();
+      simulateOpen(third);
+      const { sessionKey } = simulateServerHandshake(third);
+      await vi.advanceTimersByTimeAsync(0);
+      third.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.auth.response',
+            accepted: true,
+            instanceId: 'remote-orch',
+            agents: [],
+            capabilities: { s3LogAccess: false },
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.state).toBe('connected');
+
+      mockReadCredentialFile.mockResolvedValue(null);
+      third.readyState = 3;
+      third.emit('close', 1006, Buffer.from('abnormal'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await attempt();
+      expect(noAuthCalls(warn)).toBe(2);
+      warn.mockRestore();
+      debug.mockRestore();
     });
   });
 

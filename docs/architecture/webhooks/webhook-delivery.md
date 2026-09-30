@@ -153,7 +153,7 @@ The agent receives the `job.dispatch` message and runs the full job lifecycle. C
 5. **Sandbox execution (child process):**
    - Clone repo: shallow `git clone` at the dispatch ref, unless the job sets `checkout: false`
    - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`) and extract it over the cloned workflow root, so no `npm ci` or compile of `.kici/` is needed at execution time
-   - Restore deps: download cached dependency tarball (`depsUrl`) with SHA-256 verification, or fall back to `npm ci` inline if the cache missed
+   - Restore deps: download the cached dependency tarball (`depsUrl`) to a file, verify its SHA-256, then extract it. Install inline instead if the cache missed or the restore failed for a reason other than a hash mismatch
    - Load workflow: register the shared `@kici-dev/core/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
    - Evaluate rules: run job-level rules sequentially with fail-fast (if any rule fails, job is skipped)
    - Execute steps: run each step sequentially with timeout and abort support
@@ -222,7 +222,10 @@ Workflows without a `contentHash` field (schema version 1 lock files) bypass the
 
 A cross-source dispatch path lets a `webhook({ events: [...] })` trigger registered against one source be fired by an inbound webhook arriving on a _different_ source within the same org. The motivating case: a workflow registered through a github source is fired by a generic webhook from Stripe, ArgoCD, or any other generic source that the operator has configured for the same customer.
 
-For inbound generic webhooks, the cross-source branch is the **only** dispatch path — generic webhooks have no per-repo lock file to evaluate, so the same-source matching path is structurally bypassed.
+The cross-source branch and the same-source path are **disjoint**. Cross-source dispatches only the registrations of **other** sources. The inbound source's own workflows go through the same-source path:
+
+- **A plain generic source** reads no repository from its payload, so it has no lock file of its own. When cross-source considered at least one candidate, the delivery ends there. Cross-source writes its event-log row and the processed metric.
+- **A source whose normalizer reads a repository** (a universal-git source) always runs the same-source path too, whatever cross-source found. That path does not fall back to another source's registration for the lock file when cross-source repo mode already read the registrations of the same repository. The same-source path writes the **single** event-log row for the delivery: its matched count adds the cross-source dispatches, and it carries the degraded note when either half evaluated `paths` against unavailable changed files. `webhooksProcessedTotal` counts the delivery once.
 
 ### Lookup path
 
@@ -231,7 +234,8 @@ When the orchestrator receives a webhook with `info.provider === 'generic'`, the
 1. **Refresh registration index.** Ask `RegistrationStore.getVersion()` and call `RegistrationIndex.refreshIfNeeded(version)` so a registration just inserted by a peer is visible. Failures here are warn-logged but do not block dispatch.
 2. **Resolve event name.** The generic normalizer sets `event.type = 'generic_webhook'` and stores the user-defined event name in `event.action`. The cross-source branch reads `event.action ?? info.event` to recover the user-facing event name.
 3. **Index lookup.** Call `RegistrationIndex.getByOrgAndEvent(customerId, eventName)`, which returns every webhook-trigger registration matching `(customerId, eventName)` from an in-memory map keyed on those two fields. The map is populated alongside the existing registration indexes during `loadFromDb()`.
-4. **Record fan-out histogram.** Always record `kici_cross_source_fanout_size{event}` with the result count, **including zero-match cases**, so misconfigured event names show up in metrics rather than being silently dropped.
+4. **Repository lookup.** When the payload names a repository (`repository.full_name`, or `repository.owner.login` plus `repository.name`), call `RegistrationIndex.getByOrgAndRepo(customerId, repo)` too. These **repo-mode** candidates carry git triggers (`push()`, `pr()`) and match through the registration bundle's normalizer.
+5. **Record fan-out histogram.** Always record `kici_cross_source_fanout_size{event}` with the result count, **including zero-match cases**, so misconfigured event names show up in metrics rather than being silently dropped.
 
 ### Org isolation guarantee
 
@@ -239,7 +243,9 @@ Cross-org leakage is structurally impossible. The lookup map key is `${customerI
 
 ### Per-registration dispatch
 
-For each matched registration, the orchestrator builds a synthetic `SimulatedEvent` whose `type` is the user event name (not `'generic_webhook'`) and runs `matchAllWorkflows([reg.lockEntry], syntheticEvent)`. The synthetic event is required because `matchWebhookTrigger` checks `trigger.events.includes(event.type)` — if the type were left as `'generic_webhook'`, no user-defined webhook trigger would ever match. The fix lives entirely in the cross-source branch; the engine matcher is **not** patched (patching the matcher would change semantics for github push, pr, issue_comment, etc.).
+For each event-mode registration, the orchestrator builds a synthetic `SimulatedEvent` whose `type` is the user event name (not `'generic_webhook'`) and runs `matchAllWorkflows([reg.lockEntry], syntheticEvent)`. The synthetic event is required because `matchWebhookTrigger` checks `trigger.events.includes(event.type)` — if the type were left as `'generic_webhook'`, no user-defined webhook trigger would ever match. The fix lives entirely in the cross-source branch; the engine matcher is **not** patched (patching the matcher would change semantics for github push, pr, issue_comment, etc.).
+
+For a repo-mode registration, the registration bundle's normalizer builds the event, and the orchestrator resolves the changed files **through the registration's bundle** before matching, with `reg.providerContext` as credentials. A registration with no `paths` trigger skips the lookup; the others share one lookup per `(routing key, repository)` within the delivery. The result follows the same rules as the same-source path (see [path filter behavior](../../user/sdk/triggers.md#path-filter-behavior)). An exact list decides. An unavailable list with a git range defers the decision to an `__init__` job. A payload with no range (no `before`/`after`) matches conservatively. A pull request also matches conservatively when its list is unavailable: a cross-source job checks out the registration's commit, not the pull request's head, so no agent can diff the pull request for it. A lookup failure is `unavailable`, so one candidate never stops the fan-out.
 
 For each matched registration, the orchestrator then:
 

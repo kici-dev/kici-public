@@ -55,7 +55,7 @@ Every row names a `kici-admin` command, so disabling an operation on the web UI 
 
 The two **held-run** operations are the one row whose operator equivalent is not universally available. `kici-admin held-run approve` and `reject` answer a hold on an **independent** orchestrator. Wherever a Platform is attached they refuse with a 409: the Platform's own held-run trust gate authorizes each decision against the acting member's org RBAC, and an orchestrator admin token carries none of it.
 
-So on a Platform-attached orchestrator, disabling `held_runs.approve` or `held_runs.reject` removes **every** way to answer a context or reviewer hold. The dashboard, `kici approve` / `kici reject` and the MCP tools all relay through these operations, so those holds can only expire. A hold in the **security** queue is the one exception: it also answers to a `/kici approve` pull-request comment, which the orchestrator handles from its own webhook ingress and this policy never gates. The orchestrator refuses that write: `kici-admin org-settings dashboard-writes set --op held_runs.approve=false` returns a 409 naming the lockout. The refusal covers `--category` and `--sensitivity` too, because those expand to a list of operations before the write. `dashboard-writes show` flags an orchestrator already in that state, and the orchestrator logs a warning at boot. Neither re-enables the operation, because that is the operator's decision to make.
+So on a Platform-attached orchestrator, disabling `held_runs.approve` or `held_runs.reject` removes **every** way to answer a context or reviewer hold. The dashboard, `kici approve` / `kici reject` and the MCP tools all relay through these operations, so those holds can only expire. A hold in the **security** queue is the one exception: it also answers to a `/kici approve` pull-request comment, which the orchestrator handles from its own webhook ingress and this policy never gates. The orchestrator refuses that write: `kici-admin org-settings dashboard-writes set --org <org-id> --op held_runs.approve=false` returns a 409 naming the lockout. The refusal covers `--category` and `--sensitivity` too, because those expand to a list of operations before the write. `dashboard-writes show` flags an orchestrator already in that state, and the orchestrator logs a warning at boot. Neither re-enables the operation, because that is the operator's decision to make.
 
 Dual-control for held runs on a Platform-attached deployment — routing approvals off the dashboard and onto an operator-side channel — needs a Platform-side mechanism, and no such mechanism exists today. The available posture is to keep these two operations enabled and control who may answer a hold through org RBAC and the hold's own `approvers:` clauses.
 
@@ -76,22 +76,22 @@ The orchestrator's RBAC for admin tokens (see [Two-layer RBAC](./rbac-two-layers
 ### Show the full policy
 
 ```bash
-kici-admin org-settings dashboard-writes show
+kici-admin org-settings dashboard-writes show --org <org-id>
 ```
 
-Prints every operation grouped by category, the current state (`enabled` or `disabled`), and the `kici-admin` equivalent for each. Two filtering flags reduce the output to a category or sensitivity bucket:
+Prints every operation grouped by category, the current state (`permissive`, `encrypted`, or `disabled`), and the `kici-admin` equivalent for each. Every `dashboard-writes` subcommand requires `--org` (or its alias `--customer-id`). Two filtering flags reduce the output to a category or sensitivity bucket:
 
 ```bash
-kici-admin org-settings dashboard-writes show --category=Secrets
-kici-admin org-settings dashboard-writes show --sensitivity=plaintext
+kici-admin org-settings dashboard-writes show --org <org-id> --category=Secrets
+kici-admin org-settings dashboard-writes show --org <org-id> --sensitivity=plaintext
 ```
 
 ### Set individual operations
 
 ```bash
-kici-admin org-settings dashboard-writes set --op secrets.set=disabled
-kici-admin org-settings dashboard-writes set --op secrets.set=disabled --op variables.set=disabled
-kici-admin org-settings dashboard-writes set --op secrets.set=encrypted   # plaintext ops only
+kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=disabled
+kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=disabled --op variables.set=disabled
+kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=encrypted   # plaintext ops only
 ```
 
 Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled` (the legacy `true`/`false` are still accepted and mean `permissive`/`disabled`). Multiple `--op` flags are accepted in one call. `encrypted` is rejected for any operation outside the two plaintext ops. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
@@ -99,8 +99,8 @@ Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled`
 ### Disable a whole category or sensitivity bucket
 
 ```bash
-kici-admin org-settings dashboard-writes set --category=Secrets --enabled=false
-kici-admin org-settings dashboard-writes set --sensitivity=plaintext --enabled=false
+kici-admin org-settings dashboard-writes set --org <org-id> --category=Secrets --enabled=false
+kici-admin org-settings dashboard-writes set --org <org-id> --sensitivity=plaintext --enabled=false
 ```
 
 `--category` and `--sensitivity` are convenience flags that expand to the equivalent `--op` list before the database update — the underlying storage only knows individual operations. The CLI prints the expanded set before applying so the operator sees exactly which operations they are touching.
@@ -108,7 +108,7 @@ kici-admin org-settings dashboard-writes set --sensitivity=plaintext --enabled=f
 ### Reset to permissive
 
 ```bash
-kici-admin org-settings dashboard-writes reset
+kici-admin org-settings dashboard-writes reset --org <org-id>
 ```
 
 Erases every override; every operation flips back to the permissive default.
@@ -126,7 +126,7 @@ Keep the permissive default. The dashboard works the way most CI control planes 
 Disable the two `plaintext` operations:
 
 ```bash
-kici-admin org-settings dashboard-writes set --sensitivity=plaintext --enabled=false
+kici-admin org-settings dashboard-writes set --org <org-id> --sensitivity=plaintext --enabled=false
 ```
 
 Effect: secret values and variable values enter the orchestrator only through `kici-admin secret set` and `kici-admin variable set`. The SaaS control plane never receives those plaintext values, so a control-plane compromise cannot exfiltrate them during the breach window. Secret names, scopes, environment bindings, and every read path remain on the dashboard.
@@ -138,8 +138,8 @@ The CLI exposes five input modes (interactive prompt, stdin pipe, file, environm
 Disable `plaintext`, plus the `dispatch` operations that release execution or destroy registrations:
 
 ```bash
-kici-admin org-settings dashboard-writes set --sensitivity=plaintext --enabled=false
-kici-admin org-settings dashboard-writes set \
+kici-admin org-settings dashboard-writes set --org <org-id> --sensitivity=plaintext --enabled=false
+kici-admin org-settings dashboard-writes set --org <org-id> \
   --op event_dlq.retry=false \
   --op event_dlq.discard=false \
   --op registration.delete=false \
@@ -155,7 +155,8 @@ Effect: every dispatch decision listed above and every destructive secret / regi
 Disable every operation **except the two held-run writes**. The dashboard becomes pure observability plus binding inspection — every other mutation goes through `kici-admin`:
 
 ```bash
-for op in $(kici-admin org-settings dashboard-writes show |
+ORG=<org-id>
+for op in $(kici-admin org-settings dashboard-writes show --org "$ORG" |
   awk '$1 == "permissive" || $1 == "encrypted" { print $2 }'); do
   case "$op" in
     # A Platform-attached orchestrator has no operator-side answer for a hold,
@@ -163,7 +164,7 @@ for op in $(kici-admin org-settings dashboard-writes show |
     # orchestrator refuses the write; the guard here keeps the loop going.
     held_runs.approve | held_runs.reject) continue ;;
   esac
-  kici-admin org-settings dashboard-writes set --op "$op=false"
+  kici-admin org-settings dashboard-writes set --org "$ORG" --op "$op=false"
 done
 ```
 
@@ -173,7 +174,7 @@ This is a deliberate trade-off: every workflow that today involves an engineer c
 
 ## What the dashboard does when an operation is disabled
 
-The dashboard reads the current policy from a `GET /api/v1/orgs/:customerId/capabilities` endpoint at page load, then re-fetches every 30 seconds and on every window-focus event. Changes flipped via `kici-admin` from an adjacent terminal converge to open dashboard tabs within ~30 seconds without a manual refresh.
+The dashboard reads the current policy from the per-orchestrator `GET /api/v1/orgs/:customerId/orchestrators/:clusterName/capabilities` endpoint at page load, then re-fetches every 30 seconds and on every window-focus event. Changes flipped via `kici-admin` from an adjacent terminal converge to open dashboard tabs within ~30 seconds without a manual refresh.
 
 For each disabled operation:
 
@@ -193,7 +194,7 @@ The web UI reads the per-orchestrator capabilities endpoint, swaps disabled cont
 
 ### Layer 2 — control-plane HTTP gate
 
-The SaaS control plane caches the orchestrator's capabilities per-org (updated on every orchestrator WebSocket connection and on every `kici-admin` policy change). A `requireOrchCapability(op)` middleware sits on every Platform→Orchestrator route that proxies a mutating dashboard action. Disabled operations get a structured `403`:
+The SaaS control plane caches the orchestrator's capabilities per-org (updated on every orchestrator WebSocket connection and on every `kici-admin` policy change). A capability gate sits on every Platform→Orchestrator route that proxies a mutating dashboard action. Disabled operations get a structured `403`:
 
 ```json
 {
@@ -206,7 +207,7 @@ The SaaS control plane caches the orchestrator's capabilities per-org (updated o
 }
 ```
 
-A static-grep build-time test asserts that every operation in the registry has at least one route calling `requireOrchCapability` with that operation, and that every `requireOrchCapability` call targets a known operation — adding a new operation without a route gate fails the build.
+A static-grep build-time test asserts that every operation in the registry has at least one route gated on that operation, and that every gate names a known operation. Adding a new operation without a route gate therefore fails the build.
 
 ### Layer 3 — orchestrator handler gate
 
@@ -249,7 +250,7 @@ Two cross-cutting flags work with every input mode:
 - `--confirm-fingerprint <hex>` — pre-compute SHA-256 of the value and pass it. The CLI rejects the call if the typed / piped / read value's fingerprint doesn't match. Catches paste corruption.
 - `--dry-run` — parse and validate the value, print `[dry-run] would set <key> in scope <scope> sha256=<hex>`, exit without writing.
 
-`kici-admin variable set` accepts the same input modes plus a `--locked` flag to mark the variable as immutable from subsequent dashboard writes.
+`kici-admin variable set` accepts the same input modes plus a `--locked` flag, which stops a per-source override from replacing the variable.
 
 The full input-mode behavior is documented in [Secrets — operator path](./secrets.md#cli-input-modes).
 

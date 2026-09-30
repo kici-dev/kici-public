@@ -8,8 +8,9 @@ import path from 'node:path';
 
 /**
  * Render the post-receive hook script. For each pushed ref the hook calls
- * `kici-admin source trigger-local <id> --ref <ref> --sha <new> --base-url <url>`,
- * so a push to any branch dispatches a run for that ref.
+ * `kici-admin source trigger-local <id> --ref <ref> --before <old> --sha <new> --base-url <url>`,
+ * so a push to any branch dispatches a run for that ref, and its changed files
+ * are the commits the push added (`<old>..<new>`).
  */
 export function renderPostReceiveHook(opts: { sourceId: string; baseUrl: string }): string {
   return `#!/usr/bin/env bash
@@ -17,7 +18,7 @@ export function renderPostReceiveHook(opts: { sourceId: string; baseUrl: string 
 # Triggers a run for each pushed branch ref.
 set -euo pipefail
 while read -r _old _new ref; do
-  kici-admin source trigger-local ${opts.sourceId} --ref "$ref" --sha "$_new" --base-url ${opts.baseUrl}
+  kici-admin source trigger-local ${opts.sourceId} --ref "$ref" --before "$_old" --sha "$_new" --base-url ${opts.baseUrl}
 done
 `;
 }

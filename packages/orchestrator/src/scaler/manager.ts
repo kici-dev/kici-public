@@ -59,6 +59,22 @@ import { EventScalerBackend } from './event-backend.js';
 import type { ScalerEventEmitterLike } from './event-backend.js';
 import type { ClaimStore, ClaimedCredentials } from './claim-store.js';
 import { ScalerFailureTracker } from './failure-tracker.js';
+
+/**
+ * How long a graceful shutdown waits for the scaler backends to stop their
+ * agents. It is the first window inside the coordinator's 30 s shutdown limit,
+ * and every later step (the HTTP stop grace, the database drain) still has to
+ * fit after it.
+ *
+ * A container stop normally takes at most its own 10 s stop timeout, but the
+ * container runtime can take far longer: a Docker daemon that misses a
+ * container's exit waits out the stop timeout and then another 10 s for its
+ * kill, and one such container held the whole step for 29.7 s. Past this
+ * window the orchestrator logs each backend still stopping and continues. The
+ * runtime finishes the stop on its own, and the next start's orphan cleanup
+ * removes any agent container that is still there.
+ */
+export const SCALER_SHUTDOWN_GRACE_MS = 15_000;
 import type { BackendFailureSummary } from './failure-tracker.js';
 import type {
   ScalerBackend,
@@ -2636,9 +2652,15 @@ export class ScalerManager {
   }
 
   /**
-   * Called from agent-handler.ts when an agent disconnects.
+   * Called from agent-handler.ts when an agent disconnects. `reason` is what an
+   * event scaler's scale-down carries: `shutdown` for an ordinary disconnect,
+   * `heartbeat-timeout` for an agent the orchestrator dropped without waiting
+   * for its socket.
    */
-  onAgentDisconnected(agentId: string): void {
+  onAgentDisconnected(
+    agentId: string,
+    reason: ScaleDownReason = ScaleDownReason.enum.shutdown,
+  ): void {
     const backendName = this.managedAgentIndex.get(agentId);
     if (!backendName) {
       // Not a scaler-managed agent (static agent)
@@ -2653,16 +2675,15 @@ export class ScalerManager {
       // from the persisted spawn spec — read before the map entry goes, or the
       // customer's cloud instance is never torn down.
       //
-      // The reason matches what the backend path emits for the same trigger
-      // (`EventScalerBackend.destroy` defaults to `shutdown` when the caller
-      // passes no context), so which coordinator the agent happened to reach is
-      // invisible to the customer's teardown workflow.
+      // The reason is the one the backend path passes for the same trigger, so
+      // which coordinator the agent happened to reach is invisible to the
+      // customer's teardown workflow.
       const adopted = this.adoptedAgents.get(agentId);
       if (adopted) {
         runDetached(
           logger,
           'Scale-down emit',
-          () => this.emitScaleDownForSpec(adopted, agentId, ScaleDownReason.enum.shutdown),
+          () => this.emitScaleDownForSpec(adopted, agentId, reason),
           { agentId },
         );
       }
@@ -2686,10 +2707,11 @@ export class ScalerManager {
     // it, so the addressing does not depend on which coordinator the agent
     // reached.
     const heldSpec = this.adoptedAgents.get(agentId);
-    const destroyContext =
-      heldSpec && heldSpec.provisioningTargets.length > 0
-        ? { targets: heldSpec.provisioningTargets }
-        : undefined;
+    const destroyContext = {
+      reason,
+      ...(heldSpec &&
+        heldSpec.provisioningTargets.length > 0 && { targets: heldSpec.provisioningTargets }),
+    };
     backend
       .destroy(agentId, destroyContext)
       .then(() => {
@@ -3251,6 +3273,40 @@ export class ScalerManager {
   }
 
   /**
+   * Shut every backend down in parallel, waiting at most
+   * {@link SCALER_SHUTDOWN_GRACE_MS} for the slowest. A backend still stopping
+   * when the window closes is logged by name and left to finish on its own.
+   */
+  private async shutdownBackendsWithinGrace(): Promise<void> {
+    const pending = new Set<string>();
+    const shutdowns = [...this.backends.entries()].map(async ([name, backend]) => {
+      pending.add(name);
+      try {
+        await backend.shutdownAll();
+      } catch (err) {
+        logger.error(`Backend shutdown error: ${err}`);
+      } finally {
+        pending.delete(name);
+      }
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const graceElapsed = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SCALER_SHUTDOWN_GRACE_MS);
+    });
+    try {
+      await Promise.race([Promise.allSettled(shutdowns), graceElapsed]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (pending.size > 0) {
+      logger.warn('Scaler backends still stopping their agents after the shutdown grace', {
+        graceMs: SCALER_SHUTDOWN_GRACE_MS,
+        backends: [...pending],
+      });
+    }
+  }
+
+  /**
    * Stop warm pool, shutdown all backends, clear tracking maps.
    */
   async shutdownAll(): Promise<void> {
@@ -3273,12 +3329,7 @@ export class ScalerManager {
       });
     }
 
-    const shutdowns = [...this.backends.values()].map((backend) =>
-      backend.shutdownAll().catch((err) => {
-        logger.error(`Backend shutdown error: ${err}`);
-      }),
-    );
-    await Promise.allSettled(shutdowns);
+    await this.shutdownBackendsWithinGrace();
 
     this.spawningAgents.clear();
     this.managedAgentIndex.clear();

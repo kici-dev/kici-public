@@ -56,11 +56,18 @@ export interface CancelRunDeps {
    */
   instanceId?: string;
   /**
-   * Forward `job.cancel` to the coordinator holding the agent's socket.
-   * Returns whether the send left this process. Undefined ⇒ no peer transport,
-   * so a job owned by a sibling is unreachable rather than orphaned.
+   * Forward `job.cancel` to the coordinator holding the agent's socket, with
+   * `force` when the cancel is forced. Returns whether the send left this
+   * process. Undefined ⇒ no peer transport, so a job owned by a sibling is
+   * unreachable rather than orphaned.
    */
-  cancelJobOnPeer?: (peerId: string, runId: string, jobId: string, reason: string) => boolean;
+  cancelJobOnPeer?: (
+    peerId: string,
+    runId: string,
+    jobId: string,
+    reason: string,
+    force?: boolean,
+  ) => boolean;
   /** How stale a `cluster_instances` heartbeat may be and still read as live. */
   ownershipGraceMs?: number;
   /**
@@ -252,7 +259,7 @@ export async function cancelRunWithReason(
     // A live sibling holds the agent's socket, and only that coordinator can
     // put a `job.cancel` frame on it. `peer.job.cancel` already exists on the
     // wire, so this adds no protocol surface.
-    const sent = deps.cancelJobOnPeer?.(ownerInstanceId!, runId, jobId, reason) ?? false;
+    const sent = deps.cancelJobOnPeer?.(ownerInstanceId!, runId, jobId, reason, force) ?? false;
     if (sent) {
       agentsNotified++;
       stillUnwinding.add(jobId);
@@ -317,6 +324,7 @@ export async function cancelRunWithReason(
     .where('failure_reason', 'is', null)
     .where('status', 'not in', [...TERMINAL_RUN_STATES])
     .execute();
+  await stampForce(db, runId, force);
 
   // A cancel that reached no live owner has to leave a durable trace, or it is
   // dropped in silence. Nothing else records it: no agent reports `cancelling`
@@ -421,6 +429,22 @@ async function withdrawPendingHoldsOfActiveRun(
     withdrawn: withdrawal === HeldRunWithdrawal.Withdrawn,
     ...(withdrawal !== HeldRunWithdrawal.Withdrawn && { decision: withdrawal }),
   });
+}
+
+/**
+ * Record that a forced cancel reached the run, while it is still non-terminal.
+ * The stuck-cancelling sweep reads it to re-send a cancel that did not
+ * complete with `force`. It is only ever set: a later graceful cancel does not
+ * turn a forced one graceful.
+ */
+async function stampForce(db: Kysely<Database>, runId: string, force: boolean): Promise<void> {
+  if (!force) return;
+  await db
+    .updateTable('execution_runs')
+    .set({ cancel_force: true })
+    .where('run_id', '=', runId)
+    .where('status', 'not in', [...TERMINAL_RUN_STATES])
+    .execute();
 }
 
 /** Record who cancelled the run, while it is still non-terminal. */
@@ -538,8 +562,8 @@ async function resolveJobOwners(
  * The send is wrapped so one bad socket cannot abort the whole cancellation and
  * strand the run in `cancelling`.
  */
-function sendLocalCancel(args: {
-  registry: AgentRegistry;
+export function sendLocalCancel(args: {
+  registry: Pick<AgentRegistry, 'get'>;
   runId: string;
   jobId: string;
   agentId: string | null;

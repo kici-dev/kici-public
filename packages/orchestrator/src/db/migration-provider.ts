@@ -156,6 +156,8 @@ import * as m148 from './migrations/148_cluster_settings_sealed_secrets_retry_ba
 import * as m149 from './migrations/149_workflow_registrations_dep_cache_key.js';
 import * as m150 from './migrations/150_execution_runs_status_epoch.js';
 import * as m151 from './migrations/151_workflow_registrations_dep_cache_key_sha.js';
+import * as m152 from './migrations/152_org_settings_cache_upload_settle_timeout.js';
+import * as m153 from './migrations/153_execution_runs_cancel_force.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -312,6 +314,8 @@ export function createMigrationProvider(): MigrationProvider {
         '149_workflow_registrations_dep_cache_key': m149,
         '150_execution_runs_status_epoch': m150,
         '151_workflow_registrations_dep_cache_key_sha': m151,
+        '152_org_settings_cache_upload_settle_timeout': m152,
+        '153_execution_runs_cancel_force': m153,
       };
     },
   };

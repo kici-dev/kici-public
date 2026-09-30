@@ -462,6 +462,66 @@ describe('workflow-level filter', () => {
     });
   });
 
+  describe('deferred paths', () => {
+    const pathsFlags = {
+      dynamicContext: false,
+      dynamicEnv: false,
+      dynamicConcurrencyGroup: false,
+      deferredPaths: [['src/**']],
+    };
+
+    // fails-when: a paths no-match still runs the workflow filter (customer code for a workflow that did not trigger)
+    it('reports pathsPassed:false and never runs the filter when the diff misses', async () => {
+      const filter = vi.fn(() => true);
+      const workflow: Workflow = { ...makeWorkflow(), filter };
+      const result = await evaluateDynamicFields(
+        workflow,
+        'deploy',
+        { type: 'push' },
+        { ...pathsFlags, hasFilter: true },
+        60_000,
+        makeFilterInput({ changedFiles: ['docs/a.md'] }),
+      );
+      expect(result).toEqual({ pathsPassed: false });
+      expect(filter).not.toHaveBeenCalled();
+    });
+
+    // breaks-if-wrong: a matching diff must still reach the filter
+    it('reports pathsPassed:true and runs the filter when the diff matches', async () => {
+      const filter = vi.fn(() => true);
+      const workflow: Workflow = { ...makeWorkflow(), filter };
+      const result = await evaluateDynamicFields(
+        workflow,
+        'deploy',
+        { type: 'push' },
+        { ...pathsFlags, hasFilter: true },
+        60_000,
+        makeFilterInput({ changedFiles: ['src/a.ts'] }),
+      );
+      expect(result.pathsPassed).toBe(true);
+      expect(result.filterPassed).toBe(true);
+      expect(filter).toHaveBeenCalledTimes(1);
+    });
+
+    it('an unavailable clone diff passes conservatively', async () => {
+      const result = await evaluateDynamicFields(
+        makeWorkflow(),
+        'deploy',
+        { type: 'push' },
+        pathsFlags,
+        60_000,
+        makeFilterInput({ changedFiles: [], changedFilesStatus: 'unavailable' }),
+      );
+      expect(result.pathsPassed).toBe(true);
+    });
+
+    it('rejects deferred paths with no diff to decide them against', async () => {
+      await expect(
+        evaluateDynamicFields(makeWorkflow(), 'deploy', { type: 'push' }, pathsFlags, 60_000),
+      ).rejects.toThrow(/deferred paths but the evaluating job supplied no changed files/);
+    });
+  });
+
   it('fails with an actionable error when the lock records a filter the module does not export', async () => {
     const workflow = makeWorkflow();
     await expect(

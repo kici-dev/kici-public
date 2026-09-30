@@ -32,8 +32,11 @@ export function silenceJoinTokenLogger(): void {
 const TOKEN_PREFIX = 'kici_join_v1';
 const DEFAULT_EXPIRY_MS = 3600_000; // 1 hour
 
-const TOKEN_ALREADY_USED_MESSAGE =
-  'Join token has already been used. Generate a new token with: kici admin create-join-token';
+export const TOKEN_ALREADY_USED_MESSAGE =
+  'Join token has already been used. Create a new token with: kici-admin peer create-token';
+
+export const TOKEN_EXPIRED_MESSAGE =
+  'Join token has expired. Create a new token with: kici-admin peer create-token';
 
 interface TokenRouting {
   orgId: string;
@@ -170,9 +173,7 @@ export class JoinTokenManager {
     // regardless of which instance presents it.
     const expired = new Date((row as any).expires_at).getTime() <= Date.now();
     if (expired) {
-      throw new Error(
-        'Join token has expired. Generate a new token with: kici admin create-join-token',
-      );
+      throw new Error(TOKEN_EXPIRED_MESSAGE);
     }
 
     if ((row as any).consumed_at) {

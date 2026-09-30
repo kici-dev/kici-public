@@ -12,7 +12,7 @@ The container backend provisions agents as ephemeral containers via the Docker-c
 - `host` — Container runtime host, e.g. `tcp://192.168.1.10:2376`. Optional; defaults to auto-detecting the local socket.
 - `socketPath` — Explicit socket path. Optional; overrides auto-detection.
 - `runtime` — `docker`, `podman`, or `auto` (default). Forces a specific runtime.
-- `extraHosts` — Extra `host:IP` mappings for spawned containers, e.g. `myhost.local:host-gateway`.
+- `extraHosts` — Extra `host:IP` mappings for spawned containers, e.g. `myhost.local:host-gateway`. The scaler adds no host alias of its own. When `orchestratorUrl` names `host.docker.internal` or `host.containers.internal`, map that name here on Docker Engine for Linux, for example `host.docker.internal:host-gateway`.
 - `networkIsolation` — Enable nftables-based network isolation. Default: `true`.
 
 **Label-set-level fields:**
@@ -242,9 +242,9 @@ scalers:
 
 **Symptom:** `docker ps` or `podman ps` shows old `kici-managed` containers after orchestrator restart.
 
-**Cause:** Orchestrator crashed (SIGKILL) or was stopped before graceful shutdown completed.
+**Cause:** Orchestrator crashed (SIGKILL), was stopped before graceful shutdown completed, or the container runtime was still stopping its agents when the shutdown's 15-second window for the scaler closed. The orchestrator logs `Scaler backends still stopping their agents after the shutdown grace` in that last case.
 
-**Solution:** The container backend automatically cleans up orphaned containers on startup. It lists containers stamped with its own `kici-scaler-name` label and removes those that are stopped, or running with an agent id it is not tracking and that never registered. A running, registered agent is never removed, and a container another scaler or another orchestrator stamped is left alone — two orchestrators sharing one host do not reap each other's agents. Check orchestrator startup logs for `Cleaned up N orphaned containers`.
+**Solution:** The container backend automatically cleans up orphaned containers on startup. It lists containers stamped with its own `kici-scaler-name` label and removes those that are stopped, or running with an agent id it is not tracking and that never registered. A running, registered agent is never removed, and a container another scaler or another orchestrator stamped is left alone — two orchestrators sharing one host do not reap each other's agents. It stops the orphans in parallel, so a few leftover agents do not add their stop timeouts together to the start. Check orchestrator startup logs for `Cleaned up N orphaned containers`.
 
 If manual cleanup is needed (this removes every `kici-managed` container on the host, whichever orchestrator started it — stop the orchestrators sharing the host first):
 

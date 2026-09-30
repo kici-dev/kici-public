@@ -24,7 +24,9 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { CacheMetadata, CacheStorage } from './types.js';
-import { createS3Client } from '@kici-dev/shared';
+import { createLogger, createS3Client } from '@kici-dev/shared';
+
+const logger = createLogger({ prefix: 's3-cache' });
 
 /** Pre-signed download URL expiry in seconds (15 minutes) */
 const PRESIGNED_URL_EXPIRY_SECONDS = 900;
@@ -68,6 +70,11 @@ export class S3CacheStorage implements CacheStorage {
   private readonly bucket: string;
   private readonly prefix: string;
   private readonly ttlMs: number;
+  /**
+   * False once the backend answered a conditional self-copy with
+   * `501 NotImplemented`. From then on `updateMeta` copies unconditionally.
+   */
+  private conditionalCopySupported = true;
 
   constructor(options: S3CacheStorageOptions) {
     this.bucket = options.bucket;
@@ -116,6 +123,14 @@ export class S3CacheStorage implements CacheStorage {
    * Returns null if the object doesn't exist (NoSuchKey/NotFound).
    */
   private async readMeta(key: string): Promise<CacheMetadata | null> {
+    return (await this.readHead(key))?.meta ?? null;
+  }
+
+  /**
+   * Read an object's TTL metadata together with the ETag of the version it
+   * belongs to. Returns null if the object doesn't exist (NoSuchKey/NotFound).
+   */
+  private async readHead(key: string): Promise<{ meta: CacheMetadata; etag?: string } | null> {
     try {
       const head = await this.client.send(
         new HeadObjectCommand({
@@ -129,7 +144,7 @@ export class S3CacheStorage implements CacheStorage {
 
       if (!createdAt || !lastAccessedAt) return null;
 
-      return { createdAt, lastAccessedAt };
+      return { meta: { createdAt, lastAccessedAt }, ...(head.ETag && { etag: head.ETag }) };
     } catch (err: unknown) {
       if (this.isNotFoundError(err)) return null;
       throw err;
@@ -139,8 +154,47 @@ export class S3CacheStorage implements CacheStorage {
   /**
    * Update metadata on an S3 object by copying it to itself.
    * This is the standard S3 pattern for updating metadata without re-uploading data.
+   *
+   * The copy is conditional on `etag`, the version whose metadata the caller
+   * read. A self-copy is a whole-object write: without the condition, one that
+   * races a `put()` of the same key can land after it and write the older body
+   * back. Cache pointers are rewritten in place while builds publish them, so a
+   * touch-on-read racing a publish reverted the pointer to a tarball that no
+   * longer exists. `CopySourceIfMatch` pins the bytes copied to that version and
+   * `IfMatch` refuses the write unless the key still holds it.
+   *
+   * Returns false when the object was replaced since the read (`412`), or is
+   * being replaced right now (`409 ConditionalRequestConflict`): the newer
+   * write stamps metadata of its own, so there is nothing left to refresh.
+   *
+   * An S3-compatible backend that does not implement conditional copies
+   * answers `501 NotImplemented`. The copy then runs again without the
+   * condition, and later copies skip it, as on a backend that ignores the
+   * headers.
    */
-  private async updateMeta(key: string, meta: CacheMetadata): Promise<void> {
+  private async updateMeta(key: string, meta: CacheMetadata, etag?: string): Promise<boolean> {
+    const condition = this.conditionalCopySupported ? etag : undefined;
+    try {
+      await this.copyOntoItself(key, meta, condition);
+      return true;
+    } catch (err: unknown) {
+      if (!condition) throw err;
+      if (this.isPreconditionFailedError(err) || this.isConditionalConflictError(err)) {
+        return false;
+      }
+      if (!this.isNotImplementedError(err)) throw err;
+      this.conditionalCopySupported = false;
+      logger.warn(
+        'The object store does not implement conditional copies; refreshing cache metadata unconditionally',
+        { bucket: this.bucket },
+      );
+      await this.copyOntoItself(key, meta, undefined);
+      return true;
+    }
+  }
+
+  /** Copy an object onto itself with new TTL metadata, conditional on `etag` when given. */
+  private async copyOntoItself(key: string, meta: CacheMetadata, etag?: string): Promise<void> {
     const objectKey = this.objectKey(key);
     await this.client.send(
       new CopyObjectCommand({
@@ -152,8 +206,31 @@ export class S3CacheStorage implements CacheStorage {
           'created-at': meta.createdAt,
           'last-accessed-at': meta.lastAccessedAt,
         },
+        ...(etag && { CopySourceIfMatch: etag, IfMatch: etag }),
       }),
     );
+  }
+
+  /** Check if an error is a failed conditional request (PreconditionFailed, 412). */
+  private isPreconditionFailedError(err: unknown): boolean {
+    return this.hasErrorShape(err, 'PreconditionFailed', 412);
+  }
+
+  /** Check if an error is a conditional write that raced another write (ConditionalRequestConflict, 409). */
+  private isConditionalConflictError(err: unknown): boolean {
+    return this.hasErrorShape(err, 'ConditionalRequestConflict', 409);
+  }
+
+  /** Check if an error is a request the backend does not implement (NotImplemented, 501). */
+  private isNotImplementedError(err: unknown): boolean {
+    return this.hasErrorShape(err, 'NotImplemented', 501);
+  }
+
+  private hasErrorShape(err: unknown, name: string, status: number): boolean {
+    if (typeof err !== 'object' || err === null) return false;
+    if ((err as { name?: string }).name === name) return true;
+    const code = (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+    return code === status;
   }
 
   /** Check if an error is a "not found" error (NoSuchKey, NotFound, 404). */
@@ -188,8 +265,9 @@ export class S3CacheStorage implements CacheStorage {
   }
 
   async get(key: string, ttlMsOverride?: number): Promise<Buffer | null> {
-    const meta = await this.readMeta(key);
-    if (!meta) return null;
+    const head = await this.readHead(key);
+    if (!head) return null;
+    const { meta, etag } = head;
 
     if (this.isExpired(meta, ttlMsOverride)) {
       await this.deleteObject(key);
@@ -217,7 +295,7 @@ export class S3CacheStorage implements CacheStorage {
     // already-fetched data if the metadata update fails)
     try {
       meta.lastAccessedAt = new Date().toISOString();
-      await this.updateMeta(key, meta);
+      await this.updateMeta(key, meta, etag);
     } catch {
       // Transient S3 errors or concurrent deletes shouldn't discard cached data
     }
@@ -247,11 +325,11 @@ export class S3CacheStorage implements CacheStorage {
   }
 
   async touch(key: string): Promise<void> {
-    const meta = await this.readMeta(key);
-    if (!meta) return;
+    const head = await this.readHead(key);
+    if (!head) return;
 
-    meta.lastAccessedAt = new Date().toISOString();
-    await this.updateMeta(key, meta);
+    head.meta.lastAccessedAt = new Date().toISOString();
+    await this.updateMeta(key, head.meta, head.etag);
   }
 
   async getUrl(key: string, ttlMsOverride?: number): Promise<string | null> {

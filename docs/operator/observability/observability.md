@@ -307,24 +307,24 @@ The orchestrator is the richest source of per-delivery data.
 **Structured JSON logs** — one file per service instance under `KICI_LOG_DIR` (see [Log rotation](#log-rotation)). Grep these:
 
 ```bash
-grep -E '"Org-scoped webhook received"|"Webhook relay received"|"Generic webhook accepted"|"Webhook accepted"|"Webhook processed"|"Duplicate webhook"' \
+grep -E '"Webhook relay stream started"|"Generic webhook accepted"|"Direct GitHub webhook accepted"|"Webhook processed|"Duplicate webhook' \
   $KICI_LOG_DIR/orchestrator-*.log
 ```
 
 Key log markers and what they mean:
 
-| Message                                                         | Where emitted                                  | When                                                                                                                       |
-| --------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `Webhook relay received`                                        | `ws/platform-client.ts`                        | Platform forwarded a webhook via WS (platform/hybrid modes)                                                                |
-| `Generic webhook accepted`                                      | `routes/webhooks.ts` (generic handler)         | Provider posted to `POST /webhook/:orgId/generic/:sourceId`                                                                |
-| `Webhook accepted`                                              | `routes/webhooks.ts` (after signature check)   | Signature + dedup passed, handed to the pipeline                                                                           |
-| `Duplicate webhook`                                             | `routes/webhooks.ts` / `pipeline/processor.ts` | Delivery ID already in `dedup_cache` (in-memory fast path or DB)                                                           |
-| `Webhook processed`                                             | `pipeline/processor.ts`                        | Final line: includes `deliveryId`, `event`, `matchedWorkflows`                                                             |
-| `Cross-source webhook processed`                                | `pipeline/processor.ts`                        | Generic webhook fanned out to same-org webhook-trigger registrations                                                       |
-| `webhook pipeline failed after the delivery was acknowledged`   | `webhook/ingest-accept.ts`                     | The pipeline threw for a delivery already answered `202`. Carries the error and a remedy; the delivery is queued for retry |
-| `reclaimed a stale ingest-queue claim`                          | `webhook/ingest-overflow-replayer.ts`          | A worker died mid-pipeline and the drain pass freed its delivery for retry                                                 |
-| `ingest-queue delivery abandoned past max attempts`             | `webhook/ingest-overflow-replayer.ts`          | A delivery exhausted its retries. It was already acknowledged, so this is the only place the abandonment is announced      |
-| `ingest queue at capacity — shedding rather than acknowledging` | `webhook/ingest-accept.ts`                     | The queue hit its row cap; the delivery was refused with `429` rather than acknowledged unstored                           |
+| Message                                                         | Where emitted                                      | When                                                                                                                                                    |
+| --------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Webhook relay stream started`                                  | `ws/platform-client.ts`                            | Platform began forwarding a webhook via WS (platform/hybrid modes)                                                                                      |
+| `Generic webhook accepted`                                      | `routes/webhooks.ts` (generic handler)             | Provider posted to `POST /webhook/:orgId/generic/:sourceId`                                                                                             |
+| `Direct GitHub webhook accepted`                                | `routes/github-webhook.ts` (after signature check) | Provider posted to `POST /webhook/:orgId/github/:sourceId`; the delivery is durably queued for the pipeline                                             |
+| `Duplicate webhook, skipping`                                   | `pipeline/process-webhook.ts`                      | Delivery ID already in `dedup_cache` (in-memory fast path or DB). Logged at `debug` level                                                               |
+| `Webhook processed`                                             | `pipeline/process-webhook.ts`                      | Final line: includes `deliveryId`, `event`, `matchedWorkflows`. A repository with no lock file logs `Webhook processed (no per-repo lock file)` instead |
+| `Cross-source webhook processed`                                | `pipeline/process-webhook.ts`                      | Generic webhook fanned out to same-org webhook-trigger registrations                                                                                    |
+| `webhook pipeline failed after the delivery was acknowledged`   | `webhook/ingest-accept.ts`                         | The pipeline threw for a delivery already answered `202`. Carries the error and a remedy; the delivery is queued for retry                              |
+| `reclaimed a stale ingest-queue claim`                          | `webhook/ingest-overflow-replayer.ts`              | A worker died mid-pipeline and the drain pass freed its delivery for retry                                                                              |
+| `ingest-queue delivery abandoned past max attempts`             | `webhook/ingest-overflow-replayer.ts`              | A delivery exhausted its retries. It was already acknowledged, so this is the only place the abandonment is announced                                   |
+| `ingest queue at capacity — shedding rather than acknowledging` | `webhook/ingest-accept.ts`                         | The queue hit its row cap; the delivery was refused with `429` rather than acknowledged unstored                                                        |
 
 Each line includes `deliveryId`, `routingKey`, and usually `event` — correlate by `deliveryId` to reconstruct the full pipeline for a given webhook.
 
@@ -346,7 +346,7 @@ A direct-ingress `202` means the delivery is durably queued, not that its pipeli
 - `kici_orch_dedup_hits_total` — suppressed duplicates
 - `kici_orch_trigger_match_duration_seconds` — matcher latency
 
-**Debug bundle** — `kici-admin debug-bundle --log-window 4` packages the above logs, metrics snapshot, and redacted config for offline analysis or support. See [Debug bundles](#debug-bundles) above.
+**Debug bundle** — `kici-admin debug-bundle --log-window 4` packages the above logs, metrics snapshot, and redacted config for offline analysis or support. See [`kici-admin debug-bundle`](#kici-admin-debug-bundle) above.
 
 ### Upstream side
 

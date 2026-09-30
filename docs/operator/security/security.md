@@ -187,7 +187,7 @@ From the CLI, `--job` alone cannot separate the two. Pass `kici approve <run-id>
 
 A `fork_pr` hold covers a whole pull request and is not attached to a context, so it uses the org's **Approval expiry** setting (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour), configurable under **Contexts > [context] > Protection**.
 
-The org's approval expiry is one window that can be written two ways. The dashboard edits it in whole hours. To set a window shorter than an hour, or one that is not a whole number of hours, use seconds:
+The org's approval expiry is one window, stored in seconds. The dashboard takes an amount in seconds, minutes, or hours and always saves it as seconds. The API and the independent-orchestrator CLI accept either spelling:
 
 - On a Platform-attached org, `PUT /api/v1/orgs/:customerId/trust-policy` accepts `approvalExpirySeconds` (integer, 1 second to 1 year). It accepts `approvalExpiryHours` too; when a request carries both, the seconds value wins, because it is the more specific of the two.
 - On an independent orchestrator, `kici-admin trust-policy set --customer-id <id> --approval-expiry-seconds <n>` does the same. `--approval-expiry-hours` still works, and passing both prints a warning naming the value that is ignored.
@@ -233,14 +233,13 @@ Trust resolution reads the webhook payload and calls no provider API, so it need
 
 Security events are logged as structured JSON. Each message carries its own field set:
 
-| Message                                                 | Fields                                                     | Meaning                                      |
-| ------------------------------------------------------- | ---------------------------------------------------------- | -------------------------------------------- |
-| `Trust tier resolved for PR`                            | `deliveryId`, `sender`, `tier`, `lockFileSource`, `reason` | Trust resolution completed for a PR event    |
-| `Trust resolution failed, defaulting to base lock file` | `deliveryId`, `sender`, `error`                            | Resolution threw; the run falls back to base |
-| `Fork PR event ignored by org fork policy`              | `deliveryId`, `orgId`, `repo`, `sender`                    | The fork switch dropped the event            |
-| `Workflow modifications detected in PR`                 | `deliveryId`, `sender`, `tier`, `modifications`            | `.kici/` files changed in the pull request   |
-| `Failed to post security hold check`                    | `runId`, `job`, `error`                                    | Check posting failed (non-blocking)          |
-| `Job held by protection rules`                          | `runId`, `workflow`, `job`, `action`, `holdType`, `reason` | A job entered a hold                         |
+| Message                                    | Fields                                                     | Meaning                                    |
+| ------------------------------------------ | ---------------------------------------------------------- | ------------------------------------------ |
+| `Trust tier resolved for PR`               | `deliveryId`, `sender`, `tier`, `lockFileSource`, `reason` | Trust resolution completed for a PR event  |
+| `Fork PR event ignored by org fork policy` | `deliveryId`, `orgId`, `repo`, `sender`                    | The fork switch dropped the event          |
+| `Workflow modifications detected in PR`    | `deliveryId`, `sender`, `tier`, `modifications`            | `.kici/` files changed in the pull request |
+| `Failed to post security hold check`       | `runId`, `job`, `error`                                    | Check posting failed (non-blocking)        |
+| `Job held by protection rules`             | `runId`, `workflow`, `job`, `action`, `holdType`, `reason` | A job entered a hold                       |
 
 `tier` is the resolved trust tier and `lockFileSource` is the lock file the run used (`head` or `base`). The same two values are persisted on the run row as `execution_runs.trust_tier` and `execution_runs.lock_file_source`, which is what the queries below read.
 

@@ -855,8 +855,6 @@ export class RunCoordinator {
 
     // Send cancel to each peer
     for (const [peerId, jobIds] of peerJobs) {
-      const client = this.getPeerClient(peerId);
-
       for (const jobId of jobIds) {
         const cancelMsg: PeerJobCancel = {
           type: 'peer.job.cancel',
@@ -864,9 +862,7 @@ export class RunCoordinator {
           jobId,
           reason,
         };
-        const sent = client
-          ? client.send(cancelMsg)
-          : (this.sendToPeerViaHandler?.(peerId, cancelMsg as PeerToPeerMessage) ?? false);
+        const sent = this.sendToPeer(peerId, cancelMsg);
         if (!sent) {
           logger.warn('Failed to send cancel to peer', { peerId, runId, jobId });
         }
@@ -993,10 +989,9 @@ export class RunCoordinator {
         continue;
       }
 
-      const client = this.getPeerClient(peer.instanceId);
-      const canSendViaHandler = !client && this.sendAndWaitAckViaHandler;
-      if (!client && !canSendViaHandler) {
-        logger.warn('No PeerClient for peer (found in registry but no connection)', {
+      const transport = this.rerouteTransport(peer.instanceId);
+      if (transport === null) {
+        logger.warn('No link to peer (found in registry but no connection)', {
           peerId: peer.instanceId,
           jobName: job.jobName,
         });
@@ -1008,9 +1003,10 @@ export class RunCoordinator {
         maxHops,
       });
 
-      const accepted = client
-        ? await client.sendAndWaitAck(rerouteMsg, ackTimeoutMs)
-        : await this.sendAndWaitAckViaHandler!(peer.instanceId, rerouteMsg, ackTimeoutMs);
+      const accepted =
+        transport === 'client'
+          ? await this.getPeerClient(peer.instanceId)!.sendAndWaitAck(rerouteMsg, ackTimeoutMs)
+          : await this.sendAndWaitAckViaHandler!(peer.instanceId, rerouteMsg, ackTimeoutMs);
 
       if (accepted) {
         // ACK: reset NAK tracking for this peer
@@ -1056,7 +1052,7 @@ export class RunCoordinator {
         jobName: job.jobName,
         nakCount,
         backoffMs,
-        clientState: client?.state ?? 'handler',
+        transport,
       });
     }
 
@@ -1435,14 +1431,48 @@ export class RunCoordinator {
    * The run-cancel path needs this for a job this coordinator never routed:
    * the Platform picks any pool member to receive `run.cancel.request`, and only
    * the coordinator holding the agent's socket can put a cancel frame on it.
-   * {@link RunCoordinator.cancelRun} covers rerouted jobs and is unchanged.
+   * `force` rides on the message, so a force cancel stays forced on the peer.
+   * {@link RunCoordinator.cancelRun} covers rerouted jobs.
    */
-  cancelJobOnPeer(peerId: string, runId: string, jobId: string, reason: string): boolean {
-    const cancelMsg: PeerJobCancel = { type: 'peer.job.cancel', runId, jobId, reason };
+  cancelJobOnPeer(
+    peerId: string,
+    runId: string,
+    jobId: string,
+    reason: string,
+    force?: boolean,
+  ): boolean {
+    const cancelMsg: PeerJobCancel = {
+      type: 'peer.job.cancel',
+      runId,
+      jobId,
+      reason,
+      ...(force && { force: true }),
+    };
+    return this.sendToPeer(peerId, cancelMsg);
+  }
+
+  /**
+   * Send a fire-and-forget message to a peer. The outbound client carries it
+   * when connected; otherwise the peer's own connection to this process does.
+   * The outbound client is down while it reconnects, and for good on a
+   * coordinator whose credential an operator revoked.
+   * `PeerClient.send` returns false only when it sent nothing, so the fallback
+   * never delivers a message twice.
+   */
+  private sendToPeer(peerId: string, msg: PeerToPeerMessage): boolean {
     const client = this.getPeerClient(peerId);
-    return client
-      ? client.send(cancelMsg)
-      : (this.sendToPeerViaHandler?.(peerId, cancelMsg as PeerToPeerMessage) ?? false);
+    if (client?.send(msg)) return true;
+    return this.sendToPeerViaHandler?.(peerId, msg) ?? false;
+  }
+
+  /**
+   * The link a reroute uses, chosen before sending. A reroute is never retried
+   * over the second link: `false` from a connected client is a NAK or an ack
+   * timeout, and resending would deliver the job twice.
+   */
+  private rerouteTransport(peerId: string): 'client' | 'handler' | null {
+    if (this.getPeerClient(peerId)?.state === 'connected') return 'client';
+    return this.sendAndWaitAckViaHandler ? 'handler' : null;
   }
 
   /**

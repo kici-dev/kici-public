@@ -23,6 +23,7 @@ import {
   evaluateDynamicFields,
   evaluateWorkflowFilter,
   type FilterEvalInput,
+  type InitResult,
 } from '../init-runner.js';
 import {
   buildEvalNeedsContext,
@@ -42,6 +43,7 @@ import { serializeJobsToLock } from '../dynamic-job-serializer.js';
 import { runGlobalEvalRound } from '../global-eval-runner.js';
 import type { GlobalEvalRoundJobConfig } from '../global-eval-types.js';
 import { withTimeout } from '../timeout-util.js';
+import { describePathsVerdict, evaluateDeferredPaths } from '../deferred-paths.js';
 
 /** What an evaluation needs from its host: a log sink and the `ctx.kici` API. */
 export interface EvalDispatchDeps {
@@ -138,10 +140,17 @@ interface InitEvalConfig {
   dynamicConcurrencyGroup: boolean;
   dynamicMatrix?: boolean;
   hasFilter?: boolean;
+  /** The `paths` lists the orchestrator could only match conservatively. */
+  deferredPaths?: string[][];
   event: Record<string, unknown>;
   timeoutMs?: number;
   contentHash?: string;
   resolvedHashFiles?: string[];
+}
+
+/** Whether an evaluation job must build the diff: a filter or deferred paths read it. */
+function needsDiff(config: { hasFilter?: boolean; deferredPaths?: string[][] }): boolean {
+  return config.hasFilter === true || (config.deferredPaths?.length ?? 0) > 0;
 }
 
 async function runInit(request: EvalRequest, deps: EvalDispatchDeps): Promise<unknown> {
@@ -150,7 +159,7 @@ async function runInit(request: EvalRequest, deps: EvalDispatchDeps): Promise<un
   return withGlobalWorkflowEnv(target, async () => {
     // Built before the capture scope because it clones and shells out; the filter
     // call itself runs inside the scope with everything else.
-    const filterInput = config.hasFilter
+    const filterInput = needsDiff(config)
       ? await buildJobFilterInput(request, target, config.event, deps)
       : undefined;
     return runCaptured(makeSink(deps), () => evaluateInit(target, config, filterInput, deps));
@@ -164,6 +173,18 @@ async function evaluateInit(
   filterInput: FilterEvalInput | undefined,
   deps: EvalDispatchDeps,
 ): Promise<unknown> {
+  // Deferred paths decide before the module loads, as the dynamic-job and
+  // global-round gates do: a workflow whose paths did not match never
+  // triggered, so none of its code runs.
+  // fails-when: a paths no-match still imports the workflow module
+  // breaks-if-wrong: a paths match still evaluates the filter and dynamic fields
+  if (config.deferredPaths?.length && filterInput) {
+    const diff = { files: filterInput.changedFiles, status: filterInput.changedFilesStatus };
+    if (!evaluateDeferredPaths(config.deferredPaths, diff)) {
+      deps.emit(describePathsVerdict(config.deferredPaths, diff));
+      return { pathsPassed: false } satisfies InitResult;
+    }
+  }
   // fails-when: a global workflow's module is loaded from the source repository's clone
   const { module } = await loadWorkflowSource(
     target.workflowDir,
@@ -173,7 +194,7 @@ async function evaluateInit(
   );
   const workflow = extractWorkflow(module, config.workflowName);
   deps.emit(
-    `Evaluating dynamic fields for job '${config.targetJobName}' (env=${config.dynamicEnv} context=${config.dynamicContext} concurrencyGroup=${config.dynamicConcurrencyGroup} matrix=${config.dynamicMatrix ?? false} filter=${config.hasFilter ?? false})`,
+    `Evaluating dynamic fields for job '${config.targetJobName}' (env=${config.dynamicEnv} context=${config.dynamicContext} concurrencyGroup=${config.dynamicConcurrencyGroup} matrix=${config.dynamicMatrix ?? false} filter=${config.hasFilter ?? false} paths=${config.deferredPaths?.length ?? 0})`,
   );
   return evaluateDynamicFields(
     workflow,
@@ -185,6 +206,7 @@ async function evaluateInit(
       dynamicConcurrencyGroup: config.dynamicConcurrencyGroup,
       dynamicMatrix: config.dynamicMatrix ?? false,
       hasFilter: config.hasFilter ?? false,
+      ...(config.deferredPaths && { deferredPaths: config.deferredPaths }),
     },
     config.timeoutMs,
     filterInput,
@@ -198,6 +220,7 @@ async function runDynamicJob(request: EvalRequest, deps: EvalDispatchDeps): Prom
     event: Record<string, unknown>;
     timeoutMs?: number;
     hasFilter?: boolean;
+    deferredPaths?: string[][];
     contentHash?: string;
     resolvedHashFiles?: string[];
     resultAware?: boolean;
@@ -209,11 +232,21 @@ async function runDynamicJob(request: EvalRequest, deps: EvalDispatchDeps): Prom
 
   const scopedDollar = await buildEvalShell(request.workDir, deps.emit);
   return withGlobalWorkflowEnv(target, async () => {
-    const filterInput = config.hasFilter
+    const filterInput = needsDiff(config)
       ? await buildJobFilterInput(request, target, config.event, deps)
       : undefined;
 
     return runCaptured(makeSink(deps), async () => {
+      // Deferred paths decide before the module loads: a workflow whose paths
+      // did not match never triggered, so none of its code runs.
+      if (config.deferredPaths?.length && filterInput) {
+        const diff = { files: filterInput.changedFiles, status: filterInput.changedFilesStatus };
+        if (!evaluateDeferredPaths(config.deferredPaths, diff)) {
+          deps.emit(describePathsVerdict(config.deferredPaths, diff));
+          return [];
+        }
+      }
+
       // fails-when: a global workflow's module is loaded from the source repository's clone
       const { module } = await loadWorkflowSource(
         target.workflowDir,

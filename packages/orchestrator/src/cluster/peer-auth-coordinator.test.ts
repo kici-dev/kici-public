@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 import type { CredentialFileData } from './peer-credentials.js';
+import { CoordinatorCredentialOutcome as Outcome } from './coordinator-credential.js';
 
 let dir: string;
 let credFile: string;
@@ -169,5 +170,105 @@ describe('PeerAuthCoordinator.reportRejection', () => {
     });
     const action = await c.reportRejection('whatever', 'Unknown credential');
     expect(action).toBe('rejoin');
+  });
+});
+
+describe('PeerAuthCoordinator — lazy self-issue', () => {
+  function issuerWriting(credential = 'self-1') {
+    return vi.fn(async () => {
+      await writeFile(credFile, JSON.stringify(cred('coord-a', credential)));
+      return Outcome.Issued;
+    });
+  }
+
+  // fails-when: issuance runs at construction (startup) instead of on a dial.
+  it('does not issue until a decision needs a credential', () => {
+    const selfIssue = issuerWriting();
+    new PeerAuthCoordinator({ credentialFile: credFile, instanceId: 'coord-a', selfIssue });
+    expect(selfIssue).not.toHaveBeenCalled();
+  });
+
+  it('issues on the first decision without a credential and returns credential', async () => {
+    const selfIssue = issuerWriting();
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      selfIssue,
+    });
+    const d = await c.decideAuth();
+    expect(d.mode).toBe('credential');
+    if (d.mode === 'credential') expect(d.credential.credential).toBe('self-1');
+    expect(selfIssue).toHaveBeenCalledTimes(1);
+  });
+
+  // fails-when: the in-flight issuance is not memoized — each sibling issues,
+  // and each issuance supersedes the credential the previous one wrote.
+  it('shares one issuance across concurrent deciders', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const selfIssue = vi.fn(async () => {
+      await gate;
+      await writeFile(credFile, JSON.stringify(cred('coord-a', 'self-1')));
+      return Outcome.Issued;
+    });
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      selfIssue,
+    });
+    const all = Promise.all([c.decideAuth(), c.decideAuth(), c.decideAuth()]);
+    await new Promise((r) => setTimeout(r, 20));
+    release();
+    const results = await all;
+    expect(selfIssue).toHaveBeenCalledTimes(1);
+    expect(results.every((r) => r.mode === 'credential')).toBe(true);
+  });
+
+  // fails-when: the issuer (and its revoked error) runs again on every dial.
+  it('a revoked outcome is sticky for the process', async () => {
+    const selfIssue = vi.fn(async () => Outcome.Revoked);
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      selfIssue,
+    });
+    expect((await c.decideAuth()).mode).toBe('no-auth');
+    expect((await c.decideAuth()).mode).toBe('no-auth');
+    expect(selfIssue).toHaveBeenCalledTimes(1);
+  });
+
+  // breaks-if-wrong: a transient failure must not disable issuance for good.
+  it('a failed outcome is retried on the next decision', async () => {
+    const selfIssue = vi.fn(async () => Outcome.Failed);
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      selfIssue,
+    });
+    expect((await c.decideAuth()).mode).toBe('no-auth');
+    expect((await c.decideAuth()).mode).toBe('no-auth');
+    expect(selfIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it('a configured join token wins over the issuer', async () => {
+    const selfIssue = issuerWriting();
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      joinToken: 'tok',
+      selfIssue,
+    });
+    expect((await c.decideAuth()).mode).toBe('token-join');
+    expect(selfIssue).not.toHaveBeenCalled();
+  });
+
+  it('an unparsable credential file reads as absent instead of throwing', async () => {
+    await writeFile(credFile, '{not json');
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      joinToken: 'tok',
+    });
+    expect((await c.decideAuth()).mode).toBe('token-join');
   });
 });

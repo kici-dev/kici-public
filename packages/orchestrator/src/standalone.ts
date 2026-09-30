@@ -51,7 +51,8 @@ const otelSdk = initTelemetry({
 });
 
 const { loadConfig } = await import('./config.js');
-const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
+const { PeerClient, PeerAuthCoordinator, coordinatorSelfIssuer } =
+  await import('./cluster/index.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
 const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
 const { ContextStore } = await import('./contexts/context-store.js');
@@ -60,6 +61,8 @@ const { createIndependentApprovalExtras } = await import('./approvals/independen
 
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
+import { runDetached } from './helpers/run-detached.js';
+import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'standalone' });
@@ -130,6 +133,18 @@ await guardStartup(logger, async () => {
         credentialFile: peerCredentialFile,
         instanceId: config.instanceId,
         joinToken: config.cluster.joinToken,
+        // A coordinator without a join token issues its own credential the
+        // first time a peer client needs one. A single-node orchestrator has
+        // no coordinator peers, so it never issues one.
+        selfIssue: config.cluster.singleNode
+          ? undefined
+          : coordinatorSelfIssuer({
+              db: sub.db,
+              credentialFile: peerCredentialFile,
+              instanceId: config.instanceId,
+              agentMaxReconnectDelayMs: config.agentMaxReconnectDelayMs,
+              clusterInstanceHeartbeatMs: config.clusterInstanceHeartbeatMs,
+            }),
       });
 
       // Create PeerClient instances for statically configured peers
@@ -179,24 +194,22 @@ await guardStartup(logger, async () => {
           },
           onJobProgress: (msg, fromPeerId, reply) =>
             sub.coordinator.onPeerJobProgress(msg, fromPeerId, reply),
-          onJobCancel: (msg) => {
-            if (!msg.jobId) return;
-            const agentId = sub.dispatcher.getAgentIdForJob(msg.jobId);
-            if (agentId) {
-              const entry = sub.agentRegistry.get(agentId);
-              if (entry?.ws) {
-                entry.ws.send(
-                  JSON.stringify({
-                    type: 'job.cancel',
-                    messageId: crypto.randomUUID(),
-                    runId: msg.runId,
-                    jobId: msg.jobId,
-                    reason: msg.reason,
-                  }),
-                );
-              }
-            }
-          },
+          onJobCancel: (msg) =>
+            runDetached(
+              logger,
+              'Peer job cancel',
+              () =>
+                deliverPeerJobCancel(
+                  {
+                    dispatcher: sub.dispatcher,
+                    registry: sub.agentRegistry,
+                    lookupDispatched: (runId, jobId) => readDispatchedAgents(sub.db, runId, jobId),
+                    logger,
+                  },
+                  msg,
+                ),
+              { runId: msg.runId, jobId: msg.jobId },
+            ),
           onRaftVoteRequest: (msg) => sub.raft.handleVoteRequest(msg),
           onRaftVoteResponse: (msg) => sub.raft.handleVoteResponse(msg),
           onRaftAppendEntries: (msg) => sub.raft.handleAppendEntries(msg),

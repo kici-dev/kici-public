@@ -71,4 +71,68 @@ describe('UniversalGitChangedFilesFetcher', () => {
     const result = await fetcher.getChangedFiles('x/y', 'push', {}, {});
     expect(result).toEqual({ files: [], status: 'fetched' });
   });
+
+  // fails-when: a truncated forge commits[] reads as authoritative
+  it('forgejo push whose total_commits exceeds the listed commits is unavailable', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('forgejo') });
+    const push = { ...loadFixture('forgejo-push.json'), total_commits: 99 };
+    const result = await fetcher.getChangedFiles('kici-dev/sample-repo', 'push', push, {});
+    expect(result).toEqual({ files: [], status: 'unavailable' });
+  });
+
+  // breaks-if-wrong: a complete payload must stay fetched
+  it('forgejo push whose total_commits equals the listed commits stays fetched', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('forgejo') });
+    const push = loadFixture('forgejo-push.json') as { commits: unknown[] };
+    const result = await fetcher.getChangedFiles(
+      'kici-dev/sample-repo',
+      'push',
+      { ...push, total_commits: push.commits.length },
+      {},
+    );
+    expect(result.status).toBe('fetched');
+  });
+
+  it('gitea reads total_commits', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('gitea') });
+    const push = { ...loadFixture('gitea-push.json'), total_commits: 6 };
+    expect((await fetcher.getChangedFiles('o/r', 'push', push, {})).status).toBe('unavailable');
+  });
+
+  it('gitlab reads total_commits_count', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('gitlab-repo') });
+    const push = { ...loadFixture('gitlab-repo-push.json'), total_commits_count: 50 };
+    expect((await fetcher.getChangedFiles('g/r', 'Push Hook', push, {})).status).toBe(
+      'unavailable',
+    );
+  });
+
+  it('github-repo preset: a commits[] at the 2048 cap is unavailable', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('github-repo') });
+    const commits = Array.from({ length: 2048 }, () => ({
+      added: ['a.ts'],
+      modified: [],
+      removed: [],
+    }));
+    const push = { ...loadFixture('github-repo-push.json'), commits };
+    expect((await fetcher.getChangedFiles('o/r', 'push', push, {})).status).toBe('unavailable');
+  });
+
+  // breaks-if-wrong: a github-repo push under the cap must stay fetched
+  it('github-repo preset: a commits[] under the 2048 cap stays fetched', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('github-repo') });
+    const commits = Array.from({ length: 2047 }, () => ({
+      added: ['a.ts'],
+      modified: [],
+      removed: [],
+    }));
+    const push = { ...loadFixture('github-repo-push.json'), commits };
+    expect((await fetcher.getChangedFiles('o/r', 'push', push, {})).status).toBe('fetched');
+  });
+
+  it('gogs has neither field and keeps today’s behavior', async () => {
+    const fetcher = new UniversalGitChangedFilesFetcher({ config: config('gogs') });
+    const push = { ...loadFixture('gogs-push.json'), total_commits: 99 };
+    expect((await fetcher.getChangedFiles('o/r', 'push', push, {})).status).toBe('fetched');
+  });
 });

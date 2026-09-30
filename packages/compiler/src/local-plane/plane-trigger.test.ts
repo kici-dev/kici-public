@@ -2,6 +2,22 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { buildLocalTriggerRequest, triggerRun, type RunDiscoveryClient } from './plane-trigger.js';
 
 describe('buildLocalTriggerRequest', () => {
+  it('puts before in the body when given, and omits it when absent', () => {
+    const base = {
+      orgId: '__default__',
+      sourceId: 'src-1',
+      repoFullName: '.',
+      event: 'push' as const,
+      ref: 'refs/heads/kici-local',
+      sha: 'bbb',
+      defaultBranch: 'kici-local',
+    };
+    expect(JSON.parse(buildLocalTriggerRequest({ ...base, before: 'aaa' }).body).before).toBe(
+      'aaa',
+    );
+    expect('before' in JSON.parse(buildLocalTriggerRequest(base).body)).toBe(false);
+  });
+
   it('builds a GitHub-shaped push body + generic webhook path', () => {
     const req = buildLocalTriggerRequest({
       orgId: '__default__',

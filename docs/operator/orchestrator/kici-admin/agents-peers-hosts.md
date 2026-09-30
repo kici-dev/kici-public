@@ -21,6 +21,7 @@ kici-admin agent revoke <id>
 - `--privileged-root` is shorthand for `--mandatory-label kici:privileged:root`: it mints a **confined root agent** token. The agent must run as uid 0 — the orchestrator refuses the registration otherwise. See [Confined root agents](../../security/agent-security.md#confined-root-agents) for the full security model.
 - `list --include-pending` (HTTP mode only) additionally shows agents that have connected via WS but have not yet completed registration. Pending state is in-memory on the orchestrator, so direct-DB mode cannot surface it.
 - `list --database-url` switches to offline direct-DB mode, reading `agent_tokens` directly (pending agents are not visible).
+- `revoke` disconnects every agent connected with the token at once. Their running jobs get the same handling as when an agent loses its connection. An ephemeral token that expires disconnects its agents the same way.
 
 **Service lifecycle:**
 
@@ -58,7 +59,7 @@ Produces a self-contained agent + Node payload so a fresh host can be brought up
 
 ```bash
 kici-admin peer create-token [--role coordinator|worker] [--expiry-hours <n>] [--org-id <id>] [--routing-key <key>] [--created-by <actor>] [--json]
-kici-admin peer list
+kici-admin peer list [--json]
 kici-admin peer revoke --instance-id <id>
 kici-admin peer revoke-all --confirm
 kici-admin peer prune-credentials --filter <pattern> --database-url <url> [--json]
@@ -70,7 +71,7 @@ Manages peer credentials for multi-orchestrator clusters. These commands access 
 - `create-token` generates a single-use join token (defaults: coordinator role, 1-hour expiry, org-id `default`, routing-key `default`, attribution `cli`).
   - `--created-by <actor>` sets the `join_tokens.created_by` audit attribution. Defaults to `cli`; a deploy script can pass its own name, e.g. `deploy-script`, so its join tokens are distinguishable from ad-hoc operator ones.
   - `--json` prints a single JSON object (`{ token, role, orgId, routingKey, expiresAt }`) on stdout instead of the human-readable multi-line output, so callers can pipe it through `JSON.parse` without stripping prose. This is what lets a deploy script mint a token and hand it straight to a joining peer when bootstrapping an HA cluster unattended.
-- `revoke` disconnects a peer on its next heartbeat.
+- `revoke` refuses the peer's next connection attempt. It does not close the peer's open connections.
 - `revoke-all` requires `--confirm` as a safety guard.
 - `prune-credentials` (direct-DB only, destructive) deletes every `peer_credentials` row whose `instance_id` does **not** match the `--filter` SQL `LIKE` pattern (e.g. `--filter 'cluster-b-%'` keeps the peers of the new cluster and removes everything else). HTTP mode is intentionally unsupported: run it as a preflight step while the orchestrator is stopped.
 - `reset-raft-state` (direct-DB only, destructive) deletes every row from `raft_state` so a freshly-started orchestrator self-elects with a clean term. Same offline-only constraint as `prune-credentials`.
@@ -435,7 +436,13 @@ Synopsis: `kici-admin peer create-token [options]`
 
 List active peer credentials
 
-Synopsis: `kici-admin peer list`
+Synopsis: `kici-admin peer list [options]`
+
+**Options**
+
+| Option   | Default | Description                                                                                                              |
+| -------- | ------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `--json` | `false` | Emit JSON { peers: [{ id, instanceId, role, selfIssued, createdAt, lastSeenAt, lastValidatedBy, expiresAt }] } on stdout |
 
 ### `kici-admin peer prune-credentials`
 

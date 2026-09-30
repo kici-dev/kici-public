@@ -444,6 +444,24 @@ export class Dispatcher {
     this.getAckTimeoutMs = deps.getAckTimeoutMs ?? (async () => Dispatcher.DEFAULT_ACK_TIMEOUT_MS);
     this.onAckTimeout = deps.onAckTimeout;
     this.rosterStore = deps.rosterStore;
+    // An agent the registry drops on its own (a revoked or expired token)
+    // gets the same job triage as one whose socket closes.
+    this.registry.setDisconnectTriage((agentId) => this.onAgentDisconnect(agentId));
+  }
+
+  /** Runs with the ids of the jobs each disconnect triage failed; see {@link setDisconnectCleanup}. */
+  private disconnectCleanup?: (failedJobIds: string[]) => void;
+
+  /**
+   * Install what runs with the ids of the jobs a disconnect triage failed. The
+   * agent WebSocket handler installs the release of their in-memory waiters
+   * (pending builds, inits, dynamic evaluations, global eval rounds). It runs
+   * inside {@link onAgentDisconnect}, so a path that drops an agent without
+   * waiting for its socket (heartbeat timeout, ack timeout, token revocation)
+   * reaches it too.
+   */
+  setDisconnectCleanup(cleanup: (failedJobIds: string[]) => void): void {
+    this.disconnectCleanup = cleanup;
   }
 
   /**
@@ -1553,12 +1571,35 @@ export class Dispatcher {
     //     redispatch's findAvailable can never re-select it (the WS close
     //     event fires asynchronously and would otherwise leave the agent a
     //     candidate during the synchronous redispatch below).
-    // The job is already untracked, so the close's disconnect triage finds
-    // nothing to double-handle.
+    // The job is already untracked, so the triage below leaves it to the
+    // requeue.
     this.onAckTimeout?.(agentId, jobId, runId);
-    this.registry.unregister(agentId);
+    const triage = this.dropUnacknowledgingAgent(agentId);
     await this.finishRequeue(agentId, jobId, 'dispatch ack timeout', attempts);
+    await triage;
     await this.updateQueueDepthMetric();
+  }
+
+  /**
+   * Drop an agent that did not acknowledge a dispatch. Its other in-flight jobs
+   * (a multi-slot agent may run more than the one that timed out) go through
+   * {@link onAgentDisconnect}, which reads the registration before its first
+   * await to tell a scaler-managed agent from a static one, so the triage
+   * starts first. The unregister right after removes the agent from routing at
+   * once, so a redispatch cannot re-select it while the triage awaits.
+   */
+  private dropUnacknowledgingAgent(agentId: string): Promise<void> {
+    const triage = this.onAgentDisconnect(agentId).then(
+      () => undefined,
+      (err: unknown) => {
+        logger.error('Job triage failed for an agent dropped by an ack timeout', {
+          agentId,
+          error: toErrorMessage(err),
+        });
+      },
+    );
+    this.registry.unregister(agentId);
+    return triage;
   }
 
   /**
@@ -1825,7 +1866,15 @@ export class Dispatcher {
    * asynchronously when recovery timers expire).
    */
   async onAgentDisconnect(agentId: string): Promise<string[]> {
-    const scalerManaged = this.registry.get(agentId)?.scalerManaged ?? false;
+    const entry = this.registry.get(agentId);
+    const scalerManaged = entry?.scalerManaged ?? false;
+    // The unregisters below run after awaits. A caller that dropped the agent
+    // before this call (a token revocation, an ack timeout) leaves no entry, so
+    // a registration found then is a reconnect, and removing it would drop a
+    // live agent.
+    const unregisterIfUnchanged = (): void => {
+      if (this.registry.get(agentId) === entry) this.registry.unregister(agentId);
+    };
     const jobIds = this.agentJobs.get(agentId);
     if (!jobIds || jobIds.size === 0) {
       // No in-flight jobs -- clean disconnect. (The common reboot case: the
@@ -1846,7 +1895,7 @@ export class Dispatcher {
     if (rebootPending && !scalerManaged) {
       await this.completeInFlightForReboot(agentId, [...jobIds]);
       this.cleanupGraceEntriesForAgent(agentId);
-      this.registry.unregister(agentId);
+      unregisterIfUnchanged();
       await this.updateQueueDepthMetric();
       return [];
     }
@@ -1856,7 +1905,17 @@ export class Dispatcher {
       : await this.startRecoveryForDisconnect(agentId, jobIds);
 
     this.cleanupGraceEntriesForAgent(agentId);
-    this.registry.unregister(agentId);
+    unregisterIfUnchanged();
+    if (failedJobIds.length > 0) {
+      try {
+        this.disconnectCleanup?.(failedJobIds);
+      } catch (err) {
+        logger.error('Releasing the waiters of failed jobs threw', {
+          agentId,
+          error: toErrorMessage(err),
+        });
+      }
+    }
     await this.updateQueueDepthMetric();
     return failedJobIds;
   }
@@ -2069,6 +2128,15 @@ export class Dispatcher {
    */
   getAgentIdForJob(jobId: string): string | null {
     return this.jobToAgent.get(jobId) ?? null;
+  }
+
+  /** The jobs of `runId` this dispatcher currently tracks to an agent. */
+  getTrackedJobIdsForRun(runId: string): string[] {
+    const jobIds: string[] = [];
+    for (const [jobId, trackedRunId] of this.jobRunIds) {
+      if (trackedRunId === runId) jobIds.push(jobId);
+    }
+    return jobIds;
   }
 
   /**
@@ -2292,6 +2360,7 @@ export class Dispatcher {
         runId: row.runId,
         agentId: row.agentId ?? '',
       });
+      let triage: Promise<void> | undefined;
       if (row.agentId && this.registry.get(row.agentId)) {
         this.registry.decrementActiveJobs(row.agentId);
         this.untrackJob(row.agentId, row.id);
@@ -2299,9 +2368,10 @@ export class Dispatcher {
         // before re-dispatching so it cannot re-select the agent (same order
         // as handleAckExpiry).
         this.onAckTimeout?.(row.agentId, row.id, row.runId);
-        this.registry.unregister(row.agentId);
+        triage = this.dropUnacknowledgingAgent(row.agentId);
       }
       await this.finishRequeue(row.agentId ?? '', row.id, 'dispatch ack deadline sweep', attempts);
+      await triage;
     }
     if (requeued > 0) {
       logger.info('dispatcher: leader sweep requeued un-acked dispatches', { expired: requeued });

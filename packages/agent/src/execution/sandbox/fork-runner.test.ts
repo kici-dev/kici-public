@@ -1,10 +1,11 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import type { JobDispatch } from '@kici-dev/engine';
 import type { JobExecutionOptions } from './types.js';
 import type { RunnerToAgentMessage, AgentToRunnerMessage } from './ipc-protocol.js';
+import { DepRestoreOutcome, type DepRestoreReport } from '../dep-restore-report.js';
 
 // We test createForkRunner via a controlled mock of child_process.fork
 // The fork-runner uses fork/spawn internally, so we mock at the module level.
@@ -655,6 +656,65 @@ describe('fork-runner completion-hooks-done relay', () => {
 });
 
 // --- buildRequest tests for job-level timeout ---
+
+describe('fork-runner dep-restore report relay', () => {
+  let mockChild: ReturnType<typeof createMockChild>;
+  let sink: Mock<(report: DepRestoreReport, context: Record<string, string>) => void>;
+  const REPORT: DepRestoreReport = {
+    outcome: DepRestoreOutcome.enum.restored,
+    source: 'https://bucket/deps/x.tar.gz',
+    verified: true,
+    attempts: [],
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    mockChild = createMockChild();
+    sink = vi.fn();
+    vi.doMock('node:child_process', () => ({
+      fork: vi.fn().mockReturnValue(mockChild),
+      spawn: vi.fn().mockReturnValue(mockChild),
+    }));
+    vi.doMock('node:fs', () => ({ existsSync: vi.fn().mockReturnValue(false) }));
+    vi.doMock('./env-sanitizer.js', () => ({ buildSanitizedEnv: vi.fn().mockReturnValue({}) }));
+    vi.doMock('./secret-encryption.js', () => ({
+      encryptSecretOutputs: vi.fn().mockReturnValue(undefined),
+    }));
+    // The real relay, writing to a spy instead of the agent log.
+    vi.doMock('../dep-restore-report.js', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../dep-restore-report.js')>();
+      return {
+        ...real,
+        createDepRestoreReportRelay: (jobId: string) =>
+          real.createDepRestoreReportRelay(jobId, sink),
+      };
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
+  it("logs the runner's setup report once, tagged with the job", async () => {
+    // fails-when: the relay case is missing from relayChildIpcMessage
+    const mod = await import('./fork-runner.js');
+    mod.createForkRunner({ runnerPath: '/test/runner.js', env: {} }, createMockExecOptions());
+    mockChild.simulateIpc({ type: 'dep-restore.report', report: REPORT });
+    mockChild.simulateIpc({ type: 'dep-restore.report', report: REPORT });
+    expect(sink.mock.calls).toEqual([[REPORT, { jobId: 'job-1', via: 'runner' }]]);
+  });
+
+  it('ignores a report sent after the first step started', async () => {
+    // fails-when: step.start does not close the relay
+    // breaks-if-wrong: the setup report above is still logged
+    const mod = await import('./fork-runner.js');
+    mod.createForkRunner({ runnerPath: '/test/runner.js', env: {} }, createMockExecOptions());
+    mockChild.simulateIpc({ type: 'step.start', stepIndex: 0, stepName: 'build' });
+    mockChild.simulateIpc({ type: 'dep-restore.report', report: REPORT });
+    expect(sink).not.toHaveBeenCalled();
+  });
+});
 
 describe('buildRequest - job timeout', () => {
   it('threads jobConfig.timeout into request.jobTimeoutMs', async () => {

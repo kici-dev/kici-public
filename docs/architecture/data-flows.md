@@ -32,7 +32,7 @@ GitHub  -->  Platform Relay  -->  Orchestrator  -->  Agent
 11. **Orchestrator detects workflow modifications** for untrusted PR events by comparing base and head lock files via `detectWorkflowModifications()`, applying security holds when non-trusted contributors modify workflow files.
 12. **Orchestrator extracts registrations** on default-branch pushes: persists registerable workflows (event, schedule, lifecycle triggers) for cluster-wide event matching.
 13. **Orchestrator notifies the event router** on default-branch pushes: after the registrations are persisted, emits a `registration.updated` event via `eventRouter.emit()` (if event routing is active). Workflow event subscriptions are the persisted registrations themselves, matched at emit time through the registration index.
-14. **Orchestrator fetches changed files** via the provider's `ChangedFilesFetcher` for path-based trigger filtering (skipped when no workflow uses path filters).
+14. **Orchestrator resolves changed files** via the provider's `ChangedFilesFetcher` for path-based trigger filtering (`skipped` when no workflow uses path filters). No fetcher, a truncated list, or an API failure resolves as `unavailable`: a path filter then matches, and when the event has a git range the agent decides it from its clone in an `__init__` job.
 15. **Orchestrator matches triggers** against the lock file using `matchWorkflowsForEvent()` from `@kici-dev/engine` -- an event-type-bucketed candidate scan that evaluates only the workflows subscribed to this event type. (The single-registration global / cross-source paths evaluate one lock entry at a time via `matchAllWorkflows()`.)
 16. **Orchestrator applies the content-requirements filter** to the matched candidates: for each trigger that declares `requires`, it reads the named source files at the event's ref through the provider's `FileContentsFetcher` (once per distinct `(repo, sha, path)` via an LRU cache) and evaluates the declarative requirement. Candidates that fail -- or that cannot be evaluated at all (unreadable or oversize content, a fetch error, no fetcher wired) -- are dropped before dispatch with the concrete reason logged. No workflow code runs at this stage. Skipped entirely when no matched trigger declares `requires`.
 17. **Orchestrator checks caches** for source tarballs and dependency tarballs.
@@ -238,8 +238,8 @@ The coalescing map is per coordinator. The build job itself sits on the cluster-
 If cache storage is unavailable or a download fails:
 
 - **Source tarball download failure:** Hard failure today — the agent does not fall back to rebuilding `.kici/` from the checkout. In practice this is rare because the same orchestrator that issued the pre-signed URL controls the cache backend.
-- **Dep tarball download failure:** Agent falls back to running `npm ci` / `npm install` inline.
-- **Dep tarball hash mismatch:** Agent retries the download twice (3 total attempts), then fails the job (no fallback for integrity failures).
+- **Dep tarball download or extraction failure:** The agent installs the dependencies inline instead. This applies to every job kind: execution, init and evaluation jobs.
+- **Dep tarball hash mismatch:** The agent fails the job after one download, before it extracts anything (no fallback for integrity failures).
 - **Source tarball drift (extracted `contentHash` ≠ lock file):** Hard failure with "Lock file is out of date: workflow source changed without regenerating kici.lock.json" — see [Lock file and drift](../user/lock-file-and-drift.md).
 - **Build failure:** Execution is skipped entirely with a "Build failed" check status. Workflows that contain dynamic job entries (DynamicJobFn) are allowed to proceed with their dynamic eval jobs since those compile from source.
 - **No cache configured:** Agent runs inline install for every job (pre-caching behavior).
@@ -309,6 +309,8 @@ Agent                         Orchestrator                    S3
 
 The two-phase metadata approach (`upload via PUT` then `initMeta via CopyObject`) works around the limitation that S3 pre-signed URLs cannot include custom metadata headers. For dependency tarballs, the agent also reports the SHA-256 content hash in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file alongside the tarball. When dispatching execution jobs, the orchestrator reads this hash and includes it as `depsHash` in `job.dispatch`, enabling agent-side integrity verification on download. Source tarballs carry their own SHA-256 as `sourceTarDigest` in `job.dispatch`, verified before extraction; the workflow `contentHash` is then re-computed against the extracted source to verify it against the lock file, which covers drift end-to-end.
 
+The orchestrator holds the build job's terminal success until the metadata copy and the pointer write for every upload it reported have finished, bounded by the org's cache upload settle timeout (default 10 seconds). The jobs that wait on the build read the cache when that success is handled, so they get the URLs of the tarballs the build just uploaded.
+
 ### URL delivery (downloads)
 
 Agents receive pre-signed S3 GET URLs (15-minute expiry) directly in `job.dispatch` messages. Agents download artifacts from S3, bypassing the orchestrator for all data transfer.
@@ -317,7 +319,7 @@ Agents receive pre-signed S3 GET URLs (15-minute expiry) directly in `job.dispat
 
 The source/dep cache above is internal: the orchestrator owns its keys and decides when to hit or build. The **user-facing cache** is driven by the workflow author — the declarative `cache: { key, paths, restoreKeys? }` on a job/step, or the imperative `ctx.cache.restore()` / `ctx.cache.save()` API (see [SDK caching reference](../user/sdk/caching.md)). It reuses the same object-storage backend and the same direct-to-storage presigned-URL transport, but the agent — not the orchestrator — initiates each restore and save over WebSocket.
 
-The agent's cache module archives `paths` into a gzipped tarball (computing a SHA-256 over the bytes) and streams downloads back through a checksum-verified extract pipeline. The orchestrator's `UserCache` owns the `cache/<orgId>/<repoId>/<scope>/<key>-<discriminator>` namespacing (the discriminator is a hash of the exact cache key, so two keys differing only by case stay two objects on a case-insensitive store), the immutable first-save check, the `restoreKeys` prefix scan, the two-phase atomic save, and per-org quota/TTL eviction.
+The agent's cache module archives `paths` into a gzipped tarball (computing a SHA-256 over the bytes) and restores by downloading the tarball to a temporary file, checking its SHA-256, and only then extracting it. The orchestrator's `UserCache` owns the `cache/<orgId>/<repoId>/<scope>/<key>-<discriminator>` namespacing, the immutable first-save check, the `restoreKeys` prefix scan, the two-phase atomic save, and per-org quota/TTL eviction. The discriminator is a hash of the exact cache key, so two keys that differ only by case stay two objects on a case-insensitive store.
 
 ### Restore flow
 

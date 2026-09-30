@@ -19,6 +19,11 @@ export interface LocalTriggerInput {
   event: 'push' | 'pull_request';
   ref: string;
   sha: string;
+  /**
+   * The commit before the push. With it the changed files are `before..sha`;
+   * without it the push has no range and path filters match conservatively.
+   */
+  before?: string;
   defaultBranch: string;
 }
 
@@ -32,6 +37,7 @@ export interface LocalTriggerRequest {
 export function buildLocalTriggerRequest(input: LocalTriggerInput): LocalTriggerRequest {
   const body = JSON.stringify({
     ref: input.ref,
+    ...(input.before && { before: input.before }),
     after: input.sha,
     repository: { full_name: input.repoFullName, default_branch: input.defaultBranch },
   });
@@ -55,6 +61,20 @@ export function readRepoHead(repoPath: string): { ref: string; sha: string } {
     encoding: 'utf8',
   }).trim();
   return { ref: `refs/heads/${branch}`, sha };
+}
+
+/** The parent of `sha` in a local repo, or undefined for a root commit or an unreadable repo. */
+export function readParentSha(repoPath: string, sha: string): string | undefined {
+  try {
+    const parent = execFileSync(
+      'git',
+      ['-C', repoPath, 'rev-parse', '--verify', '--quiet', `${sha}^`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+    return parent || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** POST the trigger request to the orchestrator base URL. Returns the HTTP status. */

@@ -69,7 +69,7 @@ The `encrypted` posture never silently falls back to sending plaintext through t
 
 ## Key rotation
 
-Rotating the encryption key generates a new active key and marks the previous one rotated-out. The rotated-out key drops out of the published JWKS immediately, so every new seal uses the new key — but your orchestrator keeps the old key's private half, so a value a browser already sealed to the previous key id still decrypts. Nothing is lost mid-rotation.
+Rotating the encryption key generates a new active key and marks the previous one rotated-out. The rotated-out key drops out of the published JWKS immediately, so every new seal uses the new key. Your orchestrator still keeps the old key's private half, so a value a browser already sealed to the previous key id still decrypts. Nothing is lost mid-rotation.
 
 ```bash
 kici-admin dashboard-encryption-key show      # active kid, public JWK, both JWKS URLs
@@ -79,7 +79,7 @@ kici-admin dashboard-encryption-key rotate    # mint a new active key
 
 `rotate` prompts before it mints; pass `--dry-run` to preview or `--yes` to skip the prompt in a script. All three read the orchestrator database directly, so they need `KICI_DATABASE_URL` (or `--database-url`); `rotate` also needs `KICI_SECRET_KEY`, which wraps the new private key.
 
-The active key is generated automatically the first time an orchestrator boots with `KICI_SECRET_KEY` set — in an HA cluster the generation is leader-gated, so exactly one key is minted no matter how many nodes start at once. You only need `rotate` for a deliberate rotation or a suspected compromise.
+The active key is generated automatically the first time an orchestrator boots with `KICI_SECRET_KEY` set. In an HA cluster the generation is leader-gated, so exactly one key is minted no matter how many nodes start at once. You only need `rotate` for a deliberate rotation or a suspected compromise.
 
 ## See also
 

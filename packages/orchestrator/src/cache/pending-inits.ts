@@ -30,6 +30,15 @@ export interface InitResult {
    * explicit `false` suppresses.
    */
   filterPassed?: boolean;
+  /**
+   * Verdict on the workflow's deferred `paths`, reported only when the init job
+   * was asked to decide them. `false` means the agent's clone diff matched none
+   * of them and the job must not be dispatched.
+   *
+   * Optional on purpose: an agent that predates deferred paths never sends it,
+   * so absence means "no verdict" and dispatch proceeds.
+   */
+  pathsPassed?: boolean;
 }
 
 export class PendingInitTracker extends PendingTracker<InitResult> {

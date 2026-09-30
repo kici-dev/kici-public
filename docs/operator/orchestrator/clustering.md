@@ -66,9 +66,9 @@ The shared database ensures:
 
 **Do not** run separate PostgreSQL instances per orchestrator in a cluster. This will cause split-brain: each orchestrator would generate a different `cluster_id`, tokens consumed on one would not be visible to others, and peer credentials would be siloed.
 
-### Peer authentication (join tokens)
+### Peer authentication
 
-Peer-to-peer WebSocket connections use an ECDH key exchange followed by join token or credential authentication. The first orchestrator (coordinator) starts normally. Additional peers join using a one-time join token that authenticates them and issues a persistent credential for subsequent connections.
+Peer-to-peer WebSocket connections use an ECDH key exchange, then authenticate with a join token or a credential. A coordinator without `KICI_CLUSTER_JOIN_TOKEN` issues its own credential the first time it connects to a peer. It writes to the shared database, which is the same authority `kici-admin peer create-token` uses. A worker has no database, so a worker joins with a one-time join token, and the coordinator that accepts the token issues the worker's credential. A coordinator can also join with a token. After the first join, every peer authenticates with its credential.
 
 ### Network connectivity
 
@@ -82,37 +82,49 @@ For the full outbound allowlist and inbound surface across all deployment modes,
 
 Cluster configuration uses the `KICI_CLUSTER_*` environment variable prefix.
 
-| Environment Variable                        | Default                   | Required               | Description                                                                                                                                                                                                                                                                                                             |
-| ------------------------------------------- | ------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KICI_CLUSTER_JOIN_TOKEN`                   | --                        | First join only        | One-time join token for authenticating with the cluster. Used only on the first connection; a persistent credential is issued after successful authentication.                                                                                                                                                          |
-| `KICI_CLUSTER_CREDENTIAL_FILE`              | `~/.kici/peer-credential` | --                     | Path to store/load the persistent peer credential. After first join, the orchestrator uses this credential for all subsequent connections.                                                                                                                                                                              |
-| `KICI_CLUSTER_INSTANCE_ID`                  | random UUID               | Recommended            | Unique identifier for this orchestrator instance. Auto-generated if not set, which gives a restarted orchestrator a new id and orphans the rows its previous boot wrote — set a stable value on every orchestrator, see [recovery is scoped to the owning instance](#recovery-is-scoped-to-the-owning-instance).        |
-| `KICI_CLUSTER_ADDRESS`                      | --                        | When peers set         | This orchestrator's reachable address (e.g., `ws://10.0.0.1:4000`). Required when `KICI_CLUSTER_PEERS` is set.                                                                                                                                                                                                          |
-| `KICI_CLUSTER_PEERS`                        | --                        | Multi-orch independent | Comma-separated list of peer addresses (e.g., `ws://10.0.0.2:4000,ws://10.0.0.3:4000`). Only needed for multi-orchestrator independent mode (Platform/hybrid uses automatic peer discovery).                                                                                                                            |
-| `KICI_CLUSTER_RAFT_ELECTION_TIMEOUT_MIN_MS` | `5000`                    | --                     | Minimum Raft election timeout (ms).                                                                                                                                                                                                                                                                                     |
-| `KICI_CLUSTER_RAFT_ELECTION_TIMEOUT_MAX_MS` | `10000`                   | --                     | Maximum Raft election timeout (ms).                                                                                                                                                                                                                                                                                     |
-| `KICI_CLUSTER_RAFT_HEARTBEAT_MS`            | `2000`                    | --                     | Raft leader heartbeat interval (ms).                                                                                                                                                                                                                                                                                    |
-| `KICI_CLUSTER_PEER_HEARTBEAT_INTERVAL_MS`   | `30000`                   | --                     | Peer inventory heartbeat interval (ms).                                                                                                                                                                                                                                                                                 |
-| `KICI_CLUSTER_INSTANCE_HEARTBEAT_MS`        | `10000`                   | --                     | How often this orchestrator records its own liveness in the shared `cluster_instances` table (ms). Every recovery decision reads it, so raising it widens the window in which a crashed coordinator's jobs stay untouched. See [recovery is scoped to the owning instance](#recovery-is-scoped-to-the-owning-instance). |
-| `KICI_CLUSTER_PEER_MAX_RECONNECT_DELAY_MS`  | `60000`                   | --                     | Maximum delay between peer reconnect attempts (ms).                                                                                                                                                                                                                                                                     |
-| `KICI_CLUSTER_ROLE`                         | `coordinator`             | For workers            | Cluster role: `coordinator` (default, full orchestrator) or `worker` (delegated execution only). See [Coordinator/worker deployment](coordinator-worker.md).                                                                                                                                                            |
-| `KICI_CLUSTER_COORDINATOR_URL`              | --                        | For workers            | WebSocket URL of the coordinator's peer endpoint (e.g., `ws://coordinator:4000/ws/peer`). Required when `KICI_CLUSTER_ROLE=worker`.                                                                                                                                                                                     |
-| `KICI_CLUSTER_PEER_STALE_TIMEOUT_MS`        | `60000`                   | --                     | Timeout in ms after which a peer with no heartbeat is considered stale.                                                                                                                                                                                                                                                 |
-| `KICI_CLUSTER_TRUSTED_PROXIES`              | --                        | Behind reverse proxy   | Comma-separated list of trusted proxy IPs or CIDR ranges (e.g., `10.0.0.0/8,172.16.0.0/12`). When set, the peer handler extracts the real client IP from `X-Forwarded-For` instead of using the socket IP. Required for correct rate limiting when orchestrators are behind a load balancer or reverse proxy.           |
+| Environment Variable                        | Default                   | Required                       | Description                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------- | ------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_CLUSTER_JOIN_TOKEN`                   | --                        | Workers; a revoked coordinator | One-time join token. A worker needs one for its first connection. A coordinator needs one only to rejoin after an operator revoked its credential; without a token, a coordinator issues its own credential. After a successful join the peer uses its persisted credential.                                                                                                                            |
+| `KICI_CLUSTER_CREDENTIAL_FILE`              | `~/.kici/peer-credential` | --                             | Path to store/load the persistent peer credential. After first join, the orchestrator uses this credential for all subsequent connections. Each orchestrator on a host needs its own file.                                                                                                                                                                                                              |
+| `KICI_CLUSTER_INSTANCE_ID`                  | random UUID               | Recommended                    | Unique identifier for this orchestrator instance. Auto-generated if not set, which gives a restarted orchestrator a new id and orphans the rows its previous boot wrote — set a stable value on every orchestrator, see [recovery is scoped to the owning instance](#recovery-is-scoped-to-the-owning-instance). A coordinator retires the credential its previous run issued when it issues a new one. |
+| `KICI_CLUSTER_ADDRESS`                      | --                        | When peers set                 | This orchestrator's reachable address (e.g., `ws://10.0.0.1:4000`). Required when `KICI_CLUSTER_PEERS` is set.                                                                                                                                                                                                                                                                                          |
+| `KICI_CLUSTER_PEERS`                        | --                        | Multi-orch independent         | Comma-separated list of peer addresses (e.g., `ws://10.0.0.2:4000,ws://10.0.0.3:4000`). Only needed for multi-orchestrator independent mode (Platform/hybrid uses automatic peer discovery).                                                                                                                                                                                                            |
+| `KICI_CLUSTER_RAFT_ELECTION_TIMEOUT_MIN_MS` | `5000`                    | --                             | Minimum Raft election timeout (ms).                                                                                                                                                                                                                                                                                                                                                                     |
+| `KICI_CLUSTER_RAFT_ELECTION_TIMEOUT_MAX_MS` | `10000`                   | --                             | Maximum Raft election timeout (ms).                                                                                                                                                                                                                                                                                                                                                                     |
+| `KICI_CLUSTER_RAFT_HEARTBEAT_MS`            | `2000`                    | --                             | Raft leader heartbeat interval (ms).                                                                                                                                                                                                                                                                                                                                                                    |
+| `KICI_CLUSTER_PEER_HEARTBEAT_INTERVAL_MS`   | `30000`                   | --                             | Peer inventory heartbeat interval (ms).                                                                                                                                                                                                                                                                                                                                                                 |
+| `KICI_CLUSTER_INSTANCE_HEARTBEAT_MS`        | `10000`                   | --                             | How often this orchestrator records its own liveness in the shared `cluster_instances` table (ms). Every recovery decision reads it, so raising it widens the window in which a crashed coordinator's jobs stay untouched. See [recovery is scoped to the owning instance](#recovery-is-scoped-to-the-owning-instance).                                                                                 |
+| `KICI_CLUSTER_PEER_MAX_RECONNECT_DELAY_MS`  | `60000`                   | --                             | Maximum delay between peer reconnect attempts (ms).                                                                                                                                                                                                                                                                                                                                                     |
+| `KICI_CLUSTER_ROLE`                         | `coordinator`             | For workers                    | Cluster role: `coordinator` (default, full orchestrator) or `worker` (delegated execution only). See [Coordinator/worker deployment](coordinator-worker.md).                                                                                                                                                                                                                                            |
+| `KICI_CLUSTER_COORDINATOR_URL`              | --                        | For workers                    | WebSocket URL of the coordinator's peer endpoint (e.g., `ws://coordinator:4000/ws/peer`). Required when `KICI_CLUSTER_ROLE=worker`.                                                                                                                                                                                                                                                                     |
+| `KICI_CLUSTER_COORDINATOR_URLS`             | --                        | For multi-coordinator workers  | Comma-separated peer endpoint URLs of every coordinator. The worker connects to each one, so every coordinator can route work to it. Takes precedence over `KICI_CLUSTER_COORDINATOR_URL` when both are set.                                                                                                                                                                                            |
+| `KICI_CLUSTER_PEER_STALE_TIMEOUT_MS`        | `60000`                   | --                             | Timeout in ms after which a peer with no heartbeat is considered stale.                                                                                                                                                                                                                                                                                                                                 |
+| `KICI_CLUSTER_ELECTION_GRACE_PERIOD_MS`     | `60000`                   | --                             | How long an orchestrator with no connected peers waits before it elects itself leader (ms). The wait keeps it from taking leadership while it is still discovering its peers.                                                                                                                                                                                                                           |
+| `KICI_CLUSTER_SINGLE_NODE`                  | `false`                   | --                             | Set to `true` on a deployment that will never have peers. The orchestrator then skips the election grace period and elects itself leader at once.                                                                                                                                                                                                                                                       |
+| `KICI_CLUSTER_TRUSTED_PROXIES`              | --                        | Behind reverse proxy           | Comma-separated list of trusted proxy IPs or CIDR ranges (e.g., `10.0.0.0/8,172.16.0.0/12`). When set, the peer handler extracts the real client IP from `X-Forwarded-For` instead of using the socket IP. Required for correct rate limiting when orchestrators are behind a load balancer or reverse proxy.                                                                                           |
 
 ### Mode-specific requirements
 
 - **Single-orchestrator (any mode):** No cluster env vars needed. Cluster components initialize in dormant mode automatically.
-- **Multi-orchestrator Platform/hybrid mode:** The first orchestrator starts normally. Additional peers need a join token created by `kici-admin peer create-token`. The Platform matchmaker handles peer discovery automatically.
-- **Multi-orchestrator independent mode:** `KICI_CLUSTER_JOIN_TOKEN` (for peers), `KICI_CLUSTER_ADDRESS`, and `KICI_CLUSTER_PEERS` are required because there is no Platform matchmaker for peer discovery.
+- **Multi-orchestrator Platform/hybrid mode:** Coordinators need no join token: each issues its own credential. Workers need a join token from `kici-admin peer create-token --role worker`. The Platform matchmaker handles peer discovery automatically.
+- **Multi-orchestrator independent mode:** `KICI_CLUSTER_ADDRESS` and `KICI_CLUSTER_PEERS` are required because there is no Platform matchmaker for peer discovery. Workers also need `KICI_CLUSTER_JOIN_TOKEN`.
 
 ## Peer authentication flow
 
 Peer authentication uses ECDH (X25519) key exchange to establish an encrypted channel before any credentials are transmitted.
 
+### A coordinator's own credential
+
+A coordinator without `KICI_CLUSTER_JOIN_TOKEN` authenticates with its credential file when the file names it. When it has no usable file the first time it connects to a peer, or a peer rejects its credential, it checks the shared database:
+
+- No credential, an expired credential, or a credential file that is missing or does not match: the coordinator issues a new credential, stores its hash in the database, and writes the credential file.
+- A credential that an operator revoked: the coordinator does not issue a new one. It logs `Peer credential for this coordinator was revoked; not issuing a new one` once. Its outbound peer connections close without authenticating, and other coordinators still connect to it. See [Re-joining after revocation](#re-joining-after-revocation). A revoke applies to one instance ID. A coordinator without a stable `KICI_CLUSTER_INSTANCE_ID` gets a new ID when it restarts, and the new ID issues its own credential. Set a stable instance ID on every coordinator so that a revoke holds across restarts.
+
+A restart without a stable instance ID gives the orchestrator a new instance ID. When the credential file holds a credential that the previous run issued to itself, the coordinator revokes it, unless the previous instance still reads as live. A previous run that stopped cleanly is not live. A previous run that crashed stays live for the heartbeat grace window (120 seconds at the defaults, see [recovery is scoped to the owning instance](#recovery-is-scoped-to-the-owning-instance)). A coordinator that restarts inside that window keeps the previous credential active until it expires. A credential the previous run got from a join token stays active until it expires. A coordinator that never connects to a peer, such as a single orchestrator, issues nothing. A single-node orchestrator (`KICI_CLUSTER_SINGLE_NODE=true`) never issues a credential.
+
 ### First join (with token)
 
-1. **Start the coordinator** -- the first orchestrator in the cluster starts normally with `KICI_SECRET_KEY` set
+1. **Start the coordinator** -- the first orchestrator in the cluster starts with `KICI_SECRET_KEY` set; it issues its own credential when it first connects to a peer
 2. **Create a join token** on the coordinator:
    ```bash
    kici-admin peer create-token --role coordinator
@@ -189,7 +201,7 @@ KICI_DATABASE_URL=postgres://user:pass@shared-db:5432/kici
 KICI_SCALER_CONFIG_PATH=/etc/kici/scalers.yaml
 ```
 
-After the first successful connection, Orchestrator B saves its credential and no longer needs the join token. Subsequent restarts use the persisted credential automatically.
+After the first successful connection, Orchestrator B saves its credential and no longer needs the join token. Subsequent restarts use the persisted credential automatically. Orchestrator B is a coordinator, so it can also start without `KICI_CLUSTER_JOIN_TOKEN` and issue its own credential.
 
 ### x64 + ARM64 pool
 
@@ -445,12 +457,13 @@ After the initial join, peers authenticate using persistent credentials stored i
 The credential file is stored at `~/.kici/peer-credential` by default (configurable via `KICI_CLUSTER_CREDENTIAL_FILE`). It contains:
 
 - Instance ID
-- Credential hash
+- Credential (a secret; peers store only its SHA-256 hash)
 - Role (coordinator or worker)
-- Coordinator URL
 - Issued timestamp
 
 The file is created with `0600` permissions (owner read/write only).
+
+Each orchestrator needs its own credential file: two orchestrators that share one path overwrite each other's credential. Keep the file on persistent storage (for a container, a volume). A coordinator that finds its file missing issues a replacement on its next peer connection.
 
 ### Managing peers
 
@@ -460,13 +473,15 @@ The file is created with `0600` permissions (owner read/write only).
 kici-admin peer list
 ```
 
+`kici-admin peer list --json` prints the same records as JSON. `selfIssued` is `true` for a credential a coordinator issued to itself. `lastValidatedBy` names the coordinator that last accepted the peer's credential proof; a coordinator whose outbound connections authenticate shows another coordinator there.
+
 **Revoke a peer:**
 
 ```bash
 kici-admin peer revoke --instance-id <id>
 ```
 
-The revoked peer's credential is invalidated. The peer must re-join with a new token.
+The revoked peer's credential is invalidated. The peer must re-join with a new token. This applies to a coordinator with a stable `KICI_CLUSTER_INSTANCE_ID` too: it does not issue itself a new credential after a revoke.
 
 **Revoke all peers:**
 
@@ -474,7 +489,7 @@ The revoked peer's credential is invalidated. The peer must re-join with a new t
 kici-admin peer revoke-all --confirm
 ```
 
-All peer credentials are invalidated. All peers must re-join with new tokens. Use this for emergency security responses.
+All peer credentials are invalidated. All peers must re-join with new tokens. Use this for emergency security responses. This applies to a coordinator with a stable `KICI_CLUSTER_INSTANCE_ID` too: it does not issue itself a new credential after a revoke.
 
 ### Re-joining after revocation
 
@@ -484,6 +499,7 @@ If a peer's credential is revoked:
 2. Set the token on the revoked peer: `KICI_CLUSTER_JOIN_TOKEN=<new-token>`
 3. Restart the peer
 4. The peer authenticates with the new token and receives a new credential
+5. Remove `KICI_CLUSTER_JOIN_TOKEN` after the peer has joined. A coordinator without a token then manages its own credential again.
 
 ## Monitoring
 
@@ -568,14 +584,30 @@ Without this setting, rate limiting uses the socket IP (the proxy), which may in
 
 ### Peer authentication failed
 
-**Symptom:** Peer connections fail with "Invalid join token" or "Invalid credential" in logs.
+**Symptom:** Peer connections fail, and the connecting orchestrator logs `Peer auth rejected` with a reason such as `Invalid token`, `Unknown credential`, `Credential revoked`, or `Invalid proof`.
 
 **Checks:**
 
 1. **Join token expired** -- tokens expire after 1 hour by default. Create a new one with `kici-admin peer create-token`
 2. **Token already consumed** -- join tokens are one-time use. Create a new one for each peer
-3. **Credential revoked** -- if the credential was revoked via `kici-admin peer revoke`, the peer needs a new join token
+3. **Credential revoked** -- if the credential was revoked via `kici-admin peer revoke`, the peer needs a new join token, including a coordinator
 4. **Rate limited** -- after 5 failed auth attempts within 60 seconds, the IP is temporarily blocked. Wait and retry
+
+### `No peer auth method` in the logs
+
+**Symptom:** An orchestrator logs `No peer auth method: this instance has no credential file and no join token` once for each outbound peer connection, and those connections close.
+
+**Checks:**
+
+1. On a worker, set `KICI_CLUSTER_JOIN_TOKEN` to a token from `kici-admin peer create-token --role worker`.
+2. On a coordinator, look for the revoked-credential error below, or `Could not issue this coordinator its peer credential`, which names the database or file error.
+3. Make sure `KICI_CLUSTER_CREDENTIAL_FILE` is writable and no other orchestrator uses the same path.
+
+### Coordinator credential revoked
+
+**Symptom:** A coordinator logs `Peer credential for this coordinator was revoked; not issuing a new one`. Other coordinators connect to it. Its own connections to them close without authenticating, and it retries them with backoff.
+
+An operator revoked its credential with `kici-admin peer revoke` or `kici-admin peer revoke-all`. Follow [Re-joining after revocation](#re-joining-after-revocation).
 
 ### Peers not connecting
 
@@ -620,7 +652,7 @@ A peer that accepts a reroute but then fails to spawn the agent (transient scale
 
 ### Jobs not rerouting
 
-**Symptom:** Jobs fail with "No orchestrator in cluster has matching agents" even though a peer has agents.
+**Symptom:** Jobs fail with `No orchestrator in cluster handles labels: <labels>` even though a peer has agents.
 
 **Checks:**
 

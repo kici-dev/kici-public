@@ -26,6 +26,7 @@ import {
   type PeerWsLike,
 } from './peer-handler.js';
 import { PeerRegistry } from './peer-registry.js';
+import { TOKEN_ALREADY_USED_MESSAGE } from './join-token.js';
 
 // ── Mock WebSocket ──────────────────────────────────────────────────
 
@@ -421,8 +422,7 @@ describe('PeerHandler', () => {
       return { token, validationHash, routing };
     }
 
-    const ALREADY_USED =
-      'Join token has already been used. Generate a new token with: kici admin create-join-token';
+    const ALREADY_USED = TOKEN_ALREADY_USED_MESSAGE;
 
     async function presentAlreadyUsedToken(
       token: string,

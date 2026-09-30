@@ -68,7 +68,7 @@ Can be sync or async. Receives a `RuleContext`:
 | `env`                | `Record<string, string\|undefined>`       | Environment variables                                                   |
 | `$`                  | zx shell                                  | Shell executor for running commands                                     |
 
-`changedFiles` is available on `push` and `pull_request` events — the agent computes the diff from its checkout, so no `paths:` trigger is required. It is `unavailable` for events with no diff (`schedule`, `tag`, `manual_schedule`), and in the rare case where the diff cannot be computed (e.g. a history deeper than the agent's bounded fetch). Reading `changedFiles` when it is unavailable throws and fails the job, so guard with `changedFilesStatus` first when a rule can run on such events:
+`changedFiles` is available on `push` and `pull_request` events — the agent computes the diff from its checkout, so no `paths:` trigger is required. A push to an existing branch diffs `before..after`. A push that creates a branch lists the files the branch adds, compared with the default branch. A pull request lists the files it changes. It is `unavailable` for events with no diff (`schedule`, `tag`, `manual_schedule`) and for a push whose payload has no `before` or `after` commit. It is also `unavailable` for a push that creates the default branch itself, and when the diff cannot be computed (e.g. a history deeper than the agent's bounded fetch). Reading `changedFiles` when it is unavailable throws and fails the job, so guard with `changedFilesStatus` first when a rule can run on such events:
 
 ```typescript
 rule('has source changes', (ctx) => {
@@ -223,7 +223,7 @@ A dynamic matrix that would expand to an unreasonable number of raw combinations
 before it is built, so a runaway discovery command fails the job with an error rather than
 exhausting the agent.
 
-A dynamic matrix is resolved at runtime, then materialized into N instances exactly like a static matrix. Because the combinations are not known until the function runs, the 256-combination cap (and the "zero combinations" guard) is enforced at that point: a dynamic matrix that resolves to more than 256 combinations, or to none, fails the job with a matrix-expansion error rather than dispatching.
+A dynamic matrix is resolved at runtime, then materialized into N instances exactly like a static matrix. Because the combinations are not known until the function runs, the 256-combination cap (and the "zero combinations" guard) is enforced at that point. A dynamic matrix that resolves to more than 256 combinations, or to none, fails the job with a matrix-expansion error rather than dispatching.
 
 ### Include and exclude
 
@@ -368,9 +368,9 @@ Receives a `DynamicJobContext`:
 | `sourceRepo`   | `RepoInfo \| undefined`             | Repo whose event triggered the run, when the evaluation has a checkout  |
 | `workflowRepo` | `RepoInfo \| undefined`             | Repo that registered the workflow (same repo outside a global workflow) |
 
-`RepoInfo` carries `path` — an absolute path to that repo's checkout — plus optional `ref` and `sha`; guard before reading either, since an event that carries no single ref leaves them undefined. In a [global workflow](../global-workflows.md) `sourceRepo` and `workflowRepo` are different repos, so one generator can produce a different job set per source repo.
+`RepoInfo` carries `identifier` (`owner/repo`) and `path` — an absolute path to that repo's checkout — plus optional `ref` and `sha`; guard before reading either, since an event that carries no single ref leaves them undefined. In a [global workflow](../global-workflows.md) `sourceRepo` and `workflowRepo` are different repos, so one generator can produce a different job set per source repo.
 
-**`sourceRepo.path` is not stable across calls.** A generator is invoked once to discover the job set and again to extract the step closures of the job being run; both see the same tree at the same commit, but not necessarily the same path or even the same machine. Read _through_ it, and derive job names from what the tree contains — never from the path itself, or the second call produces different names and the run fails the determinism check.
+**`sourceRepo.path` is not stable across calls.** A generator is invoked once to discover the job set and again to extract the step closures of the job being run. Both calls see the same tree at the same commit, but not necessarily the same path or even the same machine. Read _through_ it, and derive job names from what the tree contains — never from the path itself, or the second call produces different names and the run fails the determinism check.
 
 ```typescript
 const discoverJobs: DynamicJobFn = async ({ $ }) => {

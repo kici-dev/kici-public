@@ -6,6 +6,7 @@ import {
   type OnDispatch,
 } from './dispatcher.js';
 import { AgentRegistry, BUSY_HOLD_MAX_MS } from './registry.js';
+import { AgentHeartbeatMonitor } from '../ws/agent-heartbeat.js';
 import type { ScaleResult } from '../scaler/types.js';
 import {
   DispatchQueueStatus,
@@ -17,6 +18,12 @@ import {
 import { canonicalizeLabels, JobRejectReason } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { JobSecretsUnsealError } from '../secrets/job-secret-seal.js';
+
+/** The job id of a dispatch that went to an agent. */
+function jobIdOf(result: { status: string }): string {
+  expect(result.status).toBe('dispatched');
+  return (result as { status: 'dispatched'; jobId: string }).jobId;
+}
 
 function makeJobInput(overrides: Partial<QueuedJobInput> = {}): QueuedJobInput {
   return {
@@ -185,6 +192,23 @@ describe('Dispatcher', () => {
   });
 
   describe('dispatch', () => {
+    it('lists the jobs it tracks for a run', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue(),
+        metrics,
+        onDispatch: onDispatch as OnDispatch,
+      });
+
+      const result = await dispatcher.dispatch(makeJobInput());
+
+      expect(result.status).toBe('dispatched');
+      if (result.status !== 'dispatched') return;
+      expect(dispatcher.getTrackedJobIdsForRun('run-1')).toEqual([result.jobId]);
+      expect(dispatcher.getTrackedJobIdsForRun('run-other')).toEqual([]);
+    });
+
     it('dispatches to available agent and calls onDispatch callback', async () => {
       registry.register('agent-1', mockWs(), ['linux']);
       const queue = mockQueue();
@@ -3308,6 +3332,62 @@ describe('Dispatcher', () => {
       expect(onAckTimeout).toHaveBeenCalledWith('a1', 'job-s', 'run-s');
     });
 
+    it("an ack timeout sends the agent's other in-flight jobs to recovery", async () => {
+      // fails-when: the ack timeout unregisters the agent without onAgentDisconnect,
+      //   so the job it did acknowledge stays tracked with no recovery timer
+      // breaks-if-wrong: the timed-out job itself is still requeued, not recovered
+      vi.useFakeTimers();
+      registry.register('a1', mockWs(), ['linux'], 'linux', 'x64', undefined, 2);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics: mockMetrics(),
+        onDispatch: vi.fn(),
+        getAckTimeoutMs: async () => 5_000,
+        onAckTimeout: vi.fn(),
+      });
+      const unacked = jobIdOf(await dispatcher.dispatch(makeJobInput()));
+      const running = jobIdOf(await dispatcher.dispatch(makeJobInput({ jobName: 'test' })));
+      dispatcher.onJobAcked('a1', running);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+
+      expect(registry.get('a1')).toBeUndefined();
+      expect(queue.requeueIfAwaitingAck).toHaveBeenCalledWith(unacked, 'a1');
+      expect(queue.markRecovering).toHaveBeenCalledTimes(1);
+      expect(queue.markRecovering).toHaveBeenCalledWith(running, expect.any(Date), 'a1');
+      dispatcher.stopRecoveryTimers();
+      vi.useRealTimers();
+    });
+
+    it("the ack deadline sweep sends the agent's other in-flight jobs to recovery", async () => {
+      // fails-when: the sweep unregisters the agent without onAgentDisconnect
+      registry.register('a1', mockWs(), ['linux'], 'linux', 'x64', undefined, 2);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics: mockMetrics(),
+        onDispatch: vi.fn(),
+        getAckTimeoutMs: async () => 3_600_000,
+        onAckTimeout: vi.fn(),
+      });
+      const expired = jobIdOf(await dispatcher.dispatch(makeJobInput()));
+      const running = jobIdOf(await dispatcher.dispatch(makeJobInput({ jobName: 'test' })));
+      dispatcher.onJobAcked('a1', running);
+      (queue.listExpiredAckDeadlines as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: expired, runId: 'run-1', agentId: 'a1' },
+      ]);
+
+      await dispatcher.sweepExpiredAckDeadlines();
+
+      expect(registry.get('a1')).toBeUndefined();
+      expect(queue.markRecovering).toHaveBeenCalledTimes(1);
+      expect(queue.markRecovering).toHaveBeenCalledWith(running, expect.any(Date), 'a1');
+      dispatcher.stopRecoveryTimers();
+    });
+
     it('a late ack timer whose ack already landed leaves the running job alone', async () => {
       // The DB is the arbiter: the guarded requeue reports that the row is no
       // longer awaiting this agent's ack, which is how a coordinator learns the
@@ -3822,5 +3902,164 @@ describe('Dispatcher — the requeue redispatch and a job inside its sealed-secr
     await dispatcher.onJobRejected('a1', 'job-1', JobRejectReason.enum.draining);
     // breaks-if-wrong: a job past its back-off is offered like any other, so it can still fail
     expect(queue.dequeueById).toHaveBeenCalledWith('job-1', ['linux'], [], 'a1');
+  });
+});
+
+describe('Dispatcher job triage when an agent is dropped without its socket', () => {
+  // A test earlier in this file can leave fake timers installed; these drive real ones.
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a token revocation sends the agent's in-flight jobs to recovery and unregisters it at once", async () => {
+    // fails-when: disconnectByTokenId unregisters the agent without the
+    //   dispatcher's triage, so its job stays tracked with no recovery timer
+    // breaks-if-wrong: the agent still leaves the registry before the call returns
+    const registry = new AgentRegistry();
+    registry.register('a1', mockWs(), ['linux'], 'linux', 'x64', undefined, 1, {
+      tokenId: 'tok-1',
+    });
+    const queue = mockQueue();
+    const onRecoveryStarted = vi.fn();
+    const dispatcher = new Dispatcher({
+      registry,
+      queue,
+      metrics: mockMetrics(),
+      onDispatch: vi.fn(),
+      getAckTimeoutMs: async () => 3_600_000,
+      onRecoveryStarted,
+    });
+    const jobId = jobIdOf(await dispatcher.dispatch(makeJobInput()));
+    dispatcher.onJobAcked('a1', jobId);
+
+    expect(registry.disconnectByTokenId('tok-1')).toBe(1);
+    expect(registry.get('a1')).toBeUndefined();
+
+    await vi.waitFor(() => expect(onRecoveryStarted).toHaveBeenCalledWith('a1', jobId));
+    expect(queue.markRecovering).toHaveBeenCalledWith(jobId, expect.any(Date), 'a1');
+    dispatcher.stopRecoveryTimers();
+  });
+
+  it("a token revocation hands a scaler-managed agent's failed job to the waiter cleanup", async () => {
+    // fails-when: the cleanup runs only from the socket's close (with nothing,
+    //   since the registration is already gone), so the failed job's global eval
+    //   round waits out its ceiling
+    // breaks-if-wrong: a triage that fails no job does not call the cleanup
+    const registry = new AgentRegistry();
+    registry.register('a1', mockWs(), ['linux'], 'linux', 'x64', undefined, 1, {
+      tokenId: 'tok-1',
+      scalerManaged: true,
+    });
+    const queue = mockQueue();
+    const dispatcher = new Dispatcher({
+      registry,
+      queue,
+      metrics: mockMetrics(),
+      onDispatch: vi.fn(),
+      getAckTimeoutMs: async () => 3_600_000,
+    });
+    const cleanup = vi.fn();
+    dispatcher.setDisconnectCleanup(cleanup);
+    const jobId = jobIdOf(await dispatcher.dispatch(makeJobInput()));
+    dispatcher.onJobAcked('a1', jobId);
+    dispatcher.markJobStarted(jobId);
+
+    registry.disconnectByTokenId('tok-1');
+
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledWith([jobId]));
+    expect(queue.markFailed).toHaveBeenCalledWith(jobId, expect.any(String));
+  });
+
+  it('does not run the waiter cleanup when the triage fails no job', async () => {
+    const registry = new AgentRegistry();
+    registry.register('a1', mockWs(), ['linux']);
+    const dispatcher = new Dispatcher({
+      registry,
+      queue: mockQueue(),
+      metrics: mockMetrics(),
+      onDispatch: vi.fn(),
+    });
+    const cleanup = vi.fn();
+    dispatcher.setDisconnectCleanup(cleanup);
+
+    await dispatcher.onAgentDisconnect('a1');
+
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+
+  it('keeps a registration the agent made while its triage awaited', async () => {
+    // A caller that drops the agent first (revocation, ack timeout) leaves no
+    // entry; an entry found after the triage's awaits is a reconnect.
+    // fails-when: onAgentDisconnect unregisters unconditionally after its awaits
+    // breaks-if-wrong: with no reconnect, the triage still unregisters the agent
+    //   (the heartbeat test below)
+    const registry = new AgentRegistry();
+    registry.register('a1', mockWs(), ['linux']);
+    const queue = mockQueue();
+    const dispatcher = new Dispatcher({
+      registry,
+      queue,
+      metrics: mockMetrics(),
+      onDispatch: vi.fn(),
+      getAckTimeoutMs: async () => 3_600_000,
+    });
+    const jobId = jobIdOf(await dispatcher.dispatch(makeJobInput()));
+    dispatcher.onJobAcked('a1', jobId);
+    let releaseLookup!: () => void;
+    const held = new Promise<void>((r) => {
+      releaseLookup = r;
+    });
+    (queue.getJobById as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      await held;
+      return { id: jobId, runId: 'run-1', status: 'dispatched' };
+    });
+
+    registry.unregister('a1');
+    const triage = dispatcher.onAgentDisconnect('a1');
+    const reconnected = mockWs();
+    registry.register('a1', reconnected, ['linux']);
+    releaseLookup();
+    await triage;
+
+    expect(registry.get('a1')?.ws).toBe(reconnected);
+    dispatcher.stopRecoveryTimers();
+  });
+
+  it('a heartbeat timeout still triages the jobs exactly once', async () => {
+    // breaks-if-wrong: the registry's revocation hook must not add a second
+    //   triage to the heartbeat monitor's own onAgentDisconnect call
+    const registry = new AgentRegistry();
+    registry.register('a1', mockWs(), ['linux']);
+    const queue = mockQueue();
+    const onRecoveryStarted = vi.fn();
+    const dispatcher = new Dispatcher({
+      registry,
+      queue,
+      metrics: mockMetrics(),
+      onDispatch: vi.fn(),
+      getAckTimeoutMs: async () => 3_600_000,
+      onRecoveryStarted,
+    });
+    const jobId = jobIdOf(await dispatcher.dispatch(makeJobInput()));
+    dispatcher.onJobAcked('a1', jobId);
+    registry.get('a1')!.lastHeartbeatAt = Date.now() - 10_000;
+    const monitor = new AgentHeartbeatMonitor({
+      registry,
+      dispatcher,
+      disconnectThresholdMs: 1_000,
+      checkIntervalMs: 5,
+    });
+
+    monitor.start();
+    try {
+      await vi.waitFor(() => expect(registry.get('a1')).toBeUndefined());
+      await new Promise((r) => setTimeout(r, 30));
+    } finally {
+      monitor.stop();
+    }
+
+    expect(queue.markRecovering).toHaveBeenCalledTimes(1);
+    expect(onRecoveryStarted).toHaveBeenCalledTimes(1);
+    dispatcher.stopRecoveryTimers();
   });
 });

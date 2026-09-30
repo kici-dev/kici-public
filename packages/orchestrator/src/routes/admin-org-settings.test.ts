@@ -222,6 +222,61 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     return root;
   }
 
+  it('GET projects cacheUploadSettleTimeoutMs as null when the org row is absent', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
+    const body = (await res.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.cacheUploadSettleTimeoutMs).toBeNull();
+  });
+
+  it('PATCH sets cacheUploadSettleTimeoutMs and GET reads it back (bigint string → number)', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'acmeOrg00001', cacheUploadSettleTimeoutMs: 20000 }),
+    });
+    expect(patch.status).toBe(200);
+    const stored = rows.get('acmeOrg00001')!;
+    stored.cache_upload_settle_timeout_ms = String(stored.cache_upload_settle_timeout_ms);
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.cacheUploadSettleTimeoutMs).toBe(20000);
+  });
+
+  it('PATCH accepts 0 (no wait) and null clears the override', async () => {
+    // breaks-if-wrong: 0 is the documented "turn the wait off" value.
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const zero = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'acmeOrg00001', cacheUploadSettleTimeoutMs: 0 }),
+    });
+    expect(zero.status).toBe(200);
+    expect(rows.get('acmeOrg00001')!.cache_upload_settle_timeout_ms).toBe(0);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'acmeOrg00001', cacheUploadSettleTimeoutMs: null }),
+    });
+    expect(rows.get('acmeOrg00001')!.cache_upload_settle_timeout_ms).toBeNull();
+  });
+
+  it('PATCH rejects a negative cacheUploadSettleTimeoutMs (Zod)', async () => {
+    // fails-when: the schema floor is missing.
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'acmeOrg00001', cacheUploadSettleTimeoutMs: -1 }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it('GET projects user-cache quota/TTL as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);

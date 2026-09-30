@@ -327,13 +327,12 @@ build_base() {
   echo -e "${BOLD}Step 5: Install Node.js${NC}"
   HOST_NODE_VERSION=$("$HOST_NODE" --version 2>/dev/null | sed 's/^v//' || echo "")
 
-  if [ -n "$HOST_NODE_VERSION" ]; then
-    NODE_URL="https://nodejs.org/dist/v${HOST_NODE_VERSION}/node-v${HOST_NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
-    info "Using host Node.js version: v${HOST_NODE_VERSION}"
-  else
-    NODE_URL="https://nodejs.org/dist/v24.0.0/node-v24.0.0-linux-${NODE_ARCH}.tar.xz"
-    info "Using Node.js v24.0.0"
+  if [ -z "$HOST_NODE_VERSION" ]; then
+    err "Could not read the Node.js version from $HOST_NODE; the rootfs installs the host's Node.js version"
+    exit 1
   fi
+  NODE_URL="https://nodejs.org/dist/v${HOST_NODE_VERSION}/node-v${HOST_NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+  info "Using host Node.js version: v${HOST_NODE_VERSION}"
 
   NODE_TMP=$(mktemp -d -t kici-fc-XXXXXX)
   curl -fSL "$NODE_URL" -o "$NODE_TMP/node.tar.xz"

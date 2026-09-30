@@ -2,8 +2,9 @@
  * User-facing artifacts engine (sandbox-side).
  *
  * Packs `ctx.artifacts.upload(name, paths)` into a gzip tarball and uploads it
- * under a run-scoped, named key; `ctx.artifacts.download(name, destDir)` streams
- * the tarball back with on-the-fly SHA-256 verification and extracts it. Reuses
+ * under a run-scoped, named key; `ctx.artifacts.download(name, destDir)`
+ * downloads the tarball to a temp file, verifies its SHA-256, and only then
+ * extracts it. Reuses
  * the cache engine's pack/extract/anchor primitives (`packCachePaths`,
  * `downloadAndExtractCache`) — the tar layout, path-safety, and multi-root
  * anchoring are identical; only the addressing (named + immutable-per-run

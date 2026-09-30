@@ -31,8 +31,8 @@ interface AgentHeartbeatMonitorDeps {
 /**
  * Periodically inspects all registered agent connections and:
  * - Marks agents as unhealthy after 90s of silence (log only).
- * - Closes and unregisters agents after 180s of silence.
- * - Triggers dispatcher.onAgentDisconnect for stale agents.
+ * - Triggers dispatcher.onAgentDisconnect for an agent silent for 180s, then
+ *   unregisters it and closes its socket.
  */
 export class AgentHeartbeatMonitor {
   private readonly registry: AgentRegistry;
@@ -69,27 +69,32 @@ export class AgentHeartbeatMonitor {
   private check(): void {
     const now = Date.now();
 
-    for (const entry of this.registry.getAllEntries()) {
+    for (const entry of [...this.registry.getAllEntries()]) {
       const elapsed = now - entry.lastHeartbeatAt;
 
       if (elapsed > this.disconnectThresholdMs) {
-        // Agent is stale -- close and unregister
+        // Agent is stale -- triage its jobs, unregister, then close
         logger.warn('Closing stale agent connection', {
           agentId: entry.agentId,
           elapsedMs: elapsed,
         });
 
-        entry.ws.close(WS_CLOSE_HEARTBEAT_TIMEOUT, 'Heartbeat timeout');
-
-        // Dispatcher handles: mark dispatched jobs as failed, unregister from registry
+        // The dispatcher reads the registration before its first await, so the
+        // triage starts first. The unregister right after removes the agent at
+        // once, so the socket's close finds no registration: it tears the agent
+        // down as dropped (`heartbeat-timeout` for an event scaler) and does
+        // not triage its jobs a second time.
         this.dispatcher.onAgentDisconnect(entry.agentId).catch((err) => {
           logger.error('Error handling stale agent disconnect', {
             agentId: entry.agentId,
             error: toErrorMessage(err),
           });
         });
+        this.registry.unregister(entry.agentId);
 
-        setAgentsActive(Math.max(0, this.registry.getActiveCount() - 1));
+        entry.ws.close(WS_CLOSE_HEARTBEAT_TIMEOUT, 'Heartbeat timeout');
+
+        setAgentsActive(this.registry.getActiveCount());
       } else if (elapsed > this.unhealthyThresholdMs) {
         // Agent is unhealthy but not stale yet -- log only
         logger.info('Agent connection unhealthy', {

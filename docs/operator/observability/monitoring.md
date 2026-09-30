@@ -124,11 +124,11 @@ The trailing `jobId!=""` filter keeps only the lines emitted during job executio
 
 KiCI exposes Prometheus metrics from three services:
 
-| Service      | Mode                                     | Endpoint                                         | Metric prefix |
-| ------------ | ---------------------------------------- | ------------------------------------------------ | ------------- |
-| Platform     | Scraped by Prometheus                    | `{base-path}/metrics` (port 10142)               | `kici_`       |
-| Orchestrator | Scraped by Prometheus                    | `/metrics` (port 10143)                          | `kici_orch_`  |
-| Agent        | Scraped directly or pushed via WebSocket | `/metrics` (port 8080) + orchestrator `/metrics` | `kici_agent_` |
+| Service      | Mode                                     | Endpoint                                                                       | Metric prefix |
+| ------------ | ---------------------------------------- | ------------------------------------------------------------------------------ | ------------- |
+| Platform     | Scraped by Prometheus                    | `{base-path}/metrics`                                                          | `kici_`       |
+| Orchestrator | Scraped by Prometheus                    | `/metrics` (default port 4000, set with `KICI_PORT`)                           | `kici_orch_`  |
+| Agent        | Scraped directly or pushed via WebSocket | `/metrics` (default port 8080, set with `KICI_PORT`) + orchestrator `/metrics` | `kici_agent_` |
 
 ### Agent metrics push
 

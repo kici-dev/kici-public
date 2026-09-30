@@ -23,6 +23,7 @@ vi.mock('../local-plane/source-provider.js', () => ({
     cleanup: vi.fn().mockResolvedValue(undefined),
     warnings: [],
   }),
+  readParentSha: vi.fn().mockReturnValue('cafebabe'),
 }));
 vi.mock('../local-plane/plane-seed.js', () => ({
   ensureLocalSource: vi
@@ -112,6 +113,8 @@ describe('runRoutedCommand', () => {
         event: 'push',
         ref: 'refs/heads/kici-local',
         sha: 'deadbeef',
+        // The snapshot's parent, so the run has a real before..sha diff.
+        before: 'cafebabe',
       }),
       // The timeout diagnosis needs the workdir the source points at.
       // fails-when: run-routed stops threading repoBasePath, so a lock-file

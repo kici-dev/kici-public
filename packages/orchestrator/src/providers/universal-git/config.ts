@@ -84,6 +84,17 @@ export const UniversalGitPayloadPathsSchema = z.object({
    * trigger filter is INDETERMINATE and the workflow does not run.
    */
   commitMessage: z.string().min(1).optional(),
+  /**
+   * Path to the forge's total commit count on a push. When the total exceeds
+   * the commits listed, the payload was truncated and its file list is not
+   * authoritative.
+   */
+  commitsTotal: z.string().min(1).optional(),
+  /**
+   * The most commits the forge lists in a push payload, for a forge that sends
+   * no total. A push listing this many may be truncated.
+   */
+  commitsCap: z.number().int().positive().optional(),
 });
 export type UniversalGitPayloadPaths = z.infer<typeof UniversalGitPayloadPathsSchema>;
 
@@ -219,6 +230,9 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
       commitMessage: '$.head_commit.message',
+      // Gitea's FEED_MAX_COMMIT_NUM and Forgejo's PAYLOAD_COMMIT_LIMIT cap
+      // commits[]; total_commits carries the true count.
+      commitsTotal: '$.total_commits',
     },
     eventMapping: {
       push: ['push'],
@@ -236,6 +250,9 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
       commitMessage: '$.head_commit.message',
+      // Gitea's FEED_MAX_COMMIT_NUM and Forgejo's PAYLOAD_COMMIT_LIMIT cap
+      // commits[]; total_commits carries the true count.
+      commitsTotal: '$.total_commits',
     },
     eventMapping: {
       push: ['push'],
@@ -274,6 +291,8 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
       commitMessage: '$.commits[-1:].message',
+      // GitLab lists the newest 20 commits; total_commits_count is the true count.
+      commitsTotal: '$.total_commits_count',
     },
     eventMapping: {
       push: ['Push Hook', 'push'],
@@ -291,6 +310,8 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
       commitMessage: '$.head_commit.message',
+      // GitHub sends no total; a push payload lists at most 2048 commits.
+      commitsCap: 2048,
     },
     eventMapping: {
       push: ['push'],

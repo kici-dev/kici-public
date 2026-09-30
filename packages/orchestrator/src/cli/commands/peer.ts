@@ -14,7 +14,11 @@ import { toErrorMessage, resetRaftStateDirect, prunePeerCredentialsDirect } from
 
 import { withDb } from './shared/db.js';
 import { JoinTokenManager, silenceJoinTokenLogger } from '../../cluster/join-token.js';
-import { PeerCredentialStore } from '../../cluster/peer-credentials.js';
+import {
+  PeerCredentialIssuance,
+  PeerCredentialStore,
+  type PeerCredential,
+} from '../../cluster/peer-credentials.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
   return explicit ?? process.env.KICI_DATABASE_URL ?? null;
@@ -43,6 +47,24 @@ function formatPeerTable(
     return `${p.instanceId} | ${p.role} | ${created} | ${lastSeen} | ${expires}`;
   });
   return [header, sep, ...rows].join('\n');
+}
+
+/**
+ * The `peer list --json` record. The credential hash is the HMAC key of every
+ * proof, so it, the source-token hash and the raw metadata never leave the
+ * database.
+ */
+function toPeerListEntry(p: PeerCredential) {
+  return {
+    id: p.id,
+    instanceId: p.instanceId,
+    role: p.role,
+    selfIssued: p.metadata?.issuance === PeerCredentialIssuance.Self,
+    createdAt: p.createdAt.toISOString(),
+    lastSeenAt: p.lastSeenAt ? p.lastSeenAt.toISOString() : null,
+    lastValidatedBy: p.lastValidatedBy,
+    expiresAt: p.expiresAt.toISOString(),
+  };
 }
 
 export function registerPeerCommands(program: Command, _getClient: () => AdminApiClient): void {
@@ -132,13 +154,22 @@ export function registerPeerCommands(program: Command, _getClient: () => AdminAp
   peer
     .command('list')
     .description('List active peer credentials')
-    .action(async () => {
+    .option(
+      '--json',
+      'Emit JSON { peers: [{ id, instanceId, role, selfIssued, createdAt, lastSeenAt, lastValidatedBy, expiresAt }] } on stdout',
+      false,
+    )
+    .action(async (opts: { json: boolean }) => {
       try {
         const peers = await withDb(async (db) => {
           const store = new PeerCredentialStore(db);
           return store.listActive();
         });
 
+        if (opts.json) {
+          console.log(JSON.stringify({ peers: peers.map(toPeerListEntry) }, null, 2));
+          return;
+        }
         console.log(formatPeerTable(peers));
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
@@ -158,7 +189,7 @@ export function registerPeerCommands(program: Command, _getClient: () => AdminAp
         });
 
         console.log(
-          `Peer ${opts.instanceId} credential revoked. It will be disconnected on next heartbeat.`,
+          `Peer ${opts.instanceId} credential revoked. Its next connection attempt is refused; its open connections stay up.`,
         );
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);

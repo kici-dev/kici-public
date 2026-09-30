@@ -45,6 +45,7 @@ import { buildGeneratorContext } from './generator-context.js';
 import { applyGlobalWorkflowEnv } from './global-workflow-env.js';
 import { loadWorkflowSource, extractWorkflow } from './workflow-loader.js';
 import { serializeJobsToLock } from './dynamic-job-serializer.js';
+import { describePathsVerdict, evaluateDeferredPaths } from './deferred-paths.js';
 
 /** One workflow the round must decide on, as the lock file describes it. */
 export interface GlobalEvalCandidate {
@@ -53,6 +54,8 @@ export interface GlobalEvalCandidate {
   sourceFile: string;
   /** From `LockWorkflow.hasFilter` — skip the filter call entirely when false. */
   hasFilter: boolean;
+  /** The `paths` lists the orchestrator could only match conservatively; decided first. */
+  deferredPaths?: string[][];
 }
 
 /** Arguments for {@link runGlobalEvalRound}. */
@@ -200,14 +203,25 @@ async function generateDynamicJobs(
 }
 
 /**
- * Evaluate one candidate to a verdict: run its `filter` if it declares one,
- * then its generators if it survives.
+ * Evaluate one candidate to a verdict: decide its deferred `paths` from the
+ * round's diff, run its `filter` if it declares one, then its generators if it
+ * survives. A paths no-match returns before the module loads.
  */
 async function evaluateCandidateInner(
   candidate: GlobalEvalCandidate,
   shared: RoundState,
 ): Promise<GlobalEvalCandidateResult> {
   const { args } = shared;
+  if (candidate.deferredPaths?.length) {
+    const diff = { files: args.changedFiles, status: args.changedFilesStatus };
+    if (!evaluateDeferredPaths(candidate.deferredPaths, diff)) {
+      return {
+        workflowName: candidate.workflowName,
+        run: false,
+        reason: describePathsVerdict(candidate.deferredPaths, diff),
+      };
+    }
+  }
   const workflow = await loadWorkflowCached(shared, candidate.sourceFile, candidate.workflowName);
 
   if (candidate.hasFilter) {

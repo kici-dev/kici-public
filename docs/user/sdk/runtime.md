@@ -9,76 +9,114 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 
 ### Core types
 
-| Type              | Description                                                                                                                                                                                                                                                                        |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Workflow`        | Workflow definition returned by `workflow()`                                                                                                                                                                                                                                       |
-| `WorkflowOptions` | Options for `workflow()` factory                                                                                                                                                                                                                                                   |
-| `Job`             | Job definition returned by `job()`                                                                                                                                                                                                                                                 |
-| `JobOptions`      | Options for `job()` factory                                                                                                                                                                                                                                                        |
-| `Step<TOutputs>`  | Step definition returned by `step()`                                                                                                                                                                                                                                               |
-| `StepOptions<T>`  | Options for `step()` factory (full form with outputs)                                                                                                                                                                                                                              |
-| `StepRunFn`       | Simple step function type: `(ctx) => Promise<void>`                                                                                                                                                                                                                                |
-| `BareStepFn`      | Bare step function (no options, just `(ctx) => ...`)                                                                                                                                                                                                                               |
-| `StepInput`       | Union of step input forms accepted by `job()`                                                                                                                                                                                                                                      |
-| `OutputSchema`    | Record of Zod types for step outputs                                                                                                                                                                                                                                               |
-| `InferOutputs<T>` | Infer output type from output schema                                                                                                                                                                                                                                               |
-| `ContainerConfig` | Container config for job execution: `image` or `dockerfile` (with `context`, `target`, `args`), plus `env` and registry `auth`. See [Container jobs](../container-jobs.md).                                                                                                        |
-| `RunsOn`          | Union of `runsOn` forms: `string \| RegExp \| (string \| RegExp)[] \| RunsOnSelector`. A plain string matches exactly, a string with glob metacharacters (`*?[]{}`) is a glob, and a `RegExp` is a regular expression. See [Targeting by pattern](./core.md#targeting-by-pattern). |
-| `RunsOnSelector`  | Object form for `runsOn` with `labels` (required) and `exclude` (optional) properties. Each element accepts the exact / glob / regex forms on both sides.                                                                                                                          |
-| `RunsOnPick`      | Single-agent selection policy when several agents match a `runsOn` selector: `'deterministic'` (stable hash — same job lands on the same host across re-runs) or `'any'` (spread load). See [runsOnAll](./runs-on-all.md#targeting-by-pattern) for the fan-out forms.              |
-| `Fixture`         | Test fixture definition returned by `fixture()`                                                                                                                                                                                                                                    |
-| `FixtureOptions`  | Options for `fixture()` factory                                                                                                                                                                                                                                                    |
-| `Registry`        | Private npm registry declaration used in `WorkflowOptions.registries`                                                                                                                                                                                                              |
+| Type                              | Description                                                                                                                                                                                                                                                                        |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Workflow`                        | Workflow definition returned by `workflow()`                                                                                                                                                                                                                                       |
+| `WorkflowOptions`                 | Options for `workflow()` factory                                                                                                                                                                                                                                                   |
+| `Job`                             | Job definition returned by `job()`                                                                                                                                                                                                                                                 |
+| `JobOptions`                      | Options for `job()` factory                                                                                                                                                                                                                                                        |
+| `Step<TOutputs>`                  | Step definition returned by `step()`                                                                                                                                                                                                                                               |
+| `StepOptions<T>`                  | Options for `step()` factory (full form with outputs)                                                                                                                                                                                                                              |
+| `StepOptionsBase`                 | Facets shared by the plain and the check variant of `StepOptions` (`outputs`, `continueOnError`, `timeout`, `retry`, `cache`, `rules`, `onCancel`, `cleanup`, `approval`)                                                                                                          |
+| `StepOptionsPlain<T>`             | `StepOptions` variant without a `check` facet: `run(ctx)` only                                                                                                                                                                                                                     |
+| `StepOptionsWithCheck<T, TDrift>` | `StepOptions` variant with a `check` facet: `check(ctx)` returns drift or `null`, and `summarize(drift)` is required. See [Idempotent helpers](./idempotent.md)                                                                                                                    |
+| `NormalizedRetry`                 | Retry policy with defaults filled in (`maxAttempts`, `delayMs`, `backoff`, `maxDelayMs`, optional `retryIf`), carried on the built `Step`                                                                                                                                          |
+| `SourceLocation`                  | `{ file, line, column }` captured at a `step()` call site                                                                                                                                                                                                                          |
+| `StepRunFn`                       | Simple step function type: `(ctx) => Promise<void>`                                                                                                                                                                                                                                |
+| `BareStepFn`                      | Bare step function (no options, just `(ctx) => ...`)                                                                                                                                                                                                                               |
+| `StepInput`                       | Union of step input forms accepted by `job()`                                                                                                                                                                                                                                      |
+| `OutputSchema`                    | Record of Zod types for step outputs                                                                                                                                                                                                                                               |
+| `InferOutputs<T>`                 | Infer output type from output schema                                                                                                                                                                                                                                               |
+| `ContainerConfig`                 | Container config for job execution: `image` or `dockerfile` (with `context`, `target`, `args`), plus `env` and registry `auth`. See [Container jobs](../container-jobs.md).                                                                                                        |
+| `RunsOn`                          | Union of `runsOn` forms: `string \| RegExp \| (string \| RegExp)[] \| RunsOnSelector`. A plain string matches exactly, a string with glob metacharacters (`*?[]{}`) is a glob, and a `RegExp` is a regular expression. See [Targeting by pattern](./core.md#targeting-by-pattern). |
+| `RunsOnSelector`                  | Object form for `runsOn` with `labels` (required) and `exclude` (optional) properties. Each element accepts the exact / glob / regex forms on both sides.                                                                                                                          |
+| `RunsOnPick`                      | Single-agent selection policy when several agents match a `runsOn` selector: `'deterministic'` (stable hash — same job lands on the same host across re-runs) or `'any'` (spread load). See [runsOnAll](./runs-on-all.md#targeting-by-pattern) for the fan-out forms.              |
+| `Fixture`                         | Test fixture definition returned by `fixture()`                                                                                                                                                                                                                                    |
+| `FixtureOptions`                  | Options for `fixture()` factory                                                                                                                                                                                                                                                    |
+| `Registry`                        | Private npm registry declaration used in `WorkflowOptions.registries`                                                                                                                                                                                                              |
+| `GenericInitConfig`               | Hand-written per-job init directive. See [Per-job init](./core.md#per-job-init)                                                                                                                                                                                                    |
+| `MiseInitConfig`                  | Overrides for the `mise` toolchain preset (`cache`, `timeout`, `env`)                                                                                                                                                                                                              |
+| `InitPreset`                      | Typed toolchain preset: `'mise' \| { mise: MiseInitConfig }`                                                                                                                                                                                                                       |
+| `InitItem`                        | One init directive: `GenericInitConfig \| InitPreset`                                                                                                                                                                                                                              |
+| `InitConfig`                      | Per-job `init` value: one `InitItem`, an ordered array of them, `'auto'`, or `false`                                                                                                                                                                                               |
+| `ParallelGroup`                   | Concurrent step group returned by `parallel()`. See [Parallel steps](./parallel.md)                                                                                                                                                                                                |
+| `ParallelOptions`                 | Options for `parallel()`: `failFast`, `maxParallel`, `name`                                                                                                                                                                                                                        |
+| `ApprovalConfig`                  | Approval gate declaration: `true`, an `ApproverClause[]`, or `{ when?, approvers?, reason?, timeout? }`. See [Approvals](../approvals.md)                                                                                                                                          |
+| `ApproverClause`                  | One approver clause: `{ team }` or `{ user }`                                                                                                                                                                                                                                      |
+| `ApprovalWhen`                    | When the gate fires: `'always'` (before the element runs) or `'drift'` (between a step's `check` and `run`)                                                                                                                                                                        |
+| `NormalizedApproval`              | Normalized gate shape written into the lock file: `{ clauses, reason?, timeoutSeconds?, when }`                                                                                                                                                                                    |
+| `InvokeConfig`                    | Options for `invokeSource()` on an invoke-gate job. See [Global workflows](../global-workflows.md)                                                                                                                                                                                 |
+| `FilterFn`                        | Workflow-level pre-dispatch predicate: `(ctx: FilterContext) => boolean \| Promise<boolean>`                                                                                                                                                                                       |
+| `FilterContext`                   | Context passed to a `filter`: `sourceRepo`, `workflowRepo`, `event`, `changedFiles`, `changedFilesStatus`, `env`, `$`                                                                                                                                                              |
+| `CreateFilterContextInput`        | Input accepted when a `FilterContext` is built for a `filter`                                                                                                                                                                                                                      |
 
 ### Trigger types
 
-| Type                                | Description                                                                    |
-| ----------------------------------- | ------------------------------------------------------------------------------ |
-| `Trigger`                           | Trigger definition (trigger config + source location)                          |
-| `TriggerConfig`                     | Union of all 23 trigger config types                                           |
-| `PrTriggerConfig`                   | PR trigger configuration (from `pr()`)                                         |
-| `PushTriggerConfig`                 | Push trigger configuration (from `push()`)                                     |
-| `TagTriggerConfig`                  | Tag trigger configuration (from `tag()`)                                       |
-| `CommentTriggerConfig`              | Comment trigger configuration (from `comment()`)                               |
-| `ReviewTriggerConfig`               | Review trigger configuration (from `review()`)                                 |
-| `ReviewCommentTriggerConfig`        | Review comment trigger configuration (from `reviewComment()`)                  |
-| `ReleaseTriggerConfig`              | Release trigger configuration (from `release()`)                               |
-| `DispatchTriggerConfig`             | Repository dispatch trigger configuration (from `dispatch()`)                  |
-| `CreateTriggerConfig`               | Ref creation trigger configuration (from `create()`)                           |
-| `DeleteTriggerConfig`               | Ref deletion trigger configuration (from `delete()`)                           |
-| `StatusTriggerConfig`               | Commit status trigger configuration (from `status()`)                          |
-| `WorkflowRunTriggerConfig`          | Workflow run trigger configuration (from `workflowRun()`)                      |
-| `ForkTriggerConfig`                 | Fork trigger configuration (from `fork()`)                                     |
-| `StarTriggerConfig`                 | Star trigger configuration (from `star()`)                                     |
-| `WatchTriggerConfig`                | Watch trigger configuration (from `watch()`)                                   |
-| `WebhookTriggerConfig`              | Catch-all webhook trigger configuration (from `webhook()`)                     |
-| `KiciEventTriggerConfig`            | Custom event trigger configuration (from `kiciEvent()`)                        |
-| `WorkflowCompleteTriggerConfig`     | Workflow completion trigger configuration (from `workflowComplete()`)          |
-| `WorkflowsFailedBatchTriggerConfig` | Batched workflow-failure trigger configuration (from `workflowsFailedBatch()`) |
-| `JobCompleteTriggerConfig`          | Job completion trigger configuration (from `jobComplete()`)                    |
-| `GenericWebhookTriggerConfig`       | Generic webhook trigger configuration (from `genericWebhook()`)                |
-| `ScheduleTriggerConfig`             | Schedule trigger configuration (from `schedule()`)                             |
-| `LifecycleTriggerConfig`            | Lifecycle trigger configuration (from `lifecycle()`)                           |
-| `PrConfigInput`                     | Config object for `pr()` factory                                               |
-| `PushConfigInput`                   | Config object for `push()` factory                                             |
-| `BranchPattern`                     | `{ type: 'glob', pattern } \| { type: 'regex', pattern, flags? }`              |
-| `PrEvent`                           | PR event string literal union (17 event types)                                 |
-| `GenericWebhookConfigInput`         | Config object for `genericWebhook()` factory                                   |
-| `GenericWebhookAuth`                | Union of generic webhook auth types (HMAC or API key)                          |
-| `GenericWebhookHmacAuth`            | HMAC-SHA256 auth configuration for generic webhooks                            |
-| `GenericWebhookApiKeyAuth`          | API key auth configuration for generic webhooks                                |
-| `GenericWebhookAuthMethod`          | Auth method string literal (`'hmac-sha256' \| 'api-key'`)                      |
+| Type                                      | Description                                                                                                         |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `Trigger`                                 | Trigger definition (trigger config + source location)                                                               |
+| `TriggerConfig`                           | Union of all 23 trigger config types                                                                                |
+| `PrTriggerConfig`                         | PR trigger configuration (from `pr()`)                                                                              |
+| `PushTriggerConfig`                       | Push trigger configuration (from `push()`)                                                                          |
+| `TagTriggerConfig`                        | Tag trigger configuration (from `tag()`)                                                                            |
+| `CommentTriggerConfig`                    | Comment trigger configuration (from `comment()`)                                                                    |
+| `ReviewTriggerConfig`                     | Review trigger configuration (from `review()`)                                                                      |
+| `ReviewCommentTriggerConfig`              | Review comment trigger configuration (from `reviewComment()`)                                                       |
+| `ReleaseTriggerConfig`                    | Release trigger configuration (from `release()`)                                                                    |
+| `DispatchTriggerConfig`                   | Repository dispatch trigger configuration (from `dispatch()`)                                                       |
+| `CreateTriggerConfig`                     | Ref creation trigger configuration (from `create()`)                                                                |
+| `DeleteTriggerConfig`                     | Ref deletion trigger configuration (from `delete()`)                                                                |
+| `StatusTriggerConfig`                     | Commit status trigger configuration (from `status()`)                                                               |
+| `WorkflowRunTriggerConfig`                | Workflow run trigger configuration (from `workflowRun()`)                                                           |
+| `ForkTriggerConfig`                       | Fork trigger configuration (from `fork()`)                                                                          |
+| `StarTriggerConfig`                       | Star trigger configuration (from `star()`)                                                                          |
+| `WatchTriggerConfig`                      | Watch trigger configuration (from `watch()`)                                                                        |
+| `WebhookTriggerConfig`                    | Catch-all webhook trigger configuration (from `webhook()`)                                                          |
+| `KiciEventTriggerConfig`                  | Custom event trigger configuration (from `kiciEvent()`)                                                             |
+| `WorkflowCompleteTriggerConfig`           | Workflow completion trigger configuration (from `workflowComplete()`)                                               |
+| `WorkflowsFailedBatchTriggerConfig`       | Batched workflow-failure trigger configuration (from `workflowsFailedBatch()`)                                      |
+| `JobCompleteTriggerConfig`                | Job completion trigger configuration (from `jobComplete()`)                                                         |
+| `GenericWebhookTriggerConfig`             | Generic webhook trigger configuration (from `genericWebhook()`)                                                     |
+| `ScheduleTriggerConfig`                   | Schedule trigger configuration (from `schedule()`)                                                                  |
+| `LifecycleTriggerConfig`                  | Lifecycle trigger configuration (from `lifecycle()`)                                                                |
+| `PrConfigInput`                           | Config object for `pr()` factory                                                                                    |
+| `PushConfigInput`                         | Config object for `push()` factory                                                                                  |
+| `TagConfigInput`, `CommentConfigInput`, … | Config object for each remaining trigger factory, named `<Trigger>ConfigInput`                                      |
+| `DispatchInputsMap`                       | `Record<string, ZodType>` — typed `dispatch()` inputs                                                               |
+| `DefinedDispatchInputs<TMap>`             | Handle returned by `defineDispatchInputs()`; `.from(ctx)` reads the validated inputs. See [Triggers](./triggers.md) |
+| `InferDispatchInputs<TMap>`               | Value type inferred from a `DispatchInputsMap`                                                                      |
+| `BodyMatchPattern`                        | Comment body match: `{ type: 'glob', pattern } \| { type: 'regex', pattern, flags? }`                               |
+| `PushEvent`                               | `'push'`                                                                                                            |
+| `CommentAction`                           | `'created' \| 'edited' \| 'deleted'`                                                                                |
+| `CommentSource`                           | `'issue' \| 'pr'`                                                                                                   |
+| `ReviewAction`                            | `'submitted' \| 'edited' \| 'dismissed'`                                                                            |
+| `ReviewState`                             | `'approved' \| 'changes_requested' \| 'commented' \| 'dismissed'`                                                   |
+| `ReviewCommentAction`                     | `'created' \| 'edited' \| 'deleted'`                                                                                |
+| `ReleaseAction`                           | `'published' \| 'unpublished' \| 'created' \| 'edited' \| 'deleted' \| 'prereleased' \| 'released'`                 |
+| `RefType`                                 | `'branch' \| 'tag'` (for `create()` / `delete()`)                                                                   |
+| `StatusState`                             | `'error' \| 'failure' \| 'pending' \| 'success'`                                                                    |
+| `WorkflowRunAction`                       | `'requested' \| 'completed' \| 'in_progress'`                                                                       |
+| `StarAction`                              | `'created' \| 'deleted'`                                                                                            |
+| `WatchAction`                             | `'started'`                                                                                                         |
+| `BranchPattern`                           | `{ type: 'glob', pattern } \| { type: 'regex', pattern, flags? }`                                                   |
+| `PrEvent`                                 | PR event string literal union (17 event types)                                                                      |
+| `GenericWebhookConfigInput`               | Config object for `genericWebhook()` factory                                                                        |
+| `GenericWebhookAuth`                      | Union of generic webhook auth types (HMAC or API key)                                                               |
+| `GenericWebhookHmacAuth`                  | HMAC-SHA256 auth configuration for generic webhooks                                                                 |
+| `GenericWebhookApiKeyAuth`                | API key auth configuration for generic webhooks                                                                     |
+| `GenericWebhookAuthMethod`                | Auth method string literal (`'hmac-sha256' \| 'api-key'`)                                                           |
 
 ### Rule types
 
-| Type                   | Description                                                             |
-| ---------------------- | ----------------------------------------------------------------------- |
-| `Rule`                 | Rule definition returned by `rule()` / `skip()`                         |
-| `RuleCheckFn`          | `(ctx: RuleContext) => Promise<boolean> \| boolean`                     |
-| `RuleContext`          | Context passed to rule check functions                                  |
-| `RuleResult`           | Result of rule evaluation (label, passed, duration)                     |
-| `EventPayload`         | Discriminated union over event type (narrow on `type` for autocomplete) |
-| `RuleEvaluationResult` | Result of evaluating a rule list (`allPassed` + per-rule `results`)     |
+| Type                     | Description                                                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Rule`                   | Rule definition returned by `rule()` / `skip()`                                                                                                              |
+| `RuleCheckFn`            | `(ctx: RuleContext) => Promise<boolean> \| boolean`                                                                                                          |
+| `RuleContext`            | Context passed to rule check functions                                                                                                                       |
+| `RuleResult`             | Result of rule evaluation (label, passed, duration)                                                                                                          |
+| `EventPayload`           | Discriminated union over event type (narrow on `type` for autocomplete)                                                                                      |
+| `RuleEvaluationResult`   | Result of evaluating a rule list (`allPassed` + per-rule `results`)                                                                                          |
+| `CreateRuleContextInput` | Input accepted when a `RuleContext` is built: `event`, `changedFiles`, `changedFilesStatus`, `env`, `dispatchInputs`, `fanout`, `sourceRepo`, `workflowRepo` |
 
 ### Matrix types
 
@@ -105,29 +143,112 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 
 ### Dynamic job types
 
-| Type                | Description                        |
-| ------------------- | ---------------------------------- |
-| `DynamicJobFn`      | `(ctx) => Promise<Job[]>`          |
-| `DynamicJobContext` | Context for dynamic job generators |
-| `JobOrFactory`      | `Job \| DynamicJobFn`              |
+| Type                          | Description                                                                                                                                 |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DynamicJobFn`                | `(ctx) => Promise<Job[]>`                                                                                                                   |
+| `DynamicJobContext`           | Context for dynamic job generators                                                                                                          |
+| `JobOrFactory`                | `Job \| DynamicJobFn`                                                                                                                       |
+| `TaggedDynamicJobFn`          | `DynamicJobFn` tagged with a group name by `dynamicJob()`                                                                                   |
+| `ResultAwareDynamicJobConfig` | Options-object form of `dynamicJob()`: `{ needs?, generate, gitCredentials? }`                                                              |
+| `ResultAwareDynamicJobFn`     | Generator tagged with its declared `needs` (result-aware)                                                                                   |
+| `DynamicJobNeed`              | One declared upstream edge: a job, a job name, a `DynamicGroupRef`, `{ name, when? }`, or `{ group, when? }`                                |
+| `NeedsWhen`                   | Keyword run condition for a `needs` edge: `'on-success' \| 'always' \| 'on-skip' \| 'on-failure'`                                           |
+| `NeedsWhenInput`              | `NeedsWhen`, or a raw array of upstream terminal statuses                                                                                   |
+| `DynamicGroupRef`             | Reference returned by `dynamicGroup()`                                                                                                      |
+| `NeedsContext`                | The `ctx.needs` map, keyed by job or group name                                                                                             |
+| `NeedEntry`                   | One `ctx.needs` value: `{ result, status }` for a job, an array of `GroupNeedEntry` for a group, or an `InvokeNeedEntry` for an invoke gate |
+| `GroupNeedEntry`              | One group member: `{ name, result, status }`                                                                                                |
+| `InvokeNeedEntry`             | Invoke-gate need: `{ result: InvokeResult[] }`, one entry per triggered run                                                                 |
+| `InvokeResult`                | One invoked run: `{ repo, workflow, runId, status, outputs }`                                                                               |
+| `UpstreamSnapshot`            | Frozen upstream outputs and statuses that `ctx.needs` is built from                                                                         |
 
 ### Context types
 
-| Type                  | Description                                                                                                      |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `StepContext<T>`      | Context passed to step run functions                                                                             |
-| `Logger`              | Logger interface (info, warn, error, debug)                                                                      |
-| `WorkflowInfo`        | Workflow metadata: `{ name: string }`                                                                            |
-| `JobInfo`             | Job metadata: `{ name: string, runsOn: string }`                                                                 |
-| `AgentInfo`           | Facts about the pinned agent (`host`, `labels`, `platform`, `arch`), set on `runsOnAll` fan-out jobs             |
-| `FanoutPosition`      | Position of a child within its fan-out (host or matrix), deterministically ordered                               |
-| `MatrixJobOutputs`    | Envelope returned by `jobOutputs()` for a matrix upstream: `{ byMatrix, merged }`                                |
-| `HostJobOutputs`      | Envelope returned by `jobOutputs()` for a `runsOnAll` upstream, keyed per host                                   |
-| `RepoInfo`            | Repository metadata available in step context                                                                    |
-| `StepSecrets`         | Async accessor interface for step secrets (`get`, `expose`, `has`, `getMeta`, `list`, `mountFile`, `exposeFile`) |
-| `StepSecretsTyped`    | Typed step secrets with known key inference                                                                      |
-| `KnownSecretKeys`     | String literal union of declared secret context keys                                                             |
-| `SecretNotFoundError` | Thrown when accessing a nonexistent key in secrets                                                               |
+| Type                                                                | Description                                                                                                                           |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `StepContext<T>`                                                    | Context passed to step run functions                                                                                                  |
+| `Logger`                                                            | Logger interface (info, warn, error, debug)                                                                                           |
+| `WorkflowInfo`                                                      | Workflow metadata: `{ name: string }`                                                                                                 |
+| `JobInfo`                                                           | Job metadata: `{ name: string, runsOn: string }`                                                                                      |
+| `AgentInfo`                                                         | Facts about the pinned agent (`host`, `labels`, `platform`, `arch`), set on `runsOnAll` fan-out jobs                                  |
+| `FanoutPosition`                                                    | Position of a child within its fan-out (host or matrix), deterministically ordered                                                    |
+| `MatrixJobOutputs`                                                  | Envelope returned by `jobOutputs()` for a matrix upstream: `{ byMatrix, merged }`                                                     |
+| `HostJobOutputs`                                                    | Envelope returned by `jobOutputs()` for a `runsOnAll` upstream, keyed per host                                                        |
+| `RepoInfo`                                                          | Repository metadata available in step context                                                                                         |
+| `StepSecrets`                                                       | Async accessor interface for step secrets (`get`, `expose`, `has`, `getMeta`, `list`, `mountFile`, `exposeFile`)                      |
+| `StepSecretsTyped`                                                  | Typed step secrets with known key inference                                                                                           |
+| `KnownSecretKeys`                                                   | String literal union of declared secret context keys                                                                                  |
+| `SecretNotFoundError`                                               | Thrown when accessing a nonexistent key in secrets                                                                                    |
+| `TrackedStepSecrets`                                                | `StepSecrets` plus access tracking: `getAccessLog()`, `getMountedKeys()`, `getMountRecords()` (key names only, never values)          |
+| `SecretMeta`                                                        | Result of `ctx.secrets.getMeta(key)`: `{ value, backend, scope }`                                                                     |
+| `SecretFileOptions`                                                 | Options for `ctx.secrets.mountFile()` / `exposeFile()`: `sources`, `divider?`, `mode?` (default `0o600`), `name?`                     |
+| `MountedFile`                                                       | Result of `mountFile()` / `exposeFile()`: `{ path }`                                                                                  |
+| `StepSecretMountKind`                                               | `'mountFile' \| 'exposeFile'`                                                                                                         |
+| `StepSecretMountRecord`                                             | Audit record of one mount: `{ sources, target, envVar?, kind }`                                                                       |
+| `StepSecretsFileHost`, `StepSecretsFileWiring`, `StepSecretsHandle` | Host adapter, wiring, and handle types the runner uses to back `mountFile()` / `exposeFile()` and remove the files when the step ends |
+| `KiciApi`                                                           | Type of `ctx.kici`: `infrastructure`, `inventory`, `oidc`, `git`, `host`, `bootstrap`, `scaler`                                       |
+| `KiciApiTransport`                                                  | `(method, params?) => Promise<unknown>` — the transport a `KiciApi` is built on                                                       |
+| `InfrastructureApi`                                                 | `ctx.kici.infrastructure`: `list()` returns an `InfrastructureListResult`                                                             |
+| `InfrastructureListResult`                                          | `{ scalers, agents }` — each entry carries a `source` (`'local'` or a peer instance id)                                               |
+| `InventoryApi`                                                      | `ctx.kici.inventory`: `query(selector?)` and `get(agentId)`                                                                           |
+| `InventorySelector`                                                 | Label selector for `ctx.kici.inventory.query()`                                                                                       |
+| `HostInventoryEntry`                                                | One host in the inventory roster                                                                                                      |
+| `HostApi`                                                           | `ctx.kici.host`: `requestReboot({ deadlineMs? })`, used by `restartHost()`                                                            |
+| `CacheSpec`                                                         | `{ key, paths, restoreKeys? }`. See [Caching](./caching.md)                                                                           |
+| `CacheInput`                                                        | `CacheSpec \| CacheSpec[]`                                                                                                            |
+| `CacheApi`                                                          | Type of `ctx.cache`                                                                                                                   |
+| `CacheRestoreResult`                                                | Result of `ctx.cache.restore()`: `{ hit, matchedKey? }`                                                                               |
+| `ArtifactsApi`                                                      | Type of `ctx.artifacts`. See [Artifacts](./artifacts.md)                                                                              |
+| `ArtifactResult`                                                    | Result of an artifact upload or download: `{ size, sha256 }`                                                                          |
+| `AttestProvenanceOptions`                                           | Options for `ctx.attestProvenance()`: `{ subject, audience? }`                                                                        |
+| `AttestProvenanceResult`                                            | Result of `ctx.attestProvenance()`: the stored bundle, or `{ deferred: true, … }` when the identity token is minted later             |
+| `ProvenanceSubjectInput`                                            | The attested artifact: `{ name, digest }` or `{ name, path }`                                                                         |
+
+### Git credential types
+
+See [Git credentials](../patterns/git-credentials.md) for how these are used.
+
+| Type                    | Description                                                                                                                                     |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ForgeName`             | `'github' \| 'gitlab' \| 'bitbucket' \| 'generic'`                                                                                              |
+| `GitCredentialRef`      | One credential: `{ kind: 'app' }`, `{ kind: 'token' }`, or `{ kind: 'ssh' }`, each field given as a `<name>Secret` reference or a `<name>Value` |
+| `GitCredentialMap`      | Named credentials for a job (`gitCredentials`); `default` applies when a call names none                                                        |
+| `Sourced<Name>`         | Field pair where exactly one of `<Name>Secret` and `<Name>Value` is set                                                                         |
+| `ContainerRegistryAuth` | Registry credentials for `container.auth`: a token plus optional `username` and `registry`                                                      |
+| `GitHubPermissions`     | GitHub repository permissions (`contents`, `pull_requests`, `workflows`, …); unknown keys pass through to GitHub                                |
+| `WriteOptions<F>`       | Options for `withWrite()`: `{ permissions }` on GitHub, no fields on other forges                                                               |
+| `GitGrant`              | What a credential can do: `{ scoped: false }` or `{ scoped: true, permissions }`                                                                |
+| `RepoHandle<F>`         | A checked-out repository: `identifier`, `path`, `ref?`, `sha?`, `withWrite(opts, fn)`                                                           |
+| `GitApi`                | Type of `ctx.kici.git`: `{ github: GitHubApi }`                                                                                                 |
+| `GitHubApi`             | `getToken({ repositories, permissions, credential? })` — mint a token as a value                                                                |
+| `GitTokenResult`        | Result of `getToken()`: `{ token, expiresAt, granted }`                                                                                         |
+
+### Other helpers and constants
+
+These are exported from the root entry point. Most workflows never call them directly.
+
+| Export                                                                                                                                                              | Description                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `isParallelGroup(x)`                                                                                                                                                | Type guard: `true` for a group returned by `parallel()`                                                                                         |
+| `isEventDefinition(value)`                                                                                                                                          | Type guard: `true` for a value returned by `defineEvent()`                                                                                      |
+| `isDynamicGroupRef(value)`                                                                                                                                          | Type guard: `true` for a value returned by `dynamicGroup()`                                                                                     |
+| `getDynamicJobGroup(fn)`                                                                                                                                            | Group name a generator was tagged with by `dynamicJob()`, or `undefined`                                                                        |
+| `getDynamicJobNeeds(fn)`                                                                                                                                            | Declared `needs` of a result-aware generator, or `undefined` for an event-only one                                                              |
+| `getDynamicJobGitCredentials(fn)`                                                                                                                                   | `gitCredentials` a generator declared, or `undefined`                                                                                           |
+| `DYNAMIC_JOB_GROUP_TAG`, `DYNAMIC_JOB_NEEDS_TAG`, `DYNAMIC_JOB_GIT_CREDENTIALS_TAG`, `DYNAMIC_GROUP_TAG`                                                            | Symbol keys the dynamic-job helpers tag their values with                                                                                       |
+| `CacheSpecSchema`                                                                                                                                                   | Zod schema for a `CacheSpec`: non-empty `key`, at least one non-empty `paths` entry, optional `restoreKeys`                                     |
+| `ArtifactNameSchema`                                                                                                                                                | Zod schema for an artifact name: 1 to `ARTIFACT_NAME_MAX_LENGTH` characters from `A-Z a-z 0-9 . _ -`, not only dots                             |
+| `ARTIFACT_NAME_MAX_LENGTH`                                                                                                                                          | Maximum artifact name length (`128`)                                                                                                            |
+| `provenanceSubjectIsPath(subject)`                                                                                                                                  | Type guard: `true` for a `{ name, path }` provenance subject                                                                                    |
+| `assertSecretName(value, field, subject?)`                                                                                                                          | Throws when a credential field holds what looks like the credential itself (a PEM block or a GitHub token) instead of a secret name             |
+| `createStepOutputProxy`, `createJobOutputProxy`, `createSnapshotOutputProxy`                                                                                        | Build the lazy proxies behind `step.result`, `job.result`, and `ctx.needs.<job>.result`                                                         |
+| `resolveStepOutputs`, `resolveJobOutputs`                                                                                                                           | Read the recorded outputs of a step or job reference                                                                                            |
+| `getStepOutputsMap`, `getJobOutputsMap`, `getStepRefMap`                                                                                                            | Read the maps the output proxies resolve against                                                                                                |
+| `OutputsMap`, `StepRefMap`                                                                                                                                          | Types of those maps: outputs keyed by step or job name, and bare step functions mapped to their step names                                      |
+| `waitForHostAlive`, `restartHost` (`WaitForHostAliveOptions`, `RestartHostOptions`)                                                                                 | Host-restart steps. See [Host restart](../patterns/host-restart.md)                                                                             |
+| `agentVersionConverge` (`AgentVersionConvergeOptions`, `AgentVersionDrift`)                                                                                         | Check-step that converges a fleet host's agent onto the orchestrator's version. See [Distribution](../../operator/distribution/distribution.md) |
+| `buildAgentCloudInit` (`AgentCloudInitCredentials`, `ClaimCodeCredentials`, `AgentCloudInitOptions`, `AgentDeliveryMode`, `UserDataEncoding`, `CloudInitWriteFile`) | Renders the cloud-init `user_data` that boots a scaler-provisioned agent. See [Autoscaling workflows](../workflows/autoscaling-workflows.md)    |
+| `CheckStepOptions`                                                                                                                                                  | Options for `checkStep()`. See [Idempotent helpers](./idempotent.md)                                                                            |
 
 ## StepContext
 
@@ -473,7 +594,7 @@ A `runsOn` of a single host's `agentId` (as in `runsOn: [h.agentId]` above) **pi
 
 ### ctx.attestProvenance({ subject })
 
-Build, sign, and persist a build-provenance attestation for an artifact your step produced. KiCI assembles an in-toto SLSA v1.0 provenance statement whose build identity (`repository`, `ref`, `sha`, run/job ids) comes from your orchestrator — not from the step — so it cannot be spoofed, signs it, and stores a verifiable bundle that the dashboard surfaces and the `kici verify-attestation` CLI checks.
+Build, sign, and persist a build-provenance attestation for an artifact your step produced. KiCI assembles an in-toto SLSA v1.0 provenance statement whose build identity (`repository`, `ref`, `sha`, run/job ids) comes from your orchestrator — not from the step — so it cannot be spoofed. KiCI then signs the statement and stores a verifiable bundle that the dashboard surfaces and the `kici verify-attestation` CLI checks.
 
 The artifact is **caller-supplied**: give it either a precomputed digest or a path (relative to the step working directory) that KiCI digests with SHA-256. For a container image, pass the manifest digest your build tool emitted.
 

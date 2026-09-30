@@ -47,6 +47,7 @@ import type {
   StepApprovalRequestIpc,
 } from './ipc-protocol.js';
 import { buildRequest } from './fork-runner.js';
+import { createDepRestoreReportRelay, type DepRestoreReportRelay } from '../dep-restore-report.js';
 import { runnerLaunchArgv, KICI_RUNTIME_NODE_DIR } from './kici-runtime.js';
 import { assertImageRunnable } from './image-preflight.js';
 import { describeRunnerCrash, MAX_RAW_STDOUT_LINES, pushBounded } from './runner-crash.js';
@@ -193,6 +194,8 @@ interface MutableRunnerState {
   droppedJobs: string[] | undefined;
   jobOutputs: Record<string, Record<string, unknown>> | undefined;
   encryptedSecretOutputs: Record<string, { agentPublicKey: string; encrypted: string }> | undefined;
+  /** Writes the runner's setup-time dep-restore report to the agent log. */
+  depRestoreRelay: DepRestoreReportRelay;
 }
 
 /**
@@ -1058,6 +1061,7 @@ export class ContainerSandbox implements ExecutionSandbox {
       droppedJobs: undefined,
       jobOutputs: undefined,
       encryptedSecretOutputs: undefined,
+      depRestoreRelay: createDepRestoreReportRelay(this.jobId),
     };
 
     return new Promise<RunnerOutcome>((resolve, reject) => {
@@ -1175,6 +1179,7 @@ export class ContainerSandbox implements ExecutionSandbox {
         return false;
 
       case 'step.start': {
+        state.depRestoreRelay.onStepStarted();
         stepNames.set(msg.stepIndex, msg.stepName);
         const startState =
           msg.state === 'pending'
@@ -1262,6 +1267,10 @@ export class ContainerSandbox implements ExecutionSandbox {
 
       case 'approval.request':
         relayApprovalRequest(stream, options, msg as StepApprovalRequestIpc);
+        return false;
+
+      case 'dep-restore.report':
+        state.depRestoreRelay.relay(msg.report);
         return false;
 
       case 'job.complete':

@@ -294,6 +294,10 @@ The catch-all `webhook()` trigger (see [SDK reference: webhook()](sdk/triggers.m
 
 The lookup is structurally org-isolated — a generic webhook delivered to org A can never reach a workflow registered against org B, because foreign-org rows live in a different bucket of the index. When a webhook fires across sources, the runtime clone token, repo URL, and check-status posting all come from the **registration's** source bundle, not the inbound source. The inbound source contributes only the event payload.
 
+A generic webhook whose payload names a repository (`repository.full_name`) also reaches that repository's `push()` and `pr()` registrations from other sources. Their `paths` filters apply: the changed files come through the registration's own source, with the rules in [path filter behavior](sdk/triggers.md#path-filter-behavior).
+
+Cross-source delivery never hides a source's own workflows. When the inbound source reads a repository from its payload (a universal-git source), its own lock file is evaluated as well, and the delivery records one event-log row for both.
+
 ## Circuit breaker
 
 Events can trigger workflows that emit more events, creating chains. The circuit breaker prevents runaway event storms.

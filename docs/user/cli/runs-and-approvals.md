@@ -47,6 +47,8 @@ Secrets are always sourced from your real `.kici/` directory, not from the isola
 
 Pass `--in-place` to run against the real working directory instead — useful when you explicitly want in-tree execution. `--in-place` requires no git repository; the default isolated mode does, and fails with an actionable error pointing at `--in-place` when the directory is not a git repository.
 
+The run's changed files are the commit it runs. In the default isolated mode, that commit holds your uncommitted changes, so `paths` filters and `ctx.changedFiles` rules see those files. With no uncommitted changes, or with `--in-place`, the run uses your `HEAD` commit, so they see the files `HEAD` changed.
+
 **If the trigger times out:**
 
 The command waits up to 60 seconds for the local dev plane to create the run. If nothing appears in that window it stops and names the cause it read back from the plane:

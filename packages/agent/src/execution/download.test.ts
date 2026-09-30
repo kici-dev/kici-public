@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { uploadToPresignedUrl, UPLOAD_MAX_RETRIES } from './download.js';
+import { downloadUrl, uploadToPresignedUrl, UPLOAD_MAX_RETRIES } from './download.js';
 
 /**
  * Object-storage backends answer an overload with a retryable 5xx — S3
@@ -151,4 +151,15 @@ describe('uploadToPresignedUrl — stalled socket', () => {
       new RegExp(`failed after ${UPLOAD_MAX_RETRIES + 1} attempts.*timed out after 150ms`),
     );
   }, 20_000);
+});
+
+describe('downloadUrl', () => {
+  it('names the failed status without the presigned signature', async () => {
+    // fails-when: the error message carries the URL's query string
+    // breaks-if-wrong: the message still names the status and the object path
+    const s = await serverAnswering([403]);
+    closers.push(s.close);
+    const err = await downloadUrl(s.url).catch((e: unknown) => e);
+    expect((err as Error).message).toBe(`HTTP 403 downloading from ${s.url.split('?')[0]}`);
+  });
 });

@@ -12,7 +12,12 @@ import type {
 } from './types.js';
 import type { WarmPoolStats } from './warm-pool.js';
 import { ScalerEventType } from './types.js';
-import { ScalerManager, resolveScalerOrchestratorUrl, buildScalerUsageRows } from './manager.js';
+import {
+  ScalerManager,
+  SCALER_SHUTDOWN_GRACE_MS,
+  resolveScalerOrchestratorUrl,
+  buildScalerUsageRows,
+} from './manager.js';
 import { agentMayRefuse, canAgentRunJob, JobContainerNeed, type AgentFitJob } from './agent-fit.js';
 import type { ProvisionBackoffSettings, ScalerManagerDeps } from './manager.js';
 import { normalizeLabelSet } from './label-matcher.js';
@@ -2437,6 +2442,33 @@ describe('ScalerManager', () => {
       );
     });
 
+    it('scales an agent dropped for missed heartbeats down once, as heartbeat-timeout', async () => {
+      // fails-when: the reason is `shutdown`, or the socket's later close emits a
+      //   second scale-down
+      // breaks-if-wrong: an ordinary disconnect still carries `shutdown` (previous test)
+      const emitter = fakeEmitter();
+      const stateStore = fakeStateStore({
+        adoptSpawningAgent: vi.fn().mockResolvedValue(spawnRow()),
+      });
+      const manager = makeManagerWithEventBackend({ stateStore, emitter, instanceId: 'orch-b' });
+
+      await manager.onAgentRegistered('agent-77', ['github-actions']);
+      manager.onAgentDisconnected('agent-77', ScaleDownReason.enum['heartbeat-timeout']);
+      manager.onAgentDisconnected('agent-77');
+
+      await vi.waitFor(() => expect(emitter.emitScalerScaleDown).toHaveBeenCalledTimes(1));
+      expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'agent-77', reason: 'heartbeat-timeout' }),
+        ['e2e/provision'],
+      );
+      // The stranded-provision sweep lists spawn rows; the row goes with the
+      // teardown, so the sweep cannot emit a second scale-down for this agent.
+      await vi.waitFor(() =>
+        expect(stateStore.deleteSpawningAgent).toHaveBeenCalledWith('agent-77'),
+      );
+      expect(emitter.emitScalerScaleDown).toHaveBeenCalledTimes(1);
+    });
+
     it('returns null when another instance already adopted the agent', async () => {
       // `agent-77` deliberately carries no `scaler-` prefix, so it takes the
       // static path. A scaler-minted id is refused here instead — see the
@@ -3439,9 +3471,11 @@ describe('ScalerManager', () => {
       // Disconnect
       manager.onAgentDisconnected(agentId);
 
-      // The second argument is the adopted-agent teardown context, undefined for
-      // an agent this instance spawned itself.
-      expect(containerBackend.destroy).toHaveBeenCalledWith(agentId, undefined);
+      // The second argument is the teardown context: the scale-down reason, and
+      // no targets for an agent this instance spawned itself.
+      expect(containerBackend.destroy).toHaveBeenCalledWith(agentId, {
+        reason: ScaleDownReason.enum.shutdown,
+      });
     });
 
     it('ignores non-managed (static) agents', () => {
@@ -4549,6 +4583,52 @@ describe('ScalerManager', () => {
       await manager.shutdownAll();
 
       expect(manager.getStatus().spawningCount).toBe(0);
+    });
+
+    it('stops waiting for a backend that is still stopping once the grace elapses', async () => {
+      // A container runtime that misses an agent's exit holds its stop far past
+      // the stop timeout. The scaler is the first step of a 30 s shutdown, so
+      // an unbounded wait here leaves no time for the rest.
+      // fails-when: shutdownAll() awaits every backend unconditionally — it
+      // never resolves below.
+      containerBackend.shutdownAll = vi.fn(() => new Promise<void>(() => {}));
+      const manager = createManager();
+      let resolved = false;
+      const done = manager.shutdownAll().then(() => {
+        resolved = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(SCALER_SHUTDOWN_GRACE_MS - 1);
+      expect(resolved, 'the grace is a real wait, not an immediate return').toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await done;
+
+      expect(resolved).toBe(true);
+      expect(bareMetalBackend.shutdownAll).toHaveBeenCalled();
+      expect(manager.getStatus().spawningCount).toBe(0);
+    });
+
+    it('waits for a backend that finishes inside the grace', async () => {
+      // breaks-if-wrong: the grace must bound a stuck stop, not cut short one
+      // that completes — agents a backend is still stopping inside the window
+      // are waited for.
+      let finishStop!: () => void;
+      containerBackend.shutdownAll = vi.fn(
+        () => new Promise<void>((resolve) => (finishStop = resolve)),
+      );
+      const manager = createManager();
+      let resolved = false;
+      const done = manager.shutdownAll().then(() => {
+        resolved = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(resolved).toBe(false);
+      finishStop();
+      await done;
+
+      expect(resolved).toBe(true);
+      expect(vi.getTimerCount(), 'the grace timer is cleared once every backend stopped').toBe(0);
     });
   });
 

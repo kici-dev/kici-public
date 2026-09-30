@@ -48,7 +48,7 @@ pnpm -r run build
 pnpm -r run test
 ```
 
-Requires Node 24, pnpm 11+.
+Requires Node.js 24.5.0 or later, pnpm 11+.
 
 ## Where development happens
 

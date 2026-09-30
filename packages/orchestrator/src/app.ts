@@ -51,6 +51,7 @@ import type { PendingDynamicTracker, PendingGlobalEvalTracker } from './cache/in
 import type { GlobalEvalRoundCache } from './cache/index.js';
 import { settlePendingPrecursor } from './cache/precursor-result.js';
 import type { CacheStorage } from './storage/types.js';
+import type { CacheUploadSettle } from './cache/cache-upload-settle.js';
 import type { ProvenanceTrustRoot } from './provenance/trust-root.js';
 import { PendingAttestationsRepo } from './provenance/pending-attestations-repo.js';
 import { registerBlobRoutes, CACHE_BLOB_PATH_PREFIX } from './storage/blob-routes.js';
@@ -258,6 +259,11 @@ export interface AppDependencies {
   dispatchCacheRefs?: DispatchCacheRefTracker;
   /** Cache storage backend (S3) for metadata operations on upload completion. */
   cacheStorage?: CacheStorage;
+  /**
+   * In-flight build-cache publishes plus the per-org settle bound. Constructed
+   * once by orchestrator-core: the agent-WS factory below runs per connection.
+   */
+  cacheUploadSettle?: CacheUploadSettle;
   /** Provenance trust root used to verify build-provenance bundles at ingest. */
   provenanceTrustRoot?: ProvenanceTrustRoot;
   /**
@@ -876,6 +882,7 @@ export function createApp(deps: AppDependencies) {
         artifactStore: deps.artifactStore,
         dispatchCacheRefs: deps.dispatchCacheRefs,
         cacheStorage: deps.cacheStorage,
+        cacheUploadSettle: deps.cacheUploadSettle,
         onJobStatus:
           deps.platformClient ||
           deps.executionTracker ||
@@ -1026,8 +1033,8 @@ export function createApp(deps: AppDependencies) {
           deps.onAgentInventoryChanged?.(); // broadcast heartbeat to peers
           return result;
         },
-        onScalerAgentDisconnected: (agentId) => {
-          deps.scalerManager?.onAgentDisconnected(agentId);
+        onScalerAgentDisconnected: (agentId, reason) => {
+          deps.scalerManager?.onAgentDisconnected(agentId, reason);
           deps.onAgentInventoryChanged?.(); // broadcast heartbeat to peers
         },
         onScalerJobComplete: deps.scalerManager
@@ -1457,8 +1464,8 @@ export function createApp(deps: AppDependencies) {
           // Absent in a deployment with no peer transport, which reads as
           // "a sibling-owned job is unreachable" rather than "orphaned".
           cancelJobOnPeer: deps.coordinator
-            ? (peerId, cancelRunId, jobId, cancelReason) =>
-                deps.coordinator!.cancelJobOnPeer(peerId, cancelRunId, jobId, cancelReason)
+            ? (peerId, cancelRunId, jobId, cancelReason, force) =>
+                deps.coordinator!.cancelJobOnPeer(peerId, cancelRunId, jobId, cancelReason, force)
             : undefined,
           // A held run's cancel withdraws its approval request the way a
           // reject does, from the live processing-deps bag.

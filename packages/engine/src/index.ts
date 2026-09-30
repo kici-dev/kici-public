@@ -186,6 +186,7 @@ export * from './trigger/text-match.js';
 export * from './trigger/trigger-event-type.js';
 export * from './trigger/decision-trace.js';
 export * from './trigger/matcher.js';
+export * from './trigger/diff-range.js';
 // Exported so the orchestrator's org-level repo policy matches repo
 // identifiers by the same rules a workflow's own `repos:` patterns do. A
 // second, subtly different repo matcher is how a deny-list pattern came to

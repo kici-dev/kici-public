@@ -9,6 +9,7 @@ import https from 'node:https';
 import http from 'node:http';
 import { createLogger } from '@kici-dev/shared';
 import { resolveOrchestratorUrl } from './dep-restore.js';
+import { redactUrl } from './resumable-download.js';
 
 const logger = createLogger({ prefix: 'agent:download' });
 
@@ -32,8 +33,9 @@ const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Retries a pre-signed upload makes after its first attempt, matching the
- * dep-tarball download's ceiling (`MAX_RETRIES` in `dep-restore.ts`) so both
- * halves of the agent's object-storage traffic give up at the same point.
+ * dependency download's ceiling (`DEFAULT_DOWNLOAD_LIMITS.maxAttempts` in
+ * `resumable-download.ts`, three attempts in total) so both halves of the
+ * agent's object-storage traffic give up at the same point.
  */
 export const UPLOAD_MAX_RETRIES = 2;
 
@@ -78,7 +80,7 @@ export function downloadUrl(url: string): Promise<Buffer> {
     client
       .get(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) }, (res) => {
         if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-          reject(new Error(`HTTP ${res.statusCode} downloading from ${url}`));
+          reject(new Error(`HTTP ${res.statusCode} downloading from ${redactUrl(url)}`));
           res.resume();
           return;
         }

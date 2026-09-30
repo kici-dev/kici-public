@@ -137,6 +137,8 @@ The filter receives a `FilterContext`:
 | `env`                | `Record<string, string\|undefined>`       | Environment variables.                                                                     |
 | `$`                  | zx shell                                  | Shell executor.                                                                            |
 
+`changedFiles` follows the same rules as a rule's `ctx.changedFiles` (see [rules](sdk/rules-matrix-dynamic.md)): a push that creates a branch lists the files the branch adds, compared with the default branch, and a push with no `before` commit is `unavailable`. A workflow whose `paths` filter the orchestrator could not decide is decided by the evaluation round first, from the same diff; on no match, its `filter` never runs.
+
 `RepoInfo` carries `identifier` (the repo's `owner/repo` name) and `path` (an absolute path to the checkout on the evaluating agent), plus optional `ref` and `sha`. **`ref` and `sha` are optional** — an event that carries no single ref leaves them undefined, so guard before reading them.
 
 **`sourceRepo.path` is not stable across evaluations.** Its _contents_ are: the evaluating agent and the later run see the same tree at the same commit. The path itself is not — a different working directory, and possibly a different machine. Read _through_ it; never embed it in a job name, an output, or anything compared across calls.

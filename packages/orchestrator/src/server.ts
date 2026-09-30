@@ -102,7 +102,8 @@ const { BindingStore } = await import('./contexts/binding-store.js');
 const { handleRerun } = await import('./pipeline/rerun.js');
 const { handleManualSchedule } = await import('./pipeline/manual-schedule.js');
 const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
-const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
+const { PeerClient, PeerAuthCoordinator, coordinatorSelfIssuer } =
+  await import('./cluster/index.js');
 const { HeldRunStore } = await import('./contexts/held-runs.js');
 const { TrustPolicyStore } = await import('./security/trust-policy-store.js');
 const { TrustDirectoryStore } = await import('./security/trust-directory-store.js');
@@ -166,6 +167,7 @@ import {
   type DashboardEncryptionJwk,
 } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 import { runDetached } from './helpers/run-detached.js';
+import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'server' });
@@ -673,8 +675,8 @@ export async function runServer(
               registry: sub.agentRegistry,
               executionTracker: sub.executionTracker,
               instanceId: sub.config.instanceId,
-              cancelJobOnPeer: (peerId, runId, jobId, reason) =>
-                sub.coordinator.cancelJobOnPeer(peerId, runId, jobId, reason),
+              cancelJobOnPeer: (peerId, runId, jobId, reason, force) =>
+                sub.coordinator.cancelJobOnPeer(peerId, runId, jobId, reason, force),
               // A held run's cancel withdraws its approval request the way a
               // reject does, from the live processing-deps bag.
               rejectHeldWorkflow: (hold, reason, opts) =>
@@ -929,6 +931,18 @@ export async function runServer(
             credentialFile: peerCredentialFile,
             instanceId: config.instanceId,
             joinToken: config.cluster.joinToken,
+            // A coordinator without a join token issues its own credential the
+            // first time a peer client needs one. A single-node orchestrator has
+            // no coordinator peers, so it never issues one.
+            selfIssue: config.cluster.singleNode
+              ? undefined
+              : coordinatorSelfIssuer({
+                  db: sub.db,
+                  credentialFile: peerCredentialFile,
+                  instanceId: config.instanceId,
+                  agentMaxReconnectDelayMs: config.agentMaxReconnectDelayMs,
+                  clusterInstanceHeartbeatMs: config.clusterInstanceHeartbeatMs,
+                }),
           });
 
           const createOutboundPeerClient = (rawUrl: string, initialKey: string): PeerClientT => {
@@ -955,24 +969,23 @@ export async function runServer(
               },
               onJobProgress: (msg, fromPeerId, reply) =>
                 sub.coordinator.onPeerJobProgress(msg, fromPeerId, reply),
-              onJobCancel: (msg) => {
-                if (!msg.jobId) return;
-                const agentId = sub.dispatcher.getAgentIdForJob(msg.jobId);
-                if (agentId) {
-                  const entry = sub.agentRegistry.get(agentId);
-                  if (entry?.ws) {
-                    entry.ws.send(
-                      JSON.stringify({
-                        type: 'job.cancel',
-                        messageId: crypto.randomUUID(),
-                        runId: msg.runId,
-                        jobId: msg.jobId,
-                        reason: msg.reason,
-                      }),
-                    );
-                  }
-                }
-              },
+              onJobCancel: (msg) =>
+                runDetached(
+                  logger,
+                  'Peer job cancel',
+                  () =>
+                    deliverPeerJobCancel(
+                      {
+                        dispatcher: sub.dispatcher,
+                        registry: sub.agentRegistry,
+                        lookupDispatched: (runId, jobId) =>
+                          readDispatchedAgents(sub.db, runId, jobId),
+                        logger,
+                      },
+                      msg,
+                    ),
+                  { runId: msg.runId, jobId: msg.jobId },
+                ),
               onRaftVoteRequest: (msg) => sub.raft.handleVoteRequest(msg),
               onRaftVoteResponse: (msg) => sub.raft.handleVoteResponse(msg),
               onRaftAppendEntries: (msg) => sub.raft.handleAppendEntries(msg),

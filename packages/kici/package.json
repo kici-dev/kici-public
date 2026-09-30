@@ -1,6 +1,6 @@
 {
   "name": "kici",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Developer CLI for the KiCI CI/CD stack. Compile workflows, run them locally, and interact with a remote orchestrator from the command line.",
   "keywords": [
     "ci",
@@ -27,7 +27,7 @@
   },
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=24"
+    "node": ">=24.5.0"
   },
   "type": "module",
   "bin": {

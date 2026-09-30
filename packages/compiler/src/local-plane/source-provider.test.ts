@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveWorkdir, LOCAL_RUN_BRANCH } from './source-provider.js';
+import { resolveWorkdir, readParentSha, LOCAL_RUN_BRANCH } from './source-provider.js';
 
 /** Create a throwaway git repo with one committed file. */
 function makeRepo(): string {
@@ -18,6 +18,34 @@ function makeRepo(): string {
   git(['commit', '-q', '-m', 'base']);
   return dir;
 }
+
+describe('readParentSha', () => {
+  let repo: string;
+  beforeEach(() => {
+    repo = makeRepo();
+  });
+  afterEach(() => {
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it('returns undefined for a root commit and for a path that is not a repo', () => {
+    const root = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    expect(readParentSha(repo, root)).toBeUndefined();
+    expect(readParentSha(path.join(repo, 'missing'), root)).toBeUndefined();
+  });
+
+  // fails-when: kici run sends no before, so the run's changed files are unavailable
+  it("an isolated run's parent is the developer's HEAD, so its diff is the overlay", async () => {
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    fs.writeFileSync(path.join(repo, 'untracked.txt'), 'new\n');
+    const wd = await resolveWorkdir({ inPlace: false, repoRoot: repo });
+    try {
+      expect(readParentSha(wd.dir, wd.sha)).toBe(head);
+    } finally {
+      await wd.cleanup();
+    }
+  });
+});
 
 describe('LocalSourceProvider resolveWorkdir', () => {
   let repo: string;

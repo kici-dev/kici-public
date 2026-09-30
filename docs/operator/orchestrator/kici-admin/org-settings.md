@@ -149,6 +149,20 @@ How long a job may sit queued before it expires. The deadline resolves as `job.t
 - `set <milliseconds>` takes an integer of at least 0; **`set 0` means indefinite** (a queued job never expires).
 - `reset` clears the override (writes NULL) so the org falls back to the cluster default.
 
+#### `cache-upload-settle` — per-org build cache publish wait
+
+```bash
+kici-admin org-settings cache-upload-settle show --customer-id <id> [--format json|table]
+kici-admin org-settings cache-upload-settle set <milliseconds> --customer-id <id> [--format json|table]
+kici-admin org-settings cache-upload-settle reset --customer-id <id> [--format json|table]
+```
+
+How long a build job's success waits for the orchestrator to publish the cache that the build uploaded. The jobs that wait on the build read the published cache when the build succeeds. Without the wait, they can start before the publish finishes and install their dependencies themselves. The value resolves as this org override → the cluster default from `KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS` (10 seconds).
+
+- `set <milliseconds>` takes an integer of at least 0. **`set 0` turns the wait off.**
+- When the wait times out, the orchestrator logs `Cache upload did not publish within the settle timeout` and starts the waiting jobs without the cache.
+- `reset` clears the override (writes NULL) so the org falls back to the cluster default.
+
 #### `reroute` — per-org cross-peer reroute tunables
 
 ```bash
@@ -207,7 +221,7 @@ kici-admin org-settings dispatch-ack set <milliseconds> --customer-id <id> [--fo
 kici-admin org-settings dispatch-ack reset --customer-id <id> [--format json|table]
 ```
 
-Reads and writes the per-org dispatch-acknowledgment deadline: how long the orchestrator waits for the agent to answer a dispatched job (with an accept acknowledgment, a refusal, or a `running` status) before treating the dispatch as lost. On expiry the orchestrator requeues the job and disconnects the unresponsive agent, so a dispatch dropped in an agent's socket teardown no longer strands the run until a timeout.
+Reads and writes the per-org dispatch-acknowledgment deadline. This is how long the orchestrator waits for the agent to answer a dispatched job before it treats the dispatch as lost. The agent answers with an accept acknowledgment, a refusal, or a `running` status. On expiry the orchestrator requeues the job and disconnects the unresponsive agent, so a dispatch dropped in an agent's socket teardown no longer strands the run until a timeout. The agent's other running jobs get the same handling as when an agent loses its connection.
 
 The value maps to the NULLABLE column `org_settings.dispatch_ack_timeout_ms`. When NULL (the default), the orchestrator uses the cluster-wide default from `KICI_DISPATCH_ACK_TIMEOUT_MS` (10 seconds); a per-org override of at least 1000 ms takes precedence at dispatch time.
 
@@ -691,6 +705,60 @@ Synopsis: `kici-admin org-settings backup-freshness set [options]`
 Print the current per-org backup-freshness threshold
 
 Synopsis: `kici-admin org-settings backup-freshness show [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings cache-upload-settle`
+
+Manage how long a build success waits for its cache upload to publish (null = cluster default)
+
+Synopsis: `kici-admin org-settings cache-upload-settle`
+
+### `kici-admin org-settings cache-upload-settle reset`
+
+Clear the per-org cache upload settle override (fall back to the cluster default)
+
+Synopsis: `kici-admin org-settings cache-upload-settle reset [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings cache-upload-settle set`
+
+Set the per-org cache upload settle timeout in milliseconds (0 = no wait)
+
+Synopsis: `kici-admin org-settings cache-upload-settle set <ms> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description                                   |
+| -------- | -------- | -------- | --------------------------------------------- |
+| `ms`     | yes      | no       | Settle timeout in milliseconds (integer >= 0) |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings cache-upload-settle show`
+
+Print the current per-org cache upload settle timeout
+
+Synopsis: `kici-admin org-settings cache-upload-settle show [options]`
 
 **Options**
 

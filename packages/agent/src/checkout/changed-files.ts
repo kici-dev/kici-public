@@ -1,6 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import type { EventPayload } from '@kici-dev/sdk';
-import type { ChangedFilesStatus } from '@kici-dev/engine';
+import {
+  diffRangeKindSchema,
+  resolveDiffRange,
+  type ChangedFilesStatus,
+  type DiffRangeEvent,
+} from '@kici-dev/engine';
 import type { GitAuth } from './git-clone.js';
 import { setupSshAuth } from './ssh-auth.js';
 
@@ -26,12 +31,7 @@ export interface GitAuthCtx {
   cleanup?: () => Promise<void>;
 }
 
-// git's canonical empty-tree object (SHA-1; kici uses git's SHA-1 defaults).
-// Used as the diff base for a new-branch / zero-`before` push so every tracked
-// file counts as changed. A literal constant is portable (the `hash-object
-// /dev/null` form is not available on Windows agents).
-const EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-const ZERO_SHA = /^0+$/;
+const Kind = diffRangeKindSchema.enum;
 const MAX_DEEPEN = 4; // bounded history deepening before giving up
 const DEEPEN_STEP = 50;
 
@@ -98,63 +98,93 @@ function ensureCommit(workDir: string, commitish: string, ctx: GitAuthCtx): bool
   return false;
 }
 
-function pushDiff(workDir: string, before: string, ctx: GitAuthCtx): ChangedFilesResult {
-  const isZero = !before || ZERO_SHA.test(before);
-  const baseRef = isZero ? EMPTY_TREE_SHA : before;
-  if (!isZero && !ensureCommit(workDir, before, ctx)) {
+/**
+ * Two-dot `before..after`: the files a push to an existing branch changed.
+ * Diffed against the event's `after`, not the checkout: a cross-source job
+ * checks out the registration's commit, which is not the pushed one.
+ */
+function twoDotDiff(
+  workDir: string,
+  before: string,
+  after: string,
+  ctx: GitAuthCtx,
+): ChangedFilesResult {
+  // fails-when: a checkout at another commit diffs before..HEAD instead of before..after
+  // breaks-if-wrong: a checkout at `after` (every same-source job) diffs as before, with no fetch
+  if (!ensureCommit(workDir, before, ctx) || !ensureCommit(workDir, after, ctx)) {
     return { files: [], status: 'unavailable' };
   }
-  const out = git(workDir, ['diff', '--name-only', baseRef, 'HEAD'], ctx);
+  const out = git(workDir, ['diff', '--name-only', before, after], ctx);
   return { files: parseNameOnly(out), status: 'fetched' };
 }
 
-function prDiff(workDir: string, base: string, ctx: GitAuthCtx): ChangedFilesResult {
-  // Base may already be a local ref, or need fetching into origin/<base>.
-  const candidates = [base, `origin/${base}`, 'FETCH_HEAD'];
+/**
+ * Three-dot `base...head`: the files `head` adds relative to `base` — a pull
+ * request's base branch against the checkout, or a new branch's default branch
+ * against the pushed `after`.
+ */
+function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): ChangedFilesResult {
+  if (!ensureCommit(workDir, head, ctx)) return { files: [], status: 'unavailable' };
+  // The agent's clone is shallow and single-branch (`--depth` implies it), so
+  // the base branch is usually absent. Fetch it into its own remote-tracking
+  // ref: a bare `fetch origin <base>` lands only in FETCH_HEAD, which the next
+  // fetch overwrites — and a FETCH_HEAD left by the clone's own fetch of HEAD
+  // would diff HEAD against itself and report no changed files.
+  const baseSpec = `+refs/heads/${base}:refs/remotes/origin/${base}`;
   const resolveBase = (): string | undefined =>
-    candidates.find((c) => tryGit(workDir, ['rev-parse', '--verify', `${c}^{commit}`], ctx));
+    [base, `origin/${base}`].find((c) =>
+      tryGit(workDir, ['rev-parse', '--verify', '--quiet', `${c}^{commit}`], ctx),
+    );
   let baseRef = resolveBase();
   if (!baseRef) {
-    if (!ensureCommit(workDir, base, ctx)) return { files: [], status: 'unavailable' };
+    // fails-when: a single-branch clone resolves no base and reports unavailable
+    // breaks-if-wrong: a clone that already holds the base branch never fetches
+    tryGit(workDir, ['fetch', '--depth', '1', 'origin', baseSpec], ctx);
     baseRef = resolveBase();
   }
   if (!baseRef) return { files: [], status: 'unavailable' };
   // Deepen (bounded) until a merge-base with HEAD exists, then three-dot diff.
+  // Deepening through the base's refspec moves every shallow boundary, HEAD's
+  // included, and keeps the base ref current.
   for (let i = 0; i <= MAX_DEEPEN; i++) {
-    if (tryGit(workDir, ['merge-base', baseRef, 'HEAD'], ctx)) {
-      const out = git(workDir, ['diff', '--name-only', `${baseRef}...HEAD`], ctx);
+    if (tryGit(workDir, ['merge-base', baseRef, head], ctx)) {
+      const out = git(workDir, ['diff', '--name-only', `${baseRef}...${head}`], ctx);
       return { files: parseNameOnly(out), status: 'fetched' };
     }
-    if (!tryGit(workDir, ['fetch', `--deepen=${DEEPEN_STEP}`, 'origin'], ctx)) break;
+    if (!tryGit(workDir, ['fetch', `--deepen=${DEEPEN_STEP}`, 'origin', baseSpec], ctx)) break;
   }
   return { files: [], status: 'unavailable' };
 }
 
 /**
- * Compute the changed-files list from the agent's local clone (HEAD is the
- * checked-out head commit). Ground truth for job/step rule evaluation. `auth`
- * (the same credentials used for the clone) authenticates the deepen / fetch
- * calls so a private remote resolves. Returns `unavailable` for diff-less
- * events (schedule/tag/manual) or any git failure — never throws.
+ * Compute the changed-files list from the agent's local clone, over the same
+ * range the orchestrator uses (`resolveDiffRange`): a push reads the event's
+ * own `before` / `after` commits, fetching them when the checkout lacks them;
+ * a pull request diffs its base against the checked-out head. Ground truth for job/step rules, the workflow filter
+ * and deferred `paths`. `auth` (the same credentials used for the clone)
+ * authenticates the deepen / fetch calls so a private remote resolves.
+ *
+ * Returns `unavailable` for an event with no range — a diff-less event
+ * (schedule/tag/manual), a push without `before` or `after`, a new branch
+ * with no other default branch to diff against — and for any git failure.
+ * A deleted branch is `fetched` with no files. Never throws.
  */
 export async function computeChangedFiles(
   workDir: string,
   event: EventPayload,
   auth?: GitAuth,
 ): Promise<ChangedFilesResult> {
+  const range = resolveDiffRange(event as unknown as DiffRangeEvent);
+  if (range.kind === Kind.none) return { files: [], status: 'unavailable' };
+  if (range.kind === Kind.deleted) return { files: [], status: 'fetched' };
   let ctx: GitAuthCtx | undefined;
   try {
-    if (event.type !== 'push' && event.type !== 'pull_request') {
-      return { files: [], status: 'unavailable' };
-    }
     ctx = await buildAuthCtx(auth);
-    if (event.type === 'push') {
-      const before = (event.payload as { before?: string } | undefined)?.before ?? '';
-      return pushDiff(workDir, before, ctx);
+    if (range.kind === Kind['two-dot']) return twoDotDiff(workDir, range.base, range.head, ctx);
+    if (range.kind === Kind['new-branch']) {
+      return prDiff(workDir, range.defaultBranch, ctx, range.head);
     }
-    const base = event.baseBranch ?? event.targetBranch;
-    if (!base) return { files: [], status: 'unavailable' };
-    return prDiff(workDir, base, ctx);
+    return prDiff(workDir, range.base, ctx);
   } catch {
     return { files: [], status: 'unavailable' };
   } finally {

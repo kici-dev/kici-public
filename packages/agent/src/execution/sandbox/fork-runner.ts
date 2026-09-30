@@ -13,6 +13,7 @@ import type { JobDispatch, CheckMode } from '@kici-dev/engine';
 import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
 import type { JobExecutionOptions, JobExecutionResult } from './types.js';
 import { createSecretMasker, type LogMasker } from './log-masker.js';
+import { createDepRestoreReportRelay, type DepRestoreReportRelay } from '../dep-restore-report.js';
 import type {
   RunnerToAgentMessage,
   AgentToRunnerMessage,
@@ -776,6 +777,8 @@ interface ForkRunnerCtx {
   masker: LogMasker;
   /** When true, the `ready` handler tells the runner to run cleanup-only. */
   cleanupOnly: boolean;
+  /** Writes the runner's setup-time dep-restore report to the agent log. */
+  depRestoreRelay: DepRestoreReportRelay;
 }
 
 function clearAllCancelTimers(ctx: ForkRunnerCtx): void {
@@ -1026,7 +1029,11 @@ function relayChildIpcMessage(
     case 'log.line':
       ctx.execOptions.onLogLine(msg.stepIndex, msg.line, msg.stream);
       return;
+    case 'dep-restore.report':
+      ctx.depRestoreRelay.relay(msg.report);
+      return;
     case 'step.start': {
+      ctx.depRestoreRelay.onStepStarted();
       ctx.stepNames.set(msg.stepIndex, msg.stepName);
       const startState =
         msg.state === 'pending'
@@ -1304,6 +1311,7 @@ export function createForkRunner(
         }),
       ),
       cleanupOnly: options.cleanupOnly === true,
+      depRestoreRelay: createDepRestoreReportRelay(dispatch.jobId),
     };
 
     process.stderr.write(

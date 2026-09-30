@@ -12,6 +12,7 @@ import {
   type MatrixValues,
 } from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
+import { evaluateDeferredPaths } from './deferred-paths.js';
 
 /**
  * Result of evaluating dynamic fields on a job.
@@ -36,6 +37,15 @@ export interface InitResult {
    * orchestrator reads absence as "no verdict was reported", never as "suppress".
    */
   filterPassed?: boolean;
+  /**
+   * Verdict on the workflow's deferred `paths`, set only when the init job was
+   * asked to decide them (`flags.deferredPaths`). `false` means the clone's
+   * diff matched none of them and the job must not be dispatched.
+   *
+   * Optional on purpose: an agent that predates deferred paths never sets it,
+   * so the orchestrator reads absence as "no verdict", never as "suppress".
+   */
+  pathsPassed?: boolean;
 }
 
 /**
@@ -138,7 +148,10 @@ function findJobByName(workflow: Workflow, jobName: string): Job {
  * -: If a dynamic function returns undefined/null, the field is left undefined.
  * -: Each dynamic function call is wrapped in a timeout (default 60s).
  *
- * A workflow-level `filter` is evaluated FIRST when `flags.hasFilter` is set. A
+ * Deferred `paths` are decided FIRST when `flags.deferredPaths` is set, from the
+ * clone's diff in `filterInput`; a no-match returns immediately, before the
+ * filter, because a workflow whose paths did not match never triggered. The
+ * workflow-level `filter` is evaluated next when `flags.hasFilter` is set. A
  * `false` verdict returns immediately: no job of that workflow will be
  * dispatched, so evaluating this one's dynamic fields would run customer code
  * whose result nothing can consume.
@@ -148,7 +161,7 @@ function findJobByName(workflow: Workflow, jobName: string): Job {
  * @param event - Normalized event envelope — same shape every dynamic-function call site receives.
  * @param flags - Which fields are dynamic and need evaluation
  * @param timeoutMs - Timeout per dynamic function call (default 60_000ms)
- * @param filterInput - Source tree + diff the workflow's `filter` reads. Required when `flags.hasFilter`.
+ * @param filterInput - Source tree + diff the workflow's `filter` and deferred `paths` read. Required when either is set.
  */
 export async function evaluateDynamicFields(
   workflow: Workflow,
@@ -160,11 +173,27 @@ export async function evaluateDynamicFields(
     dynamicConcurrencyGroup: boolean;
     dynamicMatrix?: boolean;
     hasFilter?: boolean;
+    /** The `paths` lists the orchestrator could only match conservatively. */
+    deferredPaths?: string[][];
   },
   timeoutMs: number = 60_000,
   filterInput?: FilterEvalInput,
 ): Promise<InitResult> {
   const result: InitResult = {};
+
+  if (flags.deferredPaths && flags.deferredPaths.length > 0) {
+    if (!filterInput) {
+      throw new Error(
+        `Workflow '${workflow.name}' has deferred paths but the evaluating job supplied no ` +
+          `changed files to decide them against.`,
+      );
+    }
+    result.pathsPassed = evaluateDeferredPaths(flags.deferredPaths, {
+      files: filterInput.changedFiles,
+      status: filterInput.changedFilesStatus,
+    });
+    if (!result.pathsPassed) return result;
+  }
 
   if (flags.hasFilter) {
     result.filterPassed = await evaluateWorkflowFilter(workflow, event, filterInput, timeoutMs);

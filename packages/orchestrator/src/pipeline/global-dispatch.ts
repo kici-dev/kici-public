@@ -140,14 +140,21 @@ export function globalRunLockFile(
 
 /** The candidate's trigger decision, or a matched one when the caller carried none. */
 function decisionOf(candidate: GlobalEvalCandidate): WorkflowDecision {
-  return (
-    candidate.decision ?? {
+  if (!candidate.decision) {
+    return {
       workflowName: candidate.lockEntry.name,
       matched: true,
       checks: [],
       summary: 'Organization-wide workflow matched',
-    }
-  );
+    };
+  }
+  // A candidate with deferred paths reaches the pipeline only after the eval
+  // round decided them, as it decided the filter `dispatchableGlobalWorkflow`
+  // strips; carrying them on would give every job a second init round.
+  // fails-when: a round-cleared global gets a per-job __init__ for paths the round already decided
+  // breaks-if-wrong: the rest of the decision (checks, summary) still reaches the trace
+  const { deferredPaths: _alreadyDecided, ...decision } = candidate.decision;
+  return decision;
 }
 
 /**

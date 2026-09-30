@@ -58,6 +58,13 @@ import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'peer-client' });
 
+/** Logged when this instance has neither a credential file nor a join token. */
+export const NO_AUTH_METHOD_MESSAGE =
+  'No peer auth method: this instance has no credential file and no join token';
+
+const NO_AUTH_METHOD_REMEDY =
+  'A coordinator issues its own credential unless an operator revoked it; a worker needs KICI_CLUSTER_JOIN_TOKEN';
+
 // Software version injected at build time by scripts/build-service.mjs.
 declare const KICI_PKG_VERSION: string;
 const SOFTWARE_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.0';
@@ -197,6 +204,8 @@ export class PeerClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+  /** Whether this client already warned that it has no auth method; re-armed by an accepted auth. */
+  private noAuthWarned = false;
   private intentionalDisconnect = false;
   private _targetInstanceId: string | null = null;
   private sessionKey: Buffer | null = null;
@@ -638,6 +647,7 @@ export class PeerClient {
 
         this._state = 'connected';
         this.reconnectAttempts = 0;
+        this.noAuthWarned = false;
 
         // Persist credential if issued (first join). The coordinator owns the
         // shared file; if this client is the joiner it writes via complete().
@@ -857,7 +867,17 @@ export class PeerClient {
         ),
       );
     } else {
-      logger.error('No auth method available: no credential file and no join token');
+      const meta = {
+        instanceId: this.instanceId,
+        targetUrl: this.url,
+        remedy: NO_AUTH_METHOD_REMEDY,
+      };
+      if (this.noAuthWarned) {
+        logger.debug(NO_AUTH_METHOD_MESSAGE, meta);
+      } else {
+        this.noAuthWarned = true;
+        logger.warn(NO_AUTH_METHOD_MESSAGE, meta);
+      }
       if (this.ws.readyState === WebSocket.OPEN) {
         this.ws.close(1000, 'No auth method');
       }

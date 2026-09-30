@@ -1201,6 +1201,12 @@ export interface SimulatedEvent {
   isForkPR?: boolean;
   /** Base branch ref for PR events (the branch being merged into). */
   baseBranch?: string;
+  /**
+   * The repository's default branch, when the delivery names it. A new-branch
+   * push diffs against it (`resolveDiffRange`); absent, the range falls back to
+   * `payload.repository.default_branch`.
+   */
+  defaultBranch?: string;
   /** Sender username from the webhook payload (e.g. GitHub login). */
   senderUsername?: string;
   /**

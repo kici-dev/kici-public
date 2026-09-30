@@ -52,6 +52,8 @@ A host's status is **computed at read time** from the shared `last_seen` + conne
 
 A single leader instance runs a periodic reaper that **deletes `ephemeral` rows past their TTL** (scaled-down autoscale agents — silent GC, no alarm). `static` rows are never deleted; an absent static host stays in the roster and reads `unreachable`.
 
+The same tick clears every host-reboot hold whose deadline has passed. When a workflow restarts a host, the orchestrator holds the post-restart job until that host reboots and reconnects. If the host does not return by the deadline, the reaper clears the hold, and the held job fails at its dispatch-queue timeout. See [Host restart](../../user/patterns/host-restart.md).
+
 ## Unreachable-host alarm
 
 A declared (`static`) host that goes dark is exactly what the roster exists to surface — a racked box can fail silently, and "absence is an alarm" is the whole reason durable hosts persist in the inventory. The leader instance publishes the count of currently-unreachable declared hosts on each reaper tick as the `kici_orch_declared_hosts_unreachable` metric (a plain count — no per-host labels, so it never grows with fleet size). A monitoring alert, `DeclaredHostUnreachable`, fires when that count is `> 0` for longer than the roster grace window plus a margin (7 minutes against the 5-minute default), routing to the operator's pager.

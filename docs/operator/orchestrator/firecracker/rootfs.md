@@ -18,7 +18,7 @@ Because the rootfs image is large (~500MB+), it is **not distributed as a pre-bu
 | **mkfs.ext4**          | Part of `e2fsprogs` (usually pre-installed)                                          |
 | **util-linux**         | `flock`, `losetup` and `findmnt` (usually pre-installed)                             |
 | **Git**                | To clone the source repository                                                       |
-| **Node.js 24**         | Builds the workspace and bundles the agent. The rootfs gets the same Node.js version |
+| **Node.js 24.5.0+**    | Builds the workspace and bundles the agent. The rootfs gets the same Node.js version |
 | **pnpm 11**            | Installs and builds the workspace                                                    |
 | **Firecracker binary** | For running the microVM (not needed for building the rootfs)                         |
 | **Kernel image**       | Linux kernel 5.10+ for Firecracker (not needed for building the rootfs)              |

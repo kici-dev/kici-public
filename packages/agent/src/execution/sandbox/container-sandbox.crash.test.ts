@@ -18,7 +18,19 @@ vi.mock('@kici-dev/shared/container-runtime', () => ({
   RuntimeSubtree: { enum: { all: 'all', node: 'node' } },
 }));
 
+// The real dep-restore relay, writing to a spy instead of the agent log.
+const depReportSink = vi.hoisted(() => vi.fn());
+vi.mock('../dep-restore-report.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../dep-restore-report.js')>();
+  return {
+    ...real,
+    createDepRestoreReportRelay: (jobId: string) =>
+      real.createDepRestoreReportRelay(jobId, depReportSink),
+  };
+});
+
 import { ContainerSandbox } from './container-sandbox.js';
+import { DepRestoreOutcome, type DepRestoreReport } from '../dep-restore-report.js';
 import {
   DEFAULT_MEMORY_BYTES,
   DEFAULT_NANO_CPUS,
@@ -279,5 +291,56 @@ describe('ContainerSandbox runner that reports a failure on job.complete', () =>
     expect(res.status).toBe(ExecutionJobStatus.enum.failed);
     expect(res.error).toBeUndefined();
     expect(res.droppedJobs).toBeUndefined();
+  });
+});
+
+describe('ContainerSandbox dep-restore report relay', () => {
+  const REPORT: DepRestoreReport = {
+    outcome: DepRestoreOutcome.enum.restored,
+    source: 'https://bucket/deps/x.tar.gz',
+    verified: true,
+    attempts: [],
+  };
+  const line = (msg: unknown) => stdoutFrame(JSON.stringify(msg) + '\n');
+
+  beforeEach(() => vi.clearAllMocks());
+
+  /** Run one job whose runner writes `messages`, then job.complete. */
+  async function runWith(messages: unknown[]): Promise<void> {
+    const stream = hijackedStream();
+    const { docker } = mockDocker(stream, 0);
+    const sandbox = await sandboxFor(docker);
+    const result = sandbox.executeJob({
+      signal: new AbortController().signal,
+      dispatch: {},
+      onStepStatus: vi.fn(),
+      onLogLine: vi.fn(),
+    } as never);
+    await new Promise((r) => setTimeout(r, 0));
+    for (const msg of messages) stream.push(line(msg));
+    stream.push(
+      line({ type: 'job.complete', status: ExecutionJobStatus.enum.success, stepResults: [] }),
+    );
+    stream.push(null);
+    await result;
+  }
+
+  it("logs the runner's setup report once, tagged with the job", async () => {
+    // fails-when: dispatchRunnerMessage has no dep-restore.report case
+    await runWith([
+      { type: 'dep-restore.report', report: REPORT },
+      { type: 'dep-restore.report', report: REPORT },
+    ]);
+    expect(depReportSink.mock.calls).toEqual([[REPORT, { jobId: 'job-crash', via: 'runner' }]]);
+  });
+
+  it('ignores a report sent after the first step started', async () => {
+    // fails-when: step.start does not close the relay
+    // breaks-if-wrong: the setup report above is still logged
+    await runWith([
+      { type: 'step.start', stepIndex: 0, stepName: 'build' },
+      { type: 'dep-restore.report', report: REPORT },
+    ]);
+    expect(depReportSink).not.toHaveBeenCalled();
   });
 });

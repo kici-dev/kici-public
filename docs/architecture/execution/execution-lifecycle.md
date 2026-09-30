@@ -12,9 +12,9 @@ This document describes the runtime lifecycle of a KiCI workflow execution, focu
 The `cancelling` state is a transient state between `running` and `cancelled`. It represents the grace period during which the agent terminates the active step and runs lifecycle hooks.
 
 ```
-pending -> queued -> running -> cancelling -> cancelled
-                         \                       ^
-                          \-> cancelled ----------|  (direct, force cancel)
+pending -> running -> cancelling -> cancelled
+               \                       ^
+                \-> cancelled ----------|  (direct, force cancel)
 ```
 
 ### Transitions involving cancelling

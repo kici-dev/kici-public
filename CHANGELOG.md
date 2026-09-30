@@ -2,6 +2,41 @@
 
 Release notes for the public KiCI packages.
 
+## v0.13.0 — 2026-09-30
+
+### Features
+
+- kici-admin source trigger-local accepts --before (default: the parent of --sha), install-hook forwards the pushed ref's old commit, and kici run sends the parent of its snapshot, so path filters and changedFiles rules see a real diff
+- kici-admin peer list --json prints the active peer credentials as JSON, including whether a coordinator issued the credential to itself and which coordinator last validated it
+
+### Fixes
+
+- Path filters decide from the agent's clone when the orchestrator cannot fetch the changed files, instead of running every path-filtered workflow
+- A GitHub new-branch push runs the path-filtered workflows whose paths the branch touches, and a diff GitHub or a forge truncated no longer silently skips a path-filtered workflow
+- Path-filtered workflows on local sources, and organization-wide workflows on a repository with no lock file or whose own lock file declares no paths filters, now evaluate their paths filters instead of never matching
+- A failed changed-files lookup no longer fails the whole webhook delivery; the agent decides the affected path filters from its clone
+- A generic webhook routed to a repository applies that repository's push and pull-request paths filters instead of firing nothing
+- A universal-git source's own workflows run even when another source's registrations also match the event or repository
+- On a new-branch push, rules and filters see the files the branch adds instead of every tracked file; on a push with no before commit, ctx.changedFiles throws ChangedFilesUnavailableError as documented
+- A pull request's changedFiles no longer comes back empty when the agent had to re-fetch the head commit, and the files a new branch adds are computed on the agent's shallow clone
+- A cache hit that raced a dependency rebuild no longer puts the old dependency pointer back, so the rebuilt dependency tarball stays reachable from the cache
+- A graceful orchestrator stop no longer spends its whole shutdown window waiting for a slow container runtime to stop agents, and the orphaned agent containers a start cleans up are stopped in parallel
+- Jobs that run after a build job restore the dependencies it just cached, instead of installing them again; kici-admin org-settings cache-upload-settle bounds the wait
+- A cluster coordinator now reroutes jobs and forwards cancels to a sibling it reaches only through the sibling's own connection
+- A run cancel now stops a job whose agent reconnected to a different coordinator, and a forwarded force cancel stays forced, including when the leader sends it again after the first forward failed
+- An agent error for a failed source tarball or overlay download no longer includes the presigned URL's signature.
+- A dependency cache restore no longer fails when the storage server closes the connection early. The agent now downloads and verifies the tarball before it extracts it, and it continues a cut download. Init and evaluation jobs install their dependencies inline when the restore fails, as execution jobs do. User cache restores (`ctx.cache.restore()`) and artifact downloads (`ctx.artifacts.download()`) also download and verify the tarball before they extract it.
+- An autoscaled agent that the orchestrator drops after a missed heartbeat or an unacknowledged dispatch is now destroyed, and the scaler gets its capacity back. Before, each such agent kept a scaler slot, and a scaler at its agent limit stopped starting new agents.
+- When the orchestrator disconnects an agent because its token was revoked or expired, or because the agent did not acknowledge a dispatch, the agent's running jobs now get the same handling as when an agent loses its connection. Before, those jobs stayed assigned to the gone agent until the stale-run detector failed them. A build, init job, evaluation or global evaluation round that waits on a job of an agent dropped for missed heartbeats now ends when that job fails, instead of at its timeout.
+- An agent can no longer register under the id of a live agent with a different agent token. The orchestrator refuses the registration while the live agent stays connected.
+- A cluster coordinator without a join token issues its own peer credential on its first outbound peer connection, so the connection authenticates instead of closing with "No auth method"; it retires the credential its previous run issued, and never re-issues a credential an operator revoked
+- Join-token errors name the real command to create a new token, kici-admin peer create-token
+- kici-admin peer revoke says that the peer's next connection attempt is refused and its open connections stay up, instead of claiming the peer is disconnected on its next heartbeat
+
+### Other
+
+- The published packages now require Node.js 24.5.0 or later. The agent downloads dependency caches through the Node.js HTTP client, which honors `NODE_USE_ENV_PROXY` from Node.js 24.5.0 on. Upgrade Node.js to 24.5.0 or later on every host that runs the orchestrator, the agent or the CLIs.
+
 ## v0.12.0 — 2026-09-28
 
 ### Features

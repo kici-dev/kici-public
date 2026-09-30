@@ -156,7 +156,7 @@ An approve posts the terminal provider status before it resumes the run, so the 
 
 ### Approval expiry
 
-A security hold expires on a deadline set when it is created. A `fork_pr` hold covers a whole pull request and is not attached to any context, so it uses the organization's approval expiry (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour). An expired hold is marked `expired`, its run fails with an expiry reason, and its checks are completed with a timeout explanation.
+A security hold expires on a deadline set when it is created. A `fork_pr` hold covers a whole pull request and is not attached to any context, so it uses the approval expiry stored on the organization's trust policy (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour). An expired hold is marked `expired`, its run fails with an expiry reason, and its checks are completed with a timeout explanation.
 
 ## Check runs
 
@@ -226,7 +226,7 @@ execution_runs
 
 held_runs
   + id                   UUID PRIMARY KEY
-  + org_id               VARCHAR(12) NOT NULL
+  + org_id               VARCHAR(16) NOT NULL
   + run_id               UUID NOT NULL
   + job_id               TEXT NOT NULL   -- expanded job name, or a run-wide sentinel
   + context_id           UUID (FK to contexts.id; null for context-free holds)

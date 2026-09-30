@@ -127,7 +127,10 @@ import { expandInitDirectives } from '../env-init/presets/expand.js';
 import { armJobDeadline } from './job-deadline.js';
 import { executeHook, buildOutcomeMetadata } from '../hook-executor.js';
 import { cloneJobRepos, type CloneJobReposRequest } from '../../checkout/clone-job-repos.js';
-import { restoreDeps, excludeScratchFromGit } from '../dep-restore.js';
+import { excludeScratchFromGit } from '../dep-restore.js';
+import { tryRestoreDeps } from '../dep-restore-fallback.js';
+import { redactUrl } from '../resumable-download.js';
+import { runSetupThenSendDepRestoreReport, type DepRestoreReport } from '../dep-restore-report.js';
 import { installDeps } from '../dep-installer.js';
 import {
   loadWorkflowSource,
@@ -1921,59 +1924,55 @@ async function makeOverlayGitUsable(
 }
 
 /**
- * Phase 2 — Restore deps from cache (with hash-mismatch hard-fail) OR fall
- * back to inline install. Skipped when `.kici/package.json` doesn't exist.
+ * Phase 2 — Restore deps from cache (a hash mismatch fails the job; any other
+ * restore failure falls back to an inline install) OR install inline. Skipped
+ * when `.kici/package.json` doesn't exist.
  * For global workflows deps come from the workflow repo (where `.kici/` lives).
  */
 async function installDependenciesIfNeeded(
   workflowDir: string,
   request: JobExecutionRequest,
+  send: (msg: RunnerToAgentMessage) => void,
+  onReport: (report: DepRestoreReport) => void,
 ): Promise<void> {
   const kiciDir = join(workflowDir, '.kici');
   const hasPackageJson = fileExists(join(kiciDir, 'package.json'));
   trace(
-    `deps: kiciDir=${kiciDir}, hasPackageJson=${hasPackageJson}, depsUrl=${request.depsUrl ?? 'none'}`,
+    `deps: kiciDir=${kiciDir}, hasPackageJson=${hasPackageJson}, depsUrl=${request.depsUrl ? redactUrl(request.depsUrl) : 'none'}`,
   );
   if (!hasPackageJson) return;
 
   if (request.depsUrl) {
     trace('restoring deps from cache');
-    sendMessage({
-      type: 'log.line',
-      stepIndex: -1,
-      line: `[workflow-runner] Restoring deps from ${request.depsUrl}`,
+    const setupLog = (line: string): void =>
+      send({ type: 'log.line', stepIndex: -1, line: `[workflow-runner] ${line}` });
+    setupLog(`Restoring deps from ${redactUrl(request.depsUrl)}`);
+    // A hash mismatch rejects and fails the job; any other failure falls back.
+    const restored = await tryRestoreDeps({
+      workDir: workflowDir,
+      depsUrl: request.depsUrl,
+      depsHash: request.depsHash,
+      log: setupLog,
+      onReport,
     });
-    try {
-      await restoreDeps(workflowDir, request.depsUrl, request.depsHash);
-      sendMessage({
-        type: 'log.line',
-        stepIndex: -1,
-        line: '[workflow-runner] Deps restored from cache',
-      });
+    if (restored) {
       trace('deps restored from cache');
-    } catch (err) {
-      // Hash mismatch is not recoverable per user decision
-      if (err instanceof Error && err.message.includes('hash mismatch')) throw err;
-      trace(`cache restore failed: ${toErrorMessage(err)}, falling back`);
-      sendMessage({
-        type: 'log.line',
-        stepIndex: -1,
-        line: `[workflow-runner] Cache restore failed (${toErrorMessage(err)}), falling back to inline install`,
-      });
-      await installDeps(kiciDir, {
-        npmRegistries: request.npmRegistries,
-        installEnvSecrets: request.installEnvSecrets,
-        jobIdShort: request.jobIdShort,
-        ...(request.allowInstallScripts ? { allowInstallScripts: true } : {}),
-      });
-      trace('fallback install complete');
+      return;
     }
+    trace('cache restore failed, falling back to inline install');
+    await installDeps(kiciDir, {
+      npmRegistries: request.npmRegistries,
+      installEnvSecrets: request.installEnvSecrets,
+      jobIdShort: request.jobIdShort,
+      ...(request.allowInstallScripts ? { allowInstallScripts: true } : {}),
+    });
+    trace('fallback install complete');
     return;
   }
 
   if (fileExists(join(kiciDir, 'node_modules'))) {
     trace('node_modules already exists, skipping install');
-    sendMessage({
+    send({
       type: 'log.line',
       stepIndex: -1,
       line: '[workflow-runner] Deps already present (node_modules exists), skipping install',
@@ -1982,7 +1981,7 @@ async function installDependenciesIfNeeded(
   }
 
   trace('installing deps inline (no cache)');
-  sendMessage({
+  send({
     type: 'log.line',
     stepIndex: -1,
     line: '[workflow-runner] Installing deps inline (no cache)',
@@ -2002,7 +2001,7 @@ async function installDependenciesIfNeeded(
     if (depStack) trace(`installDeps stack: ${depStack}`);
     throw depErr;
   }
-  sendMessage({ type: 'log.line', stepIndex: -1, line: '[workflow-runner] Deps installed' });
+  send({ type: 'log.line', stepIndex: -1, line: '[workflow-runner] Deps installed' });
   trace('deps installed IPC sent');
 }
 
@@ -2016,7 +2015,7 @@ async function restoreSourceTarballIfRequested(
   request: JobExecutionRequest,
 ): Promise<void> {
   if (!request.sourceTarUrl) return;
-  trace(`restoring .kici/ source from tarball url=${request.sourceTarUrl}`);
+  trace(`restoring .kici/ source from tarball url=${redactUrl(request.sourceTarUrl)}`);
   sendMessage({
     type: 'log.line',
     stepIndex: -1,
@@ -3051,20 +3050,26 @@ async function main(): Promise<void> {
   // A between-jobs out-of-band cleanup re-run reuses the preserved workdir: the
   // clone, dependency install, and source tarball are already in place, so
   // phases 1–2b are skipped and only the declared cleanup hooks run below.
-  if (!request.cleanupOnly) {
-    // Phase 1: clone (if checkout enabled) + overlay tarball
-    await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
-    await applyOverlayIfRequested(request, workflowDir);
-    await makeOverlayGitUsable(request, workflowDir);
-    if (aborted) abortAndExit('aborted after clone');
+  // Setup ends with the one `dep-restore.report` message, before any workflow
+  // code loads: it closes the agent's relay.
+  await runSetupThenSendDepRestoreReport(
+    async (onReport) => {
+      if (request.cleanupOnly) return;
+      // Phase 1: clone (if checkout enabled) + overlay tarball
+      await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
+      await applyOverlayIfRequested(request, workflowDir);
+      await makeOverlayGitUsable(request, workflowDir);
+      if (aborted) abortAndExit('aborted after clone');
 
-    // Phase 2: deps (cache restore or inline install)
-    await installDependenciesIfNeeded(workflowDir, request);
-    if (aborted) abortAndExit('aborted after deps');
+      // Phase 2: deps (cache restore or inline install)
+      await installDependenciesIfNeeded(workflowDir, request, maskedSend, onReport);
+      if (aborted) abortAndExit('aborted after deps');
 
-    // Phase 2b: restore cached source tarball over .kici/ if present
-    await restoreSourceTarballIfRequested(workflowDir, request);
-  }
+      // Phase 2b: restore cached source tarball over .kici/ if present
+      await restoreSourceTarballIfRequested(workflowDir, request);
+    },
+    (report) => maskedSend({ type: 'dep-restore.report', ...(report && { report }) }),
+  );
 
   // Phase 3: load workflow module + install output capture
   const loaded = await loadWorkflowModuleWithCapture(workflowDir, request, isGlobal, maskedSend);

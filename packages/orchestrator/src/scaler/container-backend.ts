@@ -15,6 +15,7 @@ import { createLogger, toErrorMessage, type ToolRequirement } from '@kici-dev/sh
 import { KICI_AGENT_ENV_PREFIX, scalerAgentLabels, ScalerBackendType } from '@kici-dev/engine';
 import { normalizeLabelSet } from './label-matcher.js';
 import { buildAgentContainerHostConfig } from './container-hostconfig.js';
+import { containerRuntimeForSocketPath } from './container-runtime.js';
 import {
   validateNftablesAvailability,
   ensureKiciTable,
@@ -407,7 +408,7 @@ export class ContainerScalerBackend implements ScalerBackend {
       backend = new ContainerScalerBackend(options, '', runtime);
     } else if (options.socketPath) {
       // Explicit socket path -- detect runtime type from path
-      const runtime = options.socketPath.includes('podman') ? 'podman' : 'docker';
+      const runtime = containerRuntimeForSocketPath(options.socketPath);
       logger.info(`Using configured socket at ${options.socketPath}`, { runtime });
       backend = new ContainerScalerBackend(options, options.socketPath, runtime);
     } else {
@@ -965,30 +966,38 @@ export class ContainerScalerBackend implements ScalerBackend {
       },
     });
 
-    let cleaned = 0;
     const liveIps = new Set(this.containerIps.values());
-    for (const info of containers) {
+    const orphans = containers.filter((info) => {
       const agentId = info.Labels?.['kici-agent-id'];
-      if (agentId && this.agents.has(agentId)) continue;
+      if (agentId && this.agents.has(agentId)) return false;
       const running = info.State === 'running';
-      if (running && (!agentId || this.isRegistered(agentId))) continue;
-
-      const container = this.docker.getContainer(info.Id);
-      try {
-        await container.stop({ t: 5 });
-      } catch {
-        // May already be stopped
-      }
-      try {
-        await container.remove({ force: true });
-        cleaned++;
-      } catch {
-        // Best effort
-      }
-    }
+      return !(running && (!agentId || this.isRegistered(agentId)));
+    });
+    // In parallel: each stop can take its full stop timeout, and longer when
+    // the runtime misses the container's exit, so one after another turned a
+    // handful of leftover agents into a minute-long start.
+    const removed = await Promise.all(orphans.map((info) => this.removeOrphan(info.Id)));
+    let cleaned = removed.filter(Boolean).length;
 
     cleaned += await this.reapUnownedIsolationRules(liveIps);
     return cleaned;
+  }
+
+  /** Stop and remove one orphaned agent container; true when it was removed. */
+  private async removeOrphan(containerId: string): Promise<boolean> {
+    const container = this.docker.getContainer(containerId);
+    try {
+      await container.stop({ t: 5 });
+    } catch {
+      // May already be stopped
+    }
+    try {
+      await container.remove({ force: true });
+      return true;
+    } catch {
+      // Best effort
+      return false;
+    }
   }
 
   /**

@@ -120,11 +120,14 @@ the local filesystem path does not exist.
   `providerContext`, carrying `installationId` etc.)
 - `effectiveRoutingKey` → `fallbackRoutingKey`
 - `effectiveProvider` → `fallbackBundle.normalizer.provider`
+- `changedFilesFetcher` → `fallbackBundle.changedFilesFetcher`, called
+  with the fallback credentials: the provider that serves the lock file is
+  the one whose API can list the push's changed files. A fallback bundle
+  with no fetcher yields `unavailable`, and a path decision with a git
+  range moves to the agent.
 
 **What is NOT swapped:**
 
-- `changedFilesFetcher` — inbound concern (changed files detection is
-  normalized from the inbound payload, not the fallback provider)
 - `checkStatusPoster` — inbound context (check runs belong to the provider
   that received the original webhook)
 - Registration extraction (`replaceAll`) — event-driven, uses inbound
@@ -133,6 +136,10 @@ the local filesystem path does not exist.
 This mirrors the bundle-swap pattern used by cross-source dispatch in
 `process-webhook.ts`, applied to the fallback resolution path. The principle:
 "the bundle that knows about the repo provides the clone credentials."
+
+The fallback is off when the delivery is a generic one whose cross-source
+repo mode already evaluated the other sources' registrations for the same
+repository: the fallback would re-read exactly those registrations.
 
 **Return type extension:** `resolveLockFileWithFallback` now returns
 `fallbackBundle` (the winning `ProviderBundle`) and `fallbackCredentials`

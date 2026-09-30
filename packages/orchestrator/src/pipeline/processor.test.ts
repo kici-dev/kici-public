@@ -1198,6 +1198,130 @@ describe('processWebhook', () => {
     );
   });
 
+  describe('changed files resolution', () => {
+    function pushPathsLockFile() {
+      return {
+        schemaVersion: 1,
+        source: { file: '.kici/workflows/ci.ts', export: '#default' },
+        contentHash: 'test-hash',
+        workflows: [
+          {
+            name: 'Paths',
+            triggers: [{ _type: 'push', branches: [], paths: ['src/**'] }],
+            jobs: [
+              {
+                _type: 'static',
+                name: 'build',
+                runsOn: [{ kind: 'exact', value: 'linux' }],
+                needs: [],
+                steps: [{ name: 'Build', hasOutputs: false }],
+              },
+            ],
+          },
+        ],
+      };
+    }
+
+    /** The `paths` check value the forwarded decision trace carries. */
+    function forwardedPathsValue(deps: ProcessingDeps): unknown {
+      const calls = (deps.platformClient!.send as ReturnType<typeof vi.fn>).mock.calls;
+      for (const [msg] of calls) {
+        const decisions = (msg as { data?: { decisions?: unknown } }).data?.decisions;
+        if (!Array.isArray(decisions)) continue;
+        for (const d of decisions as Array<{ checks?: Array<{ check: string; value: string }> }>) {
+          const check = d.checks?.find((c) => c.check === 'paths');
+          if (check) return check.value;
+        }
+      }
+      return undefined;
+    }
+
+    // fails-when: a fetch failure propagates and fails the whole delivery
+    it('a throwing changed-files fetcher degrades to unavailable instead of failing the delivery', async () => {
+      const bundle = createMockProviderBundle();
+      (bundle.changedFilesFetcher!.getChangedFiles as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error('changed-files fetch failed — trigger evaluation degraded: 502'),
+      );
+      const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
+      const deps = createDeps({
+        providerRegistry: createMockProviderRegistry(bundle),
+        lockFileCache: createMockLockFileCache(pushPathsLockFile()) as any,
+        eventLog: mockEventLog as any,
+      });
+
+      const outcome = await processWebhook(basePushInfo(), deps);
+
+      expect(outcome).toBe('processed');
+      expect(deps.dispatcher.dispatch).toHaveBeenCalled();
+      expect(mockEventLog.record).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({
+          status: EventLogStatus.enum.processed,
+          errorMessage: expect.stringContaining('changed files unavailable'),
+        }),
+      );
+    });
+
+    it('a throwing fetcher on a push with a range dispatches a deferred __init__ carrying the paths', async () => {
+      const bundle = createMockProviderBundle();
+      (bundle.changedFilesFetcher!.getChangedFiles as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error('changed-files fetch failed — trigger evaluation degraded: 502'),
+      );
+      const pendingInits = {
+        ...createMockPendingInits(),
+        track: vi.fn().mockReturnValue(new Promise(() => {})),
+      };
+      const deps = createDeps({
+        providerRegistry: createMockProviderRegistry(bundle),
+        lockFileCache: createMockLockFileCache(pushPathsLockFile()) as any,
+        pendingInits: pendingInits as any,
+      });
+
+      await processWebhook(basePushInfo(), deps);
+      for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+      const jobs = (deps.dispatcher.dispatch as ReturnType<typeof vi.fn>).mock.calls.map(
+        (c: unknown[]) => c[0] as { jobName: string; jobConfig: Record<string, unknown> },
+      );
+      expect(jobs.map((j) => j.jobName)).toEqual(['__init__Paths__build']);
+      expect(jobs[0].jobConfig.deferredPaths).toEqual([['src/**']]);
+    });
+
+    // fails-when: a bundle with no fetcher reports `skipped`, under which a path never matches
+    it('a bundle with no fetcher decides paths on the agent when the push has a range', async () => {
+      const bundle = createMockProviderBundle();
+      delete (bundle as { changedFilesFetcher?: unknown }).changedFilesFetcher;
+      const deps = createDeps({
+        providerRegistry: createMockProviderRegistry(bundle),
+        lockFileCache: createMockLockFileCache(pushPathsLockFile()) as any,
+      });
+
+      await processWebhook(basePushInfo(), deps);
+
+      expect(forwardedPathsValue(deps)).toBe('[unavailable — decided on agent]');
+      expect(deps.dispatcher.dispatch).toHaveBeenCalled();
+    });
+
+    it('a bundle with no fetcher matches conservatively when the push has no range', async () => {
+      const bundle = createMockProviderBundle();
+      delete (bundle as { changedFilesFetcher?: unknown }).changedFilesFetcher;
+      const deps = createDeps({
+        providerRegistry: createMockProviderRegistry(bundle),
+        lockFileCache: createMockLockFileCache(pushPathsLockFile()) as any,
+      });
+      const info = basePushInfo();
+      const payload = { ...(info.payload as Record<string, unknown>) };
+      delete payload.before;
+      delete payload.after;
+
+      await processWebhook({ ...info, payload }, deps);
+
+      expect(forwardedPathsValue(deps)).toBe('[unavailable — matched conservatively]');
+      expect(deps.dispatcher.dispatch).toHaveBeenCalled();
+    });
+  });
+
   it('uses repoUrlBuilder from provider bundle for clone URL', async () => {
     const bundle = createMockProviderBundle();
     const registry = createMockProviderRegistry(bundle);
@@ -3873,6 +3997,417 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       job: { id: 'job-1', ...call },
     });
     expect(cloneAuth).toMatchObject({ auth: { token: 'TOKEN-FROM-REG-BUNDLE' } });
+  });
+
+  // ── Cross-source repo mode: path filters and disjoint routing ──
+
+  const SHA_BEFORE = 'a'.repeat(40);
+  const SHA_AFTER = 'b'.repeat(40);
+
+  /** A repo-mode registration: a push trigger scoped to `paths`. */
+  function makeRepoRegistration(opts: {
+    id: string;
+    workflowName: string;
+    repoIdentifier?: string;
+    routingKey?: string;
+    paths?: string[];
+  }): ReturnType<typeof makeWebhookRegistration> {
+    const reg = makeWebhookRegistration({
+      id: opts.id,
+      customerId: '__default__',
+      routingKey: opts.routingKey ?? 'github:42',
+      repoIdentifier: opts.repoIdentifier ?? 'orgA/repo1',
+      workflowName: opts.workflowName,
+      events: [],
+    });
+    return {
+      ...reg,
+      lockEntry: {
+        ...reg.lockEntry,
+        triggers: [{ _type: 'push', branches: [], paths: opts.paths ?? ['src/**'] }],
+      },
+      triggerTypes: ['push'],
+    } as unknown as ReturnType<typeof makeWebhookRegistration>;
+  }
+
+  /** A registered GitHub-shaped bundle that normalizes a push and fetches its diff. */
+  function createRepoBundle(changed: { files: string[]; status: string }): ProviderBundle {
+    const bundle = createRegisteredBundle();
+    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
+      (_event: string, _action: string | null, payload: Record<string, unknown>) => ({
+        type: 'push',
+        targetBranch: 'main',
+        payload,
+        provider: 'github',
+      }),
+    );
+    return {
+      ...bundle,
+      changedFilesFetcher: {
+        provider: 'github' as const,
+        getChangedFiles: vi.fn().mockResolvedValue(changed),
+      },
+    };
+  }
+
+  function pushGenericInfo(payloadOverrides: Record<string, unknown> = {}): WebhookInfo {
+    return baseGenericInfo({
+      event: 'push',
+      payload: {
+        ref: 'refs/heads/main',
+        before: SHA_BEFORE,
+        after: SHA_AFTER,
+        repository: { full_name: 'orgA/repo1' },
+        ...payloadOverrides,
+      },
+    });
+  }
+
+  function withRepoLookup(
+    deps: ProcessingDeps,
+    registrations: ReturnType<typeof makeWebhookRegistration>[],
+  ): ProcessingDeps {
+    (deps.registrationIndex as unknown as Record<string, unknown>).getByOrgAndRepo = vi
+      .fn()
+      .mockImplementation((org: string, repo: string) =>
+        registrations.filter((r) => r.customerId === org && r.repoIdentifier === repo),
+      );
+    return deps;
+  }
+
+  function dispatchedJobs(deps: ProcessingDeps): Array<Record<string, any>> {
+    return (deps.dispatcher.dispatch as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: unknown[]) => c[0] as Record<string, any>,
+    );
+  }
+
+  // fails-when: cross-source repo mode matches path filters against an event with no changed files
+  it('CS-paths-1: a repo-mode registration applies its paths through the registration bundle', async () => {
+    const reg = makeRepoRegistration({ id: 'reg-p1', workflowName: 'src-build' });
+    const hit = createRepoBundle({ files: ['src/a.ts'], status: 'fetched' });
+    const hitDeps = withRepoLookup(
+      makeCrossSourceDeps({ registrations: [reg], registeredBundle: hit }),
+      [reg],
+    );
+    await processWebhook(pushGenericInfo(), hitDeps);
+
+    expect(dispatchedJobs(hitDeps)).toHaveLength(1);
+    expect(dispatchedJobs(hitDeps)[0].workflowName).toBe('src-build');
+    // fails-when: the inbound generic bundle or its credentials are used
+    expect(hit.changedFilesFetcher!.getChangedFiles).toHaveBeenCalledWith(
+      'orgA/repo1',
+      'push',
+      expect.objectContaining({ before: SHA_BEFORE, after: SHA_AFTER }),
+      { installationId: 7 },
+    );
+
+    // breaks-if-wrong: a diff that misses the paths must not dispatch
+    const miss = createRepoBundle({ files: ['docs/a.md'], status: 'fetched' });
+    const missDeps = withRepoLookup(
+      makeCrossSourceDeps({ registrations: [reg], registeredBundle: miss }),
+      [reg],
+    );
+    await processWebhook(pushGenericInfo(), missDeps);
+    expect(missDeps.dispatcher.dispatch).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: a range-less payload must stay conservative with no extra init agent
+  it('CS-paths-2: a range-less payload matches conservatively with no __init__', async () => {
+    const reg = makeRepoRegistration({ id: 'reg-p2', workflowName: 'src-build' });
+    const bundle = createRepoBundle({ files: [], status: 'unavailable' });
+    const deps = withRepoLookup(
+      makeCrossSourceDeps({
+        registrations: [reg],
+        registeredBundle: bundle,
+        pendingInits: createMockPendingInits(),
+      }),
+      [reg],
+    );
+    await processWebhook(pushGenericInfo({ before: undefined, after: undefined }), deps);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const jobs = dispatchedJobs(deps);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].jobName).toBe('do-thing');
+  });
+
+  // fails-when: an unavailable diff with a range dispatches the workflow job without asking the agent
+  it('CS-paths-3: an unavailable diff with a range dispatches a deferred __init__', async () => {
+    const reg = makeRepoRegistration({ id: 'reg-p3', workflowName: 'src-build' });
+    const bundle = createRepoBundle({ files: [], status: 'unavailable' });
+    const pendingInits = {
+      ...createMockPendingInits(),
+      track: vi.fn().mockReturnValue(new Promise(() => {})),
+    };
+    const deps = withRepoLookup(
+      makeCrossSourceDeps({ registrations: [reg], registeredBundle: bundle, pendingInits }),
+      [reg],
+    );
+    await processWebhook(pushGenericInfo(), deps);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const jobs = dispatchedJobs(deps);
+    expect(jobs.map((j) => j.jobName)).toEqual(['__init__src-build__do-thing']);
+    expect(jobs[0].jobConfig.deferredPaths).toEqual([['src/**']]);
+    expect(jobs[0].jobConfig.initOnly).toBe(true);
+  });
+
+  // fails-when: a cross-source PR defers and the agent diffs the registration commit instead of the PR
+  it('CS-paths-pr: an undecidable cross-source pull request runs conservatively, with no __init__', async () => {
+    const base = makeRepoRegistration({ id: 'reg-pr', workflowName: 'src-build' });
+    const reg = {
+      ...base,
+      lockEntry: {
+        ...base.lockEntry,
+        triggers: [
+          { _type: 'pr', events: [], targetBranches: [], sourceBranches: [], paths: ['src/**'] },
+        ],
+      },
+      triggerTypes: ['pr'],
+    } as unknown as typeof base;
+    const bundle = createRepoBundle({ files: [], status: 'unavailable' });
+    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
+      (_event: string, _action: string | null, payload: Record<string, unknown>) => ({
+        type: 'pull_request',
+        action: 'opened',
+        targetBranch: 'main',
+        baseBranch: 'main',
+        payload,
+        provider: 'github',
+      }),
+    );
+    const pendingInits = {
+      ...createMockPendingInits(),
+      track: vi.fn().mockReturnValue(new Promise(() => {})),
+    };
+    const deps = withRepoLookup(
+      makeCrossSourceDeps({ registrations: [reg], registeredBundle: bundle, pendingInits }),
+      [reg],
+    );
+    await processWebhook(
+      baseGenericInfo({
+        event: 'pull_request',
+        payload: { repository: { full_name: 'orgA/repo1' } },
+      }),
+      deps,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    const jobs = dispatchedJobs(deps);
+    expect(jobs.map((j) => j.jobName)).toEqual(['do-thing']);
+    expect(jobs[0].jobConfig.deferredPaths).toBeUndefined();
+  });
+
+  it('CS-memo: two registrations on the same source and repo resolve the diff once', async () => {
+    const regs = [
+      makeRepoRegistration({ id: 'reg-m1', workflowName: 'wf-one' }),
+      makeRepoRegistration({ id: 'reg-m2', workflowName: 'wf-two' }),
+    ];
+    const bundle = createRepoBundle({ files: ['src/a.ts'], status: 'fetched' });
+    const deps = withRepoLookup(
+      makeCrossSourceDeps({ registrations: regs, registeredBundle: bundle }),
+      regs,
+    );
+    await processWebhook(pushGenericInfo(), deps);
+
+    expect(bundle.changedFilesFetcher!.getChangedFiles).toHaveBeenCalledTimes(1);
+    expect(
+      dispatchedJobs(deps)
+        .map((j) => j.workflowName)
+        .sort(),
+    ).toEqual(['wf-one', 'wf-two']);
+  });
+
+  // fails-when: the memo stores a sibling's `skipped` and a paths registration reads it as "no diff"
+  it('CS-memo-mixed: a registration without paths never hands its skipped answer to one with paths', async () => {
+    const regs = [
+      makeRepoRegistration({ id: 'reg-x1', workflowName: 'no-paths', paths: [] }),
+      makeRepoRegistration({ id: 'reg-x2', workflowName: 'src-only' }),
+    ];
+    const bundle = createRepoBundle({ files: ['src/a.ts'], status: 'fetched' });
+    const deps = withRepoLookup(
+      makeCrossSourceDeps({ registrations: regs, registeredBundle: bundle }),
+      regs,
+    );
+    await processWebhook(pushGenericInfo(), deps);
+
+    expect(bundle.changedFilesFetcher!.getChangedFiles).toHaveBeenCalledTimes(1);
+    expect(
+      dispatchedJobs(deps)
+        .map((j) => j.workflowName)
+        .sort(),
+    ).toEqual(['no-paths', 'src-only']);
+  });
+
+  /**
+   * An inbound universal-git-style source: provider `generic`, a normalizer that
+   * reads a repository, and a lock-file fetcher of its own.
+   */
+  function createRepoReadingGenericBundle(): ProviderBundle {
+    const bundle = createGenericProviderBundle();
+    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
+      (_event: string, _action: string | null, payload: Record<string, unknown>) => ({
+        type: 'push',
+        targetBranch: 'main',
+        payload,
+        provider: 'generic',
+      }),
+    );
+    (bundle.normalizer.extractRepoIdentifier as ReturnType<typeof vi.fn>).mockReturnValue(
+      'orgA/repo1',
+    );
+    return {
+      ...bundle,
+      lockFileFetcher: { provider: 'generic' as const, fetchLockFile: vi.fn() },
+      repoUrlBuilder: {
+        provider: 'generic' as const,
+        buildCloneUrl: vi.fn().mockImplementation((id: string) => `https://forge.test/${id}.git`),
+        buildRawFileUrl: vi.fn(),
+      },
+    };
+  }
+
+  function ownPushLockFile() {
+    return {
+      schemaVersion: 1,
+      source: { file: '.kici/workflows/own.ts', export: '#default' },
+      contentHash: 'own-hash',
+      workflows: [
+        {
+          name: 'own-push',
+          triggers: [{ _type: 'push', branches: [], paths: [] }],
+          jobs: [
+            {
+              _type: 'static',
+              name: 'own-build',
+              runsOn: [{ kind: 'exact', value: 'linux' }],
+              needs: [],
+              steps: [{ name: 'Build', hasOutputs: false }],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  function repoReadingDeps(opts: {
+    registrations: ReturnType<typeof makeWebhookRegistration>[];
+    lockFile: unknown;
+  }): { deps: ProcessingDeps; record: ReturnType<typeof vi.fn> } {
+    const deps = withRepoLookup(
+      makeCrossSourceDeps({
+        registrations: opts.registrations,
+        registeredBundle: createRepoBundle({ files: ['src/a.ts'], status: 'fetched' }),
+      }),
+      opts.registrations,
+    );
+    (deps.providerRegistry as ProviderRegistry).registerByRoutingKey(
+      'generic:acmeOrg00001:src-generic',
+      createRepoReadingGenericBundle(),
+    );
+    const record = vi.fn().mockResolvedValue(undefined);
+    return {
+      deps: {
+        ...deps,
+        lockFileCache: createMockLockFileCache(opts.lockFile) as any,
+        eventLog: { record } as any,
+      },
+      record,
+    };
+  }
+
+  // fails-when: a cross-source candidate short-circuits the inbound source's own workflows
+  it('CS-disjoint-1: a repo-reading source runs its own workflows beside a foreign event registration, in one event-log row', async () => {
+    const foreign = makeWebhookRegistration({
+      id: 'reg-foreign',
+      customerId: '__default__',
+      routingKey: 'github:42',
+      repoIdentifier: 'orgB/listener',
+      workflowName: 'push-listener',
+      events: ['push'],
+    });
+    const { deps, record } = repoReadingDeps({
+      registrations: [foreign],
+      lockFile: ownPushLockFile(),
+    });
+    const promMod = await import('../metrics/prometheus.js');
+    const processedSpy = vi.spyOn(promMod.webhooksProcessedTotal, 'add');
+
+    await processWebhook(pushGenericInfo(), deps);
+
+    const names = dispatchedJobs(deps)
+      .map((j) => j.workflowName)
+      .sort();
+    expect(names).toEqual(['own-push', 'push-listener']);
+    // One row for the delivery, counting both halves.
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record.mock.calls[0][2]).toMatchObject({
+      status: EventLogStatus.enum.processed,
+      matchedCount: 2,
+    });
+    expect(processedSpy).toHaveBeenCalledTimes(1);
+    processedSpy.mockRestore();
+  });
+
+  // fails-when: the registration fallback re-reads the registrations cross-source already evaluated
+  it('CS-disjoint-1b: after cross-source ran, the same-source path does not fall back to a registration', async () => {
+    const sameRepo = makeRepoRegistration({
+      id: 'reg-same-repo',
+      workflowName: 'other-source-wf',
+      paths: [],
+    });
+    const { deps } = repoReadingDeps({ registrations: [sameRepo], lockFile: null });
+    const fallbackBundle = (deps.providerRegistry as ProviderRegistry).getByRoutingKey(
+      'github:42',
+    )!;
+    (fallbackBundle as { lockFileFetcher?: unknown }).lockFileFetcher = {
+      provider: 'github',
+      fetchLockFile: vi.fn(),
+    };
+
+    await processWebhook(pushGenericInfo(), deps);
+
+    const cacheGets = (deps.lockFileCache.get as ReturnType<typeof vi.fn>).mock.calls;
+    expect(cacheGets.map((c: unknown[]) => c[0])).not.toContain(fallbackBundle.lockFileFetcher);
+    // The registration still ran — through cross-source repo mode, exactly once.
+    expect(dispatchedJobs(deps).map((j) => j.workflowName)).toEqual(['other-source-wf']);
+  });
+
+  it('CS-disjoint-2: a plain generic delivery with candidates writes one event-log row', async () => {
+    const reg = makeWebhookRegistration({
+      id: 'reg-plain',
+      customerId: '__default__',
+      routingKey: 'github:42',
+      repoIdentifier: 'orgA/repo1',
+      workflowName: 'react-to-foo',
+      events: ['foo'],
+    });
+    const record = vi.fn().mockResolvedValue(undefined);
+    const deps = { ...makeCrossSourceDeps({ registrations: [reg] }), eventLog: { record } as any };
+    const promMod = await import('../metrics/prometheus.js');
+    const processedSpy = vi.spyOn(promMod.webhooksProcessedTotal, 'add');
+
+    const outcome = await processWebhook(baseGenericInfo(), deps);
+
+    expect(outcome).toBe('processed');
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record.mock.calls[0][2]).toMatchObject({
+      status: EventLogStatus.enum.processed,
+      matchedCount: 1,
+    });
+    expect(processedSpy).toHaveBeenCalledTimes(1);
+    processedSpy.mockRestore();
+  });
+
+  it('CS-disjoint-2b: a plain generic delivery with no candidates keeps the skip row', async () => {
+    const record = vi.fn().mockResolvedValue(undefined);
+    const deps = { ...makeCrossSourceDeps({ registrations: [] }), eventLog: { record } as any };
+
+    const outcome = await processWebhook(baseGenericInfo(), deps);
+
+    expect(outcome).toBe('skipped');
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record.mock.calls[0][2]).toMatchObject({ status: EventLogStatus.enum.received });
   });
 });
 

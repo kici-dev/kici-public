@@ -31,7 +31,12 @@ import { createPool, createDb } from '../../db/client.js';
 import { GenericSourceManager } from '../../webhook/generic-sources.js';
 import { UNIVERSAL_GIT_PRESETS } from '../../providers/universal-git/index.js';
 import { LocalSourceConfigSchema } from '../../providers/local/local-source-config.js';
-import { buildLocalTriggerRequest, readRepoHead, sendLocalTrigger } from './local-trigger.js';
+import {
+  buildLocalTriggerRequest,
+  readParentSha,
+  readRepoHead,
+  sendLocalTrigger,
+} from './local-trigger.js';
 import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
 import { runGithubManifestSetup } from './source-manifest.js';
 import { confirmPrompt } from './shared/confirm.js';
@@ -1443,6 +1448,10 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--event <event>', 'push | pull_request', 'push')
     .option('--ref <ref>', 'Git ref (default: repo HEAD branch)')
     .option('--sha <sha>', 'Commit SHA (default: repo HEAD)')
+    .option(
+      '--before <sha>',
+      'Commit before the push; the changed files are before..sha (default: parent of --sha)',
+    )
     .option('--repo-full-name <name>', 'owner/name identifier used in the payload', 'local/repo')
     .option('--base-url <url>', 'Orchestrator base URL', DEFAULT_ORCH_URL)
     .action(async (id: string, opts) => {
@@ -1467,6 +1476,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           event: opts.event === 'pull_request' ? 'pull_request' : 'push',
           ref: head.ref,
           sha: head.sha,
+          before: opts.before ?? readParentSha(cfg.repoBasePath, head.sha),
           defaultBranch: head.ref.replace('refs/heads/', ''),
         });
         const status = await sendLocalTrigger(opts.baseUrl, req);

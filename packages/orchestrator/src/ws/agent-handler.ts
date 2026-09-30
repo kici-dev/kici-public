@@ -45,6 +45,7 @@ import {
   ArtifactUploadOutcome,
   LogStream,
   reservedEventNamePrefix,
+  ScaleDownReason,
 } from '@kici-dev/engine';
 import type { RateLimiterConfig, AttestationVerifyStatus } from '@kici-dev/engine';
 import { provenanceStorageKey } from '@kici-dev/engine/provenance/bundle';
@@ -78,6 +79,11 @@ import type { PendingBuildTracker } from '../cache/pending-builds.js';
 import type { PendingInitTracker } from '../cache/pending-inits.js';
 import type { PendingDynamicTracker } from '../cache/pending-dynamics.js';
 import type { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
+import {
+  awaitCacheUploadSettle,
+  CacheUploadSettleOutcome,
+  type CacheUploadSettle,
+} from '../cache/cache-upload-settle.js';
 import type { CacheStorage } from '../storage/types.js';
 import { setAgentsActive } from '../metrics/prometheus.js';
 import type { AgentMetricsAggregator } from '../metrics/agent-metrics-aggregator.js';
@@ -263,11 +269,14 @@ export interface AgentWsEvents extends Omit<WSEvents, 'onMessage'> {
   onMessage(evt: MessageEvent<WSMessageReceive>, ws: WSContext): Promise<void>;
 }
 
+/** `error` frame code sent when a registration is refused because another agent token holds the id. */
+export const AGENT_ID_IN_USE = 'AGENT_ID_IN_USE';
+
 function enforceRegisterAuthGates(
   authState: AuthState | undefined,
   payload: { agentId: string; labels: string[]; runningAsUid?: number },
-  ws: { close(code: number, reason: string): void },
-  agentIdToTokenId: Map<unknown, string>,
+  ws: WsLike & { close(code: number, reason: string): void },
+  registry: Pick<AgentRegistry, 'isAgentIdHeldByOtherToken'>,
 ): boolean {
   const { agentId, runningAsUid } = payload;
   // Fold the wire labels once, here at the ingress. Every gate below compares
@@ -356,14 +365,30 @@ function enforceRegisterAuthGates(
     }
   }
 
-  // Gate 3 — agentId collision.
-  if (tokenId !== undefined) {
-    const existingTokenId = agentIdToTokenId.get(agentId);
-    if (existingTokenId !== undefined && existingTokenId !== tokenId) {
-      logger.warn('AgentId collision: different token', { agentId });
-      ws.close(WS_CLOSE_INVALID_MESSAGE, 'AgentId already registered with a different token');
-      return false;
+  // Gate 3 — agentId collision. A live agent id belongs to the agent token it
+  // registered with. A registration under another token is refused while that
+  // connection lives, or while another connection is registering the id under
+  // another token; the shared registry holds both, since each connection has
+  // its own handler. Every legitimate re-registration still passes: a
+  // reconnect presents the same token, and an agent restarted with a rotated
+  // or new token gets in once its old connection has gone (its socket closed,
+  // its token revoked, or the heartbeat timeout dropped it). The close code is
+  // not permanent, so a refused agent keeps retrying until then.
+  if (tokenId !== undefined && registry.isAgentIdHeldByOtherToken(agentId, tokenId, ws)) {
+    logger.warn('Agent register rejected: agent id held by a live connection under another token', {
+      agentId,
+    });
+    if (ws.readyState === 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'error',
+          code: AGENT_ID_IN_USE,
+          message: `Agent id ${agentId} is registered under a different agent token`,
+        }),
+      );
     }
+    ws.close(WS_CLOSE_INVALID_MESSAGE, 'AgentId already registered with a different token');
+    return false;
   }
 
   return true;
@@ -442,8 +467,11 @@ export interface AgentWsHandlerDeps {
     agentId: string,
     labels: string[],
   ) => Promise<{ boundJobId?: string; mandatoryLabels: string[] } | null>;
-  /** Optional callback when an agent disconnects (for scaler lifecycle). */
-  onScalerAgentDisconnected?: (agentId: string) => void;
+  /**
+   * Optional callback when an agent disconnects (for scaler lifecycle). `reason`
+   * is the scale-down reason an event scaler emits for it.
+   */
+  onScalerAgentDisconnected?: (agentId: string, reason?: ScaleDownReason) => void;
   /** Optional callback when an agent completes a job (for scaler lifecycle). */
   onScalerJobComplete?: (agentId: string) => void;
   /** Optional callback when agent sends per-job heartbeats. */
@@ -540,6 +568,13 @@ export interface AgentWsHandlerDeps {
   artifactStore?: ArtifactStore;
   /** Cache storage for setting metadata after upload completion. */
   cacheStorage?: CacheStorage;
+  /**
+   * In-flight build-cache publishes and the per-org bound a build's success
+   * waits for them. Built once per orchestrator, not per connection, so a
+   * success replayed on a reconnected socket still sees a publish started on
+   * the old one. Absent: no registration and no wait.
+   */
+  cacheUploadSettle?: CacheUploadSettle;
   /**
    * Storage used to mint presigned PUT URLs for provenance bundles. Distinct
    * dep so a deployment can decide whether attestations share the cache bucket.
@@ -829,6 +864,74 @@ function acceptLogChunk(
 }
 
 /**
+ * Release the in-memory waiters of jobs a disconnect triage failed: pending
+ * builds, inits, dynamic evaluations and global eval rounds, and the user-cache
+ * refs of the dispatch. The dispatcher runs it inside `onAgentDisconnect`, so
+ * every path that drops an agent reaches it, whether or not it waits for the
+ * socket to close.
+ */
+export function releaseFailedJobWaiters(
+  deps: Pick<
+    AgentWsHandlerDeps,
+    | 'pendingBuilds'
+    | 'pendingInits'
+    | 'pendingDynamics'
+    | 'pendingGlobalEvals'
+    | 'dispatchCacheRefs'
+  >,
+  failedJobIds: string[],
+): void {
+  const { pendingBuilds, pendingInits, pendingDynamics, pendingGlobalEvals, dispatchCacheRefs } =
+    deps;
+  // Clean up pending build entries so processor doesn't hang forever
+  if (pendingBuilds) {
+    for (const jobId of failedJobIds) {
+      pendingBuilds.cleanup(jobId);
+    }
+  }
+
+  // Clean up pending init entries so init dispatch doesn't hang forever
+  if (pendingInits) {
+    for (const jobId of failedJobIds) {
+      pendingInits.cleanup(jobId);
+    }
+  }
+
+  // Clean up pending dynamic eval entries so processor doesn't hang forever
+  if (pendingDynamics) {
+    for (const jobId of failedJobIds) {
+      pendingDynamics.cleanup(jobId);
+    }
+  }
+
+  // Clean up pending global eval rounds so the webhook pipeline doesn't hang forever.
+  //
+  // This covers SCALER-MANAGED agents only, and deliberately so: for a
+  // static agent with in-flight jobs `Dispatcher.onAgentDisconnect`
+  // routes to `startRecoveryForDisconnect`, which always returns an
+  // empty list (it keeps tracking the jobs for reconnect
+  // reconciliation instead of failing them), so this loop iterates
+  // nothing. A round left pending by a static agent's disconnect is
+  // settled by that agent's own terminal `job.status` on reconnect,
+  // or — when it never reconnects — by the orchestrator-side wait
+  // ceiling the round applies around its own await
+  // (`global_eval_wait_timeout_ms`), not from here.
+  if (pendingGlobalEvals) {
+    for (const jobId of failedJobIds) {
+      pendingGlobalEvals.cleanup(jobId);
+    }
+  }
+
+  // Drop the server-side user-cache namespace refs for the agent's
+  // now-failed jobs so the tracker can't leak across a disconnect.
+  if (dispatchCacheRefs) {
+    for (const jobId of failedJobIds) {
+      dispatchCacheRefs.delete(jobId);
+    }
+  }
+}
+
+/**
  * Create a Hono WS event handler for agent connections.
  *
  * Flow:
@@ -864,6 +967,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
     artifactStore,
     dispatchCacheRefs,
     cacheStorage,
+    cacheUploadSettle,
     provenanceTrustRoot,
     provenanceStorage,
     onProvenanceUpload,
@@ -871,16 +975,16 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
     classifyDeferOrigin,
     rateLimiterConfig,
     ownershipTracker,
-    pendingBuilds,
-    pendingInits,
-    pendingDynamics,
-    pendingGlobalEvals,
     onSecretOutputs,
     onConcurrencyReport,
     onStepApproval,
     onConcurrencyAgentDisconnect,
     agentMetricsAggregator,
   } = deps;
+
+  // Every disconnect triage, including one run by a path that drops the agent
+  // without waiting for its socket, releases the waiters of the jobs it failed.
+  dispatcher.setDisconnectCleanup?.((failedJobIds) => releaseFailedJobWaiters(deps, failedJobIds));
 
   /** Per-connection rate limiters. Created on connect, cleaned up on disconnect. */
   const rateLimiters = new Map<WSContext, WsRateLimiter>();
@@ -969,12 +1073,6 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
   const wsToAgentId = new Map<WSContext, string>();
 
   /**
-   * Map from agentId to the tokenId used for authentication.
-   * Used for agentId collision detection (different token = reject).
-   */
-  const agentIdToTokenId = new Map<string, string>();
-
-  /**
    * Map from WSContext to the token authority context captured at auth
    * time. Populated when Phase 2's auth gates pass and consulted on every
    * subsequent `agent.register` (re-register branch) so the gates re-run
@@ -1026,6 +1124,37 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
   function sendJson(ws: WSContext, data: unknown): void {
     if (ws.readyState === 1) {
       ws.send(JSON.stringify(data));
+    }
+  }
+
+  /**
+   * Hold a build's success until the cache publish its agent reported just
+   * before it has finished, bounded by the org's settle timeout. The waiting
+   * pipeline reads the published pointer as soon as the success is handled —
+   * here, or from the shared job row on a sibling coordinator.
+   */
+  async function holdSuccessForCacheUpload(
+    agentId: string,
+    runId: string,
+    jobId: string,
+    orgId: string | undefined,
+  ): Promise<void> {
+    const { outcome, timeoutMs, waitedMs } = await awaitCacheUploadSettle(cacheUploadSettle, {
+      jobId,
+      orgId,
+    });
+    if (outcome === CacheUploadSettleOutcome.Settled) {
+      logger.info('Build success waited for its cache upload to publish', {
+        agentId,
+        runId,
+        jobId,
+        waitedMs,
+      });
+    } else if (outcome === CacheUploadSettleOutcome.TimedOut) {
+      logger.warn(
+        'Cache upload did not publish within the settle timeout; releasing the build without it',
+        { agentId, runId, jobId, timeoutMs },
+      );
     }
   }
 
@@ -1395,17 +1524,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           !enforceRegisterAuthGates(
             authStateForRegister,
             { agentId, labels, runningAsUid: parsed.data.runningAsUid },
-            ws,
-            agentIdToTokenId,
+            ws as unknown as WsLike,
+            registry,
           )
         ) {
           return;
-        }
-        if (regEntry.tokenId !== undefined) {
-          // Bind the agentId to its tokenId so the collision gate fires
-          // on a future first-register from a different token claiming
-          // the same agentId.
-          agentIdToTokenId.set(agentId, regEntry.tokenId);
         }
         // Cache the token authority context on the WS so the re-register
         // branch in the post-register switch can re-run the same gates
@@ -1426,6 +1549,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
         // through it so a close landing mid-lookup is still seen.
         const registerState = { closed: false };
         registering.set(ws, registerState);
+        registry.beginRegistering(agentId, ws as unknown as WsLike, regEntry.tokenId ?? null);
         let scalerInfo: { boundJobId?: string; mandatoryLabels: string[] } | null = null;
         let scalerLookupFailed = false;
         try {
@@ -1448,11 +1572,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           });
         } finally {
           registering.delete(ws);
+          registry.endRegistering(agentId, ws as unknown as WsLike);
         }
 
         if (scalerLookupFailed) {
           wsToAuthState.delete(ws);
-          agentIdToTokenId.delete(agentId);
           ws.close(WS_CLOSE_INTERNAL_ERROR, 'Scaler state unavailable');
           return;
         }
@@ -1466,7 +1590,6 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           // what tears the provisioned instance down.
           logger.info('Agent connection closed during registration', { agentId });
           wsToAuthState.delete(ws);
-          agentIdToTokenId.delete(agentId);
           if (scalerInfo !== null) {
             onScalerAgentDisconnected?.(agentId);
           }
@@ -1718,19 +1841,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
             !enforceRegisterAuthGates(
               reregisterAuthState,
               { agentId: msg.agentId, labels: msg.labels, runningAsUid: msg.runningAsUid },
-              ws,
-              agentIdToTokenId,
+              ws as unknown as WsLike,
+              registry,
             )
           ) {
             return;
-          }
-          if (reregisterAuthState?.tokenId !== undefined) {
-            // Update the agentId-to-tokenId mapping if the wire agentId
-            // changed across the re-register (covers a static-token PSK
-            // legitimately rebinding to a fresh agentId; the collision
-            // gate above already rejected re-registers under an agentId
-            // owned by a different token).
-            agentIdToTokenId.set(msg.agentId, reregisterAuthState.tokenId);
           }
 
           const existingEntry = registry.get(msg.agentId);
@@ -1753,6 +1868,9 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
               runningAsUid: msg.runningAsUid,
               capabilities: msg.capabilities,
               mandatoryLabels: existingEntry ? [...existingEntry.mandatoryLabels] : undefined,
+              // Keep the token binding: revocation, expiry and the agent-id
+              // collision check all read it from the registry entry.
+              tokenId: reregisterAuthState?.tokenId ?? null,
               // Preserve single-use status across a re-register so disconnect
               // triage stays correct for a scaler-managed agent that reconnects.
               scalerManaged: existingEntry?.scalerManaged ?? false,
@@ -1907,6 +2025,9 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
 
               // Job completed -- decrement active jobs and drain queue
               dispatcher.onJobComplete(agentId, jobId);
+              // Read before the ref is dropped: a build's success waits below
+              // on its org's cache upload settle bound.
+              const jobOrgId = dispatchCacheRefs?.get(jobId)?.orgId;
               // Drop the server-side user-cache namespace ref so the tracker
               // can't leak (mirrors the dispatcher's own per-job cleanup).
               dispatchCacheRefs?.delete(jobId);
@@ -1928,6 +2049,17 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
 
               // Notify scaler of job completion
               onScalerJobComplete?.(agentId);
+
+              // A build's success releases the jobs that wait on it (the local
+              // build waiter and, through the terminal job row, a sibling
+              // coordinator), so it waits here for the cache publish its agent
+              // reported just before. The wait sits after onJobComplete: an
+              // idle scaler-managed agent shuts itself down seconds after its
+              // job, and a job still tracked to it when it disconnects is
+              // failed.
+              if (state === ExecutionJobStatus.enum.success) {
+                await holdSuccessForCacheUpload(agentId, runId, jobId, jobOrgId);
+              }
 
               // Forward to Platform client and ExecutionTracker
               onJobStatus?.(agentId, { runId, jobId, state, timestamp, data });
@@ -2263,72 +2395,89 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
         }
 
         case 'cache.upload.complete': {
-          // No reply exists for this message, so a refusal is a drop — but the
-          // decision is still resolved rather than assumed.
-          if (
-            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'cache.upload.complete')) ===
-            'reject'
-          ) {
-            break;
-          }
-
-          // Compute the storage key from the message fields. A dep tarball is
-          // addressed by its own content hash; only fall back to the lockfile
-          // name for an older agent that sent no `depsHash` (see the upload-URL
-          // branch above — the two must agree on the key or initMeta stamps TTL
-          // bookkeeping onto an object that does not exist).
+          // Register the publish before the first await. Frames enter this
+          // handler in wire order, so the build's `job.status success`, sent
+          // right after this frame, always finds the registration and waits.
+          const settleUpload = cacheUploadSettle?.uploads.begin(msg.jobId);
+          // Read before any await: the build's success deletes the job's ref.
           const uploadOrgId = dispatchCacheRefs?.get(msg.jobId)?.orgId;
-          let storageKey: string;
-          if (msg.cacheType === 'source') {
-            storageKey = sourceTarballKey(
-              uploadOrgId ?? '',
-              msg.sourceTarDigest ?? msg.contentHash!,
-            );
-          } else {
-            storageKey = depTarballKey(msg.depsHash ?? msg.lockfileHash!, msg.platform, msg.arch);
-          }
+          try {
+            // No reply exists for this message, so a refusal is a drop — but the
+            // decision is still resolved rather than assumed.
+            if (
+              (await gateOwnership(
+                ownershipTracker,
+                agentId,
+                msg.jobId,
+                'cache.upload.complete',
+              )) === 'reject'
+            ) {
+              break;
+            }
 
-          if (cacheStorage) {
-            try {
-              await cacheStorage.initMeta(storageKey);
-              // Publish the pointer only now, after the agent confirmed the
-              // upload landed. Publishing earlier would let a reader resolve a
-              // lockfile to bytes that are not there yet.
-              if (msg.cacheType === 'deps' && msg.depsHash && msg.lockfileHash && depCache) {
-                await depCache.publishPointer(
-                  msg.lockfileHash,
-                  msg.platform,
-                  msg.arch,
-                  msg.depsHash,
-                  msg.siblingsDigest,
-                );
+            // Compute the storage key from the message fields. A dep tarball is
+            // addressed by its own content hash; only fall back to the lockfile
+            // name for an older agent that sent no `depsHash` (see the upload-URL
+            // branch above — the two must agree on the key or initMeta stamps TTL
+            // bookkeeping onto an object that does not exist).
+            let storageKey: string;
+            if (msg.cacheType === 'source') {
+              storageKey = sourceTarballKey(
+                uploadOrgId ?? '',
+                msg.sourceTarDigest ?? msg.contentHash!,
+              );
+            } else {
+              storageKey = depTarballKey(msg.depsHash ?? msg.lockfileHash!, msg.platform, msg.arch);
+            }
+
+            if (cacheStorage) {
+              try {
+                await cacheStorage.initMeta(storageKey);
+                // Publish the pointer only now, after the agent confirmed the
+                // upload landed. Publishing earlier would let a reader resolve a
+                // lockfile to bytes that are not there yet.
+                if (msg.cacheType === 'deps' && msg.depsHash && msg.lockfileHash && depCache) {
+                  await depCache.publishPointer(
+                    msg.lockfileHash,
+                    msg.platform,
+                    msg.arch,
+                    msg.depsHash,
+                    msg.siblingsDigest,
+                  );
+                }
+                if (
+                  msg.cacheType === 'source' &&
+                  msg.sourceTarDigest &&
+                  msg.contentHash &&
+                  uploadOrgId &&
+                  sourceCache
+                ) {
+                  await sourceCache.publishPointer(
+                    uploadOrgId,
+                    msg.contentHash,
+                    msg.sourceTarDigest,
+                  );
+                }
+                logger.info('Cache upload metadata initialized', {
+                  agentId,
+                  cacheType: msg.cacheType,
+                  storageKey,
+                });
+              } catch (err) {
+                logger.error('Failed to initialize cache metadata', {
+                  agentId,
+                  storageKey,
+                  error: toErrorMessage(err),
+                });
               }
-              if (
-                msg.cacheType === 'source' &&
-                msg.sourceTarDigest &&
-                msg.contentHash &&
-                uploadOrgId &&
-                sourceCache
-              ) {
-                await sourceCache.publishPointer(uploadOrgId, msg.contentHash, msg.sourceTarDigest);
-              }
-              logger.info('Cache upload metadata initialized', {
-                agentId,
-                cacheType: msg.cacheType,
-                storageKey,
-              });
-            } catch (err) {
-              logger.error('Failed to initialize cache metadata', {
+            } else {
+              logger.warn('cache.upload.complete received but cacheStorage not configured', {
                 agentId,
                 storageKey,
-                error: toErrorMessage(err),
               });
             }
-          } else {
-            logger.warn('cache.upload.complete received but cacheStorage not configured', {
-              agentId,
-              storageKey,
-            });
+          } finally {
+            settleUpload?.();
           }
           break;
         }
@@ -3183,17 +3332,32 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
         // it if it is scaler-managed. A stale socket's close drops only its own
         // per-socket state. `retireSupersededSocket` normally removes the ghost
         // at register time; this is the guard for a close that beats it.
-        if (registry.get(agentId)?.ws !== (ws as unknown as WsLike)) {
+        const live = registry.get(agentId);
+        if (live !== undefined && live.ws !== (ws as unknown as WsLike)) {
           wsToAgentId.delete(ws);
           wsToAuthState.delete(ws);
           logger.info('Stale agent socket closed, live registration untouched', { agentId });
           return;
         }
+        // No registration at all means a path that dropped the agent without
+        // waiting for its socket already unregistered it: the heartbeat
+        // monitor's timeout, a dispatch-ack timeout, a token revocation or
+        // expiry. Each of them runs the dispatcher's job triage as it drops the
+        // agent (the triage reads the registration to tell a scaler-managed agent
+        // from a static one, so it cannot run here). This close still owns the
+        // rest of the disconnect, so a scaler-managed agent's VM or container is
+        // destroyed and its capacity released.
+        const unregistered = live === undefined;
+        // Unless the same agent is registering again on a newer socket: that
+        // registration owns the agent now, and tearing it down here would
+        // destroy the instance it is registering from.
+        if (unregistered && registry.isRegisteringElsewhere(agentId, ws as unknown as WsLike)) {
+          wsToAgentId.delete(ws);
+          wsToAuthState.delete(ws);
+          logger.info('Dropped agent socket closed while the agent re-registers', { agentId });
+          return;
+        }
         wsToAgentId.delete(ws);
-        // Cleanup the agentId->tokenId map too, otherwise an agent that
-        // disconnects and never reconnects leaves a stale entry behind
-        // (slow leak that grows with every churned agent).
-        agentIdToTokenId.delete(agentId);
         // Same cleanup logic for the per-WS authority cache — the WS is
         // gone, so the captured token context is dead state.
         wsToAuthState.delete(ws);
@@ -3217,73 +3381,37 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           });
         }
 
-        // Dispatcher handles: mark dispatched jobs as failed, unregister from registry
-        dispatcher
-          .onAgentDisconnect(agentId)
-          .then((failedJobIds) => {
-            // Clean up pending build entries so processor doesn't hang forever
-            if (pendingBuilds) {
-              for (const jobId of failedJobIds) {
-                pendingBuilds.cleanup(jobId);
-              }
-            }
-
-            // Clean up pending init entries so init dispatch doesn't hang forever
-            if (pendingInits) {
-              for (const jobId of failedJobIds) {
-                pendingInits.cleanup(jobId);
-              }
-            }
-
-            // Clean up pending dynamic eval entries so processor doesn't hang forever
-            if (pendingDynamics) {
-              for (const jobId of failedJobIds) {
-                pendingDynamics.cleanup(jobId);
-              }
-            }
-
-            // Clean up pending global eval rounds so the webhook pipeline doesn't hang forever.
-            //
-            // This covers SCALER-MANAGED agents only, and deliberately so: for a
-            // static agent with in-flight jobs `Dispatcher.onAgentDisconnect`
-            // routes to `startRecoveryForDisconnect`, which always returns an
-            // empty list (it keeps tracking the jobs for reconnect
-            // reconciliation instead of failing them), so this loop iterates
-            // nothing. A round left pending by a static agent's disconnect is
-            // settled by that agent's own terminal `job.status` on reconnect,
-            // or — when it never reconnects — by the orchestrator-side wait
-            // ceiling the round applies around its own await
-            // (`global_eval_wait_timeout_ms`), not from here.
-            if (pendingGlobalEvals) {
-              for (const jobId of failedJobIds) {
-                pendingGlobalEvals.cleanup(jobId);
-              }
-            }
-
-            // Drop the server-side user-cache namespace refs for the agent's
-            // now-failed jobs so the tracker can't leak across a disconnect.
-            if (dispatchCacheRefs) {
-              for (const jobId of failedJobIds) {
-                dispatchCacheRefs.delete(jobId);
-              }
-            }
-          })
-          .catch((err) => {
-            logger.error('Error handling agent disconnect', {
-              agentId,
-              error: toErrorMessage(err),
-            });
+        // Dispatcher handles: mark dispatched jobs as failed, unregister from
+        // registry, and release the waiters of the jobs it failed through the
+        // `releaseFailedJobWaiters` cleanup this handler installs.
+        const triage = unregistered
+          ? Promise.resolve<string[]>([])
+          : dispatcher.onAgentDisconnect(agentId);
+        triage.catch((err) => {
+          logger.error('Error handling agent disconnect', {
+            agentId,
+            error: toErrorMessage(err),
           });
+        });
 
         // Mark agent metrics for retention-based cleanup
         agentMetricsAggregator?.markDisconnected(agentId);
 
-        // Notify scaler of agent disconnect
-        onScalerAgentDisconnected?.(agentId);
+        // Notify scaler of agent disconnect. An agent dropped without waiting
+        // for its socket is torn down as a `heartbeat-timeout`: until this close
+        // reached the scaler, the stranded-provision sweep was the only teardown
+        // such an agent got, and it emitted that reason, which a customer's
+        // teardown workflow may branch on.
+        if (unregistered) {
+          onScalerAgentDisconnected?.(agentId, ScaleDownReason.enum['heartbeat-timeout']);
+        } else {
+          onScalerAgentDisconnected?.(agentId);
+        }
 
-        setAgentsActive(Math.max(0, registry.getActiveCount() - 1));
+        // An agent already unregistered is no longer in the count.
+        setAgentsActive(Math.max(0, registry.getActiveCount() - (unregistered ? 0 : 1)));
 
-        logger.info('Agent disconnected', { agentId });
+        logger.info('Agent disconnected', { agentId, ...(unregistered && { unregistered }) });
       }
     },
 

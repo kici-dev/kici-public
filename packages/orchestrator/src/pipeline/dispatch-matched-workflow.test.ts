@@ -2254,6 +2254,8 @@ async function runEvaluateJobContexts(over: {
    * case drives N sibling children through the per-job block.
    */
   mats?: Array<Record<string, unknown>>;
+  /** Merged onto the workflow's match decision — `deferredPaths` routes every job to the init round. */
+  decision?: Record<string, unknown>;
 }): ReturnType<typeof evaluateJobContexts> {
   const lockJob = {
     _type: 'static' as const,
@@ -2289,6 +2291,7 @@ async function runEvaluateJobContexts(over: {
     // records its routing key from it.
     info: { provider: 'local', routingKey: 'local:repo', deliveryId: 'd' },
     resolvedOrgId: '__default__',
+    decision: { workflowName: 'ci', matched: true, checks: [], summary: '', ...over.decision },
     deps: { pendingInits: { has: () => false }, ...over.deps },
   };
   const setup = {
@@ -2343,6 +2346,54 @@ describe('evaluateJobContexts — dynamic fields defer to the init round', () =>
     });
     expect(deferredInitJobs).toHaveLength(1);
     expect('hasFilter' in deferredInitJobs[0].initJobInput.jobConfig).toBe(false);
+  });
+});
+
+describe('evaluateJobContexts — deferred paths defer to the init round', () => {
+  const staticJob = { _type: 'static' as const, name: 'build' };
+
+  // fails-when: a conservative path match dispatches without asking the agent
+  it('requests an init job carrying the deferred paths for a workflow with no filter', async () => {
+    const { deferredInitJobs, jobContextData } = await runEvaluateJobContexts({
+      lockJob: staticJob,
+      event: { type: 'push' },
+      decision: { deferredPaths: [['src/**']] },
+    });
+    expect(deferredInitJobs).toHaveLength(1);
+    expect(deferredInitJobs[0].initJobInput.jobConfig.deferredPaths).toEqual([['src/**']]);
+    expect('hasFilter' in deferredInitJobs[0].initJobInput.jobConfig).toBe(false);
+    expect(jobContextData.get('build')?.pendingInit).toBe(true);
+  });
+
+  // breaks-if-wrong: a decision with no deferred paths must dispatch straight through
+  it('defers nothing when the decision carries no deferred paths', async () => {
+    const { deferredInitJobs } = await runEvaluateJobContexts({
+      lockJob: staticJob,
+      event: { type: 'push' },
+    });
+    expect(deferredInitJobs).toHaveLength(0);
+  });
+
+  it('gives a held job no init job, as a filter does', async () => {
+    const approval = { clauses: [], reason: 'ship it', when: 'always' as const };
+    const { deferredInitJobs, jobContextData } = await runEvaluateJobContexts({
+      lockJob: { ...staticJob, approval },
+      event: { type: 'push' },
+      decision: { deferredPaths: [['src/**']] },
+      deps: { heldRunStore: { create: vi.fn() } },
+    });
+    expect(jobContextData.get('build')?.held).toBe(true);
+    expect(deferredInitJobs).toHaveLength(0);
+  });
+
+  it('carries the deferred paths on an init job a dynamic field created', async () => {
+    const { deferredInitJobs } = await runEvaluateJobContexts({
+      lockJob: { ...staticJob, dynamicEnv: true },
+      event: { type: 'push' },
+      decision: { deferredPaths: [['src/**']] },
+    });
+    expect(deferredInitJobs).toHaveLength(1);
+    expect(deferredInitJobs[0].initJobInput.jobConfig.deferredPaths).toEqual([['src/**']]);
   });
 });
 
@@ -2744,6 +2795,37 @@ describe('initDispatchSuppression', () => {
 
   it('dispatches an ungated job with nothing to suppress it', () => {
     expect(initDispatchSuppression({}, {}, {})).toBeNull();
+  });
+});
+
+describe('initDispatchSuppression — deferred paths', () => {
+  const open = { rejected: false, held: false };
+  it('suppresses when the agent reports the paths did not match', () => {
+    expect(initDispatchSuppression({}, { pathsPassed: false }, open)).toBe(
+      InitDispatchSuppression.Paths,
+    );
+  });
+  // breaks-if-wrong: an agent that predates deferred paths reports no verdict
+  it('dispatches when no paths verdict was reported', () => {
+    expect(initDispatchSuppression({}, {}, open)).toBeNull();
+  });
+  it('checks paths before the filter', () => {
+    expect(
+      initDispatchSuppression(
+        { hasFilter: true },
+        { pathsPassed: false, filterPassed: false },
+        open,
+      ),
+    ).toBe(InitDispatchSuppression.Paths);
+  });
+  it('a passing paths verdict leaves the filter to decide', () => {
+    expect(
+      initDispatchSuppression(
+        { hasFilter: true },
+        { pathsPassed: true, filterPassed: false },
+        open,
+      ),
+    ).toBe(InitDispatchSuppression.Filter);
   });
 });
 
@@ -3775,6 +3857,73 @@ describe('dispatchMatchedWorkflow — a non-global workflow filter', () => {
     // dispatch such an agent handles, so only an explicit `false` suppresses.
     const names = await dispatchWith({});
     expect(names).toEqual([INIT_JOB_NAME, 'build']);
+  });
+});
+
+describe('dispatchMatchedWorkflow — deferred paths decided on the agent', () => {
+  const INIT_JOB_NAME = '__init__ci__build';
+
+  async function dispatchDeferred(initResult: Record<string, unknown>): Promise<{
+    names: string[];
+    initConfig: Record<string, unknown> | undefined;
+  }> {
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      pendingInits: {
+        track: vi.fn(async () => initResult),
+        resolve: vi.fn(),
+        reject: vi.fn(),
+        has: vi.fn().mockReturnValue(false),
+        cleanup: vi.fn(),
+      },
+    });
+    ctx.decision = { ...ctx.decision, deferredPaths: [['src/**']] };
+    await dispatchMatchedWorkflow(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+    const init = dispatched.find((d) => d.jobName === INIT_JOB_NAME);
+    return { names: dispatched.map((d) => d.jobName), initConfig: init?.jobConfig };
+  }
+
+  // fails-when: a paths no-match from the agent still dispatches the workflow's job
+  it('dispatches only the __init__ job when the agent reports pathsPassed:false', async () => {
+    const { names, initConfig } = await dispatchDeferred({ pathsPassed: false });
+    expect(names).toEqual([INIT_JOB_NAME]);
+    expect(initConfig?.deferredPaths).toEqual([['src/**']]);
+  });
+
+  it('dispatches the job when the paths match', async () => {
+    const { names } = await dispatchDeferred({ pathsPassed: true });
+    expect(names).toEqual([INIT_JOB_NAME, 'build']);
+  });
+
+  // breaks-if-wrong: an agent that ignores deferredPaths returns no verdict and must still dispatch
+  it('dispatches when the agent reports no paths verdict (an older agent)', async () => {
+    const { names } = await dispatchDeferred({});
+    expect(names).toEqual([INIT_JOB_NAME, 'build']);
+  });
+
+  it('carries the deferred paths on the dynamic eval job', async () => {
+    const pendingDynamics = {
+      track: vi.fn(async () => []),
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      has: vi.fn().mockReturnValue(false),
+      cleanup: vi.fn(),
+    };
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      withDynamicEntry: true,
+      pendingDynamics,
+    });
+    ctx.decision = { ...ctx.decision, deferredPaths: [['src/**']] };
+    await dispatchMatchedWorkflow(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const evalJob = dispatched.find((d) => d.jobName.startsWith('__dynamic__'));
+    expect(evalJob).toBeDefined();
+    expect(evalJob!.jobConfig.deferredPaths).toEqual([['src/**']]);
   });
 });
 

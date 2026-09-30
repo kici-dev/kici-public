@@ -183,6 +183,23 @@ export function maskMessageText(
       if (masked.droppedJobs) masked.droppedJobs = masked.droppedJobs.map((j) => masker.mask(j));
       return masked;
     }
+    case 'dep-restore.report': {
+      const maskError = <T extends { message: string; causeMessage?: string }>(e: T): T => ({
+        ...e,
+        message: masker.mask(e.message),
+        ...(e.causeMessage !== undefined && { causeMessage: masker.mask(e.causeMessage) }),
+      });
+      const r = msg.report;
+      if (!r) return msg;
+      return {
+        ...msg,
+        report: {
+          ...r,
+          ...(r.error && { error: maskError(r.error) }),
+          attempts: r.attempts.map((a) => (a.error ? { ...a, error: maskError(a.error) } : a)),
+        },
+      };
+    }
     default:
       return msg;
   }

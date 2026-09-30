@@ -115,6 +115,8 @@ function makeGlobalRegistration(over: {
   repoIdentifier?: string;
   /** Disabled in the dashboard; the index filters it like the real one. */
   disabled?: boolean;
+  /** `paths` on the push trigger. */
+  paths?: string[];
 }) {
   return {
     id: over.id ?? 'reg-global-1',
@@ -135,7 +137,7 @@ function makeGlobalRegistration(over: {
         {
           _type: 'push',
           branches: [],
-          paths: [],
+          paths: over.paths ?? [],
           ...(over.requires === undefined ? {} : { requires: over.requires }),
           ...(over.repos === undefined ? {} : { repos: over.repos }),
         },
@@ -280,6 +282,8 @@ function makeDeps(over: {
    * path actually reads.
    */
   branches?: { targetBranch: string; sourceBranch: string };
+  /** The normalized event's raw payload — carries `before` / `after` for a push with a range. */
+  eventPayload?: Record<string, unknown>;
 }): Harness {
   const sourceRepo = over.sourceRepo ?? SOURCE_REPO;
   const branches = over.branches ?? { targetBranch: 'main', sourceBranch: 'main' };
@@ -326,7 +330,7 @@ function makeDeps(over: {
       provider: 'github',
       normalizeEvent: () => ({
         type: 'push',
-        payload: {},
+        payload: over.eventPayload ?? {},
         targetBranch: branches.targetBranch,
         sourceBranch: branches.sourceBranch,
         senderUsername: 'octocat',
@@ -533,6 +537,67 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
     await processWebhook(makeInfo(), h.deps);
 
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['lint', 'gen-a']);
+  });
+
+  describe('deferred paths', () => {
+    const RANGE = { before: 'a'.repeat(40), after: 'b'.repeat(40) };
+
+    // fails-when: an unavailable diff with a range dispatches the global workflow without asking the agent
+    it('sends a paths-deferred global to the round, and dispatches nothing on a no-match', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')], paths: ['src/**'] })],
+        eventPayload: RANGE,
+        roundResult: {
+          candidates: [
+            { workflowName: GLOBAL_WORKFLOW, run: false, reason: 'paths: no match for [src/**]' },
+          ],
+        } as GlobalEvalRoundResult,
+      });
+
+      await processWebhook(makeInfo(), h.deps);
+
+      expect(h.track).toHaveBeenCalledTimes(1);
+      const round = h.dispatched().find((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
+      expect(round?.jobConfig.candidates).toEqual([
+        expect.objectContaining({ workflowName: GLOBAL_WORKFLOW, deferredPaths: [['src/**']] }),
+      ]);
+      expect(h.workJobs()).toEqual([]);
+    });
+
+    // breaks-if-wrong: a round that cleared the paths must dispatch the jobs, with no second init round
+    it('dispatches a round-cleared global without a per-job __init__', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')], paths: ['src/**'] })],
+        eventPayload: RANGE,
+        roundResult: {
+          candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true }],
+        } as GlobalEvalRoundResult,
+      });
+      const pendingInits = {
+        track: vi.fn(async () => ({})),
+        resolve: vi.fn(),
+        reject: vi.fn(),
+        has: vi.fn().mockReturnValue(false),
+        cleanup: vi.fn(),
+      };
+
+      await processWebhook(makeInfo(), { ...h.deps, pendingInits } as unknown as typeof h.deps);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
+      expect(pendingInits.track).not.toHaveBeenCalled();
+    });
+
+    it('matches a range-less push conservatively with no round', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')], paths: ['src/**'] })],
+      });
+
+      await processWebhook(makeInfo(), h.deps);
+
+      expect(h.track).not.toHaveBeenCalled();
+      expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
+    });
   });
 
   it('dispatches nothing for a global workflow whose filter returned false', async () => {

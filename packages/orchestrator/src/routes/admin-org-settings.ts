@@ -131,6 +131,9 @@ const updateSchema = z
     // Per-org dispatch-queue job timeout (ms). null clears the override → cluster
     // default (config.queueTimeoutMs). 0 = indefinite (no expiry).
     queueTimeoutMs: z.number().int().min(0).nullable().optional(),
+    // Per-org bound (ms) on a build success's wait for its cache publish.
+    // null clears the override → cluster default; 0 turns the wait off.
+    cacheUploadSettleTimeoutMs: z.number().int().min(0).nullable().optional(),
     // Approval policy. Both have NOT NULL defaults in the DB, so they are not
     // nullable here — a value always replaces the current one.
     approvalExpirySeconds: z.number().int().min(1).optional(),
@@ -179,6 +182,8 @@ interface ProjectedSettings {
   backupStalenessWarnHours: number | null;
   /** Per-org dispatch-queue job timeout (ms); null = cluster default. */
   queueTimeoutMs: number | null;
+  /** Per-org build-cache publish settle bound (ms); null = cluster default. */
+  cacheUploadSettleTimeoutMs: number | null;
   /** Per-org held-approval expiry (seconds). */
   approvalExpirySeconds: number;
   /** Whether a run's triggerer may self-approve its held elements. */
@@ -242,6 +247,7 @@ function projectRow(
       rerouteMaxHops: null,
       backupStalenessWarnHours: null,
       queueTimeoutMs: null,
+      cacheUploadSettleTimeoutMs: null,
       // Mirror the DB column defaults so a customer with no row reads the
       // same effective policy a fresh row would carry.
       approvalExpirySeconds: 86400,
@@ -273,6 +279,7 @@ function projectRow(
     rerouteMaxHops: row.reroute_max_hops,
     backupStalenessWarnHours: row.backup_staleness_warn_hours,
     queueTimeoutMs: bigintToNumber(row.queue_timeout_ms),
+    cacheUploadSettleTimeoutMs: bigintToNumber(row.cache_upload_settle_timeout_ms),
     approvalExpirySeconds: row.approval_expiry_seconds,
     allowSelfApproval: row.allow_self_approval,
     sandboxAllowedCapabilities: row.sandbox_allowed_capabilities ?? [],
@@ -363,6 +370,9 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       let rerouteMaxHops: number | null = existing?.reroute_max_hops ?? null;
       let backupStalenessWarnHours: number | null = existing?.backup_staleness_warn_hours ?? null;
       let queueTimeoutMs: number | null = bigintToNumber(existing?.queue_timeout_ms ?? null);
+      let cacheUploadSettleTimeoutMs: number | null = bigintToNumber(
+        existing?.cache_upload_settle_timeout_ms ?? null,
+      );
       // NOT NULL columns: fall back to the DB defaults when no row exists yet.
       let approvalExpirySeconds: number = existing?.approval_expiry_seconds ?? 86400;
       let allowSelfApproval: boolean = existing?.allow_self_approval ?? true;
@@ -393,6 +403,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       if (body.backupStalenessWarnHours !== undefined)
         backupStalenessWarnHours = body.backupStalenessWarnHours;
       if (body.queueTimeoutMs !== undefined) queueTimeoutMs = body.queueTimeoutMs;
+      if (body.cacheUploadSettleTimeoutMs !== undefined)
+        cacheUploadSettleTimeoutMs = body.cacheUploadSettleTimeoutMs;
       if (body.approvalExpirySeconds !== undefined)
         approvalExpirySeconds = body.approvalExpirySeconds;
       if (body.allowSelfApproval !== undefined) allowSelfApproval = body.allowSelfApproval;
@@ -438,6 +450,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
           reroute_max_hops: rerouteMaxHops,
           backup_staleness_warn_hours: backupStalenessWarnHours,
           queue_timeout_ms: queueTimeoutMs,
+          cache_upload_settle_timeout_ms: cacheUploadSettleTimeoutMs,
           approval_expiry_seconds: approvalExpirySeconds,
           allow_self_approval: allowSelfApproval,
           sandbox_allowed_capabilities: sandboxAllowedCapabilities,
@@ -463,6 +476,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
             reroute_max_hops: rerouteMaxHops,
             backup_staleness_warn_hours: backupStalenessWarnHours,
             queue_timeout_ms: queueTimeoutMs,
+            cache_upload_settle_timeout_ms: cacheUploadSettleTimeoutMs,
             approval_expiry_seconds: approvalExpirySeconds,
             allow_self_approval: allowSelfApproval,
             sandbox_allowed_capabilities: sandboxAllowedCapabilities,

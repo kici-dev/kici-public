@@ -29,6 +29,10 @@ Examples: `production-arm`, `staging-x86`, `eu-west-1`,
 
 ## First boot — auto-generation
 
+To choose the name up front, set `KICI_CLUSTER_NAME` before the
+orch's first boot. The orchestrator checks it against the format
+above and stores it; a value that does not match stops the startup.
+
 On the orch's first boot, if no operator has supplied a cluster name,
 the orchestrator picks `cluster-<6hex>` — six lowercase hex
 characters derived from the host's randomness. That value is written

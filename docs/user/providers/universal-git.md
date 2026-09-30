@@ -50,6 +50,36 @@ Pick `custom` only when the forge's payload structure or event header
 deviates from GitHub's — you'll then supply `payloadPaths` and
 `eventMapping` explicitly.
 
+## Changed files and truncated pushes
+
+A universal-git source reads a push's changed files from the payload's
+`commits[].added/modified/removed` lists. Forges cap `commits[]`, so a
+large push can list only part of its commits. A truncated list is never
+used: the push's changed files are `unavailable`, and a `paths` filter is
+decided on the agent from its clone (see
+[path filter behavior](../sdk/triggers.md#path-filter-behavior)).
+
+Two optional `payloadPaths` fields detect truncation:
+
+| Field          | Meaning                                                                                                              |
+| -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `commitsTotal` | JSONPath to the forge's total commit count. A total above the listed commits is truncated.                           |
+| `commitsCap`   | The most commits the forge lists, for a forge that sends no total. A push listing this many is treated as truncated. |
+
+The presets set them for you:
+
+| Preset        | Setting                                 |
+| ------------- | --------------------------------------- |
+| `forgejo`     | `commitsTotal: '$.total_commits'`       |
+| `gitea`       | `commitsTotal: '$.total_commits'`       |
+| `gitlab-repo` | `commitsTotal: '$.total_commits_count'` |
+| `github-repo` | `commitsCap: 2048`                      |
+| `gogs`        | Neither                                 |
+
+A `custom` configuration without either field reads every push as complete.
+Universal-git pull requests carry no diff in the webhook, so their `paths`
+filters are always decided on the agent.
+
 ## Create a source (PAT)
 
 ```bash

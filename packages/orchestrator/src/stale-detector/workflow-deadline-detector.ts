@@ -36,7 +36,7 @@ export interface WorkflowDeadlineDetectorDeps {
    * implementation the user-initiated `kici cancel` route uses
    * (cancelRunWithReason bound to the orchestrator's deps).
    */
-  cancelRun: (runId: string, reason: string) => Promise<unknown>;
+  cancelRun: (runId: string, reason: string, options: { force: boolean }) => Promise<unknown>;
   jobQueue: JobQueue;
   /** How often to scan in ms. Default supplied by the caller (reuses the stale-detector interval). */
   scanIntervalMs: number;
@@ -86,7 +86,11 @@ export class WorkflowDeadlineDetector {
       const overdue = await this.buildOverdueQuery().execute();
 
       for (const run of overdue) {
-        await this.cancelOverdueRun(run.run_id, Number(run.workflow_timeout_ms));
+        await this.cancelOverdueRun(
+          run.run_id,
+          Number(run.workflow_timeout_ms),
+          run.cancel_force === true,
+        );
       }
 
       if (overdue.length > 0) {
@@ -117,7 +121,7 @@ export class WorkflowDeadlineDetector {
     return (
       this.db
         .selectFrom('execution_runs')
-        .select(['run_id', 'workflow_timeout_ms', 'started_at'])
+        .select(['run_id', 'workflow_timeout_ms', 'started_at', 'cancel_force'])
         .where('status', 'in', [
           ExecutionRunStatus.enum.pending,
           ExecutionRunStatus.enum.running,
@@ -134,13 +138,17 @@ export class WorkflowDeadlineDetector {
     );
   }
 
-  private async cancelOverdueRun(runId: string, timeoutMs: number): Promise<void> {
+  /**
+   * A run a forced cancel already reached (`cancel_force`) is cancelled with
+   * `force` again, so a deadline scan never turns that cancel graceful.
+   */
+  private async cancelOverdueRun(runId: string, timeoutMs: number, force: boolean): Promise<void> {
     const reason = `${TimeoutReason.enum.workflow_timeout}: run exceeded the workflow timeout of ${timeoutMs}ms`;
     logger.warn('Workflow run exceeded its deadline; cancelling', { runId, timeoutMs });
 
     // Cancel queued dispatch rows for this run, then drive the run + its
     // running jobs through the canonical cancel path with the distinct reason.
     await this.jobQueue.cancelByRunId(runId);
-    await this.cancelRun(runId, reason);
+    await this.cancelRun(runId, reason, { force });
   }
 }

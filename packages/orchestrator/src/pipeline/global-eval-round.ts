@@ -127,6 +127,8 @@ interface GlobalEvalWireCandidate {
   workflowName: string;
   sourceFile: string;
   hasFilter: boolean;
+  /** The `paths` lists the orchestrator could only match conservatively; omitted when none. */
+  deferredPaths?: string[][];
 }
 
 /**
@@ -174,8 +176,9 @@ export function hasDeferredGenerator(lockEntry: LockWorkflow): boolean {
  * those that must go through an eval round first.
  *
  * A candidate needs the round when it declares a `filter` (only the agent may
- * run the predicate) or carries a needs-free `DynamicJobFn` (only the agent may
- * run the generator, and it depends on nothing the run produces). Everything
+ * run the predicate), carries a needs-free `DynamicJobFn` (only the agent may
+ * run the generator, and it depends on nothing the run produces), or matched
+ * with deferred `paths` (only the agent's clone holds the diff). Everything
  * else — static jobs, and result-aware generators the run evaluates later — is
  * handed to the dispatch pipeline as declared, so routing it through a round
  * would add a job dispatch and an agent round trip for nothing.
@@ -188,8 +191,12 @@ export function partitionCandidates(candidates: readonly GlobalEvalCandidate[]):
   const needsRound: GlobalEvalCandidate[] = [];
   for (const candidate of candidates) {
     // fails-when: a candidate whose only generators are result-aware is sent to the round
-    // breaks-if-wrong: a candidate with a needs-free generator or a filter must still need the round
-    if (candidate.lockEntry.hasFilter === true || hasRoundGenerator(candidate.lockEntry)) {
+    // breaks-if-wrong: a candidate with a needs-free generator, a filter or deferred paths must still need the round
+    if (
+      candidate.lockEntry.hasFilter === true ||
+      hasRoundGenerator(candidate.lockEntry) ||
+      (candidate.decision?.deferredPaths?.length ?? 0) > 0
+    ) {
       needsRound.push(candidate);
     } else {
       immediate.push(candidate);
@@ -669,6 +676,9 @@ function toWireCandidate(candidate: GlobalEvalCandidate): GlobalEvalWireCandidat
     workflowName: lockEntry.name,
     sourceFile: lockEntry.source?.file ?? reg.lockEntry.source?.file ?? reg.sourceFile ?? '',
     hasFilter: lockEntry.hasFilter === true,
+    ...(candidate.decision?.deferredPaths?.length && {
+      deferredPaths: candidate.decision.deferredPaths,
+    }),
   };
 }
 

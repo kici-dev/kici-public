@@ -486,6 +486,13 @@ const baseSchema = z.object({
   reconnectReplayWindowHours: z.coerce.number().positive().default(24),
   cacheBuildTimeoutMs: z.coerce.number().default(600_000), // 10 min build timeout
   cacheMaxTarballBytes: z.coerce.number().default(524_288_000), // Max dep tarball size (500MB)
+  // Cluster-wide bound (ms) on how long a build job's `job.status success`
+  // waits for the cache publish (metadata + pointer) its agent reported just
+  // before it, so the jobs waiting on the build dispatch with the cache URL.
+  // 0 turns the wait off. Per-org override in
+  // org_settings.cache_upload_settle_timeout_ms (kici-admin org-settings
+  // cache-upload-settle).
+  cacheUploadSettleTimeoutMs: z.coerce.number().int().min(0).default(10_000),
   // User-facing cache (ctx.cache / declarative job/step cache). Per-org byte
   // quota and per-entry TTL for the UserCache layer. Defaults: 5 GiB / 7 days.
   userCacheQuotaBytes: z.coerce
@@ -1008,6 +1015,7 @@ export const envDef = defineEnv({
     reconnectReplayWindowHours: 'KICI_ORCH_RECONNECT_REPLAY_WINDOW_HOURS',
     cacheBuildTimeoutMs: 'KICI_CACHE_BUILD_TIMEOUT_MS',
     cacheMaxTarballBytes: 'KICI_CACHE_MAX_TARBALL_BYTES',
+    cacheUploadSettleTimeoutMs: 'KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS',
     userCacheQuotaBytes: 'KICI_USER_CACHE_QUOTA_BYTES',
     userCacheTtlMs: 'KICI_USER_CACHE_TTL_MS',
     artifactQuotaBytes: 'KICI_ARTIFACT_QUOTA_BYTES',

@@ -889,3 +889,62 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
     });
   });
 });
+
+describe('kici-admin org-settings cache-upload-settle', () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockPatch: ReturnType<typeof vi.fn>;
+  let client: Partial<AdminApiClient>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    mockPatch = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    client = { get: mockGet as any, patch: mockPatch as any };
+  });
+
+  it('show fetches the settings and renders a missing field as the cluster default', async () => {
+    // SAMPLE_SETTINGS has no cacheUploadSettleTimeoutMs — an older orchestrator.
+    const { stdout } = await runCommand(
+      ['org-settings', 'cache-upload-settle', 'show', '--org', ORG],
+      client,
+    );
+    expect(mockGet).toHaveBeenCalledWith(
+      `/api/v1/admin/org-settings/global-workflows?customerId=${encodeURIComponent(ORG)}`,
+    );
+    expect(stdout).toMatch(/Cache upload settle:\s+\(cluster default\)/);
+  });
+
+  it('set patches cacheUploadSettleTimeoutMs', async () => {
+    await runCommand(['org-settings', 'cache-upload-settle', 'set', '5000', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      cacheUploadSettleTimeoutMs: 5000,
+    });
+  });
+
+  it('set accepts 0 (no wait)', async () => {
+    await runCommand(['org-settings', 'cache-upload-settle', 'set', '0', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      cacheUploadSettleTimeoutMs: 0,
+    });
+  });
+
+  it('set rejects a non-integer with exit 1 and sends nothing', async () => {
+    // fails-when: the CLI forwards an invalid value.
+    const { exitCode } = await runCommand(
+      ['org-settings', 'cache-upload-settle', 'set', '1.5', '--org', ORG],
+      client,
+    );
+    expect(exitCode).toBe(1);
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('reset clears the override to null', async () => {
+    await runCommand(['org-settings', 'cache-upload-settle', 'reset', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      cacheUploadSettleTimeoutMs: null,
+    });
+  });
+});

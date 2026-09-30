@@ -49,7 +49,7 @@ interface ArtifactsApi {
 - **`paths`** are repo-root-relative or `~`-prefixed, exactly like [cache paths](./caching.md) — the same packing, path-safety, and multi-root anchoring apply. Absolute paths and `..` escapes are rejected.
 - **`destDir`** on download defaults to the step's working directory; pass an explicit directory to extract elsewhere.
 
-Both methods verify the content hash end to end: the SHA-256 computed at upload is checked again when the tarball is downloaded, so a corrupted transfer fails loudly.
+Both methods verify the content hash end to end: the SHA-256 computed at upload is checked again when the tarball is downloaded, before anything is extracted, so a corrupted transfer fails loudly.
 
 `upload()` returns only once the orchestrator confirms it recorded the artifact. If that commit cannot be completed — the uploaded object never landed, or the orchestrator's storage or database is unreachable long enough for its retries to run out — the step fails with that reason instead of returning successfully. So a green upload step always means a downstream job can download the artifact. The reason names which kind of failure it was, not the orchestrator's internal error text — an internal commit failure is one to take to whoever runs the orchestrator, who can read the details in its logs.
 

@@ -34,7 +34,6 @@ import type {
   LockWorkflow,
   SimulatedEvent,
   LockFileParseError,
-  ChangedFilesResult,
   LockContentRequirement,
   WorkflowDecision,
   FileContentsFetcher,
@@ -98,6 +97,15 @@ import {
   type RoundClearedCandidate,
 } from './global-dispatch.js';
 import { resumeWorkflow, rejectWorkflow } from './resume-workflow.js';
+import {
+  resolveEventChangedFiles,
+  stampChangedFiles,
+  withDefaultBranch,
+  withoutCrossSourcePrDeferral,
+  type ResolvedChangedFiles,
+} from './changed-files.js';
+import { withCrossSourceTally, type CrossSourceTally } from './cross-source-tally.js';
+import { DEGRADED_CHANGED_FILES_REASON } from './degraded-reason.js';
 import { holdGlobalEvalRounds } from './global-round-hold.js';
 import { filterByContentRequirements } from './content-filter.js';
 import {
@@ -119,9 +127,9 @@ import {
   resolveLockFileWithFallback,
   eventTypeToTriggerType,
   extractInboundRepoIdentifier,
+  anyTriggerHasPathPatterns,
   isDefaultBranchPush,
   extractDefaultBranch,
-  anyTriggerHasPathPatterns,
   summarizeDecision,
   capDecisionSummaries,
   buildTriggerEvent,
@@ -285,15 +293,6 @@ async function globalCandidateSurvivesContentFilter(args: {
  */
 export const WebhookIngestOutcome = z.enum(['processed', 'queued', 'duplicate', 'skipped', 'shed']);
 export type WebhookIngestOutcome = z.infer<typeof WebhookIngestOutcome>;
-
-/**
- * Annotation written to a `processed` event-log row when path filters were
- * evaluated against an unavailable changed-files diff (conservative match).
- * Reuses the existing free-text field so the outcome is never a silent
- * `processed / matched 0` — no new event-log status enum value is added.
- */
-const DEGRADED_CHANGED_FILES_REASON =
-  'trigger evaluation degraded: changed files unavailable — path filters matched conservatively';
 
 /** Map a dedup/provider skip reason onto the ingest outcome a route reports. */
 function skipReasonToOutcome(reason: 'duplicate' | 'unknown-provider'): WebhookIngestOutcome {
@@ -459,7 +458,7 @@ async function normalizeWebhookEvent(
   resolvedOrgId: string,
 ): Promise<SimulatedEvent | null> {
   const event = bundle.normalizer.normalizeEvent(info.event, info.action, info.payload);
-  if (event) return event;
+  if (event) return withDefaultBranch(event, info.payload, bundle.normalizer);
   logger.debug('Unknown event type, skipping', {
     deliveryId: info.deliveryId,
     event: info.event,
@@ -560,16 +559,65 @@ function buildCrossSourceEvent(
   }
   const regBundleForNormalization = deps.providerRegistry.getByRoutingKey(candidate.reg.routingKey);
   if (!regBundleForNormalization) return null;
-  return regBundleForNormalization.normalizer.normalizeEvent(inboundEventName, null, info.payload);
+  const normalized = regBundleForNormalization.normalizer.normalizeEvent(
+    inboundEventName,
+    null,
+    info.payload,
+  );
+  return normalized
+    ? withDefaultBranch(normalized, info.payload, regBundleForNormalization.normalizer)
+    : null;
+}
+
+/**
+ * Phase B.2a — Resolve a repo-mode candidate's changed files through the
+ * registration's own bundle and credentials. A registration with no `paths`
+ * trigger resolves to `skipped` without a fetch; the rest share one resolve per
+ * (source, repository) within the delivery. A failure is already
+ * `unavailable`, so one candidate never aborts the fan-out.
+ */
+function resolveCrossSourceChangedFiles(args: {
+  info: WebhookInfo;
+  reg: RegisteredWorkflow;
+  regBundle: ProviderBundle;
+  syntheticEvent: SimulatedEvent;
+  inboundEventName: string;
+  changedFilesMemo: Map<string, Promise<ResolvedChangedFiles>>;
+}): Promise<ResolvedChangedFiles> {
+  const { info, reg, regBundle, syntheticEvent, inboundEventName, changedFilesMemo } = args;
+  const resolveArgs = {
+    bundle: regBundle,
+    credentials: reg.providerContext,
+    repoIdentifier: reg.repoIdentifier,
+    eventName: inboundEventName,
+    payload: info.payload,
+    event: syntheticEvent,
+  };
+  const workflows = [reg.lockEntry as LockWorkflow];
+  // A memoized answer must never be a `skipped` that a sibling registration
+  // with `paths` would then read as "no diff".
+  if (!anyTriggerHasPathPatterns(workflows)) {
+    return resolveEventChangedFiles({ ...resolveArgs, workflows });
+  }
+  const key = `${reg.routingKey}\u0000${reg.repoIdentifier}`;
+  let pending = changedFilesMemo.get(key);
+  if (!pending) {
+    pending = resolveEventChangedFiles(resolveArgs);
+    changedFilesMemo.set(key, pending);
+  }
+  return pending;
 }
 
 /**
  * Phase B.2 — Dispatch a single cross-source candidate via
- * `dispatchMatchedWorkflow`. Checks that the registration's bundle can mint a
+ * `dispatchMatchedWorkflow`. A repo-mode candidate first resolves its changed
+ * files through the registration's bundle, so its `paths` filters decide as
+ * the same-source path's do. Checks that the registration's bundle can mint a
  * clone token (fail-fast on errors — we MUST NOT fall back to the inbound
  * generic bundle which has no credentials for the registration's repo). The
  * token itself is minted again at dispatch, where it is consumed. Returns the
- * count of jobs successfully dispatched for this candidate.
+ * count of jobs successfully dispatched for this candidate, and whether its
+ * paths were evaluated against an unavailable diff.
  */
 async function dispatchOneCrossSourceCandidate(args: {
   info: WebhookInfo;
@@ -577,7 +625,9 @@ async function dispatchOneCrossSourceCandidate(args: {
   resolvedOrgId: string;
   candidate: CrossSourceCandidate;
   inboundEventName: string;
-}): Promise<number> {
+  /** Per-delivery changed-files memo, keyed by (routing key, repository). */
+  changedFilesMemo: Map<string, Promise<ResolvedChangedFiles>>;
+}): Promise<{ jobsDispatched: number; degraded: boolean }> {
   const { info, deps, resolvedOrgId, candidate, inboundEventName } = args;
   const { reg } = candidate;
 
@@ -589,12 +639,32 @@ async function dispatchOneCrossSourceCandidate(args: {
       routingKey: reg.routingKey,
       inboundEventName,
     });
-    return 0;
+    return { jobsDispatched: 0, degraded: false };
   }
 
-  const decisions = matchAllWorkflows([reg.lockEntry], syntheticEvent);
+  const regBundle = deps.providerRegistry.getByRoutingKey(reg.routingKey);
+  const resolved =
+    candidate.matchMode === 'repo' && regBundle
+      ? await resolveCrossSourceChangedFiles({
+          info,
+          reg,
+          regBundle,
+          syntheticEvent,
+          inboundEventName,
+          changedFilesMemo: args.changedFilesMemo,
+        })
+      : undefined;
+  // An event-mode candidate's `webhook()` trigger has no `paths`.
+  const eventWithFiles = resolved
+    ? stampChangedFiles(syntheticEvent, resolved)
+    : { ...syntheticEvent, changedFiles: [] };
+  const noDispatch = { jobsDispatched: 0, degraded: resolved?.status === 'unavailable' };
+
+  const decisions = matchAllWorkflows([reg.lockEntry], eventWithFiles).map((d) =>
+    withoutCrossSourcePrDeferral(d, eventWithFiles),
+  );
   const matchedDecisions = decisions.filter((d) => d.matched);
-  if (matchedDecisions.length === 0) return 0;
+  if (matchedDecisions.length === 0) return noDispatch;
 
   // Composite dedup key: `${inboundDeliveryId}:${registrationId}`.
   // Each registration gets its own slot so re-delivery of the inbound webhook
@@ -605,10 +675,9 @@ async function dispatchOneCrossSourceCandidate(args: {
       deliveryId: info.deliveryId,
       registrationId: reg.id,
     });
-    return 0;
+    return noDispatch;
   }
 
-  const regBundle = deps.providerRegistry.getByRoutingKey(reg.routingKey);
   if (!regBundle) {
     logger.warn('Cross-source dispatch: registration bundle not found', {
       deliveryId: info.deliveryId,
@@ -616,7 +685,7 @@ async function dispatchOneCrossSourceCandidate(args: {
       routingKey: reg.routingKey,
     });
     crossSourceErrorsTotal.add(1, { reason: 'bundle_missing' });
-    return 0;
+    return noDispatch;
   }
 
   // Fail-fast clone-token issuance check through the registration's bundle.
@@ -634,7 +703,7 @@ async function dispatchOneCrossSourceCandidate(args: {
       error: toErrorMessage(err),
     });
     crossSourceErrorsTotal.add(1, { reason: 'clone_token' });
-    return 0;
+    return noDispatch;
   }
 
   // Cross-source is a dispatch path, so it consults the policy through the same
@@ -665,11 +734,6 @@ async function dispatchOneCrossSourceCandidate(args: {
     const crossRunId = randomUUID();
     enrichRequestContext({ runId: crossRunId });
 
-    const syntheticEventWithFiles: SimulatedEvent = {
-      ...syntheticEvent,
-      changedFiles: [],
-    };
-
     // Synthesize a single-workflow lockfile so the helper's internal lookup
     // (by workflow.name) still resolves. lockfileHash is cleared so the dep
     // cache check becomes a no-op; the bundle cache + build job path is also
@@ -698,8 +762,10 @@ async function dispatchOneCrossSourceCandidate(args: {
       // second repository — so the defining repository IS `repoIdentifier`.
       workflowRepoIdentifier: reg.repoIdentifier,
       credentials: crossSourceCredentials,
+      // Init and eval jobs recompute the diff from `event`; execution jobs
+      // carry the resolved files.
       event: syntheticEvent,
-      eventWithFiles: syntheticEventWithFiles,
+      eventWithFiles,
       ref: reg.commitSha ?? 'HEAD',
       fullLockFile: syntheticLockFile,
       resolvedOrgId,
@@ -732,25 +798,24 @@ async function dispatchOneCrossSourceCandidate(args: {
 
     dispatchedCount += helperResult.dispatchedJobCount;
   }
-  return dispatchedCount;
+  return { jobsDispatched: dispatchedCount, degraded: noDispatch.degraded };
 }
 
 /**
  * Phase B.3 — After all candidates are dispatched (or zero matched), forward
- * the cross-source delivery summary to Platform, record metrics, and write
- * the event log row. The caller returns immediately after this — there is no
- * per-repo path for cross-source dispatches.
+ * the cross-source delivery summary to Platform and log it. The event-log row
+ * and the processed metric belong to whichever half finishes the delivery:
+ * `recordCrossSourceOnlyOutcome` for a plain generic delivery, the same-source
+ * path otherwise.
  */
 async function recordCrossSourceCompletion(args: {
   info: WebhookInfo;
   deps: ProcessingDeps;
-  resolvedOrgId: string;
   inboundEventName: string;
   candidatesConsidered: number;
   jobsDispatched: number;
 }): Promise<void> {
-  const { info, deps, resolvedOrgId, inboundEventName, candidatesConsidered, jobsDispatched } =
-    args;
+  const { info, deps, inboundEventName, candidatesConsidered, jobsDispatched } = args;
   if (deps.platformClient) {
     deps.platformClient.send({
       type: 'execution.event',
@@ -772,27 +837,38 @@ async function recordCrossSourceCompletion(args: {
     });
   }
 
-  webhooksProcessedTotal.add(1, {
-    result: jobsDispatched > 0 ? 'matched' : 'skipped',
-  });
-
   logger.info('Cross-source webhook processed', {
     deliveryId: info.deliveryId,
     inboundEventName,
     registrationsConsidered: candidatesConsidered,
     jobsDispatched,
   });
+}
 
-  // Record event-log row for the cross-source dispatch path. Cross-source
-  // dispatches don't have a per-repo concept (the inbound generic webhook has
-  // no repo); the repo is only known on the registration side. We record
-  // `processed` with `matched_count = jobsDispatched`.
+/**
+ * Phase B.4 — The processed metric and event-log row for a plain generic
+ * delivery, whose normalizer reads no repository: the cross-source half is the
+ * whole delivery, so no same-source path runs to write them. The repo is only
+ * known on the registration side, so the row carries none;
+ * `matched_count = jobsDispatched`.
+ */
+async function recordCrossSourceOnlyOutcome(args: {
+  info: WebhookInfo;
+  deps: ProcessingDeps;
+  resolvedOrgId: string;
+  tally: CrossSourceTally;
+}): Promise<void> {
+  const { info, deps, resolvedOrgId, tally } = args;
+  webhooksProcessedTotal.add(1, {
+    result: tally.jobsDispatched > 0 ? 'matched' : 'skipped',
+  });
   if (deps.eventLog) {
     await deps.eventLog.record(info, payloadFromObject(info.payload), {
       orgId: resolvedOrgId,
       source: deps.eventLogSource ?? EventLogSource.enum.direct,
       status: EventLogStatus.enum.processed,
-      matchedCount: jobsDispatched,
+      matchedCount: tally.jobsDispatched,
+      ...(tally.degraded && { errorMessage: DEGRADED_CHANGED_FILES_REASON }),
     });
   }
 }
@@ -800,26 +876,24 @@ async function recordCrossSourceCompletion(args: {
 /**
  * Phase B (top-level) — Cross-source dispatch for inbound generic webhooks.
  *
- * Inbound generic webhooks have no repo / no lock file, so the per-repo
- * same-source matching path would always early-return with `matchedCount=0`.
- * This branch looks up webhook-trigger registrations in the SAME ORG and fans
- * out to each registration's owning bundle.
+ * Looks up other sources' registrations in the SAME ORG — by event name
+ * (`webhook()` triggers) and by the payload's repository (git triggers, whose
+ * `paths` filters resolve through the registration's own bundle) — and fans
+ * out to each registration's owning bundle. Registrations of the inbound
+ * source itself are left to the same-source path.
  *
  * Branch entry: `info.provider === 'generic' && deps.registrationIndex`.
  *
- * Returns `{ handled: true }` when at least one cross-source candidate
- * matched (the caller MUST early-return). Returns `{ handled: false }` when
- * no cross-source candidates matched — the same-source per-repo path below
- * still runs (cross-source is a SUPPLEMENT, not a replacement; the
- * local provider reads the lock file from a
- * bind-mounted repo via the same-source path).
+ * Returns the tally and writes no event-log row: the caller decides whether
+ * the same-source path also runs (it always does when the inbound normalizer
+ * reads a repository) and which half records the delivery.
  */
 async function dispatchCrossSourceWorkflows(
   info: WebhookInfo,
   deps: ProcessingDeps,
   event: SimulatedEvent,
   resolvedOrgId: string,
-): Promise<{ handled: boolean }> {
+): Promise<CrossSourceTally> {
   // Guard: the inbound event name lives in event.action for generic
   // webhooks (the generic normalizer sets event.type = 'generic_webhook').
   // Fall back to info.event if action is unset.
@@ -837,29 +911,78 @@ async function dispatchCrossSourceWorkflows(
       inboundEventName,
       orgId: resolvedOrgId,
     });
-    return { handled: false };
+    return { candidatesConsidered: 0, jobsDispatched: 0, degraded: false };
   }
 
+  const changedFilesMemo = new Map<string, Promise<ResolvedChangedFiles>>();
   let jobsDispatched = 0;
+  let degraded = false;
   for (const candidate of candidates) {
-    jobsDispatched += await dispatchOneCrossSourceCandidate({
+    const outcome = await dispatchOneCrossSourceCandidate({
       info,
       deps,
       resolvedOrgId,
       candidate,
       inboundEventName,
+      changedFilesMemo,
     });
+    jobsDispatched += outcome.jobsDispatched;
+    degraded ||= outcome.degraded;
   }
 
   await recordCrossSourceCompletion({
     info,
     deps,
-    resolvedOrgId,
     inboundEventName,
     candidatesConsidered: candidates.length,
     jobsDispatched,
   });
-  return { handled: true };
+  return { candidatesConsidered: candidates.length, jobsDispatched, degraded };
+}
+
+/** How the same-source half proceeds after the cross-source half ran. */
+type CrossSourceRouting =
+  | { done: true }
+  | {
+      done: false;
+      /** The deps the same-source half uses; they fold the cross-source tally into its event-log row. */
+      deps: ProcessingDeps;
+      /** The repository cross-source repo mode read registrations for, when it ran. */
+      crossSourceRepo: string | null;
+    };
+
+/**
+ * Phase B (routing) — Run the cross-source half of a generic delivery and
+ * decide what the same-source half does. The halves are disjoint: cross-source
+ * dispatches only other sources' registrations, and the inbound source's own
+ * workflows always evaluate when its normalizer reads a repository.
+ *
+ * - A plain generic delivery with candidates is finished here: its event-log
+ *   row and metric are written, and the same-source path (which reads no
+ *   repository) does not run.
+ * - A repository-reading delivery continues with deps that fold the
+ *   cross-source tally into the single event-log row the same-source path
+ *   writes.
+ */
+async function routeCrossSource(args: {
+  info: WebhookInfo;
+  deps: ProcessingDeps;
+  event: SimulatedEvent;
+  resolvedOrgId: string;
+  bundle: ProviderBundle;
+}): Promise<CrossSourceRouting> {
+  const { info, deps, event, resolvedOrgId, bundle } = args;
+  if (info.provider !== 'generic' || !deps.registrationIndex) {
+    return { done: false, deps, crossSourceRepo: null };
+  }
+  const tally = await dispatchCrossSourceWorkflows(info, deps, event, resolvedOrgId);
+  const crossSourceRepo = extractInboundRepoIdentifier(info.payload);
+  if (tally.candidatesConsidered === 0) return { done: false, deps, crossSourceRepo };
+  if (!bundle.normalizer.extractRepoIdentifier(info.payload)) {
+    await recordCrossSourceOnlyOutcome({ info, deps, resolvedOrgId, tally });
+    return { done: true };
+  }
+  return { done: false, deps: withCrossSourceTally(deps, tally), crossSourceRepo };
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,6 +1315,75 @@ interface LockFileOutcome {
 }
 
 /**
+ * Phase E.1 — A lock file is present but unparseable and nothing else
+ * resolved: record a `lock_resolution` init-failure run and the
+ * `lockfile_corrupt` event-log row.
+ */
+async function recordCorruptLockFile(args: {
+  info: WebhookInfo;
+  deps: ProcessingDeps;
+  event: SimulatedEvent;
+  payload: Record<string, unknown>;
+  resolvedOrgId: string;
+  repoIdentifier: string;
+  credentials: Record<string, unknown>;
+  ref: string;
+  corruptError: LockFileParseError | undefined;
+}): Promise<void> {
+  const { info, deps, event, payload, resolvedOrgId, repoIdentifier, credentials, ref } = args;
+  const corruptRunId = randomUUID();
+  const message =
+    args.corruptError?.message ?? `Lock file for ${repoIdentifier} could not be parsed`;
+  logger.warn('Lock file present but unparseable — recording lock_resolution init failure', {
+    deliveryId: info.deliveryId,
+    repoIdentifier,
+    ref,
+  });
+  if (deps.executionTracker) {
+    await deps.executionTracker.recordInitFailureRun({
+      runId: corruptRunId,
+      workflowName: '(unresolved workflow)',
+      provider: info.provider,
+      repoIdentifier,
+      // The lock file that failed to parse is this repository's own, so the
+      // failure is per-repository however the workflows inside it were
+      // declared. No organization-wide workflow is in scope here: the global
+      // arm runs against registrations, never against this file.
+      workflowRepoIdentifier: repoIdentifier,
+      // The run row's `ref` is the branch the run PRESENTS, matching what
+      // `onExecutionStarted` writes everywhere else and what the context branch
+      // gate evaluates. A job's checkout ref (the PR head branch) is a different
+      // value and does not belong in this column.
+      ref: event.targetBranch ?? ref,
+      // The real commit SHA is unknown when the lock file can't be read; reuse
+      // the resolved ref as the best available locator for the failed run.
+      sha: ref,
+      deliveryId: info.deliveryId ?? null,
+      providerContext: (credentials ?? {}) as Record<string, unknown>,
+      routingKey: info.routingKey,
+      initFailure: {
+        scope: 'run',
+        category: InitFailureCategory.enum.lock_resolution,
+        message,
+      },
+      triggerEvent: buildTriggerEvent(event.type, event.action),
+      commitMessage: extractCommitMessage(info.event, payload),
+    });
+  }
+  webhooksProcessedTotal.add(1, { result: 'skipped' });
+  if (deps.eventLog) {
+    await deps.eventLog.record(info, payloadFromObject(info.payload), {
+      orgId: resolvedOrgId,
+      source: deps.eventLogSource ?? EventLogSource.enum.direct,
+      status: EventLogStatus.enum.lockfile_corrupt,
+      matchedCount: 0,
+      repoIdentifier,
+      ref,
+    });
+  }
+}
+
+/**
  * Phase E — Fetch the lock file via the multi-provider fallback resolver. The
  * resolver tries the inbound bundle's fetcher first, then iterates other
  * same-customer registrations for this repo. When fallback fires, the dispatch
@@ -1214,6 +1406,8 @@ async function fetchLockFileWithFallbackPhase(args: {
   ref: string;
   isPREvent: boolean;
   lockFileSource: 'head' | 'base';
+  /** False when cross-source repo mode already evaluated this repository's registrations. */
+  allowRegistrationFallback: boolean;
 }): Promise<LockFileOutcome> {
   const {
     info,
@@ -1227,6 +1421,18 @@ async function fetchLockFileWithFallbackPhase(args: {
     isPREvent,
     lockFileSource,
   } = args;
+  const resolveArgs = {
+    inboundBundle: bundle,
+    inboundRoutingKey: info.routingKey,
+    repoIdentifier,
+    inboundCredentials: credentials,
+    customerId: resolvedOrgId,
+    providerRegistry: deps.providerRegistry,
+    registrationIndex: deps.registrationIndex,
+    lockFileCache: deps.lockFileCache,
+    deliveryId: info.deliveryId,
+    allowRegistrationFallback: args.allowRegistrationFallback,
+  };
 
   if (!bundle.lockFileFetcher) {
     logger.debug('No lock file fetcher available for inbound provider, relying on fallback', {
@@ -1245,30 +1451,8 @@ async function fetchLockFileWithFallbackPhase(args: {
   const baseBranchRef = event.baseBranch;
   if (isPREvent && lockFileSource === 'base' && baseBranchRef) {
     const [baseResult, headResult] = await Promise.all([
-      resolveLockFileWithFallback({
-        inboundBundle: bundle,
-        inboundRoutingKey: info.routingKey,
-        repoIdentifier,
-        ref: baseBranchRef,
-        inboundCredentials: credentials,
-        customerId: resolvedOrgId,
-        providerRegistry: deps.providerRegistry,
-        registrationIndex: deps.registrationIndex,
-        lockFileCache: deps.lockFileCache,
-        deliveryId: info.deliveryId,
-      }),
-      resolveLockFileWithFallback({
-        inboundBundle: bundle,
-        inboundRoutingKey: info.routingKey,
-        repoIdentifier,
-        ref,
-        inboundCredentials: credentials,
-        customerId: resolvedOrgId,
-        providerRegistry: deps.providerRegistry,
-        registrationIndex: deps.registrationIndex,
-        lockFileCache: deps.lockFileCache,
-        deliveryId: info.deliveryId,
-      }),
+      resolveLockFileWithFallback({ ...resolveArgs, ref: baseBranchRef }),
+      resolveLockFileWithFallback({ ...resolveArgs, ref }),
     ]);
     lockFile = baseResult.lockFile;
     // The base result is the one short-circuited on; surface its corrupt outcome.
@@ -1284,18 +1468,7 @@ async function fetchLockFileWithFallbackPhase(args: {
       resolvedFallbackRoutingKey = fbSource.fallbackRoutingKey;
     }
   } else {
-    const result = await resolveLockFileWithFallback({
-      inboundBundle: bundle,
-      inboundRoutingKey: info.routingKey,
-      repoIdentifier,
-      ref,
-      inboundCredentials: credentials,
-      customerId: resolvedOrgId,
-      providerRegistry: deps.providerRegistry,
-      registrationIndex: deps.registrationIndex,
-      lockFileCache: deps.lockFileCache,
-      deliveryId: info.deliveryId,
-    });
+    const result = await resolveLockFileWithFallback({ ...resolveArgs, ref });
     lockFile = result.lockFile;
     corrupt = result.resolvedVia === 'corrupt';
     corruptError = result.corruptError;
@@ -2498,10 +2671,26 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
     await deps.registrationIndex.refreshIfNeeded(remoteVersion);
   }
 
+  // Resolve the changed files over the registrations this pass evaluates, so a
+  // global workflow's `paths` filter decides against the event's real diff.
+  const triggerType = eventTypeToTriggerType(info.event);
+  const globalLockEntries = deps.registrationIndex
+    .getGlobalByOrgAndTriggerType(resolvedOrgId, triggerType)
+    .map((reg) => reg.lockEntry as LockWorkflow);
+  const resolved = await resolveEventChangedFiles({
+    bundle: dispatchBundle,
+    credentials: dispatchCredentials,
+    repoIdentifier,
+    eventName: info.event,
+    payload: info.payload,
+    event,
+    workflows: globalLockEntries,
+  });
+
   // One stamped event for both halves: the matcher and the dispatched job must
-  // see the same envelope, and the no-lock-file path's raw event carries no
-  // `sourceRepo`.
-  const globalEvent = withSourceRepo(event, repoIdentifier);
+  // see the same envelope, carrying the resolved files and the `sourceRepo`
+  // the no-lock-file path's raw event lacks.
+  const globalEvent = withSourceRepo(stampChangedFiles(event, resolved), repoIdentifier);
 
   const collected = await collectGlobalCandidates({
     info,
@@ -2846,12 +3035,15 @@ interface MatchedSummary {
 }
 
 /**
- * Phase I.1 — Lazily fetch changed files (skipped when no trigger uses path
- * patterns) and match all workflow triggers in the lock file against the
- * resulting event. Records the trigger-match duration metric.
+ * Phase I.1 — Lazily resolve changed files (skipped when no trigger in the lock
+ * file or in the org's organization-wide workflows uses path patterns) and
+ * match all workflow triggers in the lock file against the resulting event.
+ * Records the trigger-match duration metric.
  */
 async function gatherChangedFilesAndMatchTriggers(args: {
   info: WebhookInfo;
+  deps: ProcessingDeps;
+  resolvedOrgId: string;
   payload: Record<string, unknown>;
   event: SimulatedEvent;
   fullLockFile: FullLockFile;
@@ -2861,6 +3053,8 @@ async function gatherChangedFilesAndMatchTriggers(args: {
 }): Promise<{ eventWithFiles: SimulatedEvent; decisions: ReturnType<typeof matchAllWorkflows> }> {
   const {
     info,
+    deps,
+    resolvedOrgId,
     payload,
     event,
     fullLockFile,
@@ -2868,30 +3062,36 @@ async function gatherChangedFilesAndMatchTriggers(args: {
     dispatchCredentials,
     repoIdentifier,
   } = args;
-  // When no trigger uses path patterns the fetch is skipped entirely (the
-  // legitimate fast path); otherwise the fetcher reports whether the diff was
-  // fetched authoritatively or is unavailable (a provider capability gap /
-  // upstream degradation). `unavailable` is threaded so path filters match
-  // conservatively downstream instead of a bare `[]` silently no-matching.
-  const fetched: ChangedFilesResult | { files: string[]; status: 'skipped' } =
-    dispatchBundle.changedFilesFetcher &&
-    anyTriggerHasPathPatterns(fullLockFile.workflows as LockWorkflow[])
-      ? await dispatchBundle.changedFilesFetcher.getChangedFiles(
-          repoIdentifier,
-          info.event,
-          payload,
-          dispatchCredentials,
-        )
-      : { files: [], status: 'skipped' };
+  // The organization-wide workflows the global pass matches against this same
+  // event are candidates too: a global `paths` filter must not read `skipped`
+  // because the repository's own lock declares none.
+  const globalEntries = (
+    deps.registrationIndex?.getGlobalByOrgAndTriggerType(
+      resolvedOrgId,
+      eventTypeToTriggerType(info.event),
+    ) ?? []
+  ).map((reg) => reg.lockEntry as LockWorkflow);
+  // When no trigger uses path patterns nothing is resolved (`skipped`);
+  // otherwise the resolver reports whether the diff was fetched authoritatively
+  // or is unavailable (no fetcher, a truncated result, an API failure). An
+  // `unavailable` path check matches, and moves to the agent when the event has
+  // a git range.
+  const resolved = await resolveEventChangedFiles({
+    bundle: dispatchBundle,
+    credentials: dispatchCredentials,
+    repoIdentifier,
+    eventName: info.event,
+    payload,
+    event,
+    workflows: [...(fullLockFile.workflows as LockWorkflow[]), ...globalEntries],
+  });
 
   // Populate sourceRepo so same-repo global workflows (those authored in the
   // event's own repo and gated by `repos` patterns) evaluate correctly; the
   // cross-repo matching branch below skips same-repo globals on the
   // assumption that per-repo matching already covers them.
   const eventWithFiles: SimulatedEvent = {
-    ...event,
-    changedFiles: fetched.files,
-    changedFilesStatus: fetched.status,
+    ...stampChangedFiles(event, resolved),
     sourceRepo: repoIdentifier,
   };
 
@@ -3330,6 +3530,8 @@ async function matchDispatchAndRecordOutcome(args: {
 
   const { eventWithFiles, decisions: rawDecisions } = await gatherChangedFilesAndMatchTriggers({
     info,
+    deps,
+    resolvedOrgId,
     payload,
     event,
     fullLockFile,
@@ -3510,19 +3712,24 @@ async function recordIgnoredForkPR(args: {
  */
 async function processWebhookPipeline(
   info: WebhookInfo,
-  deps: ProcessingDeps,
+  inboundDeps: ProcessingDeps,
 ): Promise<WebhookIngestOutcome> {
-  const provider = await dedupAndResolveProvider(info, deps);
+  const provider = await dedupAndResolveProvider(info, inboundDeps);
   if (provider.status === 'skip') return skipReasonToOutcome(provider.reason);
   const { resolvedOrgId, bundle } = provider;
 
-  const event = await normalizeWebhookEvent(info, deps, bundle, resolvedOrgId);
+  const event = await normalizeWebhookEvent(info, inboundDeps, bundle, resolvedOrgId);
   if (!event) return WebhookIngestOutcome.enum.skipped;
 
-  if (info.provider === 'generic' && deps.registrationIndex) {
-    const cs = await dispatchCrossSourceWorkflows(info, deps, event, resolvedOrgId);
-    if (cs.handled) return WebhookIngestOutcome.enum.processed;
-  }
+  const crossSource = await routeCrossSource({
+    info,
+    deps: inboundDeps,
+    event,
+    resolvedOrgId,
+    bundle,
+  });
+  if (crossSource.done) return WebhookIngestOutcome.enum.processed;
+  const { deps } = crossSource;
 
   const repoCreds = await extractRepoAndCredentials(info, deps, bundle, resolvedOrgId);
   if (!repoCreds) return WebhookIngestOutcome.enum.skipped;
@@ -3586,59 +3793,23 @@ async function processWebhookPipeline(
     ref,
     isPREvent,
     lockFileSource: trust.lockFileSource,
+    // Cross-source repo mode already evaluated every other-source registration
+    // for this repository, which is exactly what the fallback would re-read.
+    allowRegistrationFallback: crossSource.crossSourceRepo !== repoIdentifier,
   });
 
   if (lockOutcome.corrupt) {
-    const corruptRunId = randomUUID();
-    const message =
-      lockOutcome.corruptError?.message ?? `Lock file for ${repoIdentifier} could not be parsed`;
-    logger.warn('Lock file present but unparseable — recording lock_resolution init failure', {
-      deliveryId: info.deliveryId,
+    await recordCorruptLockFile({
+      info,
+      deps,
+      event,
+      payload,
+      resolvedOrgId,
       repoIdentifier,
+      credentials,
       ref,
+      corruptError: lockOutcome.corruptError,
     });
-    if (deps.executionTracker) {
-      await deps.executionTracker.recordInitFailureRun({
-        runId: corruptRunId,
-        workflowName: '(unresolved workflow)',
-        provider: info.provider,
-        repoIdentifier,
-        // The lock file that failed to parse is this repository's own, so the
-        // failure is per-repository however the workflows inside it were
-        // declared. No organization-wide workflow is in scope here: the global
-        // arm runs against registrations, never against this file.
-        workflowRepoIdentifier: repoIdentifier,
-        // The run row's `ref` is the branch the run PRESENTS, matching what
-        // `onExecutionStarted` writes everywhere else and what the context branch
-        // gate evaluates. A job's checkout ref (the PR head branch) is a different
-        // value and does not belong in this column.
-        ref: event.targetBranch ?? ref,
-        // The real commit SHA is unknown when the lock file can't be read; reuse
-        // the resolved ref as the best available locator for the failed run.
-        sha: ref,
-        deliveryId: info.deliveryId ?? null,
-        providerContext: (credentials ?? {}) as Record<string, unknown>,
-        routingKey: info.routingKey,
-        initFailure: {
-          scope: 'run',
-          category: InitFailureCategory.enum.lock_resolution,
-          message,
-        },
-        triggerEvent: buildTriggerEvent(event.type, event.action),
-        commitMessage: extractCommitMessage(info.event, payload),
-      });
-    }
-    webhooksProcessedTotal.add(1, { result: 'skipped' });
-    if (deps.eventLog) {
-      await deps.eventLog.record(info, payloadFromObject(info.payload), {
-        orgId: resolvedOrgId,
-        source: deps.eventLogSource ?? EventLogSource.enum.direct,
-        status: EventLogStatus.enum.lockfile_corrupt,
-        matchedCount: 0,
-        repoIdentifier,
-        ref,
-      });
-    }
     return WebhookIngestOutcome.enum.processed;
   }
 

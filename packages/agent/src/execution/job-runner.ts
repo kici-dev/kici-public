@@ -82,7 +82,8 @@ import {
 } from './host-isolated-install.js';
 import { redactNpmOutput } from './npm-registry-config.js';
 import { PackageManager } from '@kici-dev/shared/package-manager';
-import { restoreDeps, excludeScratchFromGit } from './dep-restore.js';
+import { excludeScratchFromGit } from './dep-restore.js';
+import { tryRestoreDeps } from './dep-restore-fallback.js';
 import { packNodeModules } from './dep-packer.js';
 import { uploadToPresignedUrl } from './download.js';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
@@ -165,11 +166,17 @@ async function materializeEvalWorkspace(
     return;
   }
 
-  // 1. Restore deps (needed for workflow imports like @kici-dev/sdk)
+  // 1. Restore deps (needed for workflow imports like @kici-dev/sdk). A failed
+  //    restore leaves `depsRestored` false and step 3 installs inline.
+  let depsRestored = false;
   if (dispatch.depsUrl) {
     log('Restoring dependencies from cache');
-    await restoreDeps(workDir, dispatch.depsUrl, dispatch.depsHash);
-    log('Dependencies restored');
+    depsRestored = await tryRestoreDeps({
+      workDir,
+      depsUrl: dispatch.depsUrl,
+      depsHash: dispatch.depsHash,
+      log,
+    });
   }
 
   // 2. Materialize workflow source: extract from cached tarball if present,
@@ -191,10 +198,10 @@ async function materializeEvalWorkspace(
     cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
   }
 
-  // 3. Install deps locally if the cached tarball wasn't provided —
+  // 3. Install deps locally when no cached tarball was restored —
   //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
   const kiciDir = join(workDir, '.kici');
-  if (!dispatch.depsUrl && (await fileExists(join(kiciDir, 'package.json')))) {
+  if (!depsRestored && (await fileExists(join(kiciDir, 'package.json')))) {
     log('Installing dependencies locally');
     await installDeps(kiciDir, {
       npmRegistries: dispatch.npmRegistries,
@@ -1723,17 +1730,24 @@ export class JobRunner {
       return;
     }
 
-    // 1. Restore deps (needed for workflow imports like @kici-dev/sdk)
+    // 1. Restore deps (needed for workflow imports like @kici-dev/sdk). A failed
+    //    restore leaves `depsRestored` false and step 3 installs inline.
+    let depsRestored = false;
     if (dispatch.depsUrl) {
       initLog('Restoring dependencies from cache');
-      await restoreDeps(workDir, dispatch.depsUrl, dispatch.depsHash);
+      depsRestored = await tryRestoreDeps({
+        workDir,
+        depsUrl: dispatch.depsUrl,
+        depsHash: dispatch.depsHash,
+        log: initLog,
+      });
     }
 
     // 2. Materialize the workflow source into workDir (overlay for a test run,
     //    cached tarball, or git clone — plus any attached overlay).
     await this.materializeInitJobSource(dispatch, workDir, initLog);
 
-    // 3. Install deps locally if the cached tarball wasn't provided —
+    // 3. Install deps locally when no cached tarball was restored —
     //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
     const kiciDir = join(workDir, '.kici');
     const hasPackage = await fileExists(join(kiciDir, 'package.json'));
@@ -1742,7 +1756,7 @@ export class JobRunner {
       hasPackageJson: hasPackage,
       source,
     });
-    if (!dispatch.depsUrl && hasPackage) {
+    if (!depsRestored && hasPackage) {
       initLog('Installing dependencies locally');
       await installDeps(kiciDir, {
         npmRegistries: dispatch.npmRegistries,
@@ -2144,6 +2158,8 @@ export class JobRunner {
       dynamicMatrix?: boolean;
       /** From `LockWorkflow.hasFilter` — evaluate the workflow's `filter` first. */
       hasFilter?: boolean;
+      /** Paths the orchestrator could only match conservatively; decided before the filter. */
+      deferredPaths?: string[][];
       event: Record<string, unknown>;
       timeoutMs?: number;
       contentHash?: string;
@@ -2232,8 +2248,14 @@ export class JobRunner {
         hasEnv: initResult.env !== undefined,
         hasConcurrencyGroup: initResult.concurrencyGroup !== undefined,
         filterPassed: initResult.filterPassed,
+        pathsPassed: initResult.pathsPassed,
       });
 
+      if (initResult.pathsPassed === false) {
+        initLog(
+          `Deferred paths matched none of the changed files — '${config.workflowName}' did not trigger, so no job is dispatched`,
+        );
+      }
       if (initResult.filterPassed === false) {
         initLog(
           `Workflow filter returned false — '${config.workflowName}' does not apply to this event, so no job is dispatched`,
@@ -2308,6 +2330,8 @@ export class JobRunner {
        * the generator. A `false` verdict generates no jobs at all.
        */
       hasFilter?: boolean;
+      /** Paths the orchestrator could only match conservatively; a no-match generates no jobs. */
+      deferredPaths?: string[][];
       /** Result-aware generator: declared needs + the frozen upstream snapshot. */
       resultAware?: boolean;
       declaredNeeds?: readonly unknown[];

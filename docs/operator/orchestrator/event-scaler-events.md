@@ -52,14 +52,14 @@ A `kici.scaler.scale-down` event tells a teardown workflow which instance to del
 The schema accepts six values. The orchestrator emits three of them:
 
 - `shutdown` — The agent disconnected, so the orchestrator tore its provision down. A scaler-managed agent stops itself once it goes idle, so an ordinary teardown carries this reason.
-- `heartbeat-timeout` — The agent stopped sending heartbeats, or the coordinator holding it went away.
+- `heartbeat-timeout` — The agent stopped sending heartbeats, or the coordinator holding it went away. The orchestrator sends it as soon as it drops a silent agent. It also drops an agent that does not acknowledge a dispatch, or whose token is revoked or expires, with the same reason. The orchestrator's sweep for stranded provisions sends it too.
 - `spawn-timeout` — The agent never registered in time after the scale-up.
 
 The other three — `idle`, `job-complete` and `drain` — are part of the schema, and no orchestrator path emits them. A workflow must accept them, because the schema does, but a branch on one of them never runs today.
 
 A teardown workflow can log or branch on the reason. The teardown action itself is the same for every reason: delete the instance registered under `agentId`.
 
-`spawn-timeout` and `heartbeat-timeout` come from the orchestrator's own sweep for provisions no agent ever claimed. A `spawn-timeout` covers a provisioning workflow that failed after the scale-up — a cloud API error, a denied quota, a cancelled run — so the workflow should treat it as "delete whatever this scale-up created, if anything". See [orchestrator-side backstop](./event-scaler.md#orchestrator-side-backstop).
+The orchestrator's own sweep sends `spawn-timeout` for a provision no agent ever claimed, and `heartbeat-timeout` for one whose agent went unseen. A `spawn-timeout` covers a provisioning workflow that failed after the scale-up — a cloud API error, a denied quota, a cancelled run — so the workflow should treat it as "delete whatever this scale-up created, if anything". See [orchestrator-side backstop](./event-scaler.md#orchestrator-side-backstop).
 
 ### Which coordinator emits a scale-down
 

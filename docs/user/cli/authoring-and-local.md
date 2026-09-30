@@ -81,8 +81,6 @@ kici preview push --files src/index.ts --files README.md
 | 0    | Preview completed (including zero matches) |
 | 1    | Error                                      |
 
-**Migration from the old `test` command:** The dry-run preview command was renamed from `test` to `preview`. If you were using the old `test` command with a fixture name for remote fixture execution, use `kici run remote <fixture-name>` instead. For local workflow execution, use `kici run <event> --local`.
-
 ### kici local
 
 Manage the **local dev plane** — the warm, per-user orchestrator (plus its own local PostgreSQL) that [`kici run <event> --local`](./runs-and-approvals.md#kici-run-event---local) dispatches through. You rarely need these commands directly: a local run boots the plane on demand and reuses it afterwards. Reach for them to inspect the plane, stop it, read its log, or switch it between offline and Platform-connected mode.
@@ -248,7 +246,7 @@ kici hook install [options]
 **Examples:**
 
 ```bash
-# Auto-detect hook tool (husky, lint-staged, etc.)
+# Auto-detect hook tool (Husky, Lefthook, pre-commit, prek)
 kici hook install
 
 # Force raw git hook
@@ -257,11 +255,13 @@ kici hook install --git
 
 The command auto-detects existing hook tools in your project:
 
-- **Husky**: Adds to `.husky/pre-commit`
-- **lint-staged**: Adds to lint-staged configuration
-- **Raw git**: Writes `.git/hooks/pre-commit`
+- **Husky** (`.husky/`): Adds `kici compile` to `.husky/pre-commit`
+- **Lefthook** (`lefthook.yml`, `.lefthook.yml`, or `.config/lefthook.yml`): Adds a `kici-compile` command to the config, then runs `npx lefthook install`
+- **pre-commit** (`.pre-commit-config.yaml`): Adds a kici hook to the config, then runs `pre-commit install`
+- **prek** (`prek.toml` or `.prek.toml`): Adds a kici hook to `.pre-commit-config.yaml`, then runs `prek install`
+- **Raw git** (`--git`): Writes `.git/hooks/pre-commit`
 
-If multiple tools are detected, you are prompted to choose.
+If multiple tools are detected, you are prompted to choose. In a non-interactive shell or CI, the command uses the first tool in the list above. If no tool is detected, an interactive shell offers a raw git hook; a non-interactive shell installs nothing and tells you to pass `--git`.
 
 ### kici docs
 

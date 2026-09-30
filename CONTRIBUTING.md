@@ -70,7 +70,7 @@ pnpm -r run build
 pnpm -r run test
 ```
 
-Requires Node 24 and pnpm 11, both pinned in `.mise.toml` if you use mise.
+Requires Node.js 24.5.0 or later and pnpm 11, both pinned in `.mise.toml` if you use mise.
 The quickstart at [`docs/user/quickstart.md`](docs/user/quickstart.md)
 covers the end-to-end "author a workflow, run it locally, optionally
 connect a hosted orchestrator" loop.

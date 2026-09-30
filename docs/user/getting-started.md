@@ -7,7 +7,7 @@ KiCI lets you define CI/CD workflows in TypeScript instead of YAML. You get full
 
 ## Prerequisites
 
-- **Node.js 24+** (LTS recommended)
+- **Node.js 24.5.0 or later** (LTS recommended)
 - **pnpm** (or npm/yarn -- examples use pnpm)
 - Familiarity with TypeScript
 

@@ -11,7 +11,7 @@ const MAX_PER_TICK = 20;
 export interface SweepStuckCancellingDeps {
   db: Kysely<Database>;
   /** The canonical cancel path, bound to this orchestrator's deps. */
-  cancelRun: (runId: string, reason: string) => Promise<unknown>;
+  cancelRun: (runId: string, reason: string, options: { force: boolean }) => Promise<unknown>;
   /**
    * How long a run may sit in `cancelling` before it is re-driven. Twice the
    * recovery grace period: long enough that a graceful agent teardown finishes
@@ -39,7 +39,7 @@ export async function sweepStuckCancelling(deps: SweepStuckCancellingDeps): Prom
   const cutoff = new Date(Date.now() - deps.stuckAfterMs);
   const stuck = await deps.db
     .selectFrom('execution_runs')
-    .select(['run_id'])
+    .select(['run_id', 'cancel_force'])
     .where('status', '=', ExecutionRunStatus.enum.cancelling)
     // A NULL `cancelling_at` means the run entered `cancelling` before the
     // column existed, so its clock is unknown. Re-driving it is idempotent and
@@ -52,7 +52,11 @@ export async function sweepStuckCancelling(deps: SweepStuckCancellingDeps): Prom
   let redriven = 0;
   for (const row of stuck) {
     try {
-      await deps.cancelRun(row.run_id, 'run cancelled (re-driven: cancel did not complete)');
+      // A forced cancel is re-sent forced (`execution_runs.cancel_force`);
+      // any other is re-sent gracefully.
+      await deps.cancelRun(row.run_id, 'run cancelled (re-driven: cancel did not complete)', {
+        force: row.cancel_force === true,
+      });
       redriven++;
     } catch (err) {
       logger.warn('Stuck-cancelling re-drive failed', {

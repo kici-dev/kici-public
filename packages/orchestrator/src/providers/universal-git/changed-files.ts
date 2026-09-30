@@ -8,6 +8,10 @@
  * `commits[].{added,modified,removed}` arrays in the push payload, so we
  * extract them via JSONPath from the already-delivered webhook body.
  *
+ * Forges cap `commits[]`. A preset whose forge sends a total commit count
+ * (`commitsTotal`) or has a documented list cap (`commitsCap`) reports a
+ * truncated push as `unavailable` rather than a partial list.
+ *
  * For PR events we report `unavailable`: no per-commit diff is present in the
  * webhook body, so the upstream trigger matcher matches path filters
  * conservatively (the workflow runs) instead of silently never matching. A
@@ -74,6 +78,9 @@ export class UniversalGitChangedFilesFetcher implements ChangedFilesFetcher {
     }
 
     const p = (payload as Record<string, unknown>) ?? {};
+    // A truncated commits[] lists only part of the push, so its file union is
+    // not authoritative.
+    if (this.isTruncated(p)) return { files: [], status: 'unavailable' };
     const added = JSONPath({ path: this.paths.commitsAdded, json: p, wrap: true }) as unknown[];
     const modified = JSONPath({
       path: this.paths.commitsModified,
@@ -87,6 +94,20 @@ export class UniversalGitChangedFilesFetcher implements ChangedFilesFetcher {
     }) as unknown[];
 
     return { files: collectStrings([...added, ...modified, ...removed]), status: 'fetched' };
+  }
+
+  /** Whether the payload lists fewer commits than the push carried. */
+  private isTruncated(payload: Record<string, unknown>): boolean {
+    const listed = Array.isArray(payload.commits) ? payload.commits.length : 0;
+    if (this.paths.commitsTotal) {
+      const [total] = JSONPath({
+        path: this.paths.commitsTotal,
+        json: payload,
+        wrap: true,
+      }) as unknown[];
+      if (typeof total === 'number' && total > listed) return true;
+    }
+    return this.paths.commitsCap !== undefined && listed >= this.paths.commitsCap;
   }
 
   private classifyEvent(eventType: string): 'push' | 'pull_request' | null {

@@ -18,7 +18,7 @@ import { withStdoutOnStderr } from './run.js';
 import { renderRunBanner } from './run-banner.js';
 import { resolvePlaneForRun } from '../local-plane/resolve-plane.js';
 import { planeLogPath } from '../local-plane/plane-manager.js';
-import { resolveWorkdir } from '../local-plane/source-provider.js';
+import { readParentSha, resolveWorkdir } from '../local-plane/source-provider.js';
 import { ensureLocalSource } from '../local-plane/plane-seed.js';
 import { seedLocalSecrets } from '../local-plane/secret-seed.js';
 import { triggerRun } from '../local-plane/plane-trigger.js';
@@ -232,6 +232,9 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
               : 'push',
         ref: workdir.ref,
         sha: workdir.sha,
+        // The changed files are the snapshot's own commit, so path filters and
+        // `ctx.changedFiles` rules see a real diff.
+        before: readParentSha(workdir.dir, workdir.sha),
         defaultBranch: workdir.branch,
         ...(dispatch && { action: dispatch.action, clientPayload: dispatch.clientPayload }),
       },

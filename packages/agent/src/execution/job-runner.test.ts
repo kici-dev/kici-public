@@ -11,6 +11,8 @@ import {
   buildEvalShell,
 } from './job-runner.js';
 import type { JobExecutionResult } from './sandbox/types.js';
+import { DepRestoreError, DepTarballHashMismatchError } from './dep-restore-errors.js';
+import { DepRestoreOutcome, type DepRestoreReport } from './dep-restore-report.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -234,14 +236,22 @@ vi.mock('./host-install-lockfile.js', () => ({
   checkLockedInstall: vi.fn(async () => null),
 }));
 
-// Mock dep-restore (used by init jobs)
-vi.mock('./dep-restore.js', () => ({
-  restoreDeps: vi.fn().mockResolvedValue(undefined),
-  // The host checkout hides dep-restore scratch dirs from `git status` in the
-  // freshly cloned tree; omitting it here makes the real module's export
-  // undefined and the call site throw.
-  excludeScratchFromGit: vi.fn().mockResolvedValue(undefined),
-}));
+// Mock dep-restore (used by init and evaluation jobs through tryRestoreDeps).
+vi.mock('./dep-restore.js', async () => {
+  const { DepRestoreOutcome } = await import('./dep-restore-report.js');
+  return {
+    restoreDeps: vi.fn().mockResolvedValue({
+      outcome: DepRestoreOutcome.enum.restored,
+      source: 'https://cache.example/deps.tgz',
+      verified: true,
+      attempts: [],
+    }),
+    // The host checkout hides dep-restore temp dirs from `git status` in the
+    // freshly cloned tree; omitting it here makes the real module's export
+    // undefined and the call site throw.
+    excludeScratchFromGit: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 // Mock dep-packer (used by build jobs)
 vi.mock('./dep-packer.js', () => ({
@@ -1896,6 +1906,96 @@ describe('JobRunner', () => {
     expect(call[5].sourceRepo).toEqual(call[5].workflowRepo);
   });
 
+  // fails-when: a dynamic eval job with deferred paths runs the generator for a diff that misses them
+  it('dynamic eval job: a deferred-paths no-match generates no jobs and never runs the generator', async () => {
+    const { evaluateWorkflowFilter } = await import('./init-runner.js');
+    const { extractDynamicJobFn } = await import('./workflow-loader.js');
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(
+      makeDynamicDispatch({
+        deferredPaths: [['src/**']],
+        hasFilter: true,
+        event: { changedFiles: ['docs/a.md'], changedFilesStatus: 'fetched' },
+      }),
+    );
+
+    expect(evaluateWorkflowFilter).not.toHaveBeenCalled();
+    expect(extractDynamicJobFn).not.toHaveBeenCalled();
+    const success = deps.messages.find(
+      (m) => m.type === 'job.status' && (m as { state: string }).state === 'success',
+    ) as { data?: { dynamicJobs?: unknown[] } } | undefined;
+    expect(success?.data?.dynamicJobs).toEqual([]);
+  });
+
+  // breaks-if-wrong: a matching diff must still run the generator
+  it('dynamic eval job: a deferred-paths match runs the generator', async () => {
+    const { extractDynamicJobFn } = await import('./workflow-loader.js');
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(
+      makeDynamicDispatch({
+        deferredPaths: [['src/**']],
+        event: { changedFiles: ['src/a.ts'], changedFilesStatus: 'fetched' },
+      }),
+    );
+
+    expect(extractDynamicJobFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('init job: passes deferred paths to evaluateDynamicFields with a diff to decide them', async () => {
+    const { evaluateDynamicFields } = await import('./init-runner.js');
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(makeInitDispatch({ deferredPaths: [['src/**']] }));
+
+    const call = (evaluateDynamicFields as Mock).mock.calls.at(-1)!;
+    expect(call[3]).toMatchObject({ deferredPaths: [['src/**']], hasFilter: false });
+    expect(call[5]).toBeDefined();
+  });
+
+  // fails-when: a deferred-paths no-match still imports the workflow module before deciding
+  it('init job: a deferred-paths no-match reports pathsPassed:false without loading the module', async () => {
+    const { evaluateDynamicFields } = await import('./init-runner.js');
+    const { loadWorkflowSource } = await import('./workflow-loader.js');
+    (loadWorkflowSource as Mock).mockClear();
+    (evaluateDynamicFields as Mock).mockClear();
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(
+      makeInitDispatch({
+        deferredPaths: [['src/**']],
+        event: { changedFiles: ['docs/a.md'], changedFilesStatus: 'fetched' },
+      }),
+    );
+
+    expect(loadWorkflowSource).not.toHaveBeenCalled();
+    expect(evaluateDynamicFields).not.toHaveBeenCalled();
+    const success = deps.messages.find(
+      (m) => m.type === 'job.status' && (m as { state: string }).state === 'success',
+    ) as { data?: { initResult?: { pathsPassed?: boolean } } } | undefined;
+    expect(success?.data?.initResult).toEqual({ pathsPassed: false });
+  });
+
+  // breaks-if-wrong: a diff that matches the deferred paths must still load and evaluate
+  it('init job: a deferred-paths match loads the module and evaluates as usual', async () => {
+    const { evaluateDynamicFields } = await import('./init-runner.js');
+    const { loadWorkflowSource } = await import('./workflow-loader.js');
+    (loadWorkflowSource as Mock).mockClear();
+    (evaluateDynamicFields as Mock).mockClear();
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(
+      makeInitDispatch({
+        deferredPaths: [['src/**']],
+        event: { changedFiles: ['src/a.ts'], changedFilesStatus: 'fetched' },
+      }),
+    );
+
+    expect(loadWorkflowSource).toHaveBeenCalledTimes(1);
+    expect(evaluateDynamicFields).toHaveBeenCalledTimes(1);
+  });
+
   it('init job: no filter declared means no filter context is built', async () => {
     const { evaluateDynamicFields } = await import('./init-runner.js');
 
@@ -2131,7 +2231,12 @@ describe('JobRunner', () => {
         ['asset.txt'],
       );
       // fails-when: the workflow repository's dependency tarball lands in the source tree
-      expect(restoreDeps).toHaveBeenCalledWith(WORKFLOW_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(restoreDeps).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        DEPS.depsUrl,
+        DEPS.depsHash,
+        expect.objectContaining({ onProgress: expect.any(Function) }),
+      );
       expect(restoreDeps).toHaveBeenCalledTimes(1);
       expect(restoreSource).not.toHaveBeenCalled();
       expect(installDeps).not.toHaveBeenCalled();
@@ -2164,7 +2269,12 @@ describe('JobRunner', () => {
       await new JobRunner(deps).execute(globalDispatch(makeInitDispatch(), { ...DEPS, ...PACK }));
 
       expectDualClone();
-      expect(restoreDeps).toHaveBeenCalledWith(WORKFLOW_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(restoreDeps).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        DEPS.depsUrl,
+        DEPS.depsHash,
+        expect.objectContaining({ onProgress: expect.any(Function) }),
+      );
       expect(restoreSource).toHaveBeenCalledWith(
         WORKFLOW_DIR,
         PACK.sourceTarUrl,
@@ -2191,7 +2301,12 @@ describe('JobRunner', () => {
       expect(gitClone).toHaveBeenCalledWith(
         expect.objectContaining({ repoUrl: 'https://github.com/org/repo.git', workDir: WORK_DIR }),
       );
-      expect(restoreDeps).toHaveBeenCalledWith(WORK_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(restoreDeps).toHaveBeenCalledWith(
+        WORK_DIR,
+        DEPS.depsUrl,
+        DEPS.depsHash,
+        expect.objectContaining({ onProgress: expect.any(Function) }),
+      );
       expect(loadWorkflowSource).toHaveBeenCalledWith(
         WORK_DIR,
         '.kici/workflows/ci.ts',
@@ -2289,8 +2404,79 @@ describe('JobRunner', () => {
       await new JobRunner(deps).execute(globalDispatch(round, DEPS));
 
       expectDualClone();
-      expect(restoreDeps).toHaveBeenCalledWith(WORKFLOW_DIR, DEPS.depsUrl, DEPS.depsHash);
+      expect(restoreDeps).toHaveBeenCalledWith(
+        WORKFLOW_DIR,
+        DEPS.depsUrl,
+        DEPS.depsHash,
+        expect.objectContaining({ onProgress: expect.any(Function) }),
+      );
       expect(finalState(deps)).toBe('success');
+    });
+
+    function failedReport(outcome: DepRestoreOutcome): DepRestoreReport {
+      return { outcome, source: DEPS.depsUrl, verified: false, attempts: [] };
+    }
+    const downloadFailure = (): DepRestoreError =>
+      new DepRestoreError(
+        'Dep tarball download failed: Download failed after 3 attempts: terminated',
+        failedReport(DepRestoreOutcome.enum['download-failed']),
+      );
+
+    it('init job installs inline when the dep restore fails', async () => {
+      // fails-when: a failed restore fails the init job (it had no fallback)
+      // breaks-if-wrong: a successful restore installs nothing (first test of this block)
+      const { restoreDeps } = await import('./dep-restore.js');
+      const { installDeps } = await import('./dep-installer.js');
+      vi.mocked(restoreDeps).mockRejectedValueOnce(downloadFailure());
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute({ ...makeInitDispatch(), ...DEPS });
+
+      expect(installDeps).toHaveBeenCalledWith(`${WORK_DIR}/.kici`, expect.anything());
+      expect(finalState(deps)).toBe('success');
+    });
+
+    it('global init job installs into the workflow repository when the dep restore fails', async () => {
+      const { restoreDeps } = await import('./dep-restore.js');
+      const { installDeps } = await import('./dep-installer.js');
+      vi.mocked(restoreDeps).mockRejectedValueOnce(downloadFailure());
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute(globalDispatch(makeInitDispatch(), DEPS));
+
+      expect(installDeps).toHaveBeenCalledWith(`${WORKFLOW_DIR}/.kici`, expect.anything());
+      expect(finalState(deps)).toBe('success');
+    });
+
+    it('generator evaluation installs inline when the dep restore fails', async () => {
+      const { restoreDeps } = await import('./dep-restore.js');
+      const { installDeps } = await import('./dep-installer.js');
+      vi.mocked(restoreDeps).mockRejectedValueOnce(downloadFailure());
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute({ ...makeDynamicDispatch(), ...DEPS });
+
+      expect(installDeps).toHaveBeenCalledWith(`${WORK_DIR}/.kici`, expect.anything());
+      expect(finalState(deps)).toBe('success');
+    });
+
+    it('init job fails on a dep tarball hash mismatch without installing', async () => {
+      // breaks-if-wrong: the fallback must not install over a corrupted cache entry
+      const { restoreDeps } = await import('./dep-restore.js');
+      const { installDeps } = await import('./dep-installer.js');
+      vi.mocked(restoreDeps).mockRejectedValueOnce(
+        new DepTarballHashMismatchError(
+          'deps-hash',
+          'other',
+          failedReport(DepRestoreOutcome.enum['hash-mismatch']),
+        ),
+      );
+      const deps = makeDeps();
+
+      await new JobRunner(deps).execute({ ...makeInitDispatch(), ...DEPS });
+
+      expect(installDeps).not.toHaveBeenCalled();
+      expect(finalState(deps)).toBe('failed');
     });
   });
 });

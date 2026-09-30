@@ -1080,9 +1080,11 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
       if (!stored) {
         // A peer presented an HMAC proof but no active credential row exists
-        // for its instanceId — typically because a sibling/self token-join just
-        // revoked the shared credential. The peer will delete its credential
-        // file and fall back to its join token on reconnect.
+        // for its instanceId: a sibling/self token-join revoked the shared
+        // credential, the credential expired, or the peer's row lives in
+        // another cluster's database. The peer deletes its credential file and
+        // falls back to its join token, or, for a coordinator without one,
+        // issues itself a new credential unless an operator revoked it.
         logger.warn('Peer credential not found', {
           peerInstanceId: authMsg.instanceId,
           authPath: 'credential-proof',

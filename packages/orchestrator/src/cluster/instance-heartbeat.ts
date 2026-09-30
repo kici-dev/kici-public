@@ -1,4 +1,4 @@
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import { runDetached } from '../helpers/run-detached.js';
@@ -35,6 +35,26 @@ export function instanceLivenessGraceMs(
   heartbeatMs: number = DEFAULT_INSTANCE_HEARTBEAT_MS,
 ): number {
   return Math.max(gracePeriodMs, heartbeatMs * HEARTBEAT_MISSES_BEFORE_DEAD);
+}
+
+/**
+ * Whether `instanceId` has a `cluster_instances` heartbeat inside `graceMs`:
+ * the same liveness the dispatch plane's ownership predicate reads.
+ */
+export async function isInstanceLive(
+  db: Kysely<Database>,
+  instanceId: string,
+  graceMs: number,
+): Promise<boolean> {
+  const row = await db
+    .selectFrom('cluster_instances')
+    .select('instance_id')
+    .where('instance_id', '=', instanceId)
+    .where(
+      sql<boolean>`last_heartbeat_at > NOW() - ${sql.lit(Math.max(0, Math.round(graceMs)))} * INTERVAL '1 millisecond'`,
+    )
+    .executeTakeFirst();
+  return row !== undefined;
 }
 
 export interface InstanceHeartbeatOptions {

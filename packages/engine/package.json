@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -23,7 +23,7 @@
   },
   "license": "AGPL-3.0-only",
   "engines": {
-    "node": ">=24"
+    "node": ">=24.5.0"
   },
   "type": "module",
   "files": [

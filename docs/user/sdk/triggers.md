@@ -91,14 +91,43 @@ push({ tags: ['v*'] });
 
 ### Path filter behavior
 
-A `pr()` or `push()` trigger with `paths` matches the event's changed files
-against your patterns. An available list is matched exactly (an event with no
-matching change — including a diff-less branch create or delete — does not run).
-When the diff is **unavailable** (chiefly a universal-git pull-request event,
-whose webhook carries no diff), path filters match **conservatively** so the
-workflow runs rather than being silently dropped, and the delivery is recorded
-as degraded. GitHub always provides an exact list; a transient API error fails
-loudly, not as empty.
+A `pr()` or `push()` trigger with `paths` matches your patterns against the
+files the event changed. KiCI reads the changed files as a git range, the
+same way for every source:
+
+| Event                                                                                                 | Changed files                                                                   |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Push to an existing branch                                                                            | `git diff before..after`                                                        |
+| Push that creates a branch                                                                            | The files the branch adds, compared with the default branch (`default...after`) |
+| Push that deletes a branch                                                                            | None, so a path filter does not match                                           |
+| Pull request                                                                                          | The files the pull request changes (`base...head`)                              |
+| A push without `before` or `after`, a push that creates the default branch itself, or any other event | No range exists                                                                 |
+
+These rules decide what happens:
+
+- **An exact list:** the orchestrator gets the list from the provider and
+  matches it. A workflow runs only when a changed file matches.
+- **Decided on the agent:** the orchestrator cannot get a complete list, but
+  a range exists. The run starts with an `__init__` job. The agent computes
+  the diff from its clone and matches your patterns. On no match, no other
+  job starts, and the run holds only its `__init__` job. The trace records
+  `[unavailable — decided on agent]`.
+- **Conservative run:** no range exists. The workflow runs, because nobody
+  can compute a diff. The trace records `[unavailable — matched conservatively]`.
+
+The orchestrator cannot get a complete list in these cases:
+
+- A local source, which has no provider API to ask.
+- A universal-git pull request, whose webhook carries no diff.
+- A GitHub compare result with 300 or more files, or a pull request with 3000
+  or more files. GitHub truncates these lists.
+- A forge push payload that lists fewer commits than the push carried (see
+  [universal-git sources](../providers/universal-git.md)).
+- A provider API failure. The delivery continues, and its event-log row
+  records the degraded evaluation.
+
+When a trigger matches outright, the workflow runs with no `__init__` job,
+even when another trigger of the same workflow waits for the agent.
 
 ### Content requirements (`requires`)
 
@@ -559,6 +588,8 @@ Two important rules govern the cross-source path:
 
 1. **The registration's source owns dispatch credentials.** The runtime clone, auth, and check-status posting come from the source the workflow was registered with (via its default-branch push), never from the inbound source. A generic webhook fanning out to a github-registered workflow uses the github bundle's clone token provider — the generic source contributes only the event payload.
 2. **Org isolation is structural.** A webhook delivered to org A can never trigger a workflow registered against org B. The lookup index is keyed on `(customerId, eventName)` so cross-org leakage is impossible.
+
+A `push()` or `pr()` trigger in another source's registration is reached the same way when the inbound payload names its repository (`repository.full_name`). Its `paths` filter applies through the registration's own source: the orchestrator gets the changed files with that source's credentials, with the rules in [path filter behavior](#path-filter-behavior).
 
 The orchestrator emits `kici_cross_source_fanout_size` (histogram) per inbound webhook so operators can observe how many workflows each event reaches.
 

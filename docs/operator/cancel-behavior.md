@@ -84,6 +84,8 @@ Force cancel is available through:
 - **CLI**: `kici runs cancel <runId> --force` or second Ctrl+C during interactive mode
 - **Orchestrator admin API**: `POST /api/v1/admin/runs/:runId/cancel { "force": true }`, authenticated with an admin Bearer token and gated by the `run.cancel` permission. Every attempt -- allowed, denied, or errored -- is written to the access log.
 
+In a cluster, a cancel that cannot reach the coordinator holding the job's agent leaves the run `cancelling`, and the leader sends the cancel again later. A forced cancel stays forced when it is sent again: the run records it in `execution_runs.cancel_force`.
+
 ### When to use force cancel
 
 - Step is stuck in a blocking syscall that ignores SIGTERM

@@ -10,6 +10,7 @@ export type { PeerInfo, PeerAgentInfo, PeerRegistryOptions } from './peer-regist
 export { PeerClient } from './peer-client.js';
 export type { PeerClientOptions } from './peer-client.js';
 export { PeerAuthCoordinator } from './peer-auth-coordinator.js';
+export { coordinatorSelfIssuer } from './coordinator-credential.js';
 export type { AuthDecision, RejectionAction } from './peer-auth-coordinator.js';
 export { createPeerHandler } from './peer-handler.js';
 export type { PeerHandlerDeps } from './peer-handler.js';

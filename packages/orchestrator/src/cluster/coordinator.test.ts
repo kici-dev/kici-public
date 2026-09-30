@@ -95,6 +95,16 @@ function createMockPeerClient(options: { sendAndWaitAckResult?: boolean } = {}) 
   };
 }
 
+/** An outbound client that exists but has not authenticated (reconnecting, or revoked). */
+function createReconnectingPeerClient() {
+  return {
+    ...createMockPeerClient(),
+    send: vi.fn().mockReturnValue(false),
+    sendAndWaitAck: vi.fn().mockResolvedValue(false),
+    state: 'connecting' as const,
+  };
+}
+
 function makePeerInfo(overrides: Partial<PeerInfo> = {}): PeerInfo {
   return {
     instanceId: overrides.instanceId ?? 'peer-1',
@@ -1194,6 +1204,110 @@ describe('RunCoordinator', () => {
       coordinator.cancelRun('nonexistent-run', 'test reason');
 
       expect(peerClient.send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('peer transport', () => {
+    it('cancelJobOnPeer falls back to the inbound link when the outbound client is not connected', () => {
+      const sendToPeerViaHandler = vi.fn().mockReturnValue(true);
+      const { coordinator, deps } = createCoordinator({ sendToPeerViaHandler });
+      deps.getPeerClient.mockReturnValue(createReconnectingPeerClient());
+
+      // fails-when: `client ? client.send : handler` — the dead client wins and
+      // the cancel is reported unreachable.
+      expect(coordinator.cancelJobOnPeer('peer-1', 'run-1', 'job-1', 'user', true)).toBe(true);
+      expect(sendToPeerViaHandler).toHaveBeenCalledWith('peer-1', {
+        type: 'peer.job.cancel',
+        runId: 'run-1',
+        jobId: 'job-1',
+        reason: 'user',
+        force: true,
+      });
+    });
+
+    it('cancelJobOnPeer uses a connected outbound client and leaves the inbound link alone', () => {
+      const sendToPeerViaHandler = vi.fn().mockReturnValue(true);
+      const client = createMockPeerClient();
+      const { coordinator, deps } = createCoordinator({ sendToPeerViaHandler });
+      deps.getPeerClient.mockReturnValue(client);
+
+      expect(coordinator.cancelJobOnPeer('peer-1', 'run-1', 'job-1', 'user')).toBe(true);
+      // breaks-if-wrong: a graceful forward carries no force field.
+      expect(client.send).toHaveBeenCalledWith({
+        type: 'peer.job.cancel',
+        runId: 'run-1',
+        jobId: 'job-1',
+        reason: 'user',
+      });
+      expect(sendToPeerViaHandler).not.toHaveBeenCalled();
+    });
+
+    it('cancelJobOnPeer reports false when neither link can send', () => {
+      const { coordinator, deps } = createCoordinator({
+        sendToPeerViaHandler: vi.fn().mockReturnValue(false),
+      });
+      deps.getPeerClient.mockReturnValue(createReconnectingPeerClient());
+      expect(coordinator.cancelJobOnPeer('peer-1', 'run-1', 'job-1', 'user')).toBe(false);
+    });
+
+    it('cancelRun falls back to the inbound link for a rerouted job', async () => {
+      const peer = makePeerInfo({ instanceId: 'peer-1' });
+      const sendAndWaitAckViaHandler = vi.fn().mockResolvedValue(true);
+      const sendToPeerViaHandler = vi.fn().mockReturnValue(true);
+      const { coordinator, deps } = createCoordinator({
+        sendAndWaitAckViaHandler,
+        sendToPeerViaHandler,
+      });
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
+      deps.getPeerClient.mockReturnValue(createReconnectingPeerClient());
+
+      await coordinator.routeJobs(makeRunContext({ runId: 'run-1' }), [
+        makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
+      ]);
+      coordinator.cancelRun('run-1', 'fail-fast triggered');
+
+      expect(sendToPeerViaHandler).toHaveBeenCalledWith(
+        'peer-1',
+        expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-1' }),
+      );
+    });
+
+    it('reroutes over the inbound link when the outbound client is not connected, with no NAK', async () => {
+      const peer = makePeerInfo({ instanceId: 'peer-1' });
+      const sendAndWaitAckViaHandler = vi.fn().mockResolvedValue(true);
+      const client = createReconnectingPeerClient();
+      const { coordinator, deps } = createCoordinator({ sendAndWaitAckViaHandler });
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
+      deps.getPeerClient.mockReturnValue(client);
+
+      const result = await coordinator.routeJobs(makeRunContext(), [makeJobToRoute()]);
+
+      // fails-when: `canSendViaHandler = !client` — the dead client takes the
+      // reroute, it reads as a NAK, and the job never reaches the peer.
+      expect(result.reroutedJobs).toEqual([
+        expect.objectContaining({ jobName: 'build', peerId: 'peer-1' }),
+      ]);
+      expect(sendAndWaitAckViaHandler).toHaveBeenCalledTimes(1);
+      expect(client.sendAndWaitAck).not.toHaveBeenCalled();
+      expect(coordinator.getNakCount('peer-1')).toBe(0);
+    });
+
+    it('does not retry a NAK from a connected client over the inbound link', async () => {
+      const peer = makePeerInfo({ instanceId: 'peer-1' });
+      const sendAndWaitAckViaHandler = vi.fn().mockResolvedValue(true);
+      const { coordinator, deps } = createCoordinator({ sendAndWaitAckViaHandler });
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
+      deps.getPeerClient.mockReturnValue(createMockPeerClient({ sendAndWaitAckResult: false }));
+
+      await coordinator.routeJobs(makeRunContext(), [makeJobToRoute()]);
+
+      // breaks-if-wrong: a real NAK is final for this peer — sending the same
+      // reroute over the second link would deliver it twice.
+      expect(sendAndWaitAckViaHandler).not.toHaveBeenCalled();
+      expect(coordinator.getNakCount('peer-1')).toBe(1);
     });
   });
 

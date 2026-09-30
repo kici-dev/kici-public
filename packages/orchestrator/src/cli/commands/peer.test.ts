@@ -35,6 +35,7 @@ vi.mock('../../cluster/join-token.js', () => {
 
 vi.mock('../../cluster/peer-credentials.js', () => {
   return {
+    PeerCredentialIssuance: { Self: 'self' },
     PeerCredentialStore: class MockPeerCredentialStore {
       listActive = mockListActive;
       revoke = mockRevoke;
@@ -205,6 +206,46 @@ describe('peer CLI commands', () => {
   });
 
   describe('list', () => {
+    // fails-when: the mapper spreads the store row and prints proof keys.
+    // breaks-if-wrong: every documented field is present.
+    it('emits JSON without credential material', async () => {
+      mockListActive.mockResolvedValue([
+        {
+          id: 'row-1',
+          instanceId: 'coord-a',
+          role: 'coordinator',
+          credentialHash: 'a'.repeat(64),
+          sourceTokenHash: 'b'.repeat(64),
+          routingKeys: [],
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          lastSeenAt: new Date('2026-01-02T00:00:00Z'),
+          lastValidatedBy: 'coord-b',
+          expiresAt: new Date('2026-04-01T00:00:00Z'),
+          revokedAt: null,
+          metadata: { issuance: 'self' },
+        },
+      ]);
+
+      const { stdout } = await runCommand(['peer', 'list', '--json']);
+
+      expect(JSON.parse(stdout)).toEqual({
+        peers: [
+          {
+            id: 'row-1',
+            instanceId: 'coord-a',
+            role: 'coordinator',
+            selfIssued: true,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            lastSeenAt: '2026-01-02T00:00:00.000Z',
+            lastValidatedBy: 'coord-b',
+            expiresAt: '2026-04-01T00:00:00.000Z',
+          },
+        ],
+      });
+      expect(stdout).not.toContain('a'.repeat(64));
+      expect(stdout).not.toContain('b'.repeat(64));
+    });
+
     it('lists active peers in table format', async () => {
       mockListActive.mockResolvedValue([
         {
@@ -251,6 +292,10 @@ describe('peer CLI commands', () => {
       expect(mockRevoke).toHaveBeenCalledWith('inst-42');
       expect(stdout).toContain('inst-42');
       expect(stdout).toContain('revoked');
+      // fails-when: the message promises a disconnect; nothing closes a revoked
+      // peer's open connections, the revoke only refuses its next authentication.
+      expect(stdout).toContain('next connection attempt is refused');
+      expect(stdout).not.toMatch(/disconnected/i);
     });
   });
 

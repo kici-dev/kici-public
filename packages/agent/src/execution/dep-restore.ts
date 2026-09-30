@@ -1,144 +1,93 @@
 /**
  * Dependency restoration from cached tarballs.
  *
- * Downloads a pre-built dependency tarball, verifies SHA-256 integrity,
- * and extracts to .kici/node_modules/ in the work directory.
+ * Three phases, in this order, never overlapping:
  *
- * HTTP/HTTPS downloads use a streaming pipeline (response -> hash transform ->
- * gunzip -> tar extract) to avoid buffering entire tarballs in memory.
- * file:// URLs use a buffer-based approach (local, no streaming benefit).
+ * 1. **Download** the tarball into a file at network speed
+ *    (`resumable-download.ts`): retried, resumed with a `Range` request after
+ *    a cut, each attempt bounded on its own. A `file://` URL is read in place.
+ * 2. **Verify** the file's SHA-256 against the dispatched hash. Nothing is
+ *    extracted from unverified bytes, and a mismatch is final: the key is
+ *    content-addressed, so a second download would read the same bytes.
+ * 3. **Extract** from the file into a scratch dir under a time bound, then
+ *    move the tree into the repository.
  *
- * Streaming downloads have a 5-minute timeout and up to 2 retries.
+ * Downloading first matters because extraction (tens of thousands of small
+ * files) is far slower than the network: a body streamed straight into `tar`
+ * would hold the connection open for the whole extraction, and an object store
+ * that closes it meanwhile fails the restore.
+ *
+ * The temp root is a sibling of `.kici/` at the repository root, never inside
+ * it: the workflow `contentHash` walks `.kici/`, so a leftover there would
+ * change it.
  */
 
-import { createHash } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
-import { createGunzip } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fsPromises from 'node:fs/promises';
-import { x as tarExtract } from 'tar';
-import { createLogger, sha256 } from '@kici-dev/shared';
+import { createLogger } from '@kici-dev/shared';
+import {
+  DEFAULT_DOWNLOAD_LIMITS,
+  DownloadFailedError,
+  describeError,
+  downloadToFile,
+  elapsedMs,
+  redactUrl,
+  type DownloadLimits,
+  type NextAttempt,
+  type DownloadAttempt,
+} from './resumable-download.js';
+import {
+  DepRestoreOutcome,
+  clipDescribedError,
+  formatAttemptFailure,
+  logDepRestoreReport,
+  type DepRestoreReport,
+} from './dep-restore-report.js';
+import { DepRestoreError, DepTarballHashMismatchError } from './dep-restore-errors.js';
+import { extractTarballFile, sha256File } from './tarball-file.js';
 
 const logger = createLogger({ prefix: 'dep-restore' });
 
-/** Download timeout: 5 minutes. */
-export const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+/** Download bounds plus the bound on extraction. */
+export interface DepRestoreLimits extends DownloadLimits {
+  /**
+   * Gunzip + tar extraction from the downloaded file. Matches the inline
+   * install bound (`INSTALL_TIMEOUT_MS`, 10 min): an extraction slower than
+   * installing from the registry is not worth waiting for.
+   */
+  extractTimeoutMs: number;
+}
 
-/** Maximum number of retries for HTTP downloads (0 = no retries). */
-export const MAX_RETRIES = 2;
+export const DEFAULT_DEP_RESTORE_LIMITS: DepRestoreLimits = {
+  ...DEFAULT_DOWNLOAD_LIMITS,
+  extractTimeoutMs: 10 * 60 * 1000,
+};
 
-/**
- * Compute SHA-256 hash of a buffer.
- */
-function computeHash(data: Buffer): string {
-  return sha256(data);
+export interface RestoreDepsOptions {
+  /** Test override of {@link DEFAULT_DEP_RESTORE_LIMITS}. */
+  limits?: Partial<DepRestoreLimits>;
+  /** Receives one human line per failed download attempt, as it happens. */
+  onProgress?: (line: string) => void;
 }
 
 /**
- * Extract a gzip tarball from a buffer into the target directory.
- * Used for file:// URLs where streaming provides no benefit.
+ * Basename prefix of the per-restore temp root at the repository root. The
+ * clone phase registers {@link SCRATCH_DIR_GIT_EXCLUDE_GLOB} in
+ * `.git/info/exclude`, so the glob and the prefix are defined together.
  */
-async function extractTarball(data: Buffer, targetDir: string): Promise<void> {
-  await mkdir(targetDir, { recursive: true });
-  const readable = Readable.from(data);
-  await new Promise<void>((resolve, reject) => {
-    readable
-      .pipe(tarExtract({ cwd: targetDir, gzip: true }))
-      .on('finish', resolve)
-      .on('error', reject);
-  });
-}
+const TEMP_ROOT_PREFIX = '.kici-dep-restore-';
 
 /**
- * Stream download and extract an HTTP/HTTPS tarball.
- *
- * Computes SHA-256 hash on the fly via a Transform stream.
- * Returns the computed hash of the compressed tarball data.
+ * `.git/info/exclude` pattern matching every temp root {@link restoreDeps}
+ * creates, anchored at the repository root.
  */
-export async function streamFetchAndExtract(url: string, targetDir: string): Promise<string> {
-  const response = await fetch(url, {
-    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  if (!response.body) throw new Error('No response body');
-
-  // Cast needed: fetch() returns a DOM ReadableStream, but Readable.fromWeb()
-  // expects the Node.js web stream type. They are structurally identical at runtime.
-  const nodeStream = Readable.fromWeb(response.body as any);
-  const hash = createHash('sha256');
-
-  const hashTransform = new Transform({
-    transform(chunk, _encoding, callback) {
-      hash.update(chunk);
-      callback(null, chunk);
-    },
-  });
-
-  await mkdir(targetDir, { recursive: true });
-  await pipeline(nodeStream, hashTransform, createGunzip(), tarExtract({ cwd: targetDir }));
-
-  return hash.digest('hex');
-}
-
-/**
- * Path-relative-to-`.kici/` glob that matches every scratch dir
- * `extractIntoScratch` may create. Surfaced so the clone phase can register
- * it in `.git/info/exclude` (see `excludeScratchFromGit`) — keeping the glob
- * and the exclude rule in the same file means future renames of the scratch
- * dir prefix can't fall out of sync with the git-ignore wiring.
- */
-const SCRATCH_DIR_BASENAME_PREFIX = '.dep-restore-scratch-';
-
-/**
- * Glob suitable for `.gitignore` / `.git/info/exclude` that matches every
- * scratch dir created by `extractIntoScratch`, anchored to the workflow
- * working tree's `.kici/` subdir.
- */
-export const SCRATCH_DIR_GIT_EXCLUDE_GLOB = `.kici/${SCRATCH_DIR_BASENAME_PREFIX}*`;
-
-/**
- * Extract the dep tarball into a per-attempt scratch dir so retries never race
- * with still-draining I/O from a previous failed attempt.
- *
- * When `pipeline()` rejects on a network error or AbortSignal timeout, the
- * underlying `tar.x` continues flushing pending file writes for an unbounded
- * window after the promise settles — `pipeline` does not block on async
- * filesystem side effects. If the next retry then runs `rm -rf` on the same
- * `node_modules/`, the walk races with those writes and `rmdir` fails with
- * ENOTEMPTY (new files keep appearing under a directory we just emptied).
- *
- * We sidestep the race entirely by extracting each attempt into a unique
- * scratch dir under `.kici/`. Failed attempts leave orphan scratch dirs whose
- * draining writes are harmless — the next attempt does not touch them. On
- * success `moveScratchIntoRepo` renames the extracted entries into place
- * (atomic on the same filesystem), then best-effort cleans the scratch dir.
- *
- * Scratch dirs land inside the customer's cloned working tree, so the clone
- * phase registers `SCRATCH_DIR_GIT_EXCLUDE_GLOB` in `.git/info/exclude` to
- * keep them out of `git status` for any workflow step that shells out to git.
- * See `excludeScratchFromGit`.
- */
-async function extractIntoScratch(
-  url: string,
-  kiciDir: string,
-  attempt: number,
-): Promise<{ scratchDir: string; hash: string }> {
-  const scratchDir = join(
-    kiciDir,
-    `${SCRATCH_DIR_BASENAME_PREFIX}${process.pid}-${attempt}-${Date.now()}`,
-  );
-  await mkdir(scratchDir, { recursive: true });
-  const hash = await streamFetchAndExtract(url, scratchDir);
-  return { scratchDir, hash };
-}
+export const SCRATCH_DIR_GIT_EXCLUDE_GLOB = `/${TEMP_ROOT_PREFIX}*`;
 
 /**
  * Append `SCRATCH_DIR_GIT_EXCLUDE_GLOB` to `${repoWorkDir}/.git/info/exclude`
- * so any in-flight or orphaned dep-restore scratch dirs are invisible to
+ * so an in-flight or leftover dep-restore temp root is invisible to
  * `git status` / `git add` inside the customer's cloned working tree.
  *
  * Why `.git/info/exclude` and not `.gitignore`:
@@ -150,11 +99,6 @@ async function extractIntoScratch(
  *   an empty (template-commented) file on `git init` / `git clone`, so it
  *   already exists by the time we're called.
  *
- * Why this lives next to `extractIntoScratch`:
- * - The exclude glob is tied 1:1 to the scratch dir naming convention. If
- *   the prefix ever changes, the rule must change too. Defining both in the
- *   same file means a rename touches one place, not two.
- *
  * Best-effort: if the exclude file is missing (e.g. caller sandbox blocked
  * `git clone` and the dir layout differs) we log and continue — failing the
  * job over a missing git ignore wiring would be worse than the cosmetic
@@ -165,15 +109,13 @@ async function extractIntoScratch(
  *
  * @param repoWorkDir - The git working tree root (the dir that contains
  *   `.git/`). For normal workflows this is the agent's job workDir; for
- *   global workflows it is the workflow repo dir (whose `.kici/` carries
- *   the scratch dirs).
+ *   global workflows it is the workflow repo dir (whose `.kici/` the restore
+ *   fills).
  */
 export async function excludeScratchFromGit(repoWorkDir: string): Promise<void> {
   const excludePath = join(repoWorkDir, '.git', 'info', 'exclude');
   try {
     const existing = await fsPromises.readFile(excludePath, 'utf-8').catch(() => '');
-    // Match the bare glob, ignoring leading whitespace/comments, so we treat
-    // an existing entry the same regardless of surrounding template content.
     const alreadyPresent = existing
       .split('\n')
       .some((line) => line.trim() === SCRATCH_DIR_GIT_EXCLUDE_GLOB);
@@ -181,7 +123,7 @@ export async function excludeScratchFromGit(repoWorkDir: string): Promise<void> 
     const suffix = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
     await fsPromises.appendFile(
       excludePath,
-      `${suffix}# kici: hide dep-restore scratch dirs from customer git status\n${SCRATCH_DIR_GIT_EXCLUDE_GLOB}\n`,
+      `${suffix}# kici: hide dep-restore temp dirs from customer git status\n${SCRATCH_DIR_GIT_EXCLUDE_GLOB}\n`,
     );
   } catch (err) {
     logger.warn('Failed to register scratch dir glob in .git/info/exclude', {
@@ -249,16 +191,25 @@ async function moveInto(src: string, dest: string): Promise<void> {
   await fsPromises.rename(src, dest);
 }
 
-/** Best-effort cleanup of a settled scratch dir; logs and continues on failure. */
-async function cleanupScratch(scratchDir: string): Promise<void> {
+/**
+ * Remove the temp root. After a failed extraction `tar` may still be flushing
+ * writes into it, which `rm` meets as `ENOTEMPTY`; `maxRetries` absorbs that.
+ * A leftover sits outside `.kici/`, is hidden from git, and goes with the job
+ * workdir.
+ */
+async function removeTempRoot(tempRoot: string): Promise<void> {
   try {
-    await fsPromises.rm(scratchDir, { recursive: true, force: true });
-  } catch (cleanupErr) {
-    logger.warn('Scratch dir cleanup failed (orphan left behind)', {
-      scratchDir,
-      error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+    await fsPromises.rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    logger.warn('Dep restore temp dir cleanup failed (left behind)', {
+      tempRoot,
+      error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+function toReportAttempt(a: DownloadAttempt): DepRestoreReport['attempts'][number] {
+  return { ...a, ...(a.error && { error: clipDescribedError(a.error) }) };
 }
 
 /**
@@ -266,13 +217,11 @@ async function cleanupScratch(scratchDir: string): Promise<void> {
  *
  * The tarball is packed repo-root-relative (see `dep-packer.ts`): every manager
  * carries `.kici/node_modules`; pnpm additionally carries the root
- * `node_modules/.pnpm` store and the in-repo workspace siblings `.kici` resolves.
- * Restore extracts into a scratch dir, then moves each entry into place — one
- * code path for all managers.
+ * `node_modules/.pnpm` store and the in-repo workspace siblings `.kici`
+ * resolves.
  *
- * For HTTP/HTTPS URLs: a streaming pipeline (response -> hash -> gunzip -> tar)
- * with a 5-minute timeout and up to 2 retries avoids buffering whole tarballs.
- * For file:// URLs: a buffer-based approach (local, no streaming benefit).
+ * Resolves with the restore's report; rejects with a {@link DepRestoreError}
+ * (a {@link DepTarballHashMismatchError} for a hash mismatch) carrying it.
  *
  * @param workDir - Root directory of the cloned repository
  * @param depsUrl - URL to the dependency tarball (http://, https://, or file://)
@@ -282,77 +231,98 @@ export async function restoreDeps(
   workDir: string,
   depsUrl: string,
   depsHash?: string,
-): Promise<void> {
-  // Rewrite localhost URLs for container agents
-  depsUrl = resolveOrchestratorUrl(depsUrl);
-  logger.info('Downloading dependency tarball', { url: depsUrl });
+  opts: RestoreDepsOptions = {},
+): Promise<DepRestoreReport> {
+  const url = resolveOrchestratorUrl(depsUrl);
+  const limits = { ...DEFAULT_DEP_RESTORE_LIMITS, ...opts.limits };
+  const report: DepRestoreReport = {
+    outcome: DepRestoreOutcome.enum.restored,
+    source: redactUrl(url),
+    verified: false,
+    attempts: [],
+  };
+  const fail = (outcome: DepRestoreOutcome, err: unknown, message?: string): DepRestoreError => {
+    report.outcome = outcome;
+    report.error = clipDescribedError(describeError(err));
+    return new DepRestoreError(message ?? report.error.message, report, err);
+  };
+  logger.info('Downloading dependency tarball', { url: report.source });
 
-  const kiciDir = join(workDir, '.kici');
-
-  if (depsUrl.startsWith('file://')) {
-    // file:// URLs: keep buffer-based approach (local, no streaming benefit)
-    const localPath = fileURLToPath(depsUrl);
-    const data = await fsPromises.readFile(localPath);
-    if (depsHash) {
-      const actualHash = computeHash(data);
-      if (actualHash !== depsHash) {
-        throw new Error(`Dep tarball hash mismatch: expected ${depsHash}, got ${actualHash}`);
-      }
-    }
-    const scratchDir = join(
-      kiciDir,
-      `${SCRATCH_DIR_BASENAME_PREFIX}${process.pid}-file-${Date.now()}`,
+  const isFile = url.startsWith('file://');
+  if (!isFile && !url.startsWith('http://') && !url.startsWith('https://')) {
+    const err = fail(
+      DepRestoreOutcome.enum['unsupported-url'],
+      new Error(`Unsupported deps URL scheme: ${report.source}`),
     );
-    await extractTarball(data, scratchDir);
-    await moveScratchIntoRepo(scratchDir, workDir);
-    await cleanupScratch(scratchDir);
-    const sizeMB = (data.length / (1024 * 1024)).toFixed(2);
-    logger.info('Dependencies restored from cache (file)', { sizeMB, targetDir: workDir });
-    return;
+    logDepRestoreReport(report);
+    throw err;
   }
 
-  if (!depsUrl.startsWith('http://') && !depsUrl.startsWith('https://')) {
-    throw new Error(`Unsupported deps URL scheme: ${depsUrl}`);
-  }
+  const tempRoot = join(workDir, `${TEMP_ROOT_PREFIX}${process.pid}-${Date.now()}`);
+  try {
+    await mkdir(tempRoot, { recursive: true });
 
-  // HTTP/HTTPS: streaming with retry. Each attempt extracts into its own
-  // scratch dir to avoid racing with in-flight tar writes from a prior
-  // failed attempt — see `extractIntoScratch` for the full rationale.
-  let lastError: Error | undefined;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      logger.warn('Retrying dep tarball download', { attempt, url: depsUrl });
-    }
-    try {
-      const { scratchDir, hash } = await extractIntoScratch(depsUrl, kiciDir, attempt);
-
-      if (depsHash && hash !== depsHash) {
-        throw new Error(`Dep tarball hash mismatch: expected ${depsHash}, got ${hash}`);
+    // 1. Download (or read a local file in place).
+    let tarPath: string;
+    const downloadStart = performance.now();
+    if (isFile) {
+      tarPath = fileURLToPath(url);
+    } else {
+      tarPath = join(tempRoot, 'deps.tar.gz');
+      try {
+        const result = await downloadToFile(url, tarPath, {
+          limits,
+          onAttemptFailed: (a: DownloadAttempt, next: NextAttempt | undefined) =>
+            opts.onProgress?.(formatAttemptFailure(a, limits.maxAttempts, next)),
+        });
+        report.attempts = result.attempts.map(toReportAttempt);
+      } catch (err) {
+        if (err instanceof DownloadFailedError) report.attempts = err.attempts.map(toReportAttempt);
+        throw fail(
+          DepRestoreOutcome.enum['download-failed'],
+          err,
+          `Dep tarball download failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
-
-      // Move the extracted repo-root-relative tree into the work dir. The
-      // destinations never exist before this point (we always extract into a
-      // fresh scratch dir), so the renames have nothing to race against.
-      await moveScratchIntoRepo(scratchDir, workDir);
-      await cleanupScratch(scratchDir);
-
-      logger.info('Dependencies restored from cache (stream)', { targetDir: workDir });
-      return;
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      logger.warn('Dep tarball download failed', {
-        attempt,
-        error: lastError.message,
-      });
-      // Intentionally do NOT clean up the scratch dir on failure: pipeline()
-      // rejection does not drain tar's pending fs writes, so an immediate rm
-      // would race them. Leaving the scratch dir orphaned is safe — the next
-      // retry uses a different scratch dir and the workflow's tmp workDir is
-      // wiped at job teardown.
     }
-  }
+    report.downloadMs = elapsedMs(downloadStart);
+    report.tarballBytes = (await fsPromises.stat(tarPath)).size;
 
-  throw new Error(
-    `Dep tarball download failed after ${MAX_RETRIES + 1} attempts: ${lastError?.message}`,
-  );
+    // 2. Verify before a single byte is extracted.
+    if (depsHash) {
+      const verifyStart = performance.now();
+      const actual = await sha256File(tarPath);
+      report.verifyMs = elapsedMs(verifyStart);
+      if (actual !== depsHash) {
+        report.outcome = DepRestoreOutcome.enum['hash-mismatch'];
+        const err = new DepTarballHashMismatchError(depsHash, actual, report);
+        report.error = clipDescribedError(describeError(err));
+        throw err;
+      }
+      report.verified = true;
+    }
+
+    // 3. Extract from the file, then move into place.
+    const extractStart = performance.now();
+    const scratchDir = join(tempRoot, 'extract');
+    try {
+      await extractTarballFile(tarPath, scratchDir, limits.extractTimeoutMs);
+      await moveScratchIntoRepo(scratchDir, workDir);
+    } catch (err) {
+      throw fail(
+        DepRestoreOutcome.enum['extract-failed'],
+        err,
+        `Dep tarball extraction failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    report.extractMs = elapsedMs(extractStart);
+    return report;
+  } catch (err) {
+    if (err instanceof DepRestoreError) throw err;
+    // mkdir / stat failures: the restore never reached its own phases.
+    throw fail(DepRestoreOutcome.enum['download-failed'], err);
+  } finally {
+    await removeTempRoot(tempRoot);
+    logDepRestoreReport(report, { targetDir: workDir });
+  }
 }

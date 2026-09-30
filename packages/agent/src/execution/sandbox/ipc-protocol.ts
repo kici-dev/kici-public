@@ -1,5 +1,6 @@
 import type { CheckMode, CheckStepOutcome, LogStream, ProvenanceContext } from '@kici-dev/engine';
 import type { SandboxStepResult } from './types.js';
+import type { DepRestoreReport } from '../dep-restore-report.js';
 
 /**
  * Structured clone auth. Wire-compatible with `gitAuthSchema` on the
@@ -87,6 +88,18 @@ interface LogLineMessage {
   line: string;
   /** Which subprocess stream the line came from. Absent means stdout. */
   stream?: LogStream;
+}
+
+/**
+ * Sent exactly once, at the end of the runner's setup and before it loads the
+ * workflow module: the outcome of the job's dependency restore, or no report
+ * when no restore ran. The runner's own logger output never reaches the agent
+ * log, so this is how the restore does; the agent's relay closes on the first
+ * such message, so one sent later by workflow code is ignored.
+ */
+interface DepRestoreReportMessage {
+  type: 'dep-restore.report';
+  report?: DepRestoreReport;
 }
 
 /**
@@ -336,6 +349,7 @@ export type RunnerToAgentMessage =
   | StepStartMessage
   | StepCompleteMessage
   | LogLineMessage
+  | DepRestoreReportMessage
   | StepSecretMountMessage
   | JobCompleteMessage
   | HooksDeclaredMessage

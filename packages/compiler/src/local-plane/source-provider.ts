@@ -250,6 +250,24 @@ function requireGitRepo(repoRoot: string): void {
   }
 }
 
+/**
+ * The parent of `sha` in `dir`, or undefined for a root commit or an
+ * unreadable repo. For an isolated run it is the developer's HEAD (the overlay
+ * commit's parent); in place it is `HEAD^`.
+ */
+export function readParentSha(dir: string, sha: string): string | undefined {
+  try {
+    const parent = execFileSync('git', ['rev-parse', '--verify', '--quiet', `${sha}^`], {
+      cwd: dir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return parent || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Run a git command in `cwd` and return trimmed stdout. */
 function gitOut(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();

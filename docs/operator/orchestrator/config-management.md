@@ -179,19 +179,20 @@ The orchestrator maintains several caches, and their limits live on three planes
 
 - **Fleet-wide tunables** — set with `kici-admin cluster-settings set`, stored in `cluster_settings`. The cache retention and tarball cap are re-read on every lookup, so a change applies immediately. The lock-file cache sizes are structural to the in-memory index, so a change there applies at the next orchestrator restart.
 - **Startup values** — read from the environment at startup. Change the env var and restart the service.
-- **Per-org overrides** — only the user-facing cache (`ctx.cache`) supports per-tenant overrides, stored in `org_settings` and set with `kici-admin org-settings user-cache ...`. When an override is unset (NULL), the fleet-wide default applies.
+- **Per-org overrides** — the user-facing cache (`ctx.cache`) limits and the build cache upload settle timeout support per-tenant overrides, stored in `org_settings` and set with `kici-admin org-settings user-cache ...` and `kici-admin org-settings cache-upload-settle ...`. When an override is unset (NULL), the fleet-wide default applies.
 
 ### Cache-limit fields
 
-| Field                  | Default            | Change it with                                                                  | Controls                                                                     |
-| ---------------------- | ------------------ | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `cacheMaxTarballBytes` | 524288000 (500 MB) | `cluster-settings set --cache-max-tarball-bytes` (live)                         | Max size of a source / dependency tarball the blob-storage backend accepts   |
-| `cacheTtlDays`         | 30                 | `cluster-settings set --cache-ttl-days` (live)                                  | Retention (days) for the compiled-source, dependency, and attestation caches |
-| `cacheBuildTimeoutMs`  | 600000 (10 min)    | `KICI_CACHE_BUILD_TIMEOUT_MS` + restart                                         | Deadline for a single dependency-cache build operation                       |
-| `lockfileCache.max`    | 500                | `cluster-settings set --lockfile-cache-max` + restart                           | Max entries in the in-memory lock-file LRU cache                             |
-| `lockfileCache.ttlMs`  | 3600000 (1 h)      | `cluster-settings set --lockfile-cache-ttl-ms` + restart                        | Per-entry TTL for the lock-file LRU cache                                    |
-| `userCacheQuotaBytes`  | 5368709120 (5 GiB) | `org-settings user-cache set-quota`, or `KICI_USER_CACHE_QUOTA_BYTES` + restart | Byte quota for the user-facing cache (`ctx.cache`)                           |
-| `userCacheTtlMs`       | 604800000 (7 d)    | `org-settings user-cache set-ttl`, or `KICI_USER_CACHE_TTL_MS` + restart        | Per-entry TTL for the user-facing cache                                      |
+| Field                        | Default            | Change it with                                                                                    | Controls                                                                                   |
+| ---------------------------- | ------------------ | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `cacheMaxTarballBytes`       | 524288000 (500 MB) | `cluster-settings set --cache-max-tarball-bytes` (live)                                           | Max size of a source / dependency tarball the blob-storage backend accepts                 |
+| `cacheTtlDays`               | 30                 | `cluster-settings set --cache-ttl-days` (live)                                                    | Retention (days) for the compiled-source, dependency, and attestation caches               |
+| `cacheBuildTimeoutMs`        | 600000 (10 min)    | `KICI_CACHE_BUILD_TIMEOUT_MS` + restart                                                           | Deadline for a single dependency-cache build operation                                     |
+| `cacheUploadSettleTimeoutMs` | 10000 (10 s)       | `org-settings cache-upload-settle set` (live), or `KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS` + restart | How long a build's success waits for its uploaded cache to publish; `0` turns the wait off |
+| `lockfileCache.max`          | 500                | `cluster-settings set --lockfile-cache-max` + restart                                             | Max entries in the in-memory lock-file LRU cache                                           |
+| `lockfileCache.ttlMs`        | 3600000 (1 h)      | `cluster-settings set --lockfile-cache-ttl-ms` + restart                                          | Per-entry TTL for the lock-file LRU cache                                                  |
+| `userCacheQuotaBytes`        | 5368709120 (5 GiB) | `org-settings user-cache set-quota`, or `KICI_USER_CACHE_QUOTA_BYTES` + restart                   | Byte quota for the user-facing cache (`ctx.cache`)                                         |
+| `userCacheTtlMs`             | 604800000 (7 d)    | `org-settings user-cache set-ttl`, or `KICI_USER_CACHE_TTL_MS` + restart                          | Per-entry TTL for the user-facing cache                                                    |
 
 ### List and set the fleet-wide defaults
 

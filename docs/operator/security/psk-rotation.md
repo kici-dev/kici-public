@@ -3,11 +3,11 @@ title: Peer credential management
 description: Manage peer credentials for orchestrator cluster authentication
 ---
 
-Orchestrator peers authenticate using persistent credentials issued during the initial join token exchange. This guide covers managing peer credentials: listing, revoking, and re-joining after revocation.
+Orchestrator peers authenticate using persistent credentials. A peer gets its credential from a join token exchange, or, for a coordinator without a token, from the coordinator itself. This guide covers managing peer credentials: listing, revoking, and re-joining after revocation.
 
 ## How peer authentication works
 
-1. **First join:** A new orchestrator authenticates with a one-time join token (`KICI_CLUSTER_JOIN_TOKEN`). The coordinator validates the token and issues a persistent credential
+1. **First join:** A worker, or a coordinator given a token, authenticates with a one-time join token (`KICI_CLUSTER_JOIN_TOKEN`); the coordinator it connects to validates the token and issues a persistent credential. A coordinator without a token issues its own credential from the shared database on its first peer connection, unless an operator revoked its credential
 2. **Credential persistence:** The credential is saved to `KICI_CLUSTER_CREDENTIAL_FILE` (default: `~/.kici/peer-credential`) with `0600` permissions
 3. **Subsequent connections:** The orchestrator loads its credential file and proves possession via HMAC (the credential itself is never sent over the wire)
 4. **Encrypted channel:** All authentication happens over an ECDH-encrypted channel -- no auth material is transmitted in cleartext
@@ -22,7 +22,7 @@ View all peers with active credentials:
 kici-admin peer list
 ```
 
-Output includes instance ID, role, credential status, and last connection time.
+Output lists each peer's instance ID, role, creation time, last-seen time, and credential expiry. It reads the orchestrator database directly, so it needs `KICI_DATABASE_URL`. Add `--json` for a JSON record that also says whether a coordinator issued the credential to itself (`selfIssued`) and which coordinator last validated it (`lastValidatedBy`).
 
 ### Create a join token
 
@@ -46,7 +46,7 @@ Invalidate a specific peer's credential:
 kici-admin peer revoke --instance-id <id>
 ```
 
-The revoked peer will be disconnected on its next heartbeat or reconnection attempt. It must re-join with a new token.
+A revoke does not close the peer's open connections. The peer's next connection attempt is refused, and the peer must re-join with a new token. This applies to a coordinator with a stable `KICI_CLUSTER_INSTANCE_ID` too: it does not issue itself a new credential after a revoke. A revoke applies to one instance ID. A coordinator without a stable instance ID gets a new ID when it restarts, and the new ID issues its own credential.
 
 ### Revoke all peers
 
@@ -56,7 +56,7 @@ Invalidate all peer credentials (emergency action):
 kici-admin peer revoke-all --confirm
 ```
 
-All peers will need new join tokens to reconnect. Use this for security incidents where credential compromise is suspected.
+All peers will need new join tokens to reconnect, including every coordinator with a stable `KICI_CLUSTER_INSTANCE_ID`. Use this for security incidents where credential compromise is suspected.
 
 ### Prune stale peer credentials (offline)
 

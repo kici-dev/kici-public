@@ -355,7 +355,7 @@ export default workflow('on-github-repo-push', {
 
 - No auto-clone — `packages/agent/src/checkout/git-clone.ts` uses GitHub App installation tokens to fetch the repo; a generic source has none. Either set `checkout: false` and clone yourself with a PAT/Deploy Key secret (same pattern as the Forgejo manual-clone example above), or keep the workflow self-contained.
 - No lock-file fetch — the orchestrator cannot fetch `.kici/kici.lock.json` at the pushed SHA via the GitHub API. The workflow must be pre-registered via the [registration model](../events.md#the-registration-model); ad-hoc per-commit workflow discovery that a GitHub App push gives you is not available.
-- No changed-files enrichment — `event.changedFiles` is empty. Use JSONPath `match` on `rawPayload.commits[*].added/modified/removed` if you need path filters.
+- No changed-files enrichment for `genericWebhook()` — `event.changedFiles` is empty. Use JSONPath `match` on `rawPayload.commits[*].added/modified/removed` if you need path filters. For `push()` path filters on a plain GitHub repo webhook, use a [universal-git source](../providers/universal-git.md) with the `github-repo` preset: it reads the changed files from `commits[]`, and a push listing 2048 commits (GitHub's payload cap) counts as truncated.
 - No check-run integration — KiCI cannot post Check Run results back to GitHub.
 - Workflow authors must use `genericWebhook()`, not `push()` / `pr()` / `webhook()` — the latter three only match events delivered through the native GitHub App provider.
 

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createSecretMasker, LogMasker, maskMessageText } from './log-masker.js';
+import { DepRestoreOutcome } from '../dep-restore-report.js';
 
 describe('LogMasker', () => {
   it('masks a single secret value', () => {
@@ -261,6 +262,45 @@ describe('maskMessageText', () => {
   it('returns the message unchanged when no secrets are registered', () => {
     const msg = { type: 'log.line' as const, stepIndex: 0, line: 'plain' };
     expect(maskMessageText(msg, new LogMasker())).toBe(msg);
+  });
+
+  it('passes a dep-restore.report without a report through', () => {
+    const msg = { type: 'dep-restore.report' as const };
+    expect(maskMessageText(msg, maskerWith('s3cr3t-value'))).toBe(msg);
+  });
+
+  it('masks dep-restore.report error texts', () => {
+    // fails-when: a registered secret inside a restore error reaches the agent log
+    // breaks-if-wrong: the report keeps its structure (outcome, attempts) after masking
+    const out = maskMessageText(
+      {
+        type: 'dep-restore.report',
+        report: {
+          outcome: DepRestoreOutcome.enum['download-failed'],
+          source: 'https://bucket/deps.tgz',
+          verified: false,
+          attempts: [
+            {
+              attempt: 1,
+              resumeFrom: 0,
+              bytesReceived: 0,
+              bytesOnDisk: 0,
+              durationMs: 1,
+              error: { message: 'saw s3cr3t-value', causeMessage: 'also s3cr3t-value' },
+            },
+          ],
+          error: { message: 'x s3cr3t-value' },
+        },
+      },
+      maskerWith('s3cr3t-value'),
+    );
+    expect(out).toMatchObject({
+      report: {
+        outcome: DepRestoreOutcome.enum['download-failed'],
+        error: { message: 'x ***' },
+        attempts: [{ attempt: 1, error: { message: 'saw ***', causeMessage: 'also ***' } }],
+      },
+    });
   });
 });
 

@@ -332,6 +332,69 @@ export class AgentRegistry {
     this.instanceId = deps.instanceId;
   }
 
+  /**
+   * Triages the in-flight jobs of an agent this registry drops on its own (a
+   * revoked or expired token): fails or requeues a scaler-managed agent's
+   * jobs, starts recovery for a static agent's. Installed by the dispatcher,
+   * which is built after the registry.
+   */
+  private disconnectTriage?: (agentId: string) => Promise<unknown>;
+
+  /** Install the job triage {@link disconnectByTokenId} runs for each agent it drops. */
+  setDisconnectTriage(triage: (agentId: string) => Promise<unknown>): void {
+    this.disconnectTriage = triage;
+  }
+
+  /**
+   * Sockets whose `agent.register` is in flight (awaiting the scaler lookup),
+   * per agent id, with the id of the agent token each authenticated with
+   * (`null` without token auth). Kept here rather than in the WebSocket
+   * handler because the coordinator builds one handler per connection: a
+   * socket's close, and the check a registration makes against another agent
+   * token, must see a registration in flight on another connection.
+   */
+  private readonly registeringSockets = new Map<string, Map<WsLike, string | null>>();
+
+  /** Record that `ws`, authenticated with `tokenId`, has started registering `agentId`. */
+  beginRegistering(agentId: string, ws: WsLike, tokenId: string | null): void {
+    let sockets = this.registeringSockets.get(agentId);
+    if (!sockets) {
+      sockets = new Map();
+      this.registeringSockets.set(agentId, sockets);
+    }
+    sockets.set(ws, tokenId);
+  }
+
+  /** Record that `ws` has finished registering `agentId`, however it ended. */
+  endRegistering(agentId: string, ws: WsLike): void {
+    const sockets = this.registeringSockets.get(agentId);
+    if (!sockets) return;
+    sockets.delete(ws);
+    if (sockets.size === 0) this.registeringSockets.delete(agentId);
+  }
+
+  /** Whether a socket other than `ws` is registering `agentId` right now. */
+  isRegisteringElsewhere(agentId: string, ws: WsLike): boolean {
+    const sockets = this.registeringSockets.get(agentId);
+    if (!sockets) return false;
+    return [...sockets.keys()].some((other) => other !== ws);
+  }
+
+  /**
+   * Whether another connection holds `agentId` under an agent token other than
+   * `tokenId`: the live registration, or a registration in flight on another
+   * socket. A registration without token auth (`null`) holds no token identity
+   * and conflicts with nothing.
+   */
+  isAgentIdHeldByOtherToken(agentId: string, tokenId: string, ws: WsLike): boolean {
+    const live = this.agents.get(agentId);
+    if (live && live.tokenId !== null && live.tokenId !== tokenId) return true;
+    for (const [other, otherToken] of this.registeringSockets.get(agentId) ?? []) {
+      if (other !== ws && otherToken !== null && otherToken !== tokenId) return true;
+    }
+    return false;
+  }
+
   // ── Registration ──────────────────────────────────────────────────
 
   /**
@@ -555,6 +618,16 @@ export class AgentRegistry {
         // ignore — entry will still be unregistered below
       }
 
+      // Triage the agent's in-flight jobs before it leaves the registry: the
+      // triage reads the registration, before its first await, to tell a
+      // scaler-managed agent from a static one. The unregister right after
+      // still removes the agent's authority before this call returns.
+      this.disconnectTriage?.(agentId).catch((err: unknown) => {
+        logger.error('Job triage failed for an agent dropped by token revocation', {
+          agentId,
+          error: toErrorMessage(err),
+        });
+      });
       this.unregister(agentId);
       kicked++;
     }

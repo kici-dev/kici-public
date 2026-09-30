@@ -86,6 +86,16 @@ webhook route. Override the ref/sha/event explicitly when needed:
 kici-admin source trigger-local <id> --event push --ref refs/heads/main --sha <sha>
 ```
 
+The payload's `before` commit sets the push's changed files
+(`before..sha`). It defaults to the parent of `--sha`, read from the repo;
+pass `--before <sha>` to cover several commits. A root commit, or a repo the
+command cannot read, sends no `before`: the push then has no range, and a
+`paths` filter matches conservatively.
+
+A local source has no provider API to list changed files. The agent decides
+`paths` filters from its clone: the run starts with an `__init__` job, and a
+push that touches none of the paths runs no other job.
+
 **On every push, via a hook:**
 
 ```bash
@@ -93,7 +103,12 @@ kici-admin source install-hook <id>
 ```
 
 This writes a `post-receive` hook into the repo so that every push to it
-triggers a run automatically — the local equivalent of a forge webhook.
+triggers a run automatically — the local equivalent of a forge webhook. The
+hook forwards each pushed ref's old commit as `--before`, so the run's
+changed files are exactly the pushed commits. A push that creates a branch
+forwards a zero `before`; the payload names the pushed branch as the
+default branch, so that push has no range and matches `paths` filters
+conservatively.
 
 ## Per-scaler reachability (operator's responsibility)
 

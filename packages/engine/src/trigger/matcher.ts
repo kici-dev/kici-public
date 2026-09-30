@@ -3,6 +3,7 @@
  * Single source of truth -- replaces duplicate logic in compiler and orchestrator.
  */
 import { getCompiledRegex, getGlobMatcher, getRepoGlobMatcher } from './compiled-matchers.js';
+import { isDeferrableRange, resolveDiffRange } from './diff-range.js';
 import type {
   LockTrigger,
   LockPrTrigger,
@@ -257,6 +258,56 @@ function evaluateCommitMessageFilter(
   return result.pass;
 }
 
+/** Set by a push/pr trigger whose `paths` check passed only because the diff was unavailable. */
+/** Trace value of a `paths` check that read an unavailable diff. */
+export const UnavailablePathsTrace = {
+  /** A git range exists: the agent decides from its clone. */
+  DecidedOnAgent: '[unavailable — decided on agent]',
+  /** No range the agent can diff: the workflow runs conservatively. */
+  Conservative: '[unavailable — matched conservatively]',
+} as const;
+
+/** Appended to a matched decision's summary when its paths are left to the agent. */
+export const DEFERRED_PATHS_SUMMARY_SUFFIX = ' — paths decided on the agent';
+
+export interface TriggerMatchNotes {
+  conservativePaths?: readonly string[];
+}
+
+/**
+ * Evaluate a push/pr trigger's `paths` list and trace it. An `unavailable`
+ * diff matches; when the event still has a git range, the match is recorded in
+ * `notes` so the workflow's path decision moves to the agent's clone.
+ */
+function checkTriggerPaths(
+  paths: readonly string[],
+  event: SimulatedEvent,
+  traces: TraceEntry[],
+  notes: TriggerMatchNotes | undefined,
+): boolean {
+  if (paths.length === 0) return true;
+  const changedFiles = event.changedFiles ?? [];
+  const { include, exclude } = splitStringPatterns(paths);
+  const unavailable = event.changedFilesStatus === 'unavailable';
+  const deferrable = unavailable && isDeferrableRange(resolveDiffRange(event));
+  const matches = matchPathPatterns(paths, changedFiles, event.changedFilesStatus);
+  const value = !unavailable
+    ? `[${changedFiles.join(', ')}]`
+    : deferrable
+      ? UnavailablePathsTrace.DecidedOnAgent
+      : UnavailablePathsTrace.Conservative;
+  traces.push(
+    createTraceEntry(
+      'paths',
+      `include: [${include.join(', ')}] exclude: [${exclude.join(', ')}]`,
+      value,
+      matches,
+    ),
+  );
+  if (deferrable && notes) notes.conservativePaths = paths;
+  return matches;
+}
+
 /**
  * Match a PR trigger against a simulated event.
  */
@@ -264,6 +315,7 @@ function matchPrTrigger(
   trigger: LockPrTrigger,
   event: SimulatedEvent,
   traces: TraceEntry[],
+  notes?: TriggerMatchNotes,
 ): boolean {
   // Must be pull_request event
   if (event.type !== 'pull_request') {
@@ -321,22 +373,7 @@ function matchPrTrigger(
   }
 
   // Check paths
-  if (trigger.paths.length > 0) {
-    const changedFiles = event.changedFiles ?? [];
-    const { include, exclude } = splitStringPatterns(trigger.paths);
-    const matches = matchPathPatterns(trigger.paths, changedFiles, event.changedFilesStatus);
-    traces.push(
-      createTraceEntry(
-        'paths',
-        `include: [${include.join(', ')}] exclude: [${exclude.join(', ')}]`,
-        event.changedFilesStatus === 'unavailable'
-          ? '[unavailable — matched conservatively]'
-          : `[${changedFiles.join(', ')}]`,
-        matches,
-      ),
-    );
-    if (!matches) return false;
-  }
+  if (!checkTriggerPaths(trigger.paths, event, traces, notes)) return false;
 
   // Check commit message
   if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
@@ -354,6 +391,7 @@ function matchPushTrigger(
   trigger: LockPushTrigger,
   event: SimulatedEvent,
   traces: TraceEntry[],
+  notes?: TriggerMatchNotes,
 ): boolean {
   // Must be push event
   if (event.type !== 'push') {
@@ -377,22 +415,7 @@ function matchPushTrigger(
   }
 
   // Check paths
-  if (trigger.paths.length > 0) {
-    const changedFiles = event.changedFiles ?? [];
-    const { include, exclude } = splitStringPatterns(trigger.paths);
-    const matches = matchPathPatterns(trigger.paths, changedFiles, event.changedFilesStatus);
-    traces.push(
-      createTraceEntry(
-        'paths',
-        `include: [${include.join(', ')}] exclude: [${exclude.join(', ')}]`,
-        event.changedFilesStatus === 'unavailable'
-          ? '[unavailable — matched conservatively]'
-          : `[${changedFiles.join(', ')}]`,
-        matches,
-      ),
-    );
-    if (!matches) return false;
-  }
+  if (!checkTriggerPaths(trigger.paths, event, traces, notes)) return false;
 
   // Check commit message
   if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
@@ -1220,12 +1243,13 @@ export function matchTrigger(
   trigger: LockTrigger,
   event: SimulatedEvent,
   traces: TraceEntry[],
+  notes?: TriggerMatchNotes,
 ): boolean {
   switch (trigger._type) {
     case 'pr':
-      return matchPrTrigger(trigger, event, traces);
+      return matchPrTrigger(trigger, event, traces, notes);
     case 'push':
-      return matchPushTrigger(trigger, event, traces);
+      return matchPushTrigger(trigger, event, traces, notes);
     case 'tag':
       return matchTagTrigger(trigger, event, traces);
     case 'comment':
@@ -1288,23 +1312,47 @@ export function matchWorkflowTriggers(
     return createWorkflowDecision(workflow.name, false, [], undefined, 'No triggers defined');
   }
 
-  // Try each trigger - first match wins
+  let firstDeferred: { index: number; traces: TraceEntry[]; type: string } | undefined;
+  const deferredPaths: string[][] = [];
+
+  // Try each trigger - the first outright match wins
   for (let i = 0; i < workflow.triggers.length; i++) {
     const trigger = workflow.triggers[i];
     if (trigger == null) continue; // skip null triggers
     const triggerTraces: TraceEntry[] = [];
+    const notes: TriggerMatchNotes = {};
 
-    if (matchTrigger(trigger, event, triggerTraces)) {
-      return createWorkflowDecision(
-        workflow.name,
-        true,
-        triggerTraces,
-        i,
-        `Matched trigger ${i + 1} (${trigger._type})`,
-      );
+    if (matchTrigger(trigger, event, triggerTraces, notes)) {
+      if (notes.conservativePaths === undefined) {
+        return createWorkflowDecision(
+          workflow.name,
+          true,
+          triggerTraces,
+          i,
+          `Matched trigger ${i + 1} (${trigger._type})`,
+        );
+      }
+      // Keep scanning: a later trigger matching outright makes the workflow
+      // run whatever the agent would decide for this one.
+      deferredPaths.push([...notes.conservativePaths]);
+      firstDeferred ??= { index: i, traces: triggerTraces, type: trigger._type };
+      continue;
     }
 
     allTraces.push(...triggerTraces);
+  }
+
+  if (firstDeferred) {
+    return {
+      ...createWorkflowDecision(
+        workflow.name,
+        true,
+        firstDeferred.traces,
+        firstDeferred.index,
+        `Matched trigger ${firstDeferred.index + 1} (${firstDeferred.type})${DEFERRED_PATHS_SUMMARY_SUFFIX}`,
+      ),
+      deferredPaths,
+    };
   }
 
   return createWorkflowDecision(workflow.name, false, allTraces, undefined, 'No triggers matched');

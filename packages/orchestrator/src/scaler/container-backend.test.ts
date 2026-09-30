@@ -930,6 +930,34 @@ describe('ContainerScalerBackend', () => {
       expect(mockDeleteForwardRules).not.toHaveBeenCalled();
     });
 
+    it('stops every orphan at once rather than one after another', async () => {
+      // Each stop can take its full timeout — longer when the runtime misses the
+      // exit — and the sweep runs before the orchestrator serves, so a serial
+      // sweep over a few leftover agents held a restart for over a minute.
+      // fails-when: the sweep awaits one orphan's stop before issuing the next.
+      mockListContainers.mockResolvedValueOnce([
+        { Id: 'orphan-1', State: 'exited' },
+        { Id: 'orphan-2', State: 'exited' },
+        { Id: 'orphan-3', State: 'exited' },
+      ]);
+      const releases: Array<() => void> = [];
+      const heldStop = () => new Promise<void>((resolve) => releases.push(() => resolve()));
+      mockStop
+        .mockImplementationOnce(heldStop)
+        .mockImplementationOnce(heldStop)
+        .mockImplementationOnce(heldStop);
+
+      const backend = await createBackend();
+      const sweep = backend.cleanupOrphans();
+      await vi.waitFor(() => expect(mockStop).toHaveBeenCalledTimes(3));
+      expect(mockRemove, 'no orphan is removed before its own stop returns').not.toHaveBeenCalled();
+
+      for (const release of releases) release();
+      // breaks-if-wrong: every orphan is still removed and counted.
+      await expect(sweep).resolves.toBe(3);
+      expect(mockRemove).toHaveBeenCalledTimes(3);
+    });
+
     it('handles stop failures gracefully during cleanup', async () => {
       mockListContainers.mockResolvedValueOnce([{ Id: 'orphan-1', State: 'exited' }]);
       mockStop.mockRejectedValueOnce(new Error('already stopped'));

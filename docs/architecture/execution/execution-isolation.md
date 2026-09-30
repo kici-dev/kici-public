@@ -154,6 +154,8 @@ Environment allowlist constants are defined in `@kici-dev/engine` (`packages/eng
 - **`ALLOWED_SYSTEM_VARS`** -- System variables safe to pass downstream (PATH, HOME, USER, etc.)
 - **`AGENT_REQUIRED_KICI_VARS`** -- KICI variables the agent needs (set explicitly, not copied from process.env)
 - **`KICI_AGENT_ENV_PREFIX`** -- The `KICI_AGENT_ENV_` prefix constant for operator-controlled forwarding
+- **`SANDBOX_DEFAULT_VARS`** -- Defaults the agent adds to every sandbox (`FORCE_COLOR=1`)
+- **`TRUSTED_ENV_SCRUB_EXACT`** / **`buildTrustedPassthroughEnv()`** -- The scrub-list and passthrough builder for the trusted-env profile (see [Trusted-env profile](#trusted-env-profile))
 
 This eliminates duplication between tiers and prevents drift.
 
@@ -175,8 +177,29 @@ export const ALLOWED_SYSTEM_VARS = [
   'TMPDIR', // Temp directory
   'NODE_PATH', // Node module resolution
   'TZ', // Timezone
+  // Windows system variables: command resolution, temp and profile directories
+  'PATHEXT',
+  'SystemRoot',
+  'windir',
+  'COMSPEC',
+  'TEMP',
+  'TMP',
+  'USERPROFILE',
+  'LOCALAPPDATA',
+  'APPDATA',
+  'PROCESSOR_ARCHITECTURE',
+  'NUMBER_OF_PROCESSORS',
 ] as const;
 ```
+
+### Trusted-env profile
+
+An operator can launch an agent with `KICI_TRUSTED_ENV=true`, for trusted fleet and host-configuration agents. The profile is set only at agent or scaler launch, never by a dispatch payload or a workflow. It replaces the system allowlist at both tiers:
+
+- **Orchestrator tier (bare-metal backend):** when the matched label set carries `KICI_TRUSTED_ENV=true`, or the orchestrator host sets `KICI_AGENT_ENV_KICI_TRUSTED_ENV=true`, the backend forwards the orchestrator's ambient environment instead of the allowlist, and logs the decision at spawn time.
+- **Agent tier:** `buildSanitizedEnv()` passes the agent's ambient environment to the step instead of the allowlist.
+
+Both tiers remove the whole `KICI_*` namespace and `TRUSTED_ENV_SCRUB_EXACT` (`DATABASE_URL`, `PLATFORM_TOKEN`, `WEBHOOK_SECRET`, `GITHUB_PRIVATE_KEY`), so the agent's own KiCI identity never reaches a step. The profile is independent of `KICI_SANDBOX`. See [Agent execution security](../../operator/security/agent-security.md).
 
 ### KICI_AGENT_ENV\_ prefix forwarding
 
@@ -187,7 +210,7 @@ KICI_AGENT_ENV_HTTP_PROXY=http://proxy:3128  ->  HTTP_PROXY=http://proxy:3128
 KICI_AGENT_ENV_NO_PROXY=localhost            ->  NO_PROXY=localhost
 ```
 
-All three backends honor this mechanism with identical precedence rules; only the transport differs. Bare-metal merges into the spawned process's `env` map, container assembles a flat env array Docker/Podman feeds the container, and Firecracker writes the merged map per-key into MMDS under `meta-data/kici-env/`. The Firecracker backend additionally enforces a per-VM 32 KiB byte budget (defends Firecracker's ~51 KiB MMDS data store cap) and rejects keys that aren't POSIX-safe identifiers; both filters fire warning logs and skip the offending var without aborting the spawn.
+All three backends honor this mechanism with identical precedence rules; only the transport differs. Bare-metal merges into the spawned process's `env` map, container assembles a flat env array Docker/Podman feeds the container, and Firecracker writes the merged map per-key into MMDS under `meta-data/kici-env/`. The Firecracker backend also enforces a per-VM 32 KiB byte budget (defends Firecracker's ~51 KiB MMDS data store cap) and rejects keys that aren't POSIX-safe identifiers. Both filters fire warning logs and skip the offending var without aborting the spawn.
 
 ### Orchestrator-tier precedence (bare-metal backend)
 
@@ -233,7 +256,7 @@ This ensures:
 
 ### What gets excluded
 
-Any variable not in the allowlist is stripped, including:
+Under the default profile, any variable not in the allowlist is stripped, including:
 
 - `KICI_ORCHESTRATOR_URL`, `KICI_AGENT_ID`, `KICI_LABELS` -- agent config
 - `KICI_DATABASE_URL` -- database credentials

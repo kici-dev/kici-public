@@ -2973,3 +2973,77 @@ describe('commitMessage trigger filter', () => {
     expect(matchTrigger(tagTrigger, tagEvent, tagTraces)).toBe(true);
   });
 });
+
+describe('deferred paths (unavailable diff with a computable range)', () => {
+  const SHA_A = 'a'.repeat(40);
+  const SHA_B = 'b'.repeat(40);
+  const pushPaths = (paths: string[]): LockPushTrigger =>
+    ({ _type: 'push', branches: [], paths }) as unknown as LockPushTrigger;
+  const workflowOf = (...triggers: LockPushTrigger[]): LockWorkflow => ({
+    name: 'wf',
+    contentHash: '',
+    compileSchemaVersion: 0,
+    triggers,
+    jobs: [],
+  });
+  const unavailablePush = (payload: Record<string, unknown>): SimulatedEvent => ({
+    type: 'push',
+    targetBranch: 'feature',
+    payload,
+    changedFiles: [],
+    changedFilesStatus: 'unavailable',
+  });
+
+  it('records the paths and decides on the agent when a range exists', () => {
+    const d = matchWorkflowTriggers(
+      workflowOf(pushPaths(['src/**'])),
+      unavailablePush({ before: SHA_A, after: SHA_B }),
+    );
+    expect(d.matched).toBe(true);
+    expect(d.deferredPaths).toEqual([['src/**']]);
+    expect(d.checks.find((c) => c.check === 'paths')?.value).toBe(
+      '[unavailable — decided on agent]',
+    );
+  });
+
+  // fails-when: the matcher records deferredPaths for a range-less event
+  it('matches conservatively with no deferral when no range exists', () => {
+    const d = matchWorkflowTriggers(workflowOf(pushPaths(['src/**'])), unavailablePush({}));
+    expect(d.matched).toBe(true);
+    expect(d.deferredPaths).toBeUndefined();
+    expect(d.checks.find((c) => c.check === 'paths')?.value).toBe(
+      '[unavailable — matched conservatively]',
+    );
+  });
+
+  // fails-when: the matcher returns on the first conservative match
+  it('an outright match on a later trigger wins over a conservative first one', () => {
+    const d = matchWorkflowTriggers(
+      workflowOf(pushPaths(['src/**']), pushPaths([])),
+      unavailablePush({ before: SHA_A, after: SHA_B }),
+    );
+    expect(d.matched).toBe(true);
+    expect(d.matchedTrigger).toBe(1);
+    expect(d.deferredPaths).toBeUndefined();
+  });
+
+  it('collects every conservatively-matched trigger', () => {
+    const d = matchWorkflowTriggers(
+      workflowOf(pushPaths(['src/**']), pushPaths(['docs/**'])),
+      unavailablePush({ before: SHA_A, after: SHA_B }),
+    );
+    expect(d.deferredPaths).toEqual([['src/**'], ['docs/**']]);
+    expect(d.matchedTrigger).toBe(0);
+  });
+
+  // breaks-if-wrong: a fetched diff must keep deciding on the orchestrator
+  it('a fetched diff never defers', () => {
+    const d = matchWorkflowTriggers(workflowOf(pushPaths(['src/**'])), {
+      ...unavailablePush({ before: SHA_A, after: SHA_B }),
+      changedFiles: ['src/a.ts'],
+      changedFilesStatus: 'fetched',
+    });
+    expect(d.matched).toBe(true);
+    expect(d.deferredPaths).toBeUndefined();
+  });
+});

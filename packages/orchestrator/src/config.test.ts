@@ -33,6 +33,16 @@ describe('orchestrator loadConfig', () => {
   });
 
   describe('newly-validated env vars (drift catcher)', () => {
+    it('defaults cacheUploadSettleTimeoutMs to 10000 and reads KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS', () => {
+      // fails-when: the default or the env mapping is missing (undefined / 10000).
+      expect(loadConfig().cacheUploadSettleTimeoutMs).toBe(10_000);
+      process.env.KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS = '2500';
+      expect(loadConfig().cacheUploadSettleTimeoutMs).toBe(2500);
+      // breaks-if-wrong: 0 is the documented "no wait" value and must load.
+      process.env.KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS = '0';
+      expect(loadConfig().cacheUploadSettleTimeoutMs).toBe(0);
+    });
+
     it('defaults autoMigrate to true when KICI_AUTO_MIGRATE unset', () => {
       const config = loadConfig();
       expect(config.autoMigrate).toBe(true);

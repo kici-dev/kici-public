@@ -94,7 +94,8 @@ are enveloped. Shape (abridged):
 
 `baseSha` is best-effort from the run's provider context; it is `null` when the base commit
 is not available. `triggeredBy` is the identity that triggered a re-run, and `null` for
-webhook-triggered runs.
+webhook-triggered runs. `triggeredByAgentLabel` names the agent credential label when a run was
+triggered through an agent credential. It is absent or `null` for every other run.
 
 ### Step logs
 

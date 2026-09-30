@@ -112,6 +112,43 @@ describe('WorkflowDeadlineDetector', () => {
     expect(reason).toContain(TimeoutReason.enum.workflow_timeout);
   });
 
+  it('re-sends a forced cancel forced, and any other one gracefully', async () => {
+    const mocks = createDeps();
+    const started = new Date(Date.now() - 10_000);
+    const db = createSequentialDb({
+      selects: [
+        {
+          executeResult: [
+            {
+              run_id: 'run-forced',
+              workflow_timeout_ms: 1_000,
+              started_at: started,
+              cancel_force: true,
+            },
+            {
+              run_id: 'run-plain',
+              workflow_timeout_ms: 1_000,
+              started_at: started,
+              cancel_force: null,
+            },
+          ],
+        },
+      ],
+    });
+
+    await new WorkflowDeadlineDetector(makeDeps(db, mocks)).scan();
+
+    // fails-when: the detector ignores cancel_force and re-sends a forced
+    // cancel gracefully, racing the leader's forced re-drive.
+    expect(mocks.cancelRunWithReason).toHaveBeenCalledWith('run-forced', expect.any(String), {
+      force: true,
+    });
+    // breaks-if-wrong: a run no forced cancel reached is cancelled gracefully.
+    expect(mocks.cancelRunWithReason).toHaveBeenCalledWith('run-plain', expect.any(String), {
+      force: false,
+    });
+  });
+
   it('leaves runs that are not past their deadline untouched', async () => {
     const mocks = createDeps();
     // The SQL predicate filters them out, so the SELECT returns nothing.
@@ -148,8 +185,12 @@ describe('WorkflowDeadlineDetector', () => {
     const detector = new WorkflowDeadlineDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    expect(mocks.cancelRunWithReason).toHaveBeenCalledWith('run-a', expect.any(String));
-    expect(mocks.cancelRunWithReason).toHaveBeenCalledWith('run-b', expect.any(String));
+    expect(mocks.cancelRunWithReason).toHaveBeenCalledWith('run-a', expect.any(String), {
+      force: false,
+    });
+    expect(mocks.cancelRunWithReason).toHaveBeenCalledWith('run-b', expect.any(String), {
+      force: false,
+    });
     expect(mocks.cancelRunWithReason).toHaveBeenCalledTimes(2);
   });
 

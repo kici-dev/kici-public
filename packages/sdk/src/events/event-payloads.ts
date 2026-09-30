@@ -117,6 +117,8 @@ export interface EventBase {
   isForkPR?: boolean;
   /** Base branch ref for PR events. */
   baseBranch?: string;
+  /** The repository's default branch, when the delivery names it. A new-branch push diffs against it. */
+  defaultBranch?: string;
   /** Sender username from the webhook payload. */
   senderUsername?: string;
   /** Repository identifier (e.g. "owner/repo"). */
@@ -124,7 +126,7 @@ export interface EventBase {
   /** Files changed in this event (for path filtering). */
   changedFiles?: string[];
   /**
-   * Availability of `changedFiles` — `fetched` (real diff), `unavailable` (no diff / could not compute), or `skipped` (orchestrator did not fetch; the agent recomputes from its clone).
+   * Availability of `changedFiles` — `fetched` (real diff), `unavailable` (no diff / could not compute), or `skipped` (no trigger declares `paths`, so the orchestrator resolved nothing; the agent recomputes from its clone).
    */
   changedFilesStatus?: import('@kici-dev/engine').ChangedFilesStatus;
   /** Raw webhook payload from the provider. May be absent in flattened event forms. */

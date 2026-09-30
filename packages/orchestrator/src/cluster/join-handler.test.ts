@@ -3,7 +3,14 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 import type { JoinRequest } from '@kici-dev/engine';
 import { JoinHandler } from './join-handler.js';
-import { deriveKeys, encryptBundle, decryptBundle, parseToken } from './join-token.js';
+import {
+  deriveKeys,
+  encryptBundle,
+  decryptBundle,
+  parseToken,
+  TOKEN_ALREADY_USED_MESSAGE,
+  TOKEN_EXPIRED_MESSAGE,
+} from './join-token.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 function createMockTokenManager(
@@ -18,14 +25,8 @@ function createMockTokenManager(
   return {
     validateAndConsumeToken: vi.fn().mockImplementation(async (token: string) => {
       if (!valid) throw new Error('Invalid join token');
-      if (expired)
-        throw new Error(
-          'Join token has expired. Generate a new token with: kici admin create-join-token',
-        );
-      if (consumed)
-        throw new Error(
-          'Join token has already been used. Generate a new token with: kici admin create-join-token',
-        );
+      if (expired) throw new Error(TOKEN_EXPIRED_MESSAGE);
+      if (consumed) throw new Error(TOKEN_ALREADY_USED_MESSAGE);
 
       const parsed = parseToken(token);
       const keys = deriveKeys(Buffer.from(parsed.secretHex, 'hex'));

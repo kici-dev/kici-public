@@ -129,6 +129,37 @@ describe('GitHubChangedFilesFetcher', () => {
       });
     });
 
+    // fails-when: a listFiles result at GitHub's 3000-file cap reads as authoritative
+    it('a PR listFiles result at the 3000-file cap is unavailable', async () => {
+      setupMockOctokit({
+        paginateResult: Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}` })),
+      });
+      const payload = makePayload({ pull_request: { number: 42 } });
+      const result = await fetcher.getChangedFiles(
+        'test-owner/test-repo',
+        'pull_request',
+        payload,
+        { installationId: 1 },
+      );
+      expect(result).toEqual({ files: [], status: 'unavailable' });
+    });
+
+    // breaks-if-wrong: a PR under the cap must stay authoritative
+    it('a PR listFiles result just under the 3000-file cap stays fetched', async () => {
+      setupMockOctokit({
+        paginateResult: Array.from({ length: 2999 }, (_, i) => ({ filename: `f${i}` })),
+      });
+      const payload = makePayload({ pull_request: { number: 42 } });
+      const result = await fetcher.getChangedFiles(
+        'test-owner/test-repo',
+        'pull_request',
+        payload,
+        { installationId: 1 },
+      );
+      expect(result.status).toBe('fetched');
+      expect(result.files).toHaveLength(2999);
+    });
+
     it('reports unavailable when pull_request data is missing', async () => {
       setupMockOctokit();
       const payload = makePayload(); // no pull_request
@@ -168,44 +199,97 @@ describe('GitHubChangedFilesFetcher', () => {
       });
     });
 
-    it('initial push (zero SHA before) is fetched + [] (deliberate no-diff)', async () => {
-      const mock = setupMockOctokit();
+    it('new branch: compares the default branch three-dot against after', async () => {
+      const mock = setupMockOctokit({ compareResult: [{ filename: 'src/new.ts' }] });
       const payload = makePayload({
-        before: '0000000000000000000000000000000000000000',
-        after: 'abc123',
+        ref: 'refs/heads/feature',
+        before: '0'.repeat(40),
+        after: 'bbb222',
+        repository: { owner: { login: 'test-owner' }, name: 'test-repo', default_branch: 'main' },
       });
-
       const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
         installationId: 1,
       });
-
-      expect(result).toEqual({ files: [], status: 'fetched' });
-      expect(mock.rest.repos.compareCommits).not.toHaveBeenCalled();
-      expect(mockLogger.debug).toHaveBeenCalledWith(
-        expect.stringContaining('Initial push'),
-        expect.any(Object),
-      );
+      expect(result).toEqual({ files: ['src/new.ts'], status: 'fetched' });
+      expect(mock.rest.repos.compareCommits).toHaveBeenCalledWith({
+        owner: 'test-owner',
+        repo: 'test-repo',
+        base: 'main',
+        head: 'bbb222',
+      });
     });
 
-    it('logs warning when >= 300 files returned', async () => {
-      const manyFiles = Array.from({ length: 300 }, (_, i) => ({
-        filename: `file-${i}.ts`,
-      }));
-      setupMockOctokit({ compareResult: manyFiles });
+    it('new branch pushed as the default branch itself: unavailable, no API call', async () => {
+      const mock = setupMockOctokit();
       const payload = makePayload({
-        before: 'aaa111',
+        ref: 'refs/heads/main',
+        before: '0'.repeat(40),
         after: 'bbb222',
+        repository: { owner: { login: 'test-owner' }, name: 'test-repo', default_branch: 'main' },
       });
-
       const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
         installationId: 1,
       });
+      expect(result).toEqual({ files: [], status: 'unavailable' });
+      expect(mock.rest.repos.compareCommits).not.toHaveBeenCalled();
+    });
 
-      expect(result.files).toHaveLength(300);
+    it('new branch with no known default branch: unavailable, no API call', async () => {
+      const mock = setupMockOctokit();
+      const payload = makePayload({
+        ref: 'refs/heads/feature',
+        before: '0'.repeat(40),
+        after: 'abc123',
+      });
+      const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
+        installationId: 1,
+      });
+      expect(result).toEqual({ files: [], status: 'unavailable' });
+      expect(mock.rest.repos.compareCommits).not.toHaveBeenCalled();
+    });
+
+    it('a created tag (zero before, refs/tags) is unavailable, no API call', async () => {
+      const mock = setupMockOctokit();
+      const payload = makePayload({
+        ref: 'refs/tags/v1.0.0',
+        before: '0'.repeat(40),
+        after: 'bbb222',
+        repository: { owner: { login: 'test-owner' }, name: 'test-repo', default_branch: 'main' },
+      });
+      const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
+        installationId: 1,
+      });
+      expect(result).toEqual({ files: [], status: 'unavailable' });
+      expect(mock.rest.repos.compareCommits).not.toHaveBeenCalled();
+    });
+
+    // fails-when: a truncated compare result reads as authoritative
+    it('a compare result at the 300-file cap is unavailable', async () => {
+      setupMockOctokit({
+        compareResult: Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}` })),
+      });
+      const payload = makePayload({ before: 'aaa111', after: 'bbb222' });
+      const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
+        installationId: 1,
+      });
+      expect(result).toEqual({ files: [], status: 'unavailable' });
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining('300'),
         expect.any(Object),
       );
+    });
+
+    // breaks-if-wrong: a compare result under the cap must stay authoritative
+    it('a compare result just under the 300-file cap stays fetched', async () => {
+      setupMockOctokit({
+        compareResult: Array.from({ length: 299 }, (_, i) => ({ filename: `f${i}` })),
+      });
+      const payload = makePayload({ before: 'aaa111', after: 'bbb222' });
+      const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
+        installationId: 1,
+      });
+      expect(result.status).toBe('fetched');
+      expect(result.files).toHaveLength(299);
     });
 
     it('reports unavailable when before/after SHAs are missing', async () => {

@@ -52,6 +52,8 @@ interface GlobalWorkflowSettings {
   rerouteMaxHops: number | null;
   backupStalenessWarnHours: number | null;
   queueTimeoutMs: number | null;
+  // Optional: an older orchestrator's response predates the field.
+  cacheUploadSettleTimeoutMs?: number | null;
   approvalExpirySeconds: number;
   allowSelfApproval: boolean;
   // Optional: an older orchestrator's /org-settings response predates the
@@ -86,6 +88,7 @@ interface PatchBody {
   rerouteMaxHops?: number | null;
   backupStalenessWarnHours?: number | null;
   queueTimeoutMs?: number | null;
+  cacheUploadSettleTimeoutMs?: number | null;
   approvalExpirySeconds?: number;
   allowSelfApproval?: boolean;
   sandboxAllowedCapabilities?: string[] | null;
@@ -149,6 +152,9 @@ function formatSettings(s: GlobalWorkflowSettings, format: string): string {
   );
   lines.push(
     `Queue timeout:         ${s.queueTimeoutMs === null ? '(cluster default)' : `${s.queueTimeoutMs} ms`}`,
+  );
+  lines.push(
+    `Cache upload settle:   ${s.cacheUploadSettleTimeoutMs == null ? '(cluster default)' : `${s.cacheUploadSettleTimeoutMs} ms`}`,
   );
   lines.push(`Approval expiry:       ${s.approvalExpirySeconds} s`);
   lines.push(`Allow self-approval:   ${s.allowSelfApproval}`);
@@ -323,6 +329,9 @@ export function registerOrgSettingsCommands(
 
   // ── queue-timeout ────────────────────────────────────────────────
   registerQueueTimeoutCommands(orgSettings, getClient);
+
+  // ── cache-upload-settle ──────────────────────────────────────────
+  registerCacheUploadSettleCommands(orgSettings, getClient);
 
   // ── approval ─────────────────────────────────────────────────────
   registerApprovalCommands(orgSettings, getClient);
@@ -562,6 +571,83 @@ function registerQueueTimeoutCommands(orgSettings: Command, getClient: () => Adm
       const customerId = resolveCustomerId(opts);
       try {
         const updated = await patchSettings(getClient(), { customerId, queueTimeoutMs: null });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/**
+ * `kici-admin org-settings cache-upload-settle <show|set|reset>`.
+ *
+ * The per-org bound (`org_settings.cache_upload_settle_timeout_ms`) on how long
+ * a build job's success waits for the cache publish its agent reported just
+ * before it. null clears the override → cluster default; `set 0` turns the
+ * wait off.
+ */
+function registerCacheUploadSettleCommands(
+  orgSettings: Command,
+  getClient: () => AdminApiClient,
+): void {
+  const cs = orgSettings
+    .command('cache-upload-settle')
+    .description(
+      'Manage how long a build success waits for its cache upload to publish (null = cluster default)',
+    );
+
+  cs.command('show')
+    .description('Print the current per-org cache upload settle timeout')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  cs.command('set')
+    .description('Set the per-org cache upload settle timeout in milliseconds (0 = no wait)')
+    .argument('<ms>', 'Settle timeout in milliseconds (integer >= 0)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (ms: string, opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      const cacheUploadSettleTimeoutMs = parseIntFlag(ms, 0, 'ms (milliseconds)');
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          cacheUploadSettleTimeoutMs,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  cs.command('reset')
+    .description(
+      'Clear the per-org cache upload settle override (fall back to the cluster default)',
+    )
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          cacheUploadSettleTimeoutMs: null,
+        });
         console.log(formatSettings(updated, opts.format));
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);

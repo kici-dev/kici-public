@@ -2513,8 +2513,17 @@ async function resolveWorkflowInstallSecrets(
 // Phase D — per-job context evaluation
 // ---------------------------------------------------------------------------
 
+/** The `paths` lists this workflow's matching left to the agent, or undefined. */
+export function deferredPathsOf(
+  ctx: Pick<WorkflowDispatchContext, 'decision'>,
+): string[][] | undefined {
+  const deferred = ctx.decision.deferredPaths;
+  return deferred && deferred.length > 0 ? deferred : undefined;
+}
+
 /**
- * Build the deferred init job for jobs with dynamic fields.
+ * Build the deferred init job for a job with dynamic fields, or for a workflow
+ * whose filter or deferred paths need the agent's verdict.
  */
 function buildDeferredInitJob(args: {
   ctx: WorkflowDispatchContext;
@@ -2536,6 +2545,11 @@ function buildDeferredInitJob(args: {
     // verdict suppresses the dispatch. Omitted (never `false`) when the
     // workflow declares none, matching how the lock file records it.
     ...(workflow.hasFilter === true && { hasFilter: true }),
+    // Paths the orchestrator could only match conservatively; the init job
+    // decides them from its clone before anything else, and a no-match
+    // suppresses the dispatch. Omitted when none, so an older agent sees no
+    // change.
+    ...(deferredPathsOf(ctx) && { deferredPaths: deferredPathsOf(ctx) }),
     workflowName: workflow.name,
     source: workflow.source?.file ?? fullLockFile.source.file,
     dynamicContext: (lockJob.contexts ?? []).some((e) => e.dynamic),
@@ -3391,8 +3405,12 @@ export async function evaluateJobContexts(args: {
     // either way, and giving it an init job would let the flow-back dispatch it
     // past the very hold that stopped it. The consequence is that a held job's
     // filter is never evaluated — approval, not the filter, is its gate.
+    //
+    // Deferred paths are the second verdict the init job returns: a workflow
+    // that matched only because the changed files were unavailable learns from
+    // the agent's clone whether its `paths` actually match.
     if (
-      workflow.hasFilter === true &&
+      (workflow.hasFilter === true || deferredPathsOf(ctx) !== undefined) &&
       deps.pendingInits &&
       !jobEnvData.rejected &&
       !jobEnvData.held
@@ -5605,6 +5623,8 @@ async function applyInitResultContext(args: {
 
 /** Why an init result must not lead to a dispatch. */
 export enum InitDispatchSuppression {
+  /** The agent's clone diff matched none of the deferred `paths`. */
+  Paths = 'paths',
   /** The workflow's own `filter` decided the workflow does not apply. */
   Filter = 'filter',
   /** The job is already rejected by a context rule, or held for approval. */
@@ -5613,6 +5633,11 @@ export enum InitDispatchSuppression {
 
 /**
  * Decide whether an arrived init result may dispatch its job.
+ *
+ * `Paths` is checked first: a workflow whose deferred `paths` did not match
+ * never triggered, whatever its filter says. Only an explicit `false`
+ * suppresses — an agent that predates deferred paths reports no verdict, and
+ * that absence dispatches.
  *
  * `Filter` requires the workflow to actually declare a filter as well as the
  * agent to have reported `false`: a buggy or rogue agent must not be able to
@@ -5644,9 +5669,10 @@ export enum InitDispatchSuppression {
  */
 export function initDispatchSuppression(
   workflow: Pick<LockWorkflow, 'hasFilter'>,
-  initResult: { filterPassed?: boolean },
+  initResult: { filterPassed?: boolean; pathsPassed?: boolean },
   jobEnvData: Pick<JobEnvData, 'rejected' | 'held'>,
 ): InitDispatchSuppression | null {
+  if (initResult.pathsPassed === false) return InitDispatchSuppression.Paths;
   if (workflow.hasFilter === true && initResult.filterPassed === false) {
     return InitDispatchSuppression.Filter;
   }
@@ -6055,6 +6081,15 @@ function startDeferredInitDispatch(args: {
         const jobEnvData = jobContextData.get(mat.expandedName) ?? {};
         jobEnvData.pendingInit = false;
         const suppression = initDispatchSuppression(workflow, initResult, jobEnvData);
+        if (suppression === InitDispatchSuppression.Paths) {
+          logger.info('Workflow paths suppressed dispatch', {
+            runId,
+            workflowName: workflow.name,
+            jobName: mat.expandedName,
+          });
+          jobContextData.set(mat.expandedName, jobEnvData);
+          return;
+        }
         if (suppression === InitDispatchSuppression.Filter) {
           logger.info('Workflow filter suppressed dispatch', {
             runId,
@@ -6316,6 +6351,8 @@ async function dispatchEvalJob(args: {
     // inert, and a mixed one would half-dispatch. Omitted (never `false`) when
     // the workflow declares none, matching how the lock file records it.
     ...(workflow.hasFilter === true && { hasFilter: true }),
+    // Deferred paths gate the generator the same way, and ahead of the filter.
+    ...(deferredPathsOf(ctx) && { deferredPaths: deferredPathsOf(ctx) }),
     ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
     ...(workflow.resolvedHashFiles?.length && {
       resolvedHashFiles: workflow.resolvedHashFiles,

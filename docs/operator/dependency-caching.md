@@ -80,7 +80,7 @@ The workflow `contentHash` is mixed with a `COMPILE_SCHEMA_VERSION` constant (cu
 
 ### Integrity verification
 
-- **Dependency tarball:** the build agent reports the SHA-256 of the tarball bytes in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file and sends it alongside `depsUrl` in `job.dispatch`. The execution agent streams the download through a SHA-256 hasher and fails the job (with up to 2 retries on HTTP(S) transports) if the hash does not match.
+- **Dependency tarball:** the build agent reports the SHA-256 of the tarball bytes in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file and sends it alongside `depsUrl` in `job.dispatch`. The execution agent downloads the tarball to a file, checks its SHA-256, and extracts only a tarball that matches. A mismatch fails the job at once; the agent does not download again, because the dependency cache key is the tarball's own hash.
 - **Source tarball:** `sourceTarDigest` on the `job.dispatch` message is the SHA-256 of the tarball bytes, verified before extraction. After extraction, `loadWorkflowSource` re-computes the workflow `contentHash` against the extracted raw source and fails the job with a **"lock file is out of date"** error if it diverges from the lock file's value. This covers lock-file drift end-to-end.
 
 ### Lock file and drift
@@ -107,11 +107,12 @@ All cache configuration is set via environment variables on the orchestrator.
 
 ### Cache behavior
 
-| Variable                       | Default              | Description                                              |
-| ------------------------------ | -------------------- | -------------------------------------------------------- |
-| `KICI_CACHE_TTL_DAYS`          | `30`                 | Days of inactivity before cache entries expire           |
-| `KICI_CACHE_MAX_TARBALL_BYTES` | `524288000` (500 MB) | Maximum dependency tarball size; build fails if exceeded |
-| `KICI_CACHE_BUILD_TIMEOUT_MS`  | `600000` (10 min)    | Maximum time for a build job to complete                 |
+| Variable                              | Default              | Description                                                                                                                                                                                    |
+| ------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_CACHE_TTL_DAYS`                 | `30`                 | Days of inactivity before cache entries expire                                                                                                                                                 |
+| `KICI_CACHE_MAX_TARBALL_BYTES`        | `524288000` (500 MB) | Maximum dependency tarball size; build fails if exceeded                                                                                                                                       |
+| `KICI_CACHE_BUILD_TIMEOUT_MS`         | `600000` (10 min)    | Maximum time for a build job to complete                                                                                                                                                       |
+| `KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS` | `10000` (10 s)       | How long a build's success waits for its uploaded cache to be published before the waiting jobs start; `0` turns the wait off. Per-org override: `kici-admin org-settings cache-upload-settle` |
 
 ### S3 storage (AWS)
 
@@ -214,7 +215,7 @@ The `roles` field on scaler entries controls which internal job types an agent c
 
 Build agents need the following tools installed:
 
-- **Node.js 24+** (same as execution agents)
+- **Node.js 24.5.0 or later** (same as execution agents)
 - **npm** (included with Node.js -- the default dependency installer)
 - **pnpm** -- required only when building workflows that live in a pnpm workspace; the agent shells out to `pnpm install` for those
 - **yarn** -- required only when building workflows in a yarn workspace (classic v1 or berry v2+); the agent shells out to `yarn install` for those. Corepack (bundled with Node.js) provisions the repo-pinned yarn version automatically
@@ -265,7 +266,15 @@ Monitor the hit/miss ratio to understand cache effectiveness. A healthy cache sh
 
 **Cause:** The cached tarball was corrupted or modified between upload and download. This can happen with storage backend issues.
 
-**Fix:** For HTTP/HTTPS downloads, the agent retries up to 2 times automatically (3 total attempts) with streaming hash verification. For `file://` URLs, there is no retry. If all attempts fail, clear the cached entry and let the next build repopulate it. Check the storage backend for corruption or intermittent errors.
+**Fix:** The agent does not retry a hash mismatch: the object at a dependency cache key never changes, so a second download reads the same bytes. Clear the cached entry and let the next build repopulate it. Check the storage backend for corruption.
+
+### Jobs install dependencies although the cache has them
+
+**Symptom:** The job's setup log shows `Cache restore failed (…), falling back to inline install`.
+
+**Cause:** The agent could not download or extract the dependency tarball. The setup log names the cause of each failed download attempt, for example `Dep tarball download attempt 1/3 failed after 4.1 s: …; 53.49 of 53.56 MB on disk; resuming from byte 56087920 in 0.5 s`. The agent log has the same detail in a `Dep restore report` line.
+
+**Fix:** Check the storage backend from the agent host. The agent tries a download three times and continues a cut download from the bytes it already has when the storage returns an `ETag` (S3 does; the filesystem backend does not). Each attempt stops after 5 minutes, or after 60 seconds with no data. Extraction stops after 10 minutes. During a restore the agent needs free disk space for the tarball and the extracted dependency tree at the same time; it deletes the tarball before the first step runs.
 
 ### Cache miss rate unexpectedly high
 
@@ -274,6 +283,17 @@ Monitor the hit/miss ratio to understand cache effectiveness. A healthy cache sh
 **Cause:** The lockfile is changing between runs (e.g., `npm install` modifying metadata in `.kici/package-lock.json`). The cache key is based on the full lockfile content hash.
 
 **Fix:** Use `npm ci` in your development workflow to keep lockfiles stable. Commit `.kici/package-lock.json` to version control.
+
+### Jobs after a build install dependencies themselves
+
+**Symptom:** A build job uploaded the dependency cache, but the jobs that ran after it installed their dependencies from the registry.
+
+**Cause:** The orchestrator did not publish the uploaded cache before the waiting jobs started. The orchestrator log shows which case applies:
+
+- `Cache upload did not publish within the settle timeout; releasing the build without it` — the storage backend was too slow. The publish did not finish within the settle timeout.
+- `Failed to initialize cache metadata` — the publish failed. The waiting jobs start at once, without the cache.
+
+**Fix:** Check the storage backend's latency and errors. If the backend is slow but healthy, raise the timeout for the org with `kici-admin org-settings cache-upload-settle set <milliseconds>`, or cluster-wide with `KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS`. If the publish failed, fix the storage backend error that the log line names.
 
 ## See also
 

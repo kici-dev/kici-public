@@ -74,7 +74,7 @@ Most commands follow a two-value convention:
 Two cases add a third code:
 
 - `kici doctor` grades its checks: `0` when every check passes, `1` when any check warns, `2` when any check fails.
-- A usage error exits `2` — mutually exclusive flags on `kici run remote` (`--pick` combined with a fixture name, `--all`, or `--workflow`), `--fail-on-drift` without `--check` on the same command, or invoking a retired command such as `kici run local`.
+- A usage error exits `2` — mutually exclusive flags on `kici run remote` (`--pick` combined with a fixture name, `--all`, or `--workflow`), `--fail-on-drift` without `--check` on the same command, or invoking the retired `kici run local`. Other retired commands (`kici status`, `kici cancel`) exit `1` with a hint that names their replacement.
 
 Each area page documents the exit codes of the commands it covers.
 

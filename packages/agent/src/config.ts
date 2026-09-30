@@ -381,7 +381,7 @@ export const envDef = defineEnv({
  * Maps env vars with KICI_ prefix:
  * - KICI_ORCHESTRATOR_URL (required)
  * - KICI_AGENT_ID (optional, auto-generated from hostname-uuid8)
- * - KICI_LABELS (comma-separated, e.g. "linux,docker"). Labels with 'kici-' prefix are reserved.
+ * - KICI_LABELS (comma-separated, e.g. "linux,docker"). Labels with the 'kici:' prefix are reserved.
  * - KICI_PROPERTIES (comma-separated key=value host-vars, e.g. "region=eu,cores=8,gpu=true"). Typed (bool/number/string), reported into the host roster.
  * - KICI_ROLES (comma-separated agent roles, e.g. "builder,init-runner". undefined=all, empty=execution-only)
  * - KICI_PORT (default: 8080)

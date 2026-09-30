@@ -2,9 +2,10 @@
  * User-facing cache engine (sandbox-side).
  *
  * Packs `CacheSpec.paths` into a gzip tarball (mirrors dep-packer's tar+sha256
- * approach) and restores a tarball with on-the-fly SHA-256 verification
- * (mirrors dep-restore's streaming pipeline). Drives the orchestrator over an
- * injected request-response transport (IPC -> agent WS -> orchestrator).
+ * approach) and restores a tarball by downloading it to a temp file and
+ * verifying its SHA-256 before extracting (as dep-restore does). Drives the
+ * orchestrator over an injected request-response transport (IPC -> agent WS ->
+ * orchestrator).
  *
  * Path safety: each path is either `~`-prefixed (home-relative) or
  * repo-root-relative; absolute paths and `..` escapes are rejected so a
@@ -21,11 +22,7 @@
  * sit on a different filesystem from the workspace, so the move falls back to
  * copy-then-remove on `EXDEV` rather than assuming a same-filesystem rename.
  */
-import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
-import { createGunzip } from 'node:zlib';
 import { homedir } from 'node:os';
 import { isAbsolute, dirname, join, relative, resolve, sep } from 'node:path';
 import { cp, mkdir, readdir, rename, rm } from 'node:fs/promises';
@@ -34,11 +31,13 @@ import { REPO_ANCHOR, HOME_ANCHOR } from '@kici-dev/core';
 import { c as tarCreate, x as tarExtract } from 'tar';
 import { createLogger, sha256 } from '@kici-dev/shared';
 import type { CacheSpec, CacheRestoreResult } from '@kici-dev/sdk';
+import { downloadToFile } from '../resumable-download.js';
+import { extractTarballFile, sha256File } from '../tarball-file.js';
 
 const logger = createLogger({ prefix: 'cache-engine' });
 
-/** Download timeout for a presigned cache GET: 5 minutes. */
-const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+/** Bound on extracting a downloaded cache tarball; matches the dependency restore's. */
+const EXTRACT_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Override roots — exposed for tests so the home destination is sandboxable. */
 export interface CacheRoots {
@@ -197,10 +196,30 @@ export async function extractCacheTarball(
 }
 
 /**
- * Stream-download a presigned URL, verify its SHA-256 on the fly (mirrors
- * dep-restore's response -> hash -> gunzip -> tar pipeline), then move the
- * anchored groups into place. Extracts into a scratch dir so a failed download
- * never half-writes the live tree.
+ * Remove a temp dir, logging instead of throwing. After an extraction that
+ * failed or timed out, `tar` may still be writing into the scratch dir, and an
+ * `ENOTEMPTY` from the removal must not replace the error that explains the
+ * failure. A leftover sits under the temp root, outside the job's tree.
+ */
+async function cleanupQuietly(dir: { path: string; cleanup(): Promise<void> }): Promise<void> {
+  try {
+    await dir.cleanup();
+  } catch (err) {
+    logger.warn('Cache temp dir cleanup failed (left behind)', {
+      path: dir.path,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Download a presigned URL into a temp file, verify its SHA-256, and only then
+ * extract it and move the anchored groups into place. Downloading first keeps
+ * a slow extraction from holding the connection open, where an object store
+ * closing it would fail the restore, and nothing is extracted from unverified
+ * bytes. The download retries and resumes a cut transfer
+ * (`resumable-download.ts`); both temp dirs honor `KICI_TMPDIR` and are removed
+ * whatever happens (a failed removal is logged, never thrown).
  */
 export async function downloadAndExtractCache(
   url: string,
@@ -209,35 +228,31 @@ export async function downloadAndExtractCache(
   roots?: CacheRoots,
 ): Promise<void> {
   const home = roots?.home ?? homedir();
-  const response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!response.ok || !response.body) throw new Error(`cache download HTTP ${response.status}`);
-  const hash = createHash('sha256');
-  const hashTransform = new Transform({
-    transform(chunk, _enc, cb) {
-      hash.update(chunk);
-      cb(null, chunk);
-    },
-  });
-  await mkdir(workDir, { recursive: true });
-  const { path: scratch, cleanup } = await makeTempDir('cache-extract');
+  const download = await makeTempDir('cache-download');
   try {
-    // Cast: fetch() returns a DOM ReadableStream; Readable.fromWeb expects the
-    // Node web-stream type. Structurally identical at runtime (same as dep-restore).
-    await pipeline(
-      Readable.fromWeb(response.body as never),
-      hashTransform,
-      createGunzip(),
-      tarExtract({ cwd: scratch }),
-    );
-    const digest = hash.digest('hex');
+    const tarPath = join(download.path, 'cache.tar.gz');
+    try {
+      await downloadToFile(url, tarPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`cache download failed: ${message}`, { cause: err });
+    }
+    const digest = await sha256File(tarPath);
     if (digest !== expectedHash) {
       throw new Error(
         `Cache tarball checksum mismatch on download: expected ${expectedHash}, got ${digest}`,
       );
     }
-    await moveAnchoredGroups(scratch, workDir, home);
+    await mkdir(workDir, { recursive: true });
+    const scratch = await makeTempDir('cache-extract');
+    try {
+      await extractTarballFile(tarPath, scratch.path, EXTRACT_TIMEOUT_MS);
+      await moveAnchoredGroups(scratch.path, workDir, home);
+    } finally {
+      await cleanupQuietly(scratch);
+    }
   } finally {
-    await cleanup();
+    await cleanupQuietly(download);
   }
 }
 

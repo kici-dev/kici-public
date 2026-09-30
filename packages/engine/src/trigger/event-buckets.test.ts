@@ -184,3 +184,22 @@ describe('TRIGGER_TYPE_TO_EVENT_TYPES drift guard', () => {
     expect(Object.keys(TRIGGER_TYPE_TO_EVENT_TYPES).sort()).toEqual([...expected].sort());
   });
 });
+
+describe('matchWorkflowsForEvent parity on deferred paths', () => {
+  it('returns the identical decision, deferredPaths included', () => {
+    const deferred = wf('deferred', [
+      { _type: 'push', branches: [], paths: ['src/**'] },
+      { _type: 'push', branches: [], paths: ['docs/**'] },
+    ] as LockTrigger[]);
+    const event: SimulatedEvent = {
+      type: 'push',
+      targetBranch: 'feature',
+      payload: { before: 'a'.repeat(40), after: 'b'.repeat(40) },
+      changedFiles: [],
+      changedFilesStatus: 'unavailable',
+    };
+    const viaAll = matchAllWorkflows([deferred], event);
+    expect(viaAll[0]?.deferredPaths).toEqual([['src/**'], ['docs/**']]);
+    expect(matchWorkflowsForEvent([deferred], event)).toEqual(viaAll);
+  });
+});

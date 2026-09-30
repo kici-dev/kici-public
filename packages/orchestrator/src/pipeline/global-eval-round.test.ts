@@ -119,6 +119,23 @@ describe('partitionCandidates', () => {
     expect(immediate).toHaveLength(1);
     expect(needsRound).toHaveLength(0);
   });
+
+  // fails-when: a candidate whose paths only the agent can decide dispatches without a round
+  it('routes a candidate with deferred paths to the round even without a filter or generator', () => {
+    const cand = {
+      ...candidate('paths'),
+      decision: {
+        workflowName: 'paths',
+        matched: true,
+        checks: [],
+        summary: '',
+        deferredPaths: [['src/**']],
+      },
+    };
+    const { immediate, needsRound } = partitionCandidates([cand]);
+    expect(needsRound.map((c) => c.lockEntry.name)).toEqual(['paths']);
+    expect(immediate).toHaveLength(0);
+  });
 });
 
 describe('groupCandidates', () => {
@@ -279,6 +296,37 @@ describe('runGlobalEvalRounds', () => {
     // The source repo travels on the job envelope, not in the round config.
     expect(h.dispatched[0].repoUrl).toBe('https://git.example.com/org/app.git');
     expect(h.dispatched[0].sha).toBe('source-sha');
+  });
+
+  it('carries deferred paths on the wire candidate, and omits them when none', async () => {
+    const deferred = {
+      ...candidate('org-paths'),
+      decision: {
+        workflowName: 'org-paths',
+        matched: true,
+        checks: [],
+        summary: '',
+        deferredPaths: [['src/**']],
+      },
+    };
+    const plain = candidate('org-ci', { hasFilter: true });
+    const h = harness(() => ({
+      candidates: [
+        { workflowName: 'org-paths', run: true },
+        { workflowName: 'org-ci', run: true },
+      ],
+    }));
+    await runVerdicts(roundArgs([deferred, plain], h));
+
+    expect(h.dispatched[0].jobConfig.candidates).toEqual([
+      {
+        workflowName: 'org-paths',
+        sourceFile: '.kici/workflows/org.ts',
+        hasFilter: false,
+        deferredPaths: [['src/**']],
+      },
+      { workflowName: 'org-ci', sourceFile: '.kici/workflows/org.ts', hasFilter: true },
+    ]);
   });
 
   it('builds the workflow clone URL from the registration bundle, not the event bundle', async () => {

@@ -17,6 +17,9 @@ const ZERO_SHA = '0000000000000000000000000000000000000000';
 /** GitHub's maximum files returned by compareCommits */
 const GITHUB_COMPARE_FILE_LIMIT = 300;
 
+/** GitHub's maximum files returned by pulls.listFiles */
+const GITHUB_PR_FILE_LIMIT = 3000;
+
 /** Maximum retries for 429 (rate limit) responses */
 const MAX_429_RETRIES = 3;
 
@@ -107,7 +110,10 @@ interface WebhookPayload {
   repository: {
     owner: { login: string };
     name: string;
+    default_branch?: string;
   };
+  /** Present on push events: the pushed ref (`refs/heads/<branch>`). */
+  ref?: string;
   /** Present on pull_request events */
   pull_request?: {
     number: number;
@@ -120,10 +126,15 @@ interface WebhookPayload {
 /**
  * GitHub-specific implementation of ChangedFilesFetcher.
  *
- * For PRs: uses paginated pulls.listFiles API (handles up to 3000 files).
- * For pushes: uses repos.compareCommits API (logs warning at 300+ files).
- * For initial pushes (zero SHA): returns empty array.
- * For unknown events: returns empty array.
+ * For PRs: uses the paginated pulls.listFiles API; a result at GitHub's
+ * 3000-file cap is truncated, so it reports `unavailable`.
+ * For pushes: uses the repos.compareCommits API; a result at GitHub's 300-file
+ * cap is truncated, so it reports `unavailable`.
+ * For a new branch (zero `before`): compares the default branch against
+ * `after` (three-dot), the files the branch adds. With no known default
+ * branch, or the default branch itself being created, it reports `unavailable`.
+ * For a deleted branch (zero `after`): `fetched` + [].
+ * For unknown events: reports `unavailable`.
  */
 export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
   readonly provider = 'github' as const;
@@ -207,6 +218,14 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
       `pulls.listFiles(${owner}/${repo}#${pullNumber})`,
     );
 
+    if (files.length >= GITHUB_PR_FILE_LIMIT) {
+      logger.warn(
+        `Pull request listFiles returned ${files.length} files (>= ${GITHUB_PR_FILE_LIMIT}); GitHub truncates here, so the list is not authoritative`,
+        { owner, repo, pullNumber, fileCount: files.length },
+      );
+      return { files: [], status: 'unavailable' };
+    }
+
     return { files: files.map((file) => file.filename), status: 'fetched' };
   }
 
@@ -227,19 +246,7 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
       return { files: [], status: 'unavailable' };
     }
 
-    // Initial push (branch creation) has all-zero before SHA — there is
-    // genuinely no diff, so this is `fetched` + [] (a deliberate no-match for
-    // path filters), NOT `unavailable`.
-    if (before === ZERO_SHA) {
-      logger.debug('Initial push detected (zero SHA), returning empty changed files', {
-        owner,
-        repo,
-        after,
-      });
-      return { files: [], status: 'fetched' };
-    }
-
-    // Branch deletion has all-zero after SHA — likewise a genuine no-diff.
+    // Branch deletion has all-zero after SHA — a genuine no-diff.
     if (after === ZERO_SHA) {
       logger.debug('Branch deletion detected (zero after SHA), returning empty changed files', {
         owner,
@@ -249,24 +256,51 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
       return { files: [], status: 'fetched' };
     }
 
-    const response = await withRateLimitRetry(
-      () =>
-        octokit.rest.repos.compareCommits({
+    // A new branch: the files it adds relative to the default branch (GitHub's
+    // compare is three-dot). A created tag, an unknown default, or the default
+    // branch itself being created leaves no range.
+    if (before === ZERO_SHA) {
+      const defaultBranch = payload.repository.default_branch;
+      const isBranchRef = payload.ref === undefined || payload.ref.startsWith('refs/heads/');
+      const pushed = payload.ref?.slice('refs/heads/'.length);
+      if (!isBranchRef || !defaultBranch || defaultBranch === pushed) {
+        logger.debug('New-branch push with no other default branch to diff against', {
           owner,
           repo,
-          base: before,
-          head: after,
-        }),
-      `repos.compareCommits(${owner}/${repo}, ${before.slice(0, 7)}..${after.slice(0, 7)})`,
+          after,
+        });
+        return { files: [], status: 'unavailable' };
+      }
+      return this.compare(octokit, owner, repo, defaultBranch, after);
+    }
+
+    return this.compare(octokit, owner, repo, before, after);
+  }
+
+  /**
+   * Compare two refs through the compareCommits API. A result at GitHub's
+   * 300-file cap is truncated, so it reports `unavailable`.
+   */
+  private async compare(
+    octokit: ReturnType<typeof createInstallationOctokit>,
+    owner: string,
+    repo: string,
+    base: string,
+    head: string,
+  ): Promise<ChangedFilesResult> {
+    const response = await withRateLimitRetry(
+      () => octokit.rest.repos.compareCommits({ owner, repo, base, head }),
+      `repos.compareCommits(${owner}/${repo}, ${base.slice(0, 7)}..${head.slice(0, 7)})`,
     );
 
     const files = response.data.files ?? [];
 
     if (files.length >= GITHUB_COMPARE_FILE_LIMIT) {
       logger.warn(
-        `Push event has ${files.length} changed files (>= ${GITHUB_COMPARE_FILE_LIMIT}), results may be truncated by GitHub`,
-        { owner, repo, before, after, fileCount: files.length },
+        `Push compare returned ${files.length} files (>= ${GITHUB_COMPARE_FILE_LIMIT}); GitHub truncates here, so the list is not authoritative`,
+        { owner, repo, base, head, fileCount: files.length },
       );
+      return { files: [], status: 'unavailable' };
     }
 
     return { files: files.map((file) => file.filename), status: 'fetched' };

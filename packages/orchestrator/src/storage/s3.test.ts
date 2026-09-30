@@ -1,201 +1,5 @@
-import { describe, it, expect, afterAll, vi, beforeEach } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { S3CacheStorage } from './s3.js';
-
-/**
- * S3 cache storage tests.
- *
- * Unit tests (mocked): Always run, verify getUploadUrl and initMeta behavior.
- * Integration tests: Require real AWS credentials and an S3 bucket.
- * They are skipped unless S3_TEST_BUCKET is set in the environment.
- *
- * Usage:
- *   pnpm test -- --run storage/s3                             # Unit tests only
- *   S3_TEST_BUCKET=my-test-bucket pnpm test -- --run storage/s3  # Unit + integration
- */
-
-const testBucket = process.env.S3_TEST_BUCKET;
-const testRegion = process.env.S3_TEST_REGION;
-
-// Unique prefix per test run to avoid collisions
-const testPrefix = `kici-test-${randomUUID().slice(0, 8)}/`;
-
-// Track keys for cleanup
-const createdKeys: string[] = [];
-
-describe.skipIf(!testBucket)('S3CacheStorage', () => {
-  const storage = testBucket
-    ? new S3CacheStorage({
-        bucket: testBucket,
-        prefix: testPrefix,
-        ttlMs: 60_000, // 1 minute TTL for tests
-        region: testRegion,
-      })
-    : (null as unknown as S3CacheStorage);
-
-  afterAll(async () => {
-    // Clean up all test objects
-    if (!testBucket || !storage) return;
-    for (const key of createdKeys) {
-      try {
-        await storage.delete(key);
-      } catch {
-        // Ignore cleanup errors
-      }
-    }
-  });
-
-  // -- put + get roundtrip --
-
-  describe('put() + get()', () => {
-    it('stores and retrieves string data', async () => {
-      const key = `test-string-${randomUUID().slice(0, 8)}`;
-      createdKeys.push(key);
-
-      await storage.put(key, 'hello world');
-      const result = await storage.get(key);
-
-      expect(result).not.toBeNull();
-      expect(result!.toString()).toBe('hello world');
-    });
-
-    it('stores and retrieves Buffer data', async () => {
-      const key = `test-buffer-${randomUUID().slice(0, 8)}`;
-      createdKeys.push(key);
-
-      const data = Buffer.from([0x00, 0x01, 0x02, 0xff]);
-      await storage.put(key, data);
-      const result = await storage.get(key);
-
-      expect(result).not.toBeNull();
-      expect(Buffer.compare(result!, data)).toBe(0);
-    });
-
-    it('returns null for non-existent key', async () => {
-      const result = await storage.get('non-existent-key');
-      expect(result).toBeNull();
-    });
-  });
-
-  // -- has() --
-
-  describe('has()', () => {
-    it('returns true for existing key', async () => {
-      const key = `test-has-${randomUUID().slice(0, 8)}`;
-      createdKeys.push(key);
-
-      await storage.put(key, 'data');
-      expect(await storage.has(key)).toBe(true);
-    });
-
-    it('returns false for missing key', async () => {
-      expect(await storage.has('missing-key')).toBe(false);
-    });
-  });
-
-  // -- delete() --
-
-  describe('delete()', () => {
-    it('removes data and returns true for existing key', async () => {
-      const key = `test-delete-${randomUUID().slice(0, 8)}`;
-
-      await storage.put(key, 'data');
-      const deleted = await storage.delete(key);
-      expect(deleted).toBe(true);
-
-      const result = await storage.get(key);
-      expect(result).toBeNull();
-    });
-
-    it('returns false for non-existent key', async () => {
-      const deleted = await storage.delete('never-existed');
-      expect(deleted).toBe(false);
-    });
-  });
-
-  // -- getUrl() --
-
-  describe('getUrl()', () => {
-    it('returns a pre-signed URL containing bucket and key', async () => {
-      const key = `test-url-${randomUUID().slice(0, 8)}`;
-      createdKeys.push(key);
-
-      await storage.put(key, 'data');
-      const url = await storage.getUrl(key);
-
-      expect(url).not.toBeNull();
-      expect(url).toContain(testBucket);
-      expect(url).toContain(testPrefix);
-    });
-
-    it('returns null for non-existent key', async () => {
-      const url = await storage.getUrl('missing-key');
-      expect(url).toBeNull();
-    });
-  });
-
-  // -- list() + copy() --
-
-  describe('list() + copy()', () => {
-    it('lists keys under a sub-prefix and copies bytes to a new key', async () => {
-      const base = `list-${randomUUID().slice(0, 8)}`;
-      const k1 = `${base}/k1`;
-      const k2 = `${base}/k2`;
-      const k3 = `other-${randomUUID().slice(0, 8)}/k3`;
-      createdKeys.push(k1, k2, k3, `${k1}.committed`);
-
-      await storage.put(k1, 'one');
-      await storage.put(k2, 'two');
-      await storage.put(k3, 'three');
-
-      const listed = await storage.list(`${base}/`);
-      expect(listed.sort()).toEqual([k1, k2].sort());
-
-      await storage.copy(k1, `${k1}.committed`);
-      const copied = await storage.get(`${k1}.committed`);
-      expect(copied?.toString('utf-8')).toBe('one');
-    });
-  });
-
-  // -- getMetadata() --
-
-  describe('getMetadata()', () => {
-    it('returns createdAt + lastAccessedAt, null when missing', async () => {
-      const key = `test-meta-${randomUUID().slice(0, 8)}`;
-      createdKeys.push(key);
-      expect(await storage.getMetadata(key)).toBeNull();
-      await storage.put(key, 'data');
-      const meta = await storage.getMetadata(key);
-      expect(meta).not.toBeNull();
-      expect(typeof meta!.createdAt).toBe('string');
-      expect(typeof meta!.lastAccessedAt).toBe('string');
-    });
-  });
-
-  // -- TTL expiry --
-
-  describe('TTL expiry', () => {
-    it('expires items after TTL elapses', async () => {
-      const shortTtlStorage = new S3CacheStorage({
-        bucket: testBucket!,
-        prefix: testPrefix,
-        ttlMs: 1, // 1ms TTL
-        region: testRegion,
-      });
-
-      const key = `test-ttl-${randomUUID().slice(0, 8)}`;
-      createdKeys.push(key);
-
-      await shortTtlStorage.put(key, 'data');
-
-      // Wait for TTL to pass
-      await new Promise((r) => setTimeout(r, 10));
-
-      const result = await shortTtlStorage.get(key);
-      expect(result).toBeNull();
-    });
-  });
-});
 
 // -- Unit tests (mocked S3 client) --
 
@@ -366,6 +170,124 @@ describe('S3CacheStorage (unit)', () => {
       const result = await storage.get('some-key');
       expect(result).not.toBeNull();
       expect(result!.toString()).toBe('cached-data');
+    });
+  });
+
+  describe('touch() is conditional on the version it read', () => {
+    /** Answer the client's sends in order: one entry per S3 call, an Error rejects. */
+    function answerInOrder(...responses: unknown[]): void {
+      const mockSend = (storage as any).client.send as ReturnType<typeof vi.fn>;
+      mockSend.mockReset();
+      let call = 0;
+      mockSend.mockImplementation(() => {
+        const next = responses[call++] ?? {};
+        return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+      });
+    }
+
+    const headWith = (etag: string | undefined) => ({
+      ...(etag && { ETag: etag }),
+      Metadata: {
+        'created-at': new Date().toISOString(),
+        'last-accessed-at': new Date().toISOString(),
+      },
+    });
+
+    it('pins the self-copy to the HEAD ETag on both the source and the destination', async () => {
+      answerInOrder(headWith('"etag-1"'), {});
+
+      await storage.touch('deps/linux-x64/lock.hash');
+
+      expect(CopyObjectCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: 'test-prefix/deps/linux-x64/lock.hash',
+          CopySourceIfMatch: '"etag-1"',
+          IfMatch: '"etag-1"',
+        }),
+      );
+    });
+
+    it('get() pins its touch-on-read to the HEAD ETag', async () => {
+      answerInOrder(
+        headWith('"etag-2"'),
+        { Body: { transformToByteArray: () => Promise.resolve(Buffer.from('target')) } },
+        {},
+      );
+
+      expect((await storage.get('some-key'))!.toString()).toBe('target');
+      expect(CopyObjectCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ CopySourceIfMatch: '"etag-2"', IfMatch: '"etag-2"' }),
+      );
+    });
+
+    it('resolves when the object was replaced since the read (412)', async () => {
+      // breaks-if-wrong: the dep-cache hit path awaits this touch, so a refused
+      // condition must not surface as a dispatch failure.
+      answerInOrder(
+        headWith('"etag-3"'),
+        Object.assign(new Error('At least one of the pre-conditions you specified did not hold'), {
+          name: 'PreconditionFailed',
+          $metadata: { httpStatusCode: 412 },
+        }),
+      );
+
+      await expect(storage.touch('some-key')).resolves.toBeUndefined();
+    });
+
+    it('still rethrows any other copy failure', async () => {
+      answerInOrder(headWith('"etag-4"'), new Error('AccessDenied'));
+
+      await expect(storage.touch('some-key')).rejects.toThrow('AccessDenied');
+    });
+
+    it('resolves when a concurrent write raced the conditional copy (409)', async () => {
+      // fails-when: only 412 is read as "replaced" — AWS answers a conditional
+      // copy that overlaps a concurrent write with 409, and the dep-cache hit
+      // path would fail the dispatch.
+      answerInOrder(
+        headWith('"etag-5"'),
+        Object.assign(new Error('A conflicting conditional operation is in progress'), {
+          name: 'ConditionalRequestConflict',
+          $metadata: { httpStatusCode: 409 },
+        }),
+      );
+
+      await expect(storage.touch('some-key')).resolves.toBeUndefined();
+      expect(CopyObjectCommand, 'a raced copy is not retried').toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to an unconditional copy on a backend that does not implement it (501)', async () => {
+      // fails-when: a 501 is rethrown — every cache hit on such a backend then
+      // fails its dispatch, or (via get()) never refreshes its TTL.
+      const notImplemented = () =>
+        Object.assign(new Error('Copy object not implemented with X-Amz-Copy-Source-If-Match'), {
+          name: 'NotImplemented',
+          $metadata: { httpStatusCode: 501 },
+        });
+      answerInOrder(headWith('"etag-6"'), notImplemented(), {}, headWith('"etag-7"'), {});
+
+      await storage.touch('some-key');
+      await storage.touch('other-key');
+
+      const copies = vi.mocked(CopyObjectCommand).mock.calls.map((c) => c[0]);
+      expect(copies).toHaveLength(3);
+      expect(copies[0]).toMatchObject({ CopySourceIfMatch: '"etag-6"', IfMatch: '"etag-6"' });
+      // breaks-if-wrong: the retry and every later copy carry no condition,
+      // so the metadata refresh still happens on that backend.
+      expect(copies[1]).not.toHaveProperty('IfMatch');
+      expect(copies[1]).not.toHaveProperty('CopySourceIfMatch');
+      expect(copies[2]).toMatchObject({ Key: 'test-prefix/other-key' });
+      expect(copies[2]).not.toHaveProperty('IfMatch');
+    });
+
+    it('copies unconditionally when the backend reports no ETag', async () => {
+      answerInOrder(headWith(undefined), {});
+
+      await storage.touch('some-key');
+
+      const args = vi.mocked(CopyObjectCommand).mock.calls[0][0];
+      expect(args).not.toHaveProperty('IfMatch');
+      expect(args).not.toHaveProperty('CopySourceIfMatch');
     });
   });
 

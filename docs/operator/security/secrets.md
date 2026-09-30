@@ -369,7 +369,7 @@ Two cross-cutting flags work with every mode:
 
 After a successful write, the CLI prints a one-line confirmation with the key, the scope, and the org (never the value itself).
 
-`kici-admin variable set` accepts the same five input modes plus `--locked` to mark the variable as immutable from subsequent dashboard writes. `kici-admin variable list` accepts `--values` to render the values inline (default is keys-only); `kici-admin variable delete` accepts `--yes` to skip the confirmation prompt.
+`kici-admin variable set` accepts the same five input modes plus `--locked`, which stops a per-source override from replacing the variable. `kici-admin variable list` accepts `--values` to render the values inline (default is keys-only); `kici-admin variable delete` accepts `--yes` to skip the confirmation prompt.
 
 ### Examples
 

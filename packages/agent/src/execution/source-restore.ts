@@ -3,9 +3,9 @@
  *
  * Downloads a pre-built `.kici/` source tarball from the orchestrator's cache
  * and installs it at `workDir/.kici` so the workflow entry point becomes
- * importable. Mirrors the shape of `dep-restore.ts` but without the streaming
- * optimization — source tarballs are tiny (kilobytes, not the hundreds of
- * megabytes a `node_modules/` tarball carries).
+ * importable. Unlike `dep-restore.ts`, which downloads to a file first, it
+ * reads the tarball into memory — source tarballs are tiny (kilobytes, not the
+ * hundreds of megabytes a `node_modules/` tarball carries).
  *
  * Two properties this path is responsible for:
  *
@@ -34,6 +34,7 @@ import { createLogger } from '@kici-dev/shared';
 
 import { downloadUrl } from './download.js';
 import { resolveOrchestratorUrl } from './dep-restore.js';
+import { redactUrl } from './resumable-download.js';
 
 const logger = createLogger({ prefix: 'source-restore' });
 
@@ -61,7 +62,7 @@ export async function restoreSource(
   sourceTarDigest?: string,
 ): Promise<void> {
   sourceTarUrl = resolveOrchestratorUrl(sourceTarUrl);
-  logger.info('Restoring .kici/ source from tarball', { sourceTarUrl });
+  logger.info('Restoring .kici/ source from tarball', { sourceTarUrl: redactUrl(sourceTarUrl) });
   const startTime = Date.now();
 
   let data: Buffer;
@@ -71,7 +72,7 @@ export async function restoreSource(
   } else if (sourceTarUrl.startsWith('http://') || sourceTarUrl.startsWith('https://')) {
     data = await downloadUrl(sourceTarUrl);
   } else {
-    throw new Error(`Unsupported source tarball URL scheme: ${sourceTarUrl}`);
+    throw new Error(`Unsupported source tarball URL scheme: ${redactUrl(sourceTarUrl)}`);
   }
 
   if (sourceTarDigest) {
@@ -102,7 +103,7 @@ export async function restoreSource(
     // every call path restores the deps tarball into `.kici/node_modules`
     // BEFORE this runs — so deleting `.kici` wholesale strands the workflow
     // with no `@kici-dev/sdk` to import, and the inline install that would
-    // repair it is skipped precisely when `depsUrl` was dispatched.
+    // repair it runs only when that restore failed.
     const installedDeps = path.join(kiciDir, 'node_modules');
     if (await fsPromises.stat(installedDeps).catch(() => null)) {
       await rename(installedDeps, path.join(src, 'node_modules'));

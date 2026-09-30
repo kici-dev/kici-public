@@ -66,6 +66,9 @@ import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { CronScheduler } from '../cron/cron-scheduler.js';
 import type { GlobalWorkflowPolicy } from '../security/global-workflow-policy.js';
 import type { EventLogWriter } from '../webhook/event-log.js';
+
+/** The one event-log method the pipeline calls; a per-delivery wrapper can stand in for the writer. */
+export type EventLogRecorder = Pick<EventLogWriter, 'record'>;
 import { EventLogSource } from '@kici-dev/engine';
 import { ExecutionJobStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { LockJob } from '@kici-dev/engine';
@@ -495,6 +498,12 @@ export async function resolveLockFileWithFallback(args: {
   registrationIndex: RegistrationIndex | undefined;
   lockFileCache: LockFileCache;
   deliveryId: string;
+  /**
+   * False when cross-source repo mode already evaluated this delivery's
+   * other-source registrations for the same repository: the fallback would
+   * re-read exactly those registrations. Defaults to true.
+   */
+  allowRegistrationFallback?: boolean;
 }): Promise<{
   lockFile: FullLockFile | null;
   resolvedVia: 'inbound' | 'fallback' | 'miss' | 'corrupt';
@@ -557,6 +566,8 @@ export async function resolveLockFileWithFallback(args: {
       }
     }
   }
+
+  if (args.allowRegistrationFallback === false) return missOrCorrupt();
 
   // 2. Gate on preconditions: no fallback if no registrationIndex or no
   //    tenant context, and skip fallback entirely when customerId is the
@@ -1073,7 +1084,7 @@ export interface ProcessingDeps {
   /** Global workflow policy for org-level permission enforcement. Optional -- if not set, global workflows are unrestricted. */
   globalWorkflowPolicy?: GlobalWorkflowPolicy;
   /** Inbound webhook delivery log writer. Optional -- if not set, deliveries are not persisted to event_log. */
-  eventLog?: EventLogWriter;
+  eventLog?: EventLogRecorder;
   /** Where this delivery arrived: 'relay' (Platform WS) or 'direct' (HTTP).
    *  Used by the eventLog writer to populate the source column. Defaults to
    *  'direct' when omitted (independent / direct paths). */

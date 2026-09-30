@@ -46,16 +46,17 @@ curl -s http://worker-host:4000/status | jq .
 
 ## Required environment variables
 
-| Variable                       | Required         | Description                                                                                         |
-| ------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------- |
-| `KICI_CLUSTER_ROLE`            | Yes              | Set to `worker`                                                                                     |
-| `KICI_CLUSTER_COORDINATOR_URL` | Yes              | WebSocket URL of the coordinator's peer endpoint (e.g., `ws://coordinator:4000/ws/peer`)            |
-| `KICI_CLUSTER_JOIN_TOKEN`      | First start only | One-time join token from the coordinator. After first connection, a persistent credential is issued |
-| `KICI_CLUSTER_CREDENTIAL_FILE` | No               | Path to store the persistent credential (default: `~/.kici/peer-credential`)                        |
-| `KICI_CLUSTER_INSTANCE_ID`     | No               | Human-readable instance ID (default: random UUID). Recommended for observability                    |
-| `KICI_SCALER_CONFIG_PATH`      | Yes              | Path to the scaler config for local agents                                                          |
-| `KICI_PORT`                    | No               | HTTP port for the worker's health/status endpoints (default: 4000)                                  |
-| `KICI_LOG_LEVEL`               | No               | Log level (default: `info`)                                                                         |
+| Variable                        | Required                                | Description                                                                                                                                                                                                 |
+| ------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_CLUSTER_ROLE`             | Yes                                     | Set to `worker`                                                                                                                                                                                             |
+| `KICI_CLUSTER_COORDINATOR_URL`  | Yes, or `KICI_CLUSTER_COORDINATOR_URLS` | WebSocket URL of the coordinator's peer endpoint (e.g., `ws://coordinator:4000/ws/peer`)                                                                                                                    |
+| `KICI_CLUSTER_COORDINATOR_URLS` | No                                      | Comma-separated peer endpoint URLs of every coordinator. The worker connects to each one, so every coordinator can route work to it. Takes precedence over `KICI_CLUSTER_COORDINATOR_URL` when both are set |
+| `KICI_CLUSTER_JOIN_TOKEN`       | First start only                        | One-time join token from the coordinator. After first connection, a persistent credential is issued                                                                                                         |
+| `KICI_CLUSTER_CREDENTIAL_FILE`  | No                                      | Path to store the persistent credential (default: `~/.kici/peer-credential`)                                                                                                                                |
+| `KICI_CLUSTER_INSTANCE_ID`      | No                                      | Human-readable instance ID (default: random UUID). Recommended for observability                                                                                                                            |
+| `KICI_SCALER_CONFIG_PATH`       | Yes                                     | Path to the scaler config for local agents                                                                                                                                                                  |
+| `KICI_PORT`                     | No                                      | HTTP port for the worker's health/status endpoints (default: 4000)                                                                                                                                          |
+| `KICI_LOG_LEVEL`                | No                                      | Log level (default: `info`)                                                                                                                                                                                 |
 
 ## What workers do NOT need
 
@@ -192,7 +193,7 @@ Coordinators and workers can be upgraded in any order as long as every node's pr
 
 ### Coordinator unreachable
 
-**Symptom:** Worker logs show repeated "Connection to coordinator failed" messages
+**Symptom:** Worker logs show repeated `Peer WebSocket error` or `Peer connection closed` lines, each followed by `Scheduling peer reconnect`
 
 **Checks:**
 
@@ -203,7 +204,7 @@ Coordinators and workers can be upgraded in any order as long as every node's pr
 
 ### NAK storms
 
-**Symptom:** Coordinator logs show many "NAK from worker" messages, jobs not executing
+**Symptom:** Coordinator logs show many `Peer NAKed job` messages, jobs not executing
 
 **Causes:**
 

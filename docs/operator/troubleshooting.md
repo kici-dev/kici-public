@@ -216,7 +216,9 @@ The orchestrator closes an agent WebSocket with a specific close code:
 - **4003 (invalid message)** — the agent sent a malformed protocol frame (usually
   a version skew between agent and orchestrator builds), or a second agent tried
   to register with the same agent ID but a different token (`AgentId already
-registered with a different token`) — the later one is refused.
+registered with a different token`) — the later one is refused. The refused agent keeps
+  retrying, and registers once the other connection is gone: its agent process
+  stopped, its token was revoked, or it stopped answering heartbeats.
 - **4006 (internal error)** — the orchestrator could not read its own state while
   the agent connected: the scaler's spawn record, or the agent token on a
   database error. The agent connects again on its own. See
@@ -241,7 +243,8 @@ log around the connection attempt — the close code names the cause.
   restart the agent.
 - 4003: rebuild the agent so its protocol version matches the orchestrator; for an
   agent-ID collision, give each agent a distinct agent ID (or the same ID with the
-  matching token).
+  matching token). To move an agent to a new token, stop the old agent process or revoke
+  its token; the agent with the new token then registers on its next retry.
 - 4006: fix the database or scaler-state condition. The agent registers once the
   orchestrator can read it again.
 - Provisioning: fix the host-side root cause the captured error names (install

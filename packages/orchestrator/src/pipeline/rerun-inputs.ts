@@ -5,15 +5,13 @@
  * the evaluation-round re-run and release, and the cross-repository global
  * re-run, so the paths cannot disagree about how a run's inputs are read back.
  */
-import { createLogger } from '@kici-dev/shared';
 import type { SimulatedEvent } from '@kici-dev/engine';
 import type { ProviderRegistry } from '../provider-registry.js';
 import type { TrustPolicyOutcome } from '../security/trust-policy-gate.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import { webhookPayloadPath } from './webhook-payload-store.js';
+import { resolveEventChangedFiles, stampChangedFiles, withDefaultBranch } from './changed-files.js';
 import type { OriginalRunRow, RerunDeps } from './rerun.js';
-
-const logger = createLogger({ prefix: 'rerun' });
 
 /**
  * Load the original webhook payload from object storage. Returns
@@ -138,7 +136,9 @@ export async function loadDeliveryEventName(
 export const RELEASED_DECISION: TrustPolicyOutcome = { action: 'pass' };
 
 /**
- * The normalized form of the delivery the round was deciding.
+ * The normalized form of the delivery the round was deciding, stamped with the
+ * repository's default branch as the delivery stamped it: the jobs a re-run
+ * dispatches carry this event, and an agent derives a new-branch diff from it.
  *
  * Read-only, and it throws — so it runs before the requestId claim, never
  * inside the re-evaluation.
@@ -157,17 +157,17 @@ export function normalizeRoundEvent(
         `one this orchestrator normalizes.`,
     );
   }
-  return event;
+  return withDefaultBranch(event, payload, providerBundle.normalizer);
 }
 
 /**
- * Stamp the re-evaluated event with the source repository's changed files.
+ * Stamp the re-evaluated event with the source repository's default branch and
+ * changed files.
  *
- * Unconditional, unlike the delivery path's fetch: that path skips the fetch
- * when no trigger in the source repo's lock file uses path patterns, and a
- * scoped re-evaluation has no such lock file to read. An error carries
- * `unavailable`, which every path filter downstream already treats
- * conservatively.
+ * The resolve is unconditional: the delivery path skips it when no trigger in
+ * the source repo's lock file uses path patterns, and a scoped re-evaluation
+ * has no such lock file to bound it. A bundle with no fetcher, or a fetch
+ * error, carries `unavailable`.
  */
 export async function withChangedFiles(opts: {
   event: SimulatedEvent;
@@ -177,24 +177,15 @@ export async function withChangedFiles(opts: {
   credentials: Record<string, unknown>;
   repoIdentifier: string;
 }): Promise<SimulatedEvent> {
-  const { event, bundle, info, payload, credentials, repoIdentifier } = opts;
-  const base: SimulatedEvent = { ...event, sourceRepo: repoIdentifier };
-  if (!bundle.changedFilesFetcher) {
-    return { ...base, changedFiles: [], changedFilesStatus: 'unavailable' };
-  }
-  try {
-    const fetched = await bundle.changedFilesFetcher.getChangedFiles(
-      repoIdentifier,
-      info.event,
-      payload,
-      credentials,
-    );
-    return { ...base, changedFiles: fetched.files, changedFilesStatus: fetched.status };
-  } catch (err) {
-    logger.warn('Changed files unavailable for an eval-round rerun', {
-      repoIdentifier,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return { ...base, changedFiles: [], changedFilesStatus: 'unavailable' };
-  }
+  const { bundle, info, payload, credentials, repoIdentifier } = opts;
+  const event = withDefaultBranch(opts.event, payload, bundle.normalizer);
+  const resolved = await resolveEventChangedFiles({
+    bundle,
+    credentials,
+    repoIdentifier,
+    eventName: info.event,
+    payload,
+    event,
+  });
+  return { ...stampChangedFiles(event, resolved), sourceRepo: repoIdentifier };
 }

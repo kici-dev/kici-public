@@ -7,7 +7,7 @@ GitHub's own documentation recommends self-hosted runners only for private repos
 
 ## The short answer
 
-> Self-hosted CI runners carry real risks — fork-PR code execution and lateral movement are the classic ones. KiCI's answer is ephemeral, isolated agents — container or Firecracker microVM sandboxes destroyed after every job — combined with fail-closed defaults: fork PRs are held for approval, egress to private network ranges is blocked, and secrets never enter the job environment unless a workflow explicitly exposes them. Self-hosting is not risk-free, but with these defaults it is a defensible posture — and in exchange, your code and secrets never leave your infrastructure, and logs are never stored outside it (see [Data residency](../data-residency.md) for the field-level breakdown).
+> Self-hosted CI runners carry real risks — fork-PR code execution and lateral movement are the classic ones. KiCI's answer is ephemeral, isolated agents — container or Firecracker microVM sandboxes destroyed after every job — combined with fail-closed defaults: fork PRs do not run unless you allow them, egress to private network ranges is blocked, and secrets never enter the job environment unless a workflow explicitly exposes them. Self-hosting is not risk-free, but with these defaults it is a defensible posture — and in exchange, your code and secrets never leave your infrastructure, and logs are never stored outside it (see [Data residency](../data-residency.md) for the field-level breakdown).
 
 ## The risks, stated honestly
 
@@ -23,9 +23,9 @@ Self-hosted runner risk is not hypothetical. Three patterns account for most rea
 
 Every job runs in a disposable sandbox — a fresh container, or a fresh microVM with its own root filesystem copy — torn down when the job ends. Workflow code never executes inside a long-lived agent process, so there is no persistent runner state for a compromised job to poison.
 
-### Fork PRs are held by default
+### Fork PRs do not run by default
 
-KiCI's trust policy is fail-closed out of the box: pull requests from forks are **held for approval**, unknown contributors are held, and workflow-file modifications by non-trusted contributors are held. Code from a stranger does not run until someone with approval rights releases it. See [CI security](./security.md) for policy configuration.
+KiCI's trust policy is fail-closed out of the box. Trust comes from the git ref: a ref in your repository is trusted, and a ref from a fork is not. The organization's fork switch defaults to `ignore`, which drops a fork pull request before anything is dispatched. Set it to `hold` to review each one, or to `allow` to run them. A fork run that does execute always reads the base branch's workflow definitions, receives no install or registry secrets, and cannot write to the shared build cache. See [CI security](./security.md) for policy configuration.
 
 ### Pick the isolation tier that matches your trust level
 
@@ -51,7 +51,7 @@ The same property that makes you self-host also protects you: KiCI's hosted Plat
 
 KiCI's defaults make self-hosting defensible, not risk-free. The honest division of responsibility:
 
-- **Prefer private repositories.** If your repository is public, keep the fork-PR policy at `hold` (the default) and review held runs before releasing them — or route them to the Firecracker backend.
+- **Prefer private repositories.** If your repository is public, keep the fork-PR policy at `ignore` (the default), or set it to `hold` and review held runs before releasing them — or route them to the Firecracker backend.
 - **Match the backend to the code you run.** Bare metal without the namespace sandbox is for fully trusted, internal-only workflows. Untrusted code belongs in containers at minimum, microVMs ideally.
 - **Harden and patch the host.** KiCI isolates jobs from the host and your network, but the host OS, container runtime, and kernel updates are yours to maintain.
 - **Scope your secrets.** Bind secret scopes to specific environments so a job only receives the secrets it needs — never hand every job every secret.

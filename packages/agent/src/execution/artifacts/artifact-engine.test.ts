@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -248,20 +250,29 @@ describe('createArtifactsApi.download', () => {
     );
   });
 
-  it('round-trips: uploads a tarball, then downloads + extracts it (data: URL)', async () => {
+  it('round-trips: uploads a tarball, then downloads + extracts it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'art-src-'));
     const dest = await mkdtemp(join(tmpdir(), 'art-dst-'));
+    let serve: Buffer | undefined;
+    // The presigned object-store GET the orchestrator hands out.
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-length': String(serve?.length ?? 0) });
+      res.end(serve);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
     try {
       await mkdir(join(root, 'out'), { recursive: true });
       await writeFile(join(root, 'out', 'bin'), 'round-trip-bytes');
       const { tarball, hash } = await packCachePaths(root, ['out']);
-      const dataUrl = `data:application/octet-stream;base64,${tarball.toString('base64')}`;
+      serve = tarball;
+      const { port } = server.address() as AddressInfo;
+      const downloadUrl = `http://127.0.0.1:${port}/artifacts/bundle.tar.gz?X-Amz-Signature=x`;
       const api = createArtifactsApi(
         dest,
         stubTransport({
           download: async (): Promise<ArtifactDownloadLookup> => ({
             outcome: 'found',
-            downloadUrl: dataUrl,
+            downloadUrl,
             sizeBytes: tarball.length,
             sha256: hash,
           }),
@@ -272,6 +283,8 @@ describe('createArtifactsApi.download', () => {
       expect(result.sha256).toBe(hash);
       expect((await readFile(join(dest, 'out', 'bin'))).toString()).toBe('round-trip-bytes');
     } finally {
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
       await rm(root, { recursive: true, force: true });
       await rm(dest, { recursive: true, force: true });
     }

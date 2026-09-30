@@ -8,15 +8,20 @@
  * rejection — a credential revocation cascade. This coordinator serializes all
  * file access through one in-process mutex so only one peer-client token-joins
  * per storm, and it never deletes a credential file a sibling has refreshed.
+ *
+ * A coordinator without a join token also wires a `selfIssue` callback. When a
+ * decision finds no credential and no token, the callback issues the
+ * coordinator its own credential, once per storm, under the same mutex.
  */
 import { unlink } from 'node:fs/promises';
-import { createLogger } from '@kici-dev/shared';
+import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import {
   readCredentialFile,
   writeCredentialFile,
   type CredentialFileData,
 } from './peer-credentials.js';
 import { runDetached } from '../helpers/run-detached.js';
+import { CoordinatorCredentialOutcome } from './coordinator-credential.js';
 
 const logger = createLogger({ prefix: 'peer-auth-coordinator' });
 
@@ -49,6 +54,11 @@ export class PeerAuthCoordinator {
   private readonly instanceId: string;
   private readonly joinToken?: string;
   private readonly joinWaitTimeoutMs: number;
+  private readonly selfIssue?: () => Promise<CoordinatorCredentialOutcome>;
+  /** The issuance in progress; concurrent sibling clients share it. */
+  private selfIssueInFlight: Promise<CoordinatorCredentialOutcome> | null = null;
+  /** An operator revoked this coordinator's credential: never issue again in this process. */
+  private selfIssueRevoked = false;
 
   /** Promise-chain mutex tail; every file op awaits the prior one. */
   private lock: Promise<unknown> = Promise.resolve();
@@ -60,11 +70,17 @@ export class PeerAuthCoordinator {
     instanceId: string;
     joinToken?: string;
     joinWaitTimeoutMs?: number;
+    /**
+     * Issues this coordinator its own credential when a decision finds no
+     * credential and no join token. Only a coordinator wires it.
+     */
+    selfIssue?: () => Promise<CoordinatorCredentialOutcome>;
   }) {
     this.credentialFile = opts.credentialFile;
     this.instanceId = opts.instanceId;
     this.joinToken = opts.joinToken;
     this.joinWaitTimeoutMs = opts.joinWaitTimeoutMs ?? DEFAULT_JOIN_WAIT_TIMEOUT_MS;
+    this.selfIssue = opts.selfIssue;
   }
 
   /** Run `fn` exclusively against the credential file. */
@@ -79,26 +95,48 @@ export class PeerAuthCoordinator {
   }
 
   private async readValidCredential(): Promise<CredentialFileData | null> {
-    const cred = await readCredentialFile(this.credentialFile);
+    let cred: CredentialFileData | null;
+    try {
+      cred = await readCredentialFile(this.credentialFile);
+    } catch (err) {
+      logger.warn('Ignoring unreadable peer credential file', {
+        instanceId: this.instanceId,
+        path: this.credentialFile,
+        error: toErrorMessage(err),
+      });
+      return null;
+    }
     return cred && cred.instanceId === this.instanceId ? cred : null;
   }
 
   async decideAuth(): Promise<AuthDecision> {
+    let selfIssueTried = false;
     for (let i = 0; i < MAX_DECIDE_ITERATIONS; i++) {
-      const decision = await this.withLock(async (): Promise<AuthDecision | 'await-join'> => {
-        const cred = await this.readValidCredential();
-        if (cred) return { mode: 'credential', credential: cred };
-        if (this.inFlightJoin) return 'await-join';
-        if (this.joinToken) {
-          const join = deferred<CredentialFileData | null>();
-          this.inFlightJoin = join;
-          return { mode: 'token-join', token: this.joinToken, complete: this.makeComplete(join) };
-        }
-        return { mode: 'no-auth' };
-      });
+      const decision = await this.withLock(
+        async (): Promise<AuthDecision | 'await-join' | 'self-issue'> => {
+          const cred = await this.readValidCredential();
+          if (cred) return { mode: 'credential', credential: cred };
+          if (this.inFlightJoin) return 'await-join';
+          if (this.joinToken) {
+            const join = deferred<CredentialFileData | null>();
+            this.inFlightJoin = join;
+            return { mode: 'token-join', token: this.joinToken, complete: this.makeComplete(join) };
+          }
+          if (this.selfIssue && !selfIssueTried && !this.selfIssueRevoked) return 'self-issue';
+          return { mode: 'no-auth' };
+        },
+      );
 
-      if (decision !== 'await-join') return decision;
-      await this.awaitInFlightJoin();
+      if (decision === 'await-join') {
+        await this.awaitInFlightJoin();
+        continue;
+      }
+      if (decision === 'self-issue') {
+        selfIssueTried = true;
+        await this.runSelfIssue();
+        continue;
+      }
+      return decision;
     }
     // Exhausted retries: fall back to a token-join if possible, else no-auth.
     if (this.joinToken) {
@@ -107,6 +145,21 @@ export class PeerAuthCoordinator {
       return { mode: 'token-join', token: this.joinToken, complete: this.makeComplete(join) };
     }
     return { mode: 'no-auth' };
+  }
+
+  /** Run the issuer under the mutex, once for every concurrent caller. */
+  private runSelfIssue(): Promise<CoordinatorCredentialOutcome> {
+    const selfIssue = this.selfIssue;
+    if (!selfIssue) return Promise.resolve(CoordinatorCredentialOutcome.Failed);
+    this.selfIssueInFlight ??= this.withLock(selfIssue)
+      .then((outcome) => {
+        if (outcome === CoordinatorCredentialOutcome.Revoked) this.selfIssueRevoked = true;
+        return outcome;
+      })
+      .finally(() => {
+        this.selfIssueInFlight = null;
+      });
+    return this.selfIssueInFlight;
   }
 
   private makeComplete(join: Deferred<CredentialFileData | null>) {

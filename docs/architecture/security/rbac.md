@@ -119,7 +119,7 @@ with the context the secret is bound to.
 
 **Enforcement:**
 
-- `computeEffectivePermissions()` merges repo patterns from all assigned roles using union semantics (deduplicated). If any role has `*`, the effective pattern is `['*']` (unrestricted).
+- The effective repo patterns are the union of the patterns of every assigned role (deduplicated). If any role has `*`, the effective pattern is `['*']` (unrestricted).
 - On the HTTP plane the `repoPatterns` array is stored on the request context alongside `effectivePermissions`. The developer MCP plane has no request context — it resolves the org per tool call — so it resolves the same patterns per call and threads them into the shared operation layer.
 - **List endpoints** (e.g., `GET /runs`, `GET /registrations`, `GET /held-runs`, and the MCP `list_runs` / `list_workflows` / `cancel_runs_by_branch` tools): narrow the result to the repositories the caller may see. For runs this is a SQL filter over both of a run's repositories, which keeps pagination counts correct; for registrations and held runs, which the control plane relays rather than stores, the relayed set is filtered on return. A held run carries no repository of its own, so its owning run is resolved against the Platform's mirrored `execution_runs` and a hold whose run has not been mirrored yet is dropped — the filter fails closed. Either way a repo-restricted caller cancelling a shared branch never reaches another repository's runs.
 - **Single-resource endpoints** (e.g., `GET /runs/:runId`, `POST /registrations/:id/trigger`, `POST /held-runs/:heldRunId/approve`): apply the check after resolving the target's repository, returning 403 if it does not match. The denial also writes an `authz.denied` audit row with `target_type = 'repo'`, the same way an insufficient-permission denial is recorded. On the held-run approve and reject routes the repo check runs **before** the hold-type branch, and its refusal names neither the hold type nor the permission that type would have required — otherwise the refusal itself would tell the caller what kind of hold they are not allowed to see.
@@ -203,8 +203,6 @@ Role "Deployer":  { runs: 'write', api_keys: 'read',  members: 'none'  }
 Effective:        { runs: 'write', api_keys: 'read',  members: 'read'  }
 ```
 
-A `mergePermissions()` helper inside the Platform implements this union logic.
-
 ### Zero-role members
 
 Users with no role assignments see the dashboard shell but cannot access any org data. They remain org members -- to fully revoke access, remove them from the organization.
@@ -214,7 +212,7 @@ Users with no role assignments see the dashboard shell but cannot access any org
 ### Owner
 
 - **Immutable** -- cannot be edited, deleted, or renamed
-- Every resource set to its highest level: `admin` on 17 of the 18 resources, and `write` on `fleet` (whose gates top out at `fleet:write`, so `write` already grants full fleet control). See `DEFAULT_OWNER_PERMISSIONS` in `permissions.ts`
+- Every resource set to its highest level: `admin` on 17 of the 18 resources, and `write` on `fleet` (whose gates top out at `fleet:write`, so `write` already grants full fleet control)
 - Repo pattern: `*`
 - Marked with `is_owner = true` in the database
 - Visible in the roles tab with a "Built-in" badge
@@ -223,23 +221,19 @@ Users with no role assignments see the dashboard shell but cannot access any org
 ### Member
 
 - **Default custom role** -- editable and deletable by Owners
-- All resources set to `read` by default, except `ci_trust`, `support`, and `fleet` which default to `none` (see `DEFAULT_MEMBER_PERMISSIONS` in `permissions.ts`)
+- All resources set to `read` by default, except `ci_trust`, `support`, and `fleet` which default to `none`
 - Ships with every new organization
 - Assigned automatically to new members on invite acceptance
 
 ## Enforcement
 
-All org-scoped dashboard API routes enforce RBAC through a middleware chain:
-
-```
-orgContextMiddleware(db) -> requirePermission(db, resource, level) -> route handler
-```
+Every org-scoped dashboard API route runs the same checks before its handler: it resolves the caller's organization context, then checks the permission the route requires.
 
 ### Active membership is one predicate
 
 "May this user act in this organization right now" is not a membership row. It is three conditions: the organization exists and is not soft-deleted, the organization is not disabled, and the member is not suspended. All three live in one predicate with one home, and every plane resolves through it:
 
-- the org-scoped HTTP routes (`orgContextMiddleware`);
+- the org-scoped HTTP routes;
 - the ceiling a user's own permissions are measured against when they grant or mint;
 - the dashboard's browser WebSocket — the step-log and status subscriptions, and the re-authentication of an already-open socket;
 - the organization status fan-out, which re-resolves each subscriber's scope on a sweep;
@@ -251,44 +245,29 @@ A soft-deleted organization reports as "not a member" on every plane rather than
 
 Membership is re-resolved on the live planes as well as the request planes. A suspension, an organization disable, or a removal drops an open WebSocket at its next re-authentication or fan-out sweep, rather than lasting for the life of the browser tab.
 
-### orgContextMiddleware
+### Organization context
 
 1. Resolves the caller's active membership of the target org through the shared predicate above (for service accounts, verifies the SA's `org_id` matches instead — a service account has no membership row)
 2. Blocks disabled organizations (returns 403 with `disabled_at`)
 3. Blocks suspended members (returns 403)
-4. Computes effective permissions: uses API key permissions if present, otherwise calls `computeEffectivePermissions()` to merge the user's assigned roles
-5. Sets `effectivePermissions`, `isOwner`, and `orgRole` on the request context
+4. Computes effective permissions: an API key or service account uses its own permission matrix; a user gets the union of their directly assigned roles and the roles granted to their teams
+5. Records the effective permissions, the Owner flag, and the caller's repo patterns for the rest of the request
 
-### requirePermission middleware
+### Permission check
 
-Factory function that creates a middleware checking a specific resource + level:
-
-```typescript
-requirePermission(db, 'runs', 'write');
-// Checks c.get('effectivePermissions').runs >= PERMISSION_HIERARCHY['write']
-```
-
-Returns a descriptive 403 error if the check fails:
+Each route declares the resource and the minimum level it requires, for example `runs` at `write`. A caller below that level gets a descriptive 403 error:
 
 ```json
 { "error": "Insufficient permission: runs.write needed" }
 ```
 
-### requireAnyPermission middleware
+Some routes accept any one of several checks, for example `runs:write` or `org_settings:admin`. Such a route refuses only when none of the checks passes, and its error lists every alternative joined by `or`. Every refusal also writes an `authz.denied` audit row.
 
-OR-semantics variant that passes if **any** of the given permission checks are satisfied. Returns 403 only when none pass:
+### Permission caching
 
-```typescript
-requireAnyPermission(db, [
-  { resource: 'runs', required: 'write' },
-  { resource: 'org_settings', required: 'admin' },
-]);
-// Passes if the user has runs.write OR org_settings.admin
-```
+The Platform caches each user's effective permissions per organization for at most 60 seconds. A change that affects RBAC (a role edit, a role assignment or revoke, a team change) invalidates every cached entry for the organization at once, on every Platform instance. The change therefore takes effect on the next request. The 60-second expiry is a backstop for a change made outside the dashboard API, such as the break-glass admin CLI.
 
-### Stateless enforcement
-
-Permissions are checked from the database on every API request. There is no session cache to invalidate -- role changes take effect immediately on the next request.
+Only the permission computation is cached. Membership, organization disable, and member suspension are checked against the database on every request.
 
 ## Authentication
 
@@ -348,7 +327,7 @@ The orchestrator has its own fixed 3-role (`owner` / `admin` / `auditor`) RBAC m
 | `event_dlq.manage`       | owner, admin          | Requeue or discard webhook event DLQ entries                                        |
 | `run.cancel`             | owner, admin          | `POST /api/v1/admin/runs/:runId/cancel`                                             |
 | `secret.reveal`          | owner, admin          | The `?reveal=true` variant of the run secret-outputs admin route (decrypts values)  |
-| `scheduled_job.trigger`  | owner, admin          | `POST /api/v1/admin/scheduled-jobs:name/trigger` (manually fire a scheduled job)    |
+| `scheduled_job.trigger`  | owner, admin          | `POST /api/v1/admin/scheduled-jobs/:name/trigger` (manually fire a scheduled job)   |
 | `attestation.retry`      | owner, admin          | Drain / re-arm the deferred-attestation outbox                                      |
 | `orchestrator.drain`     | owner, admin          | `GET`/`POST /api/v1/admin/orchestrator/drain` (drain, resume, status)               |
 | `ci_trust.read`          | owner, admin          | `GET /api/v1/admin/trust-policy` (read the org-wide CI trust policy)                |

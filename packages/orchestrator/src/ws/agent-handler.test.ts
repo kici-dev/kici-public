@@ -28,6 +28,8 @@ import {
   type AgentWsHandlerDeps,
 } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
+import { AgentHeartbeatMonitor } from './agent-heartbeat.js';
+import { ScaleDownReason } from '@kici-dev/engine';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import { OwnershipTracker, type OwnershipDbResult } from '../agent/ownership-tracker.js';
@@ -45,6 +47,7 @@ import {
 } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
+import { InFlightCacheUploads } from '../cache/cache-upload-settle.js';
 import type { UserCache } from '../cache/user-cache.js';
 import {
   ArtifactInvalidNameError,
@@ -1401,9 +1404,17 @@ describe('createAgentWsHandler', () => {
 
     it('cleans up pendingBuilds, pendingInits, and pendingDynamics on disconnect', async () => {
       const failedJobIds = ['job-1', 'job-2', 'job-3'];
+      // The dispatcher runs the installed cleanup with the jobs its triage failed.
+      let cleanup: ((ids: string[]) => void) | undefined;
       const disconnectDispatcher = {
         ...dispatcher,
-        onAgentDisconnect: vi.fn().mockResolvedValue(failedJobIds),
+        setDisconnectCleanup: vi.fn((fn: (ids: string[]) => void) => {
+          cleanup = fn;
+        }),
+        onAgentDisconnect: vi.fn(async () => {
+          cleanup?.(failedJobIds);
+          return failedJobIds;
+        }),
       } as unknown as Dispatcher;
 
       const pendingBuilds = { cleanup: vi.fn() };
@@ -1438,17 +1449,47 @@ describe('createAgentWsHandler', () => {
       }
     });
 
+    it('releases the pending global eval round and cache ref of a failed job', async () => {
+      // fails-when: the handler installs no cleanup on the dispatcher, so a job
+      //   failed by a triage that did not come through this socket's close keeps
+      //   its global eval round waiting and leaks its cache ref
+      let cleanup: ((ids: string[]) => void) | undefined;
+      const cleanupDispatcher = {
+        ...dispatcher,
+        setDisconnectCleanup: vi.fn((fn: (ids: string[]) => void) => {
+          cleanup = fn;
+        }),
+      } as unknown as Dispatcher;
+      const pendingGlobalEvals = { cleanup: vi.fn() };
+      const dispatchCacheRefs = { delete: vi.fn(), get: vi.fn() };
+      createAgentWsHandler({
+        registry,
+        dispatcher: cleanupDispatcher,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        pendingGlobalEvals: pendingGlobalEvals as any,
+        dispatchCacheRefs: dispatchCacheRefs as any,
+      });
+
+      cleanup!(['job-9']);
+
+      expect(pendingGlobalEvals.cleanup).toHaveBeenCalledWith('job-9');
+      expect(dispatchCacheRefs.delete).toHaveBeenCalledWith('job-9');
+    });
+
     it('a stale socket closing does not tear down the registration that replaced it', async () => {
       // A half-open connection can outlive the reconnect that replaced it. Its
       // close carries the same agent id, so without the socket-identity guard
       // the teardown runs against the live registration: the agent is
       // unregistered, its running jobs are failed, and a scaler-managed agent
       // is destroyed while it is still streaming on the new socket.
+      const onScalerAgentDisconnected = vi.fn();
       const handler = createAgentWsHandler({
         registry,
         dispatcher,
         agentAuthMode: 'none',
         onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        onScalerAgentDisconnected,
       });
       const s1 = mockWs();
       const s2 = mockWs();
@@ -1465,6 +1506,7 @@ describe('createAgentWsHandler', () => {
       handler.onClose!(new CloseEvent('close'), s1 as any);
 
       expect(dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+      expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
       expect(registry.get('agent-1')).toBeDefined();
       expect(registry.get('agent-1')!.ws).toBe(s2);
     });
@@ -1529,6 +1571,167 @@ describe('createAgentWsHandler', () => {
 
       handler.onClose!(new CloseEvent('close'), ws as any);
       expect(onScalerAgentDisconnected).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('releases an agent the heartbeat monitor timed out once its socket closes', async () => {
+      // The monitor unregisters a silent agent through the dispatcher and closes
+      // its socket; the close event arrives later, with no registration left.
+      // fails-when: the close handler reads the missing registration as a
+      //   superseded socket and returns, so the scaler never destroys the VM and
+      //   its capacity stays held (a Firecracker scaler stops spawning)
+      // breaks-if-wrong: a superseded socket's close still leaves the live
+      //   registration and the scaler alone (see the stale-socket test)
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      const onScalerAgentDisconnected = vi.fn();
+      const onAgentDisconnect = vi.fn(async (id: string) => {
+        registry.unregister(id);
+        return [];
+      });
+      const disp = { ...dispatcher, onAgentDisconnect } as unknown as Dispatcher;
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher: disp,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        onScalerAgentDisconnected,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const monitor = new AgentHeartbeatMonitor({
+        registry,
+        dispatcher: disp,
+        disconnectThresholdMs: 1_000,
+        checkIntervalMs: 10,
+      });
+      registry.get('agent-1')!.lastHeartbeatAt = Date.now() - 5_000;
+      monitor.start();
+      try {
+        vi.advanceTimersByTime(10);
+        await vi.waitFor(() => expect(registry.get('agent-1')).toBeUndefined());
+        expect(ws.close).toHaveBeenCalled();
+        expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
+
+        handler.onClose!(new CloseEvent('close'), ws as any);
+
+        expect(onScalerAgentDisconnected).toHaveBeenCalledWith(
+          'agent-1',
+          ScaleDownReason.enum['heartbeat-timeout'],
+        );
+        // The monitor already triaged the jobs; the close does not do it again.
+        expect(onAgentDisconnect).toHaveBeenCalledTimes(1);
+      } finally {
+        monitor.stop();
+        vi.useRealTimers();
+      }
+    });
+
+    it('releases a heartbeat-dropped agent as heartbeat-timeout when its socket closes mid-triage', async () => {
+      // fails-when: the monitor leaves the unregister to the dispatcher, so a close
+      //   landing while the triage awaits (the real dispatcher unregisters after a
+      //   database lookup) finds the live registration, triages a second time and
+      //   releases the agent as `shutdown`
+      // breaks-if-wrong: the triage still runs, once (asserted below)
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      const onScalerAgentDisconnected = vi.fn();
+      let finishTriage!: () => void;
+      const triageHeld = new Promise<void>((r) => {
+        finishTriage = r;
+      });
+      const onAgentDisconnect = vi.fn(async (id: string) => {
+        await triageHeld;
+        registry.unregister(id);
+        return [];
+      });
+      const disp = { ...dispatcher, onAgentDisconnect } as unknown as Dispatcher;
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher: disp,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+        onScalerAgentDisconnected,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const monitor = new AgentHeartbeatMonitor({
+        registry,
+        dispatcher: disp,
+        disconnectThresholdMs: 1_000,
+        checkIntervalMs: 10,
+      });
+      registry.get('agent-1')!.lastHeartbeatAt = Date.now() - 5_000;
+      monitor.start();
+      try {
+        vi.advanceTimersByTime(10);
+        expect(ws.close).toHaveBeenCalled();
+        expect(onAgentDisconnect).toHaveBeenCalledTimes(1);
+
+        // The close lands while the triage still awaits.
+        handler.onClose!(new CloseEvent('close'), ws as any);
+
+        expect(onScalerAgentDisconnected).toHaveBeenCalledWith(
+          'agent-1',
+          ScaleDownReason.enum['heartbeat-timeout'],
+        );
+        expect(onAgentDisconnect).toHaveBeenCalledTimes(1);
+        finishTriage();
+        await vi.waitFor(() => expect(onAgentDisconnect.mock.results[0]?.value).toBeDefined());
+        expect(registry.get('agent-1')).toBeUndefined();
+      } finally {
+        finishTriage();
+        monitor.stop();
+        vi.useRealTimers();
+      }
+    });
+
+    it('leaves a dropped agent alone when its old socket closes while it re-registers', async () => {
+      // fails-when: the dropped socket's close tears the agent down while a newer
+      //   socket is waiting on the scaler lookup, destroying the instance it
+      //   registers from
+      // breaks-if-wrong: with no newer socket registering, the close still
+      //   releases the agent (the heartbeat-timeout test above)
+      // One handler per socket sharing one registry, as the coordinator's
+      // `upgradeWebSocket` factory builds them.
+      let releaseLookup!: (v: null) => void;
+      const lookup = new Promise<null>((r) => {
+        releaseLookup = r;
+      });
+      const onScalerAgentRegistered = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockReturnValueOnce(lookup);
+      const onScalerAgentDisconnected = vi.fn();
+      const makeHandler = () =>
+        createAgentWsHandler({
+          registry,
+          dispatcher,
+          agentAuthMode: 'none',
+          onJobStatus: onJobStatus as unknown as AgentWsHandlerDeps['onJobStatus'],
+          onScalerAgentRegistered,
+          onScalerAgentDisconnected,
+        });
+      const h1 = makeHandler();
+      const h2 = makeHandler();
+      const s1 = mockWs();
+      const s2 = mockWs();
+      h1.onOpen!(new Event('open'), s1 as any);
+      await h1.onMessage!(makeMessageEvent(registerMsg()), s1 as any);
+      // Dropped by a path that does not wait for the socket (heartbeat timeout).
+      registry.unregister('agent-1');
+
+      h2.onOpen!(new Event('open'), s2 as any);
+      const registeringAgain = h2.onMessage!(makeMessageEvent(registerMsg()), s2 as any);
+      await vi.waitFor(() => expect(onScalerAgentRegistered).toHaveBeenCalledTimes(2));
+
+      h1.onClose!(new CloseEvent('close'), s1 as any);
+      expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
+
+      releaseLookup(null);
+      await registeringAgain;
+      expect(registry.get('agent-1')?.ws).toBe(s2);
     });
 
     it('calls onScalerJobComplete on job completion', async () => {
@@ -1745,6 +1948,289 @@ describe('createAgentWsHandler', () => {
         requestId: 'upload-req-1',
         uploadUrl: 'https://s3.example.com/upload-bundle',
       });
+    });
+  });
+
+  describe('build success waits for its cache upload', () => {
+    function deferred() {
+      let resolve!: () => void;
+      let reject!: (err: Error) => void;
+      const promise = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    function uploadCompleteMsg(overrides: Record<string, unknown> = {}) {
+      return {
+        type: 'cache.upload.complete',
+        messageId: 'up-1',
+        jobId: 'job-1',
+        cacheType: 'deps',
+        lockfileHash: 'lock-1',
+        depsHash: 'deps-1',
+        platform: 'linux',
+        arch: 'x64',
+        ...overrides,
+      };
+    }
+
+    function statusMsg(state: 'success' | 'failed' = 'success') {
+      return {
+        type: 'job.status',
+        messageId: 'st-1',
+        runId: 'run-1',
+        jobId: 'job-1',
+        state,
+        timestamp: Date.now(),
+        data: { buildComplete: true },
+      };
+    }
+
+    function setup(
+      opts: {
+        timeoutMs?: number;
+        publish?: () => Promise<void>;
+        extra?: Partial<AgentWsHandlerDeps>;
+      } = {},
+    ) {
+      const uploads = new InFlightCacheUploads();
+      const timeoutMsFor = vi.fn().mockResolvedValue(opts.timeoutMs ?? 10_000);
+      const cacheStorage = { initMeta: vi.fn().mockResolvedValue(undefined) };
+      const depCache = { publishPointer: vi.fn(opts.publish ?? (() => Promise.resolve())) };
+      const deps: AgentWsHandlerDeps = {
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as AgentWsHandlerDeps['onJobStatus'],
+        cacheStorage: cacheStorage as any,
+        depCache: depCache as any,
+        cacheUploadSettle: { uploads, timeoutMsFor },
+        ...opts.extra,
+      };
+      return { deps, uploads, timeoutMsFor, cacheStorage, depCache };
+    }
+
+    async function connect(handler: ReturnType<typeof createAgentWsHandler>) {
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      return ws;
+    }
+
+    it('holds the success until the pointer publish finishes (ordering race)', async () => {
+      // fails-when: the success branch does not wait, or the registration sits
+      // after the ownership gate's await — onJobStatus then runs while the
+      // publish is still pending.
+      // breaks-if-wrong: the job must leave the agent (onJobComplete) before
+      // the wait, or an idle scaler-managed agent that shuts down during it
+      // has its finished build failed by the disconnect triage.
+      const publish = deferred();
+      const { deps, uploads } = setup({ publish: () => publish.promise });
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onJobStatus).not.toHaveBeenCalled();
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-1');
+
+      publish.resolve();
+      await Promise.all([upload, status]);
+
+      expect(onJobStatus).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ jobId: 'job-1', state: 'success' }),
+      );
+      expect(uploads.size).toBe(0);
+    });
+
+    it('registers before the ownership gate, so a slow gate on the upload still holds the success', async () => {
+      // fails-when: the registration sits after the upload frame's
+      // gateOwnership await. Here that gate takes the slow DB path while the
+      // success frame's gate passes at once, so the success would find no
+      // registration and release the build before the publish.
+      const publish = deferred();
+      const checkOwnership = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+      const validateAsync = vi.fn(
+        () => new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 100)),
+      );
+      const { deps } = setup({
+        publish: () => publish.promise,
+        extra: {
+          ownershipTracker: { checkOwnership, validateAsync } as unknown as OwnershipTracker,
+        },
+      });
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onJobStatus).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(validateAsync).toHaveBeenCalledTimes(1);
+      expect(onJobStatus).not.toHaveBeenCalled();
+
+      publish.resolve();
+      await Promise.all([upload, status]);
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it('without the settle dependency nothing registers and the success is not held', async () => {
+      // The same frames as the ordering race, minus the dependency (a worker,
+      // which has no cache storage). Pins that the ordering race above holds
+      // the success because of the wait, not because of how the test drives
+      // the frames.
+      const publish = deferred();
+      const { deps } = setup({
+        publish: () => publish.promise,
+        extra: { cacheUploadSettle: undefined },
+      });
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(0);
+      await status;
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+
+      publish.resolve();
+      await upload;
+    });
+
+    it('releases the success at the org bound when the publish hangs', async () => {
+      // fails-when: the wait is unbounded, or ignores the per-org value.
+      const publish = deferred();
+      const { deps, timeoutMsFor } = setup({ timeoutMs: 50, publish: () => publish.promise });
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-1', { runId: 'run-1', orgId: 'org-a' });
+      const handler = createAgentWsHandler({ ...deps, dispatchCacheRefs });
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(49);
+      expect(onJobStatus).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await status;
+      // breaks-if-wrong: after the bound the build proceeds exactly as before.
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+      expect(timeoutMsFor).toHaveBeenCalledWith('org-a');
+
+      publish.resolve();
+      await upload;
+    });
+
+    it('does not wait, nor read the setting, when no upload is in flight', async () => {
+      // breaks-if-wrong: an ordinary job's success must not pay for this fix.
+      const { deps, timeoutMsFor } = setup();
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      await handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+      expect(timeoutMsFor).not.toHaveBeenCalled();
+    });
+
+    it('releases the success at once when the publish fails, keeping the error log', async () => {
+      // fails-when: settling is tied to a successful publish (called after
+      // publishPointer instead of in the finally) — the rejected publish never
+      // settles, the 10 s timer never fires under fake timers, and the test
+      // hangs to its own timeout.
+      const { deps, uploads } = setup({
+        publish: () => Promise.reject(new Error('S3 PUT failed')),
+      });
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+      await Promise.all([upload, status]);
+
+      expect(mockLogError).toHaveBeenCalledWith(
+        'Failed to initialize cache metadata',
+        expect.objectContaining({ error: 'S3 PUT failed' }),
+      );
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+      expect(uploads.size).toBe(0);
+    });
+
+    it('an upload frame from an older agent (no depsHash) still settles', async () => {
+      const { deps, depCache, cacheStorage, uploads } = setup();
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(
+        makeMessageEvent(uploadCompleteMsg({ depsHash: undefined })),
+        ws as any,
+      );
+      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
+      await Promise.all([upload, status]);
+
+      expect(cacheStorage.initMeta).toHaveBeenCalledTimes(1);
+      expect(depCache.publishPointer).not.toHaveBeenCalled();
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+      expect(uploads.size).toBe(0);
+    });
+
+    it('a refused upload frame settles its registration', async () => {
+      // fails-when: the refusal breaks out before settling, leaving the record.
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent: vi.fn().mockReturnValue(false),
+        onDisconnect: vi.fn(),
+        violationThreshold: 5,
+      });
+      const { deps, uploads, depCache } = setup({ extra: { ownershipTracker: tracker } });
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      await handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+
+      expect(uploads.has('job-1')).toBe(false);
+      expect(depCache.publishPointer).not.toHaveBeenCalled();
+    });
+
+    it('a success replayed on a reconnected socket still waits', async () => {
+      // fails-when: the record lives per handler instance; the handler serving
+      // the new socket cannot see the publish started on the old one.
+      const publish = deferred();
+      const { deps } = setup({ publish: () => publish.promise });
+      const handlerA = createAgentWsHandler(deps);
+      const handlerB = createAgentWsHandler(deps);
+      const wsA = await connect(handlerA);
+
+      const upload = handlerA.onMessage!(makeMessageEvent(uploadCompleteMsg()), wsA as any);
+      const wsB = await connect(handlerB);
+      const status = handlerB.onMessage!(makeMessageEvent(statusMsg()), wsB as any);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onJobStatus).not.toHaveBeenCalled();
+
+      publish.resolve();
+      await Promise.all([upload, status]);
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failed build is not held', async () => {
+      const publish = deferred();
+      const { deps } = setup({ publish: () => publish.promise });
+      const handler = createAgentWsHandler(deps);
+      const ws = await connect(handler);
+
+      const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(statusMsg('failed')), ws as any);
+      expect(onJobStatus).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ state: 'failed' }),
+      );
+
+      publish.resolve();
+      await upload;
     });
   });
 

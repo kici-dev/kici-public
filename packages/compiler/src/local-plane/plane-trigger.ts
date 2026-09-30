@@ -32,6 +32,11 @@ export interface LocalTriggerInput {
   event: 'push' | 'pull_request' | 'dispatch';
   ref: string;
   sha: string;
+  /**
+   * The commit before the run's snapshot. With it the changed files are
+   * `before..sha`; without it the push has no range.
+   */
+  before?: string;
   defaultBranch: string;
   /**
    * Dispatch event action (`dispatch()` `types` matcher key). Only used when
@@ -62,6 +67,7 @@ export function buildLocalTriggerRequest(input: LocalTriggerInput): LocalTrigger
   // workflow matches. Push/PR events omit the dispatch-only fields.
   const body = JSON.stringify({
     ref: input.ref,
+    ...(input.before && { before: input.before }),
     after: input.sha,
     repository: { full_name: input.repoFullName, default_branch: input.defaultBranch },
     ...(input.event === 'dispatch' && {

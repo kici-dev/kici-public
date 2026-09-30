@@ -75,7 +75,7 @@ A driver that cannot read its own registry is skipped instead of reporting nothi
 You need one of:
 
 - A **full package** (standalone, includes the Node.js binary and npm) -- download it from the release, see [Download a package](./sea-binaries.md#download-a-package)
-- **Node.js 24+** with the orchestrator package installed via npm
+- **Node.js 24.5.0 or later** with the orchestrator package installed via npm
 
 A `kici-admin` from a standalone package carries no orchestrator or agent server. With it, pass `install --binary` with the path of the launcher in the orchestrator or agent package, such as `<package dir>/kici-orchestrator-standalone`. Without `--binary`, `install` stops and asks for it.
 
@@ -659,7 +659,7 @@ See [Orchestrator setup — database](../orchestrator/orchestrator-setup.md#data
 
 ### Cluster upgrade order
 
-In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. 0.9.0 raises it to 3, so a 0.8.x node (protocol 2) is refused by an upgraded peer until it is upgraded too. See [Coordinator-worker — upgrade procedure](../../architecture/clustering/coordinator-worker.md#upgrade-procedure) for the full sequence.
+In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. 0.9.0 raises it to 3, so a 0.8.x node (protocol 2) is refused by an upgraded peer until it is upgraded too. See [Coordinator-worker — upgrade procedure](../orchestrator/coordinator-worker.md#upgrade-procedure) for the full sequence.
 
 ### Job recovery during upgrade
 
@@ -722,9 +722,8 @@ If you install a user-level service with Firecracker scaler configuration, the i
 
 Services are configured with automatic restart on failure:
 
-- **Backoff delays**: 1s, 5s, 15s, 30s
-- **Maximum retries**: 5 consecutive failures within 5 minutes
-- After exceeding the limit, the service stays stopped until manually restarted
+- **Restart delay**: systemd restarts a failed service after 1s, and launchd spaces restarts at least 1s apart. Windows increases the delay on each failure: 1s, 5s, 15s, then 30s.
+- **Retry limit**: on systemd, 5 failed starts within 5 minutes stop the restarts. The service then stays stopped until you restart it manually. launchd has no retry limit. On Windows, the failure count resets after 5 minutes with no failure.
 
 This is implemented via:
 

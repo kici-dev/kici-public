@@ -13,6 +13,19 @@ import { dirname } from 'node:path';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
+/** How a credential row was issued, recorded in `peer_credentials.metadata.issuance`. */
+export enum PeerCredentialIssuance {
+  /** A coordinator issued the credential to itself (`coordinator-credential.ts`). */
+  Self = 'self',
+}
+
+/**
+ * `metadata` key set when a coordinator retires the self-issued credential its
+ * previous run left behind. An operator revoke never sets it, which is how a
+ * retirement is told apart from a revoke.
+ */
+export const RETIRED_BY_INSTANCE_KEY = 'retiredByInstance';
+
 /**
  * A peer credential record stored in the coordinator's database.
  */
@@ -28,6 +41,7 @@ export interface PeerCredential {
   lastValidatedBy: string | null;
   expiresAt: Date;
   revokedAt: Date | null;
+  metadata: Record<string, unknown>;
 }
 
 /**
@@ -74,6 +88,7 @@ export class PeerCredentialStore {
     routingKeys: string[];
     sourceTokenHash?: string;
     expiryDays?: number;
+    metadata?: Record<string, unknown>;
   }): Promise<{ revokedCount: number }> {
     const expiryDays = opts.expiryDays ?? DEFAULT_EXPIRY_DAYS;
     const expiresAt = new Date(Date.now() + expiryDays * 24 * 60 * 60 * 1000);
@@ -98,6 +113,9 @@ export class PeerCredentialStore {
             routing_keys: sql`${sql.val(opts.routingKeys)}`,
             source_token_hash: opts.sourceTokenHash ?? null,
             expires_at: expiresAt,
+            ...(opts.metadata && {
+              metadata: sql`${JSON.stringify(opts.metadata)}::jsonb`,
+            }),
           })
           .execute();
 
@@ -148,6 +166,61 @@ export class PeerCredentialStore {
       .executeTakeFirst();
 
     return row ? mapRow(row) : null;
+  }
+
+  /**
+   * The credential row for `instanceId` that nobody revoked, expired or not.
+   * `peer_credentials_active_uniq` allows at most one.
+   */
+  async findUnrevokedByInstanceId(instanceId: string): Promise<PeerCredential | null> {
+    const row = await this.db
+      .selectFrom('peer_credentials' as any)
+      .selectAll()
+      .where('instance_id', '=', instanceId)
+      .where('revoked_at', 'is', null)
+      .executeTakeFirst();
+
+    return row ? mapRow(row) : null;
+  }
+
+  /** The most recently revoked credential row for `instanceId`, or null. */
+  async findLatestRevokedByInstanceId(instanceId: string): Promise<PeerCredential | null> {
+    const row = await this.db
+      .selectFrom('peer_credentials' as any)
+      .selectAll()
+      .where('instance_id', '=', instanceId)
+      .where('revoked_at', 'is not', null)
+      .orderBy('revoked_at', 'desc')
+      .executeTakeFirst();
+
+    return row ? mapRow(row) : null;
+  }
+
+  /**
+   * Revoke `instanceId`'s unrevoked, self-issued row whose hash is
+   * `credentialHash`, recording who retired it. Every condition sits in the
+   * WHERE clause, so a row that changed meanwhile is left alone.
+   * Returns whether a row was retired.
+   */
+  async retireSelfIssued(opts: {
+    instanceId: string;
+    credentialHash: string;
+    retiredByInstance: string;
+  }): Promise<boolean> {
+    const marker = JSON.stringify({ [RETIRED_BY_INSTANCE_KEY]: opts.retiredByInstance });
+    const result = await this.db
+      .updateTable('peer_credentials' as any)
+      .set({
+        revoked_at: new Date(),
+        metadata: sql`COALESCE(metadata, '{}'::jsonb) || ${marker}::jsonb`,
+      })
+      .where('instance_id', '=', opts.instanceId)
+      .where('credential_hash', '=', opts.credentialHash)
+      .where('revoked_at', 'is', null)
+      .where(sql`metadata->>'issuance'`, '=', PeerCredentialIssuance.Self)
+      .executeTakeFirst();
+
+    return Number((result as { numUpdatedRows?: bigint })?.numUpdatedRows ?? 0n) > 0;
   }
 
   /**
@@ -224,6 +297,7 @@ function mapRow(row: any): PeerCredential {
     lastValidatedBy: row.last_validated_by ?? null,
     expiresAt: new Date(row.expires_at),
     revokedAt: row.revoked_at ? new Date(row.revoked_at) : null,
+    metadata: (row.metadata ?? {}) as Record<string, unknown>,
   };
 }
 

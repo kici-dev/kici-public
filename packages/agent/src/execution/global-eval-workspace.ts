@@ -12,7 +12,8 @@
  *
  * The dependency tarball and the cached source pack both carry the workflow
  * repository's `.kici/`, so both restore into `workflow/` and never into the
- * source tree.
+ * source tree. A dependency restore that fails falls back to installing into
+ * `workflow/.kici/`.
  */
 
 import fs from 'node:fs/promises';
@@ -20,7 +21,8 @@ import { join } from 'node:path';
 import type { JobDispatch } from '@kici-dev/engine';
 import { cloneJobRepos } from '../checkout/clone-job-repos.js';
 import { buildCloneRequest } from './sandbox/fork-runner.js';
-import { restoreDeps, excludeScratchFromGit } from './dep-restore.js';
+import { excludeScratchFromGit } from './dep-restore.js';
+import { tryRestoreDeps } from './dep-restore-fallback.js';
 import { restoreSource } from './source-restore.js';
 import { installDeps } from './dep-installer.js';
 import { globalWorkspaceLayout, type JobWorkspaceLayout } from './job-workspace-layout.js';
@@ -30,7 +32,7 @@ export interface GlobalEvalWorkspaceArgs {
   dispatch: JobDispatch;
   workDir: string;
   log: (msg: string) => void;
-  /** How an inline dependency install runs when no dependency tarball was dispatched. */
+  /** How an inline dependency install runs when no dependency tarball was restored. */
   install: { baseEnv: NodeJS.ProcessEnv; allowInstallScripts: boolean | undefined };
   /**
    * Runs on the workflow checkout after the clone and before the dependencies:
@@ -76,9 +78,16 @@ export async function materializeGlobalEvalWorkspace(
 
   if (args.afterClone) await args.afterClone(workflowDir);
 
+  // A failed restore leaves `depsRestored` false and the install below runs.
+  let depsRestored = false;
   if (dispatch.depsUrl) {
     log('Restoring dependencies from cache');
-    await restoreDeps(workflowDir, dispatch.depsUrl, dispatch.depsHash);
+    depsRestored = await tryRestoreDeps({
+      workDir: workflowDir,
+      depsUrl: dispatch.depsUrl,
+      depsHash: dispatch.depsHash,
+      log,
+    });
   }
   if (dispatch.sourceTarUrl) {
     log('Restoring workflow source from cached tarball');
@@ -88,7 +97,7 @@ export async function materializeGlobalEvalWorkspace(
   const kiciDir = join(workflowDir, '.kici');
   const hasPackageJson = await fileExists(join(kiciDir, 'package.json'));
   args.onDepsCheck?.(kiciDir, hasPackageJson);
-  if (!dispatch.depsUrl && hasPackageJson) {
+  if (!depsRestored && hasPackageJson) {
     log('Installing dependencies locally');
     await installDeps(kiciDir, {
       npmRegistries: dispatch.npmRegistries,

@@ -552,6 +552,13 @@ export interface ExecutionRunTable {
    */
   cancelling_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
+   * TRUE once a forced cancel reached the run (migration 153). The
+   * stuck-cancelling re-drive reads it so a cancel that did not complete is
+   * re-sent with `force`. Never reset to FALSE: a later graceful cancel does
+   * not undo a forced one. NULL re-drives gracefully.
+   */
+  cancel_force: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
+  /**
    * The run's status generation (migration 150). Starts at 0 and rises by one
    * each time the run leaves a terminal status to continue. Forwarded on every
    * `execution.status` frame as `statusEpoch`, so the Platform can tell a
@@ -2142,6 +2149,18 @@ export interface OrgSettingsTable {
    * returns a string on select; accept a number on insert/update.
    */
   queue_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org bound (ms) on how long a build job's success waits for the cache
+   * publish its agent reported just before it. 0 turns the wait off. Null =
+   * cluster default (config.cacheUploadSettleTimeoutMs /
+   * KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS). Postgres BIGINT — pg returns a string
+   * on select; accept a number on insert/update.
+   */
+  cache_upload_settle_timeout_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
   /**
    * Per-org expiry (seconds) for a held approval element before it is rejected
    * and its run/job/step fails. NOT NULL, default 86400 (one day). An SDK

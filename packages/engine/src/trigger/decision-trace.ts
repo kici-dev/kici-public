@@ -34,6 +34,12 @@ export interface WorkflowDecision {
   checks: TraceEntry[];
   /** Summary reason */
   summary: string;
+  /**
+   * The `paths` lists of triggers that matched only because the changed files
+   * were unavailable while a git range existed. Set only when no trigger
+   * matched outright; the agent decides these from its clone.
+   */
+  deferredPaths?: string[][];
 }
 
 /**
