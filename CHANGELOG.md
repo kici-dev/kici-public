@@ -2,6 +2,12 @@
 
 Release notes for the public KiCI packages.
 
+## v0.14.1 — 2026-10-02
+
+### Fixes
+
+- An agent with git 2.54 or later now computes the changed files of a pull request or a new branch push. It reported them as unavailable, so a rule or workflow filter that reads the changed files failed
+
 ## v0.14.0 — 2026-10-02
 
 ### Features

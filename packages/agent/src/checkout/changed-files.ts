@@ -144,16 +144,43 @@ function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): 
   }
   if (!baseRef) return { files: [], status: 'unavailable' };
   // Deepen (bounded) until a merge-base with HEAD exists, then three-dot diff.
-  // Deepening through the base's refspec moves every shallow boundary, HEAD's
-  // included, and keeps the base ref current.
+  // Each round deepens both sides: the base through its refspec, which keeps
+  // the base ref current, and `head` through its own commit.
   for (let i = 0; i <= MAX_DEEPEN; i++) {
     if (tryGit(workDir, ['merge-base', baseRef, head], ctx)) {
       const out = git(workDir, ['diff', '--name-only', `${baseRef}...${head}`], ctx);
       return { files: parseNameOnly(out), status: 'fetched' };
     }
     if (!tryGit(workDir, ['fetch', `--deepen=${DEEPEN_STEP}`, 'origin', baseSpec], ctx)) break;
+    deepenCommit(workDir, head, ctx);
   }
   return { files: [], status: 'unavailable' };
+}
+
+/**
+ * Deepen the shallow history behind `commitish` by DEEPEN_STEP commits.
+ *
+ * On git 2.54 and later, a `--deepen` fetch moves only the shallow boundaries
+ * of the refs it fetches, so deepening the base's refspec leaves `head`'s
+ * boundary where it is. Naming `head`'s commit in that same fetch does not move
+ * it either. A separate fetch with an absolute `--depth` on the commit moves it
+ * on every git version. The
+ * depth is counted from the commits already present, so the fetch never
+ * shortens the history. Best effort: a remote that refuses a fetch by commit
+ * id leaves only the base deepened.
+ */
+function deepenCommit(workDir: string, commitish: string, ctx: GitAuthCtx): void {
+  let sha: string;
+  let present: number;
+  try {
+    sha = git(workDir, ['rev-parse', '--verify', `${commitish}^{commit}`], ctx).trim();
+    present = Number(git(workDir, ['rev-list', '--count', sha], ctx).trim());
+  } catch {
+    return;
+  }
+  // fails-when: on git 2.54+, a deepen through the base's refspec alone never reaches head's boundary
+  // breaks-if-wrong: a depth below the commits present would shorten head's history
+  tryGit(workDir, ['fetch', `--depth=${present + DEEPEN_STEP}`, 'origin', sha], ctx);
 }
 
 /**
