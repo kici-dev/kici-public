@@ -87,7 +87,7 @@ See [Container jobs](../../../user/container-jobs.md) for the job-side contract,
 
 ## Resource limit enforcement
 
-Container `limits` are translated into `HostConfig.Memory` (bytes) and `HostConfig.NanoCPUs` (cpus × 1e9) and are always enforced by the runtime. The requests/limits model and the three-layer cascade are described in [Common configuration → Resource limits](./common-config.md#resource-limits).
+Container `limits` are translated into `HostConfig.Memory` (bytes) and `HostConfig.NanoCpus` (cpus × 1e9) and are always enforced by the runtime. Every agent container also gets `HostConfig.PidsLimit` of 4096 processes, which bounds a fork bomb. This process cap is fixed and is not configurable. The requests/limits model and the three-layer cascade are described in [Common configuration → Resource limits](./common-config.md#resource-limits).
 
 ## Remote container host
 

@@ -1001,7 +1001,15 @@ export class StaleRunDetector {
       if (this.scalerManager) {
         this.scalerManager.onAgentDisconnected(job.agent_id);
       }
-      if (this.registry.get(job.agent_id)) {
+      // Disconnect only the registration that still holds the stale job. An
+      // agent that reconnected after the job went silent no longer holds it
+      // here, and may be running another job: treating that live connection as
+      // disconnected would put its job into a recovery no reconnect ever ends,
+      // and drop the agent from the registry while its socket stays open.
+      if (
+        this.registry.get(job.agent_id) &&
+        this.dispatcher.getAgentIdForJob(job.job_id) === job.agent_id
+      ) {
         await this.dispatcher.onAgentDisconnect(job.agent_id);
       }
     }

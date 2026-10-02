@@ -22,6 +22,7 @@ import {
 } from '@kici-dev/engine';
 import { ImagePullPolicy } from './types.js';
 import { parseExtraHost } from './firecracker-extra-hosts.js';
+import { agentLaunchRefusal } from './bare-metal-launch.js';
 import type { ScalerConfig } from './types.js';
 import { parseHostAccess } from '@kici-dev/shared/net';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -208,7 +209,8 @@ export const labelSetConfigSchema = z
  * Zod schema for a single scaler entry.
  * Includes type-specific refinements:
  * - Docker scalers require 'image' on every label set
- * - Bare-metal scalers require 'binaryPath' on every label set
+ * - Bare-metal label sets name a `binaryPath` or an `image`; on a Windows host a
+ *   batch-file `binaryPath` must be one cmd.exe can run
  */
 const scalerEntrySchema = z
   .object({
@@ -362,6 +364,17 @@ const scalerEntrySchema = z
               `Bare-metal scaler "${data.name}" label set [${i}] requires a 'binaryPath' ` +
               `(spawn a local agent process) or an 'image' (run the job's own container image ` +
               `as the agent, with the KiCI runtime injected)`,
+            path: ['labelSets', i, 'binaryPath'],
+          });
+        }
+        // A Windows host runs a batch-file binary through cmd.exe, which reads
+        // some path characters as syntax. Refused here so the orchestrator
+        // fails at startup (and a reload fails) instead of every launch.
+        const refusal = ls.binaryPath ? agentLaunchRefusal(ls.binaryPath, process.platform) : null;
+        if (refusal) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Bare-metal scaler "${data.name}" label set [${i}]: ${refusal}`,
             path: ['labelSets', i, 'binaryPath'],
           });
         }

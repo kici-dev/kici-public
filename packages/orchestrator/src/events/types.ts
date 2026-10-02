@@ -2,6 +2,8 @@
  * Event routing configuration and types.
  */
 
+import { z } from 'zod';
+
 /**
  * Configuration for the event routing system.
  */
@@ -48,6 +50,24 @@ export interface EventRouterConfig {
  */
 export type DlqReason = 'exhausted_retries' | 'non_retryable';
 
+/** How the router resolved one event against the registered workflows. */
+export const EventMatchOutcome = z.enum([
+  'matched',
+  'buffered',
+  'no-registration',
+  'no-target-repo',
+  'trust-blocked',
+  'no-trigger-match',
+]);
+export type EventMatchOutcome = z.infer<typeof EventMatchOutcome>;
+
+/** What the router resolved for one event, persisted on its processed row. */
+export interface EventMatchResult {
+  outcome: EventMatchOutcome;
+  /** Registrations the event was dispatched to. */
+  matchedCount: number;
+}
+
 /**
  * A stored internal event (matches DB row shape but with JS types).
  */
@@ -73,6 +93,39 @@ export interface StoredEvent {
   nextRetryAt: Date | null;
   dlqAt: Date | null;
   dlqReason: DlqReason | null;
+  /**
+   * How the router resolved the event. Set when the event is processed; null
+   * before, and for rows processed before the column existed.
+   */
+  matchOutcome: EventMatchOutcome | null;
+  /** Registrations the event was dispatched to; null when `matchOutcome` is. */
+  matchedCount: number | null;
+}
+
+/**
+ * An event payload safe to show an operator. An event-scaler scale-up carries
+ * a single-use claim code an agent redeems for credentials, so every read
+ * surface (event show, the dead-letter queue) replaces it with `[redacted]`.
+ */
+export function redactEventPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  return 'claimCode' in payload ? { ...payload, claimCode: '[redacted]' } : payload;
+}
+
+/** Where an internal event is in its dispatch lifecycle. */
+export const EventProcessingState = z.enum(['pending', 'leased', 'retrying', 'processed', 'dlq']);
+export type EventProcessingState = z.infer<typeof EventProcessingState>;
+
+/**
+ * Derive an event's dispatch state from its row: DLQ wins, then processed;
+ * an unprocessed row is leased while a node holds it, retrying once a failed
+ * dispatch scheduled another attempt, and pending before its first lease.
+ */
+export function eventProcessingState(e: StoredEvent): EventProcessingState {
+  if (e.dlqAt) return EventProcessingState.enum.dlq;
+  if (e.processed) return EventProcessingState.enum.processed;
+  if (e.claimedAt) return EventProcessingState.enum.leased;
+  if (e.nextRetryAt) return EventProcessingState.enum.retrying;
+  return EventProcessingState.enum.pending;
 }
 
 /**

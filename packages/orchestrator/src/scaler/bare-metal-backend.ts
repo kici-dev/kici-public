@@ -2,11 +2,12 @@
  * Bare-metal scaler backend implementation.
  *
  * Manages ephemeral agent processes using child_process.spawn.
- * Uses detached process groups for clean killing of entire process trees.
+ * On Linux and macOS each agent leads its own process group, which teardown
+ * signals; on Windows teardown ends the agent's process tree with taskkill.
  * All agents are single-use: destroyed after job completion.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
 import {
@@ -16,7 +17,7 @@ import {
   scalerAgentLabels,
   ScalerBackendType,
 } from '@kici-dev/engine';
-import { createLogger, type ToolRequirement } from '@kici-dev/shared';
+import { createLogger, stderrTail, toErrorMessage, type ToolRequirement } from '@kici-dev/shared';
 import { normalizeLabelSet } from './label-matcher.js';
 import { ScalerEventType } from './types.js';
 import Docker from 'dockerode';
@@ -58,6 +59,35 @@ import type {
   SpawnContext,
 } from './types.js';
 
+import {
+  agentLaunchRefusal,
+  buildAgentLaunch,
+  killWindowsTree,
+  startAgentProcess,
+} from './bare-metal-launch.js';
+
+/**
+ * The `scaler.failed` detail for an agent process that exited before it
+ * registered, with the end of what it wrote (bounded like a failed command's
+ * stderr tail).
+ */
+function exitedBeforeRegisteringDetail(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  output: string,
+): string {
+  const how = signal ? `signal ${signal}` : `code ${code}`;
+  const detail = `agent process exited with ${how} before it registered`;
+  const tail = stderrTail(output);
+  return tail ? `${detail}\n--- captured output ---\n${tail}` : detail;
+}
+
+/**
+ * How long `destroy()` waits for an agent to exit after asking it to stop, and
+ * the most a Windows tree kill may take.
+ */
+const EXIT_WAIT_MS = 5_000;
+
 // One logger for the module: with KICI_LOG_DIR set, each createLogger() call opens
 // its own log file stream, so a logger per spawn would leak one per agent.
 const logger = createLogger({ prefix: 'bare-metal-backend' });
@@ -68,6 +98,8 @@ interface BareMetalManagedAgent extends ManagedAgent {
   process?: ChildProcess;
   /** Set for a container-backed agent; `destroy` removes it instead of killing a PID. */
   containerId?: string;
+  /** Set by `markRegistered` once the agent process registered with the orchestrator. */
+  registered?: boolean;
 }
 
 export interface BareMetalScalerBackendOptions {
@@ -423,22 +455,25 @@ export class BareMetalScalerBackend implements ScalerBackend {
       });
     }
 
-    // Resolve cgroup wrapping: enforce only on Linux when enforceCgroups is true
-    // and effectiveLimits has at least one positive field. Otherwise spawn the
-    // binary directly (advisory limits — the scaler still tracks usage but the
-    // kernel does not enforce the per-process cap).
-    const { command, args } = this.buildSpawnInvocation(
-      matchedLabelSet.binaryPath!,
-      agentId,
-      effectiveLimits,
-    );
-
-    // Spawn process in detached process group (Pitfall #4: process group isolation)
-    const child = spawn(command, args, {
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env,
-    });
+    // Linux with enforceCgroups wraps the agent in a systemd scope, Windows runs
+    // a batch-file launcher through cmd.exe, and anything else runs directly. A
+    // launch the host refuses outright is reported here; the DeterministicSpawnError
+    // tells the manager to defer this scaler rather than retry at once.
+    let child: ChildProcess;
+    try {
+      const launch = buildAgentLaunch({
+        binaryPath: matchedLabelSet.binaryPath!,
+        agentId,
+        effectiveLimits,
+        enforceCgroups: this.enforceCgroups,
+        platform: process.platform,
+        hostEnv: process.env,
+      });
+      child = startAgentProcess(launch, env, process.platform);
+    } catch (err) {
+      emit(ScalerEventType.enum['scaler.failed'], toErrorMessage(err));
+      throw err;
+    }
 
     // Don't keep parent alive waiting for child
     child.unref();
@@ -448,8 +483,10 @@ export class BareMetalScalerBackend implements ScalerBackend {
     child.stdout?.pipe(merged, { end: false });
     child.stderr?.pipe(merged, { end: false });
 
-    // End the merged stream when the child process exits
-    child.on('exit', () => {
+    // End the merged stream once stdout and stderr are drained. 'close' comes
+    // after 'exit' and after the last output, so what the process wrote just
+    // before it exited (a fatal startup error) still reaches the capture.
+    child.on('close', () => {
       merged.end();
     });
 
@@ -508,12 +545,33 @@ export class BareMetalScalerBackend implements ScalerBackend {
     });
 
     // Listen for exit event to auto-cleanup from tracking maps
-    child.on('exit', () => {
+    let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    child.on('exit', (code, signal) => {
+      exit = { code, signal };
       this.logCaptures.delete(managed.id);
       this.agents.delete(managed.id);
     });
+    // The capture closes after the last output line. A process that exited
+    // before it registered will never register; report it with that output.
+    // The manager treats the report as a refused launch and defers the scaler.
+    rl.on('close', () => {
+      if (!exit || managed.state === 'destroying' || managed.registered) return;
+      emit(
+        ScalerEventType.enum['scaler.failed'],
+        exitedBeforeRegisteringDetail(exit.code, exit.signal, capture.tail()),
+      );
+    });
 
     return managed;
+  }
+
+  /**
+   * Record that the agent registered. From then on its exit is a disconnect
+   * the manager handles, not a failed spawn.
+   */
+  markRegistered(managedId: string): void {
+    const managed = this.agents.get(managedId);
+    if (managed) managed.registered = true;
   }
 
   /**
@@ -747,6 +805,12 @@ export class BareMetalScalerBackend implements ScalerBackend {
       return;
     }
 
+    if (process.platform === 'win32') {
+      await this.endWindowsTree(managed, pid);
+      this.agents.delete(managedId);
+      return;
+    }
+
     // Send SIGTERM to entire process group (negative PID kills group)
     try {
       process.kill(-pid, 'SIGTERM');
@@ -759,8 +823,8 @@ export class BareMetalScalerBackend implements ScalerBackend {
       throw err;
     }
 
-    // Wait up to 5 seconds for exit, then SIGKILL
-    const exited = await this.waitForExit(managed, 5000);
+    // Wait for exit, then SIGKILL
+    const exited = await this.waitForExit(managed, EXIT_WAIT_MS);
     if (!exited) {
       try {
         process.kill(-pid, 'SIGKILL');
@@ -855,6 +919,10 @@ export class BareMetalScalerBackend implements ScalerBackend {
           `Label set [${i}] requires a 'binaryPath' or an 'image' field for bare-metal backend`,
         );
       }
+      if (ls.binaryPath) {
+        const refusal = agentLaunchRefusal(ls.binaryPath, process.platform);
+        if (refusal) errors.push(`Label set [${i}]: ${refusal}`);
+      }
     });
 
     if (errors.length > 0) {
@@ -870,56 +938,23 @@ export class BareMetalScalerBackend implements ScalerBackend {
   }
 
   /**
-   * Build the (command, args) tuple used to spawn an agent process.
+   * End a Windows agent's whole process tree.
    *
-   * Two modes:
-   *   - Direct: returns (binaryPath, []) — the historical bare-metal flow.
-   *     Used when enforceCgroups is false, the host is non-Linux, or the
-   *     resolved limits carry no positive cpus/memBytes.
-   *   - systemd-run scope: returns ('systemd-run', [...]) wrapping the
-   *     binary in a transient `--user --scope --slice=kici-scaler` cgroup
-   *     with `CPUQuota=` / `MemoryMax=` properties translated from the
-   *     effective limits. The scope name embeds `agentId` so each agent is
-   *     a separately-named transient unit (and `systemctl --user status
-   *     kici-agent-<agentId>.scope` works).
+   * Windows has no process groups to signal and no SIGTERM, and Node.js cannot
+   * send a ctrl-C there (`process.kill` terminates the target unconditionally),
+   * so the tree is ended at once with `taskkill /T /F`. The pid is cmd.exe's, which runs the agent's `node` and
+   * everything it started.
    *
-   * `CPUQuota` is expressed as a percent (1.0 cpus = 100%). `MemoryMax`
-   * accepts a raw byte count.
+   * Nothing runs once Node.js has seen the child exit: libuv then releases its
+   * handle on the process, Windows may give the pid to an unrelated process,
+   * and `/T` would end that process's tree. While the child runs, the open
+   * handle keeps the pid ours.
    */
-  private buildSpawnInvocation(
-    binaryPath: string,
-    agentId: string,
-    effectiveLimits: EffectiveLimits | undefined,
-  ): { command: string; args: string[] } {
-    const cpus =
-      typeof effectiveLimits?.cpus === 'number' && effectiveLimits.cpus > 0
-        ? effectiveLimits.cpus
-        : 0;
-    const memBytes =
-      typeof effectiveLimits?.memBytes === 'number' && effectiveLimits.memBytes > 0
-        ? effectiveLimits.memBytes
-        : 0;
-
-    if (!this.enforceCgroups || process.platform !== 'linux' || (cpus === 0 && memBytes === 0)) {
-      return { command: binaryPath, args: [] };
-    }
-
-    const args: string[] = [
-      '--user',
-      '--scope',
-      '--quiet',
-      '--slice=kici-scaler',
-      `--unit=kici-agent-${agentId}`,
-    ];
-    if (cpus > 0) {
-      const quotaPercent = Math.max(1, Math.round(cpus * 100));
-      args.push(`--property=CPUQuota=${quotaPercent}%`);
-    }
-    if (memBytes > 0) {
-      args.push(`--property=MemoryMax=${memBytes}`);
-    }
-    args.push(binaryPath);
-    return { command: 'systemd-run', args };
+  private async endWindowsTree(managed: BareMetalManagedAgent, pid: number): Promise<void> {
+    const child = managed.process;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    await killWindowsTree(pid, process.env, EXIT_WAIT_MS);
+    await this.waitForExit(managed, EXIT_WAIT_MS);
   }
 
   /**

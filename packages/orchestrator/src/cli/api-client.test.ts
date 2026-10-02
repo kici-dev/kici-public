@@ -278,6 +278,75 @@ describe('AdminApiClient', () => {
     );
   });
 
+  it('posts a peer forget with the JSON body', async () => {
+    const fetchMock = mockFetch(200, { instanceId: 'coord-b', results: [] });
+    globalThis.fetch = fetchMock;
+
+    await client.forgetPeer({ instanceId: 'coord-b', timeoutMs: 15_000 });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(`${BASE_URL}/api/v1/admin/peers/forget`);
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      instanceId: 'coord-b',
+      timeoutMs: 15_000,
+    });
+  });
+
+  it('returns a backstop-acknowledgement refusal and throws any other refusal', async () => {
+    globalThis.fetch = mockFetch(409, {
+      error: 'coord-b is the last coordinator peer',
+      results: [],
+      acknowledgementRequired: true,
+    });
+    expect(await client.forgetPeer({ instanceId: 'coord-b' })).toMatchObject({
+      acknowledgementRequired: true,
+      error: 'coord-b is the last coordinator peer',
+    });
+
+    globalThis.fetch = mockFetch(409, {
+      error: 'coord-b was last heard from 5 s ago',
+      results: [],
+    });
+    await expect(client.forgetPeer({ instanceId: 'coord-b' })).rejects.toThrow(
+      'HTTP 409: coord-b was last heard from 5 s ago',
+    );
+  });
+
+  // --- Scaler orphans ---
+
+  it('lists scaler orphans on a target with the wait in the query', async () => {
+    const fetchMock = mockFetch(200, { node: {}, vms: [] });
+    globalThis.fetch = fetchMock;
+
+    await client.listScalerOrphans({ target: 'worker-1', timeoutMs: 30_000 });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `${BASE_URL}/api/v1/admin/scaler/orphans?target=worker-1&timeoutMs=30000`,
+    );
+    expect(fetchMock.mock.calls[0][1].method).toBe('GET');
+  });
+
+  it('lists scaler orphans on the coordinator itself without a query', async () => {
+    const fetchMock = mockFetch(200, { node: {}, vms: [] });
+    globalThis.fetch = fetchMock;
+
+    await client.listScalerOrphans();
+
+    expect(fetchMock.mock.calls[0][0]).toBe(`${BASE_URL}/api/v1/admin/scaler/orphans`);
+  });
+
+  it('posts a scaler orphan stop with the JSON body', async () => {
+    const fetchMock = mockFetch(200, { node: {}, results: [] });
+    globalThis.fetch = fetchMock;
+    const body = { target: 'worker-1', vmIds: ['vm-1'], timeoutMs: 45_000 };
+
+    await client.stopScalerOrphans(body);
+
+    expect(fetchMock.mock.calls[0][0]).toBe(`${BASE_URL}/api/v1/admin/scaler/orphans/stop`);
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(body);
+  });
+
   it('URL-encodes orgId in listScopes', async () => {
     const fetchMock = mockFetch(200, { scopes: [] });
     globalThis.fetch = fetchMock;

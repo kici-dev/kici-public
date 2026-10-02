@@ -1,10 +1,20 @@
 import winston from 'winston';
 import pc from 'picocolors';
 import DailyRotateFile from 'winston-daily-rotate-file';
-import { getRequestContext } from './request-context.js';
+import { getRequestContext, type RequestContext } from './request-context.js';
 import { toErrorMessage } from './error.js';
 
 let _serviceName: string | undefined;
+
+/** Request-context fields copied onto every log line the call site did not set. */
+const TRACE_CONTEXT_FIELDS = [
+  'requestId',
+  'runId',
+  'jobId',
+  'routingKey',
+  'traceId',
+  'spanId',
+] as const satisfies readonly (keyof RequestContext)[];
 
 /**
  * Node error codes that are expected when the process that consumes our
@@ -52,6 +62,22 @@ export function installStreamErrorHandlers(): void {
 installStreamErrorHandlers();
 
 /**
+ * Adds the service name and the request-context fields to a log line. A field
+ * the call site set itself wins: a call site that names a run or job knows
+ * which one the line is about, while the ambient request may be about another.
+ * An explicit `null` stays; an `undefined` value counts as not set.
+ */
+const traceContextFormat = winston.format((info) => {
+  if (_serviceName) info['service'] = _serviceName;
+  const ctx = getRequestContext();
+  for (const field of TRACE_CONTEXT_FIELDS) {
+    const value = ctx[field];
+    if (value && info[field] === undefined) info[field] = value;
+  }
+  return info;
+});
+
+/**
  * Tracked set of loggers still waiting for the service name so they can
  * add their rotated-file transport with the right filename. Module-level
  * `createLogger()` calls resolve before the service's `setServiceName()`
@@ -82,17 +108,7 @@ function buildFileTransport(): DailyRotateFile | undefined {
     maxFiles: `${process.env.KICI_LOG_RETENTION_DAYS ?? '7'}d`,
     format: winston.format.combine(
       winston.format.timestamp(),
-      winston.format((info) => {
-        if (_serviceName) info['service'] = _serviceName;
-        const ctx = getRequestContext();
-        if (ctx.requestId) info['requestId'] = ctx.requestId;
-        if (ctx.runId) info['runId'] = ctx.runId;
-        if (ctx.jobId) info['jobId'] = ctx.jobId;
-        if (ctx.routingKey) info['routingKey'] = ctx.routingKey;
-        if (ctx.traceId) info['traceId'] = ctx.traceId;
-        if (ctx.spanId) info['spanId'] = ctx.spanId;
-        return info;
-      })(),
+      traceContextFormat(),
       winston.format.json(),
     ),
     zippedArchive: true,
@@ -257,19 +273,6 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
       if (key === 'level' || key === 'message') continue;
       info[key] = maskTokens(info[key]);
     }
-    return info;
-  });
-
-  // Trace context enrichment format: reads AsyncLocalStorage and adds fields to log info
-  const traceContextFormat = winston.format((info) => {
-    if (_serviceName) info['service'] = _serviceName;
-    const ctx = getRequestContext();
-    if (ctx.requestId) info['requestId'] = ctx.requestId;
-    if (ctx.runId) info['runId'] = ctx.runId;
-    if (ctx.jobId) info['jobId'] = ctx.jobId;
-    if (ctx.routingKey) info['routingKey'] = ctx.routingKey;
-    if (ctx.traceId) info['traceId'] = ctx.traceId;
-    if (ctx.spanId) info['spanId'] = ctx.spanId;
     return info;
   });
 

@@ -168,7 +168,7 @@ When a stale job is detected:
 6. **Emit infrastructure event**: `executionTracker.emitInfraEvent()` with `orchestrator.job.stale_detected` for the dashboard timeline
 7. **Cancel in-progress steps**: `executionTracker.cancelStepsForJob()` removes stale running indicators from the dashboard
 8. **Check run update**: `checkRunReporter.updateJobStatus()` with `timed_out` conclusion
-9. **Force-terminate agent**: `scalerManager.onAgentDisconnected()` + `dispatcher.onAgentDisconnect()`
+9. **Force-terminate agent**: `scalerManager.onAgentDisconnected()` always runs. `dispatcher.onAgentDisconnect()` runs only while the agent is registered and the dispatcher still tracks the stale job to it (`dispatcher.getAgentIdForJob()`). An agent that reconnected after the job went silent no longer holds the job and can run another one, so its connection stays open and its jobs stay out of recovery.
 10. **Run completion check**: `completeRunIfAllJobsTerminal()` for each affected run (batched)
 
 ## Crash recovery

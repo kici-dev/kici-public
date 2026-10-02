@@ -203,7 +203,7 @@ When `cancelInProgress: true`, the orchestrator cancels older runs in the same g
 
 1. New run joins group
 2. Orchestrator finds older running run with same group key
-3. Older run receives `job.cancel` with reason "Superseded by run #N"
+3. Older run receives `job.cancel` with reason "Superseded by run in concurrency group 'deploy-main'"
 4. New run receives `job.concurrency.ack { action: 'proceed' }`
 
 ### Queue mode
@@ -212,7 +212,7 @@ When `cancelInProgress: false`, the orchestrator holds the new run:
 
 1. New run joins group
 2. Orchestrator finds active run with same group key
-3. New run receives `job.concurrency.ack { action: 'wait', reason: 'Waiting for deploy-main (1 ahead)' }`
+3. New run receives `job.concurrency.ack { action: 'wait', reason: "Queued in concurrency group 'deploy-main'" }`
 4. The agent keeps the job and blocks on the same WebSocket connection, waiting for a follow-up ack
 5. When the prior run completes, the orchestrator pushes an unsolicited `job.concurrency.ack { action: 'proceed' }` to that waiting agent, which resumes the job it was already holding
 

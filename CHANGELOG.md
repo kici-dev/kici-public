@@ -2,6 +2,44 @@
 
 Release notes for the public KiCI packages.
 
+## v0.14.0 — 2026-10-02
+
+### Features
+
+- The Firecracker API-socket wait is now an operator setting, kici-admin cluster-settings set --firecracker-api-socket-wait-ms, with a 30 s default (it was a fixed 5 s) and the KICI_FIRECRACKER_API_SOCKET_WAIT_MS cluster default. A spawn on a host whose disk is busy with writes no longer fails because the jailer's copy of the firecracker binary took more than 5 s. Workers receive the value from the leader
+- kici-admin org-settings reroute set takes --spawn-max-attempts and --spawn-retry-backoff: how many agent spawns a worker attempts for a rerouted job, and how long it waits between them
+- A kici.scaler event that matches no subscribing workflow is logged at info and counted in kici_orch_event_unmatched_total, with a panel in the monitoring-pack dashboard
+- kici-admin event list and event show inspect internal events: each event's dispatch state, whether it matched a workflow (or why none did), and the runs it dispatched
+- kici-admin scaler orphans lists the live Firecracker VMs a node's orchestrator does not track, on a coordinator or on any worker through --target, and --stop reclaims them after a confirmation
+- kici-admin peer forget drops a peer that left the cluster from the live peer list of every coordinator, without touching its credential, so a coordinator that is gone for good no longer keeps kici-admin scaler orphans from stopping anything. It refuses a peer the coordinator can still treat as alive (inside the reroute flap grace, or inside the event-scaler backstop's flap grace for a peer that adopted provisions), and asks for confirmation (or --yes) before forgetting the last coordinator peer turns the event-scaler backstop back on.
+- kici-admin cluster-settings show now lists the settings version each coordinator and worker applied, and flags the ones that are not on the current version
+
+### Fixes
+
+- A failed Firecracker spawn step now reports the command's exit code or signal, whether its timeout killed it, how long it ran and the end of its stderr. The same detail reaches the scaler.failed event, the job's provisioning error and the spawn-failure log lines, and failed nftables commands in every scaler report the same fields
+- A Firecracker spawn no longer formats its overlay drive. The orchestrator formats one template for each overlay size on the host and copies it sparsely for each VM, so a spawn stays fast while other processes write heavily to the same disk, instead of timing out at mkfs.ext4
+- A Firecracker VM that stops before its agent registers is now torn down within seconds, and a spawn that never registers has its compute destroyed when the orchestrator gives up on it. Such a VM no longer keeps counting against maxAgents, which could leave a scaler unable to spawn
+- A job rerouted to a worker is no longer failed while the worker is still retrying the agent spawn: the worker retries a bounded number of times, the coordinator waits for its verdict, and a job the coordinator gives up on can no longer run on the worker afterwards
+- A bare-metal scaler on a Windows orchestrator now starts its agents. It runs a .cmd or .bat agent launcher through cmd.exe, because Node.js does not start a batch file directly.
+- Stopping a bare-metal agent on Windows now ends its whole process tree with taskkill. Before, the agent kept running after the scaler released it.
+- A Windows orchestrator now refuses to start when a bare-metal binaryPath batch file contains a character that cmd.exe reads as syntax. The error names the scaler and the label set.
+- When the host refuses to start a bare-metal agent, the scaler now reports the failure in kici-admin diagnose and on the waiting job, and defers that scaler. Before, it retried several times a second.
+- An agent on Windows no longer refuses to start when bash is not on PATH. Workflow steps on Windows run in PowerShell 7, as the agent runtime dependencies describe, and the Git for Windows installer puts only git on PATH.
+- A bare-metal agent that stops before it connects is now reported at once, with its last output, in kici-admin diagnose and on the waiting job. A bare-metal or Firecracker scaler whose agents stop before they connect is now deferred with the provision backoff, instead of starting a new agent each time.
+- kici-admin workflow register-manual over HTTP no longer deletes the repository's other workflow registrations; it upserts the workflows the lock file names, as documented
+- Orchestrator log lines keep the run and job ids their call site names instead of the surrounding request's, and agent spawn lines name the job's own run
+- A pending event-scaler provision whose job is cancelled or finishes is torn down with reason job-complete within one 30-second sweep, and is no longer reported as a provisioning failure and no longer backs the scaler off; the provisioning-failure message now states only that the scale-up event was emitted
+- The event dead-letter queue (kici-admin event-dlq list and the dashboard) no longer shows an event-scaler scale-up's single-use claim code; it reads [redacted]
+- kici-admin event-dlq list returns event payloads only to a role holding event_log.read_payload; the auditor role reads DLQ metadata only, as documented
+- A Firecracker orchestrator running as a non-root user now stops its VMs through sudo as the jailer user. When it cannot stop a VM, it logs why and keeps the VM's chroot, so `kici-admin scaler orphans` can list the VM and stop it later. Before, it left the VM running without a chroot, and no command found it. The unowned-VM reclaim also keeps the chroot of a running process it cannot identify.
+- A Firecracker orchestrator running as root now recognises its own VM processes. It compared the text of the process root link, which reads `/` from the host for every jailed VM, so it treated each VM as unidentified and never force-killed one during teardown.
+- The orchestrator no longer fails a job that an agent is running when it reaps an older stale job of the same agent that reconnected since; it disconnects only an agent that still holds the stale job
+- A DB-less worker could record a newer cluster-settings version with the values of the previous one and keep them until the next change; a coordinator now serves the snapshot and its version from one read of the settings row
+
+### Documentation
+
+- The Firecracker host setup guide's sudoers allowlist now lists chown and chmod, which an orchestrator with requireSudo needs to start VMs
+
 ## v0.13.0 — 2026-09-30
 
 ### Features

@@ -69,6 +69,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'diagnostics.read': 30,
   'scaler.capacity.read': 30,
   'scaler.agents.read': 30,
+  'scaler.orphans.read': 30,
   'fleet.read': 30,
 
   // 180 days — sensitive reads
@@ -115,6 +116,8 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'trust_directory.updated': 180,
   'cluster_name.update': 180,
   'attestation.retry': 180,
+  'scaler.orphan.stop': 180,
+  'peer.forget': 180,
 
   // 180 days — direct-DB kici-admin mutations (source 'admin_cli')
   'db.fresh': 180,
@@ -415,6 +418,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'diagnostics.read': 30,
   'scaler.capacity.read': 30,
   'scaler.agents.read': 30,
+  'scaler.orphans.read': 30,
   'fleet.read': 30,
 
   // 730 days — sensitive reads
@@ -461,6 +465,8 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'trust_directory.updated': 730,
   'cluster_name.update': 730,
   'attestation.retry': 730,
+  'scaler.orphan.stop': 730,
+  'peer.forget': 730,
 
   // 730 days — direct-DB kici-admin mutations (source 'admin_cli')
   'db.fresh': 730,

@@ -190,7 +190,7 @@ While it drains, its `scaler:<name>` row in `kici-admin diagnose` reports it as 
 
 ## Monitoring
 
-The scaler exposes Prometheus metrics with the `kici_orch_scaler_` prefix, available on the orchestrator's `/metrics` endpoint. The table below covers the metrics every backend shares; the `event` backend adds its own (`kici_orch_scaler_scale_up_emitted_total`, `kici_orch_scaler_scale_down_emitted_total`, `kici_orch_scaler_external_provisioning_active`, `kici_orch_scaler_external_provision_timeout_total`, `kici_orch_scaler_reap_unseen_provisions`, `kici_orch_scaler_reap_blocked`), documented on the [Event scaler](../event-scaler.md#metrics) page.
+The scaler exposes Prometheus metrics with the `kici_orch_scaler_` prefix, available on the orchestrator's `/metrics` endpoint. The table below covers the metrics every backend shares; the `event` backend adds its own (`kici_orch_scaler_scale_up_emitted_total`, `kici_orch_scaler_scale_down_emitted_total`, `kici_orch_scaler_external_provisioning_active`, `kici_orch_scaler_external_provision_timeout_total`, `kici_orch_scaler_reap_unseen_provisions`, `kici_orch_scaler_reap_blocked`), and the event router counts its unmatched scaling events in `kici_orch_event_unmatched_total`; both are documented on the [Event scaler](../event-scaler.md#metrics) page.
 
 ### Metrics reference
 
@@ -229,7 +229,7 @@ Backend-specific troubleshooting lives on each backend page: [Container](./conta
 
 ### Label mismatch
 
-**Symptom:** Jobs fail immediately with `no-backend` error.
+**Symptom:** Jobs stay queued and never start. When the queue window expires, each job settles `unroutable`, and its error names the unsatisfied `runsOn` selectors. "What happens when no match is found" above describes the full sequence.
 
 **Cause:** Job `runsOn` labels are not a subset of any scaler label set.
 

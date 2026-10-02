@@ -28,6 +28,7 @@ export type ClusterNumberColumn =
   | 'global_eval_candidate_timeout_ms'
   | 'global_eval_cache_max'
   | 'global_eval_wait_timeout_ms'
+  | 'firecracker_api_socket_wait_ms'
   | 'check_run_tracking_ttl_days'
   | 'run_retention_days'
   | 'audit_retention_days'
@@ -175,6 +176,15 @@ export class ClusterSettingsReader {
 
   private async loadRow(): Promise<ClusterSettings | undefined> {
     return (await this.loadSnapshot()).row;
+  }
+
+  /**
+   * The whole row from one read (undefined when there is no row or the read
+   * failed). For a caller that needs several columns that agree with each
+   * other, such as a value and the row version it belongs to.
+   */
+  async getRow(): Promise<ClusterSettings | undefined> {
+    return this.loadRow();
   }
 
   /** Resolve a fleet-wide numeric knob; `fallback` is the config.ts cluster default. */

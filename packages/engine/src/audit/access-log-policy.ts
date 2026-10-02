@@ -74,6 +74,7 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'diagnostics.read': { kind: 'rate_limit', perMinutePerActor: 1 },
   'scaler.capacity.read': { kind: 'rate_limit', perMinutePerActor: 1 },
   'scaler.agents.read': { kind: 'rate_limit', perMinutePerActor: 1 },
+  'scaler.orphans.read': { kind: 'rate_limit', perMinutePerActor: 1 },
   'fleet.read': { kind: 'rate_limit', perMinutePerActor: 1 },
 
   // Sensitive reads + every mutation: always recorded.
@@ -122,6 +123,8 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'trust_directory.updated': { kind: 'always' },
   'cluster_name.update': { kind: 'always' },
   'attestation.retry': { kind: 'always' },
+  'scaler.orphan.stop': { kind: 'always' },
+  'peer.forget': { kind: 'always' },
   // Direct-DB kici-admin mutations (source 'admin_cli') — always recorded.
   'db.fresh': { kind: 'always' },
   'db.ensure': { kind: 'always' },

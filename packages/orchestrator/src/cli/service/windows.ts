@@ -26,6 +26,13 @@ import { getCacheDir } from './platform-detect.js';
 import { shutdownGraceSeconds, stopWaitSeconds } from './shutdown-grace.js';
 import { restrictEnvFileAccess } from './windows-acl.js';
 import { envFileRefusal, launchReadsEnvFile, launchedRelease } from './windows-env-file.js';
+import {
+  BATCH_STDIN,
+  BATCH_WRAPPER_ARGS,
+  assertCmdSafe,
+  batchFileCommand,
+  isBatchFile,
+} from '../../helpers/windows-batch.js';
 
 /**
  * How long a discovery-path probe of the service registry may run.
@@ -108,59 +115,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * The cmd.exe arguments that run a batch-file launcher, ahead of its path.
- *
- * shawl stops the service with a ctrl-C to its console, and cmd.exe gets it
- * too: when the batch file's node process exits, cmd.exe asks "Terminate batch
- * job (Y/N)?" and waits for an answer. shawl sees the service exit only when its
- * stop timeout kills cmd.exe. With stdin from NUL ({@link BATCH_STDIN}), cmd.exe
- * reads end-of-input at that prompt and exits with node.
- *
- * `call` keeps the launcher path out of the first position after `/c`, where
- * cmd.exe strips the quotes from a path that contains `(`, `)` or `&`. `/e:on`
- * and `/v:off` pin command extensions (the launchers use `%~dp0`) and delayed
- * expansion whatever the host's registry defaults are.
- */
-const BATCH_WRAPPER_ARGS = ['/d', '/e:on', '/v:off', '/c', 'call'] as const;
-
-/** The redirect that closes {@link BATCH_WRAPPER_ARGS}: the launcher's stdin is NUL. */
-const BATCH_STDIN = '<NUL';
-
-/** A `.cmd` or `.bat` file, which Windows runs through cmd.exe. */
-function isBatchFile(executablePath: string): boolean {
-  return /\.(cmd|bat)$/i.test(executablePath);
-}
-
-/**
- * The cmd.exe that COMSPEC names, as Node itself uses to run a shell on Windows.
- * A COMSPEC that names another shell is not used: the wrapper arguments are
- * cmd.exe's.
- */
-function cmdExePath(): string {
-  const comspec = process.env.COMSPEC;
-  return comspec && /(^|\\)cmd\.exe$/i.test(comspec) ? comspec : 'C:\\Windows\\System32\\cmd.exe';
-}
-
-/**
- * Throw when cmd.exe would read part of `token` as syntax.
- *
- * shawl quotes a token on cmd.exe's command line only when it contains a space
- * or a tab. Inside quotes cmd.exe reads `&`, `|`, `<`, `>`, `(`, `)` and the
- * `,` `;` `=` delimiters as text; outside quotes it reads them as syntax. `%`
- * and `^` change even inside quotes (`call` expands `%` again and doubles `^`),
- * and a `"` ends the quoting.
- */
-function assertCmdSafe(token: string): void {
-  const syntax = /[ \t]/.test(token) ? /["%^]/ : /["%^&|<>(),;=]/;
-  const found = syntax.exec(token);
-  if (found) {
-    throw new Error(
-      `cannot run "${token}" as a Windows service: it contains "${found[0]}", which cmd.exe ` +
-        `reads as syntax when it runs the batch file. Install from a path without it.`,
-    );
-  }
-}
+/** What a service command runs as, and what to change, in a cmd.exe refusal. */
+const SERVICE_USE = 'as a Windows service';
+const SERVICE_REMEDY = 'Install from a path without it.';
 
 /**
  * The command shawl registers for the service: the executable and its
@@ -169,8 +126,8 @@ function assertCmdSafe(token: string): void {
 function serviceCommand(config: ServiceConfig): string[] {
   const command = [config.executablePath, ...(config.args ?? [])];
   if (!isBatchFile(config.executablePath)) return command;
-  command.forEach(assertCmdSafe);
-  return [cmdExePath(), ...BATCH_WRAPPER_ARGS, ...command, BATCH_STDIN];
+  command.forEach((token) => assertCmdSafe(token, SERVICE_USE, SERVICE_REMEDY));
+  return batchFileCommand(command);
 }
 
 /** The launch command inside a {@link serviceCommand}: a batch file's cmd.exe wrapper removed. */

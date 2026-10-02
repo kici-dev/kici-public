@@ -47,15 +47,15 @@ Orchestrators participate in three communication channels. Understanding which m
 
 ### Channel summary
 
-| Channel                               | Transport                                    | Messages                                                                                                                                               |
-| ------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Platform ↔ Orchestrator**           | WS (orch connects outbound to Platform)      | Webhook relay, source registration, execution telemetry, peer discovery                                                                                |
-| **Orchestrator ↔ Orchestrator (P2P)** | WS (initiator connects to peer's `/ws/peer`) | Peer auth, heartbeat (agent inventory + scaler capacity), job reroute, job progress, cancel propagation, log relay, cache upload relay, Raft consensus |
-| **Orchestrator ↔ Agent**              | WS (agent connects outbound to orch)         | Job dispatch, job/step status, log streaming, event emit                                                                                               |
+| Channel                               | Transport                                    | Messages                                                                                                                                                                                                                                                                                           |
+| ------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Platform ↔ Orchestrator**           | WS (orch connects outbound to Platform)      | Webhook relay, source registration, execution telemetry, peer discovery                                                                                                                                                                                                                            |
+| **Orchestrator ↔ Orchestrator (P2P)** | WS (initiator connects to peer's `/ws/peer`) | Peer auth, heartbeat (agent inventory + scaler capacity), job reroute, job progress, cancel propagation, log relay, cache upload relay, Raft consensus, operator requests forwarded to one peer or fanned out to sibling coordinators (config reload, log collection, scaler orphans, peer forget) |
+| **Orchestrator ↔ Agent**              | WS (agent connects outbound to orch)         | Job dispatch, job/step status, log streaming, event emit                                                                                                                                                                                                                                           |
 
 ### What flows P2P vs upstream
 
-The KiCI Platform is primarily a **webhook router and peer matchmaker**, not a general message bus. Inter-orchestrator coordination — peer auth (`peer.hello` / `peer.auth.request`), heartbeats (agent inventory, scaler capacity, Raft state, drain status), job rerouting (`job.reroute`, `job.progress`, `peer.job.cancel`, `peer.log.chunk`), cache upload relay, and Raft consensus — never touches the upstream tier; it flows strictly between orchestrators on the `/ws/peer` channel. Execution telemetry (lifecycle events, run/job/step status forwards, log chunks) flows the other direction, from each orchestrator up to the Platform tier so the dashboard can render it. See [Protocol overview](../protocol/overview.md) for the message-by-message breakdown across each channel.
+The KiCI Platform is primarily a **webhook router and peer matchmaker**, not a general message bus. Inter-orchestrator coordination never touches the upstream tier: it flows strictly between orchestrators on the `/ws/peer` channel. It covers peer auth (`peer.hello` / `peer.auth.request`), heartbeats (agent inventory, scaler capacity, Raft state, drain status), job rerouting (`job.reroute`, `job.progress`, `peer.job.cancel`, `peer.log.chunk`), cache upload relay, operator requests (`peer.config.reload`, `peer.logs.collect.request`, `peer.scaler.orphans.request`, `peer.forget.request`), and Raft consensus. Execution telemetry (lifecycle events, run/job/step status forwards, log chunks) flows the other direction, from each orchestrator up to the Platform tier so the dashboard can render it. See [Protocol overview](../protocol/overview.md) for the message-by-message breakdown across each channel.
 
 ## Peer communication
 
@@ -209,9 +209,14 @@ A positive `job.reroute.ack` only means the peer **queued** the job — the agen
 
 - **Bounded-window re-dispatch (correctness backstop).** When a peer ACKs a reroute, the coordinator arms a per-job **spawn window**. The first `job.progress` (job or step) disarms it. If the window elapses with no progress, the coordinator best-effort cancels the original peer's job (a double-execution guard against a slow-but-healthy spawn), then re-runs the routing decision under the same `jobId` — trying another peer, then a local dispatch, and finally marking the job failed if no backend can run it. This also covers a peer that dies right after the ACK.
   - **Silence is not evidence of failure.** Only a **worker** relays `job.progress`; a peer **coordinator** shares the database and writes the job's status straight to `execution_jobs`, so it relays nothing at all. Before it treats an elapsed window as a spawn failure, the coordinator therefore reads that shared row. A job the peer has already started disarms the backstop instead of being cancelled, which is what keeps a coordinator-to-coordinator reroute alive past the window (a slow scaler spawn, a long checkout, a big dependency install). The coordinator keeps the job's tracking entry — cancel propagation still needs it — and polls the row until the job is terminal, which is the only report the peer coordinator ever makes. A read failure is treated as "not started", so a database fault cannot silently disable the backstop; once the row has shown the job running, the coordinator latches that and never re-dispatches it.
-- **Spawn-failure fast path.** A worker relays a scaler spawn failure for a rerouted-in job back to the owning coordinator over the existing scaler-event channel. On that signal the coordinator runs the same cancel-then-re-dispatch immediately, without waiting the window out. The two layers are idempotent: whichever fires first removes the tracking entry, so the other is a no-op. The re-dispatch appends the failed peer to `triedConnections` so routing never re-selects it.
+- **Worker spawn-retry verdict.** The coordinator sends a spawn-retry budget on `job.reroute` (`spawnRetry: { maxAttempts, backoffMs }`). A worker retries a failed agent spawn within that budget, and relays each `scaler.failed` for the job back to the owning coordinator over the scaler-event channel with a `final` verdict:
+  - `final: true` — the worker spent its last attempt and gave the job back. The coordinator runs the same cancel-then-re-dispatch immediately, without waiting the window out. The two layers are idempotent: whichever fires first removes the tracking entry, so the other is a no-op.
+  - `final: false` — the worker is retrying. The coordinator restarts the spawn window for one more attempt plus the backoff it told the worker to wait. It treats the `maxAttempts`-th such relay as final, so a worker that never says `final` cannot hold the job forever.
+  - no verdict — an older worker, which retries without a bound. The coordinator leaves the window it armed at the reroute running unchanged.
 
-The spawn window, the reroute ACK timeout, and the max-hop limit are per-org tunables (`reroute_spawn_window_ms`, `reroute_ack_timeout_ms`, `reroute_max_hops`) with cluster-wide defaults; operators change them with `kici-admin org-settings reroute`.
+  The re-dispatch appends the failed peer to `triedConnections` so routing never re-selects it.
+
+The spawn window, the reroute ACK timeout, the max-hop limit, and the worker's spawn-retry budget are per-org tunables (`reroute_spawn_window_ms`, `reroute_ack_timeout_ms`, `reroute_max_hops`, `reroute_spawn_max_attempts`, `reroute_spawn_retry_backoff_ms`) with cluster-wide defaults; operators change them with `kici-admin org-settings reroute`.
 
 ## Raft consensus
 
@@ -254,6 +259,18 @@ When the peer registry has 0 connected peers, the Raft node self-elects immediat
 ### Leaving the cluster
 
 A coordinator that shuts down stops its Raft node before it disconnects from its peers. The stop is final. The node gives up leadership, so its leader-only services stop with it. It ignores every election message after the stop and grants no vote. So a `peer.leaving` from a sibling that stops at the same time cannot elect it again while it shuts down, and neither can its own peers dropping away. The remaining coordinators elect a new leader among themselves. The node's last save to the shared `raft_state` row does not overwrite a newer term that they have already written.
+
+### Forgetting a departed peer
+
+Each coordinator keeps its own live peer registry, and nothing removes a disconnected peer from it. A coordinator that left the cluster for good therefore stays in every registry as a disconnected coordinator peer. `kici-admin peer forget <instance-id>` drops it (`packages/orchestrator/src/cluster/peer-forget.ts`).
+
+The coordinator that receives the request checks the peer on its own registry first (`forgetDepartedPeer()`) and keeps it, with the reason, when:
+
+- the peer is connected (`connected`), because its next heartbeat registers it again.
+- the peer was heard from inside its liveness window (`recent`), because it may be partitioned rather than gone. The window is the longer of the peer stale window and the reroute flap grace. A peer that adopted event-scaler provisions gets the backstop's own flap grace instead.
+- forgetting the last known coordinator peer would switch the event-provision backstop back on, and the request did not acknowledge that (`acknowledgement-required`).
+
+A peer kept for one of these reasons is not fanned out. Otherwise the coordinator sends `peer.forget.request` to every connected sibling coordinator (`forgetAcrossCoordinators()`). Each sibling runs the same checks on its own registry and answers with `peer.forget.response`. A sibling that does not answer within the timeout is reported as `error`. Forgetting never touches the peer's credential (that is `peer revoke`), so a forgotten peer that connects again is registered again as usual.
 
 ### State persistence
 

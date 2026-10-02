@@ -80,6 +80,16 @@ interface ReplaceAllOptions {
   depCacheKey?: DepCacheKey;
   /** Set of workflow names that should be marked as global */
   globalWorkflowNames?: Set<string>;
+  /**
+   * Delete this routing key's rows for the repo whose workflow the incoming set
+   * does not name. `true` (the default) is the default-branch push sync: the
+   * lock file is the whole truth for the repo. The manual registration route
+   * passes `false`: it upserts the workflows it names and leaves every other
+   * registration of the repo alone, which is what
+   * `kici-admin workflow register-manual` documents and what its direct-DB
+   * mode does.
+   */
+  prune?: boolean;
 }
 
 /**
@@ -227,15 +237,17 @@ export class RegistrationStore {
         }
       }
 
-      // 3. DELETE workflows that are no longer in the incoming set
-      const removedNames = [...existingByName.keys()].filter((name) => !incomingNames.has(name));
-      if (removedNames.length > 0) {
-        await trx
-          .deleteFrom('workflow_registrations')
-          .where('routing_key', '=', routingKey)
-          .where('repo_identifier', '=', repoIdentifier)
-          .where('workflow_name', 'in', removedNames)
-          .execute();
+      // 3. DELETE workflows that are no longer in the incoming set (push sync only)
+      if (options.prune !== false) {
+        const removedNames = [...existingByName.keys()].filter((name) => !incomingNames.has(name));
+        if (removedNames.length > 0) {
+          await trx
+            .deleteFrom('workflow_registrations')
+            .where('routing_key', '=', routingKey)
+            .where('repo_identifier', '=', repoIdentifier)
+            .where('workflow_name', 'in', removedNames)
+            .execute();
+        }
       }
     });
   }

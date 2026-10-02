@@ -66,6 +66,37 @@ export class InMemoryJobQueue {
   private readonly dispatched = new Map<string, QueuedJob>();
   /** Per-job re-dispatch counter (parity with dispatch_queue.dispatch_attempts). */
   private readonly attempts = new Map<string, number>();
+  /**
+   * Jobs the owning coordinator stopped (a cancel), or that this worker gave back
+   * after its spawn retries ran out. A stopped job is never claimed, listed or
+   * re-pended, which is this queue's counterpart of the database queue's
+   * stopped-run guard. The mark goes with the job's entry.
+   */
+  private readonly stopped = new Set<string>();
+
+  /** Stop-mark every job of `runId` (or just `jobId`), pending or dispatched. Synchronous. */
+  stop(runId: string, jobId?: string): { pending: string[]; dispatched: string[] } {
+    const matches = (job: QueuedJob) =>
+      job.runId === runId && (jobId === undefined || job.id === jobId);
+    const pending = [...this.jobs.values()].filter(matches).map((j) => j.id);
+    const dispatched = [...this.dispatched.values()].filter(matches).map((j) => j.id);
+    for (const id of [...pending, ...dispatched]) this.stopped.add(id);
+    return { pending, dispatched };
+  }
+
+  /** True while the job waits in this queue and has not been stopped. */
+  isPending(jobId: string): boolean {
+    const job = this.jobs.get(jobId);
+    return job?.status === DispatchQueueStatus.Pending && !this.stopped.has(jobId);
+  }
+
+  /**
+   * Parity with the database queue, whose dispatcher calls this after a `null`
+   * requeue. `requeue` already dropped a stopped job, so nothing is left to settle.
+   */
+  async settleClaimOfStoppedRun(_jobId: string, _runId: string): Promise<boolean> {
+    return false;
+  }
 
   /** Enqueue a job in memory and return its ID. */
   async enqueue(input: QueuedJobInput): Promise<string> {
@@ -139,7 +170,7 @@ export class InMemoryJobQueue {
     canServe?: (job: QueuedJob) => boolean,
   ): Promise<QueuedJob | null> {
     for (const [id, job] of this.jobs) {
-      if (job.status !== DispatchQueueStatus.Pending) continue;
+      if (job.status !== DispatchQueueStatus.Pending || this.stopped.has(id)) continue;
       if (!matchesGate(job, agentLabels, agentMandatoryLabels)) continue;
       // Same extra gate the DB-backed queue applies: labels cannot express
       // whether a scaler agent may run this job at all.
@@ -167,7 +198,7 @@ export class InMemoryJobQueue {
     agentMandatoryLabels: string[] = [],
   ): Promise<QueuedJob | null> {
     const job = this.jobs.get(jobId);
-    if (!job) return null;
+    if (!job || this.stopped.has(jobId)) return null;
     if (job.status !== DispatchQueueStatus.Pending) return null;
     if (!matchesGate(job, agentLabels, agentMandatoryLabels)) return null;
     job.status = DispatchQueueStatus.Dispatched;
@@ -194,7 +225,7 @@ export class InMemoryJobQueue {
    */
   async dequeueByPinnedAgent(agentId: string, agentLabels?: string[]): Promise<QueuedJob | null> {
     for (const [id, job] of this.jobs) {
-      if (job.status !== DispatchQueueStatus.Pending) continue;
+      if (job.status !== DispatchQueueStatus.Pending || this.stopped.has(id)) continue;
       if (job.pinnedAgentId !== agentId) continue;
       if (agentLabels) {
         const labelSet = canonicalizeLabelSet(agentLabels);
@@ -213,7 +244,7 @@ export class InMemoryJobQueue {
   async getDepth(): Promise<number> {
     let count = 0;
     for (const job of this.jobs.values()) {
-      if (job.status === DispatchQueueStatus.Pending) count++;
+      if (job.status === DispatchQueueStatus.Pending && !this.stopped.has(job.id)) count++;
     }
     return count;
   }
@@ -226,12 +257,14 @@ export class InMemoryJobQueue {
     this.dispatched.delete(jobId);
     this.jobs.delete(jobId);
     this.attempts.delete(jobId);
+    this.stopped.delete(jobId);
   }
 
   /** Drop the dispatched entry — the job completed. */
   async markCompleted(jobId: string): Promise<void> {
     this.dispatched.delete(jobId);
     this.attempts.delete(jobId);
+    this.stopped.delete(jobId);
   }
 
   /** No-op. */
@@ -265,11 +298,19 @@ export class InMemoryJobQueue {
    * Return a dispatched job to pending for re-dispatch, bumping its attempt
    * counter unless `countAttempt` is false. Mirrors the DB-backed
    * `JobQueue.requeue`. Returns the attempt count, or null when the job is
-   * not currently dispatched.
+   * not currently dispatched. A stopped job is dropped instead of re-pended, and
+   * also returns null.
    */
   async requeue(jobId: string, opts: { countAttempt?: boolean } = {}): Promise<number | null> {
     const job = this.dispatched.get(jobId);
     if (!job) return null;
+    if (this.stopped.has(jobId)) {
+      this.dispatched.delete(jobId);
+      this.jobs.delete(jobId);
+      this.attempts.delete(jobId);
+      this.stopped.delete(jobId);
+      return null;
+    }
     this.dispatched.delete(jobId);
     job.status = DispatchQueueStatus.Pending;
     this.jobs.set(jobId, job);
@@ -294,7 +335,9 @@ export class InMemoryJobQueue {
 
   /** Return all pending jobs. */
   async getPendingJobs(): Promise<QueuedJob[]> {
-    return [...this.jobs.values()].filter((j) => j.status === DispatchQueueStatus.Pending);
+    return [...this.jobs.values()].filter(
+      (j) => j.status === DispatchQueueStatus.Pending && !this.stopped.has(j.id),
+    );
   }
 
   /**

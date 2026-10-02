@@ -125,6 +125,10 @@ const updateSchema = z
     rerouteSpawnWindowMs: z.number().int().min(1000).nullable().optional(),
     rerouteAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
     rerouteMaxHops: z.number().int().min(1).nullable().optional(),
+    // A worker's spawn-retry budget for a rerouted job: attempts (>= 1) and the
+    // wait after a failed attempt (ms, >= 0). null clears the per-org override.
+    rerouteSpawnMaxAttempts: z.number().int().min(1).nullable().optional(),
+    rerouteSpawnRetryBackoffMs: z.number().int().min(0).nullable().optional(),
     // Per-org DB-backup freshness WARN threshold (hours). null clears the
     // override (fall back to the cluster-wide config default).
     backupStalenessWarnHours: z.number().int().min(1).nullable().optional(),
@@ -178,6 +182,10 @@ interface ProjectedSettings {
   rerouteAckTimeoutMs: number | null;
   /** Per-org reroute max hops; null = cluster-wide default. */
   rerouteMaxHops: number | null;
+  /** Per-org spawn attempts a worker makes for a rerouted job; null = cluster default. */
+  rerouteSpawnMaxAttempts: number | null;
+  /** Per-org wait (ms) after a rerouted job's failed spawn; null = cluster default. */
+  rerouteSpawnRetryBackoffMs: number | null;
   /** Per-org backup-freshness WARN threshold (hours); null = cluster default. */
   backupStalenessWarnHours: number | null;
   /** Per-org dispatch-queue job timeout (ms); null = cluster default. */
@@ -245,6 +253,8 @@ function projectRow(
       rerouteSpawnWindowMs: null,
       rerouteAckTimeoutMs: null,
       rerouteMaxHops: null,
+      rerouteSpawnMaxAttempts: null,
+      rerouteSpawnRetryBackoffMs: null,
       backupStalenessWarnHours: null,
       queueTimeoutMs: null,
       cacheUploadSettleTimeoutMs: null,
@@ -277,6 +287,8 @@ function projectRow(
     rerouteSpawnWindowMs: bigintToNumber(row.reroute_spawn_window_ms),
     rerouteAckTimeoutMs: bigintToNumber(row.reroute_ack_timeout_ms),
     rerouteMaxHops: row.reroute_max_hops,
+    rerouteSpawnMaxAttempts: row.reroute_spawn_max_attempts,
+    rerouteSpawnRetryBackoffMs: bigintToNumber(row.reroute_spawn_retry_backoff_ms),
     backupStalenessWarnHours: row.backup_staleness_warn_hours,
     queueTimeoutMs: bigintToNumber(row.queue_timeout_ms),
     cacheUploadSettleTimeoutMs: bigintToNumber(row.cache_upload_settle_timeout_ms),
@@ -368,6 +380,10 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         existing?.reroute_ack_timeout_ms ?? null,
       );
       let rerouteMaxHops: number | null = existing?.reroute_max_hops ?? null;
+      let rerouteSpawnMaxAttempts: number | null = existing?.reroute_spawn_max_attempts ?? null;
+      let rerouteSpawnRetryBackoffMs: number | null = bigintToNumber(
+        existing?.reroute_spawn_retry_backoff_ms ?? null,
+      );
       let backupStalenessWarnHours: number | null = existing?.backup_staleness_warn_hours ?? null;
       let queueTimeoutMs: number | null = bigintToNumber(existing?.queue_timeout_ms ?? null);
       let cacheUploadSettleTimeoutMs: number | null = bigintToNumber(
@@ -400,6 +416,10 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       if (body.rerouteSpawnWindowMs !== undefined) rerouteSpawnWindowMs = body.rerouteSpawnWindowMs;
       if (body.rerouteAckTimeoutMs !== undefined) rerouteAckTimeoutMs = body.rerouteAckTimeoutMs;
       if (body.rerouteMaxHops !== undefined) rerouteMaxHops = body.rerouteMaxHops;
+      if (body.rerouteSpawnMaxAttempts !== undefined)
+        rerouteSpawnMaxAttempts = body.rerouteSpawnMaxAttempts;
+      if (body.rerouteSpawnRetryBackoffMs !== undefined)
+        rerouteSpawnRetryBackoffMs = body.rerouteSpawnRetryBackoffMs;
       if (body.backupStalenessWarnHours !== undefined)
         backupStalenessWarnHours = body.backupStalenessWarnHours;
       if (body.queueTimeoutMs !== undefined) queueTimeoutMs = body.queueTimeoutMs;
@@ -448,6 +468,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
           reroute_spawn_window_ms: rerouteSpawnWindowMs,
           reroute_ack_timeout_ms: rerouteAckTimeoutMs,
           reroute_max_hops: rerouteMaxHops,
+          reroute_spawn_max_attempts: rerouteSpawnMaxAttempts,
+          reroute_spawn_retry_backoff_ms: rerouteSpawnRetryBackoffMs,
           backup_staleness_warn_hours: backupStalenessWarnHours,
           queue_timeout_ms: queueTimeoutMs,
           cache_upload_settle_timeout_ms: cacheUploadSettleTimeoutMs,
@@ -474,6 +496,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
             reroute_spawn_window_ms: rerouteSpawnWindowMs,
             reroute_ack_timeout_ms: rerouteAckTimeoutMs,
             reroute_max_hops: rerouteMaxHops,
+            reroute_spawn_max_attempts: rerouteSpawnMaxAttempts,
+            reroute_spawn_retry_backoff_ms: rerouteSpawnRetryBackoffMs,
             backup_staleness_warn_hours: backupStalenessWarnHours,
             queue_timeout_ms: queueTimeoutMs,
             cache_upload_settle_timeout_ms: cacheUploadSettleTimeoutMs,

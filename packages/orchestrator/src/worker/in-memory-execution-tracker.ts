@@ -192,6 +192,17 @@ export class InMemoryExecutionTracker {
   }
 
   /**
+   * Forget a job this worker gave up or was told to stop before it ran. Nothing is
+   * forwarded: the coordinator that owns the run already decided what happens to it.
+   */
+  dropJob(runId: string, jobId: string): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+    run.jobs.delete(jobId);
+    if (run.jobs.size === 0) this.runs.delete(runId);
+  }
+
+  /**
    * Get the current status of a run.
    */
   getRunStatus(runId: string): RunState | null {

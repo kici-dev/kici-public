@@ -1,5 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL, ScalerBackendType } from '@kici-dev/engine';
+import {
+  ExecutionJobStatus,
+  GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
+  ScalerBackendType,
+  ScalerVmStatus,
+  ScalerVmStopOutcome,
+  ScalerVmTracker,
+  type ScalerVmStopResult,
+} from '@kici-dev/engine';
+import {
+  enrichRequestContext,
+  getRequestContext,
+  requestContext,
+  toCommandError,
+} from '@kici-dev/shared';
 import type {
   ScalerBackend,
   ManagedAgent,
@@ -19,7 +33,7 @@ import {
   buildScalerUsageRows,
 } from './manager.js';
 import { agentMayRefuse, canAgentRunJob, JobContainerNeed, type AgentFitJob } from './agent-fit.js';
-import type { ProvisionBackoffSettings, ScalerManagerDeps } from './manager.js';
+import type { BoundJobRef, ProvisionBackoffSettings, ScalerManagerDeps } from './manager.js';
 import { normalizeLabelSet } from './label-matcher.js';
 import { EventScalerBackend } from './event-backend.js';
 import type { ScalerEventEmitterLike } from './event-backend.js';
@@ -28,6 +42,8 @@ import { DEFAULT_MAX_CONCURRENT_SPAWNS } from './config.js';
 import { ClaimStore, DEFAULT_CLAIM_TTL_SECONDS } from './claim-store.js';
 import type { ScalerStateStore, ReapCandidate } from './scaler-state-store.js';
 import { ScaleDownReason } from './scaler-events.js';
+import { DeterministicSpawnError } from './spawn-errors.js';
+import type { LiveVmProbe } from './live-vms.js';
 import { makeFakeScalerStateStore } from '../__test-helpers__/fake-scaler-state-store.js';
 import {
   incScalerExternalProvisionTimeout,
@@ -490,6 +506,8 @@ interface ManagerHarnessOptions {
   onScalerEvent?: ScalerManagerDeps['onScalerEvent'];
   /** Live external-provision backoff knobs. Omitted → the manager's defaults. */
   resolveProvisionBackoff?: ScalerManagerDeps['resolveProvisionBackoff'];
+  /** Bound-job status reader. Omitted → no withdrawal, every pruned provision reported. */
+  readJobStatuses?: ScalerManagerDeps['readJobStatuses'];
 }
 
 /** Build a `ScalerManager` with the doubles above. */
@@ -533,6 +551,7 @@ function makeManager(opts: ManagerHarnessOptions = {}) {
     ...(opts.resolveProvisionBackoff
       ? { resolveProvisionBackoff: opts.resolveProvisionBackoff }
       : {}),
+    ...(opts.readJobStatuses ? { readJobStatuses: opts.readJobStatuses } : {}),
     ...(opts.claimStore ? { claimStore: opts.claimStore as never } : {}),
     ...(opts.machineLedger ? { machineLedger: opts.machineLedger } : {}),
   });
@@ -801,8 +820,16 @@ describe('ScalerManager', () => {
 
       const result = await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
 
-      expect(result).toEqual({ action: 'spawning', backendType: 'container' });
+      expect(result).toEqual({
+        action: 'spawning',
+        backendType: 'container',
+        agentId: expect.any(String),
+      });
       expect(containerBackend.spawn).toHaveBeenCalled();
+      // fails-when: the result names an agent other than the one being spawned —
+      // a worker would then ignore the real spawn's failure as superseded
+      const spawnedId = vi.mocked(containerBackend.spawn).mock.calls[0][1];
+      expect(result.action === 'spawning' && result.agentId).toBe(spawnedId);
     });
 
     it('is a no-op while draining (no fresh capacity spawned)', async () => {
@@ -830,7 +857,11 @@ describe('ScalerManager', () => {
         'run-test',
       );
 
-      expect(result).toEqual({ action: 'spawning', backendType: 'container' });
+      expect(result).toEqual({
+        action: 'spawning',
+        backendType: 'container',
+        agentId: expect.any(String),
+      });
       for (const backend of manager.getStatus().backends) {
         for (const labels of backend.labelSets) {
           expect(labels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
@@ -846,7 +877,11 @@ describe('ScalerManager', () => {
 
       const result = await manager.requestScale(['linux', 'gpu'], 'job-2', 'run-test');
 
-      expect(result).toEqual({ action: 'spawning', backendType: 'bare-metal' });
+      expect(result).toEqual({
+        action: 'spawning',
+        backendType: 'bare-metal',
+        agentId: expect.any(String),
+      });
       expect(bareMetalBackend.spawn).toHaveBeenCalled();
     });
 
@@ -2069,6 +2104,67 @@ describe('ScalerManager', () => {
       expect(peak).toBeLessThanOrEqual(3);
     });
 
+    it('logs a spawn step killed by its timeout with the command fields', async () => {
+      vi.useRealTimers();
+      // The rejection shape Node's promisified execFile produces for a quiet
+      // command its `timeout` killed.
+      const timedOut = toCommandError(
+        Object.assign(new Error('Command failed: mkfs.ext4 -qF /o.ext4\n'), {
+          code: null,
+          killed: true,
+          signal: 'SIGTERM',
+          stderr: '',
+        }),
+        { command: 'mkfs.ext4 -qF /o.ext4', timeoutMs: 30_000, durationMs: 30_004 },
+      );
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 5,
+        spawn: vi.fn(async () => {
+          throw timedOut;
+        }),
+      });
+      const manager = createManager(
+        {
+          globalMaxAgents: 5,
+          scalers: [
+            {
+              name: 'slow-disk',
+              type: 'container' as const,
+              maxAgents: 5,
+              maxConcurrentSpawns: 1,
+              labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+            },
+          ],
+        } as unknown as Partial<ReturnType<typeof createDefaultConfig>>,
+        [{ name: 'slow-disk', backend }],
+      );
+      mockLoggerError.mockClear();
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await flush();
+
+      // fails-when: the log call drops the second argument, leaving only the
+      // text for a query to grep — or drops the bound run and job, leaving the
+      // line to whichever run the surrounding request context names.
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to spawn agent'),
+        {
+          agentId: expect.stringMatching(/^scaler-container-/),
+          scaler: 'slow-disk',
+          runId: 'run-1',
+          jobId: 'job-1',
+          command: 'mkfs.ext4 -qF /o.ext4',
+          exitCode: null,
+          signal: 'SIGTERM',
+          timedOut: true,
+          durationMs: 30_004,
+        },
+      );
+      expect(mockLoggerError.mock.calls[0]?.[0]).toContain('timed out: killed by SIGTERM');
+    });
+
     it('releases a semaphore slot when a spawn rejects (no permanent starvation)', async () => {
       vi.useRealTimers();
 
@@ -2199,6 +2295,47 @@ describe('ScalerManager', () => {
       expect(manager.getStatus().spawningCount).toBe(2);
     });
 
+    it('destroys the compute of a pruned local spawn', async () => {
+      // A VM whose guest stopped after spawn() resolved, or a process that
+      // never connected: the backend still counts it against maxAgents.
+      const manager = createManager();
+
+      await manager.requestScale(['linux', 'docker'], 'job-stale', 'run-stale');
+      await vi.advanceTimersByTimeAsync(0);
+      const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as string;
+
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      // A request that matches nothing still prunes first.
+      await manager.requestScale(['windows', 'arm64'], 'job-x', 'run-x');
+      await vi.advanceTimersByTimeAsync(0);
+
+      // fails-when: the prune only drops the manager's own entry and the
+      // backend keeps the compute (and its maxAgents slot) forever.
+      expect(containerBackend.destroy).toHaveBeenCalledWith(agentId, {
+        reason: ScaleDownReason.enum['spawn-timeout'],
+      });
+      expect(manager.getStatus().spawningCount).toBe(0);
+    });
+
+    it('does not destroy a spawn that registered before the prune window', async () => {
+      // breaks-if-wrong: a registered agent left the spawning map, so the prune
+      // never reaches it — its teardown belongs to the disconnect path.
+      const manager = createManager();
+
+      await manager.requestScale(['linux', 'docker'], 'job-ok', 'run-ok');
+      await vi.advanceTimersByTimeAsync(0);
+      const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as string;
+      await manager.onAgentRegistered(agentId, ['linux', 'docker']);
+
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      await manager.requestScale(['windows', 'arm64'], 'job-x', 'run-x');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(containerBackend.destroy).not.toHaveBeenCalled();
+    });
+
     it('drops the buffered failure of a pruned spawn, whose correlation can never arrive', async () => {
       // A warm spawn's `scaler.failed` resolves to no run/job, so it is parked
       // waiting for a correlation. The prune is the moment that wait becomes
@@ -2234,6 +2371,24 @@ describe('ScalerManager', () => {
   });
 
   describe('onAgentRegistered()', () => {
+    it('tells the backend that the agent it spawned registered', async () => {
+      const markRegistered = vi.fn();
+      containerBackend.markRegistered = markRegistered;
+      const manager = createManager();
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
+      const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as string;
+      await vi.advanceTimersToNextTimerAsync();
+      expect(markRegistered).not.toHaveBeenCalled();
+
+      await manager.onAgentRegistered(agentId, ['linux', 'docker']);
+
+      // fails-when: the backend is never told, so it reads every later VM exit
+      // as a spawn that never registered.
+      expect(markRegistered).toHaveBeenCalledWith(agentId);
+    });
+
     it('correlates spawned agent to tracking entry', async () => {
       const manager = createManager();
 
@@ -4144,6 +4299,88 @@ describe('ScalerManager', () => {
     });
   });
 
+  describe('a launch the host refuses', () => {
+    const REFUSING_SCALER = {
+      name: 'bare-metal-gpu',
+      type: 'bare-metal' as const,
+      maxAgents: 1,
+      maxConcurrentSpawns: 2,
+      labelSets: [{ labels: ['linux', 'gpu'], binaryPath: '/usr/local/bin/kici-agent' }],
+    };
+
+    function refusingBackend(error: Error): ScalerBackend {
+      return createMockBackend({
+        type: 'bare-metal',
+        labelSets: REFUSING_SCALER.labelSets,
+        maxAgents: 1,
+        spawn: vi.fn(async () => {
+          throw error;
+        }),
+      });
+    }
+
+    function managerWith(backend: ScalerBackend): ScalerManager {
+      return createManager({ scalers: [REFUSING_SCALER] }, [{ name: 'bare-metal-gpu', backend }]);
+    }
+
+    it('defers the scaler instead of re-driving into the same refusal', async () => {
+      const backend = refusingBackend(
+        new DeterministicSpawnError(
+          'the host refused to start the agent process (cmd.exe): spawn EINVAL',
+        ),
+      );
+      const manager = managerWith(backend);
+      const onCapacityFreed = vi.fn();
+      manager.onCapacityFreed = onCapacityFreed;
+
+      expect((await manager.requestScale(['linux', 'gpu'], 'job-1', 'run-1')).action).toBe(
+        'spawning',
+      );
+      // The spawn rejects, the deferral arms, then the reservation is released.
+      await vi.advanceTimersByTimeAsync(300);
+
+      // fails-when: the refusal counts as freed capacity — this request spawns again
+      const again = await manager.requestScale(['linux', 'gpu'], 'job-1', 'run-1');
+      expect(again.action).toBe('skipped');
+      expect((again as { reason: string }).reason).toBe(
+        'scaler `bare-metal-gpu` failed to start an agent; deferring for 30s before asking again.',
+      );
+      expect(backend.spawn).toHaveBeenCalledTimes(1);
+      // The release still signals freed capacity: another scaler's job may be waiting on the global cap.
+      expect(onCapacityFreed).toHaveBeenCalledTimes(1);
+    });
+
+    it('frees the reservation, so a request after the window spawns again', async () => {
+      const backend = refusingBackend(new DeterministicSpawnError('refused'));
+      const manager = managerWith(backend);
+
+      await manager.requestScale(['linux', 'gpu'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(30_300);
+
+      // maxAgents is 1: a reservation never released would answer at-capacity.
+      expect((await manager.requestScale(['linux', 'gpu'], 'job-2', 'run-2')).action).toBe(
+        'spawning',
+      );
+      expect(backend.spawn).toHaveBeenCalledTimes(2);
+    });
+
+    it('re-drives at once after any other spawn failure', async () => {
+      // breaks-if-wrong: a transient failure (timeout, image pull) is deferred too
+      const backend = refusingBackend(new Error('scaler spawn timed out after 300000ms'));
+      const manager = managerWith(backend);
+      const onCapacityFreed = vi.fn();
+      manager.onCapacityFreed = onCapacityFreed;
+
+      await manager.requestScale(['linux', 'gpu'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect((await manager.requestScale(['linux', 'gpu'], 'job-1', 'run-1')).action).toBe(
+        'spawning',
+      );
+      expect(onCapacityFreed).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('onCapacityFreed hook', () => {
     async function spawnAndRegister(manager: ScalerManager): Promise<string> {
       await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
@@ -5867,6 +6104,239 @@ describe('ScalerManager', () => {
       // The 20ms per-org deadline fired, not the 5000ms cluster default.
       expect(aborted).toBe(true);
     });
+
+    it('destroys a spawn the prune dropped only once spawn() has settled', async () => {
+      // A per-org deadline longer than the prune window lets the prune reach a
+      // spawn that is still running.
+      let settle!: () => void;
+      const destroy = vi.fn(async () => {});
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 5,
+        getActiveCount: () => 0,
+        spawn: vi.fn(
+          (labelSet: string[], id: string) =>
+            new Promise<ManagedAgent>((resolve) => {
+              settle = () =>
+                resolve({ id, labelSet, backendRef: 'r', spawnedAt: Date.now(), state: 'running' });
+            }),
+        ),
+        destroy,
+      });
+      const manager = new ScalerManager({
+        instanceId: 'orch-test',
+        config: makeContainerConfig(1),
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 300_000,
+        resolveSpawnTimeoutMs: async () => 20 * 60_000,
+      });
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1', [], undefined, 'org-slow');
+      await vi.advanceTimersByTimeAsync(0);
+      const agentId = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      // A request that matches nothing still prunes first.
+      await manager.requestScale(['windows', 'arm64'], 'job-x', 'run-x');
+      await vi.advanceTimersByTimeAsync(0);
+
+      // fails-when: the prune destroys compute that spawn() is still building,
+      // which then comes up untracked after its IP went to another VM.
+      expect(destroy).not.toHaveBeenCalled();
+
+      settle();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // fails-when: a spawn that finishes after its entry was pruned is left
+      // running with nothing that will ever tear it down.
+      expect(destroy).toHaveBeenCalledWith(agentId, {
+        reason: ScaleDownReason.enum['spawn-timeout'],
+      });
+    });
+
+    it('releases a settled spawn as soon as its backend reports it failed, and defers the scaler', async () => {
+      // A Firecracker guest that exits after spawn() resolved: the backend
+      // tears the VM down and emits scaler.failed.
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 1,
+        getActiveCount: () => 0,
+      });
+      const config = makeContainerConfig(1);
+      config.scalers[0]!.maxAgents = 1;
+      const manager = new ScalerManager({
+        instanceId: 'orch-test',
+        config,
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 300_000,
+      });
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const [, agentId, , onEvent] = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+        string[],
+        string,
+        string,
+        (e: ScalerEvent) => void,
+      ];
+      onEvent({
+        agentId,
+        eventType: ScalerEventType.enum['scaler.failed'],
+        detail: 'VM exited before its agent registered',
+        timestampMs: Date.now(),
+      });
+
+      // fails-when: the reservation is held until the five-minute prune, so a
+      // one-slot scaler refuses the job's own re-dispatch once the deferral lifts.
+      expect(manager.getStatus().spawningCount).toBe(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A spawn that produced no agent is a refused launch: the scaler is deferred
+      // rather than respawned at once. fails-when: the release alone re-drives it.
+      const deferred = await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      expect(deferred).toMatchObject({ action: 'skipped' });
+      expect((deferred as { reason: string }).reason).toBe(
+        'scaler `c` failed to start an agent; deferring for 30s before asking again.',
+      );
+      expect(backend.spawn).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(backend.spawn).toHaveBeenCalledTimes(2);
+    });
+
+    it('arms no backoff for an agent that registered before its compute stopped', async () => {
+      // breaks-if-wrong: an agent that registered and later exits counts as a refused launch
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 2,
+        getActiveCount: () => 0,
+      });
+      const manager = new ScalerManager({
+        instanceId: 'orch-test',
+        config: makeContainerConfig(2),
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 300_000,
+      });
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const [, agentId, , onEvent] = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+        string[],
+        string,
+        string,
+        (e: ScalerEvent) => void,
+      ];
+      manager.onAgentRegistered(agentId, ['linux', 'docker']);
+      onEvent({
+        agentId,
+        eventType: ScalerEventType.enum['scaler.failed'],
+        detail: 'agent process exited with code 1 before it registered',
+        timestampMs: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect((await manager.requestScale(['linux', 'docker'], 'job-2', 'run-2')).action).toBe(
+        'spawning',
+      );
+    });
+
+    it('clears the launch backoff when a later agent of the scaler registers', async () => {
+      // breaks-if-wrong: a recovered scaler stays deferred after its agent registered
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 2,
+        getActiveCount: () => 0,
+      });
+      const manager = new ScalerManager({
+        instanceId: 'orch-test',
+        config: makeContainerConfig(2),
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 300_000,
+      });
+      const spawnCall = (i: number) =>
+        (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[i] as [
+          string[],
+          string,
+          string,
+          (e: ScalerEvent) => void,
+        ];
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const [, failedId, , onFailedEvent] = spawnCall(0);
+      onFailedEvent({
+        agentId: failedId,
+        eventType: ScalerEventType.enum['scaler.failed'],
+        detail: 'agent process exited with code 1 before it registered',
+        timestampMs: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const [, healthyId] = spawnCall(1);
+      manager.onAgentRegistered(healthyId, ['linux', 'docker']);
+
+      // The next failure starts the doubling over: 30 s, not the 60 s a second
+      // consecutive failure earns. fails-when: registration leaves the count at 1.
+      expect((await manager.requestScale(['linux', 'docker'], 'job-2', 'run-2')).action).toBe(
+        'spawning',
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const [, nextId, , onNextEvent] = spawnCall(2);
+      onNextEvent({
+        agentId: nextId,
+        eventType: ScalerEventType.enum['scaler.failed'],
+        detail: 'agent process exited with code 1 before it registered',
+        timestampMs: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const deferred = await manager.requestScale(['linux', 'docker'], 'job-2', 'run-2');
+      expect((deferred as { reason: string }).reason).toBe(
+        'scaler `c` failed to start an agent; deferring for 30s before asking again.',
+      );
+    });
+
+    it('keeps a spawn still running in spawn() when its backend reports a failure', async () => {
+      // breaks-if-wrong: a failure reported during spawn() is the spawn's own
+      // rejection path's to clean up; dropping the entry early would release
+      // the reservation twice.
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 5,
+        getActiveCount: () => 0,
+        spawn: vi.fn(() => new Promise<never>(() => {})),
+      });
+      const manager = new ScalerManager({
+        instanceId: 'orch-test',
+        config: makeContainerConfig(1),
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 300_000,
+      });
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const [, agentId, , onEvent] = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+        string[],
+        string,
+        string,
+        (e: ScalerEvent) => void,
+      ];
+      onEvent({
+        agentId,
+        eventType: ScalerEventType.enum['scaler.failed'],
+        detail: 'pulling image failed',
+        timestampMs: Date.now(),
+      });
+
+      expect(manager.getStatus().spawningCount).toBe(1);
+    });
   });
 
   describe('ensureHostsReady()', () => {
@@ -5948,7 +6418,11 @@ describe('ScalerManager', () => {
       const result = await manager.requestScale(EVENT_LABELS, 'job-1', 'run-1');
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(result).toEqual({ action: 'spawning', backendType: 'event' });
+      expect(result).toEqual({
+        action: 'spawning',
+        backendType: 'event',
+        agentId: expect.any(String),
+      });
       expect(emitter.emitScalerScaleUp).toHaveBeenCalledTimes(1);
       // Exactly one row write, and it happened through the lock — a second
       // write outside the transaction would only reset the `spawned_at` the
@@ -5979,8 +6453,16 @@ describe('ScalerManager', () => {
       const third = await manager.requestScale(EVENT_LABELS, 'job-3', 'run-1');
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(first).toEqual({ action: 'spawning', backendType: 'event' });
-      expect(second).toEqual({ action: 'spawning', backendType: 'event' });
+      expect(first).toEqual({
+        action: 'spawning',
+        backendType: 'event',
+        agentId: expect.any(String),
+      });
+      expect(second).toEqual({
+        action: 'spawning',
+        backendType: 'event',
+        agentId: expect.any(String),
+      });
       expect(third).toEqual({ action: 'at-capacity' });
       // Two distinct agents, not one row upserted twice.
       expect(new Set(rowsWritten(stateStore).map((row) => row.agentId)).size).toBe(2);
@@ -6019,7 +6501,11 @@ describe('ScalerManager', () => {
       expect(capLockCalls).toBe(1);
 
       openGate();
-      expect(await first).toEqual({ action: 'spawning', backendType: 'event' });
+      expect(await first).toEqual({
+        action: 'spawning',
+        backendType: 'event',
+        agentId: expect.any(String),
+      });
       expect(await second).toEqual({ action: 'at-capacity' });
       expect(rowsWritten(stateStore)).toHaveLength(1);
     });
@@ -6061,6 +6547,7 @@ describe('ScalerManager', () => {
       expect(await manager.requestScale(EVENT_LABELS, 'job-1', 'run-1')).toEqual({
         action: 'spawning',
         backendType: 'event',
+        agentId: expect.any(String),
       });
       // The slot really was claimed, so the delete below is undoing something.
       expect(rowsWritten(stateStore)).toHaveLength(1);
@@ -6157,7 +6644,11 @@ describe('ScalerManager', () => {
 
       // Asserting the outcome too: a `no-backend` result would satisfy the
       // not-called assertion without ever reaching the cap check.
-      expect(result).toEqual({ action: 'spawning', backendType: 'container' });
+      expect(result).toEqual({
+        action: 'spawning',
+        backendType: 'container',
+        agentId: expect.any(String),
+      });
       expect(stateStore.withScalerCapLock).not.toHaveBeenCalled();
       // The row is still persisted, just outside any cluster-wide lock.
       expect(rowsWritten(stateStore)).toHaveLength(1);
@@ -6187,7 +6678,11 @@ describe('ScalerManager', () => {
       // claim registration and the scale-up emission settle before asserting.
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(result).toEqual({ action: 'spawning', backendType: 'event' });
+      expect(result).toEqual({
+        action: 'spawning',
+        backendType: 'event',
+        agentId: expect.any(String),
+      });
       expect(stateStore.registerClaim).toHaveBeenCalledTimes(1);
       expect(emitter.emitScalerScaleUp).toHaveBeenCalledTimes(1);
     });
@@ -6984,5 +7479,661 @@ describe('buildScalerUsageRows', () => {
       () => undefined,
     );
     expect(rows.find((r) => r.scaler === 'mystery')?.scalerType).toBeUndefined();
+  });
+});
+
+describe('spawn log context', () => {
+  it('runs the spawn chain under the bound run, isolated from the request store', async () => {
+    // fails-when: the spawn continuation reads the webhook request's store, which
+    // enrichRequestContext mutated to another run after requestScale returned
+    const seen: Array<string | undefined> = [];
+    const emitter = fakeEmitter();
+    emitter.emitScalerScaleUp.mockImplementation(async () => {
+      seen.push(getRequestContext().runId);
+      return 'evt-up';
+    });
+    const manager = makeManagerWithEventBackend({ emitter });
+    await requestContext.run({ requestId: 'req-1', runId: 'run-of-request' }, async () => {
+      const result = await manager.requestScale(
+        ['github-actions', 'kici:os:linux'],
+        'job-b',
+        'run-bound',
+      );
+      expect(result.action).toBe('spawning');
+      enrichRequestContext({ runId: 'run-dispatched-later' });
+    });
+    // Without the fresh store the emit reads 'run-of-request' or
+    // 'run-dispatched-later', whichever lands first — never 'run-bound'.
+    await vi.waitFor(() => expect(seen).toEqual(['run-bound']));
+  });
+
+  it('keeps the request id of the request that asked', async () => {
+    // breaks-if-wrong: the spawn chain must stay correlated with its request
+    const seen: Array<Partial<{ requestId: string; routingKey: string }>> = [];
+    const emitter = fakeEmitter();
+    emitter.emitScalerScaleUp.mockImplementation(async () => {
+      const { requestId, routingKey } = getRequestContext();
+      seen.push({ requestId, routingKey });
+      return 'evt-up';
+    });
+    const manager = makeManagerWithEventBackend({ emitter });
+    await requestContext.run(
+      { requestId: 'req-7', runId: 'run-of-request', routingKey: 'github:42' },
+      () => manager.requestScale(['github-actions', 'kici:os:linux'], 'job-c', 'run-c'),
+    );
+    await vi.waitFor(() => expect(seen).toEqual([{ requestId: 'req-7', routingKey: 'github:42' }]));
+  });
+});
+
+describe('bound-job withdrawal', () => {
+  const LABELS = ['github-actions', 'kici:os:linux'];
+  /** A status reader over a mutable job-id → status table; records each batch it was asked. */
+  const statuses = (table: Record<string, string>, asked: Array<readonly BoundJobRef[]> = []) =>
+    vi.fn(async (jobs: readonly BoundJobRef[]) => {
+      asked.push(jobs);
+      return new Map(
+        jobs.filter((j) => j.jobId in table).map((j) => [j.jobId, table[j.jobId]!] as const),
+      );
+    });
+  const backoff = async () => ({ baseMs: 30_000, maxMs: 900_000, maxConsecutiveFailures: 5 });
+
+  // The file already reads the private map this way (see its `spawningAgents` casts).
+  const spawning = (manager: ScalerManager) =>
+    (
+      manager as unknown as {
+        spawningAgents: Map<string, { boundJobId?: string; spawnSettled?: boolean }>;
+      }
+    ).spawningAgents;
+
+  async function spawnAndSettle(manager: ScalerManager, jobId: string, runId: string) {
+    expect((await manager.requestScale(LABELS, jobId, runId)).action).toBe('spawning');
+    await vi.waitFor(() =>
+      expect(
+        [...spawning(manager).values()].some((e) => e.boundJobId === jobId && e.spawnSettled),
+      ).toBe(true),
+    );
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('tears a cancelled job’s provision down with job-complete and reports nothing', async () => {
+    // fails-when: nothing withdraws — the provision lingers until the prune reports it
+    const emitter = fakeEmitter();
+    const onScalerEvent = vi.fn();
+    const jobs: Record<string, string> = {};
+    const asked: Array<readonly BoundJobRef[]> = [];
+    const stateStore = fakeStateStore();
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      stateStore,
+      onScalerEvent,
+      resolveProvisionBackoff: backoff,
+      readJobStatuses: statuses(jobs, asked),
+    });
+    await spawnAndSettle(manager, 'job-c', 'run-c');
+    await vi.waitFor(() => expect(emitter.emitScalerScaleUp).toHaveBeenCalledTimes(1));
+    const agentId = (emitter.emitScalerScaleUp.mock.calls[0]![0] as { agentId: string }).agentId;
+
+    // Positive control: a job still queued is left alone.
+    jobs['job-c'] = ExecutionJobStatus.enum.queued;
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(0);
+    expect(asked.at(-1)).toEqual([{ runId: 'run-c', jobId: 'job-c' }]);
+
+    jobs['job-c'] = ExecutionJobStatus.enum.cancelled;
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(1);
+    await vi.waitFor(() =>
+      expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId, reason: ScaleDownReason.enum['job-complete'] }),
+        ['e2e/provision'],
+      ),
+    );
+    expect(manager.getStatus().spawningCount).toBe(0);
+    expect(onScalerEvent).not.toHaveBeenCalledWith(
+      'run-c',
+      'job-c',
+      expect.objectContaining({ eventType: ScalerEventType.enum['scaler.failed'] }),
+    );
+    // The claim code the scale-up carried can no longer be redeemed, and the
+    // spawn row goes once the teardown is out.
+    await vi.waitFor(() =>
+      expect(stateStore.invalidateClaimsForAgent).toHaveBeenCalledWith(agentId),
+    );
+    expect(stateStore.deleteSpawningAgent).toHaveBeenCalledWith(agentId);
+    // No backoff: the next request spawns.
+    expect((await manager.requestScale(LABELS, 'job-n', 'run-n')).action).toBe('spawning');
+  });
+
+  it('leaves the teardown of a peer-adopted provision to its adopter', async () => {
+    // fails-when: the withdrawal emits for an agent a peer adopted — the HA
+    // success path, where the job ended because it ran on that agent
+    const emitter = fakeEmitter();
+    const jobs: Record<string, string> = {};
+    const adopter = { value: 'orch-b' as string | null };
+    const stateStore = fakeStateStore({
+      provisionAdopter: vi.fn(async () => adopter.value),
+    });
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      stateStore,
+      readJobStatuses: statuses(jobs),
+    });
+    await spawnAndSettle(manager, 'job-a', 'run-a');
+    const agentId = (emitter.emitScalerScaleUp.mock.calls[0]![0] as { agentId: string }).agentId;
+    jobs['job-a'] = ExecutionJobStatus.enum.success;
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(1);
+    await vi.waitFor(() => expect(stateStore.provisionAdopter).toHaveBeenCalledWith(agentId));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(emitter.emitScalerScaleDown).not.toHaveBeenCalled();
+    expect(stateStore.deleteSpawningAgent).not.toHaveBeenCalledWith(agentId);
+
+    // breaks-if-wrong: the same path with no adopter still tears down
+    adopter.value = null;
+    await spawnAndSettle(manager, 'job-b', 'run-b');
+    jobs['job-b'] = ExecutionJobStatus.enum.cancelled;
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(1);
+    await vi.waitFor(() =>
+      expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: ScaleDownReason.enum['job-complete'] }),
+        ['e2e/provision'],
+      ),
+    );
+  });
+
+  it('emits nothing when the adoption lookup fails', async () => {
+    const emitter = fakeEmitter();
+    const stateStore = fakeStateStore({
+      provisionAdopter: vi.fn(async () => {
+        throw new Error('db down');
+      }),
+    });
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      stateStore,
+      readJobStatuses: statuses({ 'job-f': ExecutionJobStatus.enum.cancelled }),
+    });
+    await spawnAndSettle(manager, 'job-f', 'run-f');
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(1);
+    await vi.waitFor(() => expect(stateStore.provisionAdopter).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(emitter.emitScalerScaleDown).not.toHaveBeenCalled();
+  });
+
+  it('withdraws when the bound job succeeded elsewhere', async () => {
+    const emitter = fakeEmitter();
+    const jobs: Record<string, string> = {};
+    const manager = makeManagerWithEventBackend({ emitter, readJobStatuses: statuses(jobs) });
+    await spawnAndSettle(manager, 'job-s', 'run-s');
+    jobs['job-s'] = ExecutionJobStatus.enum.success;
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(1);
+  });
+
+  it('runs the withdrawal from the periodic sweep', async () => {
+    // fails-when: the sweep never calls the withdrawal — only a direct call would
+    vi.useFakeTimers();
+    const emitter = fakeEmitter();
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      readJobStatuses: statuses({ 'job-w': ExecutionJobStatus.enum.cancelled }),
+    });
+    manager.start();
+    try {
+      expect((await manager.requestScale(LABELS, 'job-w', 'run-w')).action).toBe('spawning');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(emitter.emitScalerScaleUp).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: ScaleDownReason.enum['job-complete'] }),
+        ['e2e/provision'],
+      );
+    } finally {
+      await manager.shutdownAll();
+    }
+  });
+
+  it('leaves a provision whose job is still waiting, and the prune still reports it', async () => {
+    // breaks-if-wrong: a genuine no-agent outcome must still be reported and back off
+    const onScalerEvent = vi.fn();
+    const manager = makeManagerWithEventBackend({
+      onScalerEvent,
+      resolveProvisionBackoff: backoff,
+      readJobStatuses: statuses({ 'job-q': ExecutionJobStatus.enum.queued }),
+    });
+    await spawnAndSettle(manager, 'job-q', 'run-q');
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(0);
+    vi.setSystemTime(Date.now() + 400_000);
+    await manager.requestScale(LABELS, 'job-1', 'run-1');
+    await vi.waitFor(() =>
+      expect(onScalerEvent).toHaveBeenCalledWith(
+        'run-q',
+        'job-q',
+        expect.objectContaining({ eventType: ScalerEventType.enum['scaler.failed'] }),
+      ),
+    );
+    await vi.waitFor(async () =>
+      expect((await manager.requestScale(LABELS, 'job-2', 'run-2')).action).toBe('skipped'),
+    );
+  });
+
+  it('leaves an unsettled spawn for the next sweep', async () => {
+    // fails-when: the settled gate is missing — a teardown goes out before the scale-up
+    let release!: () => void;
+    const emitter = fakeEmitter();
+    emitter.emitScalerScaleUp.mockImplementation(
+      () =>
+        new Promise<string>((r) => {
+          release = () => r('evt-up');
+        }),
+    );
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      readJobStatuses: statuses({ 'job-u': ExecutionJobStatus.enum.cancelled }),
+    });
+    await manager.requestScale(LABELS, 'job-u', 'run-u');
+    await vi.waitFor(() => expect(emitter.emitScalerScaleUp).toHaveBeenCalled());
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(0);
+    expect(emitter.emitScalerScaleDown).not.toHaveBeenCalled();
+    release();
+    await vi.waitFor(async () => expect(await manager.withdrawEndedBoundProvisions()).toBe(1));
+  });
+
+  it('reports as before when the status read fails', async () => {
+    // breaks-if-wrong: a read error must fail open to today's reporting, never suppress it
+    const onScalerEvent = vi.fn();
+    const manager = makeManagerWithEventBackend({
+      onScalerEvent,
+      resolveProvisionBackoff: backoff,
+      readJobStatuses: async () => {
+        throw new Error('db down');
+      },
+    });
+    await spawnAndSettle(manager, 'job-e', 'run-e');
+    await expect(manager.withdrawEndedBoundProvisions()).resolves.toBe(0);
+    vi.setSystemTime(Date.now() + 400_000);
+    await manager.requestScale(LABELS, 'job-1', 'run-1');
+    await vi.waitFor(() =>
+      expect(onScalerEvent).toHaveBeenCalledWith(
+        'run-e',
+        'job-e',
+        expect.objectContaining({ eventType: ScalerEventType.enum['scaler.failed'] }),
+      ),
+    );
+    await vi.waitFor(async () =>
+      expect((await manager.requestScale(LABELS, 'job-2', 'run-2')).action).toBe('skipped'),
+    );
+  });
+
+  it('does not report a pruned spawn whose job already ended', async () => {
+    // fails-when: the prune reports without checking the job (the provision
+    // ages past the window before a sweep runs)
+    const onScalerEvent = vi.fn();
+    const asked: Array<readonly BoundJobRef[]> = [];
+    const manager = makeManagerWithEventBackend({
+      onScalerEvent,
+      resolveProvisionBackoff: backoff,
+      readJobStatuses: statuses({ 'job-p': ExecutionJobStatus.enum.cancelled }, asked),
+    });
+    await spawnAndSettle(manager, 'job-p', 'run-p');
+    vi.setSystemTime(Date.now() + 400_000);
+    await manager.requestScale(LABELS, 'job-1', 'run-1');
+    // The prune's verdict ran: it asked about the pruned spawn's job.
+    await vi.waitFor(() =>
+      expect(asked.some((b) => b.some((j) => j.jobId === 'job-p'))).toBe(true),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(onScalerEvent).not.toHaveBeenCalledWith(
+      'run-p',
+      'job-p',
+      expect.objectContaining({ eventType: ScalerEventType.enum['scaler.failed'] }),
+    );
+    expect((await manager.requestScale(LABELS, 'job-2', 'run-2')).action).toBe('spawning');
+  });
+
+  it('re-classes a reaper spawn-timeout whose job ended as job-complete, with no report', async () => {
+    const emitter = fakeEmitter();
+    const onScalerEvent = vi.fn();
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      onScalerEvent,
+      resolveProvisionBackoff: backoff,
+      readJobStatuses: statuses({ 'job-r': ExecutionJobStatus.enum.cancelled }),
+    });
+    await manager.emitOrphanScaleDown(
+      {
+        agentId: 'agent-r',
+        scalerName: 'github-actions',
+        provisioningTargets: ['e2e/provision'],
+        spawnedAt: new Date('2026-08-26T11:00:00Z'),
+        runId: 'run-r',
+        boundJobId: 'job-r',
+      },
+      ScaleDownReason.enum['spawn-timeout'],
+    );
+    expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: ScaleDownReason.enum['job-complete'] }),
+      ['e2e/provision'],
+    );
+    expect(onScalerEvent).not.toHaveBeenCalled();
+    expect((await manager.requestScale(LABELS, 'job-2', 'run-2')).action).toBe('spawning');
+  });
+
+  it('still reports a reaper spawn-timeout whose job is waiting', async () => {
+    // breaks-if-wrong: the re-class must not swallow a genuine reaper verdict
+    const emitter = fakeEmitter();
+    const onScalerEvent = vi.fn();
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      onScalerEvent,
+      resolveProvisionBackoff: backoff,
+      readJobStatuses: statuses({ 'job-r': ExecutionJobStatus.enum.queued }),
+    });
+    await manager.emitOrphanScaleDown(
+      {
+        agentId: 'agent-r2',
+        scalerName: 'github-actions',
+        provisioningTargets: ['e2e/provision'],
+        spawnedAt: new Date('2026-08-26T11:00:00Z'),
+        runId: 'run-r',
+        boundJobId: 'job-r',
+      },
+      ScaleDownReason.enum['spawn-timeout'],
+    );
+    expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: ScaleDownReason.enum['spawn-timeout'] }),
+      ['e2e/provision'],
+    );
+    expect(onScalerEvent).toHaveBeenCalledWith(
+      'run-r',
+      'job-r',
+      expect.objectContaining({ eventType: ScalerEventType.enum['scaler.failed'] }),
+    );
+  });
+
+  it('never withdraws a warm spawn', async () => {
+    // A warm spawn carries no bound job, so it is filtered out before any read.
+    const readJobStatuses = vi.fn(async () => {
+      throw new Error('must not be asked');
+    });
+    const manager = makeManagerWithEventBackend({ readJobStatuses });
+    spawning(manager).set('scaler-event-warm', {
+      spawnSettled: true,
+      ...({
+        labelSet: LABELS,
+        backendName: 'github-actions',
+        backendType: ScalerBackendType.enum.event,
+        provisioningTargets: ['e2e/provision'],
+        spawnedAt: Date.now(),
+        spawnStartedAt: Date.now(),
+      } as object),
+    });
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(0);
+    expect(readJobStatuses).not.toHaveBeenCalled();
+  });
+
+  it('withdraws a rehydrated entry', async () => {
+    // A recovered entry has no spawn() of this process behind it, so it is settled.
+    const emitter = fakeEmitter();
+    const stateStore = fakeStateStore({
+      listSpawningAgentsForOwner: vi.fn().mockResolvedValue([
+        {
+          agentId: 'scaler-event-rehydrated',
+          scalerName: 'github-actions',
+          labelSet: LABELS,
+          spawnedAt: new Date(),
+          backendType: ScalerBackendType.enum.event,
+          provisioningTargets: ['e2e/provision'],
+          boundJobId: 'job-h',
+          runId: 'run-h',
+        },
+      ]),
+    });
+    const manager = makeManagerWithEventBackend({
+      emitter,
+      stateStore,
+      readJobStatuses: statuses({ 'job-h': ExecutionJobStatus.enum.timed_out_stale }),
+    });
+    await manager.recoverState();
+    expect(await manager.withdrawEndedBoundProvisions()).toBe(1);
+    await vi.waitFor(() =>
+      expect(emitter.emitScalerScaleDown).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: 'scaler-event-rehydrated',
+          reason: ScaleDownReason.enum['job-complete'],
+        }),
+        ['e2e/provision'],
+      ),
+    );
+    expect(stateStore.deleteSpawningAgent).toHaveBeenCalledWith('scaler-event-rehydrated');
+  });
+});
+
+describe('live Firecracker VMs', () => {
+  const FC_LABELS = ['linux', 'firecracker'];
+  const FC_LABEL_SET: LabelSetConfig = { labels: FC_LABELS, rootfsPath: '/opt/rootfs.ext4' };
+
+  function probe(vmId: string, scaler: string, over: Partial<LiveVmProbe> = {}): LiveVmProbe {
+    return {
+      vmId,
+      scaler,
+      pid: 4242,
+      startedAtMs: Date.now() - 60_000,
+      chrootDir: `/srv/jailer/firecracker/${vmId}/root`,
+      identityConfirmed: true,
+      ...over,
+    };
+  }
+
+  /**
+   * A Firecracker-typed backend double: `live` is what its host scan lists,
+   * `tracking` is what it holds in memory, `owns` is whose address it holds.
+   */
+  function fcBackend(opts: { live?: LiveVmProbe[]; tracking?: string[]; owns?: string[] } = {}) {
+    const tracking = new Set(opts.tracking ?? []);
+    const base = createMockBackend({
+      type: 'firecracker',
+      labelSets: [FC_LABEL_SET],
+      maxAgents: 5,
+    });
+    return Object.assign(base, {
+      listLiveVms: vi.fn(async () => opts.live ?? []),
+      isTrackingVm: vi.fn((vmId: string) => tracking.has(vmId)),
+      ownsAllocationFor: vi.fn(async (vmId: string) => (opts.owns ?? []).includes(vmId)),
+      stopUntrackedVm: vi.fn(
+        async (vmId: string, trackersOf: () => ScalerVmTracker[]): Promise<ScalerVmStopResult> => {
+          const trackers = trackersOf();
+          return trackers.length > 0
+            ? { vmId, outcome: ScalerVmStopOutcome.enum.tracked, detail: trackers.join(', ') }
+            : { vmId, outcome: ScalerVmStopOutcome.enum.stopped, pid: 4242, detail: 'stopped' };
+        },
+      ),
+    });
+  }
+
+  function fcManager(
+    backends: Array<{ name: string; backend: ReturnType<typeof fcBackend> }>,
+    opts: ManagerHarnessOptions = {},
+  ) {
+    return makeManager({
+      ...opts,
+      backends,
+      config: {
+        version: 1 as const,
+        globalMaxAgents: 10,
+        scalers: backends.map(({ name }) => ({
+          name,
+          type: 'firecracker' as const,
+          maxAgents: 5,
+          labelSets: [FC_LABEL_SET],
+        })),
+      } as ScalerConfig,
+    });
+  }
+
+  it('names a spawning entry, then the registered agent', async () => {
+    const backend = fcBackend();
+    const manager = fcManager([{ name: 'fc', backend }]);
+    const result = await manager.requestScale(FC_LABELS, 'job-1', 'run-1');
+    if (result.action !== 'spawning') throw new Error(`expected a spawn, got ${result.action}`);
+
+    expect(manager.trackersOf(result.agentId)).toEqual([ScalerVmTracker.enum.spawning]);
+
+    await vi.waitFor(() => expect(backend.spawn).toHaveBeenCalled());
+    await manager.onAgentRegistered(result.agentId, FC_LABELS);
+    expect(manager.trackersOf(result.agentId)).toEqual([ScalerVmTracker.enum.registered]);
+  });
+
+  it('names an agent adopted from another instance as registered', async () => {
+    const stateStore = fakeStateStore({
+      adoptSpawningAgent: vi.fn().mockResolvedValue({
+        agentId: 'agent-77',
+        scalerName: 'fc',
+        labelSet: FC_LABELS,
+        boundJobId: 'job-1',
+        mandatoryLabels: [],
+        provisioningTargets: [],
+        backendType: 'firecracker',
+        spawnedAt: new Date(),
+        ownerInstanceId: 'orch-a',
+      }),
+    });
+    const manager = fcManager([{ name: 'fc', backend: fcBackend() }], {
+      stateStore,
+      instanceId: 'orch-b',
+    });
+
+    await manager.onAgentRegistered('agent-77', FC_LABELS);
+
+    expect(manager.trackersOf('agent-77')).toContain(ScalerVmTracker.enum.registered);
+  });
+
+  // fails-when: only the scanning backend is asked, so a sibling scaler's VM reads as orphaned
+  it('two scalers sharing a chroot base list a VM once, tracked by its owner', async () => {
+    const vm = probe('scaler-firecracker-shared', 'fc-a');
+    const a = fcBackend({ live: [vm] });
+    const b = fcBackend({ live: [{ ...vm, scaler: 'fc-b' }], tracking: [vm.vmId] });
+    const manager = fcManager([
+      { name: 'fc-a', backend: a },
+      { name: 'fc-b', backend: b },
+    ]);
+
+    const vms = await manager.listLiveVms();
+
+    expect(vms).toHaveLength(1);
+    expect(vms[0]).toMatchObject({
+      vmId: vm.vmId,
+      status: ScalerVmStatus.enum.tracked,
+      trackedBy: [ScalerVmTracker.enum.backend],
+    });
+  });
+
+  // breaks-if-wrong: a VM nothing tracks is still listed as an orphan
+  it('lists a VM nothing tracks as orphaned', async () => {
+    const manager = fcManager([
+      { name: 'fc', backend: fcBackend({ live: [probe('scaler-firecracker-lost', 'fc')] }) },
+    ]);
+
+    expect(await manager.listLiveVms()).toEqual([
+      expect.objectContaining({ status: ScalerVmStatus.enum.orphaned, trackedBy: [] }),
+    ]);
+    expect(manager.firecrackerScalerNames()).toEqual(['fc']);
+  });
+
+  it('ignores backends of other types', async () => {
+    const manager = makeManager();
+    expect(manager.firecrackerScalerNames()).toEqual([]);
+    expect(await manager.listLiveVms()).toEqual([]);
+    expect(await manager.stopUntrackedVms(['scaler-firecracker-x'])).toEqual([
+      expect.objectContaining({ outcome: ScalerVmStopOutcome.enum['not-found'] }),
+    ]);
+  });
+
+  it('stops each VM once, sequentially, through the backend that lists it', async () => {
+    const a = fcBackend({ live: [probe('vm-a', 'fc-a')] });
+    const b = fcBackend({ live: [probe('vm-b', 'fc-b')] });
+    const order: string[] = [];
+    for (const backend of [a, b]) {
+      const inner = backend.stopUntrackedVm.getMockImplementation()!;
+      backend.stopUntrackedVm.mockImplementation(async (vmId, trackersOf) => {
+        order.push(`start ${vmId}`);
+        const result = await inner(vmId, trackersOf);
+        order.push(`end ${vmId}`);
+        return result;
+      });
+    }
+    const manager = fcManager([
+      { name: 'fc-a', backend: a },
+      { name: 'fc-b', backend: b },
+    ]);
+
+    const results = await manager.stopUntrackedVms(['vm-a', 'vm-b']);
+
+    expect(results.map((r) => r.outcome)).toEqual([
+      ScalerVmStopOutcome.enum.stopped,
+      ScalerVmStopOutcome.enum.stopped,
+    ]);
+    expect(a.stopUntrackedVm).toHaveBeenCalledTimes(1);
+    expect(a.stopUntrackedVm).toHaveBeenCalledWith('vm-a', expect.any(Function));
+    expect(b.stopUntrackedVm).toHaveBeenCalledWith('vm-b', expect.any(Function));
+    expect(order).toEqual(['start vm-a', 'end vm-a', 'start vm-b', 'end vm-b']);
+  });
+
+  it('routes a VM two scalers list to the one holding its address', async () => {
+    const vm = probe('vm-shared', 'fc-a');
+    const a = fcBackend({ live: [vm] });
+    const b = fcBackend({ live: [vm], owns: [vm.vmId] });
+    const manager = fcManager([
+      { name: 'fc-a', backend: a },
+      { name: 'fc-b', backend: b },
+    ]);
+
+    await manager.stopUntrackedVms([vm.vmId]);
+
+    expect(b.stopUntrackedVm).toHaveBeenCalledTimes(1);
+    expect(a.stopUntrackedVm).not.toHaveBeenCalled();
+  });
+
+  // fails-when: the tracked predicate is a snapshot taken before the stop started
+  it('the stop reads tracking live, so a registration after the call is honoured', async () => {
+    const backend = fcBackend({ live: [probe('vm-late', 'fc')] });
+    const manager = fcManager([{ name: 'fc', backend }]);
+    const inner = backend.stopUntrackedVm.getMockImplementation()!;
+    backend.stopUntrackedVm.mockImplementation(async (vmId, trackersOf) => {
+      // The agent registers between the listing and the kill.
+      (manager as unknown as { managedAgentIndex: Map<string, string> }).managedAgentIndex.set(
+        vmId,
+        'fc',
+      );
+      return inner(vmId, trackersOf);
+    });
+
+    const [result] = await manager.stopUntrackedVms(['vm-late']);
+
+    expect(result).toMatchObject({ outcome: ScalerVmStopOutcome.enum.tracked });
+  });
+
+  it('asks each backend about a VM no scan lists, and reports not-found when none holds it', async () => {
+    const a = fcBackend();
+    const b = fcBackend();
+    a.stopUntrackedVm.mockResolvedValue({
+      vmId: 'vm-dead',
+      outcome: ScalerVmStopOutcome.enum['not-found'],
+      detail: 'no chroot',
+    });
+    b.stopUntrackedVm.mockResolvedValue({
+      vmId: 'vm-dead',
+      outcome: ScalerVmStopOutcome.enum['not-live'],
+      detail: 'the VM process is not running',
+    });
+    const manager = fcManager([
+      { name: 'fc-a', backend: a },
+      { name: 'fc-b', backend: b },
+    ]);
+
+    const [result] = await manager.stopUntrackedVms(['vm-dead']);
+
+    expect(result!.outcome).toBe(ScalerVmStopOutcome.enum['not-live']);
+    expect(a.stopUntrackedVm).toHaveBeenCalledTimes(1);
+    expect(b.stopUntrackedVm).toHaveBeenCalledTimes(1);
   });
 });

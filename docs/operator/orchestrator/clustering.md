@@ -491,6 +491,34 @@ kici-admin peer revoke-all --confirm
 
 All peer credentials are invalidated. All peers must re-join with new tokens. Use this for emergency security responses. This applies to a coordinator with a stable `KICI_CLUSTER_INSTANCE_ID` too: it does not issue itself a new credential after a revoke.
 
+**Forget a peer that left the cluster:**
+
+```bash
+kici-admin peer forget <instance-id> [--yes] [--timeout <seconds>] [--json]
+```
+
+Each coordinator keeps its own live list of peers, and it keeps a peer that disconnects in that list. A coordinator that left for good therefore stays there as a disconnected coordinator. While it does, `kici-admin scaler orphans` lists every untracked VM as `unverified` and stops none of them. `peer forget` removes the peer from the list of the coordinator that `--url` names. That coordinator then sends the request to every connected sibling coordinator, and the command prints one result for each coordinator.
+
+- A peer that is still connected is refused, with an error that names it, and nothing is fanned out.
+- A peer that the coordinator can still treat as alive is refused too. The error names the window and says when the peer was last heard from. Such a peer can be behind a network partition rather than gone. Wait until the window has passed, then run the command again. Each sibling coordinator applies the same check and keeps a peer it heard from recently. Its result says why.
+  - The window is never shorter than the reroute flap grace (`--reroute-flap-grace-ms`, 2 minutes by default). Every coordinator gives a disconnected peer this grace before it fails a job rerouted to that peer, or fails a job that only a coordinator with the new master key can open instead of requeueing it. If you forget the peer inside that grace, the coordinator treats it as gone at once.
+  - If you lower the grace below the peer stale window (`KICI_CLUSTER_PEER_STALE_TIMEOUT_MS`, 60 seconds by default), the window is the stale window.
+  - A peer that adopted event-scaler provisions that are still running gets the grace that the [event-scaler backstop](./event-scaler.md#orchestrator-side-backstop) gives it before it tears down those provisions, on a coordinator that runs the backstop. That grace is `--reroute-flap-grace-ms`, but never less than twice the stale window (2 minutes at the defaults).
+- When the peer is the last coordinator peer that a coordinator knows, forgetting it starts that coordinator's event-scaler backstop again (see the warning below). The command then shows that consequence and asks for confirmation. `--yes` gives the confirmation without a prompt. If you decline the prompt, the coordinator that `--url` names keeps the peer, nothing is fanned out, and the command exits 0. Without a terminal and without `--yes`, the command refuses, keeps the peer and exits 1. The coordinator itself refuses such a forget unless the request acknowledges it (`acknowledgeBackstop: true`), so an HTTP call cannot skip the confirmation. A forget that does not start a backstop needs no confirmation.
+- An instance id that no coordinator knows is an error.
+- A coordinator that keeps the peer, or does not answer within `--timeout` seconds (default 15), makes the command exit 1.
+- It needs the `peer.manage` permission (owner, admin) and a token with no routing-key scope. Each call is recorded in the access log as `peer.forget`.
+
+Forget is not revoke. `peer revoke` makes the coordinators refuse the peer's next connection. `peer forget` only removes a peer that already left from the live lists, and leaves its credential as it is. If the forgotten peer connects again, it is added again as usual.
+
+:::danger
+Forget a coordinator only after you confirm that it is gone for good. A coordinator that you cannot reach because of a network partition is not gone.
+
+A coordinator counts the coordinator peers in its list to decide if it sees enough of the cluster to tear down event-scaler provisions. When you forget its last coordinator peer and `KICI_CLUSTER_PEERS` is not set, its [orchestrator-side backstop](./event-scaler.md#when-the-backstop-turns-itself-off) starts again. If the forgotten coordinator still runs behind a partition, the backstop tears down the instances that it runs.
+
+Two checks make this harder to do by mistake. A coordinator heard from inside its window is never forgotten, and a forget that starts a backstop needs your confirmation. Neither check can tell a long partition from a coordinator that is gone. That decision stays with you.
+:::
+
 ### Re-joining after revocation
 
 If a peer's credential is revoked:
@@ -636,19 +664,34 @@ The Raft leader runs periodic orphan recovery (every 60 seconds). It detects run
 
 Rerouted jobs carry a hop counter to prevent infinite routing loops. If a job exceeds the maximum hop count, it fails instead of being rerouted again.
 
-| Limit        | Default | `kici-admin org-settings reroute` flag | Description                                                            |
-| ------------ | ------- | -------------------------------------- | ---------------------------------------------------------------------- |
-| Maximum hops | 3       | `--max-hops`                           | Jobs rerouted more than this many times are failed to prevent loops    |
-| ACK timeout  | 15s     | `--ack-timeout`                        | Time for a peer to acknowledge receipt of a rerouted job               |
-| Spawn window | 90s     | `--window`                             | After a peer ACKs, how long to wait for progress before re-dispatching |
+| Limit               | Default | `kici-admin org-settings reroute` flag | Description                                                                      |
+| ------------------- | ------- | -------------------------------------- | -------------------------------------------------------------------------------- |
+| Maximum hops        | 3       | `--max-hops`                           | Jobs rerouted more than this many times are failed to prevent loops              |
+| ACK timeout         | 15s     | `--ack-timeout`                        | Time for a peer to acknowledge receipt of a rerouted job                         |
+| Spawn window        | 90s     | `--window`                             | After a peer ACKs, how long to wait for progress before re-dispatching           |
+| Spawn attempts      | 3       | `--spawn-max-attempts`                 | Agent spawns a worker attempts for one rerouted job before it gives the job back |
+| Spawn retry backoff | 5s      | `--spawn-retry-backoff`                | Wait after a failed spawn before the worker's next attempt                       |
 
-Each default is cluster-wide; set a per-org override with `kici-admin org-settings reroute set --org <id> --window <ms> --ack-timeout <ms> --max-hops <n>`, and clear it with `kici-admin org-settings reroute reset --org <id>`.
+Each default is cluster-wide; set a per-org override with `kici-admin org-settings reroute set --org <id> --window <ms> --ack-timeout <ms> --max-hops <n> --spawn-max-attempts <n> --spawn-retry-backoff <ms>`, and clear it with `kici-admin org-settings reroute reset --org <id>`.
 
 ### Rerouted job stalls (spawn failure)
 
 **Symptom:** a job rerouted to a peer never starts and the run sits `pending`.
 
-A peer that accepts a reroute but then fails to spawn the agent (transient scaler error, image-pull failure, peer crash) does not strand the run. The coordinator arms a **spawn window** on every accepted reroute. When the window elapses with no progress, the coordinator first checks whether the job has actually started. A peer orchestrator shares this database and records the job's status in it directly. The coordinator reads that status, leaves a running job alone, and disarms the window. Only a job that never started is cancelled on the original peer. The coordinator then re-dispatches it to another peer or a local backend, and fails it only if no backend can run it. A worker that detects the spawn failure directly reports it back, so recovery usually happens well before the window elapses. Raise `--window` for peers with legitimately slow agent startup; lower it to recover faster on flaky backends.
+A peer that accepts a reroute but then fails to spawn the agent (transient scaler error, image-pull failure, peer crash) does not strand the run. The coordinator arms a **spawn window** on every accepted reroute. When the window elapses with no progress, the coordinator first checks whether the job has actually started. A peer orchestrator shares this database and records the job's status in it directly. The coordinator reads that status, leaves a running job alone, and disarms the window. Only a job that never started is cancelled on the original peer. The coordinator then re-dispatches it to another peer or a local backend, and fails it only if no backend can run it.
+
+A worker retries a failed agent spawn itself, up to the **spawn attempts** limit, and waits the **spawn retry backoff** between attempts. It reports each failure to the coordinator with a verdict:
+
+- **Retrying.** The coordinator restarts the spawn window for one more attempt plus the backoff.
+- **Last attempt failed.** The worker gives the job back. The coordinator re-dispatches it, or fails it, at once.
+- **No verdict.** A worker on an older version reports failures without one. The coordinator keeps the window it armed at the reroute.
+
+When the coordinator gives up on a job, it cancels the job on the worker. The worker removes the job from its queue, so the job cannot start there later.
+
+Sizing guidance:
+
+- Raise `--window` for peers with legitimately slow agent startup; lower it to recover faster on flaky backends. Keep it above the time one spawn needs.
+- A worker that fails every attempt holds the job for up to attempts × (window + backoff) before the coordinator re-dispatches it. Keep that product inside what a run can wait.
 
 ### Jobs not rerouting
 

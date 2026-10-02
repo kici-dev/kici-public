@@ -1608,6 +1608,10 @@ export interface KiciEventTable {
   dlq_at: Date | null;
   /** Short DLQ reason: 'exhausted_retries' | 'non_retryable' */
   dlq_reason: string | null;
+  /** How the router resolved the event (an `EventMatchOutcome`); NULL until processed */
+  match_outcome: string | null;
+  /** Registrations the event was dispatched to; NULL until processed */
+  matched_count: number | null;
 }
 
 // Convenience types for kici_events
@@ -2138,6 +2142,20 @@ export interface OrgSettingsTable {
    */
   reroute_max_hops: ColumnType<number | null, number | null | undefined, number | null>;
   /**
+   * Per-org agent spawns a worker attempts for one rerouted job. Null = cluster
+   * default (config.rerouteSpawnMaxAttempts). Plain INTEGER.
+   */
+  reroute_spawn_max_attempts: ColumnType<number | null, number | null | undefined, number | null>;
+  /**
+   * Per-org wait (ms) after a failed spawn of a rerouted job. Null = cluster
+   * default (config.rerouteSpawnRetryBackoffMs). BIGINT.
+   */
+  reroute_spawn_retry_backoff_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
    * Per-org staleness threshold (hours) for the DB-backup freshness diagnostic.
    * Null = cluster default (config.backupStalenessWarnHours). Plain INTEGER.
    */
@@ -2383,6 +2401,12 @@ export interface ClusterSettingsTable {
    * per round.
    */
   global_eval_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /** How long a Firecracker spawn waits for the VM's API socket. NULL: config default. */
+  firecracker_api_socket_wait_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
   /**
    * Retention window in days for `check_run_tracking` rows. The hourly cleanup
    * sweep deletes rows untouched for longer than this; 0 disables the sweep.

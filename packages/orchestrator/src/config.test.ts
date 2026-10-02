@@ -43,6 +43,26 @@ describe('orchestrator loadConfig', () => {
       expect(loadConfig().cacheUploadSettleTimeoutMs).toBe(0);
     });
 
+    it('defaults the reroute spawn-retry budget to 3 attempts / 5000 ms and reads KICI_REROUTE_SPAWN_*', () => {
+      // fails-when: a default or an env mapping is missing.
+      const defaults = loadConfig();
+      expect(defaults.rerouteSpawnMaxAttempts).toBe(3);
+      expect(defaults.rerouteSpawnRetryBackoffMs).toBe(5_000);
+      process.env.KICI_REROUTE_SPAWN_MAX_ATTEMPTS = '5';
+      process.env.KICI_REROUTE_SPAWN_RETRY_BACKOFF_MS = '1234';
+      const overridden = loadConfig();
+      expect(overridden.rerouteSpawnMaxAttempts).toBe(5);
+      expect(overridden.rerouteSpawnRetryBackoffMs).toBe(1234);
+      // breaks-if-wrong: a zero backoff (retry at once) is a legitimate setting.
+      process.env.KICI_REROUTE_SPAWN_RETRY_BACKOFF_MS = '0';
+      expect(loadConfig().rerouteSpawnRetryBackoffMs).toBe(0);
+    });
+
+    it('rejects a reroute spawn budget of zero attempts', () => {
+      process.env.KICI_REROUTE_SPAWN_MAX_ATTEMPTS = '0';
+      expect(() => loadConfig()).toThrow();
+    });
+
     it('defaults autoMigrate to true when KICI_AUTO_MIGRATE unset', () => {
       const config = loadConfig();
       expect(config.autoMigrate).toBe(true);

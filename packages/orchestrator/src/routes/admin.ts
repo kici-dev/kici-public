@@ -31,11 +31,16 @@ import { createHeldRunRoutes, type HeldRunReleaseWiring } from './admin-held-run
 import { HeldRunStore } from '../contexts/held-runs.js';
 import { TrustPolicyStore } from '../security/trust-policy-store.js';
 import { TrustDirectoryStore } from '../security/trust-directory-store.js';
-import { createClusterSettingsRoutes } from './admin-cluster-settings.js';
+import {
+  createClusterSettingsRoutes,
+  type ClusterSettingsPropagationSource,
+} from './admin-cluster-settings.js';
 import { createClusterNameRoutes } from './admin-cluster-name.js';
 import { createAdminSigningKeyRoutes } from './admin-signing-keys.js';
 import { createMaintenanceRoutes } from './admin-maintenance.js';
 import { createOrchestratorDrainRoutes } from './admin-orchestrator-drain.js';
+import { createScalerOrphansRoutes, type ScalerOrphansRouteDeps } from './admin-scaler-orphans.js';
+import { createPeerForgetRoutes, type PeerForgetRouteDeps } from './admin-peer-forget.js';
 import type { DrainController } from '../drain/drain-controller.js';
 import { createAdminContextRoutes } from './admin-contexts.js';
 import { createAdminQueueExecutionRoutes } from './admin-queue-execution.js';
@@ -184,6 +189,26 @@ export interface AdminRouteDeps {
    * write is best-effort, never gating.
    */
   accessLog?: AccessLogWriter;
+  /**
+   * Optional -- the coordinator's live-VM listing and stop, for this node or a
+   * `--target` peer. Backs `GET /api/v1/admin/scaler/orphans` and
+   * `POST /api/v1/admin/scaler/orphans/stop` (`kici-admin scaler orphans`).
+   * Bound by orchestrator-core once the cluster is up.
+   */
+  scalerOrphans?: ScalerOrphansRouteDeps;
+  /**
+   * Optional -- forget a departed peer here and on every connected sibling
+   * coordinator. Backs `POST /api/v1/admin/peers/forget` (`kici-admin peer
+   * forget`). Bound by orchestrator-core once the cluster is up.
+   */
+  peerForget?: PeerForgetRouteDeps;
+  /**
+   * Optional -- the peer view behind
+   * `GET /api/v1/admin/cluster-settings/propagation` (the propagation section of
+   * `kici-admin cluster-settings show`). Bound by orchestrator-core once the
+   * cluster is up; the route is not mounted without it.
+   */
+  clusterSettingsPropagation?: ClusterSettingsPropagationSource;
   /**
    * Optional -- fulfil deferred attestations on demand (mints in the running
    * orchestrator process, which owns the Platform WS). Backs
@@ -966,7 +991,14 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Backs the `kici-admin cluster-settings {show,set,reset}` subcommands (the
   // fleet-wide tunables on cluster_settings).
   if (deps.db) {
-    app.route('/api/v1/admin', createClusterSettingsRoutes({ db: deps.db, rbac: deps.rbac }));
+    app.route(
+      '/api/v1/admin',
+      createClusterSettingsRoutes({
+        db: deps.db,
+        rbac: deps.rbac,
+        propagation: deps.clusterSettingsPropagation,
+      }),
+    );
   }
 
   // Mount cluster-name routes (optional -- only when db is provided).
@@ -996,6 +1028,32 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     app.route(
       '/api/v1/admin',
       createOrchestratorDrainRoutes({ drainController: deps.drainController, rbac: deps.rbac }),
+    );
+  }
+
+  // Live orphaned Firecracker VMs on this node or a --target peer
+  // (`kici-admin scaler orphans`). Mounted whenever the coordinator wires it.
+  if (deps.scalerOrphans) {
+    app.route(
+      '/api/v1/admin',
+      createScalerOrphansRoutes({
+        orphans: deps.scalerOrphans,
+        rbac: deps.rbac,
+        accessLog: deps.accessLog,
+      }),
+    );
+  }
+
+  // Forget a departed peer (`kici-admin peer forget`). Mounted whenever the
+  // coordinator wires it.
+  if (deps.peerForget) {
+    app.route(
+      '/api/v1/admin',
+      createPeerForgetRoutes({
+        peerForget: deps.peerForget,
+        rbac: deps.rbac,
+        accessLog: deps.accessLog,
+      }),
     );
   }
 

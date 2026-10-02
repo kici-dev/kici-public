@@ -110,6 +110,9 @@ Tokens are assigned one of three roles. The role determines which admin API oper
 | orchestrator.drain     | yes   | yes   |         |
 | ci_trust.read          | yes   | yes   |         |
 | ci_trust.admin         | yes   | yes   |         |
+| scaler.read            | yes   | yes   | yes     |
+| scaler.manage          | yes   | yes   |         |
+| peer.manage            | yes   | yes   |         |
 | token.manage           | yes   |       |         |
 | key.rotate             | yes   |       |         |
 
@@ -117,7 +120,7 @@ Tokens are assigned one of three roles. The role determines which admin API oper
 
 - **owner** -- full access. Use for bootstrap and token management.
 - **admin** -- day-to-day operations (secrets, sources, config). Cannot manage tokens or rotate keys.
-- **auditor** -- read-only access to contexts, audit logs, run status, the event log (metadata only), the access log, and the event dead-letter queue. Cannot read secret values, event-log payloads, or mutate anything.
+- **auditor** -- read-only access to contexts, audit logs, run status, the event log (metadata only), the access log, the event dead-letter queue, internal events (`event list` / `event show`, which need `event_dlq.read`), and a node's live Firecracker VMs (`scaler orphans`, which needs `scaler.read`), all without payload bodies. Cannot read secret values, event-log payloads, or mutate anything.
 
 > **Note:** These roles govern the orchestrator admin API only. They are entirely separate from the SaaS dashboard RBAC system (org member roles, custom roles, permission matrices) which is managed through the dashboard UI and applies to OIDC-authenticated users.
 

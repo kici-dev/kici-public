@@ -511,6 +511,34 @@
       }
     },
     {
+      "id": 102,
+      "title": "Reserved events with no subscriber",
+      "description": "Reserved kici.scaler events (an event-scaler scale-up or scale-down) that matched no subscribing workflow, by reason. A scale-up here was never provisioned: check the scaler provisioningTargets and that the provisioning workflow is registered. kici-admin event list --name kici.scaler.scale-up shows each event and why it matched nothing.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "expr": "sum by (event_name, reason) (increase(kici_orch_event_unmatched_total[15m]))",
+          "legendFormat": "{{event_name}} {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
       "id": 16,
       "title": "Jobs & health",
       "type": "row",
@@ -518,7 +546,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 49
       },
       "collapsed": false
     },
@@ -534,7 +562,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 42
+        "y": 50
       },
       "targets": [
         {
@@ -560,7 +588,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 42
+        "y": 50
       },
       "targets": [
         {
@@ -606,7 +634,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 42
+        "y": 50
       },
       "targets": [
         {
@@ -628,7 +656,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 58
       },
       "collapsed": false
     },
@@ -644,7 +672,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 59
       },
       "targets": [
         {
@@ -670,7 +698,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 67
       },
       "targets": [
         {
@@ -696,7 +724,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 67
+        "y": 75
       },
       "targets": [
         {
@@ -718,7 +746,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 75
+        "y": 83
       },
       "collapsed": false
     },
@@ -735,7 +763,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 76
+        "y": 84
       },
       "targets": [
         {
@@ -761,7 +789,7 @@
     {
       "id": 26,
       "title": "Warm pool spawn / reap rate",
-      "description": "Rate of warm-pool spawns started and of agents destroyed as surplus: above the pool's target and past idleTimeoutSeconds, or above a target a config reload lowered. An agent that makes up the pool is never reaped, so a steady reap rate means the pool keeps rising above size \u2014 look for repeated config reloads, not for agents timing out unused.",
+      "description": "Rate of warm-pool spawns started and of agents destroyed as surplus: above the pool's target and past idleTimeoutSeconds, or above a target a config reload lowered. An agent that makes up the pool is never reaped, so a steady reap rate means the pool keeps rising above size — look for repeated config reloads, not for agents timing out unused.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -771,7 +799,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 76
+        "y": 84
       },
       "targets": [
         {
@@ -802,7 +830,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 84
+        "y": 92
       },
       "targets": [
         {

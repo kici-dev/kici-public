@@ -184,8 +184,10 @@ export function createAdminRegistrationRoutes(
     }
   });
 
-  // Manually upsert workflow_registrations from a lock file (for break-glass /
-  // test seeding). Transactional via RegistrationStore.replaceAll + bumpVersion.
+  // Upsert workflow_registrations from a lock file (break-glass / test seeding).
+  // Never removes a registration the lock does not name — removal is
+  // `registration delete`. Transactional via
+  // RegistrationStore.replaceAll({ prune: false }) + bumpVersion.
   app.post('/api/v1/admin/registrations/register-manual', async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'context.update');
@@ -237,6 +239,7 @@ export function createAdminRegistrationRoutes(
           customerId: parsed.customerId,
           commitSha: parsed.commitSha,
           depCacheKey: depCacheKeyOf(lockFile),
+          prune: false,
         },
       );
       const registryVersion = await deps.registrationStore.bumpVersion();

@@ -209,8 +209,9 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
 
   wf.command('register-manual')
     .description(
-      'Manually upsert workflow_registrations rows from a lock file + bump registry_versions. ' +
-        'Transactional. Seeds workflow registrations without a real push event.',
+      'Upsert workflow_registrations rows from a lock file and bump registry_versions. ' +
+        'Transactional. Never removes a registration the lock file does not name (use ' +
+        'registration delete). Seeds workflow registrations without a real push event.',
     )
     .requiredOption('--lock-file <path>', 'Path to a kici.lock.json file')
     .requiredOption('--repo <ident>', 'repo_identifier value (e.g. "owner/repo")')

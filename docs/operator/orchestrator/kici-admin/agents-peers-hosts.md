@@ -62,11 +62,12 @@ kici-admin peer create-token [--role coordinator|worker] [--expiry-hours <n>] [-
 kici-admin peer list [--json]
 kici-admin peer revoke --instance-id <id>
 kici-admin peer revoke-all --confirm
+kici-admin peer forget <instance-id> [--yes] [--timeout <seconds>] [--json]
 kici-admin peer prune-credentials --filter <pattern> --database-url <url> [--json]
 kici-admin peer reset-raft-state --database-url <url> [--json]
 ```
 
-Manages peer credentials for multi-orchestrator clusters. These commands access the database directly (not via the admin API). `create-token`, `list`, `revoke` and `revoke-all` read the database URL from `KICI_DATABASE_URL` only; `prune-credentials` and `reset-raft-state` also accept `--database-url`.
+Manages peer credentials for multi-orchestrator clusters. These commands access the database directly (not via the admin API), except `forget`. `forget` goes through the admin API of the running coordinators. It removes a peer that left the cluster from each coordinator's live peer list and leaves its credential as it is (see [Managing peers](../clustering.md#managing-peers)). `create-token`, `list`, `revoke` and `revoke-all` read the database URL from `KICI_DATABASE_URL` only; `prune-credentials` and `reset-raft-state` also accept `--database-url`.
 
 - `create-token` generates a single-use join token (defaults: coordinator role, 1-hour expiry, org-id `default`, routing-key `default`, attribution `cli`).
   - `--created-by <actor>` sets the `join_tokens.created_by` audit attribution. Defaults to `cli`; a deploy script can pass its own name, e.g. `deploy-script`, so its join tokens are distinguishable from ad-hoc operator ones.
@@ -431,6 +432,26 @@ Synopsis: `kici-admin peer create-token [options]`
 | `--routing-key <key>`    | `default`     | Routing key                                                       |
 | `--created-by <actor>`   | `cli`         | Attribution written to join_tokens.created_by                     |
 | `--json`                 | `false`       | Emit JSON { token, role, expiresAt, orgId, routingKey } on stdout |
+
+### `kici-admin peer forget`
+
+Drop a peer that left the cluster from the live peer registry of every coordinator (its credential is untouched)
+
+Synopsis: `kici-admin peer forget <instance-id> [options]`
+
+**Arguments**
+
+| Argument      | Required | Variadic | Description |
+| ------------- | -------- | -------- | ----------- |
+| `instance-id` | yes      | no       |             |
+
+**Options**
+
+| Option                | Default | Description                                                                                  |
+| --------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `--timeout <seconds>` | `15`    | How long to wait for each sibling coordinator                                                |
+| `--yes`               | `false` | Forget the peer even when that switches the event-provision backstop back on, without asking |
+| `--json`              | `false` | Emit machine-readable JSON                                                                   |
 
 ### `kici-admin peer list`
 

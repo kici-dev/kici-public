@@ -126,12 +126,12 @@ import {
   type PeerLogsCollectRequest,
   type PeerToPeerMessage,
   type InvokeResult,
+  type RerouteSpawnRetry,
+  type PeerScalerOrphansResponse,
 } from '@kici-dev/engine';
 import {
   ScalerManager,
   type ScalerManagerDeps,
-  ContainerScalerBackend,
-  FirecrackerScalerBackend,
   DbIpAllocator,
   ClaimStore,
   DEFAULT_CLAIM_TTL_SECONDS,
@@ -218,6 +218,21 @@ import { restorePendingWorkflowContexts } from './pipeline/pending-workflow-cont
 import { SummonRefusedError } from './pipeline/invoke-gate.js';
 import type { InvokeGateDeps, SummonArgs, SummonedRun } from './pipeline/invoke-gate.js';
 import { recomputeNeedsSatisfied } from './pipeline/needs-scheduler.js';
+import { reapOrphansAtStartup } from './scaler/startup-orphan-sweep.js';
+import { answerScalerOrphansRequest, type ScalerOrphansRequest } from './scaler/orphan-requests.js';
+import { findActiveJobBindings } from './scaler/vm-job-bindings.js';
+import {
+  disconnectedCoordinatorIds,
+  forgetAcrossCoordinators,
+  forgetDepartedPeer,
+  peerForgetGuards,
+  type PeerForgetGuards,
+  type PeerForgetRequestHandler,
+  type PeerLivenessSource,
+  type SendPeerForget,
+} from './cluster/peer-forget.js';
+import { ScalerOrphansForwardFailure } from './cluster/scaler-orphans-peer.js';
+import { resolveWorkerClusterSettingsSnapshot } from './cluster/worker-cluster-settings.js';
 import { StepLogBuffer } from './reporting/step-log-buffer.js';
 import { createLogStorage, type LogStorage } from './reporting/log-storage.js';
 import { ExecutionTracker, type ExecutionTrackerDeps } from './reporting/execution-tracker.js';
@@ -437,6 +452,12 @@ export interface OrchestratorSubsystems {
   orphanRecovery: OrphanRecovery;
   peerHandler: ReturnType<typeof createPeerHandler>;
   peerClients: Map<string, PeerClient>;
+  /**
+   * Answers a `kici-admin peer forget` a sibling coordinator fanned out. Wired
+   * into every outgoing PeerClient (the incoming peer-handler is wired directly
+   * in setupCluster).
+   */
+  answerPeerForgetRequest: PeerForgetRequestHandler;
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   broadcastHeartbeatToAllPeers: () => void;
   broadcastAgentTokenRevoke: (tokenId: string) => void;
@@ -683,8 +704,13 @@ async function initializeScaler(
     hostServices: storageHostAccessEntries(config),
     tokenTtlMs: config.agentTokenTtlMs,
     // Live per-spawn resolve of the fleet-wide agent-token TTL override
-    // (cluster_settings.agent_token_ttl_ms); leader has DB access.
+    // (cluster_settings.agent_token_ttl_ms); a coordinator has DB access.
     tokenTtlProvider: () => clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
+    firecrackerApiSocketWaitMsProvider: () =>
+      clusterSettings.getNumber(
+        'firecracker_api_socket_wait_ms',
+        config.firecrackerApiSocketWaitMs,
+      ),
     ipAllocator: ({ cidr, gateway, netmask }) => new DbIpAllocator({ db, cidr, gateway, netmask }),
     stateStore: scalerStateStore,
     eventEmitterProvider: () => eventEmitterProvider(),
@@ -746,6 +772,24 @@ async function initializeScaler(
         config.scalerProvisionMaxConsecutiveFailures,
       ),
     }),
+    // The bound job of a pending event provision is the dispatch queue's job
+    // id, which the execution tracker records as `execution_jobs.job_id`
+    // under its run. Filtering on the runs keeps the read on the run_id index.
+    readJobStatuses: async (jobs) => {
+      if (jobs.length === 0) return new Map();
+      const rows = await db
+        .selectFrom('execution_jobs')
+        .select(['run_id', 'job_id', 'status'])
+        .where('run_id', 'in', [...new Set(jobs.map((j) => j.runId))])
+        .where('job_id', 'in', [...new Set(jobs.map((j) => j.jobId))])
+        .execute();
+      const wanted = new Set(jobs.map((j) => `${j.runId}\u0000${j.jobId}`));
+      return new Map(
+        rows
+          .filter((r) => wanted.has(`${r.run_id}\u0000${r.job_id}`))
+          .map((r) => [r.job_id, r.status]),
+      );
+    },
     // A scaler added by a config reload is built through the same factory
     // startup uses, so a reload can only construct what startup exercises.
     // The reloaded config, not the boot-time one: the factory reads
@@ -759,41 +803,12 @@ async function initializeScaler(
   // bootstrap on a transient DB hiccup.
   await scalerManager.recoverState();
 
-  // Run orphan cleanup for container and firecracker backends
-  for (const { name, backend } of backends) {
-    if (backend.type === 'container') {
-      try {
-        const cleaned = await (backend as ContainerScalerBackend).cleanupOrphans();
-        if (cleaned > 0) {
-          logger.info(`Cleaned up ${cleaned} orphaned containers`, { backend: name });
-        }
-      } catch (err) {
-        logger.warn('Container orphan cleanup failed', {
-          backend: name,
-          error: toErrorMessage(err),
-        });
-      }
-    } else if (backend.type === 'firecracker') {
-      const fcBackend = backend as FirecrackerScalerBackend;
-      try {
-        const cleaned = await fcBackend.cleanupOrphans();
-        if (cleaned > 0) {
-          logger.info(`Cleaned up ${cleaned} orphaned Firecracker VMs`, { backend: name });
-        }
-      } catch (err) {
-        logger.warn('Firecracker orphan cleanup failed', {
-          backend: name,
-          error: toErrorMessage(err),
-        });
-      }
-      // Long-running orchestrators can't rely on startup-only cleanup: a
-      // host-level cleanup job skips interface cleanup while the orchestrator
-      // is active, so leaked TAPs accumulate until restart. A leaked TAP under
-      // heavy churn can wedge NetworkManager (observed 2026-04-14). The
-      // periodic sweep inside the backend closes that gap.
-      fcBackend.startPeriodicOrphanSweep();
-    }
-  }
+  // Run orphan cleanup for container and firecracker backends, and keep
+  // sweeping Firecracker: a host-level cleanup job skips interface cleanup
+  // while the orchestrator is active, so without the periodic sweep leaked
+  // TAPs accumulate until restart, and under heavy churn one can wedge
+  // NetworkManager.
+  await reapOrphansAtStartup(backends);
 
   // Verify + self-provision each backend's host prerequisites (Firecracker
   // bridge) before spawning starts. Degraded-on-failure — never aborts startup.
@@ -971,7 +986,12 @@ function makeAckTimeoutReader(
 
 /** org_settings numeric columns readable per-org by {@link makeOrgNumberReader}. */
 type OrgNumberColumn =
-  'reroute_spawn_window_ms' | 'reroute_ack_timeout_ms' | 'reroute_max_hops' | 'queue_timeout_ms';
+  | 'reroute_spawn_window_ms'
+  | 'reroute_ack_timeout_ms'
+  | 'reroute_max_hops'
+  | 'reroute_spawn_max_attempts'
+  | 'reroute_spawn_retry_backoff_ms'
+  | 'queue_timeout_ms';
 
 /**
  * Build a per-job resolver for a numeric `org_settings` column: the job's org
@@ -1004,6 +1024,27 @@ function makeOrgNumberReader(
     }
     return fallback;
   };
+}
+
+/**
+ * Per-job spawn-retry budget for a rerouted job: each field's org override,
+ * else its cluster default.
+ */
+function makeRerouteSpawnRetryReader(
+  db: Kysely<Database> | undefined,
+  config: Pick<AppConfig, 'rerouteSpawnMaxAttempts' | 'rerouteSpawnRetryBackoffMs'>,
+): (job: { jobConfig?: Record<string, unknown> }) => Promise<RerouteSpawnRetry> {
+  const maxAttempts = makeOrgNumberReader(
+    db,
+    'reroute_spawn_max_attempts',
+    config.rerouteSpawnMaxAttempts,
+  );
+  const backoffMs = makeOrgNumberReader(
+    db,
+    'reroute_spawn_retry_backoff_ms',
+    config.rerouteSpawnRetryBackoffMs,
+  );
+  return async (job) => ({ maxAttempts: await maxAttempts(job), backoffMs: await backoffMs(job) });
 }
 
 /**
@@ -2008,8 +2049,28 @@ export function buildSummonCallback(
 
 // ── Cluster initialization ──────────────────────────────────────────────────
 
+/**
+ * The live `reroute_flap_grace_ms` setting. The rerouted-job guard and the
+ * master-key requeue give a disconnected peer this grace, the event-provision
+ * backstop floors its own from it (`reaperFlapGraceMs`), and `peer forget`
+ * reads the same value so its refusal window never falls short of either.
+ */
+function readRerouteFlapGraceMs(
+  config: AppConfig,
+  clusterSettings: ClusterSettingsReader,
+): Promise<number> {
+  return clusterSettings.getNumber('reroute_flap_grace_ms', config.rerouteFlapGraceMs);
+}
+
 interface ClusterInfra {
   peerRegistry: PeerRegistry;
+  /** Answers a `kici-admin peer forget` a sibling coordinator fanned out. */
+  answerPeerForgetRequest: PeerForgetRequestHandler;
+  /** The guards this coordinator runs before it forgets `instanceId`. */
+  peerForgetGuardsFor: (
+    instanceId: string,
+    acknowledgeBackstop: boolean,
+  ) => Promise<PeerForgetGuards>;
   raft: RaftNode;
   coordinator: RunCoordinator;
   orphanRecovery: OrphanRecovery;
@@ -2105,6 +2166,26 @@ function initializeCluster(
   const planHeadroomStore = new PlanHeadroomStore(db);
   const membershipReporterRef: { current: (() => void) | null } = { current: null };
 
+  // `kici-admin peer forget` keeps a peer this coordinator still treats as
+  // alive. Every coordinator gives a disconnected peer the reroute flap grace;
+  // the event-provision backstop, which runs wherever a scaler manager runs,
+  // gives a peer that adopted provisions its own grace. A fresh store handle
+  // reads the shared spawn rows, as the backstop's own does.
+  const peerForgetLiveness: Omit<PeerLivenessSource, 'staleTimeoutMs'> = {
+    rerouteFlapGraceMs: () => readRerouteFlapGraceMs(config, clusterSettings),
+    backstop: scalerManager
+      ? {
+          holdsAdoptedProvisions: (instanceId) =>
+            new ScalerStateStore(db).hasAdoptedProvisions(instanceId),
+        }
+      : null,
+  };
+  const peerForgetGuardsFor = (
+    instanceId: string,
+    acknowledgeBackstop: boolean,
+  ): Promise<PeerForgetGuards> =>
+    peerForgetGuards(instanceId, config.cluster, peerForgetLiveness, acknowledgeBackstop);
+
   const peerRegistry = new PeerRegistry({
     onMembershipChange: () => membershipReporterRef.current?.(),
     onConfigVersionBehind: (peerVersion: number) => {
@@ -2129,6 +2210,14 @@ function initializeCluster(
     // if all peers are gone (uses late-binding ref since Raft is created after).
     onPeerDisconnected: () => raftRef?.onPeerDisconnected(),
   });
+
+  const answerPeerForgetRequest: PeerForgetRequestHandler = async (msg) =>
+    forgetDepartedPeer(
+      peerRegistry,
+      config.instanceId,
+      msg.instanceId,
+      await peerForgetGuardsFor(msg.instanceId, msg.acknowledgeBackstop === true),
+    );
 
   // Raft state store
   const raftStateStore = new RaftStateStore({ db, clusterId: 'default' });
@@ -2238,6 +2327,7 @@ function initializeCluster(
       config.rerouteAckTimeoutMs,
     ),
     getRerouteMaxHops: makeOrgNumberReader(db, 'reroute_max_hops', config.rerouteMaxHops),
+    getRerouteSpawnRetry: makeRerouteSpawnRetryReader(db, config),
   });
 
   // Orphan recovery (leader-only)
@@ -2371,20 +2461,23 @@ function initializeCluster(
       }
       return reloader.executeReload({ source: 'cluster', drain: msg.drain });
     },
+    // `kici-admin scaler orphans --target <this coordinator>`, forwarded by a
+    // sibling coordinator. The peer handler refuses one a worker sends.
+    onScalerOrphansRequest: (msg) => answerScalerOrphansRequest(scalerManager, msg),
+    // `kici-admin peer forget` fanned out by a sibling coordinator. The peer
+    // handler refuses one a worker sends.
+    onPeerForgetRequest: answerPeerForgetRequest,
     onPeerClusterSettingsRequest: async () => {
       // A DB-less worker pulls the worker-relevant settings snapshot. The async
-      // DB read lives here (off the synchronous heartbeat hot path). The leader
-      // is the sole holder of cluster_settings, so this resolves live.
-      const agentTokenTtlMs = await clusterSettings.getNumber(
-        'agent_token_ttl_ms',
-        config.agentTokenTtlMs,
-      );
-      const version = clusterSettings.getCachedVersion();
-      logger.info('Serving worker cluster-settings pull', { version, agentTokenTtlMs });
-      return {
-        version,
-        settings: { agentTokenTtlMs },
-      };
+      // DB read lives here (off the synchronous heartbeat hot path). Every
+      // coordinator reads the shared row, so any coordinator answers a pull.
+      // The version and the values come from one read of the row.
+      const { version, settings } = await resolveWorkerClusterSettingsSnapshot(clusterSettings, {
+        agentTokenTtlMs: config.agentTokenTtlMs,
+        firecrackerApiSocketWaitMs: config.firecrackerApiSocketWaitMs,
+      });
+      logger.info('Serving worker cluster-settings pull', { version, ...settings });
+      return { version, settings };
     },
   });
 
@@ -2439,6 +2532,8 @@ function initializeCluster(
 
   return {
     peerRegistry,
+    answerPeerForgetRequest,
+    peerForgetGuardsFor,
     raft: raftNode,
     coordinator,
     orphanRecovery,
@@ -3798,7 +3893,7 @@ export async function bootstrapOrchestrator(
     hasLiveCoordinatorPeer(
       cluster.peerRegistry,
       Date.now(),
-      await clusterSettings.getNumber('reroute_flap_grace_ms', config.rerouteFlapGraceMs),
+      await readRerouteFlapGraceMs(config, clusterSettings),
     );
   if (scalerManager) {
     const manager = scalerManager;
@@ -3854,7 +3949,7 @@ export async function bootstrapOrchestrator(
         // flap the other reaps on. Floored, because the two consumers do not
         // carry the same risk — see `reaperFlapGraceMs`.
         flapGraceMs: reaperFlapGraceMs(
-          await clusterSettings.getNumber('reroute_flap_grace_ms', config.rerouteFlapGraceMs),
+          await readRerouteFlapGraceMs(config, clusterSettings),
           config.cluster.peerStaleTimeoutMs,
         ),
         strandedTimeoutMs: await clusterSettings.getNumber(
@@ -4199,6 +4294,7 @@ export async function bootstrapOrchestrator(
     orphanRecovery: cluster.orphanRecovery,
     peerHandler: cluster.peerHandler,
     peerClients: cluster.peerClients,
+    answerPeerForgetRequest: cluster.answerPeerForgetRequest,
     getLocalInventory: cluster.getLocalInventory,
     broadcastHeartbeatToAllPeers: cluster.broadcastHeartbeatToAllPeers,
     broadcastAgentTokenRevoke: cluster.broadcastAgentTokenRevoke,
@@ -4488,6 +4584,101 @@ export async function bootstrapOrchestrator(
 
     return null;
   };
+
+  // Forward a scaler orphan request (`kici-admin scaler orphans --target`) to
+  // a peer over the cluster connection: the outgoing PeerClient first, then the
+  // incoming peer-handler connections. A stop is sent on one path only — the
+  // second is tried only when the first could not send at all.
+  const forwardScalerOrphansToPeer = async (
+    targetInstanceId: string,
+    req: ScalerOrphansRequest,
+    timeoutMs: number,
+  ): Promise<PeerScalerOrphansResponse | ScalerOrphansForwardFailure> => {
+    const msg = {
+      type: 'peer.scaler.orphans.request' as const,
+      messageId: crypto.randomUUID(),
+      action: req.action,
+      ...(req.vmIds ? { vmIds: req.vmIds } : {}),
+    };
+    const outgoing = cluster.peerClients.get(targetInstanceId);
+    if (outgoing && outgoing.state === 'connected') {
+      const response = await outgoing.sendScalerOrphansAndWait(msg, timeoutMs);
+      if (response) return response;
+    }
+    const response = await cluster.peerHandler.sendScalerOrphansAndWait(
+      targetInstanceId,
+      msg,
+      timeoutMs,
+    );
+    return response ?? ScalerOrphansForwardFailure.enum['not-connected'];
+  };
+  // `kici-admin peer forget`: forget a departed peer here, then on every
+  // connected sibling coordinator, each of which holds its own registry. A
+  // forget is sent on one path only: the incoming connection is tried only
+  // when the outgoing PeerClient could not send at all.
+  const sendPeerForget: SendPeerForget = async (siblingInstanceId, msg, timeoutMs) => {
+    const outgoing = cluster.peerClients.get(siblingInstanceId);
+    const response =
+      outgoing && outgoing.state === 'connected'
+        ? await outgoing.sendPeerForgetAndWait(msg, timeoutMs)
+        : null;
+    return response ?? cluster.peerHandler.sendPeerForgetAndWait(siblingInstanceId, msg, timeoutMs);
+  };
+  if (adminDeps) {
+    adminDeps.peerForget = {
+      forget: async (instanceId, timeoutMs, acknowledgeBackstop) =>
+        forgetAcrossCoordinators(
+          cluster.peerRegistry,
+          config.instanceId,
+          instanceId,
+          timeoutMs,
+          await cluster.peerForgetGuardsFor(instanceId, acknowledgeBackstop),
+          sendPeerForget,
+        ),
+    };
+  }
+
+  // `kici-admin cluster-settings show`: which settings version each peer
+  // heartbeats, beside the version this coordinator's own reads serve (the one
+  // its heartbeat advertises).
+  if (adminDeps) {
+    adminDeps.clusterSettingsPropagation = {
+      instanceId: config.instanceId,
+      peerRegistry: cluster.peerRegistry,
+      localVersion: () => clusterSettings.getCachedVersion(),
+    };
+  }
+
+  // `createApp` below mounts the admin routes, so this lands before they do.
+  if (adminDeps) {
+    adminDeps.scalerOrphans = {
+      instanceId: config.instanceId,
+      role: config.cluster.role,
+      peerRole: (instanceId) => cluster.peerRegistry.getPeer(instanceId)?.role,
+      answerLocal: (req) => answerScalerOrphansRequest(scalerManager, req),
+      forward: forwardScalerOrphansToPeer,
+      findBindings: (agentIds) => findActiveJobBindings(db, agentIds),
+      disconnectedCoordinators: () =>
+        disconnectedCoordinatorIds(cluster.peerRegistry, config.instanceId),
+      findRegistrations: (agentIds) => {
+        const wanted = new Set(agentIds);
+        const found = new Map<string, string>();
+        for (const agentId of wanted) {
+          if (agentRegistry.get(agentId)) found.set(agentId, config.instanceId);
+        }
+        // A peer's heartbeat lists the agents registered with it. A peer's list
+        // is emptied when it disconnects, so only connected peers answer here.
+        for (const peer of cluster.peerRegistry.getAllPeers()) {
+          for (const agent of peer.agents) {
+            if (wanted.has(agent.agentId) && !found.has(agent.agentId)) {
+              found.set(agent.agentId, peer.instanceId);
+            }
+          }
+        }
+        return found;
+      },
+    };
+  }
 
   const configRouteDeps: ConfigRouteDeps | undefined = config.secretKey
     ? {

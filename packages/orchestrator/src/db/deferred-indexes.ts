@@ -93,6 +93,13 @@ export const DEFERRED_INDEXES: ReadonlyArray<DeferredIndex> = [
             ON public.execution_runs USING btree (parent_run_id)
          WHERE parent_run_id IS NOT NULL`,
   },
+  {
+    // `kici-admin event show` lists the runs an internal event dispatched,
+    // which is a `delivery_id` lookup on a table that grows with run volume.
+    name: 'execution_runs_delivery_id_idx',
+    sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS execution_runs_delivery_id_idx
+            ON public.execution_runs USING btree (delivery_id)`,
+  },
 ];
 
 /**

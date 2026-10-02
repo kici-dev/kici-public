@@ -316,26 +316,29 @@ Both apply whether or not the request names `permissions` explicitly. A request 
 
 ## Orchestrator-side RBAC: access log and run cancel
 
-The orchestrator has its own fixed 3-role (`owner` / `admin` / `auditor`) RBAC model for its admin HTTP surface (`packages/orchestrator/src/secrets/rbac.ts`), spanning 23 fine-grained permissions. The read-attribution and admin-surface permissions are:
+The orchestrator has its own fixed 3-role (`owner` / `admin` / `auditor`) RBAC model for its admin HTTP surface (`packages/orchestrator/src/secrets/rbac.ts`), with fine-grained permissions. The read-attribution and admin-surface permissions are:
 
-| Permission               | Granted to            | Guards                                                                              |
-| ------------------------ | --------------------- | ----------------------------------------------------------------------------------- |
-| `access_log.read`        | owner, admin, auditor | `GET /api/v1/admin/access-log` + `GET /api/v1/admin/access-log/:id` + CLI list/show |
-| `event_log.read`         | owner, admin, auditor | List/show webhook event-log metadata rows                                           |
-| `event_log.read_payload` | owner, admin          | Read raw webhook payload bodies (may contain PII)                                   |
-| `event_dlq.read`         | owner, admin, auditor | List/show entries in the webhook event dead-letter queue                            |
-| `event_dlq.manage`       | owner, admin          | Requeue or discard webhook event DLQ entries                                        |
-| `run.cancel`             | owner, admin          | `POST /api/v1/admin/runs/:runId/cancel`                                             |
-| `secret.reveal`          | owner, admin          | The `?reveal=true` variant of the run secret-outputs admin route (decrypts values)  |
-| `scheduled_job.trigger`  | owner, admin          | `POST /api/v1/admin/scheduled-jobs/:name/trigger` (manually fire a scheduled job)   |
-| `attestation.retry`      | owner, admin          | Drain / re-arm the deferred-attestation outbox                                      |
-| `orchestrator.drain`     | owner, admin          | `GET`/`POST /api/v1/admin/orchestrator/drain` (drain, resume, status)               |
-| `ci_trust.read`          | owner, admin          | `GET /api/v1/admin/trust-policy` (read the org-wide CI trust policy)                |
-| `ci_trust.admin`         | owner, admin          | `PATCH /api/v1/admin/trust-policy` (modify org-wide trust policies)                 |
+| Permission               | Granted to            | Guards                                                                                                                                         |
+| ------------------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `access_log.read`        | owner, admin, auditor | `GET /api/v1/admin/access-log` + `GET /api/v1/admin/access-log/:id` + CLI list/show                                                            |
+| `event_log.read`         | owner, admin, auditor | List/show webhook event-log metadata rows                                                                                                      |
+| `event_log.read_payload` | owner, admin          | Read raw webhook payload bodies (may contain PII)                                                                                              |
+| `event_dlq.read`         | owner, admin, auditor | List/show entries in the webhook event dead-letter queue, and `kici-admin event list/show` (payload bodies also need `event_log.read_payload`) |
+| `event_dlq.manage`       | owner, admin          | Requeue or discard webhook event DLQ entries                                                                                                   |
+| `run.cancel`             | owner, admin          | `POST /api/v1/admin/runs/:runId/cancel`                                                                                                        |
+| `secret.reveal`          | owner, admin          | The `?reveal=true` variant of the run secret-outputs admin route (decrypts values)                                                             |
+| `scheduled_job.trigger`  | owner, admin          | `POST /api/v1/admin/scheduled-jobs/:name/trigger` (manually fire a scheduled job)                                                              |
+| `attestation.retry`      | owner, admin          | Drain / re-arm the deferred-attestation outbox                                                                                                 |
+| `orchestrator.drain`     | owner, admin          | `GET`/`POST /api/v1/admin/orchestrator/drain` (drain, resume, status)                                                                          |
+| `ci_trust.read`          | owner, admin          | `GET /api/v1/admin/trust-policy` (read the org-wide CI trust policy)                                                                           |
+| `ci_trust.admin`         | owner, admin          | `PATCH /api/v1/admin/trust-policy` (modify org-wide trust policies)                                                                            |
+| `scaler.read`            | owner, admin, auditor | `GET /api/v1/admin/scaler/orphans` (list a node's live Firecracker VMs and how each is tracked)                                                |
+| `peer.manage`            | owner, admin          | `POST /api/v1/admin/peers/forget` (drop a peer that left the cluster from the coordinators' live peer lists)                                   |
+| `scaler.manage`          | owner, admin          | `POST /api/v1/admin/scaler/orphans/stop` (stop live Firecracker VMs the node's orchestrator does not track)                                    |
 
-`access_log.read`, `event_log.read`, and `event_dlq.read` are deliberately granted to the `auditor` role — an auditor's job is to read the access log, the webhook event log, and the webhook event DLQ without being able to mutate anything. The remaining permissions are restricted to `owner` + `admin` because each either discloses sensitive payload data or mutates state (read raw payload bodies that may contain PII, requeue/discard a DLQ entry, cancel a run, decrypt and disclose a stored secret value, fire a periodic job out-of-band, re-arm the deferred-attestation outbox, quiesce the coordinator, or read and change the org trust policy that decides whether a fork PR runs at all) and is not appropriate for a read-only auditor role.
+The `auditor` role deliberately holds `access_log.read`, `event_log.read`, `event_dlq.read`, and `scaler.read`. An auditor reads the access log, the webhook event log, the webhook event DLQ, and a node's live VMs, and can mutate nothing. Only `owner` + `admin` hold the other permissions, because each one discloses sensitive payload data or mutates state. They read raw payload bodies that may contain PII, requeue or discard a DLQ entry, or cancel a run. They decrypt and disclose a stored secret value, fire a periodic job out-of-band, or re-arm the deferred-attestation outbox. They also quiesce the coordinator, read and change the org trust policy that decides whether a fork PR runs at all, stop a VM on a host, or change which peers the coordinators expect. None of these suits a read-only auditor role.
 
-The full 23-permission matrix, including the `context.*` / `secret.*` / `token.manage` / `key.rotate` permissions, is in the [`kici-admin` CLI reference](../../operator/orchestrator/kici-admin-cli.md#rbac-roles).
+The full permission matrix, including the `context.*` / `secret.*` / `token.manage` / `key.rotate` permissions, is in the [`kici-admin` CLI reference](../../operator/orchestrator/kici-admin-cli.md#rbac-roles).
 
 These permissions guard the orchestrator's admin HTTP surface only. The Platform-side dashboard routes continue to use the Platform RBAC resources (`runs:write` for cancel, `audit:read` for the Data access tab).
 

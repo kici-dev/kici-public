@@ -145,6 +145,7 @@ import {
 import type { EventRouter } from './events/event-router.js';
 import type { EventStore } from './events/event-store.js';
 import { createAdminEventDlqRoutes } from './routes/admin-event-dlq.js';
+import { createAdminEventInspectRoutes } from './routes/admin-event-inspect.js';
 import { resolveBearerAuth } from './routes/admin-auth.js';
 import { createOnErrorHandler } from './app-on-error.js';
 import type { EventEmitter } from './events/event-emitter.js';
@@ -1864,6 +1865,15 @@ export function createApp(deps: AppDependencies) {
         tokenManager: deps.adminDeps.tokenManager,
         rbac: deps.adminDeps.rbac,
         accessLog: deps.accessLogWriter,
+      }),
+    );
+    app.route(
+      '',
+      createAdminEventInspectRoutes({
+        db: deps.db,
+        eventStore: deps.eventStore,
+        tokenManager: deps.adminDeps.tokenManager,
+        rbac: deps.adminDeps.rbac,
       }),
     );
   }

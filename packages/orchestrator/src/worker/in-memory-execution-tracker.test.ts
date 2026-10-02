@@ -26,6 +26,33 @@ describe('InMemoryExecutionTracker', () => {
     expect(status!.jobs.size).toBe(2);
   });
 
+  it('dropJob removes the job without forwarding it', async () => {
+    const forward = vi.fn();
+    const tracker = new InMemoryExecutionTracker({ onStatusForward: forward });
+    await tracker.onExecutionStarted(
+      'run-1',
+      'build',
+      'github',
+      'owner/repo',
+      'refs/heads/main',
+      'abc123',
+      'delivery-1',
+      {},
+      null,
+      makeJobs(['lint', 'test']),
+    );
+
+    tracker.dropJob('run-1', 'job-0');
+    // fails-when: the worker reports a verdict the coordinator already made
+    expect(forward).not.toHaveBeenCalled();
+    expect(tracker.getRunStatus('run-1')!.jobs.has('job-0')).toBe(false);
+    expect(tracker.getRunStatus('run-1')!.jobs.has('job-1')).toBe(true);
+
+    tracker.dropJob('run-1', 'job-1');
+    expect(tracker.getRunStatus('run-1')).toBeNull();
+    expect(forward).not.toHaveBeenCalled();
+  });
+
   it('returns null for unknown runs', () => {
     const tracker = new InMemoryExecutionTracker({});
     expect(tracker.getRunStatus('unknown')).toBeNull();

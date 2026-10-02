@@ -147,7 +147,7 @@ export const peerHeartbeatSchema = z.object({
   configVersion: z.number().optional(),
   /** Registry version for cross-orchestrator registration sync (backward compatible). */
   registryVersion: z.number().optional(),
-  /** Shared cluster-settings version for leader→worker settings pull (backward compatible). */
+  /** Cluster-settings version for the coordinator→worker settings pull (backward compatible). */
   clusterSettingsVersion: z.number().optional(),
   timestamp: z.number(),
   // --- OS metadata (optional, for diagnostics visibility) ---
@@ -165,6 +165,16 @@ export const peerHeartbeatSchema = z.object({
 });
 
 // --- Job rerouting ---
+
+/**
+ * The spawn-retry budget a worker applies to one rerouted job: how many agent
+ * spawns it attempts, and how long it waits after a failed one. The sending
+ * coordinator resolves it per org and enforces the same budget on its side.
+ */
+export const rerouteSpawnRetrySchema = z.object({
+  maxAttempts: z.number().int().min(1),
+  backoffMs: z.number().int().min(0),
+});
 
 /** Request to reroute a job to another orchestrator (no local agent can handle it). */
 export const jobRerouteSchema = z.object({
@@ -203,6 +213,11 @@ export const jobRerouteSchema = z.object({
   excludePatterns: z.array(LabelMatcher).optional(),
   triedConnections: z.array(z.string()),
   maxHops: z.number(),
+  /**
+   * The worker's spawn-retry budget for this job. Absent from an older sender:
+   * the worker applies its own configured default.
+   */
+  spawnRetry: rerouteSpawnRetrySchema.optional(),
   coordinatorId: z.string(),
   requestId: z.string().optional(),
   traceId: z.string().optional(),
@@ -394,8 +409,130 @@ export const peerConfigReloadResponseSchema = z.object({
   fieldsChanged: z.array(z.string()).optional(),
 });
 
+// --- Scaler orphans (per-instance targeting) ---
+
+/** How a live Firecracker VM relates to the orchestrator on its host. */
+export const ScalerVmStatus = z.enum(['orphaned', 'unverified', 'tracked']);
+export type ScalerVmStatus = z.infer<typeof ScalerVmStatus>;
+
+/** What tracks a live VM. `bound-job` is answered from a coordinator's dispatch queue. */
+export const ScalerVmTracker = z.enum(['backend', 'spawning', 'registered', 'bound-job']);
+export type ScalerVmTracker = z.infer<typeof ScalerVmTracker>;
+
+/** What a stop did to one VM. Only `stopped` signalled anything. */
+export const ScalerVmStopOutcome = z.enum([
+  'stopped',
+  'tracked',
+  'unverified',
+  'not-live',
+  'not-found',
+  'error',
+]);
+export type ScalerVmStopOutcome = z.infer<typeof ScalerVmStopOutcome>;
+
+/** What a scaler orphan request asks the target node to do. */
+export const ScalerOrphansAction = z.enum(['list', 'stop']);
+export type ScalerOrphansAction = z.infer<typeof ScalerOrphansAction>;
+
+/** One live Firecracker VM on a node, as its orchestrator sees it. */
+export const scalerLiveVmSchema = z.object({
+  vmId: z.string(),
+  scaler: z.string(),
+  pid: z.number().int().positive(),
+  startedAt: z.string(),
+  ageSeconds: z.number().nonnegative(),
+  chrootDir: z.string(),
+  status: ScalerVmStatus,
+  trackedBy: z.array(ScalerVmTracker),
+  reason: z.string(),
+});
+export type ScalerLiveVm = z.infer<typeof scalerLiveVmSchema>;
+
+/** The result of stopping one VM. `pid` is the process that was (or would be) signalled. */
+export const scalerVmStopResultSchema = z.object({
+  vmId: z.string(),
+  outcome: ScalerVmStopOutcome,
+  pid: z.number().int().positive().optional(),
+  detail: z.string(),
+});
+export type ScalerVmStopResult = z.infer<typeof scalerVmStopResultSchema>;
+
 /**
- * Worker-relevant cluster settings a DB-less worker pulls from the leader.
+ * Scaler orphan request: forwarded by a coordinator to the node an operator
+ * targeted with `kici-admin scaler orphans --target`. The node answers from
+ * its own host and its own tracking with peer.scaler.orphans.response.
+ */
+export const peerScalerOrphansRequestSchema = z.object({
+  type: z.literal('peer.scaler.orphans.request'),
+  messageId: z.string(),
+  action: ScalerOrphansAction,
+  /** `stop` only: the VM ids the operator approved. */
+  vmIds: z.array(z.string()).optional(),
+});
+
+/**
+ * Scaler orphan response. `vms` answers a `list`, `results` answers a `stop`;
+ * `ok: false` carries the node's `error` instead.
+ */
+export const peerScalerOrphansResponseSchema = z.object({
+  type: z.literal('peer.scaler.orphans.response'),
+  messageId: z.string(),
+  ok: z.boolean(),
+  error: z.string().optional(),
+  /** The node's Firecracker scaler names; empty when it runs none. */
+  firecrackerScalers: z.array(z.string()).optional(),
+  vms: z.array(scalerLiveVmSchema).optional(),
+  results: z.array(scalerVmStopResultSchema).optional(),
+});
+
+// --- Peer forget (fan-out from the coordinator that received it) ---
+
+/**
+ * What forgetting a departed peer did on one coordinator. `recent`: the peer
+ * was heard from inside the window this coordinator still treats it as alive
+ * for (the longer of the stale window and the reroute flap grace, or the
+ * backstop grace of a peer that adopted provisions), so it may be partitioned
+ * rather than gone. `acknowledgement-required`: forgetting it would switch this
+ * coordinator's event-provision backstop back on, and the request did not
+ * acknowledge that. Every outcome but `forgotten` keeps the peer.
+ */
+export const PeerForgetOutcome = z.enum([
+  'forgotten',
+  'not-found',
+  'connected',
+  'recent',
+  'acknowledgement-required',
+  'error',
+]);
+export type PeerForgetOutcome = z.infer<typeof PeerForgetOutcome>;
+
+/**
+ * Forget request: a coordinator that forgot a departed peer (`kici-admin peer
+ * forget`) asks each connected sibling coordinator to drop it from its own
+ * live peer registry too.
+ */
+export const peerForgetRequestSchema = z.object({
+  type: z.literal('peer.forget.request'),
+  messageId: z.string(),
+  /** The departed peer's instance id. */
+  instanceId: z.string(),
+  /**
+   * The operator acknowledged that forgetting the peer may switch the
+   * event-provision backstop back on. Absent means not acknowledged.
+   */
+  acknowledgeBackstop: z.boolean().optional(),
+});
+
+/** Forget response: what the sibling did with the request. */
+export const peerForgetResponseSchema = z.object({
+  type: z.literal('peer.forget.response'),
+  messageId: z.string(),
+  outcome: PeerForgetOutcome,
+  detail: z.string(),
+});
+
+/**
+ * Worker-relevant cluster settings a DB-less worker pulls from a coordinator.
  *
  * A typed, concrete snapshot (not an open key/value bus): each worker-consumed
  * cluster knob is a field here. Adding the next worker-relevant knob is one
@@ -403,12 +540,18 @@ export const peerConfigReloadResponseSchema = z.object({
  */
 export const workerClusterSettingsSchema = z.object({
   agentTokenTtlMs: z.number(),
+  /**
+   * How long a Firecracker spawn waits for the VM's API socket. Optional: a
+   * leader that predates the knob omits it, and the worker keeps its own
+   * configured default.
+   */
+  firecrackerApiSocketWaitMs: z.number().optional(),
 });
 
 /**
- * Cluster-settings pull request: a DB-less worker asks the leader for the
- * current worker-settings snapshot after observing the leader's advertised
- * clusterSettingsVersion ahead of its own. The leader replies with
+ * Cluster-settings pull request: a DB-less worker asks a connected coordinator
+ * for the current worker-settings snapshot after a coordinator advertised a
+ * clusterSettingsVersion ahead of its own. The coordinator replies with
  * peer.clusterSettings.response.
  */
 export const peerClusterSettingsRequestSchema = z.object({
@@ -417,7 +560,7 @@ export const peerClusterSettingsRequestSchema = z.object({
 });
 
 /**
- * Cluster-settings pull response: the leader resolves the snapshot from
+ * Cluster-settings pull response: the coordinator resolves the snapshot from
  * cluster_settings and replies with it plus the current version.
  */
 export const peerClusterSettingsResponseSchema = z.object({
@@ -511,6 +654,13 @@ export const peerScalerEventSchema = z.object({
   detail: z.string(),
   /** Event timestamp in epoch milliseconds. */
   timestampMs: z.number(),
+  /**
+   * The worker's retry verdict on a `scaler.failed` for a job under its spawn-retry
+   * budget: false while attempts remain, true on the last one. Absent on a repeated
+   * report of one failed spawn, on every other relay, and from an older worker; the
+   * coordinator then keeps its spawn window running unchanged.
+   */
+  final: z.boolean().optional(),
 });
 
 // --- Discriminated unions ---
@@ -535,6 +685,10 @@ export const peerToPeerMessageSchema = z.discriminatedUnion('type', [
   peerCacheUploadResponseSchema,
   peerConfigReloadSchema,
   peerConfigReloadResponseSchema,
+  peerScalerOrphansRequestSchema,
+  peerScalerOrphansResponseSchema,
+  peerForgetRequestSchema,
+  peerForgetResponseSchema,
   peerClusterSettingsRequestSchema,
   peerClusterSettingsResponseSchema,
   peerLogsCollectRequestSchema,
@@ -565,6 +719,10 @@ export const peerFromPeerMessageSchema = z.discriminatedUnion('type', [
   peerCacheUploadResponseSchema,
   peerConfigReloadSchema,
   peerConfigReloadResponseSchema,
+  peerScalerOrphansRequestSchema,
+  peerScalerOrphansResponseSchema,
+  peerForgetRequestSchema,
+  peerForgetResponseSchema,
   peerClusterSettingsRequestSchema,
   peerClusterSettingsResponseSchema,
   peerLogsCollectRequestSchema,
@@ -581,6 +739,7 @@ export type PeerCapabilities = z.infer<typeof peerCapabilitiesSchema>;
 export type ScalerCapacitySummary = z.infer<typeof scalerCapacitySummarySchema>;
 export type PeerHeartbeat = z.infer<typeof peerHeartbeatSchema>;
 export type JobReroute = z.infer<typeof jobRerouteSchema>;
+export type RerouteSpawnRetry = z.infer<typeof rerouteSpawnRetrySchema>;
 export type JobProgress = z.infer<typeof jobProgressSchema>;
 export type JobProgressAck = z.infer<typeof jobProgressAckSchema>;
 export type PeerScalerEvent = z.infer<typeof peerScalerEventSchema>;
@@ -593,6 +752,10 @@ export type PeerCacheUploadRequest = z.infer<typeof peerCacheUploadRequestSchema
 export type PeerCacheUploadResponse = z.infer<typeof peerCacheUploadResponseSchema>;
 export type PeerConfigReload = z.infer<typeof peerConfigReloadSchema>;
 export type PeerConfigReloadResponse = z.infer<typeof peerConfigReloadResponseSchema>;
+export type PeerScalerOrphansRequest = z.infer<typeof peerScalerOrphansRequestSchema>;
+export type PeerScalerOrphansResponse = z.infer<typeof peerScalerOrphansResponseSchema>;
+export type PeerForgetRequest = z.infer<typeof peerForgetRequestSchema>;
+export type PeerForgetResponse = z.infer<typeof peerForgetResponseSchema>;
 export type WorkerClusterSettings = z.infer<typeof workerClusterSettingsSchema>;
 export type PeerClusterSettingsRequest = z.infer<typeof peerClusterSettingsRequestSchema>;
 export type PeerClusterSettingsResponse = z.infer<typeof peerClusterSettingsResponseSchema>;

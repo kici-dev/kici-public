@@ -250,6 +250,78 @@ describe('InMemoryJobQueue', () => {
     expect(job).toBeNull();
   });
 
+  describe('stop mark', () => {
+    it('a stopped pending job is never claimed, listed or counted', async () => {
+      const queue = new InMemoryJobQueue();
+      await queue.enqueue(makeInput({ jobId: 'job-1', pinnedAgentId: 'agent-1' }));
+      expect(queue.isPending('job-1')).toBe(true);
+
+      expect(queue.stop('run-1', 'job-1')).toEqual({ pending: ['job-1'], dispatched: [] });
+
+      // fails-when: a claim path skips the stop check
+      expect(await queue.dequeueById('job-1', ['linux'])).toBeNull();
+      expect(await queue.dequeueForLabels(['linux'])).toBeNull();
+      expect(await queue.dequeueByPinnedAgent('agent-1', ['linux'])).toBeNull();
+      expect(await queue.listPending(10)).toEqual([]);
+      expect(await queue.getPendingJobs()).toEqual([]);
+      expect(await queue.getDepth()).toBe(0);
+      expect(queue.isPending('job-1')).toBe(false);
+    });
+
+    it('an unrelated job still dequeues', async () => {
+      const queue = new InMemoryJobQueue();
+      await queue.enqueue(makeInput({ jobId: 'job-1' }));
+      await queue.enqueue(makeInput({ jobId: 'job-2', runId: 'run-2' }));
+      queue.stop('run-1');
+      // breaks-if-wrong: stop leaks past its run
+      expect((await queue.dequeueForLabels(['linux']))?.id).toBe('job-2');
+      expect(await queue.getDepth()).toBe(0);
+    });
+
+    it('stop without a jobId covers every job of the run', async () => {
+      const queue = new InMemoryJobQueue();
+      await queue.enqueue(makeInput({ jobId: 'job-1' }));
+      await queue.enqueue(makeInput({ jobId: 'job-2' }));
+      const claimed = await queue.dequeueForLabels(['linux']);
+      expect(claimed?.id).toBe('job-1');
+      expect(queue.stop('run-1')).toEqual({ pending: ['job-2'], dispatched: ['job-1'] });
+    });
+
+    it('requeue drops a stopped dispatched job instead of re-pending it', async () => {
+      const queue = new InMemoryJobQueue();
+      await queue.enqueue(makeInput({ jobId: 'job-1' }));
+      await queue.dequeueById('job-1', ['linux']);
+      queue.stop('run-1', 'job-1');
+      // fails-when: requeue re-pends a job its coordinator stopped
+      expect(await queue.requeue('job-1')).toBeNull();
+      expect(await queue.getFullJobById('job-1')).toBeNull();
+      expect(await queue.getDepth()).toBe(0);
+    });
+
+    it('requeue still re-pends a dispatched job nobody stopped', async () => {
+      const queue = new InMemoryJobQueue();
+      await queue.enqueue(makeInput({ jobId: 'job-1' }));
+      await queue.dequeueById('job-1', ['linux']);
+      // breaks-if-wrong: an agent dropping a job loses it instead of retrying it
+      expect(await queue.requeue('job-1')).toBe(1);
+      expect(queue.isPending('job-1')).toBe(true);
+    });
+
+    it('settleClaimOfStoppedRun reports nothing left to settle', async () => {
+      const queue = new InMemoryJobQueue();
+      expect(await queue.settleClaimOfStoppedRun('job-1', 'run-1')).toBe(false);
+    });
+
+    it('markFailed clears the stop mark', async () => {
+      const queue = new InMemoryJobQueue();
+      await queue.enqueue(makeInput({ jobId: 'job-1' }));
+      queue.stop('run-1', 'job-1');
+      await queue.markFailed('job-1', 'cancelled');
+      await queue.enqueue(makeInput({ jobId: 'job-1' }));
+      expect((await queue.dequeueById('job-1', ['linux']))?.id).toBe('job-1');
+    });
+  });
+
   describe('requeue and dispatched tracking', () => {
     it('requeues a dispatched job back to pending with a bumped attempt count', async () => {
       const queue = new InMemoryJobQueue();

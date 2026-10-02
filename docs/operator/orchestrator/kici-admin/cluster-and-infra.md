@@ -79,19 +79,25 @@ kici-admin cluster-settings reset [--<knob> ...]
 
 Reads and writes the cluster-global tunables — one row shared by every orchestrator in the cluster. These are the knobs with no per-tenant meaning: ingest limits applied before an org is resolved, process-global singletons, and leader-only sweeper timings. Per-tenant knobs live in [`org-settings`](./org-settings.md) instead.
 
-- `show` prints every knob with its effective value; a knob left unset shows as `null`, meaning the cluster default from the orchestrator's own configuration applies.
+- `show` prints every knob with its effective value; a knob left unset shows as `null`, meaning the cluster default from the orchestrator's own configuration applies. It then lists the settings version that each coordinator and worker applied, and flags each one that is not on the current version — see [Confirm a change reached every orchestrator](../cluster-settings.md#confirm-a-change-reached-every-orchestrator). `--format json` adds the same data as a `propagation` key; all other keys do not change. Reading the list needs a token with no routing-key scope.
 - `set` requires at least one knob flag and takes several in a single call. Each numeric knob enforces a floor (the same floor the admin route validates against), so a value below it is rejected rather than silently clamped.
 - `reset` clears the named knobs back to `null` (the configured default). Passing no knob flag clears **every** knob at once.
 
 Changing a knob takes effect on the running cluster without a restart — the orchestrator reads these values live at each operation. The exception is the six cache-sizing knobs (`--lockfile-cache-*` and `--content-cache-*`): those bounds are structural to caches built once at boot, so a change to one **applies at the next orchestrator restart**. See [Cluster settings](../cluster-settings.md) for the full per-knob table, including what each one governs and its default.
 
-### scaler -- scaler maintenance (local, no orchestrator)
+### scaler -- scaler maintenance
 
 ```bash
+kici-admin scaler orphans [--target <instance-id>] [--all] [--json]
+kici-admin scaler orphans --stop [--vm <id>]... [--yes] [--dry-run] [--target <instance-id>] [--timeout <seconds>]
 kici-admin scaler reap-orphans [--config <path>] [--force] [--json]
 ```
 
-Frees leaked Firecracker / container resources (orphaned microVMs, TAP devices, containers) without a running orchestrator. Runs locally against the host using the orchestrator config, so it is the recovery path when the orchestrator crashed and left scaler-managed resources behind.
+`orphans` lists the live Firecracker VMs that a node's running orchestrator does not track: no in-memory VM, no spawn in progress, no registered agent, and no job bound to its agent. With no `--target`, the coordinator that `--url` names answers for its own host. With `--target`, the coordinator forwards the request to that node over the authenticated cluster connection, so one URL and one token reach every worker. `kici-admin debug-bundle --fleet --list` shows the instance ids. Each VM is `orphaned`, `unverified` (a process runs at its PID but is not provably its firecracker) or `tracked` (shown only with `--all`). While a coordinator peer of the cluster is not connected, the coordinator cannot rule out an agent registered with that peer. Every untracked VM is then `unverified`, the output names the missing peers, and `--stop` stops nothing.
+
+`--stop` shows the orphaned VMs, asks for confirmation (`--yes` skips it, `--dry-run` stops nothing), and stops exactly those VMs. It never sends an `unverified` VM. The node checks each VM again when it stops it, and refuses one that became tracked since the listing. The command exits 1 when a VM comes back as anything other than `stopped`, or when a `--vm` id is not an orphaned VM and so is never sent. Listing needs the `scaler.read` permission (owner, admin, auditor); stopping needs `scaler.manage` (owner, admin). Both need a token with no routing-key scope, and the coordinator records each stop in the access log as `scaler.orphan.stop`. See [A live VM the orchestrator does not track](../firecracker/host-setup.md#a-live-vm-the-orchestrator-does-not-track).
+
+`reap-orphans` frees leaked Firecracker / container resources (orphaned microVMs, TAP devices, containers) without a running orchestrator. Runs locally against the host using the orchestrator config, so it is the recovery path when the orchestrator crashed and left scaler-managed resources behind. It never stops a Firecracker VM whose process still runs; use `orphans --stop` for that.
 
 By default the command refuses to reap when a local orchestrator reports healthy (so it never races a live process); pass `--force` to override.
 
@@ -227,6 +233,7 @@ Synopsis: `kici-admin cluster-settings reset [options]`
 | `--global-eval-candidate-timeout-ms`                |         | Clear only Global eval candidate timeout (ms)         |
 | `--global-eval-cache-max`                           |         | Clear only Global eval round-result cache max entries |
 | `--global-eval-wait-timeout-ms`                     |         | Clear only Global eval wait timeout (ms)              |
+| `--firecracker-api-socket-wait-ms`                  |         | Clear only Firecracker API socket wait (ms)           |
 | `--scaler-reap-interval-ms`                         |         | Clear only Scaler reap interval (ms)                  |
 | `--scaler-reap-stranded-timeout-ms`                 |         | Clear only Scaler reap stranded timeout (ms)          |
 | `--scaler-reap-reattempt-interval-ms`               |         | Clear only Scaler reap re-attempt interval (ms)       |
@@ -281,6 +288,7 @@ Synopsis: `kici-admin cluster-settings set [options]`
 | `--global-eval-candidate-timeout-ms <value>`                |         | Global eval candidate timeout (ms) (integer >= 1000)          |
 | `--global-eval-cache-max <value>`                           |         | Global eval round-result cache max entries (integer 1-100000) |
 | `--global-eval-wait-timeout-ms <value>`                     |         | Global eval wait timeout (ms) (integer >= 1000)               |
+| `--firecracker-api-socket-wait-ms <value>`                  |         | Firecracker API socket wait (ms) (integer >= 1000)            |
 | `--scaler-reap-interval-ms <value>`                         |         | Scaler reap interval (ms) (integer >= 5000)                   |
 | `--scaler-reap-stranded-timeout-ms <value>`                 |         | Scaler reap stranded timeout (ms) (integer >= 60000)          |
 | `--scaler-reap-reattempt-interval-ms <value>`               |         | Scaler reap re-attempt interval (ms) (integer >= 60000)       |
@@ -293,7 +301,7 @@ Synopsis: `kici-admin cluster-settings set [options]`
 
 ### `kici-admin cluster-settings show`
 
-Print the current cluster-global tunables
+Print the cluster-global tunables and which settings version each coordinator and worker applied
 
 Synopsis: `kici-admin cluster-settings show [options]`
 
@@ -541,9 +549,28 @@ Synopsis: `kici-admin orchestrator upgrade [options]`
 
 ### `kici-admin scaler`
 
-Scaler maintenance (local, no orchestrator)
+Scaler maintenance
 
 Synopsis: `kici-admin scaler`
+
+### `kici-admin scaler orphans`
+
+List live Firecracker VMs the orchestrator does not track, and stop them with --stop
+
+Synopsis: `kici-admin scaler orphans [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                 |
+| ------------------------ | ------- | ----------------------------------------------------------- |
+| `--target <instance-id>` |         | Node to inspect (default: the orchestrator --url points at) |
+| `--all`                  | `false` | Also list the VMs the orchestrator tracks                   |
+| `--stop`                 | `false` | Stop the orphaned VMs after a confirmation                  |
+| `--vm <id>`              |         | With --stop: stop only this VM (repeatable)                 |
+| `--yes`                  | `false` | With --stop: skip the confirmation prompt                   |
+| `--dry-run`              | `false` | With --stop: show what would be stopped and stop nothing    |
+| `--timeout <seconds>`    | `30`    | How long to wait for a --target node to answer              |
+| `--json`                 | `false` | Emit machine-readable JSON                                  |
 
 ### `kici-admin scaler reap-orphans`
 

@@ -665,6 +665,86 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     expect(rows.get('acmeOrg00001')!.queue_timeout_ms).toBeNull();
   });
 
+  it('GET projects the reroute spawn-retry budget as null when the org row is absent', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
+    const body = (await res.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.rerouteSpawnMaxAttempts).toBeNull();
+    expect(body.settings.rerouteSpawnRetryBackoffMs).toBeNull();
+  });
+
+  it('PATCH sets the reroute spawn-retry budget and GET reads it back (bigint string → number)', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'acmeOrg00001',
+        rerouteSpawnMaxAttempts: 2,
+        rerouteSpawnRetryBackoffMs: 2000,
+      }),
+    });
+    expect(patch.status).toBe(200);
+    const stored = rows.get('acmeOrg00001')!;
+    expect(stored.reroute_spawn_max_attempts).toBe(2);
+    stored.reroute_spawn_retry_backoff_ms = String(stored.reroute_spawn_retry_backoff_ms);
+    const get = await app.request('/org-settings/global-workflows?customerId=acmeOrg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.rerouteSpawnMaxAttempts).toBe(2);
+    expect(body.settings.rerouteSpawnRetryBackoffMs).toBe(2000);
+  });
+
+  it('PATCH leaves the spawn-retry budget alone on an unrelated patch, and null clears it', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'acmeOrg00001',
+        rerouteSpawnMaxAttempts: 4,
+        rerouteSpawnRetryBackoffMs: 0,
+      }),
+    });
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'acmeOrg00001', rerouteMaxHops: 2 }),
+    });
+    const row = rows.get('acmeOrg00001')!;
+    // breaks-if-wrong: an unrelated reroute patch wipes the budget.
+    expect(row.reroute_spawn_max_attempts).toBe(4);
+    expect(Number(row.reroute_spawn_retry_backoff_ms)).toBe(0);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'acmeOrg00001',
+        rerouteSpawnMaxAttempts: null,
+        rerouteSpawnRetryBackoffMs: null,
+      }),
+    });
+    const cleared = rows.get('acmeOrg00001')!;
+    expect(cleared.reroute_spawn_max_attempts).toBeNull();
+    expect(cleared.reroute_spawn_retry_backoff_ms).toBeNull();
+  });
+
+  it('PATCH rejects a spawn budget below its floors (Zod)', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    for (const field of [{ rerouteSpawnMaxAttempts: 0 }, { rerouteSpawnRetryBackoffMs: -1 }]) {
+      // fails-when: a floor is dropped, so a worker could be told to never spawn
+      const res = await app.request('/org-settings/global-workflows', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customerId: 'acmeOrg00001', ...field }),
+      });
+      expect(res.status).toBe(400);
+    }
+  });
+
   it('PATCH rejects a rerouteSpawnWindowMs below the 1000ms floor (Zod)', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);

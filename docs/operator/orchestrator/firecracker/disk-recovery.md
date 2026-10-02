@@ -39,6 +39,9 @@ What it does:
 - **Reaps only dead VMs.** A liveness pre-scan reads each chroot's
   `firecracker.pid` and protects any VM whose process is still alive. Chroots and
   TAP devices belonging to dead VMs are removed; live VMs are never touched.
+  To stop a live VM that the orchestrator does not track, run
+  `kici-admin scaler orphans --stop` against the running orchestrator (see
+  [A live VM the orchestrator does not track](./host-setup.md#a-live-vm-the-orchestrator-does-not-track)).
 - **Reclaims ownership first.** On rootless nodes the reaper reclaims ownership of
   each leaked chroot before deleting it, so disk owned by the jailer's subuid is
   actually freed.

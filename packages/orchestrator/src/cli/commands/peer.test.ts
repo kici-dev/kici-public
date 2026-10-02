@@ -44,7 +44,8 @@ vi.mock('../../cluster/peer-credentials.js', () => {
   };
 });
 
-const { registerPeerCommands } = await import('./peer.js');
+const { registerPeerCommands, runPeerForget } = await import('./peer.js');
+const { PeerForgetOutcome } = await import('@kici-dev/engine');
 
 async function runCommand(
   args: string[],
@@ -467,5 +468,169 @@ describe('peer CLI commands', () => {
       expect(mockResetRaftStateDirect).toHaveBeenCalledWith('postgresql://env-host/kici');
       expect(stdout).toContain('1 rows deleted');
     });
+  });
+});
+
+describe('kici-admin peer forget (runPeerForget)', () => {
+  const result = (coordinator: string, outcome: (typeof PeerForgetOutcome.options)[number]) => ({
+    coordinator,
+    outcome,
+    detail: `${outcome} on ${coordinator}`,
+  });
+
+  function run(
+    results: ReturnType<typeof result>[],
+    opts = { json: false, timeout: '15', yes: false },
+  ) {
+    const out: string[] = [];
+    const client = { forgetPeer: vi.fn(async () => ({ instanceId: 'coord-b', results })) };
+    return {
+      client,
+      out,
+      code: runPeerForget(client, 'coord-b', opts, {
+        out: (line) => out.push(line),
+        confirm: async () => true,
+        interactive: true,
+      }),
+    };
+  }
+
+  it('prints one line per coordinator and exits 0 when every coordinator forgot it', async () => {
+    const r = run([
+      result('coord-a', PeerForgetOutcome.enum.forgotten),
+      result('coord-c', PeerForgetOutcome.enum['not-found']),
+    ]);
+    expect(await r.code).toBe(0);
+    expect(r.client.forgetPeer).toHaveBeenCalledWith({ instanceId: 'coord-b', timeoutMs: 15_000 });
+    expect(r.out).toEqual([
+      'coord-a: forgotten — forgotten on coord-a',
+      'coord-c: not-found — not-found on coord-c',
+    ]);
+  });
+
+  // fails-when: a coordinator that kept the peer (or never answered) exits 0
+  it('exits 1 when a coordinator still has the peer or did not answer', async () => {
+    for (const outcome of [PeerForgetOutcome.enum.connected, PeerForgetOutcome.enum.error]) {
+      const r = run([
+        result('coord-a', PeerForgetOutcome.enum.forgotten),
+        result('coord-c', outcome),
+      ]);
+      expect(await r.code).toBe(1);
+    }
+  });
+
+  it('--json prints the route body', async () => {
+    const r = run([result('coord-a', PeerForgetOutcome.enum.forgotten)], {
+      json: true,
+      timeout: '15',
+      yes: false,
+    });
+    await r.code;
+    expect(JSON.parse(r.out.join('\n'))).toMatchObject({ instanceId: 'coord-b' });
+  });
+
+  it('refuses an out-of-range --timeout', async () => {
+    await expect(run([], { json: false, timeout: '61', yes: false }).code).rejects.toThrow(
+      '--timeout',
+    );
+  });
+  describe('backstop acknowledgement', () => {
+    const consequence =
+      'coord-b is the last coordinator peer this coordinator knows: forgetting it switches the event-provision backstop back on';
+    function client() {
+      return {
+        forgetPeer: vi.fn(async (body: { acknowledgeBackstop?: boolean }) =>
+          body.acknowledgeBackstop
+            ? {
+                instanceId: 'coord-b',
+                results: [result('coord-a', PeerForgetOutcome.enum.forgotten)],
+              }
+            : {
+                instanceId: 'coord-b',
+                results: [result('coord-a', PeerForgetOutcome.enum['acknowledgement-required'])],
+                acknowledgementRequired: true,
+                error: consequence,
+              },
+        ),
+      };
+    }
+    const opts = { json: false, timeout: '15', yes: false };
+
+    it('asks with the consequence and retries with the acknowledgement on yes', async () => {
+      const c = client();
+      const confirm = vi.fn(async () => true);
+      const code = await runPeerForget(c, 'coord-b', opts, {
+        out: () => {},
+        confirm,
+        interactive: true,
+      });
+      expect(confirm).toHaveBeenCalledWith(
+        expect.stringContaining('event-provision backstop back on'),
+      );
+      expect(c.forgetPeer).toHaveBeenLastCalledWith(
+        expect.objectContaining({ acknowledgeBackstop: true }),
+      );
+      expect(code).toBe(0);
+    });
+
+    it('a declined prompt sends no acknowledgement and exits 0', async () => {
+      const c = client();
+      const code = await runPeerForget(c, 'coord-b', opts, {
+        out: () => {},
+        confirm: async () => false,
+        interactive: true,
+      });
+      expect(c.forgetPeer).toHaveBeenCalledTimes(1);
+      expect(code).toBe(0);
+    });
+
+    // fails-when: a script without --yes forgets the backstop-guarding coordinator
+    it('refuses without a terminal and without --yes, naming the consequence', async () => {
+      const c = client();
+      await expect(
+        runPeerForget(c, 'coord-b', opts, {
+          out: () => {},
+          confirm: async () => true,
+          interactive: false,
+        }),
+      ).rejects.toThrow(/backstop back on.*Pass --yes/s);
+      expect(c.forgetPeer).toHaveBeenCalledTimes(1);
+    });
+
+    it('--yes acknowledges up front and never asks', async () => {
+      const c = client();
+      const confirm = vi.fn(async () => true);
+      const code = await runPeerForget(
+        c,
+        'coord-b',
+        { ...opts, yes: true },
+        { out: () => {}, confirm, interactive: false },
+      );
+      expect(c.forgetPeer).toHaveBeenCalledTimes(1);
+      expect(c.forgetPeer).toHaveBeenCalledWith(
+        expect.objectContaining({ acknowledgeBackstop: true }),
+      );
+      expect(confirm).not.toHaveBeenCalled();
+      expect(code).toBe(0);
+    });
+
+    // breaks-if-wrong: a forget with no backstop impact is never prompted for
+    it('sends no acknowledgement when no coordinator needs one', async () => {
+      const r = run([result('coord-a', PeerForgetOutcome.enum.forgotten)]);
+      expect(await r.code).toBe(0);
+      expect(r.client.forgetPeer).toHaveBeenCalledTimes(1);
+      expect(r.client.forgetPeer).toHaveBeenCalledWith({
+        instanceId: 'coord-b',
+        timeoutMs: 15_000,
+      });
+    });
+  });
+
+  it('exits 1 when a coordinator kept a recently seen peer', async () => {
+    const r = run([
+      result('coord-a', PeerForgetOutcome.enum.forgotten),
+      result('coord-c', PeerForgetOutcome.enum.recent),
+    ]);
+    expect(await r.code).toBe(1);
   });
 });

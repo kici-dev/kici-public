@@ -41,6 +41,9 @@ const ALL_PERMISSIONS: Permission[] = [
   'orchestrator.drain',
   'ci_trust.read',
   'ci_trust.admin',
+  'scaler.read',
+  'scaler.manage',
+  'peer.manage',
 ];
 
 describe('RbacEnforcer', () => {
@@ -97,10 +100,37 @@ describe('RbacEnforcer', () => {
         'orchestrator.drain',
         'ci_trust.read',
         'ci_trust.admin',
+        'scaler.manage',
+        'peer.manage',
       ];
       for (const perm of deniedPerms) {
         expect(enforcer.hasPermission('auditor', perm)).toBe(false);
       }
+    });
+  });
+
+  describe('peer.manage permission', () => {
+    it('owner and admin hold peer.manage', () => {
+      expect(enforcer.hasPermission('owner', 'peer.manage')).toBe(true);
+      expect(enforcer.hasPermission('admin', 'peer.manage')).toBe(true);
+    });
+    // fails-when: the read-only role can change cluster membership
+    it('auditor does NOT hold peer.manage', () => {
+      expect(enforcer.hasPermission('auditor', 'peer.manage')).toBe(false);
+    });
+  });
+
+  describe('scaler permissions', () => {
+    it('owner and admin hold scaler.read and scaler.manage', () => {
+      for (const role of ['owner', 'admin'] as const) {
+        expect(enforcer.hasPermission(role, 'scaler.read')).toBe(true);
+        expect(enforcer.hasPermission(role, 'scaler.manage')).toBe(true);
+      }
+    });
+    // fails-when: the read-only role can stop VMs
+    it('auditor reads but never manages', () => {
+      expect(enforcer.hasPermission('auditor', 'scaler.read')).toBe(true);
+      expect(enforcer.hasPermission('auditor', 'scaler.manage')).toBe(false);
     });
   });
 

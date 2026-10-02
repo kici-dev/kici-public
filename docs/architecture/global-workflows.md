@@ -46,8 +46,9 @@ Webhook event (push to myorg/backend)
       Skip if same repo as event source (matched in pass 1)
       Check GlobalWorkflowPolicy (author allow-list, source deny-list)
       Match trigger patterns (repos, branches, requires, ...)
-    Run the pre-run evaluation round for workflows with a filter
-      or a needs-free generator (one round per workflow repo)
+    Run the pre-run evaluation round for workflows with a filter,
+      a needs-free generator, or a paths filter the orchestrator could
+      not decide (one round per workflow repo)
     For each surviving workflow:
       dispatchMatchedWorkflow with a GlobalDispatchIdentity
 ```
@@ -151,6 +152,12 @@ do not exist before the run. It runs on the pipeline's deferred path, after its
 upstream jobs complete, as in a per-repo workflow. A workflow whose only
 generators declare `needs`, and that has no `filter`, needs no round and
 dispatches directly.
+
+The orchestrator cannot decide a `paths` filter when the provider cannot list the
+changed files but the event carries a git range. The same round decides that
+filter from a diff of the agent's clone, before the `filter` runs. On no match,
+the workflow gets no run. A workflow cleared by the round dispatches its
+jobs without a second path check.
 
 A round for a workflow that also declares a `needs` generator must skip that
 generator. An agent reports that it can with the self-reported label

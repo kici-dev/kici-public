@@ -9,9 +9,17 @@
 
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
-import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import {
+  CommandError,
+  createLogger,
+  getRequestContext,
+  requestContext,
+  toErrorMessage,
+} from '@kici-dev/shared';
 import {
   ScalerBackendType,
+  ScalerVmTracker,
+  TERMINAL_JOB_STATES,
   deriveOsArchLabels,
   derivePlatformTaints,
   platformToOsArchLabels,
@@ -27,7 +35,9 @@ import type {
   ResourceRequest,
   ResourceSpec,
   ScalerCapacitySummary,
+  ScalerLiveVm,
   ScalerPlatform,
+  ScalerVmStopResult,
 } from '@kici-dev/engine';
 import {
   normalizeLabelSet,
@@ -97,8 +107,24 @@ import type {
 import { PG_LOCK_NOT_AVAILABLE } from './scaler-state-store.js';
 import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 import { runDetached } from '../helpers/run-detached.js';
+import { isDeterministicSpawnError } from './spawn-errors.js';
+import {
+  listClassifiedLiveVms,
+  stopLiveVms,
+  type LiveVmBackend,
+  type NamedLiveVmBackend,
+} from './live-vms.js';
 
 const logger = createLogger({ prefix: 'scaler' });
+
+/**
+ * Structured fields for a spawn-failure log line. A failed host command adds
+ * its command, exit code, signal, timeout flag and duration, so a query can
+ * filter on them; the message already carries its stderr tail.
+ */
+function spawnFailureFields(err: unknown): Record<string, unknown> {
+  return err instanceof CommandError ? err.toLogFields() : {};
+}
 
 /**
  * Prefix every scaler-minted agent id carries. Load-bearing: it is the only
@@ -455,6 +481,20 @@ interface SpawningEntry {
   /** Run this spawn's bound job belongs to. Undefined for warm-pool spawns. */
   runId?: string;
   /**
+   * Set when `backend.spawn()` resolved: the compute exists and only its
+   * agent's registration is outstanding. The stale-spawn prune destroys only a
+   * settled spawn — an unsettled one is still inside `spawn()`, whose failure
+   * path cleans up after itself — and `onSpawnSettled` destroys a spawn that
+   * settles after the prune already dropped it. An entry `recoverState`
+   * rehydrated is settled too: no `spawn()` of this process backs it.
+   *
+   * `withdrawEndedBoundProvisions` withdraws only a settled event spawn: for
+   * one still inside `spawn()` the scale-up may not be out yet, and a
+   * teardown sent ahead of it would leave the instance the provisioning
+   * workflow then creates with nothing to remove it.
+   */
+  spawnSettled?: boolean;
+  /**
    * The agent starts inside its bound job's own container image. Such an agent
    * may run only that job. Recorded here because the spawn is the one place
    * that knows it, and this entry is what registration reads.
@@ -523,6 +563,14 @@ const DEFAULT_PROVISION_BACKOFF: ProvisionBackoffSettings = {
   maxConsecutiveFailures: 5,
 };
 
+/** Which kind of provisioning failure armed a scaler's backoff; picks the wording. */
+enum ProvisionFailureKind {
+  /** An event scaler's external provision never registered an agent. */
+  External = 'external',
+  /** A local backend's host refused to start the agent process. */
+  Launch = 'launch',
+}
+
 /** Per-scaler consecutive-failure state driving the backoff. */
 interface ProvisionFailureState {
   /** Consecutive provisioning failures with no successful registration between. */
@@ -552,6 +600,12 @@ interface ProvisionFailureState {
  * long outage would otherwise add one id per attempt for as long as it lasts.
  */
 const MAX_COUNTED_FAILED_AGENTS = 64;
+
+/** A job a pending provision was requested for. */
+export interface BoundJobRef {
+  runId: string;
+  jobId: string;
+}
 
 /** Everything the {@link ScalerManager} is constructed from. */
 export interface ScalerManagerDeps {
@@ -643,6 +697,14 @@ export interface ScalerManagerDeps {
    */
   resolveProvisionBackoff?: () => Promise<ProvisionBackoffSettings>;
   /**
+   * Current `execution_jobs.status` of the jobs bound to pending event
+   * provisions, keyed by job id. A job with no row is absent from the map.
+   * Each job comes with its run so the read stays on the `(run_id, job_id)`
+   * index. Wired in orchestrator-core (has DB); omitted by the worker and most
+   * unit tests, which then withdraw nothing and report every pruned provision.
+   */
+  readJobStatuses?: (jobs: readonly BoundJobRef[]) => Promise<ReadonlyMap<string, string>>;
+  /**
    * Constructs a backend for a scaler added by a config reload. Supplied by
    * both hosts from the shared backend factory, so a reload can only build
    * what startup already exercises. When omitted (unit tests), a reload that
@@ -673,8 +735,10 @@ export class ScalerManager {
   /** Recent scaler spawn failures, surfaced by `kici-admin diagnose`. */
   private readonly failureTracker = new ScalerFailureTracker();
   /**
-   * Consecutive external-provision failures per scaler NAME, and the deferral
-   * they earned.
+   * Consecutive provisioning failures per scaler NAME, and the deferral they
+   * earned: an event scaler's external provision that never registered an
+   * agent, or a local launch that produced no agent (refused outright, or the
+   * agent stopped before it registered).
    *
    * Keyed by name rather than by backend type so one failing scaler never
    * defers spawns for an unrelated one — two event scalers routinely drive two
@@ -686,6 +750,7 @@ export class ScalerManager {
    */
   private readonly provisionFailures = new Map<string, ProvisionFailureState>();
   private readonly resolveProvisionBackoff: () => Promise<ProvisionBackoffSettings>;
+  private readonly readJobStatuses?: ScalerManagerDeps['readJobStatuses'];
   private globalMaxAgents: number;
 
   /** Per-scaler resource caps (`{ maxCpu, maxMemoryBytes }`), keyed by scaler name. */
@@ -889,6 +954,7 @@ export class ScalerManager {
     this.onScalerEvent = deps.onScalerEvent;
     this.resolveProvisionBackoff =
       deps.resolveProvisionBackoff ?? (async () => DEFAULT_PROVISION_BACKOFF);
+    this.readJobStatuses = deps.readJobStatuses;
     this.isDraining = deps.isDraining ?? (() => false);
     this.globalResourceCap = deps.config.globalResourceCap;
     this.createBackend = deps.createBackend;
@@ -1157,13 +1223,17 @@ export class ScalerManager {
       // scaler-managed, never gated by the pool's mandatory labels, and
       // never torn down on disconnect. `pruneStaleSpawningEntries` reaps
       // the entry if the agent never shows up.
-      this.startLogForwarding(backend, agentId);
+      if (this.onSpawnSettled(agentId, backend)) this.startLogForwarding(backend, agentId);
     } catch (err) {
       this.spawningAgents.delete(agentId);
       this.deleteSpawningAgentFromStore(agentId);
-      this.releaseAll(agentId);
+      if (isDeterministicSpawnError(err)) this.deferRefusedLaunch(backendName, agentId);
+      else this.releaseAll(agentId);
       this.warmPool.onWarmSpawnFailed(labelSet);
-      logger.error(`Warm pool spawn failed for backend ${backendName}: ${err}`);
+      logger.error(
+        `Warm pool spawn failed for backend ${backendName}: ${err}`,
+        spawnFailureFields(err),
+      );
     }
   }
 
@@ -1218,6 +1288,52 @@ export class ScalerManager {
    */
   isPrespawnedAgent(agentId: string): boolean {
     return this.warmAgents.has(agentId);
+  }
+
+  /** Every local Firecracker backend, under its scaler name. */
+  private firecrackerBackends(): NamedLiveVmBackend[] {
+    return [...this.backends]
+      .filter(([, backend]) => backend.type === ScalerBackendType.enum.firecracker)
+      .map(([name, backend]) => [name, backend as unknown as LiveVmBackend] as const);
+  }
+
+  /** The names of this node's Firecracker scalers. */
+  firecrackerScalerNames(): string[] {
+    return this.firecrackerBackends().map(([name]) => name);
+  }
+
+  /**
+   * What on this node tracks `vmId`. Synchronous on purpose: the Firecracker
+   * stop calls it in the same tick as its kill, so it must not await.
+   *
+   * Every local Firecracker backend is asked, so two scalers sharing a chroot
+   * base never see each other's VMs as orphans. `spawningAgents` includes the
+   * entries `recoverState` rehydrated after a restart, which no backend tracks.
+   */
+  trackersOf(vmId: string): ScalerVmTracker[] {
+    const trackers: ScalerVmTracker[] = [];
+    if (this.firecrackerBackends().some(([, backend]) => backend.isTrackingVm(vmId))) {
+      trackers.push(ScalerVmTracker.enum.backend);
+    }
+    if (this.spawningAgents.has(vmId)) trackers.push(ScalerVmTracker.enum.spawning);
+    if (this.managedAgentIndex.has(vmId) || this.adoptedAgents.has(vmId)) {
+      trackers.push(ScalerVmTracker.enum.registered);
+    }
+    return trackers;
+  }
+
+  /** Every live Firecracker VM on this host, classified against what tracks it. */
+  listLiveVms(): Promise<ScalerLiveVm[]> {
+    return listClassifiedLiveVms(this.firecrackerBackends(), (vmId) => this.trackersOf(vmId));
+  }
+
+  /**
+   * Stop the approved VMs one at a time. Each stop re-checks {@link trackersOf}
+   * in the tick of its kill, so a VM that became tracked since the listing is
+   * refused, never signalled.
+   */
+  stopUntrackedVms(vmIds: readonly string[]): Promise<ScalerVmStopResult[]> {
+    return stopLiveVms(this.firecrackerBackends(), vmIds, (vmId) => this.trackersOf(vmId));
   }
 
   /**
@@ -1877,38 +1993,57 @@ export class ScalerManager {
       mandatoryLabels: this.labelSetMandatoryLabels(backendName, backend, spawnLabelSet),
       ...(containerSpawn ? { container: containerSpawn } : {}),
     };
-    this.spawnSemaphoreFor(backendName)
-      .run(() => {
-        // The spawn has been admitted past the throttle: start the "never
-        // registered" staleness clock now, not at enqueue time.
-        const entry = this.spawningAgents.get(agentId);
-        if (entry) entry.spawnStartedAt = Date.now();
-        return this.runSpawnWithTimeout(orgId, (signal) =>
-          backend.spawn(
-            spawnLabelSet,
-            agentId,
-            orchestratorUrl,
-            onEvent,
-            effectiveLimits,
-            spawnContext,
-            signal,
-          ),
+    // The spawn outlives this call. It runs in its own request store holding
+    // the bound job: the caller's store is mutated per dispatched run
+    // (`enrichRequestContext`), so a continuation reading it later would log
+    // whichever run the request reached last.
+    // A snapshot of the caller's store keeps its routing key and trace ids.
+    const callerContext = getRequestContext();
+    const logContext = {
+      ...callerContext,
+      requestId: callerContext.requestId ?? randomUUID(),
+      runId,
+      jobId,
+    };
+    const ids = { agentId, scaler: backendName, runId, jobId };
+    requestContext.run(logContext, () => {
+      this.spawnSemaphoreFor(backendName)
+        .run(() => {
+          // The spawn has been admitted past the throttle: start the "never
+          // registered" staleness clock now, not at enqueue time.
+          const entry = this.spawningAgents.get(agentId);
+          if (entry) entry.spawnStartedAt = Date.now();
+          return this.runSpawnWithTimeout(orgId, (signal) =>
+            backend.spawn(
+              spawnLabelSet,
+              agentId,
+              orchestratorUrl,
+              onEvent,
+              effectiveLimits,
+              spawnContext,
+              signal,
+            ),
+          );
+        })
+        .then(
+          () => {
+            logger.info(`Agent ${agentId} spawned successfully via ${backendName}`, ids);
+            if (this.onSpawnSettled(agentId, backend)) this.startLogForwarding(backend, agentId);
+          },
+          (err) => {
+            this.spawningAgents.delete(agentId);
+            this.deleteSpawningAgentFromStore(agentId);
+            if (isDeterministicSpawnError(err)) this.deferRefusedLaunch(backendName, agentId);
+            else this.releaseAll(agentId);
+            logger.error(`Failed to spawn agent ${agentId} via ${backendName}: ${err}`, {
+              ...ids,
+              ...spawnFailureFields(err),
+            });
+          },
         );
-      })
-      .then(
-        () => {
-          logger.info(`Agent ${agentId} spawned successfully via ${backendName}`);
-          this.startLogForwarding(backend, agentId);
-        },
-        (err) => {
-          this.spawningAgents.delete(agentId);
-          this.deleteSpawningAgentFromStore(agentId);
-          this.releaseAll(agentId);
-          logger.error(`Failed to spawn agent ${agentId} via ${backendName}: ${err}`);
-        },
-      );
+    });
 
-    return { action: 'spawning', backendType: backend.type };
+    return { action: 'spawning', backendType: backend.type, agentId };
   }
 
   /**
@@ -2584,6 +2719,7 @@ export class ScalerManager {
     this.spawningAgents.delete(agentId);
 
     const backend = this.backends.get(spawning.backendName);
+    backend?.markRegistered?.(agentId);
     if (backend?.type === ScalerBackendType.enum.event) {
       // Seed the backend's own agent map, the same way the cross-instance
       // adoption path does. `spawn()` already seeded it in the common case, and
@@ -2763,10 +2899,29 @@ export class ScalerManager {
    * label-mismatch complaint that sends its operator to fix a correct `runsOn`.
    */
   async emitOrphanScaleDown(candidate: ReapCandidate, reason: ScaleDownReason): Promise<void> {
+    // A provision whose bound job already ended was not a failed one: the job
+    // no longer needed it. It is torn down as `job-complete`, the reason the
+    // withdrawal sweep uses, and nothing is reported.
+    const withdrawn =
+      reason === ScaleDownReason.enum['spawn-timeout'] &&
+      candidate.boundJobId !== undefined &&
+      (await this.boundJobEnded(candidate.runId, candidate.boundJobId));
+    const effective = withdrawn ? ScaleDownReason.enum['job-complete'] : reason;
+    if (withdrawn) {
+      logger.info(
+        'scaler: reaper found a stranded provision whose job already ended; tearing it down as job-complete',
+        {
+          agentId: candidate.agentId,
+          scaler: candidate.scalerName,
+          jobId: candidate.boundJobId,
+          runId: candidate.runId,
+        },
+      );
+    }
     const emitted = await this.emitScaleDownForSpec(
       { scalerName: candidate.scalerName, provisioningTargets: candidate.provisioningTargets },
       candidate.agentId,
-      reason,
+      effective,
     );
     // Only a teardown that actually went out counts. A row that reaches no
     // emitter, or names nowhere to deliver to, keeps its record and is retried
@@ -2780,16 +2935,17 @@ export class ScalerManager {
     // behaviour of having no record at all (the prune reports), never to a
     // wrong suppression.
     this.stateStore
-      ?.recordProvisionCondemned(candidate.agentId, candidate.scalerName, reason)
+      ?.recordProvisionCondemned(candidate.agentId, candidate.scalerName, effective)
       .catch((err) => {
         logger.warn('scaler: failed to record the provision-condemned verdict', {
           agentId: candidate.agentId,
           scaler: candidate.scalerName,
-          reason,
+          reason: effective,
           error: toErrorMessage(err),
         });
       });
-    if (reason === ScaleDownReason.enum['spawn-timeout']) {
+    if (withdrawn) this.eventBuffer.delete(candidate.agentId);
+    if (effective === ScaleDownReason.enum['spawn-timeout']) {
       incScalerExternalProvisionTimeout(candidate.scalerName);
       // The identity comes off the candidate, not off the in-memory maps: the
       // reaper is leader-gated, so the condemning coordinator often never
@@ -2840,19 +2996,33 @@ export class ScalerManager {
     const repeated = state.consecutive >= settings.maxConsecutiveFailures;
     // Two distinct causes, because they send an operator to different places. A
     // handful of failures is plausibly one bad spawn; passing the configured
-    // limit means provisioning for this scaler is broken, not unlucky.
-    const reason = repeated
-      ? `scaler \`${backendName}\` has failed to provision ${state.consecutive} times in a row; ` +
-        `deferring for ${Math.ceil(waitMs / 1000)}s. Provisioning for this scaler is failing ` +
-        `consistently — check the provisioning workflow and the provider it drives.`
-      : `scaler \`${backendName}\` failed to provision; deferring for ${Math.ceil(waitMs / 1000)}s ` +
-        `before asking again.`;
+    // limit means provisioning for this scaler is broken, not unlucky. An event
+    // scaler provisions through an external workflow; any other backend's
+    // failures here are launches its own host refused.
+    const seconds = Math.ceil(waitMs / 1000);
+    const external = this.backends.get(backendName)?.type === ScalerBackendType.enum.event;
+    let reason: string;
+    if (external) {
+      reason = repeated
+        ? `scaler \`${backendName}\` has failed to provision ${state.consecutive} times in a row; ` +
+          `deferring for ${seconds}s. Provisioning for this scaler is failing ` +
+          `consistently — check the provisioning workflow and the provider it drives.`
+        : `scaler \`${backendName}\` failed to provision; deferring for ${seconds}s ` +
+          `before asking again.`;
+    } else {
+      reason = repeated
+        ? `scaler \`${backendName}\` has failed to start an agent ${state.consecutive} times in a ` +
+          `row; deferring for ${seconds}s. Its launch is failing consistently — ` +
+          `\`kici-admin diagnose\` shows the cause on the \`scaler:${backendName}\` row.`
+        : `scaler \`${backendName}\` failed to start an agent; deferring for ${seconds}s ` +
+          `before asking again.`;
+    }
     logger.info('scaler: deferring a spawn request inside the provision backoff window', {
       scaler: backendName,
       consecutiveFailures: state.consecutive,
       waitMs,
     });
-    return { action: 'skipped', reason };
+    return { action: 'skipped', reason, retryAfterMs: waitMs };
   }
 
   /**
@@ -2864,7 +3034,10 @@ export class ScalerManager {
    * provider or growing without bound. `2 ** (n - 1)` is bounded by the cap
    * before it is used, so a long outage cannot overflow the shift.
    */
-  private async recordProvisionFailure(backendName: string): Promise<void> {
+  private async recordProvisionFailure(
+    backendName: string,
+    kind: ProvisionFailureKind,
+  ): Promise<void> {
     // The settings read comes first so the get/set below is one uninterrupted
     // microtask: reading the count before awaiting would let two concurrent
     // reports read the same value and lose one increment.
@@ -2881,12 +3054,17 @@ export class ScalerManager {
       countedAgents: prior?.countedAgents ?? new Set<string>(),
     });
     if (consecutive >= settings.maxConsecutiveFailures) {
-      logger.warn('scaler: external provisioning is failing consistently', {
-        scaler: backendName,
-        consecutiveFailures: consecutive,
-        maxConsecutiveFailures: settings.maxConsecutiveFailures,
-        nextAttemptInMs: delayMs,
-      });
+      logger.warn(
+        kind === ProvisionFailureKind.External
+          ? 'scaler: external provisioning is failing consistently'
+          : 'scaler: agent launches are failing consistently',
+        {
+          scaler: backendName,
+          consecutiveFailures: consecutive,
+          maxConsecutiveFailures: settings.maxConsecutiveFailures,
+          nextAttemptInMs: delayMs,
+        },
+      );
     }
   }
 
@@ -2955,9 +3133,10 @@ export class ScalerManager {
         eventType: ScalerEventType.enum['scaler.failed'],
         detail:
           `External provisioning for scaler \`${opts.scalerName}\` produced no agent: ` +
-          `the scale-up was delivered, but agent ${opts.agentId} never registered before ` +
-          `the spawn timeout. The provisioning workflow, or the provider it drives, did not ` +
-          `deliver a running agent.`,
+          `the scale-up event was emitted, but agent ${opts.agentId} never registered before ` +
+          `the spawn timeout. Check that a provisioning workflow received the event ` +
+          `(\`kici-admin event list --name kici.scaler.scale-up\`) and that the provider it ` +
+          `drives started the agent.`,
         timestampMs: Date.now(),
       },
       {
@@ -2967,12 +3146,181 @@ export class ScalerManager {
         backendType: ScalerBackendType.enum.event,
       },
     );
-    void this.recordProvisionFailure(opts.scalerName).catch((err) => {
-      logger.warn('scaler: failed to arm the provision backoff', {
-        scaler: opts.scalerName,
+    void this.recordProvisionFailure(opts.scalerName, ProvisionFailureKind.External).catch(
+      (err) => {
+        logger.warn('scaler: failed to arm the provision backoff', {
+          scaler: opts.scalerName,
+          error: toErrorMessage(err),
+        });
+      },
+    );
+  }
+
+  /**
+   * Defer a scaler whose host refused to start an agent, then free the spawn's
+   * reservation.
+   *
+   * Arming comes first: the release notifies freed capacity, and the re-drive
+   * that follows 250 ms later must meet the deferral rather than spawn straight
+   * into the same refusal. The release still notifies, because a job waiting on
+   * another scaler, or on the global cap, is legitimately unblocked by it.
+   * Two failures come here: a `spawn()` that rejected with a
+   * `DeterministicSpawnError`, and a settled spawn whose compute stopped before
+   * its agent registered (`dropFailedSettledSpawn`). Every other spawn
+   * rejection is released at once and retried.
+   */
+  private deferRefusedLaunch(backendName: string, agentId: string): void {
+    const claimed = this.claimFailedProvision(backendName, agentId);
+    runDetached(
+      logger,
+      'Arm the launch-refusal backoff',
+      async () => {
+        try {
+          if (claimed) await this.recordProvisionFailure(backendName, ProvisionFailureKind.Launch);
+        } finally {
+          this.releaseAll(agentId);
+        }
+      },
+      { scaler: backendName, agentId },
+    );
+  }
+
+  /**
+   * Whether a bound job has ended. A read error, a missing row, an unknown
+   * run, or no reader wired all read as "not ended", so the caller keeps
+   * reporting the provision as it would without the check.
+   */
+  private async boundJobEnded(runId: string | undefined, jobId: string): Promise<boolean> {
+    if (!this.readJobStatuses || runId === undefined) return false;
+    try {
+      const status = (await this.readJobStatuses([{ runId, jobId }])).get(jobId);
+      return status !== undefined && TERMINAL_JOB_STATES.has(status);
+    } catch (err) {
+      logger.warn('scaler: could not read a bound job’s status', {
+        jobId,
         error: toErrorMessage(err),
       });
+      return false;
+    }
+  }
+
+  /**
+   * Withdraw every settled, job-bound event provision on this coordinator
+   * whose job already ended — cancelled, timed out, or run on another agent.
+   *
+   * The job's row is the shared truth: a cancel reaches whichever coordinator
+   * the Platform picks, while the spawning entry lives on the one that asked.
+   * A withdrawal is not a provisioning failure, so nothing is reported and no
+   * backoff is armed. Returns how many provisions were withdrawn.
+   */
+  async withdrawEndedBoundProvisions(): Promise<number> {
+    if (!this.readJobStatuses) return 0;
+    const candidates = [...this.spawningAgents].filter(
+      ([, e]) =>
+        e.boundJobId !== undefined &&
+        e.runId !== undefined &&
+        e.spawnSettled === true &&
+        (e.backendType ?? this.backends.get(e.backendName)?.type) === ScalerBackendType.enum.event,
+    );
+    if (candidates.length === 0) return 0;
+    let statuses: ReadonlyMap<string, string>;
+    try {
+      statuses = await this.readJobStatuses(
+        candidates.map(([, e]) => ({ runId: e.runId!, jobId: e.boundJobId! })),
+      );
+    } catch (err) {
+      logger.warn('scaler: could not read bound job statuses; no provision withdrawn', {
+        error: toErrorMessage(err),
+      });
+      return 0;
+    }
+    let withdrawn = 0;
+    for (const [agentId, entry] of candidates) {
+      const status = statuses.get(entry.boundJobId!);
+      if (status === undefined || !TERMINAL_JOB_STATES.has(status)) continue;
+      // The agent may have registered, or the prune taken the entry, while the
+      // read was in flight.
+      if (this.spawningAgents.get(agentId) !== entry) continue;
+      this.withdrawProvision(agentId, entry, status);
+      withdrawn++;
+    }
+    return withdrawn;
+  }
+
+  /**
+   * Forget one pending provision and tear it down as `job-complete` — unless a
+   * peer adopted its agent, in which case the adopter owns the teardown.
+   *
+   * The teardown goes through `emitScaleDownForSpec`, which drops the spawn
+   * row only once the scale-down is out: a failed emit keeps the row for the
+   * reaper, whose spawn-timeout verdict re-checks the job and sends
+   * `job-complete` too. `backend.destroy` is not used — a rehydrated entry is
+   * not tracked by the backend, so it would emit nothing.
+   */
+  private withdrawProvision(agentId: string, entry: SpawningEntry, jobStatus: string): void {
+    this.spawningAgents.delete(agentId);
+    this.releaseAll(agentId);
+    this.eventBuffer.delete(agentId);
+    const backend = this.backends.get(entry.backendName);
+    if (backend instanceof EventScalerBackend) backend.forget(agentId);
+    const claims = backend instanceof EventScalerBackend ? backend.claimStore : undefined;
+    logger.info('scaler: withdrew a pending provision whose bound job ended', {
+      agentId,
+      scaler: entry.backendName,
+      jobId: entry.boundJobId,
+      runId: entry.runId,
+      jobStatus,
     });
+    runDetached(
+      logger,
+      'Withdraw provision',
+      async () => {
+        // Nothing tells this coordinator that a peer adopted the agent, so the
+        // entry outlives adoption — and on the ordinary HA success path the job
+        // ends because it ran on that adopted agent. The adopter owns that
+        // agent's teardown; emitting here would delete a live instance and the
+        // adopter's row. An unanswerable lookup emits nothing either: the row
+        // stays, and the reaper re-checks adoption and the job.
+        let adoptedBy: string | null;
+        try {
+          adoptedBy = (await this.stateStore?.provisionAdopter(agentId)) ?? null;
+        } catch (err) {
+          logger.warn(
+            'scaler: adoption lookup failed for a withdrawn provision; left to the reaper',
+            {
+              agentId,
+              error: toErrorMessage(err),
+            },
+          );
+          return;
+        }
+        if (adoptedBy !== null) {
+          logger.info(
+            'scaler: withdrawn provision was adopted by a peer, which owns its teardown',
+            {
+              agentId,
+              scaler: entry.backendName,
+              adoptedBy,
+            },
+          );
+          return;
+        }
+        await this.emitScaleDownForSpec(
+          { scalerName: entry.backendName, provisioningTargets: entry.provisioningTargets },
+          agentId,
+          ScaleDownReason.enum['job-complete'],
+        );
+        // The claim code in the scale-up is single-use; once the provision is
+        // withdrawn nothing may redeem it.
+        await claims?.invalidate(agentId).catch((err: unknown) => {
+          logger.warn('scaler: could not invalidate a withdrawn provision’s claim', {
+            agentId,
+            error: toErrorMessage(err),
+          });
+        });
+      },
+      { agentId },
+    );
   }
 
   /**
@@ -3006,6 +3354,35 @@ export class ScalerManager {
    * existed, and they age out within one stale-prune window of the deploy.
    */
   private reportPrunedProvisionFailure(agentId: string, entry: SpawningEntry): void {
+    const boundJobId = entry.boundJobId;
+    if (boundJobId === undefined || !this.readJobStatuses) {
+      this.reportPrunedUnlessAdopted(agentId, entry);
+      return;
+    }
+    // A job that already ended (cancelled, timed out, ran on another agent)
+    // no longer needs this provision: it is withdrawn, not failed. The row
+    // stays for the reaper, which tears the provision down as `job-complete`.
+    runDetached(
+      logger,
+      'Pruned provision verdict',
+      async () => {
+        if (await this.boundJobEnded(entry.runId, boundJobId)) {
+          logger.info('scaler: pruned spawn’s bound job already ended; not a failed provision', {
+            agentId,
+            scaler: entry.backendName,
+            jobId: boundJobId,
+            runId: entry.runId,
+          });
+          return;
+        }
+        this.reportPrunedUnlessAdopted(agentId, entry);
+      },
+      { agentId },
+    );
+  }
+
+  /** The adoption half of {@link reportPrunedProvisionFailure}. */
+  private reportPrunedUnlessAdopted(agentId: string, entry: SpawningEntry): void {
     const report = (): void => {
       this.reportProvisionFailure({
         scalerName: entry.backendName,
@@ -3057,7 +3434,7 @@ export class ScalerManager {
    */
   private clearProvisionFailures(backendName: string): void {
     if (this.provisionFailures.delete(backendName)) {
-      logger.info('scaler: external provisioning recovered, cleared the backoff', {
+      logger.info('scaler: provisioning recovered, cleared the backoff', {
         scaler: backendName,
       });
     }
@@ -3841,6 +4218,11 @@ export class ScalerManager {
     }
     this.retirementSweep ??= setInterval(() => {
       runDetached(logger, 'Retired backend sweep', () => this.sweepRetiredBackends());
+      // Separate from the sweep: its job-status read awaits, and the sweep's
+      // retirement half must reach its first await without yielding. A
+      // provision the prune meets first is not reported either — the prune
+      // re-checks the job — and the reaper then tears it down as job-complete.
+      runDetached(logger, 'Bound provision withdrawal', () => this.withdrawEndedBoundProvisions());
     }, RETIREMENT_SWEEP_INTERVAL_MS);
     this.retirementSweep.unref?.();
   }
@@ -3965,6 +4347,18 @@ export class ScalerManager {
           // local-backend row is never adoptable, so the predicate is a
           // belt-and-braces guard rather than a live branch.
           this.deleteUnadoptedSpawningAgentFromStore(id);
+          // The compute itself may still exist: a VM whose guest stopped
+          // after `spawn()` resolved, or a process that never connected.
+          // Without a teardown the backend keeps counting it against
+          // `maxAgents` and its host resources outlive it.
+          if (backend && entry.spawnSettled) {
+            runDetached(
+              logger,
+              'Stale spawn teardown',
+              () => backend.destroy(id, { reason: ScaleDownReason.enum['spawn-timeout'] }),
+              { agentId: id },
+            );
+          }
         }
         // Release the reservation this spawn is holding. A spawn that is pruned
         // never registered an agent (otherwise it would have left the spawning
@@ -4155,6 +4549,60 @@ export class ScalerManager {
     });
   }
 
+  /**
+   * Record that `backend.spawn()` resolved for a spawn this instance started.
+   *
+   * Returns false when the stale-spawn prune dropped the entry while
+   * `spawn()` was still running (a per-org spawn deadline can outlast the
+   * prune window). Nothing else would ever tear that compute down, so a local
+   * backend's is destroyed here. An event backend's provision is left to the
+   * reaper, as the prune leaves it.
+   */
+  private onSpawnSettled(agentId: string, backend: ScalerBackend): boolean {
+    const entry = this.spawningAgents.get(agentId);
+    if (entry) {
+      entry.spawnSettled = true;
+      return true;
+    }
+    // The agent registered before spawn() returned.
+    if (this.managedAgentIndex.has(agentId)) return true;
+    if (backend.type !== ScalerBackendType.enum.event) {
+      logger.warn(`Spawn of agent ${agentId} finished after it was pruned; destroying it`);
+      runDetached(
+        logger,
+        'Late spawn teardown',
+        () => backend.destroy(agentId, { reason: ScaleDownReason.enum['spawn-timeout'] }),
+        { agentId },
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Drop a settled local spawn whose backend reported it failed.
+   *
+   * After `spawn()` resolved, a backend that finds its compute gone before the
+   * agent registered (a Firecracker guest that exited, a bare-metal agent
+   * process that exited) tears the compute down itself and emits
+   * `scaler.failed`. The agent will never register, so the spawning entry, its
+   * durable row and its reservation go now — waiting for the stale-spawn prune
+   * would hold the scaler's slot for minutes.
+   *
+   * A spawn that produced no agent is a refused launch, the same rule an event
+   * scaler's dead provision follows: the scaler is deferred before the
+   * reservation is freed, so an agent that dies at startup every time is not
+   * respawned at its own startup cadence. Only a spawn that has not registered
+   * reaches here — registration deletes the spawning entry — so an agent that
+   * registered and exits later never arms the backoff.
+   */
+  private dropFailedSettledSpawn(agentId: string, spawning: SpawningEntry): void {
+    this.spawningAgents.delete(agentId);
+    this.deleteUnadoptedSpawningAgentFromStore(agentId);
+    if (!spawning.boundJobId) this.warmPool.onWarmSpawnFailed(spawning.labelSet);
+    this.deferRefusedLaunch(spawning.backendName, agentId);
+    this.eventBuffer.delete(agentId);
+  }
+
   /** Store-side half of the stale prune: drops the row only if nobody adopted it. */
   private deleteUnadoptedSpawningAgentFromStore(agentId: string): void {
     if (!this.stateStore) return;
@@ -4303,6 +4751,7 @@ export class ScalerManager {
           // and the correlation map is only populated post-registration — which
           // is exactly what never happened for a recovered spawning entry.
           ...(entry.runId !== undefined && { runId: entry.runId }),
+          spawnSettled: true,
         });
       }
       recovery.spawningAgentsRehydrated = spawning.length - recovery.spawningDropped;
@@ -4495,6 +4944,15 @@ export class ScalerManager {
         this.eventBuffer.set(event.agentId, buffer);
       }
       buffer.push(event);
+    }
+
+    if (
+      event.eventType === ScalerEventType.enum['scaler.failed'] &&
+      spawning?.spawnSettled &&
+      (spawning.backendType ?? this.backends.get(spawning.backendName)?.type) !==
+        ScalerBackendType.enum.event
+    ) {
+      this.dropFailedSettledSpawn(event.agentId, spawning);
     }
   }
 }

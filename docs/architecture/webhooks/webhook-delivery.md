@@ -77,15 +77,16 @@ KiCI receives the webhook, validates provider headers, resolves the routing key,
 | Condition                                               | HTTP status                                                               | Where decided                                                                       |
 | ------------------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | Body > 25 MiB                                           | 413                                                                       | HTTP body-limit, before any WS work                                                 |
-| Negative-cache hit on unknown `(orgId, routingKey)`     | 404                                                                       | `unknown-source-cache.ts`                                                           |
-| Orchestrator ACK `result: accepted`                     | 200                                                                       | `statusForResult()`                                                                 |
-| Orchestrator ACK `result: rejected_signature`           | 401                                                                       | `statusForResult()`                                                                 |
-| Orchestrator ACK `result: rejected_unknown_source`      | 404                                                                       | `statusForResult()`; primes negative cache                                          |
-| Orchestrator ACK `result: rejected_misconfigured`       | 500                                                                       | `statusForResult()`                                                                 |
+| Negative-cache hit on unknown `(orgId, routingKey)`     | 404                                                                       | Platform negative cache of unknown sources                                          |
+| Orchestrator ACK `result: accepted`                     | 200                                                                       | Platform maps the ACK result to an HTTP status                                      |
+| Orchestrator ACK `result: rejected_signature`           | 401                                                                       | Platform maps the ACK result to an HTTP status                                      |
+| Orchestrator ACK `result: rejected_unknown_source`      | 404                                                                       | Platform maps the ACK result; primes the negative cache                             |
+| Orchestrator ACK `result: rejected_misconfigured`       | 500                                                                       | Platform maps the ACK result to an HTTP status                                      |
+| Orchestrator ACK `result: shed_retry_later`             | 429 with `Retry-After`                                                    | see [ingest admission shed](#ingest-admission-shed-step-3)                          |
 | No orch in pool, all candidates timed out, or no remote | 200 `{ status: "buffered" }` (or 503 when the buffer budget is exhausted) | buffered for replay, see [below](#no-orchestrator-connected----any-instance-step-2) |
-| Total relay budget exhausted                            | 200 `{ status: "buffered" }`                                              | `relayToApp` stops trying candidates; the dispatcher skips the cross-instance hop   |
-| Ingress rate limit exceeded for the org or client IP    | 429 with `Retry-After`                                                    | `webhook-ingress-rate-limit.ts`, before the body is read                            |
-| Candidate socket past its send-buffer watermark         | that candidate is skipped; the next one is tried                          | `chunked-sender.ts` refuses the send; `relayToApp` moves on                         |
+| Total relay budget exhausted                            | 200 `{ status: "buffered" }`                                              | The Platform stops trying candidates and skips the cross-instance hop               |
+| Ingress rate limit exceeded for the org or client IP    | 429 with `Retry-After`                                                    | Platform ingress rate limit, before the body is read                                |
+| Candidate socket past its send-buffer watermark         | that candidate is skipped; the next one is tried                          | The Platform refuses the send and moves to the next candidate                       |
 
 #### The total relay budget
 
@@ -111,7 +112,7 @@ written to again.
 The orchestrator reassembles the body from the chunked stream and asks its ingest admission controller for a slot. Admission runs before signature verification, so it needs only the Platform-established routing key. A granted delivery is then verified locally via `verifyInboundWebhook()` (`packages/orchestrator/src/webhook/verify-inbound.ts`), ACKed upstream with the verdict, and on `accepted` run through the provider-agnostic processing pipeline:
 
 1. **Dedup:** Check dual-layer dedup cache (in-memory + DB) by delivery ID
-2. **Provider lookup:** Get the provider bundle from the ProviderRegistry using `getByRoutingKey()` (exact match first, falls back to provider type prefix for backward compatibility)
+2. **Provider lookup:** Get the provider bundle from the ProviderRegistry using `getByRoutingKey()` (exact match first, falls back to provider type prefix for backward compatibility; a `generic:` key falls back only to the shared `generic:default` bundle, never to another source's)
 3. **Event normalization:** Use the provider's `WebhookNormalizer` to map the event/action to a `SimulatedEvent` (e.g., `push` -> `{ type: 'push', targetBranch: '...' }`)
 4. **Repo and credential extraction:** Extract repository identifier and provider-specific credentials from the payload (e.g., GitHub installation ID)
 5. **Command interception:** For `issue_comment` events, intercept `/kici approve` and `/kici reject` commands via `handleApprovalComment()` for security hold management (before normal trigger matching)
@@ -152,7 +153,7 @@ The agent receives the `job.dispatch` message and runs the full job lifecycle. C
 4. **Emit context:** Send `job.context` with runtime details (Node version, OS, arch, sandbox type)
 5. **Sandbox execution (child process):**
    - Clone repo: shallow `git clone` at the dispatch ref, unless the job sets `checkout: false`
-   - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`) and extract it over the cloned workflow root, so no `npm ci` or compile of `.kici/` is needed at execution time
+   - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`), verify it against `sourceTarDigest`, and replace the clone's `.kici/` with it, so no `npm ci` or compile of `.kici/` is needed at execution time
    - Restore deps: download the cached dependency tarball (`depsUrl`) to a file, verify its SHA-256, then extract it. Install inline instead if the cache missed or the restore failed for a reason other than a hash mismatch
    - Load workflow: register the shared `@kici-dev/core/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
    - Evaluate rules: run job-level rules sequentially with fail-fast (if any rule fails, job is skipped)
@@ -190,7 +191,7 @@ When a workflow's `contentHash` is found in the cache:
 1. The orchestrator retrieves the source tarball URL from the cache storage (`S3CacheStorage`)
 2. The URL is a pre-signed S3 GET URL (15-minute expiry); the `touch-on-read` refreshes the entry's TTL
 3. The `sourceTarUrl` and `sourceTarDigest` (the tarball's SHA-256) are included in the `job.dispatch` message. The dep cache provides `depsUrl`/`depsHash` the same way.
-4. The execution agent downloads and extracts the tarball over its checkout, registers the shared TypeScript loader hook, and dynamic-imports the workflow `.ts` directly — no `npm ci` of `.kici/`, no runtime bundler.
+4. The execution agent downloads the tarball, replaces its checkout's `.kici/` with the restored tree, registers the shared TypeScript loader hook, and dynamic-imports the workflow `.ts` directly — no `npm ci` of `.kici/`, no runtime bundler.
 
 ### Cache miss
 
@@ -206,7 +207,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 41; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
+A workflow entry without a `contentHash` field bypasses the cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow. A lock old enough to lack one (schema version 1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. The current lock file schema version is 42. The orchestrator does not require an exact match: it accepts a compatibility window of schema versions. A lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 
@@ -239,7 +240,7 @@ When the orchestrator receives a webhook with `info.provider === 'generic'`, the
 
 ### Org isolation guarantee
 
-Cross-org leakage is structurally impossible. The lookup map key is `${customerId}|${eventName}`, so registrations belonging to different orgs live in different buckets of the index. There is no query-time filter to forget — the structural separation is enforced at insert time. This guarantees WHK-CROSS-02 (no cross-org webhook fan-out).
+Cross-org leakage is structurally impossible. The lookup map key is `${customerId}|${eventName}`, so registrations belonging to different orgs live in different buckets of the index. There is no query-time filter to forget — the structural separation is enforced at insert time, so no webhook fans out across organizations.
 
 ### Per-registration dispatch
 

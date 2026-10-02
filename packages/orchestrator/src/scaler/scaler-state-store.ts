@@ -406,6 +406,23 @@ export class ScalerStateStore {
   }
 
   /**
+   * Whether `instanceId` adopted an event provision whose spawn row is still
+   * live: one of the rows `listReapCandidates` returns that the reaper judges
+   * by its adopter's liveness rather than by its own deadline. `peer forget`
+   * reads it, so forgetting such an adopter never cuts the reaper's grace short.
+   */
+  async hasAdoptedProvisions(instanceId: string): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('scaler_spawning_agents')
+      .select('agent_id')
+      .where('backend_type', '=', ScalerBackendType.enum.event)
+      .where('adopted_by', '=', instanceId)
+      .limit(1)
+      .executeTakeFirst();
+    return row !== undefined;
+  }
+
+  /**
    * Every event row that is either past its spawn deadline without ever being
    * adopted, or adopted by some instance. The reaper decides which to tear down;
    * this only narrows the scan. Deliberately NOT a blanket `spawned_at < cutoff`

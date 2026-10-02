@@ -450,6 +450,59 @@ describe('scalerFileSchema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'uid' field/);
   });
 
+  describe('a bare-metal batch path cmd.exe would read as syntax', () => {
+    let originalPlatform: PropertyDescriptor | undefined;
+    const config = (binaryPath: string) => ({
+      version: 1,
+      scalers: [
+        {
+          name: 'windows-bare-metal',
+          type: 'bare-metal',
+          maxAgents: 2,
+          labelSets: [{ labels: ['windows', 'bare-metal'], binaryPath }],
+        },
+      ],
+    });
+    const setPlatform = (value: NodeJS.Platform) =>
+      Object.defineProperty(process, 'platform', { value, configurable: true });
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    });
+    afterEach(() => {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+    });
+
+    it('is refused on a Windows host, naming the label set', () => {
+      // fails-when: the refine is missing — the path parses and every launch fails later
+      setPlatform('win32');
+      const result = scalerFileSchema.safeParse(config('C:\\a&b\\kici-agent.cmd'));
+      expect(result.success).toBe(false);
+      expect(result.error?.issues).toEqual([
+        expect.objectContaining({
+          path: ['scalers', 0, 'labelSets', 0, 'binaryPath'],
+          message:
+            'Bare-metal scaler "windows-bare-metal" label set [0]: cannot run ' +
+            '"C:\\a&b\\kici-agent.cmd" as a bare-metal agent: it contains "&", which cmd.exe ' +
+            'reads as syntax when it runs the batch file. Move the agent to a path without it.',
+        }),
+      ]);
+    });
+
+    it('accepts a quoted path with a space on a Windows host', () => {
+      // breaks-if-wrong: an install under Program Files (x86) is refused
+      setPlatform('win32');
+      expect(() =>
+        scalerFileSchema.parse(config('C:\\Program Files (x86)\\KiCI\\kici-agent.cmd')),
+      ).not.toThrow();
+    });
+
+    it('accepts the same path on a Linux host', () => {
+      setPlatform('linux');
+      expect(() => scalerFileSchema.parse(config('C:\\a&b\\kici-agent.cmd'))).not.toThrow();
+    });
+  });
+
   describe('Firecracker extraHosts', () => {
     const fcScaler = (extraHosts: string[]) => ({
       version: 1,

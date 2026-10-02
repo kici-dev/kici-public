@@ -52,7 +52,7 @@ Give each bridge on a host its own `table`, for example when two orchestrators r
 
 **Scaler-level fields:**
 
-- `firecrackerPath` — Path to the Firecracker binary. Required.
+- `firecrackerPath` — Path to the Firecracker binary. Required. Its file name must be `firecracker`: the jailer names each VM's chroot and PID file after the binary, and the backend looks for them under `<chrootBaseDir>/firecracker/`. To keep several versions, put each in its own directory (for example `/opt/firecracker/v1.13.1/firecracker`).
 - `jailerPath` — Path to the jailer binary. Required.
 - `kernelPath` — Default kernel path. Required.
 - `chrootBaseDir` — Jailer chroot base directory. Optional; default `/srv/jailer`.
@@ -63,14 +63,14 @@ Give each bridge on a host its own `table`, for example when two orchestrators r
   - Write each entry as `host:address`. The container runtime also accepts `host=address` and a bracketed IPv6 address, but a Firecracker scaler does not. An entry that is not a hostname and an address stops the orchestrator at startup.
   - A mapping names a host; it does not open a path to it. The per-VM chain blocks private (RFC 1918) addresses, the gateway included, unless the label set's [`networkPolicy`](./common-config.md#network-policy) allows them.
   - The VM `/init` applies the mappings. A rootfs built before a KiCI release that supports this field ignores them: refresh it with `build-agent-rootfs.sh --agent-only <the rootfsPath image>` from a checkout of the current release (see [Firecracker rootfs](../firecracker/rootfs.md#upgrading)).
-- `requireSudo` — Wrap the privileged commands the backend runs (`ip`, `chown`, `chmod`, and `nft` for per-VM network isolation) with `sudo -n`. Optional; default `false`. Set it `true` when the orchestrator runs as a non-root user (for example a user-mode systemd unit) and the operator has a NOPASSWD sudoers entry for those binaries. Leave it unset when the orchestrator is root or already holds the required capabilities — `-n` fails fast rather than prompting, so an unnecessary `true` turns a working setup into a spawn failure.
+- `requireSudo` — Wrap the privileged commands the backend runs (`ip`, `chown`, `chmod`, and `nft` for per-VM network isolation) with `sudo -n`, and stop a VM through `sudo -n -u '#<uid>' kill` as the jailer user when `kill(2)` refuses the signal. Optional; default `false`. Set it `true` when the orchestrator runs as a non-root user (for example a user-mode systemd unit) and the operator has a NOPASSWD sudoers entry for those binaries. Leave it unset when the orchestrator is root or already holds the required capabilities — `-n` fails fast rather than prompting, so an unnecessary `true` turns a working setup into a spawn failure.
 
 **Label-set-level fields:**
 
 - `rootfsPath` — Path to a pre-built ext4 rootfs image. Required on every Firecracker label set.
 - `kernelPath` — Override the scaler-level kernel path for this label set. Optional.
 - `vcpuCount` / `memSizeMib` — Override the scaler-level VM CPU / memory for this label set. Optional.
-- `overlayDriveSizeMib` — Copy-on-write overlay drive size in MiB. Optional; default `2048`.
+- `overlayDriveSizeMib` — Copy-on-write overlay drive size in MiB. Optional; default `2048`. The orchestrator keeps one pre-formatted template for each size on the host (see [Overlay drive templates](../firecracker/host-setup.md#overlay-drive-templates)).
 
 ## Configuration
 
@@ -119,6 +119,13 @@ MiB or more**. Raise it further for a workflow with a large dependency tree.
 
 Set it per label set when only some of your jobs are heavy, so a small VM still
 serves the light ones.
+
+## Launch failures
+
+A VM that stops before its agent connects to the orchestrator is a failed
+launch. The scaler reports it in `kici-admin diagnose` and on the waiting job,
+frees the VM's slot, and defers the scaler with the same backoff a bare-metal
+scaler uses. See [Launch failures](./bare-metal.md#launch-failures).
 
 ## DB migration
 

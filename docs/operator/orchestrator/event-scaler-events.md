@@ -49,13 +49,14 @@ A `kici.scaler.scale-down` event tells a teardown workflow which instance to del
 
 ### Teardown reasons
 
-The schema accepts six values. The orchestrator emits three of them:
+The schema accepts six values. The orchestrator emits four of them:
 
 - `shutdown` — The agent disconnected, so the orchestrator tore its provision down. A scaler-managed agent stops itself once it goes idle, so an ordinary teardown carries this reason.
 - `heartbeat-timeout` — The agent stopped sending heartbeats, or the coordinator holding it went away. The orchestrator sends it as soon as it drops a silent agent. It also drops an agent that does not acknowledge a dispatch, or whose token is revoked or expires, with the same reason. The orchestrator's sweep for stranded provisions sends it too.
 - `spawn-timeout` — The agent never registered in time after the scale-up.
+- `job-complete` — The job the provision was requested for ended before its agent registered: the job was cancelled, timed out, or ran on another agent. The orchestrator withdraws the provision within about 30 seconds.
 
-The other three — `idle`, `job-complete` and `drain` — are part of the schema, and no orchestrator path emits them. A workflow must accept them, because the schema does, but a branch on one of them never runs today.
+The other two — `idle` and `drain` — are part of the schema, and no orchestrator path emits them. A workflow must accept them, because the schema does, but a branch on one of them never runs today.
 
 A teardown workflow can log or branch on the reason. The teardown action itself is the same for every reason: delete the instance registered under `agentId`.
 

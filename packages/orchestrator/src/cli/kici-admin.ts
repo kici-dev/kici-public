@@ -151,15 +151,17 @@ export function buildProgram(): Command {
   // Firecracker host-networking ops (provision/verify/teardown bridges) run
   // locally on the orchestrator host — no admin HTTP client.
   registerFirecrackerCommands(program);
-  // Scaler maintenance (reap-orphans) runs locally from config — no admin HTTP
-  // client, no DB, no running orchestrator. Recovers a node wedged on ENOSPC.
-  registerScalerCommands(program);
+  // Scaler maintenance: `orphans` goes through the admin HTTP API; `reap-orphans`
+  // runs locally from config — no admin HTTP client, no DB, no running
+  // orchestrator — and recovers a node wedged on ENOSPC.
+  registerScalerCommands(program, getClient);
   // Agent service commands are added to the existing 'agent' command group
   // (registered above by registerAgentCommands), so this must come after it.
   registerAgentServiceCommands(program);
   // Agent payload producer (`agent package`) — also added to the 'agent' group.
   registerAgentPackage(program);
-  // Peer commands use direct DB access (not AdminApiClient)
+  // Peer commands use direct DB access, except `peer forget`, which reaches the
+  // running coordinators through the admin HTTP API.
   registerPeerCommands(program, getClient);
   // Host roster commands use direct DB access (not AdminApiClient)
   registerHostCommands(program);

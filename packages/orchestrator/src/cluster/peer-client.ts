@@ -35,6 +35,10 @@ import {
   type PeerCacheUploadResponse,
   type PeerConfigReload,
   type PeerConfigReloadResponse,
+  type PeerScalerOrphansRequest,
+  type PeerForgetRequest,
+  type PeerForgetResponse,
+  type PeerScalerOrphansResponse,
   type PeerClusterSettingsRequest,
   type PeerClusterSettingsResponse,
   type PeerLogsCollectRequest,
@@ -46,6 +50,18 @@ import {
   PROTOCOL_VERSION,
 } from '@kici-dev/engine';
 import type { PeerRegistry } from './peer-registry.js';
+import {
+  PeerForgetWaiters,
+  replyToPeerForgetRequest,
+  type PEER_FORGET_TIMEOUT,
+  type PeerForgetRequestHandler,
+} from './peer-forget.js';
+import {
+  replyToScalerOrphansRequest,
+  ScalerOrphansWaiters,
+  type SCALER_ORPHANS_TIMEOUT,
+  type ScalerOrphansRequestHandler,
+} from './scaler-orphans-peer.js';
 import {
   generateEcdhKeyPair,
   deriveSessionKey,
@@ -153,6 +169,17 @@ export interface PeerClientOptions {
    * If undefined, incoming collect requests are ignored.
    */
   onLogsCollectRequest?: PeerLogsCollectResponder;
+  /**
+   * Answers a peer.scaler.orphans.request the connected coordinator forwarded
+   * to this node (`kici-admin scaler orphans --target`). If undefined,
+   * requests are answered with ok=false.
+   */
+  onScalerOrphansRequest?: ScalerOrphansRequestHandler;
+  /**
+   * Forgets a departed peer the connected coordinator forgot (`kici-admin peer
+   * forget`). If undefined, requests are answered with outcome `error`.
+   */
+  onPeerForgetRequest?: PeerForgetRequestHandler;
 }
 
 /**
@@ -212,6 +239,8 @@ export class PeerClient {
   private readonly ackWaiters = new Map<string, AckWaiter>();
   private readonly cacheWaiters = new Map<string, CacheWaiter>();
   private readonly configReloadWaiters = new Map<string, ConfigReloadWaiter>();
+  private readonly scalerOrphansWaiters = new ScalerOrphansWaiters();
+  private readonly peerForgetWaiters = new PeerForgetWaiters();
   private readonly clusterSettingsWaiters = new Map<string, ClusterSettingsWaiter>();
   /** Correlates peer.logs.collect.request with the peer's chunked subtree response. */
   private readonly logsCollectWaiters = new ChunkRequestWaiter();
@@ -257,6 +286,8 @@ export class PeerClient {
   }>;
   private readonly onAuthenticated?: (targetInstanceId: string) => void;
   private readonly onLogsCollectRequest?: PeerLogsCollectResponder;
+  private readonly onScalerOrphansRequest?: ScalerOrphansRequestHandler;
+  private readonly onPeerForgetRequest?: PeerClientOptions['onPeerForgetRequest'];
 
   constructor(options: PeerClientOptions) {
     this.url = options.url;
@@ -282,6 +313,8 @@ export class PeerClient {
     this.onPeerConfigReload = options.onPeerConfigReload;
     this.onAuthenticated = options.onAuthenticated;
     this.onLogsCollectRequest = options.onLogsCollectRequest;
+    this.onScalerOrphansRequest = options.onScalerOrphansRequest;
+    this.onPeerForgetRequest = options.onPeerForgetRequest;
   }
 
   /** Current connection state. */
@@ -318,6 +351,8 @@ export class PeerClient {
     this.clearCacheWaiters();
     this.clearConfigReloadWaiters();
     this.clearClusterSettingsWaiters();
+    this.scalerOrphansWaiters.rejectAll('Disconnected before the scaler orphan response arrived');
+    this.peerForgetWaiters.rejectAll('Disconnected before the peer forget response arrived');
     this.logsCollectWaiters.rejectAll('peer disconnected');
 
     if (this.ws) {
@@ -408,10 +443,40 @@ export class PeerClient {
   }
 
   /**
-   * Send a peer.clusterSettings.request to the connected leader and wait for the
-   * matching peer.clusterSettings.response carrying the worker-settings snapshot.
+   * Send a peer.forget.request to the connected peer and wait for the matching
+   * response.
    *
-   * @returns The response, or null if not connected or the leader doesn't reply
+   * @returns the response; null when not connected; `'timeout'` when no
+   *   response arrived within `timeoutMs`.
+   */
+  async sendPeerForgetAndWait(
+    msg: PeerForgetRequest,
+    timeoutMs: number,
+  ): Promise<PeerForgetResponse | null | typeof PEER_FORGET_TIMEOUT> {
+    if (!this.send(msg as PeerToPeerMessage)) return null;
+    return this.peerForgetWaiters.wait(msg.messageId, timeoutMs);
+  }
+
+  /**
+   * Send a peer.scaler.orphans.request to the connected peer and wait for the
+   * matching response.
+   *
+   * @returns the response; null when not connected; `'timeout'` when no
+   *   response arrived within `timeoutMs`.
+   */
+  async sendScalerOrphansAndWait(
+    msg: PeerScalerOrphansRequest,
+    timeoutMs: number,
+  ): Promise<PeerScalerOrphansResponse | null | typeof SCALER_ORPHANS_TIMEOUT> {
+    if (!this.send(msg as PeerToPeerMessage)) return null;
+    return this.scalerOrphansWaiters.wait(msg.messageId, timeoutMs);
+  }
+
+  /**
+   * Send a peer.clusterSettings.request to the connected coordinator and wait for
+   * the matching peer.clusterSettings.response carrying the worker-settings snapshot.
+   *
+   * @returns The response, or null if not connected or the coordinator doesn't reply
    *   within the timeout — the caller keeps its current (config-default) settings.
    */
   async sendClusterSettingsRequestAndWait(
@@ -1046,6 +1111,41 @@ export class PeerClient {
           this.configReloadWaiters.delete(msg.messageId);
           waiter.resolve(msg);
         }
+        break;
+      }
+
+      case 'peer.scaler.orphans.request': {
+        replyToScalerOrphansRequest(
+          msg,
+          this.onScalerOrphansRequest,
+          (response) => {
+            this.send(response);
+          },
+          { peerId: this._targetInstanceId },
+        );
+        break;
+      }
+
+      case 'peer.forget.request': {
+        // This client dialled the peer, and only coordinators dial coordinators.
+        replyToPeerForgetRequest(
+          msg,
+          this.onPeerForgetRequest,
+          (response) => {
+            this.send(response);
+          },
+          { peerId: this._targetInstanceId },
+        );
+        break;
+      }
+
+      case 'peer.forget.response': {
+        this.peerForgetWaiters.resolve(msg);
+        break;
+      }
+
+      case 'peer.scaler.orphans.response': {
+        this.scalerOrphansWaiters.resolve(msg);
         break;
       }
 

@@ -146,6 +146,10 @@ Worker log lines emit structured JSON parsed into per-line Loki structured metad
 
 Filter for one worker's logs in LogQL: `{service="orchestrator", instance="mac-mini-1"}`. To page across every worker in a cluster, query by the workers' instance IDs (the coordinator/worker distinction is not a log label — it is inferred from the instance ID set per process).
 
+### Cluster settings on a worker
+
+A worker has no database. It gets the cluster settings from a coordinator. To see which settings version each worker applied, run `kici-admin cluster-settings show` against a coordinator — see [Confirm a change reached every orchestrator](cluster-settings.md#confirm-a-change-reached-every-orchestrator).
+
 ## Drain and upgrade
 
 Workers support two drain mechanisms:

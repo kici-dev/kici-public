@@ -40,7 +40,13 @@ export type Permission =
   /** Read the org-wide CI trust policy that gates fork / unknown / workflow-change PRs. */
   | 'ci_trust.read'
   /** Modify org-wide trust policies (independent mode only — Platform-attached PATCH refuses). */
-  | 'ci_trust.admin';
+  | 'ci_trust.admin'
+  /** List the live Firecracker VMs on a node and how each is tracked. */
+  | 'scaler.read'
+  /** Stop live Firecracker VMs the node's orchestrator does not track. */
+  | 'scaler.manage'
+  /** Drop a departed peer from the coordinators' live peer registries. */
+  | 'peer.manage';
 
 /**
  * Role-to-permission mapping.
@@ -54,6 +60,12 @@ export type Permission =
  * policy decides whether a fork PR runs at all, so it is not a read-only-role
  * surface; the auditor sees trust-policy changes through `access_log.read`
  * instead, which records every `trust_policy.updated` mutation.
+ *
+ * `scaler.read` (owner, admin, auditor) lists a node's live Firecracker VMs;
+ * `scaler.manage` (owner, admin) stops the ones its orchestrator does not
+ * track, so a read-only role can inspect a host but never kill a VM on it.
+ * `peer.manage` (owner, admin) drops a departed peer from the live peer
+ * registries; the auditor never changes cluster membership.
  */
 const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
   owner: new Set<Permission>([
@@ -80,6 +92,9 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'orchestrator.drain',
     'ci_trust.read',
     'ci_trust.admin',
+    'scaler.read',
+    'scaler.manage',
+    'peer.manage',
   ]),
   admin: new Set<Permission>([
     'context.create',
@@ -103,6 +118,9 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'orchestrator.drain',
     'ci_trust.read',
     'ci_trust.admin',
+    'scaler.read',
+    'scaler.manage',
+    'peer.manage',
   ]),
   auditor: new Set<Permission>([
     'context.read',
@@ -111,6 +129,7 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'event_log.read',
     'access_log.read',
     'event_dlq.read',
+    'scaler.read',
   ]),
 };
 

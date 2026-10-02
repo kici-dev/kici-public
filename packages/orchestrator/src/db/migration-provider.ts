@@ -158,6 +158,9 @@ import * as m150 from './migrations/150_execution_runs_status_epoch.js';
 import * as m151 from './migrations/151_workflow_registrations_dep_cache_key_sha.js';
 import * as m152 from './migrations/152_org_settings_cache_upload_settle_timeout.js';
 import * as m153 from './migrations/153_execution_runs_cancel_force.js';
+import * as m154 from './migrations/154_cluster_settings_firecracker_api_socket_wait.js';
+import * as m155 from './migrations/155_org_settings_reroute_spawn_retry.js';
+import * as m156 from './migrations/156_kici_events_match_outcome.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -316,6 +319,9 @@ export function createMigrationProvider(): MigrationProvider {
         '151_workflow_registrations_dep_cache_key_sha': m151,
         '152_org_settings_cache_upload_settle_timeout': m152,
         '153_execution_runs_cancel_force': m153,
+        '154_cluster_settings_firecracker_api_socket_wait': m154,
+        '155_org_settings_reroute_spawn_retry': m155,
+        '156_kici_events_match_outcome': m156,
       };
     },
   };

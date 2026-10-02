@@ -10,7 +10,9 @@ The bare-metal backend provisions agents as host child processes (`child_process
 **Label-set-level fields:**
 
 - `binaryPath` — Filesystem path to the agent binary. The scaler spawns this
-  process for each job.
+  process for each job. On Windows this is the `kici-agent.cmd` launcher that a
+  Windows package or `npm install -g kici-admin` installs. See
+  [Windows launchers](#windows-launchers).
 - `image` — A `kici-agent` container image. It has two uses, described in
   [Container jobs](#container-jobs) below.
 
@@ -47,7 +49,7 @@ The host needs docker or podman for any of this. See
 
 ## Process management
 
-Processes are spawned in detached process groups (`{ detached: true }`) to enable clean killing of entire process trees. Environment variables are passed directly to the spawned process:
+Each agent runs as a host process. On Linux and macOS it is detached and leads its own process group, so the scaler can stop the whole tree. On Windows it starts without a console window. Environment variables are passed directly to the spawned process:
 
 - `KICI_ORCHESTRATOR_URL` -- Orchestrator WebSocket URL
 - `KICI_AGENT_ID` -- Pre-generated agent ID for correlation
@@ -61,9 +63,32 @@ Processes are spawned in detached process groups (`{ detached: true }`) to enabl
 - Host variables forwarded through the [`KICI_AGENT_ENV_` prefix](./common-config.md#environment-variable-forwarding)
 - Any additional `env` entries from the label set config, which win on a conflict
 
+### Windows launchers
+
+On Windows the agent binary is a batch file, `kici-agent.cmd`. Node.js does not start a batch file directly, so the scaler runs it through cmd.exe:
+
+    cmd.exe /d /e:on /v:off /c call <binaryPath> <NUL
+
+The scaler uses the cmd.exe that `COMSPEC` names on the orchestrator host. When `COMSPEC` names another program, it uses `C:\Windows\System32\cmd.exe`. A binary that is not a batch file, such as `node.exe`, runs directly.
+
+cmd.exe reads some characters in a path as syntax. On a Windows orchestrator, a `.cmd` or `.bat` `binaryPath` that contains `"`, `%` or `^` stops the orchestrator from starting, and a reload fails. When the path contains no space, `&`, `|`, `<`, `>`, `(`, `)`, `,`, `;` and `=` are refused too. A path with a space is quoted, so `C:\Program Files (x86)\KiCI\kici-agent.cmd` is accepted.
+
 ## Agent lifecycle
 
-All bare-metal agents are single-use: the agent process is spawned for one job, then killed after the job completes or the agent disconnects. Process group kill sequence: SIGTERM, wait 5s, SIGKILL.
+All bare-metal agents are single-use: the agent process is spawned for one job, then stopped after the job completes or the agent disconnects.
+
+- **Linux and macOS:** the scaler sends SIGTERM to the process group, waits 5 seconds, then sends SIGKILL.
+- **Windows:** the scaler ends the whole process tree at once with `taskkill /T /F /PID <pid>`. The orchestrator cannot send a ctrl-C to a process on Windows, so there is no graceful step. When the tree has already exited, the scaler does nothing.
+
+## Launch failures
+
+Sometimes an agent never starts. Either the host refuses to start the agent process, or the process stops before it connects to the orchestrator. For example, a label-set `env` value can be longer than the operating system accepts (`E2BIG` on Linux), or the agent can stop at startup because a tool it needs is missing. In both cases the scaler does three things:
+
+- **Reports it.** `kici-admin diagnose` shows the cause on the `scaler:<name>` row, and the waiting job's error names it. For an agent that stopped, the cause includes the last lines the agent wrote.
+- **Defers the scaler.** The next spawn for that scaler waits `scaler-provision-backoff-base-ms`. Each further consecutive failure doubles the wait, up to `scaler-provision-backoff-max-ms`. An agent that registers clears it. These are the cluster settings described in [Retry backoff](../event-scaler.md#retry-backoff).
+- **Frees the capacity.** Other scalers and other jobs are not held back.
+
+An agent that connected and stops later is not a launch failure. A missing binary is caught earlier: the orchestrator checks that `binaryPath` exists when it starts.
 
 ## cgroup enforcement
 
@@ -116,7 +141,7 @@ scalers:
     maxAgents: 2
     labelSets:
       - labels: [windows, bare-metal]
-        binaryPath: C:\kici\agent\kici-agent.exe
+        binaryPath: C:\kici\agent\kici-agent.cmd
 ```
 
 For a non-Linux bare-metal pool, prefer declaring the structured `platform: { os, arch }` field. It is the canonical way to taint a Windows / macOS / ARM pool so unqualified Linux jobs are never routed to it, and it works even when the pool's plain labels use a non-canonical name. See [Automatic platform taint](./common-config.md) in the common config reference.

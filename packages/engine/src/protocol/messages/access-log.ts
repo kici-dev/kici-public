@@ -115,6 +115,7 @@ export const AccessLogAction = z.enum([
   'diagnostics.read',
   'scaler.capacity.read',
   'scaler.agents.read',
+  'scaler.orphans.read',
   'fleet.read',
   'fleet.host.declare',
   'fleet.host.remove',
@@ -194,6 +195,20 @@ export const AccessLogAction = z.enum([
    * clears a terminal `rejected_at` marker, so it is always audited.
    */
   'attestation.retry',
+  /**
+   * Live orphaned Firecracker VMs stopped via the orch admin
+   * `POST /admin/scaler/orphans/stop` route (driven by `kici-admin scaler
+   * orphans --stop`). `target_id` is the node's instance id; `actor_meta`
+   * carries `target`, `vm_ids` and the per-VM `results`.
+   */
+  'scaler.orphan.stop',
+  /**
+   * A departed peer dropped from the coordinators' live peer registries via
+   * the orch admin `POST /admin/peers/forget` route (driven by `kici-admin peer
+   * forget`). `target_id` is the forgotten instance id; `actor_meta` carries the
+   * per-coordinator `results`.
+   */
+  'peer.forget',
   'access_log.list.read',
   /** Event DLQ admin actions (at-least-once event delivery). */
   'event_dlq.list.read',

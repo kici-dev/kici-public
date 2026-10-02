@@ -303,6 +303,32 @@ describe('RegistrationStore', () => {
       expect(mocks.trxInsertInto).toHaveBeenCalledWith('workflow_registrations');
     });
 
+    it('keeps workflows the incoming set omits when prune is false', async () => {
+      // fails-when: replaceAll ignores `prune` and deletes old-wf
+      const existingRow = makeRegistrationRow({
+        id: 'existing-uuid-1',
+        workflow_name: 'old-wf',
+        routing_key: 'github:42',
+        repo_identifier: 'owner/repo',
+      });
+      const { db, mocks } = createMockDb({ trxSelectResult: [existingRow] });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('new-wf')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+          prune: false,
+        },
+      );
+
+      expect(mocks.trxDeleteFrom).not.toHaveBeenCalled();
+      expect(mocks.trxInsertInto).toHaveBeenCalledWith('workflow_registrations');
+    });
+
     it('should NOT include disabled in the UPDATE set clause', async () => {
       const existingRow = makeRegistrationRow({
         id: 'existing-uuid-1',

@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { EventStore, EVENT_CATCHUP_BATCH_SIZE, type NewEventInput } from './event-store.js';
-import { DEFAULT_EVENT_ROUTER_CONFIG, type EventRouterConfig } from './types.js';
+import { DEFAULT_EVENT_ROUTER_CONFIG, EventMatchOutcome, type EventRouterConfig } from './types.js';
 
 // ── Mock helpers ────────────────────────────────────────────────
 
@@ -44,6 +44,8 @@ function makeDbRow(overrides: Partial<Record<string, unknown>> = {}): Record<str
     next_retry_at: null,
     dlq_at: null,
     dlq_reason: null,
+    match_outcome: null,
+    matched_count: null,
     ...overrides,
   };
 }
@@ -250,6 +252,101 @@ describe('EventStore', () => {
         claimed_by: null,
       });
       expect(mocks.updateWhere).toHaveBeenCalledWith('id', '=', 'evt-001');
+    });
+
+    it('records the match outcome when one is given', async () => {
+      // fails-when: markProcessed drops the router's result
+      const { db, mocks } = createMockDb();
+      const store = new EventStore(db, config);
+
+      await store.markProcessed('evt-001', {
+        outcome: EventMatchOutcome.enum['no-target-repo'],
+        matchedCount: 0,
+      });
+
+      expect(mocks.updateSet).toHaveBeenCalledWith({
+        processed: true,
+        claimed_at: null,
+        claimed_by: null,
+        match_outcome: 'no-target-repo',
+        matched_count: 0,
+      });
+    });
+  });
+
+  describe('list', () => {
+    it('applies every filter and orders newest first', async () => {
+      const rows = [
+        makeDbRow({
+          id: 'evt-new',
+          event_name: 'kici.scaler.scale-up',
+          match_outcome: 'no-target-repo',
+          created_at: new Date('2026-10-01T12:00:00Z'),
+        }),
+        makeDbRow({
+          id: 'evt-other',
+          event_name: 'deploy-complete',
+          match_outcome: 'matched',
+          created_at: new Date('2026-10-01T12:00:00Z'),
+        }),
+      ];
+      const { db, mocks } = createMockDb({ selectManyResult: rows });
+      const store = new EventStore(db, config);
+
+      const events = await store.list({
+        name: 'kici.scaler.scale-up',
+        outcome: EventMatchOutcome.enum['no-target-repo'],
+        since: new Date('2026-10-01T00:00:00Z'),
+        before: new Date('2026-10-02T00:00:00Z'),
+        limit: 25,
+        sourceRoutingKey: 'github:42',
+      });
+
+      // The mock applies the where predicates, so the other event is filtered out.
+      expect(events.map((e) => e.id)).toEqual(['evt-new']);
+      expect(mocks.selectWhere).toHaveBeenCalledWith('event_name', '=', 'kici.scaler.scale-up');
+      expect(mocks.selectWhere).toHaveBeenCalledWith('match_outcome', '=', 'no-target-repo');
+      expect(mocks.selectWhere).toHaveBeenCalledWith(
+        'created_at',
+        '>=',
+        new Date('2026-10-01T00:00:00Z'),
+      );
+      expect(mocks.selectWhere).toHaveBeenCalledWith(
+        'created_at',
+        '<',
+        new Date('2026-10-02T00:00:00Z'),
+      );
+      expect(mocks.selectWhere).toHaveBeenCalledWith('source_routing_key', '=', 'github:42');
+      expect(mocks.selectOrderBy).toHaveBeenCalledWith('created_at', 'desc');
+      expect(mocks.selectLimit).toHaveBeenCalledWith(25);
+    });
+
+    it('adds no filter the caller did not ask for', async () => {
+      const { db, mocks } = createMockDb({ selectManyResult: [makeDbRow()] });
+      const events = await new EventStore(db, config).list({ limit: 10 });
+      expect(events).toHaveLength(1);
+      expect(mocks.selectWhere).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('match outcome mapping', () => {
+    it('reads a stored outcome and count', async () => {
+      const { db } = createMockDb({
+        selectOneResult: makeDbRow({ match_outcome: 'matched', matched_count: 2 }),
+      });
+      const event = await new EventStore(db, config).getById('evt-001');
+      expect(event!.matchOutcome).toBe(EventMatchOutcome.enum.matched);
+      expect(event!.matchedCount).toBe(2);
+    });
+
+    it('reads an outcome this build does not know as null', async () => {
+      // breaks-if-wrong: a row a newer peer wrote must not fail the read
+      const { db } = createMockDb({
+        selectOneResult: makeDbRow({ match_outcome: 'some-future-outcome', matched_count: 0 }),
+      });
+      const event = await new EventStore(db, config).getById('evt-001');
+      expect(event!.matchOutcome).toBeNull();
+      expect(event!.matchedCount).toBe(0);
     });
   });
 

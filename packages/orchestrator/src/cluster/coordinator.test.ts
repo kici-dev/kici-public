@@ -11,6 +11,8 @@ import {
   ScalerEventType,
   type LabelMatcher,
   type PeerHeartbeat,
+  type PeerScalerEvent,
+  type RerouteSpawnRetry,
 } from '@kici-dev/engine';
 import { AgentRegistry } from '../agent/registry.js';
 
@@ -1528,11 +1530,16 @@ describe('RunCoordinator', () => {
   });
 
   describe('reroute NAK-after-accept fast path (Layer B)', () => {
-    async function setupReroute(windowMs = 100_000) {
+    async function setupReroute(
+      windowMs = 100_000,
+      spawnRetry: RerouteSpawnRetry = { maxAttempts: 3, backoffMs: 10_000 },
+      getWindow: () => Promise<number> = async () => windowMs,
+    ) {
       const peer1 = makePeerInfo({ instanceId: 'peer-1' });
       const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
       const { coordinator, deps } = createCoordinator({
-        getRerouteSpawnWindowMs: async () => windowMs,
+        getRerouteSpawnWindowMs: getWindow,
+        getRerouteSpawnRetry: async () => spawnRetry,
       } as Partial<RunCoordinatorDeps>);
       deps.dispatcher.dispatch.mockResolvedValueOnce({ status: 'rejected', reason: 'no backend' });
       deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer1]);
@@ -1560,6 +1567,7 @@ describe('RunCoordinator', () => {
           eventType: ScalerEventType.enum['scaler.failed'],
           detail: 'spawn EINVAL',
           timestampMs: 1,
+          final: true,
         },
         'peer-1',
       );
@@ -1609,6 +1617,7 @@ describe('RunCoordinator', () => {
           eventType: ScalerEventType.enum['scaler.failed'],
           detail: 'spawn EINVAL',
           timestampMs: 2,
+          final: true,
         },
         'peer-1',
       );
@@ -1659,6 +1668,7 @@ describe('RunCoordinator', () => {
           eventType: ScalerEventType.enum['scaler.failed'],
           detail: 'spawn EINVAL',
           timestampMs: 1,
+          final: true,
         },
         'peer-1',
       );
@@ -1695,6 +1705,7 @@ describe('RunCoordinator', () => {
           eventType: ScalerEventType.enum['scaler.failed'],
           detail: 'stale failure from superseded peer',
           timestampMs: 2000,
+          final: true,
         },
         'peer-SUPERSEDED',
       );
@@ -1716,6 +1727,7 @@ describe('RunCoordinator', () => {
           eventType: ScalerEventType.enum['scaler.failed'],
           detail: 'spawn EINVAL',
           timestampMs: 2001,
+          final: true,
         },
         'peer-1',
       );
@@ -1761,6 +1773,7 @@ describe('RunCoordinator', () => {
           eventType: ScalerEventType.enum['scaler.failed'],
           detail: 'spawn EINVAL',
           timestampMs: 2,
+          final: true,
         },
         'peer-1',
       );
@@ -1806,6 +1819,166 @@ describe('RunCoordinator', () => {
         'peer-OTHER',
       );
       await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+    });
+
+    /** A worker-relayed `scaler.failed` for the tracked reroute. */
+    function failed(jobId: string, extra: Partial<PeerScalerEvent> = {}): PeerScalerEvent {
+      return {
+        type: 'scaler.event',
+        runId: 'run-9',
+        jobId,
+        agentId: 'scaler-container-1',
+        eventType: ScalerEventType.enum['scaler.failed'],
+        detail: 'no such image',
+        timestampMs: 1,
+        ...extra,
+      };
+    }
+
+    function expectRedispatched(
+      deps: ReturnType<typeof createCoordinator>['deps'],
+      peerClient: ReturnType<typeof createMockPeerClient>,
+      jobId: string,
+    ): void {
+      expect(peerClient.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-9', jobId }),
+      );
+      expect(deps.dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ jobId }));
+    }
+
+    function expectNotRedispatched(
+      deps: ReturnType<typeof createCoordinator>['deps'],
+      peerClient: ReturnType<typeof createMockPeerClient>,
+    ): void {
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+      expect(peerClient.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel' }),
+      );
+    }
+
+    async function setupForVerdict(
+      windowMs: number,
+      spawnRetry: RerouteSpawnRetry,
+      getWindow?: () => Promise<number>,
+    ) {
+      const setup = await setupReroute(windowMs, spawnRetry, getWindow);
+      setup.deps.dispatcher.dispatch.mockReset();
+      setup.deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+      return setup;
+    }
+
+    it('the reroute carries the per-org spawn-retry budget', async () => {
+      const { peerClient } = await setupReroute(100_000, { maxAttempts: 5, backoffMs: 1234 });
+      expect(peerClient.sendAndWaitAck).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'job.reroute',
+          spawnRetry: { maxAttempts: 5, backoffMs: 1234 },
+        }),
+        expect.any(Number),
+      );
+    });
+
+    it('final:false re-arms the window to window + backoff instead of re-dispatching', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupForVerdict(100_000, {
+        maxAttempts: 3,
+        backoffMs: 10_000,
+      });
+
+      coordinator.onPeerScalerEvent(failed(jobId, { final: false }), 'peer-1');
+      // fails-when: no re-arm — the original window fires at 100 s
+      await vi.advanceTimersByTimeAsync(100_000);
+      expectNotRedispatched(deps, peerClient);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expectRedispatched(deps, peerClient, jobId);
+    });
+
+    it('a legacy relay (no final) waits out the original window', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupForVerdict(100_000, {
+        maxAttempts: 3,
+        backoffMs: 10_000,
+      });
+
+      // fails-when: a verdict-less relay is treated as final, or extends the window
+      coordinator.onPeerScalerEvent(failed(jobId), 'peer-1');
+      await vi.advanceTimersByTimeAsync(1);
+      expectNotRedispatched(deps, peerClient);
+
+      await vi.advanceTimersByTimeAsync(100_000);
+      expectRedispatched(deps, peerClient, jobId);
+    });
+
+    it('maxAttempts non-final relays are treated as final', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupForVerdict(100_000, {
+        maxAttempts: 2,
+        backoffMs: 10_000,
+      });
+
+      // breaks-if-wrong: a conforming worker's maxAttempts - 1 non-final relays fail nothing over
+      coordinator.onPeerScalerEvent(failed(jobId, { agentId: 'a1', final: false }), 'peer-1');
+      await vi.advanceTimersByTimeAsync(1);
+      expectNotRedispatched(deps, peerClient);
+
+      // fails-when: a worker that never says final keeps the job forever
+      coordinator.onPeerScalerEvent(failed(jobId, { agentId: 'a2', final: false }), 'peer-1');
+      await vi.advanceTimersByTimeAsync(1);
+      expectRedispatched(deps, peerClient, jobId);
+    });
+
+    it('does not re-arm a window a progress disarmed during the re-arm', async () => {
+      let releaseWindowRead: (ms: number) => void = () => {};
+      let windowReads = 0;
+      const getWindow = (): Promise<number> => {
+        windowReads += 1;
+        // The reroute's own read resolves at once; the re-arm's read is held open.
+        if (windowReads === 1) return Promise.resolve(100_000);
+        return new Promise<number>((resolve) => {
+          releaseWindowRead = resolve;
+        });
+      };
+      const { coordinator, deps, peerClient, jobId } = await setupForVerdict(
+        100_000,
+        { maxAttempts: 3, backoffMs: 10_000 },
+        getWindow,
+      );
+
+      coordinator.onPeerScalerEvent(failed(jobId, { final: false }), 'peer-1');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(windowReads).toBe(2);
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-9',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: ExecutionJobStatus.enum.running,
+          timestamp: 2,
+        },
+        'peer-1',
+      );
+      releaseWindowRead(100_000);
+      // fails-when: the re-arm ignores the progress that landed during its read and
+      // re-dispatches a running job
+      await vi.advanceTimersByTimeAsync(1_000_000);
+      expectNotRedispatched(deps, peerClient);
+    });
+
+    it('final:true from a superseded peer is ignored', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupForVerdict(100_000, {
+        maxAttempts: 3,
+        backoffMs: 10_000,
+      });
+
+      coordinator.onPeerScalerEvent(failed(jobId, { final: true }), 'peer-SUPERSEDED');
+      await vi.advanceTimersByTimeAsync(1);
+      expectNotRedispatched(deps, peerClient);
     });
   });
 

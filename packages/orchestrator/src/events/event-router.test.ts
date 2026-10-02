@@ -40,13 +40,18 @@ vi.mock('./batch-accumulator.js', () => ({
 // real lazy instrument.
 vi.mock('../metrics/prometheus.js', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, eventCatchUpFailuresTotal: { add: vi.fn() } };
+  return { ...actual, eventCatchUpFailuresTotal: { add: vi.fn() }, incEventUnmatched: vi.fn() };
 });
 
 import { EventRouter, type EmitEventInput, type EventRouterOptions } from './event-router.js';
-import { eventCatchUpFailuresTotal } from '../metrics/prometheus.js';
+import { eventCatchUpFailuresTotal, incEventUnmatched } from '../metrics/prometheus.js';
 import { openOrGetBatchWindow, appendBatchItem } from './batch-accumulator.js';
-import { DEFAULT_EVENT_ROUTER_CONFIG, type EventRouterConfig, type StoredEvent } from './types.js';
+import {
+  DEFAULT_EVENT_ROUTER_CONFIG,
+  EventMatchOutcome,
+  type EventRouterConfig,
+  type StoredEvent,
+} from './types.js';
 import { EVENT_CATCHUP_BATCH_SIZE, type EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
@@ -75,6 +80,8 @@ function makeStoredEvent(overrides: Partial<StoredEvent> = {}): StoredEvent {
     nextRetryAt: null,
     dlqAt: null,
     dlqReason: null,
+    matchOutcome: null,
+    matchedCount: null,
     ...overrides,
   };
 }
@@ -789,7 +796,10 @@ describe('EventRouter', () => {
       // after a successful dispatch (vs. the old "mark processed upfront"
       // pattern which silently lost events on dispatch failure).
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-idx-log', 'test-node-A');
-      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-idx-log');
+      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-idx-log', {
+        outcome: EventMatchOutcome.enum.matched,
+        matchedCount: 1,
+      });
     });
   });
 
@@ -1657,7 +1667,10 @@ describe('EventRouter', () => {
       await router.start();
       await simulateNotification(opts.mockPool, 'kici_event_channel', 'evt-ok');
 
-      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-ok');
+      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-ok', {
+        outcome: EventMatchOutcome.enum.matched,
+        matchedCount: 1,
+      });
       expect(eventStore.recordDispatchFailure).not.toHaveBeenCalled();
       expect(eventStore.markDlq).not.toHaveBeenCalled();
     });
@@ -1757,7 +1770,10 @@ describe('EventRouter', () => {
       await simulateNotification(opts.mockPool, 'kici_event_channel', 'evt-fi-2');
 
       expect(onEventMatched).toHaveBeenCalledTimes(1);
-      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-fi-2');
+      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-fi-2', {
+        outcome: EventMatchOutcome.enum.matched,
+        matchedCount: 1,
+      });
     });
 
     it('does nothing when the event name is absent from the map', async () => {
@@ -1787,7 +1803,10 @@ describe('EventRouter', () => {
 
       // Different event name → not affected by the budget.
       expect(onEventMatched).toHaveBeenCalledTimes(1);
-      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-fi-3');
+      expect(eventStore.markProcessed).toHaveBeenCalledWith('evt-fi-3', {
+        outcome: EventMatchOutcome.enum.matched,
+        matchedCount: 1,
+      });
     });
 
     it('lands the event in DLQ when budget exceeds maxDispatchAttempts', async () => {
@@ -1871,8 +1890,9 @@ describe('EventRouter', () => {
     it('buffers a failed workflow_complete instead of dispatching now', async () => {
       const event = makeFailedCompletionEvent();
       const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      const eventStore = createMockEventStore({ events: [event] });
       const opts = createRouterOptions({
-        eventStore: createMockEventStore({ events: [event] }),
+        eventStore,
         onEventMatched,
         registrationIndex: batchRegIndex(),
       });
@@ -1893,6 +1913,10 @@ describe('EventRouter', () => {
         }),
       );
       expect(onEventMatched).not.toHaveBeenCalled();
+      expect(eventStore.markProcessed).toHaveBeenCalledWith(event.id, {
+        outcome: EventMatchOutcome.enum.buffered,
+        matchedCount: 0,
+      });
     });
 
     it('dispatches the synthetic workflows_failed_batch event to its registration', async () => {
@@ -1932,9 +1956,10 @@ describe('EventRouter', () => {
       (db as any).transaction = vi.fn().mockReturnValue({
         execute: vi.fn().mockImplementation((fn: (tx: any) => Promise<unknown>) => fn({})),
       });
+      const eventStore = createMockEventStore({ events: [event] });
       const opts = createRouterOptions({
         db,
-        eventStore: createMockEventStore({ events: [event] }),
+        eventStore,
         onEventMatched,
         registrationIndex: batchRegIndex(),
       });
@@ -1945,6 +1970,11 @@ describe('EventRouter', () => {
 
       expect(appendBatchItem).not.toHaveBeenCalled();
       expect(onEventMatched).not.toHaveBeenCalled();
+      // A self-excluded decision was neither buffered nor dispatched.
+      expect(eventStore.markProcessed).toHaveBeenCalledWith(event.id, {
+        outcome: EventMatchOutcome.enum['no-trigger-match'],
+        matchedCount: 0,
+      });
     });
   });
 
@@ -1990,5 +2020,105 @@ describe('EventRouter', () => {
 
       expect(matches).toHaveLength(0);
     });
+  });
+});
+
+describe('match outcome', () => {
+  async function routeOne(event: StoredEvent, regs: RegisteredWorkflow[], trusted = true) {
+    const eventStore = createMockEventStore({ events: [event] });
+    const opts = createRouterOptions({
+      registrationIndex: createMockRegistrationIndex(regs),
+      eventStore,
+      trustStore: createMockTrustStore({ trusted }),
+    });
+    const router = new EventRouter(opts);
+    await router.start();
+    await simulateNotification(opts.mockPool, 'kici_event_channel', event.id);
+    await router.stop();
+    return (eventStore.markProcessed as any).mock.calls[0];
+  }
+
+  it('records matched with the dispatch count', async () => {
+    // fails-when: the router drops the result, or counts registrations it never dispatched
+    const call = await routeOne(makeStoredEvent({ id: 'e1' }), [
+      makeRegisteredWorkflow('on-deploy', 'deploy-complete'),
+      makeRegisteredWorkflow('other', 'other-event'),
+    ]);
+    expect(call).toEqual(['e1', { outcome: EventMatchOutcome.enum.matched, matchedCount: 1 }]);
+  });
+
+  it('records no-registration when nothing subscribes to the trigger type', async () => {
+    const call = await routeOne(makeStoredEvent({ id: 'e2' }), []);
+    expect(call[1]).toEqual({
+      outcome: EventMatchOutcome.enum['no-registration'],
+      matchedCount: 0,
+    });
+  });
+
+  it('records no-target-repo when the targeted repos have no registration', async () => {
+    const call = await routeOne(makeStoredEvent({ id: 'e3', targetRepos: ['org/none'] }), [
+      makeRegisteredWorkflow('on-deploy', 'deploy-complete'),
+    ]);
+    expect(call[1].outcome).toBe(EventMatchOutcome.enum['no-target-repo']);
+  });
+
+  it('records no-trigger-match when a registration exists but its trigger does not match', async () => {
+    const call = await routeOne(makeStoredEvent({ id: 'e4', eventName: 'other-event' }), [
+      makeRegisteredWorkflow('on-deploy', 'deploy-complete'),
+    ]);
+    expect(call[1].outcome).toBe(EventMatchOutcome.enum['no-trigger-match']);
+  });
+
+  it('records trust-blocked when every candidate is refused by the trust store', async () => {
+    const call = await routeOne(
+      makeStoredEvent({ id: 'e5', sourceRepo: 'org/src' }),
+      [makeRegisteredWorkflow('on-deploy', 'deploy-complete', { repoIdentifier: 'org/dst' })],
+      false,
+    );
+    expect(call[1].outcome).toBe(EventMatchOutcome.enum['trust-blocked']);
+  });
+
+  it('signals a reserved kici. event that matched no subscriber', async () => {
+    // fails-when: a scale-up targeting a repo with no provisioning workflow is
+    // marked processed silently
+    vi.mocked(incEventUnmatched).mockClear();
+    await routeOne(
+      makeStoredEvent({
+        id: 'k1',
+        eventName: 'kici.scaler.scale-up',
+        targetRepos: ['org/none'],
+        sourceRepo: undefined,
+        sourceRoutingKey: undefined,
+      }),
+      [makeRegisteredWorkflow('provision', 'kici.scaler.scale-up')],
+    );
+    expect(incEventUnmatched).toHaveBeenCalledWith(
+      'kici.scaler.scale-up',
+      EventMatchOutcome.enum['no-target-repo'],
+    );
+  });
+
+  it('does not signal a system or user event with no subscriber', async () => {
+    // breaks-if-wrong: __workflow_complete with no subscriber is routine
+    vi.mocked(incEventUnmatched).mockClear();
+    await routeOne(makeSystemEvent('__workflow_complete'), []);
+    await routeOne(makeStoredEvent({ id: 'u1', eventName: 'nobody-listens' }), []);
+    expect(incEventUnmatched).not.toHaveBeenCalled();
+  });
+
+  it('does not signal a matched reserved event', async () => {
+    vi.mocked(incEventUnmatched).mockClear();
+    const call = await routeOne(
+      makeStoredEvent({
+        id: 'k2',
+        eventName: 'kici.scaler.scale-up',
+        sourceRepo: undefined,
+        sourceRoutingKey: undefined,
+      }),
+      [makeRegisteredWorkflow('provision', 'kici.scaler.scale-up')],
+    );
+    // Positive control: the event really matched, so the silence is earned.
+    expect(call[1].outcome).toBe(EventMatchOutcome.enum.matched);
+    expect(incEventUnmatched).not.toHaveBeenCalled();
   });
 });

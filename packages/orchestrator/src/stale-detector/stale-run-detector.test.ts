@@ -82,8 +82,11 @@ function createDeps() {
     onAgentDisconnected: vi.fn(),
   };
 
+  // By default the dispatcher tracks no job to any agent; a test that expects
+  // the agent to be disconnected maps the stale job to it.
   const dispatcher = {
     onAgentDisconnect: vi.fn().mockResolvedValue(undefined),
+    getAgentIdForJob: vi.fn((_jobId: string): string | null => null),
   };
 
   const registry = {
@@ -1267,6 +1270,9 @@ describe('StaleRunDetector', () => {
   it('force-terminates agent via scalerManager', async () => {
     const mocks = createDeps();
     const job = staleJob({ agent_id: 'agent-99' });
+    mocks.dispatcher.getAgentIdForJob.mockImplementation((jobId) =>
+      jobId === job.job_id ? 'agent-99' : null,
+    );
 
     const db = createSequentialDb({
       selects: [{ executeResult: [job] }, { executeResult: [] }, { executeResult: [] }],
@@ -1354,6 +1360,49 @@ describe('StaleRunDetector', () => {
 
     // Should not throw -- scan() catches errors internally
     await expect(detector.scan()).resolves.toBeUndefined();
+  });
+
+  // fails-when: the detector disconnects the agent the row names although this
+  // dispatcher no longer tracks the stale job to it — the agent reconnected and
+  // runs another job, which the disconnect would push into a recovery that never
+  // ends, and the agent would be dropped from the registry with its socket open.
+  it('leaves a reconnected agent alone when the dispatcher no longer tracks the stale job to it', async () => {
+    const mocks = createDeps();
+    const job = staleJob({ agent_id: 'agent-1' });
+    mocks.dispatcher.getAgentIdForJob.mockReturnValue(null);
+
+    const db = createSequentialDb({
+      selects: [{ executeResult: [job] }, { executeResult: [] }, { executeResult: [] }],
+      updates: [{ executeTakeFirstResult: { numUpdatedRows: 1n } }],
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    // The job itself is still reaped.
+    expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
+      job.run_id,
+      job.job_id,
+      'timed_out_stale',
+    );
+    expect(mocks.dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: an agent that still holds the stale job is force-terminated
+  it('disconnects an agent the dispatcher still tracks the stale job to', async () => {
+    const mocks = createDeps();
+    const job = staleJob({ agent_id: 'agent-1' });
+    mocks.dispatcher.getAgentIdForJob.mockReturnValue('agent-1');
+
+    const db = createSequentialDb({
+      selects: [{ executeResult: [job] }, { executeResult: [] }, { executeResult: [] }],
+      updates: [{ executeTakeFirstResult: { numUpdatedRows: 1n } }],
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    expect(mocks.dispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
   });
 
   it('does not force-terminate when job has no agent_id', async () => {

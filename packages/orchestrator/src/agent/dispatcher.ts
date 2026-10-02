@@ -727,23 +727,7 @@ export class Dispatcher {
       const pending = await this.queue.listPending(maxJobs);
       let redriven = 0;
       for (const job of pending) {
-        // fails-when: the re-drive spawns a job's private image without its sealed registry credentials
-        // breaks-if-wrong: a job whose secrets opened is still offered to the scaler
-        if (job.secretsUnavailable) {
-          await this.settleUnopenablePending(job, job.secretsUnavailable);
-          continue;
-        }
-        const containerSpawn = containerSpawnFor(job.jobConfig);
-        const result = await this.onNoMatchingAgent(
-          job.runsOnLabels,
-          job.id,
-          job.runId,
-          job.excludeLabels ?? [],
-          job.resources,
-          typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
-          containerSpawn,
-        );
-        if (result.action === 'spawning') redriven++;
+        if ((await this.offerPendingToScaler(job)) === 'spawning') redriven++;
       }
       if (redriven > 0) {
         this.metrics.incScalerRedispatch(trigger, redriven);
@@ -760,6 +744,48 @@ export class Dispatcher {
     } finally {
       this.redriveInFlight = false;
     }
+  }
+
+  /**
+   * Re-offer ONE pending job to the scaler: a worker's spawn-retry backoff ending.
+   *
+   * Outside the batch's single-flight on purpose: a wake-up that lands during a
+   * batch pass would otherwise be dropped, and a worker runs no pending-scale
+   * sweep to pick it up. The worker's per-job attempt gate is what keeps this
+   * from starting a second spawn for the same job.
+   *
+   * @returns true when a spawn started.
+   */
+  async redrivePendingJob(jobId: string): Promise<boolean> {
+    if (!this.onNoMatchingAgent) return false;
+    const job = await this.queue.getFullJobById(jobId);
+    if (!job || job.status !== DispatchQueueStatus.Pending) return false;
+    return (await this.offerPendingToScaler(job)) === 'spawning';
+  }
+
+  /**
+   * Offer one pending job to the scaler through the same `onNoMatchingAgent` →
+   * `requestScale` path a dispatch uses, or settle it when its sealed secrets
+   * cannot be opened here.
+   */
+  private async offerPendingToScaler(job: QueuedJob): Promise<ScaleResult['action'] | 'settled'> {
+    // fails-when: the re-drive spawns a job's private image without its sealed registry credentials
+    // breaks-if-wrong: a job whose secrets opened is still offered to the scaler
+    if (job.secretsUnavailable) {
+      await this.settleUnopenablePending(job, job.secretsUnavailable);
+      return 'settled';
+    }
+    if (!this.onNoMatchingAgent) return 'settled';
+    const result = await this.onNoMatchingAgent(
+      job.runsOnLabels,
+      job.id,
+      job.runId,
+      job.excludeLabels ?? [],
+      job.resources,
+      typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
+      containerSpawnFor(job.jobConfig),
+    );
+    return result.action;
   }
 
   /**

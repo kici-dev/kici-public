@@ -168,6 +168,7 @@ import {
 } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 import { runDetached } from './helpers/run-detached.js';
 import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
+import { answerScalerOrphansRequest } from './scaler/orphan-requests.js';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'server' });
@@ -1010,6 +1011,9 @@ export async function runServer(
                 }
                 return reloader.executeReload({ source: 'cluster', drain: msg.drain });
               },
+              onPeerForgetRequest: sub.answerPeerForgetRequest,
+              onScalerOrphansRequest: (msg) =>
+                answerScalerOrphansRequest(sub.scalerManager ?? null, msg),
               onLogsCollectRequest: (msg, send) => sub.fleetCollectResponder(msg, send),
               onAuthenticated: (targetInstanceId) => {
                 if (initialKey === targetInstanceId) return;

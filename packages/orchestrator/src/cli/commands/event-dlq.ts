@@ -19,7 +19,8 @@ import type { AdminApiClient } from '../api-client.js';
 interface DlqEvent {
   id: string;
   eventName: string;
-  payload: Record<string, unknown>;
+  /** Null for a role without `event_log.read_payload`. */
+  payload: Record<string, unknown> | null;
   sourceRepo: string | null;
   sourceRoutingKey: string | null;
   sourceRunId: string | null;

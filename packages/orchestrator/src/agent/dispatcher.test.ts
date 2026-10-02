@@ -1928,6 +1928,111 @@ describe('Dispatcher', () => {
     });
   });
 
+  describe('redrivePendingJob (one job, outside the batch single-flight)', () => {
+    function setupOne(job: QueuedJob | null, onNoMatchingAgent = vi.fn()) {
+      const queue = mockQueue();
+      vi.mocked(queue.getFullJobById).mockResolvedValue(job);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch: onDispatch as OnDispatch,
+        onNoMatchingAgent,
+      });
+      return { dispatcher, queue, onNoMatchingAgent };
+    }
+
+    it('offers one pending job with the batch argument list', async () => {
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const { dispatcher } = setupOne(
+        makeQueuedJob({ id: 'old', runId: 'run-old', status: DispatchQueueStatus.Pending }),
+        onNoMatchingAgent,
+      );
+
+      expect(await dispatcher.redrivePendingJob('old')).toBe(true);
+      expect(onNoMatchingAgent).toHaveBeenCalledWith(
+        ['linux'],
+        'old',
+        'run-old',
+        [],
+        undefined,
+        undefined,
+        undefined,
+      );
+      // A backoff re-drive is logged by its caller, not counted as a capacity-freed one.
+      expect(metrics.incScalerRedispatch).not.toHaveBeenCalled();
+    });
+
+    it('reports false when no spawn started', async () => {
+      const { dispatcher } = setupOne(
+        makeQueuedJob({ id: 'old', status: DispatchQueueStatus.Pending }),
+        vi.fn().mockResolvedValue({ action: 'at-capacity' }),
+      );
+      expect(await dispatcher.redrivePendingJob('old')).toBe(false);
+    });
+
+    it('does nothing for a missing or already dispatched job', async () => {
+      for (const job of [
+        null,
+        makeQueuedJob({ id: 'old', status: DispatchQueueStatus.Dispatched }),
+      ]) {
+        const { dispatcher, onNoMatchingAgent } = setupOne(job);
+        expect(await dispatcher.redrivePendingJob('old')).toBe(false);
+        expect(onNoMatchingAgent).not.toHaveBeenCalled();
+      }
+    });
+
+    it('settles a job whose sealed secrets cannot be opened instead of scaling for it', async () => {
+      const unsealed = new JobSecretsUnsealError('run-1', 'bad key').message;
+      const { dispatcher, queue, onNoMatchingAgent } = setupOne(
+        makeQueuedJob({
+          id: 'old',
+          status: DispatchQueueStatus.Pending,
+          secretsUnavailable: unsealed,
+        }),
+      );
+
+      expect(await dispatcher.redrivePendingJob('old')).toBe(false);
+      // fails-when: the re-drive spawns a job's private image without its sealed registry credentials
+      expect(onNoMatchingAgent).not.toHaveBeenCalled();
+      expect(queue.claimUnopenableById).toHaveBeenCalledWith('old');
+    });
+
+    it('is not blocked by an in-flight batch pass', async () => {
+      const queue = mockQueue({ pendingJobs: [makeQueuedJob({ id: 'batch' })] });
+      vi.mocked(queue.getFullJobById).mockResolvedValue(
+        makeQueuedJob({ id: 'old', status: DispatchQueueStatus.Pending }),
+      );
+      let releaseBatch: (r: ScaleResult) => void = () => {};
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<ScaleResult>((resolve) => {
+              releaseBatch = resolve;
+            }),
+        )
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch: onDispatch as OnDispatch,
+        onNoMatchingAgent,
+      });
+
+      const batch = dispatcher.retryPendingScaleRequests();
+      // fails-when: a backoff wake-up during a batch pass is dropped, and the worker runs no sweep
+      expect(await dispatcher.redrivePendingJob('old')).toBe(true);
+      expect(onNoMatchingAgent).toHaveBeenCalledTimes(2);
+
+      releaseBatch({ action: 'spawning', backendType: 'docker', agentId: 'agent-batch' });
+      expect(await batch).toBe(1);
+    });
+  });
+
   describe('onDispatch callback verification', () => {
     it('callback receives correct agentId and full job data', async () => {
       registry.register('agent-42', mockWs(), ['linux', 'docker']);

@@ -20,6 +20,7 @@ import type {
   PeerScalerEvent,
   PeerJobCancel,
   PeerToPeerMessage,
+  RerouteSpawnRetry,
   ResourceRequest,
   LabelMatcher,
 } from '@kici-dev/engine';
@@ -48,6 +49,13 @@ const DEFAULT_MAX_HOPS = 3;
  * `org_settings.reroute_spawn_window_ms` / `config.rerouteSpawnWindowMs`.
  */
 const DEFAULT_REROUTE_SPAWN_WINDOW_MS = 90_000;
+
+/**
+ * Default spawn-retry budget a worker applies to a rerouted job. Fallback when no
+ * per-org reader is wired (tests, minimal deps); production reads
+ * `org_settings.reroute_spawn_max_attempts` / `reroute_spawn_retry_backoff_ms`.
+ */
+const DEFAULT_REROUTE_SPAWN_RETRY: RerouteSpawnRetry = { maxAttempts: 3, backoffMs: 5_000 };
 
 // --- Types ---
 
@@ -146,6 +154,14 @@ export interface RunCoordinatorDeps {
    * {@link DEFAULT_MAX_HOPS}.
    */
   getRerouteMaxHops?: (job: JobToRoute) => Promise<number>;
+  /**
+   * Per-job spawn-retry budget sent to the receiving peer on `job.reroute` and
+   * enforced here on the peer's relayed spawn failures. Resolves the job's org
+   * overrides from `org_settings.reroute_spawn_max_attempts` /
+   * `reroute_spawn_retry_backoff_ms`, else the cluster defaults. When absent,
+   * {@link DEFAULT_REROUTE_SPAWN_RETRY} is used.
+   */
+  getRerouteSpawnRetry?: (job: JobToRoute) => Promise<RerouteSpawnRetry>;
 }
 
 /**
@@ -174,6 +190,10 @@ interface RerouteTracking {
    * COORDINATOR relays nothing that would otherwise release the entry.
    */
   windowTimer: NodeJS.Timeout | undefined;
+  /** The spawn-retry budget sent to the peer on the reroute. */
+  spawnRetry: RerouteSpawnRetry;
+  /** `final: false` spawn failures the tracked peer has relayed. */
+  spawnFailures: number;
 }
 
 /** NAK backoff base delay (1s). */
@@ -203,6 +223,7 @@ export class RunCoordinator {
   private readonly getRerouteSpawnWindowMs: (job: JobToRoute) => Promise<number>;
   private readonly getRerouteAckTimeoutMs: (job: JobToRoute) => Promise<number>;
   private readonly getRerouteMaxHops: (job: JobToRoute) => Promise<number>;
+  private readonly getRerouteSpawnRetry: (job: JobToRoute) => Promise<RerouteSpawnRetry>;
 
   /**
    * Tracks which jobs have been rerouted to which peers, keyed by runId.
@@ -247,6 +268,8 @@ export class RunCoordinator {
       deps.getRerouteSpawnWindowMs ?? (async () => DEFAULT_REROUTE_SPAWN_WINDOW_MS);
     this.getRerouteAckTimeoutMs = deps.getRerouteAckTimeoutMs ?? (async () => this.ackTimeoutMs);
     this.getRerouteMaxHops = deps.getRerouteMaxHops ?? (async () => DEFAULT_MAX_HOPS);
+    this.getRerouteSpawnRetry =
+      deps.getRerouteSpawnRetry ?? (async () => DEFAULT_REROUTE_SPAWN_RETRY);
 
     const evictionHooks: EvictionHooks = {
       // Permanently deprioritize the peer so the dispatch NAK-backoff filter
@@ -738,12 +761,18 @@ export class RunCoordinator {
    * line + dispatch-queue last-error column) just as it would for a
    * locally-emitted scaler event.
    *
-   * Layer B fast path: a `scaler.failed` for a tracked rerouted job whose spawn
-   * window is still armed is the worker's NAK-after-accept — the peer accepted
-   * the reroute but its agent spawn failed asynchronously before reporting any
-   * progress. Re-dispatch immediately (the same routine the spawn-window timer
-   * runs) instead of waiting the window out. Idempotent with the Layer A timer:
-   * whichever fires first removes the tracking entry.
+   * Layer B: a `scaler.failed` for a tracked rerouted job whose spawn window is
+   * still armed is the worker reporting that an agent spawn failed after it
+   * accepted the reroute. The worker retries within the spawn-retry budget sent on
+   * `job.reroute`, and the relay carries its verdict:
+   *
+   * - `final: true` — the worker gave the job back. Re-dispatch immediately (the
+   *   same routine the spawn-window timer runs). Idempotent with the Layer A
+   *   timer: whichever fires first removes the tracking entry.
+   * - `final: false` — the worker is retrying. Re-arm the window for one more
+   *   attempt plus the backoff; treat the `maxAttempts`-th such relay as final.
+   * - no verdict — an older worker that retries without a bound. The window
+   *   armed at the reroute keeps running unchanged.
    *
    * Two guards make the re-dispatch safe. First, source provenance: the failure
    * must come from `fromPeerId === tracked.peerId` (the authenticated connection
@@ -763,31 +792,91 @@ export class RunCoordinator {
       timestampMs: msg.timestampMs,
     });
 
-    // Layer B NAK fast path — gated on source provenance AND an armed window.
-    // Re-dispatch only when the failure comes from the peer this job is actually
-    // tracked against: a late scaler.failed relayed for the same jobId by a
+    // Layer B — gated on source provenance AND an armed window. Act only when
+    // the failure comes from the peer this job is actually tracked against: a
+    // late scaler.failed relayed for the same jobId by a
     // superseded peer (after an earlier re-dispatch moved the job) must NOT
     // bounce the healthy replacement. The armed-window check additionally keeps
     // a failure that arrives after first progress from cancelling a running job.
     const tracked = this.reroutedJobs.get(msg.runId)?.get(msg.jobId);
     if (
-      msg.eventType === ScalerEventType.enum['scaler.failed'] &&
-      tracked?.windowTimer !== undefined &&
-      tracked.peerId === fromPeerId
+      msg.eventType !== ScalerEventType.enum['scaler.failed'] ||
+      tracked?.windowTimer === undefined ||
+      tracked.peerId !== fromPeerId
     ) {
-      logger.warn('Worker relayed scaler.failed for a rerouted job — re-dispatching', {
-        runId: msg.runId,
-        jobId: msg.jobId,
-        detail: msg.detail,
-      });
-      void this.handleRerouteSpawnTimeout(msg.runId, msg.jobId).catch((err) => {
-        logger.error('Reroute NAK-fast-path handler failed', {
-          runId: msg.runId,
-          jobId: msg.jobId,
-          error: toErrorMessage(err),
-        });
-      });
+      return;
     }
+    this.onRelayedSpawnFailure(msg, tracked);
+  }
+
+  /**
+   * A worker's verdict on a failed spawn for a job it holds. `final: true` means it
+   * gave the job back, so re-dispatch now. `final: false` means it is retrying, so
+   * restart the window for one more attempt plus the backoff this coordinator told it
+   * to wait. No verdict means a worker that retries without a bound, so leave the
+   * window as it is. The count caps a worker that never says `final`.
+   */
+  private onRelayedSpawnFailure(msg: PeerScalerEvent, tracked: RerouteTracking): void {
+    const { runId, jobId } = msg;
+    if (msg.final === undefined) {
+      logger.info(
+        'Worker relayed scaler.failed without a retry verdict — waiting out the spawn window',
+        { runId, jobId, detail: msg.detail },
+      );
+      return;
+    }
+    if (!msg.final) {
+      tracked.spawnFailures += 1;
+      if (tracked.spawnFailures < tracked.spawnRetry.maxAttempts) {
+        logger.info('Worker retrying spawn for a rerouted job — spawn window re-armed', {
+          runId,
+          jobId,
+          attempt: tracked.spawnFailures,
+          maxAttempts: tracked.spawnRetry.maxAttempts,
+          detail: msg.detail,
+        });
+        this.rearmAfterSpawnRetry(runId, jobId, tracked).catch((err: unknown) => {
+          logger.error('Reroute spawn-window re-arm failed', {
+            runId,
+            jobId,
+            error: toErrorMessage(err),
+          });
+        });
+        return;
+      }
+    }
+    logger.warn('Worker exhausted spawn retries for a rerouted job — re-dispatching', {
+      runId,
+      jobId,
+      detail: msg.detail,
+    });
+    this.handleRerouteSpawnTimeout(runId, jobId).catch((err: unknown) => {
+      logger.error('Reroute exhausted-retries handler failed', {
+        runId,
+        jobId,
+        error: toErrorMessage(err),
+      });
+    });
+  }
+
+  /** Restart a rerouted job's spawn window for one more worker attempt plus its backoff. */
+  private async rearmAfterSpawnRetry(
+    runId: string,
+    jobId: string,
+    tracked: RerouteTracking,
+  ): Promise<void> {
+    const windowMs = await this.getRerouteSpawnWindowMs(tracked.job);
+    // A first progress (clears the timer) or a re-dispatch (drops the entry) that
+    // landed during the read already settled this window: leave it settled.
+    if (this.reroutedJobs.get(runId)?.get(jobId) !== tracked || tracked.windowTimer === undefined) {
+      return;
+    }
+    clearTimeout(tracked.windowTimer);
+    tracked.windowTimer = this.armRerouteWindow(
+      runId,
+      jobId,
+      windowMs + tracked.spawnRetry.backoffMs,
+    );
   }
 
   /**
@@ -971,6 +1060,7 @@ export class RunCoordinator {
     const sortedPeers = this.sortPeersByCapacity(peers, labelSets);
     const maxHops = await this.getRerouteMaxHops(job);
     const ackTimeoutMs = await this.getRerouteAckTimeoutMs(job);
+    const spawnRetry = await this.getRerouteSpawnRetry(job);
     const now = Date.now();
 
     for (const peer of sortedPeers) {
@@ -1001,6 +1091,7 @@ export class RunCoordinator {
       const rerouteMsg = this.buildRerouteMessage(runContext, job, labelSets, jobId, {
         triedConnections,
         maxHops,
+        spawnRetry,
       });
 
       const accepted =
@@ -1019,14 +1110,11 @@ export class RunCoordinator {
         // the worker's first status creates the execution_jobs row (the row does
         // not exist yet at reroute-ACK time, so a marker write here would be a
         // no-op UPDATE).
-        await this.trackReroutedJob(
-          runContext,
-          job,
-          labelSets,
-          jobId,
-          peer.instanceId,
+        await this.trackReroutedJob(runContext, job, labelSets, jobId, {
+          peerId: peer.instanceId,
           triedConnections,
-        );
+          spawnRetry,
+        });
 
         logger.info('Job rerouted to peer', {
           runId: runContext.runId,
@@ -1104,7 +1192,7 @@ export class RunCoordinator {
     job: JobToRoute,
     labelSets: string[][],
     jobId: string,
-    routing: { triedConnections: string[]; maxHops: number },
+    routing: { triedConnections: string[]; maxHops: number; spawnRetry: RerouteSpawnRetry },
   ): JobReroute {
     return {
       type: 'job.reroute',
@@ -1127,6 +1215,7 @@ export class RunCoordinator {
       excludePatterns: job.excludePatterns,
       triedConnections: routing.triedConnections,
       maxHops: routing.maxHops,
+      spawnRetry: routing.spawnRetry,
       coordinatorId: this.instanceId,
       requestId: runContext.requestId,
       traceId: runContext.traceId,
@@ -1199,9 +1288,9 @@ export class RunCoordinator {
     job: JobToRoute,
     labelSets: string[][],
     jobId: string,
-    peerId: string,
-    triedConnections: string[],
+    target: { peerId: string; triedConnections: string[]; spawnRetry: RerouteSpawnRetry },
   ): Promise<void> {
+    const { peerId, triedConnections, spawnRetry } = target;
     const runId = runContext.runId;
     let runJobs = this.reroutedJobs.get(runId);
     if (!runJobs) {
@@ -1229,6 +1318,8 @@ export class RunCoordinator {
       triedConnections: [...triedConnections],
       peerStarted: false,
       windowTimer,
+      spawnRetry,
+      spawnFailures: 0,
     });
 
     if (this.executionTracker) {
@@ -1347,7 +1438,8 @@ export class RunCoordinator {
   /**
    * Post-ACK spawn-window backstop. Fires when a rerouted job's peer accepted
    * but produced no progress within the window (Layer A), or immediately when a
-   * worker relays a `scaler.failed` for the job (Layer B, via onPeerScalerEvent).
+   * worker relays its final spawn-failure verdict for the job (Layer B, via
+   * onPeerScalerEvent).
    * Best-effort cancels the original peer (double-execution guard against a
    * slow-but-healthy spawn), then re-runs routing to another peer, then a local
    * fallback, and finally records the job failed rather than leaving it pending.

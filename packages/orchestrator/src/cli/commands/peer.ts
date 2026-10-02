@@ -5,12 +5,16 @@
  *   peer create-token   Create a join token for a new peer
  *   peer list           List active peer credentials
  *   peer revoke         Revoke a specific peer's credential
+ *   peer forget         Drop a departed peer from every coordinator's live
+ *                       peer registry (admin HTTP API; credential untouched)
  *   peer revoke-all     Revoke all peer credentials
  */
 
 import type { Command } from 'commander';
-import type { AdminApiClient } from '../api-client.js';
+import type { AdminApiClient, PeerForgetResponseBody } from '../api-client.js';
+import { confirmPrompt } from './shared/confirm.js';
 import { toErrorMessage, resetRaftStateDirect, prunePeerCredentialsDirect } from '@kici-dev/shared';
+import { PeerForgetOutcome } from '@kici-dev/engine';
 
 import { withDb } from './shared/db.js';
 import { JoinTokenManager, silenceJoinTokenLogger } from '../../cluster/join-token.js';
@@ -67,8 +71,112 @@ function toPeerListEntry(p: PeerCredential) {
   };
 }
 
-export function registerPeerCommands(program: Command, _getClient: () => AdminApiClient): void {
+/** Where `peer forget` writes its results. */
+export interface PeerForgetIo {
+  out: (line: string) => void;
+  /** Asks the operator; resolves true on yes. */
+  confirm: (prompt: string) => Promise<boolean>;
+  /** Whether an operator can answer a prompt (stdin is a terminal). */
+  interactive: boolean;
+}
+
+/** The backstop consequence a coordinator named, when one needs acknowledging. */
+function backstopConsequenceOf(body: PeerForgetResponseBody): string | null {
+  if (body.acknowledgementRequired)
+    return body.error ?? 'forgetting this peer switches the event-provision backstop back on';
+  const sibling = body.results.find(
+    (r) => r.outcome === PeerForgetOutcome.enum['acknowledgement-required'],
+  );
+  return sibling ? `${sibling.coordinator}: ${sibling.detail}` : null;
+}
+
+function printForgetResults(body: PeerForgetResponseBody, json: boolean, io: PeerForgetIo): void {
+  if (json) {
+    io.out(JSON.stringify(body, null, 2));
+    return;
+  }
+  for (const result of body.results) {
+    io.out(`${result.coordinator}: ${result.outcome} — ${result.detail}`);
+  }
+}
+
+/**
+ * `kici-admin peer forget`: drop a departed peer from this coordinator's live
+ * peer registry and every connected sibling's. Exits 1 when any coordinator
+ * kept it (connected, heard from recently, or no answer).
+ *
+ * When the forget would switch a coordinator's event-provision backstop back
+ * on, the operator confirms that consequence first; `--yes` acknowledges it up
+ * front, and without a terminal the command refuses instead of asking.
+ *
+ * @returns the process exit code
+ */
+export async function runPeerForget(
+  client: Pick<AdminApiClient, 'forgetPeer'>,
+  instanceId: string,
+  opts: { json: boolean; timeout: string; yes: boolean },
+  io: PeerForgetIo,
+): Promise<number> {
+  const seconds = Number(opts.timeout);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) {
+    throw new Error(
+      `--timeout must be a whole number of seconds from 1 to 60, got "${opts.timeout}"`,
+    );
+  }
+  const timeoutMs = seconds * 1_000;
+  let body = await client.forgetPeer({
+    instanceId,
+    timeoutMs,
+    ...(opts.yes ? { acknowledgeBackstop: true } : {}),
+  });
+  const consequence = opts.yes ? null : backstopConsequenceOf(body);
+  if (consequence) {
+    if (!io.interactive) {
+      throw new Error(`${consequence} Pass --yes to forget ${instanceId} anyway.`);
+    }
+    if (!(await io.confirm(`${consequence}\nForget ${instanceId} anyway? [y/N] `))) {
+      printForgetResults(body, opts.json, io);
+      // Declined before anything changed: the coordinator kept the peer.
+      return body.acknowledgementRequired ? 0 : 1;
+    }
+    body = await client.forgetPeer({ instanceId, timeoutMs, acknowledgeBackstop: true });
+  }
+  printForgetResults(body, opts.json, io);
+  const kept = body.results.some(
+    (r) =>
+      r.outcome !== PeerForgetOutcome.enum.forgotten &&
+      r.outcome !== PeerForgetOutcome.enum['not-found'],
+  );
+  return kept ? 1 : 0;
+}
+
+export function registerPeerCommands(program: Command, getClient: () => AdminApiClient): void {
   const peer = program.command('peer').description('Manage peer tokens and credentials');
+
+  peer
+    .command('forget <instance-id>')
+    .description(
+      'Drop a peer that left the cluster from the live peer registry of every coordinator (its credential is untouched)',
+    )
+    .option('--timeout <seconds>', 'How long to wait for each sibling coordinator', '15')
+    .option(
+      '--yes',
+      'Forget the peer even when that switches the event-provision backstop back on, without asking',
+      false,
+    )
+    .option('--json', 'Emit machine-readable JSON', false)
+    .action(async (instanceId: string, opts: { json: boolean; timeout: string; yes: boolean }) => {
+      try {
+        process.exitCode = await runPeerForget(getClient(), instanceId, opts, {
+          out: (line) => console.log(line),
+          confirm: (prompt) => confirmPrompt(prompt),
+          interactive: process.stdin.isTTY === true,
+        });
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
 
   peer
     .command('create-token')

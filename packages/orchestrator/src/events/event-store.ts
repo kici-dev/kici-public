@@ -1,7 +1,13 @@
 import { sql, type Kysely, type Transaction } from 'kysely';
 
 import type { Database } from '../db/types.js';
-import type { DlqReason, EventRouterConfig, StoredEvent } from './types.js';
+import {
+  EventMatchOutcome,
+  type DlqReason,
+  type EventMatchResult,
+  type EventRouterConfig,
+  type StoredEvent,
+} from './types.js';
 
 /** Either a Kysely DB handle or an active transaction. */
 export type DbExecutor = Kysely<Database> | Transaction<Database>;
@@ -160,13 +166,57 @@ export class EventStore {
   }
 
   /**
-   * Mark an event as fully processed. Called after a successful dispatch.
-   * Clears any prior lease so the row is unambiguously terminal.
+   * List events newest first, for `kici-admin event list`. Every filter is
+   * optional except the limit. `before` keeps events created before a
+   * timestamp. `afterEventId` is the next-page cursor: the events that sort
+   * after that event in this order, compared on the stored `(created_at, id)`
+   * so events created in the same millisecond are neither skipped nor repeated.
    */
-  async markProcessed(id: string): Promise<void> {
+  async list(opts: {
+    name?: string;
+    outcome?: EventMatchOutcome;
+    since?: Date;
+    before?: Date;
+    afterEventId?: string;
+    limit: number;
+    sourceRoutingKey?: string;
+  }): Promise<StoredEvent[]> {
+    let query = this.db
+      .selectFrom('kici_events')
+      .selectAll()
+      .orderBy('created_at', 'desc')
+      .orderBy('id', 'desc')
+      .limit(opts.limit);
+    if (opts.name !== undefined) query = query.where('event_name', '=', opts.name);
+    if (opts.outcome !== undefined) query = query.where('match_outcome', '=', opts.outcome);
+    if (opts.since !== undefined) query = query.where('created_at', '>=', opts.since);
+    if (opts.before !== undefined) query = query.where('created_at', '<', opts.before);
+    if (opts.afterEventId !== undefined) {
+      query = query.where(
+        sql<boolean>`(created_at, id) < (SELECT c.created_at, c.id FROM kici_events c WHERE c.id = ${opts.afterEventId})`,
+      );
+    }
+    if (opts.sourceRoutingKey !== undefined) {
+      query = query.where('source_routing_key', '=', opts.sourceRoutingKey);
+    }
+    const rows = await query.execute();
+    return rows.map((row) => this.rowToStoredEvent(row));
+  }
+
+  /**
+   * Mark an event as fully processed. Called after a successful dispatch.
+   * Clears any prior lease so the row is unambiguously terminal, and records
+   * how the router resolved it when `result` is given.
+   */
+  async markProcessed(id: string, result?: EventMatchResult): Promise<void> {
     await this.db
       .updateTable('kici_events')
-      .set({ processed: true, claimed_at: null, claimed_by: null })
+      .set({
+        processed: true,
+        claimed_at: null,
+        claimed_by: null,
+        ...(result && { match_outcome: result.outcome, matched_count: result.matchedCount }),
+      })
       .where('id', '=', id)
       .execute();
   }
@@ -464,6 +514,8 @@ export class EventStore {
     next_retry_at: Date | null;
     dlq_at: Date | null;
     dlq_reason: string | null;
+    match_outcome: string | null;
+    matched_count: number | null;
   }): StoredEvent {
     const targetRepos = row.target_repos
       ? typeof row.target_repos === 'string'
@@ -491,6 +543,9 @@ export class EventStore {
       nextRetryAt: row.next_retry_at,
       dlqAt: row.dlq_at,
       dlqReason: row.dlq_reason as DlqReason | null,
+      // An outcome this build does not know (written by a newer peer) reads as unknown.
+      matchOutcome: EventMatchOutcome.safeParse(row.match_outcome).data ?? null,
+      matchedCount: row.matched_count,
     };
   }
 }

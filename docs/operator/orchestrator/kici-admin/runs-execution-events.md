@@ -127,12 +127,14 @@ kici-admin workflow register-manual --lock-file <path> --repo <ident> --routing-
 
 `list` inspects workflow registrations from the `workflow_registrations` table. All filters are optional and combinable.
 
-`register-manual` seeds `workflow_registrations` rows straight from a compiled lock file — used by local-only / non-Git deployments and by test setups that can't rely on a webhook-driven compile-and-register flow. Dual-mode (HTTP via admin API, or direct DB via `--database-url`).
+`register-manual` seeds `workflow_registrations` rows straight from a compiled lock file — used by local-only / non-Git deployments and by test setups that can't rely on a webhook-driven compile-and-register flow. Dual-mode (HTTP via admin API, or direct DB via `--database-url`). Both modes upsert: the command adds or updates the workflows the lock file names and never removes another registration of the repository. To remove one, use `kici-admin registration delete <id>`.
 
-### event -- internal event emission
+### event -- internal events
 
 ```bash
 kici-admin event emit <name> --payload-file <path> [--source-routing-key <k>] [--source-repo <r>] [--database-url <url>] [--json]
+kici-admin event list [--name <eventName>] [--outcome <outcome>] [--since <iso>] [--before <cursor>] [--limit <n>] [--json]
+kici-admin event show <eventId> [--json]
 ```
 
 Inserts a row into `kici_events` and fires `pg_notify('kici_event_channel', <id>)` so the orchestrator's `EventRouter` picks it up immediately. It does what an agent's `ctx.emit()` does from within a step execution. Dual-mode: HTTP (`POST /api/v1/admin/events/emit`) or direct DB via `emitKiciEventDirect` from `@kici-dev/shared`.
@@ -140,6 +142,8 @@ Inserts a row into `kici_events` and fires `pg_notify('kici_event_channel', <id>
 - `<name>` is the event name (e.g. `deploy.completed`).
 - `--payload-file` is required and must contain a JSON object (not an array).
 - `--source-routing-key` / `--source-repo` are optional hints for cross-repo event matching.
+
+`list` shows internal events newest first, with each event's dispatch state (`pending`, `leased`, `retrying`, `processed` or `dlq`) and its match outcome: `matched`, or the reason no workflow ran (`no-registration`, `no-target-repo`, `trust-blocked`, `no-trigger-match`, `buffered`). `show` adds the runs the event dispatched and, for a role holding `event_log.read_payload`, the payload. It replaces the `claimCode` of an event-scaler scale-up with `[redacted]`. Both commands are HTTP-only and need the `event_dlq.read` permission. A token scoped to one routing key sees only the events emitted under that key. The event scaler's `kici.scaler.*` events have no source routing key, so a scoped token does not see them.
 
 ### event-dlq -- event dead-letter queue triage
 
@@ -153,6 +157,7 @@ kici-admin event-dlq discard <id>
 Operator triage surface for at-least-once event delivery. When an event lands in the DLQ it usually means a workflow handler is consistently failing and should be fixed at its root cause; this CLI is the path to inspect `last_error`, retry once a fix is deployed, or discard if the event is no longer relevant.
 
 - `list` shows DLQ events most-recent-first with id, event name, reason, attempts, source repo / routing key, and a truncated `last_error`. `--before <iso>` paginates via the `dlq_at` cursor (echoed as `Next page: --before "<ts>"`); `--limit` caps rows (default 50, max 200).
+  With `--json`, each row carries the event payload for a role holding `event_log.read_payload` (for the auditor role it is `null`). The `claimCode` of an event-scaler scale-up is replaced with `[redacted]`, here and in the dashboard.
 - `count` prints the total number of events currently in the DLQ — handy for monitoring / alerting.
 - `retry <id>` clears the DLQ flag, resets the attempts counter, and `pg_notify`s the `EventRouter` to schedule the event for immediate retry.
 - `discard <id>` permanently deletes the row.
@@ -185,7 +190,7 @@ Synopsis: `kici-admin check-run list [options]`
 
 ### `kici-admin event`
 
-Internal event emission (kici_events)
+Internal events (kici_events): emit, list, show
 
 Synopsis: `kici-admin event`
 
@@ -210,6 +215,41 @@ Synopsis: `kici-admin event emit <name> [options]`
 | `--source-repo <r>`        |         | Source repo identifier for cross-repo matching (default: empty)   |
 | `--database-url <url>`     |         | Use direct DB access instead of HTTP (offline mode)               |
 | `--json`                   | `false` | Emit JSON output { eventId } on stdout                            |
+
+### `kici-admin event list`
+
+List internal events, newest first, with each event's state and match outcome (admin API: /api/v1/admin/events)
+
+Synopsis: `kici-admin event list [options]`
+
+**Options**
+
+| Option                | Default | Description                                                                                                   |
+| --------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
+| `--name <eventName>`  |         | Filter by event name (e.g. kici.scaler.scale-up)                                                              |
+| `--outcome <outcome>` |         | Filter by match outcome (matched\|buffered\|no-registration\|no-target-repo\|trust-blocked\|no-trigger-match) |
+| `--since <iso>`       |         | Only events created at or after this ISO timestamp                                                            |
+| `--before <cursor>`   |         | Only events after this cursor: the next-page cursor (an event id) or an ISO timestamp                         |
+| `--limit <n>`         |         | Max results (default 50, max 200)                                                                             |
+| `--json`              |         | Emit raw JSON instead of a table                                                                              |
+
+### `kici-admin event show`
+
+Show one internal event: its state, match outcome, payload (claim codes redacted) and the runs it dispatched
+
+Synopsis: `kici-admin event show <eventId> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `eventId` | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description                               |
+| -------- | ------- | ----------------------------------------- |
+| `--json` |         | Emit raw JSON instead of formatted output |
 
 ### `kici-admin event-dlq`
 
@@ -640,7 +680,7 @@ Synopsis: `kici-admin workflow list [options]`
 
 ### `kici-admin workflow register-manual`
 
-Manually upsert workflow_registrations rows from a lock file + bump registry_versions. Transactional. Seeds workflow registrations without a real push event.
+Upsert workflow_registrations rows from a lock file and bump registry_versions. Transactional. Never removes a registration the lock file does not name (use registration delete). Seeds workflow registrations without a real push event.
 
 Synopsis: `kici-admin workflow register-manual [options]`
 

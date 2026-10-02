@@ -3,14 +3,24 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/types.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { LockFile, SimulatedEvent, WorkflowDecision } from '@kici-dev/engine';
-import { matchAllWorkflows, SCHEMA_VERSION, reservedEventNamePrefix } from '@kici-dev/engine';
+import {
+  KICI_EVENT_NAME_PREFIX,
+  matchAllWorkflows,
+  SCHEMA_VERSION,
+  reservedEventNamePrefix,
+} from '@kici-dev/engine';
 import { NotifyListener } from '../db/notify-listener.js';
 import { EVENT_CATCHUP_BATCH_SIZE } from './event-store.js';
 import type { EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
 import type { RegisteredWorkflow, RegistrationIndex } from '../registration/registration-index.js';
-import type { EventRouterConfig, StoredEvent } from './types.js';
+import {
+  EventMatchOutcome,
+  type EventMatchResult,
+  type EventRouterConfig,
+  type StoredEvent,
+} from './types.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import { appendBatchItem, openOrGetBatchWindow } from './batch-accumulator.js';
 import {
@@ -19,6 +29,7 @@ import {
   eventDispatchSuccessTotal,
   eventDlqTotal,
   eventRetryTotal,
+  incEventUnmatched,
 } from '../metrics/prometheus.js';
 
 const logger = createLogger({ prefix: 'event-router' });
@@ -419,8 +430,24 @@ export class EventRouter {
           `fault-injection: debug-fail-first-n (eventName=${event.eventName}, attempts=${event.attempts}, budget=${failBudget})`,
         );
       }
-      await this.processSubscriptions(event);
-      await this.eventStore.markProcessed(event.id);
+      const result = await this.processSubscriptions(event);
+      await this.eventStore.markProcessed(event.id, result);
+      if (
+        result.outcome !== EventMatchOutcome.enum.matched &&
+        event.eventName.startsWith(KICI_EVENT_NAME_PREFIX)
+      ) {
+        // A reserved event is the orchestrator asking a customer workflow to
+        // act (provision, tear down). Nothing subscribing is a
+        // misconfiguration, not the routine "no listener" any other event may
+        // have.
+        logger.info('Reserved event matched no subscriber', {
+          eventId: event.id,
+          eventName: event.eventName,
+          reason: result.outcome,
+          targetRepos: event.targetRepos ?? [],
+        });
+        incEventUnmatched(event.eventName, result.outcome);
+      }
       eventDispatchSuccessTotal.add(1, { event_name: event.eventName });
       eventAttemptsHistogram.record(event.attempts, {
         event_name: event.eventName,
@@ -477,8 +504,16 @@ export class EventRouter {
    * schedule a retry or move the event to the DLQ. Swallowing the error
    * here would silently lose the event — exactly the failure mode the
    * lease pattern fixes.
+   *
+   * Returns how the event resolved, which `dispatchAndRecord` persists on the
+   * processed row: `matched` when it dispatched at least one workflow, else
+   * the reason nothing ran.
    */
-  private async processSubscriptions(event: StoredEvent): Promise<void> {
+  private async processSubscriptions(event: StoredEvent): Promise<EventMatchResult> {
+    const unmatched = (outcome: EventMatchOutcome): EventMatchResult => ({
+      outcome,
+      matchedCount: 0,
+    });
     const simulatedEvent = this.buildSimulatedEvent(event);
 
     // Map stored event to trigger type for index lookup
@@ -491,7 +526,7 @@ export class EventRouter {
         eventName: event.eventName,
         triggerType,
       });
-      return;
+      return unmatched(EventMatchOutcome.enum['no-registration']);
     }
 
     // For __schedule_fire events, the cron scheduler already targeted a specific
@@ -505,7 +540,7 @@ export class EventRouter {
           eventId: event.id,
           registrationId: targetId,
         });
-        return;
+        return unmatched(EventMatchOutcome.enum['no-registration']);
       }
     }
 
@@ -520,7 +555,7 @@ export class EventRouter {
           eventId: event.id,
           registrationId: targetId,
         });
-        return;
+        return unmatched(EventMatchOutcome.enum['no-registration']);
       }
     }
 
@@ -536,10 +571,13 @@ export class EventRouter {
           eventName: event.eventName,
           targetRepos: event.targetRepos,
         });
-        return;
+        return unmatched(EventMatchOutcome.enum['no-target-repo']);
       }
     }
 
+    let dispatched = 0;
+    let buffered = false;
+    let blocked = false;
     // Group registrations by customer for trust boundary checks
     for (const reg of registrations) {
       // Cross-customer trust check: if event is from a different customer, verify trust.
@@ -564,6 +602,7 @@ export class EventRouter {
               sourceRepo: event.sourceRepo,
               targetRepo: reg.repoIdentifier,
             });
+            blocked = true;
             continue;
           }
         }
@@ -585,7 +624,12 @@ export class EventRouter {
       // A failed workflow_complete that matched a workflowsFailedBatch trigger is
       // buffered into the accumulation window instead of dispatched now; the rest
       // dispatch as usual.
-      const dispatchNow = await this.bufferBatchDecisions(event, reg, matchedDecisions);
+      const { dispatchNow, bufferedCount } = await this.bufferBatchDecisions(
+        event,
+        reg,
+        matchedDecisions,
+      );
+      if (bufferedCount > 0) buffered = true;
       if (dispatchNow.length === 0) continue;
 
       logger.info('Event matched registered workflow', {
@@ -603,7 +647,15 @@ export class EventRouter {
         providerContext: reg.providerContext,
         defaultBranch: reg.defaultBranch,
       });
+      dispatched += 1;
     }
+
+    if (dispatched > 0) {
+      return { outcome: EventMatchOutcome.enum.matched, matchedCount: dispatched };
+    }
+    if (buffered) return unmatched(EventMatchOutcome.enum.buffered);
+    if (blocked) return unmatched(EventMatchOutcome.enum['trust-blocked']);
+    return unmatched(EventMatchOutcome.enum['no-trigger-match']);
   }
 
   /**
@@ -616,17 +668,20 @@ export class EventRouter {
    * itself dispatched by a failure-lifecycle trigger is neither buffered nor
    * dispatched — a broken notifier must not re-trigger the batch on its own
    * failure. The chain-depth breaker remains the backstop for anything missed.
+   *
+   * `bufferedCount` counts the decisions appended to a batch window.
    */
   private async bufferBatchDecisions(
     event: StoredEvent,
     reg: RegisteredWorkflow,
     matchedDecisions: WorkflowDecision[],
-  ): Promise<WorkflowDecision[]> {
+  ): Promise<{ dispatchNow: WorkflowDecision[]; bufferedCount: number }> {
     const isFailedCompletion =
       event.eventName === '__workflow_complete' && event.payload.status === 'failed';
-    if (!isFailedCompletion) return matchedDecisions;
+    if (!isFailedCompletion) return { dispatchNow: matchedDecisions, bufferedCount: 0 };
 
     const dispatchNow: WorkflowDecision[] = [];
+    let bufferedCount = 0;
     let selfExcluded: boolean | null = null;
     for (const decision of matchedDecisions) {
       const trigger = reg.lockEntry.triggers[decision.matchedTrigger ?? -1];
@@ -648,8 +703,9 @@ export class EventRouter {
         continue;
       }
       await this.bufferBatchFailure(event, reg, trigger.accumulateFor);
+      bufferedCount += 1;
     }
-    return dispatchNow;
+    return { dispatchNow, bufferedCount };
   }
 
   /** Open (or reuse) the registration's batch window and append the failed run. */

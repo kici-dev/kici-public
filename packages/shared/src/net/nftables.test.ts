@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { CommandError } from '../command-error.js';
 
 const mockExecFile = vi.fn();
 vi.mock('node:child_process', () => ({
@@ -583,5 +584,38 @@ describe('removeIsolationRules', () => {
       .map((c) => c[1] as string[])
       .filter((a) => a[0] === 'delete');
     expect(deletes).toEqual([]);
+  });
+});
+
+describe('nft failure diagnostics', () => {
+  it('reports the exit code and stderr of a failed nft call, sudo prefix included', async () => {
+    // The shape Node's execFile rejects with when the process exits non-zero.
+    mockExecFile.mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (e: Error | null) => void) =>
+        cb(
+          Object.assign(
+            new Error('Command failed: sudo -n nft insert rule\nError: No such file or directory'),
+            {
+              code: 1,
+              killed: false,
+              signal: null,
+              stderr: 'Error: No such file or directory\n',
+            },
+          ),
+        ),
+    );
+
+    // fails-when: nft() rethrows the bare execFile error, which has no
+    // exitCode / timedOut fields and no "exited with code" text.
+    const err = await addIsolationRules('10.0.0.5', '10.0.0.1', undefined, 'saddr', {
+      requireSudo: true,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CommandError);
+    expect(err).toMatchObject({ exitCode: 1, timedOut: false });
+    expect(
+      (err as CommandError).command.startsWith('sudo -n nft insert rule ip kici forward'),
+    ).toBe(true);
+    expect((err as CommandError).message).toContain('exited with code 1 after');
+    expect((err as CommandError).message).toContain('stderr: Error: No such file or directory');
   });
 });

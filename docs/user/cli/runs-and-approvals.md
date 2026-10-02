@@ -45,7 +45,7 @@ Set the `KICI_TMPDIR` environment variable to place the isolated checkout (and e
 
 Secrets are always sourced from your real `.kici/` directory, not from the isolated checkout. Gitignored secret files (such as `.kici/.env.local` and `.kici/secrets.yaml`) are never copied into the checkout, so a step that reads a secret still gets it from the original location.
 
-Pass `--in-place` to run against the real working directory instead — useful when you explicitly want in-tree execution. `--in-place` requires no git repository; the default isolated mode does, and fails with an actionable error pointing at `--in-place` when the directory is not a git repository.
+Pass `--in-place` to run against the real working directory instead — useful when you explicitly want in-tree execution. Both modes need a git repository, because the run triggers on a commit. Outside a git work tree, the command fails and tells you to initialize a repository (`git init`).
 
 The run's changed files are the commit it runs. In the default isolated mode, that commit holds your uncommitted changes, so `paths` filters and `ctx.changedFiles` rules see those files. With no uncommitted changes, or with `--in-place`, the run uses your `HEAD` commit, so they see the files `HEAD` changed.
 

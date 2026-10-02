@@ -20,6 +20,12 @@ Internal events flow through the orchestrator's event router:
 
 System events (`workflow_complete`, `job_complete`) are emitted automatically by the orchestrator when executions finish. No opt-in is required.
 
+### Match outcome
+
+When the router processes an event, it records the match outcome and the number of workflows it dispatched to. `kici-admin event list` and `kici-admin event show <eventId>` show both. The outcome is `matched`, or the reason no workflow ran: `no-registration`, `no-target-repo`, `trust-blocked`, `no-trigger-match` or `buffered`.
+
+An event with no subscriber is normal for most events. A reserved `kici.` event is different: the orchestrator emits it to ask a workflow to act, for example an event scaler's scale-up. When a reserved event matches no workflow, the orchestrator logs it at info level (`Reserved event matched no subscriber`) and counts it in `kici_orch_event_unmatched_total`.
+
 ### Downtime recovery
 
 On start, the orchestrator catches up on every internal event that was left unprocessed while it was down and dispatches each one. There is no cap on how many are recovered: the catch-up pages through the entire backlog until it is drained. An event-triggered downstream workflow therefore fires even if many events accumulated during a long outage. Events are only dropped once they pass the TTL (`eventTtlSeconds`, default 7 days).

@@ -8,6 +8,10 @@
  * only to `dispatch_queue.agent_id`. So the agent is resolved from the
  * dispatcher first and from the dispatch record second, and a cancel that
  * cannot be delivered is logged with the reason.
+ *
+ * On a worker the receiver also removes the jobs of the cancel that are still
+ * queued (waiting for an agent spawn), and stop-marks the dispatched ones so a
+ * requeue cannot bring them back. A removed job is reported `dequeued`.
  */
 import type { Kysely } from 'kysely';
 import { z } from 'zod';
@@ -21,6 +25,7 @@ import { sendLocalCancel } from './cancel-run.js';
 
 export const PeerCancelOutcome = z.enum([
   'delivered',
+  'dequeued',
   'not-tracked',
   'agent-not-connected',
   'lookup-failed',
@@ -42,6 +47,13 @@ export interface PeerJobCancelDeps {
   registry: Pick<AgentRegistry, 'get'>;
   /** The durable dispatch record. Absent on a worker, which has no database. */
   lookupDispatched?: (runId: string, jobId: string | undefined) => Promise<DispatchedAgent[]>;
+  /**
+   * Remove this process's queued (not yet dispatched) jobs of the cancel, and
+   * stop-mark its dispatched ones so a requeue cannot bring them back. Wired only
+   * on a worker, whose queue lives in memory; a coordinator's queue rows are
+   * settled by its own run-cancel path.
+   */
+  releaseQueued?: (runId: string, jobId: string | undefined) => Promise<string[]>;
   logger: {
     info(message: string, meta?: object): unknown;
     warn(message: string, meta?: object): unknown;
@@ -74,12 +86,19 @@ export async function deliverPeerJobCancel(
   deps: PeerJobCancelDeps,
   msg: PeerJobCancel,
 ): Promise<PeerCancelDelivery[]> {
+  // First, before any lookup: the release stop-marks synchronously, so a requeue
+  // racing this cancel drops the job instead of re-pending it.
+  const dequeued = (await releaseQueued(deps, msg)).map((jobId): PeerCancelDelivery => ({
+    jobId,
+    agentId: null,
+    outcome: PeerCancelOutcome.enum.dequeued,
+  }));
   const targets = await resolveTargets(deps, msg);
   if (targets === PeerCancelOutcome.enum['lookup-failed']) {
-    return msg.jobId === undefined
-      ? []
-      : [{ jobId: msg.jobId, agentId: null, outcome: PeerCancelOutcome.enum['lookup-failed'] }];
+    if (msg.jobId === undefined || dequeued.length > 0) return dequeued;
+    return [{ jobId: msg.jobId, agentId: null, outcome: PeerCancelOutcome.enum['lookup-failed'] }];
   }
+  if (targets.length === 0 && dequeued.length > 0) return dequeued;
   if (targets.length === 0) {
     deps.logger.warn(NOT_DELIVERED, {
       runId: msg.runId,
@@ -112,7 +131,35 @@ export async function deliverPeerJobCancel(
       force: msg.force === true,
     });
   }
-  return deliveries;
+  return [...deliveries, ...dequeued];
+}
+
+/**
+ * Run the worker's queued-job release, when wired. Resolves; never rejects: a
+ * failed release is a warn line, and the cancel still reaches dispatched jobs.
+ */
+async function releaseQueued(deps: PeerJobCancelDeps, msg: PeerJobCancel): Promise<string[]> {
+  if (!deps.releaseQueued) return [];
+  let released: string[];
+  try {
+    released = await deps.releaseQueued(msg.runId, msg.jobId);
+  } catch (err) {
+    deps.logger.warn(NOT_DELIVERED, {
+      runId: msg.runId,
+      ...(msg.jobId !== undefined && { jobId: msg.jobId }),
+      outcome: PeerCancelOutcome.enum['lookup-failed'],
+      error: toErrorMessage(err),
+    });
+    return [];
+  }
+  if (released.length > 0) {
+    deps.logger.info('Peer job cancel removed a queued job', {
+      runId: msg.runId,
+      ...(msg.jobId !== undefined && { jobId: msg.jobId }),
+      removed: released.length,
+    });
+  }
+  return released;
 }
 
 /** The jobs this cancel targets, with the agent each is known to run on. */

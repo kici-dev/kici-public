@@ -20,6 +20,7 @@ import { Hono } from 'hono';
 import { sql } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { EventStore } from '../events/event-store.js';
+import { redactEventPayload } from '../events/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
@@ -80,6 +81,9 @@ export function createAdminEventDlqRoutes(deps: AdminEventDlqRoutesDeps): Hono<A
       const limit = clampLimit(c.req.query('limit'));
       const beforeDlqAt = parseCursor(c.req.query('before'));
       const tokenRoutingKey = c.get('routingKey') ?? undefined;
+      // Payload bodies are `event_log.read_payload`; `event_dlq.read` alone
+      // (the auditor role) reads DLQ metadata only.
+      const canReadPayload = deps.rbac.hasPermission(c.get('role'), 'event_log.read_payload');
 
       const events = await deps.eventStore.listDlq(limit, beforeDlqAt, tokenRoutingKey);
 
@@ -91,7 +95,7 @@ export function createAdminEventDlqRoutes(deps: AdminEventDlqRoutesDeps): Hono<A
           events: events.map((e) => ({
             id: e.id,
             eventName: e.eventName,
-            payload: e.payload,
+            payload: canReadPayload ? redactEventPayload(e.payload) : null,
             sourceRepo: e.sourceRepo ?? null,
             sourceRoutingKey: e.sourceRoutingKey ?? null,
             sourceRunId: e.sourceRunId ?? null,

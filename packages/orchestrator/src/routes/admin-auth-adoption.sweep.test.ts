@@ -24,6 +24,7 @@ import { AUTH_ERROR } from './admin-auth.js';
 import { createAdminRoutes } from './admin.js';
 import { createAdminRunRoutes } from './admin-runs.js';
 import { createAdminEventDlqRoutes } from './admin-event-dlq.js';
+import { createAdminEventInspectRoutes } from './admin-event-inspect.js';
 import { createAdminEventLogRoutes } from './admin-event-log.js';
 import { createAdminEventRoutes } from './admin-events.js';
 import { createAdminAccessLogRoutes } from './admin-access-log.js';
@@ -81,6 +82,18 @@ const cases: AdoptionCase[] = [
     build: (tokenManager) => createAdminEventDlqRoutes({ tokenManager } as any),
     method: 'GET',
     path: '/api/v1/admin/event-dlq',
+  },
+  {
+    name: 'admin-event-inspect.ts',
+    build: (tokenManager) => createAdminEventInspectRoutes({ tokenManager } as any),
+    method: 'GET',
+    path: '/api/v1/admin/events',
+  },
+  {
+    name: 'admin-event-inspect.ts (show)',
+    build: (tokenManager) => createAdminEventInspectRoutes({ tokenManager } as any),
+    method: 'GET',
+    path: '/api/v1/admin/events/0b5c7a52-6c1e-4b8e-9d3a-7f1e2a3b4c5d',
   },
   {
     name: 'admin-access-log.ts',

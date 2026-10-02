@@ -7,6 +7,42 @@
  */
 
 import * as fs from 'node:fs';
+import type { PeerForgetOutcome, ScalerLiveVm, ScalerVmStopResult } from '@kici-dev/engine';
+
+/** `POST /api/v1/admin/peers/forget`: one result per coordinator, this one first. */
+export interface PeerForgetResponseBody {
+  instanceId: string;
+  results: Array<{ coordinator: string; outcome: PeerForgetOutcome; detail: string }>;
+  /** Set when the coordinator kept the peer only for want of the backstop acknowledgement. */
+  acknowledgementRequired?: boolean;
+  error?: string;
+}
+
+/** The node a scaler orphans request answered for. */
+export interface ScalerOrphansNode {
+  instanceId: string;
+  /** The node's cluster role; `unknown` for a peer the coordinator has no role for. */
+  role: 'coordinator' | 'worker' | 'unknown';
+  /** The node's Firecracker scaler names; empty when it runs none. */
+  firecrackerScalers: string[];
+  /**
+   * Coordinator peers the cluster expects but the answering coordinator has no
+   * live link to. While any is listed, no VM is `orphaned`.
+   */
+  disconnectedCoordinators?: string[];
+}
+
+/** `GET /api/v1/admin/scaler/orphans`: every live Firecracker VM on the node. */
+export interface ScalerOrphansListResponse {
+  node: ScalerOrphansNode;
+  vms: ScalerLiveVm[];
+}
+
+/** `POST /api/v1/admin/scaler/orphans/stop`: one result per requested VM. */
+export interface ScalerOrphansStopResponse {
+  node: ScalerOrphansNode;
+  results: ScalerVmStopResult[];
+}
 
 /** A node in the fleet topology returned by GET /admin/fleet-topology. */
 export interface FleetTopologyNodeResponse {
@@ -765,6 +801,78 @@ export class AdminApiClient {
     );
   }
 
+  // --- Peer forget (drop a departed peer from the live peer registries) ---
+
+  /** Forget a departed peer on this coordinator and every connected sibling. */
+  /**
+   * Forget a departed peer on this coordinator and every connected sibling. A
+   * refusal that only needs the backstop acknowledgement comes back as a body
+   * with `acknowledgementRequired`, so the caller can ask and retry; every
+   * other failure throws.
+   */
+  async forgetPeer(body: {
+    instanceId: string;
+    timeoutMs?: number;
+    acknowledgeBackstop?: boolean;
+  }): Promise<PeerForgetResponseBody> {
+    const res = await fetchAdminApi(
+      `${this.baseUrl}/api/v1/admin/peers/forget`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      this.baseUrl,
+    );
+    const text = await res.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = undefined;
+    }
+    const json = (parsed ?? {}) as Partial<PeerForgetResponseBody> & { error?: string };
+    if (res.ok) return json as PeerForgetResponseBody;
+    if (res.status === 409 && json.acknowledgementRequired === true) {
+      return {
+        instanceId: body.instanceId,
+        results: json.results ?? [],
+        acknowledgementRequired: true,
+        ...(json.error ? { error: json.error } : {}),
+      };
+    }
+    throw new Error(`HTTP ${res.status}: ${json.error ?? text}`);
+  }
+
+  // --- Scaler orphans (live Firecracker VMs a node does not track) ---
+
+  /** List the live Firecracker VMs on this coordinator, or on the `target` peer. */
+  async listScalerOrphans(
+    opts: { target?: string; timeoutMs?: number } = {},
+  ): Promise<ScalerOrphansListResponse> {
+    const params = new URLSearchParams();
+    if (opts.target !== undefined) params.set('target', opts.target);
+    if (opts.timeoutMs !== undefined) params.set('timeoutMs', String(opts.timeoutMs));
+    const query = params.toString();
+    return this.request<ScalerOrphansListResponse>(
+      'GET',
+      `/api/v1/admin/scaler/orphans${query ? `?${query}` : ''}`,
+    );
+  }
+
+  /** Stop the named VMs on this coordinator, or on the `target` peer. */
+  async stopScalerOrphans(body: {
+    target?: string;
+    vmIds: string[];
+    timeoutMs?: number;
+  }): Promise<ScalerOrphansStopResponse> {
+    return this.request<ScalerOrphansStopResponse>(
+      'POST',
+      '/api/v1/admin/scaler/orphans/stop',
+      body,
+    );
+  }
+
   // --- Platform API key management ---
 
   async createApiKey(opts: {
@@ -1029,6 +1137,35 @@ export class AdminApiClient {
       'GET',
       `/api/v1/admin/event-log/${encodeURIComponent(deliveryId)}?${params}`,
     );
+  }
+
+  // --- Internal events (kici_events) ---
+
+  /** List internal events, newest first (`GET /api/v1/admin/events`). */
+  async listEvents(opts?: {
+    name?: string;
+    outcome?: string;
+    since?: string;
+    before?: string;
+    limit?: number;
+  }): Promise<{
+    events: Array<Record<string, unknown>>;
+    limit: number;
+    nextCursor: string | null;
+  }> {
+    const params = new URLSearchParams();
+    if (opts?.name) params.set('name', opts.name);
+    if (opts?.outcome) params.set('outcome', opts.outcome);
+    if (opts?.since) params.set('since', opts.since);
+    if (opts?.before) params.set('before', opts.before);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return this.request('GET', `/api/v1/admin/events${qs ? `?${qs}` : ''}`);
+  }
+
+  /** One internal event with its redacted payload and dispatched runs. */
+  async getEvent(id: string): Promise<Record<string, unknown>> {
+    return this.request('GET', `/api/v1/admin/events/${encodeURIComponent(id)}`);
   }
 
   // --- Access log (read + orchestrator-admin mutation attribution) ---

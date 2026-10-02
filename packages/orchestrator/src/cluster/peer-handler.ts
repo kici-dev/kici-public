@@ -31,6 +31,11 @@ import {
   type PeerCacheUploadResponse,
   type PeerConfigReload,
   type PeerConfigReloadResponse,
+  type PeerScalerOrphansRequest,
+  type PeerForgetRequest,
+  type PeerForgetResponse,
+  PeerForgetOutcome,
+  type PeerScalerOrphansResponse,
   type PeerClusterSettingsRequest,
   type WorkerClusterSettings,
   type PeerLogsCollectRequest,
@@ -41,6 +46,20 @@ import {
   type RaftAppendEntries,
 } from '@kici-dev/engine';
 import type { PeerRegistry } from './peer-registry.js';
+import {
+  PeerForgetWaiters,
+  PEER_FORGET_COORDINATORS_ONLY,
+  replyToPeerForgetRequest,
+  type PEER_FORGET_TIMEOUT,
+  type PeerForgetRequestHandler,
+} from './peer-forget.js';
+import {
+  replyToScalerOrphansRequest,
+  ScalerOrphansWaiters,
+  SCALER_ORPHANS_COORDINATORS_ONLY_ERROR,
+  type SCALER_ORPHANS_TIMEOUT,
+  type ScalerOrphansRequestHandler,
+} from './scaler-orphans-peer.js';
 import {
   generateEcdhKeyPair,
   deriveSessionKey,
@@ -162,6 +181,19 @@ export interface PeerHandlerDeps {
     msg: PeerLogsCollectRequest,
     send: (out: PeerToPeerMessage) => boolean,
   ) => Promise<void>;
+  /**
+   * Answers a peer.scaler.orphans.request a coordinator forwarded to this node
+   * (`kici-admin scaler orphans --target`). A request from a peer that is not
+   * a coordinator is refused before it reaches the handler. If undefined,
+   * requests are answered with ok=false.
+   */
+  onScalerOrphansRequest?: ScalerOrphansRequestHandler;
+  /**
+   * Forgets a departed peer a sibling coordinator forgot (`kici-admin peer
+   * forget`). A request from a peer that is not a coordinator is refused. If
+   * undefined, requests are answered with outcome `error`.
+   */
+  onPeerForgetRequest?: PeerForgetRequestHandler;
 }
 
 interface PeerConnection {
@@ -169,6 +201,11 @@ interface PeerConnection {
   ws: PeerWsLike;
   sessionKey: Buffer;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
+  /**
+   * The role the peer's join token or credential carries. The registry keeps
+   * the role the peer declares, which a worker could set to `coordinator`.
+   */
+  authenticatedRole: string;
 }
 
 /** Rate limit tracking per IP. */
@@ -232,6 +269,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     onPeerConfigReload,
     onPeerClusterSettingsRequest,
     onLogsCollectRequest,
+    onScalerOrphansRequest,
+    onPeerForgetRequest,
   } = deps;
 
   /** Active peer connections by instanceId. */
@@ -254,6 +293,11 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+
+  /** Scaler orphan response waiters (server-side connections). */
+  const scalerOrphansWaiters = new ScalerOrphansWaiters();
+  /** Peer forget response waiters (server-side connections). */
+  const peerForgetWaiters = new PeerForgetWaiters();
 
   /** Correlates peer.logs.collect.request with the peer's chunked subtree response. */
   const logsCollectWaiters = new ChunkRequestWaiter();
@@ -576,8 +620,75 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         break;
       }
 
+      case 'peer.scaler.orphans.request': {
+        const send = (response: PeerScalerOrphansResponse): void => {
+          sendEncryptedMessage(conn.ws, conn.sessionKey, response);
+        };
+        // Only a coordinator forwards an operator's request: a worker never
+        // needs to list or stop another node's VMs. The role is the one the
+        // peer's credential carries, not the one it declares.
+        if (conn.authenticatedRole !== 'coordinator') {
+          logger.warn('Refused a scaler orphan request from a peer that is not a coordinator', {
+            peerId: conn.peerInstanceId,
+            role: conn.authenticatedRole,
+            declaredRole: peerRegistry.getPeer(conn.peerInstanceId)?.role ?? 'unknown',
+          });
+          send({
+            type: 'peer.scaler.orphans.response',
+            messageId: msg.messageId,
+            ok: false,
+            error: SCALER_ORPHANS_COORDINATORS_ONLY_ERROR,
+          });
+          break;
+        }
+        replyToScalerOrphansRequest(msg, onScalerOrphansRequest, send, {
+          peerId: conn.peerInstanceId,
+        });
+        break;
+      }
+
+      case 'peer.scaler.orphans.response': {
+        scalerOrphansWaiters.resolve(msg);
+        break;
+      }
+
+      case 'peer.forget.request': {
+        const reply = (outcome: PeerForgetOutcome, detail: string): void => {
+          sendEncryptedMessage(conn.ws, conn.sessionKey, {
+            type: 'peer.forget.response',
+            messageId: msg.messageId,
+            outcome,
+            detail,
+          });
+        };
+        // Only a coordinator forwards an operator's forget, and the role is the
+        // one the peer's credential carries.
+        if (conn.authenticatedRole !== 'coordinator') {
+          logger.warn('Refused a peer forget request from a peer that is not a coordinator', {
+            peerId: conn.peerInstanceId,
+            role: conn.authenticatedRole,
+          });
+          reply(PeerForgetOutcome.enum.error, PEER_FORGET_COORDINATORS_ONLY);
+          break;
+        }
+        replyToPeerForgetRequest(
+          msg,
+          onPeerForgetRequest,
+          (response) => {
+            sendEncryptedMessage(conn.ws, conn.sessionKey, response);
+          },
+          { peerId: conn.peerInstanceId },
+        );
+        break;
+      }
+
+      case 'peer.forget.response': {
+        peerForgetWaiters.resolve(msg);
+        break;
+      }
+
       case 'peer.clusterSettings.request': {
-        // A DB-less worker pulls the worker-settings snapshot from the leader.
+        // A DB-less worker pulls the worker-settings snapshot from a coordinator.
         // A peer with no handler (not a DB-backed coordinator) does not
         // reply — the worker times out and keeps its boot-time config default,
         // never a poisoned zero snapshot.
@@ -748,8 +859,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
         // Handle auth asynchronously
         handleAuth(ws, sessionKey, handshakeNonce!, authMsg.data, ip)
-          .then((result) => {
-            if (!result) return;
+          .then((authenticatedRole) => {
+            if (authenticatedRole === null) return;
 
             authenticated = true;
             peerInstanceId = authMsg.data.instanceId;
@@ -779,6 +890,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
               ws,
               sessionKey: sessionKey!,
               heartbeatTimer: null,
+              authenticatedRole,
             };
             connections.set(peerInstanceId, conn);
             startHeartbeat(conn);
@@ -847,7 +959,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
   /**
    * Validate auth request (token or credential proof).
-   * Returns true if accepted, false if rejected.
+   * Returns the role the accepted credential or join token carries, or null
+   * when the request is rejected. The role the peer declares in its request is
+   * not authenticated; this one is.
    */
   async function handleAuth(
     ws: PeerWsLike,
@@ -862,7 +976,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       role?: 'coordinator' | 'worker';
     },
     ip: string,
-  ): Promise<boolean> {
+  ): Promise<string | null> {
     // Protocol version check (minimum-version semantics: future versions accepted)
     if (authMsg.protocolVersion < MIN_PROTOCOL_VERSION) {
       logger.warn('Peer protocol version below minimum', {
@@ -879,7 +993,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       });
       recordFailedAuth(ip, authMsg.instanceId);
       ws.close(WS_CLOSE_PROTOCOL_ERROR, 'Unsupported protocol version');
-      return false;
+      return null;
     }
 
     if (authMsg.softwareVersion) {
@@ -926,7 +1040,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
           });
           recordFailedAuth(ip, authMsg.instanceId);
           ws.close(WS_CLOSE_UNAUTHORIZED, 'Role mismatch');
-          return false;
+          return null;
         }
 
         // Generate session credential
@@ -955,7 +1069,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
         // Gate a worker join against the plan ceiling before accepting.
         if (!(await admitWorkerOrReject(result.routing.role, ws, sessionKey, authMsg.instanceId)))
-          return false;
+          return null;
 
         // Get local inventory for auth response
         const inventory = getLocalInventory();
@@ -973,7 +1087,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
           capabilities: inventory.capabilities,
         });
 
-        return true;
+        return result.routing.role;
       } catch (err) {
         // Idempotent mesh-join recovery: when sibling peer-clients on the
         // same peer identity race on a single join token across a shared-DB
@@ -1008,7 +1122,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
                 });
                 recordFailedAuth(ip, authMsg.instanceId);
                 ws.close(WS_CLOSE_UNAUTHORIZED, 'Role mismatch');
-                return false;
+                return null;
               }
 
               const credential = randomBytes(32).toString('hex');
@@ -1036,7 +1150,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
                   authMsg.instanceId,
                 ))
               )
-                return false;
+                return null;
 
               const inventory = getLocalInventory();
               sendEncryptedMessage(ws, sessionKey, {
@@ -1050,7 +1164,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
                 scalerCapacity: inventory.scalerCapacity,
                 capabilities: inventory.capabilities,
               });
-              return true;
+              return parsed.routing.role;
             }
           } catch (recoveryErr) {
             logger.warn('Peer token idempotent recovery failed', {
@@ -1072,7 +1186,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         });
         recordFailedAuth(ip, authMsg.instanceId);
         ws.close(WS_CLOSE_UNAUTHORIZED, 'Invalid token');
-        return false;
+        return null;
       }
     } else if (authMsg.proof) {
       // --- Credential-based auth (reconnection) ---
@@ -1097,7 +1211,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         });
         recordFailedAuth(ip, authMsg.instanceId);
         ws.close(WS_CLOSE_UNAUTHORIZED, 'Unknown credential');
-        return false;
+        return null;
       }
 
       if (stored.revokedAt) {
@@ -1114,7 +1228,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         });
         recordFailedAuth(ip, authMsg.instanceId);
         ws.close(WS_CLOSE_UNAUTHORIZED, 'Credential revoked');
-        return false;
+        return null;
       }
 
       // HMAC proof verification:
@@ -1142,7 +1256,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         });
         recordFailedAuth(ip, authMsg.instanceId);
         ws.close(WS_CLOSE_UNAUTHORIZED, 'Invalid proof');
-        return false;
+        return null;
       }
 
       // Update last seen (track which coordinator validated)
@@ -1150,7 +1264,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
       // Gate a worker join against the plan ceiling before accepting.
       if (!(await admitWorkerOrReject(stored.role, ws, sessionKey, authMsg.instanceId)))
-        return false;
+        return null;
 
       // Get local inventory for auth response
       const inventory = getLocalInventory();
@@ -1166,7 +1280,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         capabilities: inventory.capabilities,
       });
 
-      return true;
+      return stored.role;
     } else {
       // Neither token nor proof provided
       logger.warn('Peer auth request missing token and proof', {
@@ -1180,7 +1294,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       });
       recordFailedAuth(ip, authMsg.instanceId);
       ws.close(WS_CLOSE_UNAUTHORIZED, 'Missing auth method');
-      return false;
+      return null;
     }
   }
 
@@ -1294,6 +1408,38 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
+   * Send a peer.forget.request to a peer connected via this handler and wait
+   * for the matching response.
+   *
+   * @returns the response; null when the peer is not connected via this
+   *   handler; `'timeout'` when no response arrived within `timeoutMs`.
+   */
+  async function sendPeerForgetAndWait(
+    targetInstanceId: string,
+    msg: PeerForgetRequest,
+    timeoutMs: number,
+  ): Promise<PeerForgetResponse | null | typeof PEER_FORGET_TIMEOUT> {
+    if (!sendToPeer(targetInstanceId, msg as PeerToPeerMessage)) return null;
+    return peerForgetWaiters.wait(msg.messageId, timeoutMs);
+  }
+
+  /**
+   * Send a peer.scaler.orphans.request to a peer connected via this handler
+   * (incoming WS) and wait for the matching response.
+   *
+   * @returns the response; null when the peer is not connected via this
+   *   handler; `'timeout'` when no response arrived within `timeoutMs`.
+   */
+  async function sendScalerOrphansAndWait(
+    targetInstanceId: string,
+    msg: PeerScalerOrphansRequest,
+    timeoutMs: number,
+  ): Promise<PeerScalerOrphansResponse | null | typeof SCALER_ORPHANS_TIMEOUT> {
+    if (!sendToPeer(targetInstanceId, msg as PeerToPeerMessage)) return null;
+    return scalerOrphansWaiters.wait(msg.messageId, timeoutMs);
+  }
+
+  /**
    * Send a peer.logs.collect.request to a peer connected via this handler
    * (incoming WS) and await its reassembled subtree-bundle ZIP. Rejects on
    * timeout, an error frame, or peer disconnect.
@@ -1331,6 +1477,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       clearTimeout(waiter.timer);
     }
     configReloadWaiters.clear();
+    scalerOrphansWaiters.rejectAll('peer handler shutting down');
+    peerForgetWaiters.rejectAll('peer handler shutting down');
     logsCollectWaiters.rejectAll('peer handler shutting down');
   }
 
@@ -1363,6 +1511,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     closePeer,
     sendAndWaitAck,
     sendConfigReloadAndWait,
+    sendScalerOrphansAndWait,
+    sendPeerForgetAndWait,
     sendLogsCollectAndWait,
     getConnectionCount,
     broadcastHeartbeat,

@@ -47,13 +47,37 @@ All orchestrators in a cluster listen on the `kici_event_channel` PostgreSQL not
 
 1. The event is persisted via the event store (INSERT into `kici_events`)
 2. A `pg_notify('kici_event_channel', eventId)` is issued
-3. All listening orchestrators receive the notification and process the event independently
+3. All listening orchestrators receive the notification. Each one tries to take the event's dispatch lease, and only the orchestrator that takes it processes the event
 
 This provides cluster-wide event delivery without additional infrastructure.
 
 ### Catch-up on startup
 
-When the event router starts, it queries for unprocessed events via `getUnprocessedSince()`. This handles events that were emitted while this orchestrator was down. Each missed event is processed through the normal matching pipeline and marked as processed.
+When the event router starts, it queries for unprocessed events via `getUnprocessedSince()`. This handles events that were emitted while this orchestrator was down. The router takes the dispatch lease of each missed event, processes it through the normal matching pipeline, and marks it as processed. An event that another orchestrator already leased or finished is skipped.
+
+### Dispatch lease, retries, and the DLQ
+
+A notification does not mark the event processed up front. The router first takes a dispatch lease with `tryLeaseForProcessing()`: it sets `claimed_at` and `claimed_by` and increments `attempts`. The lease fails when the event is already processed, is in the DLQ, or has a fresh lease held by another orchestrator.
+
+- **Success** -- `markProcessed()` clears the lease, sets `processed = true`, and records the match outcome.
+- **Failure** -- `recordDispatchFailure()` releases the lease, stores the error, and sets `next_retry_at`. When `attempts` reaches the maximum dispatch attempts (default: 5, overridden by the `event_router_max_dispatch_attempts` cluster setting), `markDlq()` moves the event to the DLQ with the reason `exhausted_retries` instead.
+
+The Raft leader runs the retry scanner (`packages/orchestrator/src/events/event-retry-scanner.ts`) every 10 seconds by default. It re-publishes `pg_notify` for each event whose `next_retry_at` has passed. It also releases each lease older than the lease duration (default: 60 seconds), which an orchestrator that crashed or hung during dispatch leaves behind, and re-publishes that event.
+
+### Match outcome
+
+`processSubscriptions()` returns how the event resolved, and `markProcessed()` stores it in the `match_outcome` and `matched_count` columns of `kici_events`:
+
+| Outcome            | Meaning                                                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| `matched`          | The event dispatched at least one workflow                                                 |
+| `buffered`         | A failed workflow completion joined a `workflowsFailedBatch` window instead of dispatching |
+| `no-registration`  | No registration exists for the trigger type, or the targeted one is missing                |
+| `no-target-repo`   | The event names target repos and no registration belongs to one of them                    |
+| `trust-blocked`    | The trust store blocked a cross-repo delivery, and nothing dispatched                      |
+| `no-trigger-match` | Registrations exist, but no trigger matched the event                                      |
+
+A reserved event (name prefix `kici.`, such as the event scaler's scale-up and scale-down events) asks a customer workflow to act. When a reserved event resolves to any outcome other than `matched`, the router logs `Reserved event matched no subscriber` at info level and increments `kici_orch_event_unmatched_total{event_name,reason}`. Other events that match nothing produce no info-level log line and no metric. `kici-admin event list` and `kici-admin event show` read the stored outcome.
 
 ### Registration index matching
 
@@ -63,11 +87,12 @@ The event router matches events against persistent DB-backed registrations via t
 
 System events use `__` prefixed names internally:
 
-| Internal event name   | Mapped trigger type |
-| --------------------- | ------------------- |
-| `__workflow_complete` | `workflow_complete` |
-| `__job_complete`      | `job_complete`      |
-| `__schedule_fire`     | `schedule`          |
+| Internal event name        | Mapped trigger type      |
+| -------------------------- | ------------------------ |
+| `__workflow_complete`      | `workflow_complete`      |
+| `__job_complete`           | `job_complete`           |
+| `__schedule_fire`          | `schedule`               |
+| `__workflows_failed_batch` | `workflows_failed_batch` |
 
 When building a `SimulatedEvent` for trigger matching, the `__` prefix is stripped to produce the trigger type. System event payloads are passed through directly to the matcher (which checks fields like `workflowName`, `status`, etc.).
 
@@ -96,7 +121,13 @@ The event store (`packages/orchestrator/src/events/event-store.ts`) persists eve
 - **write()** -- INSERT a new event with computed `expires_at`
 - **getById()** -- Read a single event by ID
 - **getUnprocessedSince()** -- Query unprocessed events after a reference point (for catch-up)
-- **markProcessed()** -- SET `processed = true` for delivery tracking
+- **list()** -- List events newest first, filtered by name, outcome, and time window (for `kici-admin event list`)
+- **tryLeaseForProcessing()** -- Take the dispatch lease of an event
+- **markProcessed()** -- SET `processed = true`, clear the lease, and record the match outcome
+- **recordDispatchFailure()** -- Release the lease and schedule the next retry
+- **markDlq()** -- Move an event to the DLQ
+- **findEventsDueForRetry()**, **findExpiredLeases()**, **releaseExpiredLease()** -- Retry scanner queries
+- **listDlq()**, **countDlq()**, **resetFromDlq()**, **deleteDlq()** -- DLQ inspection and recovery
 - **cleanup()** -- DELETE events where `expires_at < NOW()`
 
 ### TTL-based cleanup

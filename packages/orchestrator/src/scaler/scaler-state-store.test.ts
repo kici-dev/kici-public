@@ -212,6 +212,32 @@ describe('ScalerStateStore', () => {
       expect(await unadopted.provisionAdopter('agent-001')).toBeNull();
       expect(await missing.provisionAdopter('agent-001')).toBeNull();
     });
+
+    it('reports an instance holding a live adopted event provision', async () => {
+      const row = {
+        agent_id: 'agent-001',
+        backend_type: ScalerBackendType.enum.event,
+        adopted_by: 'orch-b',
+      };
+      const store = new ScalerStateStore(createMockDb({ selectFirstRow: row }).db);
+
+      // fails-when: the query drops the adopter filter, so every instance reads
+      // as an adopter of orch-b's provision.
+      expect(await store.hasAdoptedProvisions('orch-b')).toBe(true);
+      expect(await store.hasAdoptedProvisions('orch-c')).toBe(false);
+    });
+
+    it('does not count an adopted row of another backend type', async () => {
+      // The reaper judges event rows only, so a non-event row holds no grace.
+      const row = {
+        agent_id: 'agent-001',
+        backend_type: ScalerBackendType.enum.container,
+        adopted_by: 'orch-b',
+      };
+      const store = new ScalerStateStore(createMockDb({ selectFirstRow: row }).db);
+
+      expect(await store.hasAdoptedProvisions('orch-b')).toBe(false);
+    });
   });
 
   describe('provision outcomes', () => {

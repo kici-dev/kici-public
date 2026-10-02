@@ -97,6 +97,7 @@ import type { CacheStorage } from '../storage/types.js';
 import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { EventStore } from '../events/event-store.js';
+import { redactEventPayload } from '../events/types.js';
 import { loadEventLogByDeliveryId } from '../cold-store/load-event-log-range.js';
 import { webhookPayloadPath } from '../pipeline/webhook-payload-store.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
@@ -3045,7 +3046,7 @@ export class DashboardHandler {
       const items: DashboardEventDlqListItem[] = events.map((e) => ({
         id: e.id,
         eventName: e.eventName,
-        payload: e.payload,
+        payload: redactEventPayload(e.payload),
         sourceRepo: e.sourceRepo ?? null,
         sourceRoutingKey: e.sourceRoutingKey ?? null,
         sourceRunId: e.sourceRunId ?? null,

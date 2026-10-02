@@ -1573,6 +1573,24 @@ export const eventDlqTotal = lazyCounter('kici_orch_event_dlq_total', {
 });
 
 /**
+ * Reserved `kici.`-prefixed internal events (today the event scaler's
+ * scale-up and scale-down) that matched no subscribing workflow. A reserved
+ * event with no subscriber is a misconfiguration — a scale-up nothing
+ * provisions, a teardown nothing runs — so every increment deserves a look.
+ * Labels:
+ * - event_name: the reserved event name (kici.scaler.scale-up or kici.scaler.scale-down)
+ * - reason: why nothing matched (no-registration, no-target-repo, trust-blocked, no-trigger-match, buffered)
+ */
+const eventUnmatchedTotal = lazyCounter('kici_orch_event_unmatched_total', {
+  description: 'Reserved kici.-prefixed internal events that matched no subscribing workflow',
+});
+
+/** Record a reserved internal event that matched no subscriber. */
+export function incEventUnmatched(eventName: string, reason: string): void {
+  eventUnmatchedTotal.add(1, { event_name: eventName, reason });
+}
+
+/**
  * Startup catch-up scans that threw. Emits no labels.
  *
  * The scan recovers the internal-event backlog a restart left behind, and it

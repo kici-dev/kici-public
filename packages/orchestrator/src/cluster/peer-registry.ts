@@ -350,10 +350,10 @@ export class PeerRegistry {
       this.onRegistryVersionBehind(peer.registryVersion);
     }
 
-    // Auto-remediation: if a peer (the leader) advertises a newer cluster-settings
+    // Auto-remediation: if a coordinator advertises a newer cluster-settings
     // version, pull the worker-settings snapshot. Unlike config/registry, there is
     // NO `localClusterSettingsVersion > 0` gate: a worker legitimately starts at 0
-    // and must pull the first time the leader is ahead.
+    // and must pull the first time a coordinator is ahead.
     if (
       peer.clusterSettingsVersion > 0 &&
       peer.clusterSettingsVersion > this.localClusterSettingsVersion &&

@@ -167,20 +167,23 @@ How long a build job's success waits for the orchestrator to publish the cache t
 
 ```bash
 kici-admin org-settings reroute show --customer-id <id> [--format json|table]
-kici-admin org-settings reroute set --customer-id <id> [--window <ms>] [--ack-timeout <ms>] [--max-hops <n>] [--format json|table]
+kici-admin org-settings reroute set --customer-id <id> [--window <ms>] [--ack-timeout <ms>] [--max-hops <n>] [--spawn-max-attempts <n>] [--spawn-retry-backoff <ms>] [--format json|table]
 kici-admin org-settings reroute reset --customer-id <id> [--format json|table]
 ```
 
-The three knobs governing how a coordinator hands a job to a sibling peer that can actually run it. Each maps to a NULLABLE `org_settings` column; NULL means the cluster default applies.
+The knobs governing how a coordinator hands a job to a sibling peer that can actually run it, and how often a worker retries the agent spawn for a job it received. Each maps to a NULLABLE `org_settings` column; NULL means the cluster default applies.
 
-| Flag            | Column                    | Cluster default (env var)             |
-| --------------- | ------------------------- | ------------------------------------- |
-| `--window`      | `reroute_spawn_window_ms` | 90 s (`KICI_REROUTE_SPAWN_WINDOW_MS`) |
-| `--ack-timeout` | `reroute_ack_timeout_ms`  | 15 s (`KICI_REROUTE_ACK_TIMEOUT_MS`)  |
-| `--max-hops`    | `reroute_max_hops`        | 3 hops (`KICI_REROUTE_MAX_HOPS`)      |
+| Flag                    | Column                           | Cluster default (env var)                      |
+| ----------------------- | -------------------------------- | ---------------------------------------------- |
+| `--window`              | `reroute_spawn_window_ms`        | 90 s (`KICI_REROUTE_SPAWN_WINDOW_MS`)          |
+| `--ack-timeout`         | `reroute_ack_timeout_ms`         | 15 s (`KICI_REROUTE_ACK_TIMEOUT_MS`)           |
+| `--max-hops`            | `reroute_max_hops`               | 3 hops (`KICI_REROUTE_MAX_HOPS`)               |
+| `--spawn-max-attempts`  | `reroute_spawn_max_attempts`     | 3 attempts (`KICI_REROUTE_SPAWN_MAX_ATTEMPTS`) |
+| `--spawn-retry-backoff` | `reroute_spawn_retry_backoff_ms` | 5 s (`KICI_REROUTE_SPAWN_RETRY_BACKOFF_MS`)    |
 
-- `set` requires at least one of the three flags and accepts several at once. `--window` / `--ack-timeout` take integer milliseconds of at least 1000; `--max-hops` takes an integer of at least 1 and exists for loop prevention.
-- `reset` clears **all three** overrides at once.
+- `set` requires at least one flag and accepts several at once. `--window` / `--ack-timeout` take integer milliseconds of at least 1000; `--max-hops` takes an integer of at least 1 and exists for loop prevention.
+- `--spawn-max-attempts` takes an integer of at least 1: the agent spawns a worker attempts for one rerouted job before it gives the job back to its coordinator. `--spawn-retry-backoff` takes integer milliseconds of at least 0: the wait after a failed spawn before the next attempt. The coordinator sends both values to the worker with each rerouted job. When the worker's scaler is deferring after failed launches (see [Launch failures](../auto-scaler/bare-metal.md#launch-failures)), the worker waits for the deferral to end. That wait does not use an attempt.
+- `reset` clears every reroute override the orchestrator reports. Against an orchestrator that does not know the spawn-retry fields, it clears only the others.
 
 See [Multi-orchestrator clustering](../../../architecture/clustering/multi-orchestrator.md) for the reroute protocol itself.
 
@@ -1096,7 +1099,7 @@ Synopsis: `kici-admin org-settings reroute`
 
 ### `kici-admin org-settings reroute reset`
 
-Clear all per-org reroute overrides (fall back to the cluster defaults)
+Clear every per-org reroute override (fall back to the cluster defaults)
 
 Synopsis: `kici-admin org-settings reroute reset [options]`
 
@@ -1110,20 +1113,22 @@ Synopsis: `kici-admin org-settings reroute reset [options]`
 
 ### `kici-admin org-settings reroute set`
 
-Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops.
+Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops / --spawn-max-attempts / --spawn-retry-backoff.
 
 Synopsis: `kici-admin org-settings reroute set [options]`
 
 **Options**
 
-| Option               | Default | Description                                         |
-| -------------------- | ------- | --------------------------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org)                    |
-| `--org <id>`         |         | Alias for --customer-id                             |
-| `--window <ms>`      |         | Spawn window (integer milliseconds, >= 1000)        |
-| `--ack-timeout <ms>` |         | Reroute ACK timeout (integer milliseconds, >= 1000) |
-| `--max-hops <n>`     |         | Maximum peer hops (integer >= 1)                    |
-| `--format <format>`  | `table` | Output format: json\|table                          |
+| Option                       | Default | Description                                                                    |
+| ---------------------------- | ------- | ------------------------------------------------------------------------------ |
+| `--customer-id <id>`         |         | Customer / org id (alias: --org)                                               |
+| `--org <id>`                 |         | Alias for --customer-id                                                        |
+| `--window <ms>`              |         | Spawn window (integer milliseconds, >= 1000)                                   |
+| `--ack-timeout <ms>`         |         | Reroute ACK timeout (integer milliseconds, >= 1000)                            |
+| `--max-hops <n>`             |         | Maximum peer hops (integer >= 1)                                               |
+| `--spawn-max-attempts <n>`   |         | Spawn attempts a worker makes for one rerouted job (integer >= 1)              |
+| `--spawn-retry-backoff <ms>` |         | Wait after a failed spawn before the next attempt (integer milliseconds, >= 0) |
+| `--format <format>`          | `table` | Output format: json\|table                                                     |
 
 ### `kici-admin org-settings reroute show`
 

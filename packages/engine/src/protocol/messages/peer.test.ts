@@ -20,6 +20,14 @@ import {
   peerClusterSettingsResponseSchema,
   peerToPeerMessageSchema,
   peerFromPeerMessageSchema,
+  peerScalerOrphansRequestSchema,
+  peerScalerOrphansResponseSchema,
+  scalerVmStopResultSchema,
+  ScalerOrphansAction,
+  ScalerVmStatus,
+  ScalerVmStopOutcome,
+  PeerForgetOutcome,
+  peerForgetResponseSchema,
 } from './peer.js';
 import { ScalerEventType } from './scaler-event.js';
 
@@ -350,6 +358,28 @@ describe('peerClusterSettings request/response schemas', () => {
       settings: { agentTokenTtlMs: 1_800_000 },
     };
     expect(peerClusterSettingsResponseSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('carries the Firecracker API-socket wait when the leader sends it', () => {
+    const msg = {
+      type: 'peer.clusterSettings.response',
+      messageId: 'm1',
+      version: 4,
+      settings: { agentTokenTtlMs: 1_800_000, firecrackerApiSocketWaitMs: 45_000 },
+    };
+    expect(peerClusterSettingsResponseSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts a snapshot without firecrackerApiSocketWaitMs, as an older leader sends it', () => {
+    // breaks-if-wrong: a required field would reject every pull from a leader
+    // that predates the knob, leaving the worker on stale settings.
+    const parsed = peerClusterSettingsResponseSchema.parse({
+      type: 'peer.clusterSettings.response',
+      messageId: 'm1',
+      version: 3,
+      settings: { agentTokenTtlMs: 1_800_000 },
+    });
+    expect(parsed.settings.firecrackerApiSocketWaitMs).toBeUndefined();
   });
 
   it('rejects a response whose settings omit agentTokenTtlMs', () => {
@@ -943,5 +973,164 @@ describe('job.progress.ack', () => {
 
   it('rejects a non-ExecutionJobStatus state', () => {
     expect(() => jobProgressAckSchema.parse({ ...valid, state: 'bogus' })).toThrow();
+  });
+});
+
+describe('reroute spawn-retry wire fields', () => {
+  const reroute = {
+    type: 'job.reroute',
+    messageId: 'm-1',
+    jobId: 'job-1',
+    runId: 'run-1',
+    deliveryId: 'd-1',
+    routingKey: 'rk',
+    event: 'push',
+    action: null,
+    payload: {},
+    jobName: 'build',
+    workflowName: 'ci',
+    runsOnLabels: [['linux']],
+    triedConnections: ['coord-a'],
+    maxHops: 3,
+    coordinatorId: 'coord-a',
+  };
+
+  const scalerFailed = {
+    type: 'scaler.event',
+    runId: 'run-1',
+    jobId: 'job-1',
+    agentId: 'scaler-container-1',
+    eventType: ScalerEventType.enum['scaler.failed'],
+    detail: 'no such image',
+    timestampMs: 1,
+  };
+
+  it('job.reroute parses with and without spawnRetry', () => {
+    expect(jobRerouteSchema.parse(reroute).spawnRetry).toBeUndefined();
+    expect(
+      jobRerouteSchema.parse({ ...reroute, spawnRetry: { maxAttempts: 3, backoffMs: 0 } })
+        .spawnRetry,
+    ).toEqual({ maxAttempts: 3, backoffMs: 0 });
+  });
+
+  it('job.reroute rejects a budget of zero attempts or a negative backoff', () => {
+    // fails-when: maxAttempts loses its floor, so a worker could be told to never spawn
+    expect(
+      jobRerouteSchema.safeParse({ ...reroute, spawnRetry: { maxAttempts: 0, backoffMs: 0 } })
+        .success,
+    ).toBe(false);
+    expect(
+      jobRerouteSchema.safeParse({ ...reroute, spawnRetry: { maxAttempts: 1, backoffMs: -1 } })
+        .success,
+    ).toBe(false);
+  });
+
+  it('scaler.event carries final true, false, or nothing', () => {
+    expect(peerScalerEventSchema.parse({ ...scalerFailed, final: true }).final).toBe(true);
+    expect(peerScalerEventSchema.parse({ ...scalerFailed, final: false }).final).toBe(false);
+    expect(peerScalerEventSchema.parse(scalerFailed).final).toBeUndefined();
+  });
+
+  it('a peer message with a field this build does not know is stripped, not rejected', () => {
+    // fails-when: a peer schema is made .strict(), so an older peer drops a newer peer's frame
+    const parsed = peerFromPeerMessageSchema.safeParse({
+      ...scalerFailed,
+      final: true,
+      fieldFromANewerPeer: 1,
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toMatchObject({ type: 'scaler.event', final: true });
+    expect(parsed.data).not.toHaveProperty('fieldFromANewerPeer');
+  });
+});
+
+describe('peer.scaler.orphans', () => {
+  const vm = {
+    vmId: 'scaler-firecracker-0d1e2f3a',
+    scaler: 'fc',
+    pid: 4242,
+    startedAt: '2026-10-01T10:00:00.000Z',
+    ageSeconds: 120,
+    chrootDir: '/srv/jailer/firecracker/scaler-firecracker-0d1e2f3a/root',
+    status: ScalerVmStatus.enum.orphaned,
+    trackedBy: [],
+    reason: 'no in-memory VM, spawning entry, registered agent or active job binding',
+  };
+
+  it('both unions accept the request and the response', () => {
+    const req = {
+      type: 'peer.scaler.orphans.request',
+      messageId: 'm1',
+      action: ScalerOrphansAction.enum.stop,
+      vmIds: [vm.vmId],
+    };
+    const res = {
+      type: 'peer.scaler.orphans.response',
+      messageId: 'm1',
+      ok: true,
+      firecrackerScalers: ['fc'],
+      vms: [vm],
+      results: [
+        { vmId: vm.vmId, outcome: ScalerVmStopOutcome.enum.stopped, pid: 4242, detail: '' },
+      ],
+    };
+    for (const schema of [peerToPeerMessageSchema, peerFromPeerMessageSchema]) {
+      expect(schema.safeParse(req).success).toBe(true);
+      expect(schema.safeParse(res).success).toBe(true);
+    }
+  });
+
+  // fails-when: an unknown action or outcome is accepted
+  it('rejects an action and an outcome outside the enums', () => {
+    expect(
+      peerScalerOrphansRequestSchema.safeParse({
+        type: 'peer.scaler.orphans.request',
+        messageId: 'm',
+        action: 'kill',
+      }).success,
+    ).toBe(false);
+    expect(
+      scalerVmStopResultSchema.safeParse({ vmId: 'x', outcome: 'killed', detail: '' }).success,
+    ).toBe(false);
+  });
+
+  // breaks-if-wrong: a list response without results (and an error without vms) must parse
+  it('every payload field of the response is optional', () => {
+    expect(
+      peerScalerOrphansResponseSchema.safeParse({
+        type: 'peer.scaler.orphans.response',
+        messageId: 'm',
+        ok: false,
+        error: 'x',
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe('peer.forget', () => {
+  it('both unions accept the request and the response', () => {
+    const req = { type: 'peer.forget.request', messageId: 'f1', instanceId: 'coord-b' };
+    const res = {
+      type: 'peer.forget.response',
+      messageId: 'f1',
+      outcome: PeerForgetOutcome.enum.forgotten,
+      detail: 'forgotten',
+    };
+    for (const schema of [peerToPeerMessageSchema, peerFromPeerMessageSchema]) {
+      expect(schema.safeParse(req).success).toBe(true);
+      expect(schema.safeParse(res).success).toBe(true);
+    }
+  });
+
+  // fails-when: an outcome outside the enum is accepted
+  it('rejects an unknown outcome', () => {
+    expect(
+      peerForgetResponseSchema.safeParse({
+        type: 'peer.forget.response',
+        messageId: 'f',
+        outcome: 'removed',
+        detail: '',
+      }).success,
+    ).toBe(false);
   });
 });

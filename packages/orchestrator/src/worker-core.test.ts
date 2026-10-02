@@ -222,6 +222,37 @@ describe('bootstrapWorker', () => {
     });
   });
 
+  it('a coordinator cancel removes a rerouted job still queued on the worker', async () => {
+    const config = createWorkerConfig();
+    const { bootstrapWorker } = await import('./worker-core.js');
+    const subsystems = await bootstrapWorker(config);
+    const peerClient = subsystems.peerClient as unknown as MockPeerClient;
+    const onJobReroute = peerClient.options.onJobReroute as (msg: unknown) => Promise<void>;
+    const onJobCancel = peerClient.options.onJobCancel as (msg: unknown) => void;
+
+    await onJobReroute({
+      type: 'job.reroute',
+      messageId: 'm-3',
+      jobId: 'reroute-job-3',
+      runId: 'run-3',
+      workflowName: 'ci',
+      jobName: 'build',
+      runsOnLabels: [['linux']],
+      deliveryId: 'd-3',
+      routingKey: 'github:42',
+    });
+    expect(subsystems.jobQueue.isPending('reroute-job-3')).toBe(true);
+
+    mockPeerClientSend.mockClear();
+    onJobCancel({ type: 'peer.job.cancel', runId: 'run-3', jobId: 'reroute-job-3', reason: 'x' });
+
+    // fails-when: the worker's cancel receiver is wired without the queued-job release
+    await vi.waitFor(() => expect(subsystems.jobQueue.isPending('reroute-job-3')).toBe(false));
+    expect(await subsystems.jobQueue.getFullJobById('reroute-job-3')).toBeNull();
+    // The coordinator already decided: the worker reports nothing for the job.
+    expect(mockPeerClientSend).not.toHaveBeenCalled();
+  });
+
   describe('a rerouted global job carrying only the workflow repo clone token', () => {
     /** Drive one reroute of a global job whose source clone token could not be minted. */
     async function rerouteGlobal(sourceRepoUrl: string) {
@@ -328,6 +359,32 @@ describe('resolveWorkerAgentTokenTtlMs', () => {
   it('falls back to the config default until the first pull lands (null snapshot)', async () => {
     const { resolveWorkerAgentTokenTtlMs } = await import('./worker-core.js');
     expect(resolveWorkerAgentTokenTtlMs(null, 3_600_000)).toBe(3_600_000);
+  });
+});
+
+describe('resolveWorkerFirecrackerApiSocketWaitMs', () => {
+  it('returns the pulled firecracker_api_socket_wait_ms', async () => {
+    const { resolveWorkerFirecrackerApiSocketWaitMs } = await import('./worker-core.js');
+    expect(
+      resolveWorkerFirecrackerApiSocketWaitMs(
+        { settings: { agentTokenTtlMs: 1, firecrackerApiSocketWaitMs: 45_000 } },
+        30_000,
+      ),
+    ).toBe(45_000);
+  });
+
+  it('falls back to the config default until the first pull lands', async () => {
+    const { resolveWorkerFirecrackerApiSocketWaitMs } = await import('./worker-core.js');
+    expect(resolveWorkerFirecrackerApiSocketWaitMs(null, 30_000)).toBe(30_000);
+  });
+
+  it('falls back to the config default for a snapshot from a leader without the knob', async () => {
+    // breaks-if-wrong: an older leader omits the field; the worker must keep
+    // its own default rather than wait for 0 ms.
+    const { resolveWorkerFirecrackerApiSocketWaitMs } = await import('./worker-core.js');
+    expect(
+      resolveWorkerFirecrackerApiSocketWaitMs({ settings: { agentTokenTtlMs: 1 } }, 30_000),
+    ).toBe(30_000);
   });
 });
 

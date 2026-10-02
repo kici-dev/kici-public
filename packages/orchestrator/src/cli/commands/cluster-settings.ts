@@ -5,16 +5,23 @@
  *
  * Talks to the orchestrator admin API directly (not the Platform dashboard
  * proxy), so the CLI stays operable even when Platform is unavailable. Backed
- * by `packages/orchestrator/src/routes/admin-cluster-settings.ts`.
+ * by `packages/orchestrator/src/routes/admin-cluster-settings.ts`. `show` also
+ * lists which settings version each coordinator and worker applied.
  *
  * These knobs are fleet-wide (a single `cluster_settings` row), not per-tenant.
  * For per-tenant knobs use `kici-admin org-settings`.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { formatUptime, toErrorMessage } from '@kici-dev/shared';
 import { jwksUrlFor } from '../../cluster/verified-issuer.js';
 import { CACHE_MAX_ENTRIES_CEILING } from '../../cluster/cluster-settings-reader.js';
+import {
+  SettingsPropagationStatus,
+  settingsPropagationReportSchema,
+  type SettingsPropagationEntry,
+  type SettingsPropagationReport,
+} from '../../cluster/settings-propagation.js';
 
 /** One numeric knob: its wire (camelCase) field, CLI flag, bounds, and label. */
 interface KnobSpec {
@@ -269,6 +276,14 @@ const KNOBS: KnobSpec[] = [
     min: 1000,
     label: 'Global eval wait timeout (ms)',
   },
+  // Read per spawn. On a host whose disk is saturated with writes, the jailer's
+  // own copy of the firecracker binary into the chroot can take seconds.
+  {
+    field: 'firecrackerApiSocketWaitMs',
+    flag: 'firecracker-api-socket-wait-ms',
+    min: 1000,
+    label: 'Firecracker API socket wait (ms)',
+  },
   // Event-scaler provision reaper. Unlike the cache knobs above, all four are
   // read per sweep, so a change lands on the next tick with no restart — the
   // interval reschedules the timer at the end of the sweep that observed it.
@@ -376,6 +391,105 @@ function formatSettings(s: ClusterSettings, format: string): string {
 async function fetchSettings(client: AdminApiClient): Promise<ClusterSettings> {
   const res = await client.get<SettingsResponse>('/api/v1/admin/cluster-settings');
   return res.settings;
+}
+
+/** The outcome of the propagation request `show` makes after the settings read. */
+export type PropagationFetch =
+  | { kind: 'ok'; report: SettingsPropagationReport }
+  | { kind: 'unsupported' }
+  | { kind: 'error'; reason: string };
+
+export const PROPAGATION_UNSUPPORTED_NOTE =
+  'Note: this orchestrator does not report cluster-settings propagation; ' +
+  'upgrade it to see which version each orchestrator applied.';
+
+/**
+ * Fetch the propagation report. A 404 means the orchestrator predates the
+ * route; `show` then prints the settings alone, because this CLI may be newer
+ * than the orchestrator it talks to.
+ */
+export async function fetchPropagation(client: AdminApiClient): Promise<PropagationFetch> {
+  let body: { propagation?: unknown } | null;
+  try {
+    body = await client.get<{ propagation?: unknown } | null>(
+      '/api/v1/admin/cluster-settings/propagation',
+    );
+  } catch (err) {
+    const reason = toErrorMessage(err);
+    return reason.startsWith('HTTP 404:') ? { kind: 'unsupported' } : { kind: 'error', reason };
+  }
+  const parsed = settingsPropagationReportSchema.safeParse(body?.propagation);
+  return parsed.success
+    ? { kind: 'ok', report: parsed.data }
+    : {
+        kind: 'error',
+        reason: `unexpected response: ${parsed.error.issues[0]?.message ?? 'invalid'}`,
+      };
+}
+
+const LAGGING: ReadonlySet<string> = new Set([
+  SettingsPropagationStatus.behind,
+  SettingsPropagationStatus.ahead,
+]);
+
+function describeLiveness(entry: SettingsPropagationEntry): string {
+  if (entry.self) return 'this coordinator';
+  const age =
+    entry.lastHeartbeatAgeMs === null
+      ? 'unknown'
+      : `${formatUptime(Math.round(entry.lastHeartbeatAgeMs / 1000))} ago`;
+  return entry.connected ? `heartbeat ${age}` : `disconnected, last heartbeat ${age}`;
+}
+
+/** The table section: one row per orchestrator, lagging ones in upper case. */
+export function formatPropagation(report: SettingsPropagationReport): string {
+  const rows = report.orchestrators;
+  const idWidth = Math.max(0, ...rows.map((r) => r.instanceId.length));
+  const lines = [
+    `Propagation (current version ${report.currentVersion}, as seen by ${report.reportedBy}):`,
+  ];
+  for (const r of rows) {
+    const status = LAGGING.has(r.status) ? r.status.toUpperCase() : r.status.replace('-', ' ');
+    lines.push(
+      `  ${r.instanceId.padEnd(idWidth)}  ${r.role.padEnd(11)}  ${`v${r.appliedVersion}`.padEnd(6)}  ` +
+        `${status.padEnd(7)}  ${describeLiveness(r)}`,
+    );
+  }
+  const lagging = rows.filter((r) => LAGGING.has(r.status)).length;
+  lines.push(
+    lagging === 0
+      ? `All ${rows.length} orchestrators run the current version.`
+      : `${lagging} of ${rows.length} orchestrators are not on the current version.`,
+  );
+  return lines.join('\n');
+}
+
+/**
+ * What `show` prints. The JSON keeps the flat settings map exactly as before
+ * and adds one `propagation` key, so scripts that read knob keys keep working.
+ */
+export function renderShow(
+  settings: ClusterSettings,
+  propagation: PropagationFetch,
+  format: string,
+): { stdout: string; stderr: string | null } {
+  const stderr =
+    propagation.kind === 'unsupported'
+      ? PROPAGATION_UNSUPPORTED_NOTE
+      : propagation.kind === 'error'
+        ? `Warning: could not read cluster-settings propagation: ${propagation.reason}`
+        : null;
+  if (format === 'json') {
+    const out =
+      propagation.kind === 'ok' ? { ...settings, propagation: propagation.report } : settings;
+    return { stdout: JSON.stringify(out, null, 2), stderr };
+  }
+  const table = formatSettings(settings, format);
+  return {
+    stdout:
+      propagation.kind === 'ok' ? `${table}\n\n${formatPropagation(propagation.report)}` : table,
+    stderr,
+  };
 }
 
 async function patchSettings(client: AdminApiClient, body: PatchBody): Promise<ClusterSettings> {
@@ -565,16 +679,22 @@ export function registerClusterSettingsCommands(
     .description('Manage the fleet-wide cluster tunables (null = cluster default)');
 
   cs.command('show')
-    .description('Print the current cluster-global tunables')
+    .description(
+      'Print the cluster-global tunables and which settings version each coordinator and worker applied',
+    )
     .option('--format <format>', 'Output format: json|table', 'table')
     .action(async (opts: { format: string }) => {
+      const client = getClient();
+      let settings: ClusterSettings;
       try {
-        const settings = await fetchSettings(getClient());
-        console.log(formatSettings(settings, opts.format));
+        settings = await fetchSettings(client);
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
       }
+      const { stdout, stderr } = renderShow(settings, await fetchPropagation(client), opts.format);
+      console.log(stdout);
+      if (stderr) console.error(stderr);
     });
 
   const setCmd = cs

@@ -4,7 +4,9 @@
  * Exposes GET / PATCH `/api/v1/admin/cluster-settings` so `kici-admin
  * cluster-settings` can read and write the single `cluster_settings` row
  * (id='default') without going through the Platform dashboard proxy — the CLI
- * stays operable even when Platform is unavailable.
+ * stays operable even when Platform is unavailable. `GET
+ * /api/v1/admin/cluster-settings/propagation` reports which settings version
+ * each orchestrator this coordinator knows has applied.
  *
  * These knobs are fleet-wide, not per-tenant, so the route is deliberately NOT
  * under `/orgs/:customerId/*`. Mutations require the `secret.write` RBAC
@@ -20,12 +22,24 @@ import { CACHE_MAX_ENTRIES_CEILING } from '../cluster/cluster-settings-reader.js
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
 import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
+import type { PeerRegistry } from '../cluster/peer-registry.js';
+import { buildSettingsPropagationReport } from '../cluster/settings-propagation.js';
 
 const logger = createLogger({ prefix: 'admin-cluster-settings' });
+
+/** The live view behind `GET /cluster-settings/propagation`. */
+export interface ClusterSettingsPropagationSource {
+  instanceId: string;
+  peerRegistry: Pick<PeerRegistry, 'getAllPeers'>;
+  /** The cluster-settings version this coordinator's reads currently serve. */
+  localVersion: () => number;
+}
 
 interface ClusterSettingsRouteDeps {
   db: Kysely<Database>;
   rbac: RbacEnforcer;
+  /** Mounts `GET /cluster-settings/propagation` when set. */
+  propagation?: ClusterSettingsPropagationSource;
 }
 
 type AdminEnv = {
@@ -74,6 +88,7 @@ const COLUMNS = {
   globalEvalCandidateTimeoutMs: 'global_eval_candidate_timeout_ms',
   globalEvalCacheMax: 'global_eval_cache_max',
   globalEvalWaitTimeoutMs: 'global_eval_wait_timeout_ms',
+  firecrackerApiSocketWaitMs: 'firecracker_api_socket_wait_ms',
   scalerReapIntervalMs: 'scaler_reap_interval_ms',
   scalerReapStrandedTimeoutMs: 'scaler_reap_stranded_timeout_ms',
   scalerReapReattemptIntervalMs: 'scaler_reap_reattempt_interval_ms',
@@ -188,6 +203,13 @@ const updateSchema = z
      */
     globalEvalWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
     /**
+     * How long a Firecracker spawn waits for the VM's API socket after the
+     * jailer starts. Read per spawn on coordinators; workers get it in the
+     * cluster-settings snapshot they pull, so a change lands on the next spawn.
+     * Floor 1s: below that, an idle host's normal start-up would fail.
+     */
+    firecrackerApiSocketWaitMs: z.number().int().min(1000).nullable().optional(),
+    /**
      * Event-scaler provision reaper. All four are read per sweep, so a change
      * lands on the next tick with no restart — the interval itself reschedules
      * the timer at the end of the sweep that observed it.
@@ -278,6 +300,44 @@ function projectRow(row: Record<string, unknown> | undefined): ProjectedClusterS
   return out;
 }
 
+function mountPropagationRoute(
+  app: Hono<AdminEnv>,
+  deps: ClusterSettingsRouteDeps,
+  source: ClusterSettingsPropagationSource,
+): void {
+  // The '/cluster-settings' guard matches that exact path only.
+  app.use('/cluster-settings/propagation', async (c, next) => {
+    const denied = requireUnscopedToken(c);
+    if (denied) return denied;
+    await next();
+  });
+
+  // GET /api/v1/admin/cluster-settings/propagation
+  app.get('/cluster-settings/propagation', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'secret.read');
+      // Read the row directly, not through a reader cache: this is the version
+      // every coordinator converges on, whichever coordinator answers.
+      const row = (await deps.db
+        .selectFrom('cluster_settings')
+        .selectAll()
+        .where('id', '=', 'default')
+        .executeTakeFirst()) as Record<string, unknown> | undefined;
+      const currentVersion = toNumber(row?.version as string | number | null | undefined) ?? 0;
+      return c.json({
+        propagation: buildSettingsPropagationReport({
+          currentVersion,
+          self: { instanceId: source.instanceId, appliedVersion: source.localVersion() },
+          peers: source.peerRegistry.getAllPeers(),
+          now: Date.now(),
+        }),
+      });
+    } catch (err) {
+      return handleAdminError(c, err, logger);
+    }
+  });
+}
+
 export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hono<AdminEnv> {
   const app = new Hono<AdminEnv>();
 
@@ -302,6 +362,8 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
       return handleAdminError(c, err, logger);
     }
   });
+
+  if (deps.propagation) mountPropagationRoute(app, deps, deps.propagation);
 
   // PATCH /api/v1/admin/cluster-settings
   app.patch('/cluster-settings', async (c) => {

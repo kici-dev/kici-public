@@ -75,7 +75,7 @@ describe('classifyUnroutable', () => {
     // backend did match, and was actively spawning.
     const detail =
       'External provisioning for scaler `github-actions` produced no agent: the scale-up ' +
-      'was delivered, but agent agent-77 never registered before the spawn timeout.';
+      'event was emitted, but agent agent-77 never registered before the spawn timeout.';
     const r = classifyUnroutable(
       facts({ runsOnLabels: ['github-actions'], lastProvisioningError: detail }),
       () => false,

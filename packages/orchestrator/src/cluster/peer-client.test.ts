@@ -4,6 +4,9 @@ import {
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
   ExecutionJobStatus,
+  ScalerOrphansAction,
+  ScalerVmStopOutcome,
+  PeerForgetOutcome,
   type JobReroute,
   type JobProgressAck,
   type PeerHeartbeat,
@@ -1344,6 +1347,239 @@ describe('PeerClient', () => {
       expect(result).not.toBeNull();
       expect(result!.success).toBe(false);
       expect(result!.errors?.[0]).toMatch(/timed out/);
+    });
+  });
+
+  describe('peer forget routing', () => {
+    it('answers a request through onPeerForgetRequest, and waits for a response', async () => {
+      const onPeerForgetRequest = vi.fn(async () => ({
+        outcome: PeerForgetOutcome.enum.forgotten,
+        detail: 'coord-gone forgotten',
+      }));
+      const { client } = createPeerClient({ onPeerForgetRequest });
+      const { mock, sessionKey } = await authenticateClient(client);
+      const countBefore = mock.sentMessages.length;
+
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.forget.request',
+            messageId: 'fc-1',
+            instanceId: 'coord-gone',
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const replies = mock.sentMessages
+        .slice(countBefore)
+        .map((m: string) => {
+          try {
+            return JSON.parse(decryptMessage(m, sessionKey));
+          } catch {
+            return null;
+          }
+        })
+        .filter((m: any) => m?.type === 'peer.forget.response');
+      expect(replies).toEqual([
+        expect.objectContaining({ messageId: 'fc-1', outcome: PeerForgetOutcome.enum.forgotten }),
+      ]);
+
+      const pending = client.sendPeerForgetAndWait(
+        { type: 'peer.forget.request', messageId: 'fc-out', instanceId: 'coord-gone' },
+        5_000,
+      );
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.forget.response',
+            messageId: 'fc-out',
+            outcome: PeerForgetOutcome.enum.forgotten,
+            detail: 'ok',
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await pending).toMatchObject({ outcome: PeerForgetOutcome.enum.forgotten });
+    });
+
+    it('answers error when no forget handler is wired', async () => {
+      const { client } = createPeerClient();
+      const { mock, sessionKey } = await authenticateClient(client);
+      const countBefore = mock.sentMessages.length;
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({ type: 'peer.forget.request', messageId: 'fc-2', instanceId: 'x' }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const reply = mock.sentMessages
+        .slice(countBefore)
+        .map((m: string) => JSON.parse(decryptMessage(m, sessionKey)))
+        .find((m: any) => m.type === 'peer.forget.response');
+      expect(reply).toMatchObject({
+        outcome: PeerForgetOutcome.enum.error,
+        detail: 'peer forget requests are not handled by this peer',
+      });
+    });
+  });
+
+  describe('scaler orphans routing', () => {
+    function orphansReply(mock: any, sessionKey: Buffer, countBefore: number): any {
+      for (const msg of mock.sentMessages.slice(countBefore)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.scaler.orphans.response') return parsed;
+        } catch {
+          // ignore
+        }
+      }
+      return null;
+    }
+
+    it('answers an incoming request through onScalerOrphansRequest', async () => {
+      const onScalerOrphansRequest = vi.fn().mockResolvedValue({
+        ok: true,
+        firecrackerScalers: ['fc'],
+        vms: [],
+      });
+      const { client } = createPeerClient({ onScalerOrphansRequest });
+      const { mock, sessionKey } = await authenticateClient(client);
+      const countBefore = mock.sentMessages.length;
+
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.scaler.orphans.request',
+            messageId: 'or-client-1',
+            action: ScalerOrphansAction.enum.list,
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onScalerOrphansRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          messageId: 'or-client-1',
+          action: ScalerOrphansAction.enum.list,
+        }),
+      );
+      expect(orphansReply(mock, sessionKey, countBefore)).toMatchObject({
+        messageId: 'or-client-1',
+        ok: true,
+        firecrackerScalers: ['fc'],
+      });
+    });
+
+    it('answers ok=false when no handler is wired', async () => {
+      const { client } = createPeerClient();
+      const { mock, sessionKey } = await authenticateClient(client);
+      const countBefore = mock.sentMessages.length;
+
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.scaler.orphans.request',
+            messageId: 'or-client-2',
+            action: ScalerOrphansAction.enum.list,
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(orphansReply(mock, sessionKey, countBefore)).toMatchObject({
+        ok: false,
+        error: 'scaler orphan requests are not handled by this peer',
+      });
+    });
+
+    it('sendScalerOrphansAndWait resolves with the matching response', async () => {
+      const { client } = createPeerClient();
+      const { mock, sessionKey } = await authenticateClient(client);
+
+      const promise = client.sendScalerOrphansAndWait(
+        {
+          type: 'peer.scaler.orphans.request',
+          messageId: 'or-out-1',
+          action: ScalerOrphansAction.enum.stop,
+          vmIds: ['vm-1'],
+        },
+        5_000,
+      );
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.scaler.orphans.response',
+            messageId: 'or-out-1',
+            ok: true,
+            results: [
+              { vmId: 'vm-1', outcome: ScalerVmStopOutcome.enum.stopped, detail: 'stopped' },
+            ],
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await promise).toMatchObject({ ok: true, results: [{ vmId: 'vm-1' }] });
+    });
+
+    it('sendScalerOrphansAndWait returns null when not connected', async () => {
+      const { client } = createPeerClient();
+      expect(
+        await client.sendScalerOrphansAndWait(
+          {
+            type: 'peer.scaler.orphans.request',
+            messageId: 'or-disc',
+            action: ScalerOrphansAction.enum.list,
+          },
+          500,
+        ),
+      ).toBeNull();
+    });
+
+    it('sendScalerOrphansAndWait resolves timeout when no response arrives', async () => {
+      const { client } = createPeerClient();
+      await authenticateClient(client);
+
+      const promise = client.sendScalerOrphansAndWait(
+        {
+          type: 'peer.scaler.orphans.request',
+          messageId: 'or-timeout',
+          action: ScalerOrphansAction.enum.list,
+        },
+        500,
+      );
+      await vi.advanceTimersByTimeAsync(600);
+
+      expect(await promise).toBe('timeout');
+    });
+
+    it('a disconnect ends a pending wait with ok=false', async () => {
+      const { client } = createPeerClient();
+      await authenticateClient(client);
+
+      const promise = client.sendScalerOrphansAndWait(
+        {
+          type: 'peer.scaler.orphans.request',
+          messageId: 'or-dropped',
+          action: ScalerOrphansAction.enum.list,
+        },
+        5_000,
+      );
+      client.disconnect();
+
+      expect(await promise).toMatchObject({ messageId: 'or-dropped', ok: false });
     });
   });
 

@@ -23,7 +23,7 @@ GitHub  -->  Platform Relay  -->  Orchestrator  -->  Agent
 2. **Platform routes the webhook** to the right orchestrator over WebSocket and forwards the body bytes verbatim. Platform never sees customer HMAC secrets — signature verification happens entirely on the orchestrator after reassembly.
 3. **Orchestrator admits the delivery**, then **verifies the signature** (HMAC-SHA256 against per-source webhook secret, with dual-secret rotation support). Admission runs first, on the routing key alone: when the ingest admission controller sheds, the orchestrator records an `event_log` breadcrumb with status `shed` and ACKs `shed_retry_later`, which the Platform answers as **429** with `Retry-After`. See [ingest admission shed](./webhooks/webhook-delivery.md#ingest-admission-shed-step-3).
 4. **Orchestrator dedup check** against dual-layer `DedupCache` (in-memory set + `dedup_cache` DB table).
-5. **Orchestrator resolves provider** by looking up the provider bundle from the `ProviderRegistry` using `getByRoutingKey()` (exact match first, falls back to provider type prefix for backward compatibility). Skips processing if the provider is unknown.
+5. **Orchestrator resolves provider** by looking up the provider bundle from the `ProviderRegistry` using `getByRoutingKey()` (exact match first, falls back to provider type prefix for backward compatibility; a `generic:` key falls back only to the shared `generic:default` bundle, never to another source's). Skips processing if the provider is unknown.
 6. **Orchestrator normalizes** the webhook via the provider's `WebhookNormalizer` (extracts branch, event type, action, sender).
 7. **Orchestrator extracts repo and credentials** from payload (repository identifier from `repository.full_name`, provider credentials such as GitHub installation ID).
 8. **Orchestrator handles /kici commands** in `issue_comment` events: intercepts `/kici approve` and `/kici reject` approval commands before trigger matching, delegating to `handleApprovalComment()` for security hold management.
@@ -126,7 +126,7 @@ Remote runs are offered by the Platform; an orchestrator with no Platform connec
 
 KiCI runs two orchestrator-side caches — the **source tarball cache** (raw `.kici/` directory minus `node_modules/`) and the **dependency tarball cache** (packed `node_modules/`). Both use a build-then-execute pattern: the orchestrator checks the caches before dispatching execution jobs, and if the source cache is cold a build agent populates both in one pass.
 
-With the shared TypeScript loader hook plus source tarball, execution agents never install or compile `.kici/` at runtime — they restore the workflow directory and its `node_modules` with two S3 GETs and extract. The workspace checkout is unaffected: an execution job still clones the repository at the dispatch ref unless it sets `checkout: false`, and the source tarball is restored over that clone.
+With the shared TypeScript loader hook plus source tarball, execution agents never install or compile `.kici/` at runtime — they restore the workflow directory and its `node_modules` with two S3 GETs and extract. The workspace checkout is unaffected: an execution job still clones the repository at the dispatch ref unless it sets `checkout: false`, and the restored source tree then replaces the clone's `.kici/`.
 
 ### Cache miss flow
 
@@ -174,7 +174,7 @@ Execution Job Dispatch --> Execution Agent
 Done <-----------------------+
 ```
 
-The execution agent never rebuilds `.kici/`. The source tarball IS the workflow repo's `.kici/` directory, extracted over the checkout.
+The execution agent never rebuilds `.kici/`. The source tarball IS the workflow repo's `.kici/` directory, and it replaces the checkout's `.kici/` wholesale, so a file deleted from `.kici/` does not survive a cache hit.
 
 ### Cache hit flow
 
@@ -223,7 +223,7 @@ A miss on either cache triggers a build job, and the job carries `buildSourceNee
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 42.
+- **A workflow entry without `contentHash`** skips the source cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow, and a lock old enough to lack one (schema v1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. Regenerate it with `kici compile`. The current lock file schema version is 42.
 - **Cross-source dispatch** (a workflow registered against source A fired by a generic webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 - **Global-workflow dispatch** (a workflow defined in repository A with `repos:`, fired by an event from repository B) uses both caches when A's registration records a commit. The build job packs A's `.kici/` at that commit under A's `contentHash`, and the dependency cache is keyed by the `lockfileHash` and `siblingsDigest` the registration stored from A's lock file. A registration with no commit clones and installs on the agent. See [global workflows](global-workflows.md#which-repository-each-decision-uses).
 
@@ -242,7 +242,7 @@ If cache storage is unavailable or a download fails:
 - **Dep tarball hash mismatch:** The agent fails the job after one download, before it extracts anything (no fallback for integrity failures).
 - **Source tarball drift (extracted `contentHash` ≠ lock file):** Hard failure with "Lock file is out of date: workflow source changed without regenerating kici.lock.json" — see [Lock file and drift](../user/lock-file-and-drift.md).
 - **Build failure:** Execution is skipped entirely with a "Build failed" check status. Workflows that contain dynamic job entries (DynamicJobFn) are allowed to proceed with their dynamic eval jobs since those compile from source.
-- **No cache configured:** Agent runs inline install for every job (pre-caching behavior).
+- **No cache configured:** Agent runs inline install for every job.
 
 ## Cache storage architecture
 
@@ -265,7 +265,7 @@ Both source and dep caches use `S3CacheStorage` as the sole backend. The `CacheS
 
 Cache keys reflect that source tarballs and deps have different platform characteristics:
 
-- **Source:** `source/v2/{orgId}/{sourceTarDigest}.tar.gz`, with a `source/v2/{orgId}/{contentHash}.hash` pointer — platform-agnostic, and scoped to the owning organization so two repositories with matching `.kici/` trees never share one object. Raw TypeScript source is identical regardless of CPU architecture, so one entry is shared across all platforms. `contentHash` is the per-workflow hash from the lock file (`SHA-256(COMPILE_SCHEMA_VERSION + ":" + rawSource [+ "\0" + assetDigest])`, where `COMPILE_SCHEMA_VERSION = 7` and line endings are normalized to LF so the hash agrees across platforms).
+- **Source:** `source/v2/{orgId}/{sourceTarDigest}.tar.gz`, with a `source/v2/{orgId}/{contentHash}.hash` pointer — platform-agnostic, and scoped to the owning organization so two repositories with matching `.kici/` trees never share one object. Raw TypeScript source is identical regardless of CPU architecture, so one entry is shared across all platforms. `contentHash` is the per-workflow hash from the lock file (`SHA-256(COMPILE_SCHEMA_VERSION + ":" + treeDigest [+ "\0" + assetDigest])`, where `treeDigest` covers every file under `.kici/` except the paths `.kici/.kiciignore` declares, `COMPILE_SCHEMA_VERSION = 7`, and line endings are normalized to LF so the hash agrees across platforms).
 - **Deps:** `deps/{platform}-{arch}/{depsHash}.tar.gz`, with a
   `deps/{platform}-{arch}/{lockfileHash}.hash` pointer holding that hash — the
   tarball is addressed by its own content, so two builds sharing a lock file
@@ -414,7 +414,8 @@ EventRouter.onNotification(eventId) [private]
   |     |     |     matchAllWorkflows() against in-memory lock file subscriptions
   |     |     |-- For each match: onEventMatched(event, lockFile, matchedWorkflows)
   |     |
-  |     |-- On success: markProcessed (commits processed=true, clears lease)
+  |     |-- On success: markProcessed (commits processed=true, clears lease,
+  |     |   records match_outcome + matched_count)
   |     |-- On failure (any onEventMatched throws):
   |           |-- If attempts >= maxDispatchAttempts: markDlq('exhausted_retries')
   |           |-- Else: recordDispatchFailure (sets next_retry_at via exponential
@@ -470,7 +471,8 @@ Agent                          Orchestrator
   |                                |-- store event
   |                                |-- NOTIFY
   |<-- event.emit.response --------|
-  |   { requestId, deliveryId? }   |
+  |   { requestId, deliveryId?,    |
+  |     error? }                   |
   |                                |
 ```
 
@@ -649,7 +651,8 @@ Dashboard                    Platform                         Orchestrator
     |                          |   (last_rerun_at < 5s ago?)  |
     |                          |                              |
     |                          |-- run.rerun.request (WS) --->|
-    |                          |   { runId, triggeredBy }     |
+    |                          |   { runId, actor,            |
+    |                          |     routingKey? }            |
     |                          |                              |-- Load original run from DB
     |                          |                              |-- Read webhook payload from storage
     |                          |                              |-- Re-fetch lock file at original SHA
@@ -682,7 +685,7 @@ Dashboard                    Platform                         Orchestrator      
     |-- POST /orgs/:id/runs/ ->|                              |                    |
     |   :runId/cancel (auth)   |                              |                    |
     |                          |-- run.cancel.request (WS) -->|                    |
-    |                          |   { runId, cancelledBy }     |                    |
+    |                          |   { runId, actor, force? }   |                    |
     |                          |                              |-- Find active jobs  |
     |                          |                              |   from dispatch queue
     |                          |                              |-- job.cancel (WS) ->|
@@ -700,13 +703,13 @@ The cancel flow is asynchronous: the orchestrator sends `job.cancel` to agents a
 
 ### Payload storage flow
 
-Webhook payloads are stored during initial processing and retrieved later for re-runs and the payload viewer.
+Every dispatch path that creates a run from an inbound event stores its webhook payload through `storeWebhookPayload()`: the per-repository dispatch and both organization-wide dispatch paths. The payload is retrieved later for re-runs and the payload viewer. Storing it is best-effort: a failed write is logged and never fails the run.
 
 ```
-Webhook arrives                          Payload retrieved
+Run created from an event               Payload retrieved
     |                                        |
     v                                        v
-processWebhook()                     GET /orgs/:id/runs/:runId/payload
+storeWebhookPayload()                GET /orgs/:id/runs/:runId/payload
     |                                        |
     v                                        v
 logStorage.append(                   Platform -> dashboard.payload (WS)
@@ -778,7 +781,7 @@ GitHub         Platform                  Orchestrator              Agent
 
 ### Implementation
 
-Trace propagation uses Node.js `AsyncLocalStorage` from `@kici-dev/shared`. A logger format reads the current context and injects fields into every JSON log line -- no changes needed at individual call sites.
+Trace propagation uses Node.js `AsyncLocalStorage` from `@kici-dev/shared`. A logger format reads the current context and adds its fields to every JSON log line -- no changes needed at individual call sites. A field the call site sets itself (any value but `undefined`) is kept; the context fills only the fields a line leaves unset.
 
 Tier identification is handled at the infrastructure level: the `service` Loki label (set by Grafana Alloy from the systemd unit / log source) identifies which service produced the log (`platform`, `orchestrator`, `agent`, etc.). For agent logs forwarded through the orchestrator's stdout, the parsed JSON also carries an inner `service: 'agent'` field — query both with `{service="orchestrator"} | json | service="agent"` to disambiguate.
 
@@ -790,7 +793,7 @@ Output chaining allows steps to consume outputs from preceding steps (within a j
 
 When workflow code runs at definition time (`step()`, `job()` calls):
 
-- `step()` creates an `OutputProxy<T>` via `createStepOutputProxy(stepName)` and attaches it as `.result`
+- `step()` creates an `OutputProxy<T>` via `createStepOutputProxy(stepRef)` and attaches it as `.result`. The proxy reads the step name when a property is read, not when the proxy is built, so an unnamed step resolves under the `step-N` name the runner assigns before any step runs
 - `job()` creates an `OutputProxy<TOutputs>` (the job's inferred output shape — nested by step name for a multi-step job, flat for the `run:` shorthand) via `createJobOutputProxy(jobName)` and attaches it as `.result`, so cross-job reads type-check
 - The proxy is an ES6 `Proxy` object that defers all property access to a module-global `OutputsMap`
 - No outputs exist yet -- accessing `.result.field` before execution throws "has not produced outputs yet"

@@ -124,7 +124,7 @@ The sandbox performs a shallow `git clone` at the dispatch ref. For private repo
 
 On execution jobs the sandbox performs exactly two cache fetches:
 
-1. **Source tarball** — downloads the `.kici/` source tarball at `sourceTarUrl` and extracts it over the cloned workflow root, so the loaded workflow's `contentHash` matches the lock file exactly. The tarball replaces the install-and-compile of `.kici/`, not the checkout: the clone above still runs unless the job sets `checkout: false`.
+1. **Source tarball** — downloads the `.kici/` source tarball at `sourceTarUrl`, verifies its bytes against `sourceTarDigest`, and replaces the clone's `.kici/` with the restored tree, so a file deleted from `.kici/` does not survive a cache hit and the loaded workflow's `contentHash` matches the lock file exactly. The tarball replaces the install-and-compile of `.kici/`, not the checkout: the clone above still runs unless the job sets `checkout: false`.
 2. **Dependency tarball** — downloads the `node_modules` tarball at `depsUrl` to a temporary file, verifies its SHA-256 against `depsHash`, and only then extracts it into `.kici/node_modules/`. If `depsUrl` is absent (dep cache miss), or the restore fails for a reason other than a hash mismatch, the sandbox installs the dependencies inline instead.
 
 > See [Source and dependency caching flow](../data-flows.md#source-and-dependency-caching-flow) for the full cache architecture.
@@ -141,7 +141,7 @@ The lock file's `source.file` and `source.exportName` identify the exact workflo
 
 1. Resolve source file path relative to work directory
 2. Register the TS loader hook (idempotent, once per process)
-3. Read the raw TS source, compute `contentHash = SHA-256(COMPILE_SCHEMA_VERSION + ":" + normalizeLineEndings(rawSource) [+ "\0" + normalizeLineEndings(assetDigest)])` (with `COMPILE_SCHEMA_VERSION = 6`), and compare to the lock file's expected `contentHash`. The same line-ending normalization is applied by the compiler so an LF-authored lockfile matches a CRLF working tree on Windows hosts (where Git's system gitconfig defaults `core.autocrlf=true`). A mismatch throws a "lock file is out of date" error carrying the baked agent SDK version + bundle hash for debugging.
+3. Walk the extracted `.kici/` tree, compute `contentHash = SHA-256(COMPILE_SCHEMA_VERSION + ":" + treeDigest [+ "\0" + assetDigest])` (with `COMPILE_SCHEMA_VERSION = 7`), and compare to the lock file's expected `contentHash`. `treeDigest` covers every file under `.kici/` except the paths `.kici/.kiciignore` declares, so an edit to any file the workflow imports is caught. The digest normalizes line endings (CRLF → LF) with the same implementation the compiler uses, so an LF-authored lockfile matches a CRLF working tree on Windows hosts (where Git's system gitconfig defaults `core.autocrlf=true`). A mismatch throws a "lock file is out of date" error carrying the baked agent SDK version + bundle hash for debugging.
 4. Dynamic-`import()` the `.ts` file (cache-busted with a `?t=<ts>` query) — the loader hook transforms TS on demand.
 5. Extract the named workflow from module exports.
 

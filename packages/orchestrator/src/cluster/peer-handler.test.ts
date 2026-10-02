@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { PeerHeartbeat, PeerLogChunk } from '@kici-dev/engine';
-import { LogStream } from '@kici-dev/engine';
+import {
+  LogStream,
+  PeerForgetOutcome,
+  ScalerOrphansAction,
+  ScalerVmStopOutcome,
+} from '@kici-dev/engine';
 import { createLogChunkSink } from '../reporting/log-chunk-sink.js';
 import { normalizePeerLogChunk } from '../reporting/peer-log-normalize.js';
 import type { LogWriter } from '../reporting/log-writer.js';
@@ -1561,6 +1566,313 @@ describe('PeerHandler', () => {
 
       expect(cacheResponse).not.toBeNull();
       expect(cacheResponse.uploadUrl).toBe('');
+    });
+  });
+
+  describe('peer forget routing', () => {
+    function forgetResponse(ws: MockPeerWs, sessionKey: Buffer, countBefore: number): any {
+      for (const msg of ws.sentMessages.slice(countBefore)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.forget.response') return parsed;
+        } catch {
+          // ignore non-encrypted or other messages
+        }
+      }
+      return null;
+    }
+    const request = {
+      type: 'peer.forget.request',
+      messageId: 'forget-1',
+      instanceId: 'coord-gone',
+    };
+
+    // breaks-if-wrong: a coordinator's fan-out is answered
+    it('answers a coordinator through onPeerForgetRequest', async () => {
+      const onPeerForgetRequest = vi.fn(async () => ({
+        outcome: PeerForgetOutcome.enum.forgotten,
+        detail: 'coord-gone forgotten',
+      }));
+      const { handler } = createTestHandler({ onPeerForgetRequest });
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const countBefore = ws.sentMessages.length;
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onPeerForgetRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ instanceId: 'coord-gone' }),
+      );
+      expect(forgetResponse(ws, sessionKey, countBefore)).toMatchObject({
+        messageId: 'forget-1',
+        outcome: PeerForgetOutcome.enum.forgotten,
+      });
+    });
+
+    // fails-when: a peer holding a worker join token can make a coordinator forget a peer
+    it('refuses a peer holding a worker join token, whatever role it declares', async () => {
+      const onPeerForgetRequest = vi.fn();
+      const { handler } = createTestHandler({
+        onPeerForgetRequest,
+        tokenManager: createMockTokenManager({ role: 'worker' }) as any,
+        acceptedRoles: ['coordinator', 'worker'],
+      });
+      const ws = new MockPeerWs();
+      handler.handleConnection(ws);
+      const { sessionKey } = completeEcdhHandshake(ws);
+      ws.simulateRawMessage(
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.auth.request',
+            instanceId: 'remote-peer',
+            protocolVersion: PROTOCOL_VERSION,
+            token: 'kici_join_v1.worker.token',
+            role: 'coordinator',
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const countBefore = ws.sentMessages.length;
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onPeerForgetRequest).not.toHaveBeenCalled();
+      expect(forgetResponse(ws, sessionKey, countBefore)).toMatchObject({
+        outcome: PeerForgetOutcome.enum.error,
+        detail: 'peer forget requests are accepted from coordinators only',
+      });
+    });
+
+    it('sendPeerForgetAndWait resolves with the response, or timeout', async () => {
+      const { handler } = createTestHandler();
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+
+      const answered = handler.sendPeerForgetAndWait(
+        'remote-peer',
+        { ...request, messageId: 'f-ok' } as never,
+        5_000,
+      );
+      ws.simulateRawMessage(
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.forget.response',
+            messageId: 'f-ok',
+            outcome: PeerForgetOutcome.enum['not-found'],
+            detail: 'x',
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await answered).toMatchObject({ outcome: PeerForgetOutcome.enum['not-found'] });
+
+      const silent = handler.sendPeerForgetAndWait(
+        'remote-peer',
+        { ...request, messageId: 'f-late' } as never,
+        500,
+      );
+      await vi.advanceTimersByTimeAsync(600);
+      expect(await silent).toBe('timeout');
+      expect(
+        await handler.sendPeerForgetAndWait(
+          'nobody',
+          { ...request, messageId: 'f-none' } as never,
+          500,
+        ),
+      ).toBeNull();
+    });
+  });
+
+  describe('scaler orphans routing', () => {
+    /** The scaler orphan response among what the handler sent after `countBefore`. */
+    function orphansResponse(ws: MockPeerWs, sessionKey: Buffer, countBefore: number): any {
+      for (const msg of ws.sentMessages.slice(countBefore)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.scaler.orphans.response') return parsed;
+        } catch {
+          // ignore non-encrypted or other messages
+        }
+      }
+      return null;
+    }
+
+    const request = {
+      type: 'peer.scaler.orphans.request',
+      messageId: 'orphans-1',
+      action: ScalerOrphansAction.enum.stop,
+      vmIds: ['scaler-firecracker-1'],
+    };
+
+    // breaks-if-wrong: a coordinator-role peer's request is answered
+    it('answers a request from a coordinator through onScalerOrphansRequest', async () => {
+      const onScalerOrphansRequest = vi.fn().mockResolvedValue({
+        ok: true,
+        firecrackerScalers: ['fc'],
+        results: [
+          {
+            vmId: 'scaler-firecracker-1',
+            outcome: ScalerVmStopOutcome.enum.stopped,
+            detail: 'stopped',
+          },
+        ],
+      });
+      const { handler, registry } = createTestHandler({ onScalerOrphansRequest });
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      expect(registry.getPeer('remote-peer')?.role).toBe('coordinator');
+      const countBefore = ws.sentMessages.length;
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onScalerOrphansRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'orphans-1', vmIds: ['scaler-firecracker-1'] }),
+      );
+      expect(orphansResponse(ws, sessionKey, countBefore)).toMatchObject({
+        messageId: 'orphans-1',
+        ok: true,
+        results: [{ vmId: 'scaler-firecracker-1', outcome: ScalerVmStopOutcome.enum.stopped }],
+      });
+    });
+
+    // fails-when: a worker can drive a coordinator's stop, including by declaring
+    // itself a coordinator (or no role, which the registry reads as one)
+    it.each([['worker'], ['coordinator'], [undefined]] as const)(
+      'refuses a request from a peer holding a worker join token (declared role %s)',
+      async (declaredRole) => {
+        const onScalerOrphansRequest = vi.fn();
+        const { handler, registry } = createTestHandler({
+          onScalerOrphansRequest,
+          tokenManager: createMockTokenManager({ role: 'worker' }) as any,
+          acceptedRoles: ['coordinator', 'worker'],
+        });
+        const ws = new MockPeerWs();
+        handler.handleConnection(ws);
+        const { sessionKey } = completeEcdhHandshake(ws);
+        const authRequest = {
+          type: 'peer.auth.request',
+          instanceId: 'remote-peer',
+          protocolVersion: PROTOCOL_VERSION,
+          token: 'kici_join_v1.worker.token',
+          ...(declaredRole ? { role: declaredRole } : {}),
+        };
+        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        await vi.advanceTimersByTimeAsync(0);
+        // The registry keeps the declared role; only the token's role is authenticated.
+        expect(registry.getPeer('remote-peer')?.role).toBe(declaredRole ?? 'coordinator');
+        const countBefore = ws.sentMessages.length;
+
+        ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(onScalerOrphansRequest).not.toHaveBeenCalled();
+        expect(orphansResponse(ws, sessionKey, countBefore)).toMatchObject({
+          messageId: 'orphans-1',
+          ok: false,
+          error: 'scaler orphan requests are accepted from coordinators only',
+        });
+      },
+    );
+
+    it('answers ok=false when no handler is wired', async () => {
+      const { handler } = createTestHandler();
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const countBefore = ws.sentMessages.length;
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(orphansResponse(ws, sessionKey, countBefore)).toMatchObject({
+        ok: false,
+        error: 'scaler orphan requests are not handled by this peer',
+      });
+    });
+
+    it('answers ok=false with the message when the handler throws', async () => {
+      const onScalerOrphansRequest = vi.fn().mockRejectedValue(new Error('probe failed'));
+      const { handler } = createTestHandler({ onScalerOrphansRequest });
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const countBefore = ws.sentMessages.length;
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(orphansResponse(ws, sessionKey, countBefore)).toMatchObject({
+        ok: false,
+        error: 'probe failed',
+      });
+    });
+
+    it('sendScalerOrphansAndWait returns null when the target is not connected', async () => {
+      const { handler } = createTestHandler();
+      expect(
+        await handler.sendScalerOrphansAndWait(
+          'nonexistent-peer',
+          {
+            type: 'peer.scaler.orphans.request',
+            messageId: 'x',
+            action: ScalerOrphansAction.enum.list,
+          },
+          1_000,
+        ),
+      ).toBeNull();
+    });
+
+    it('sendScalerOrphansAndWait resolves with the matching response', async () => {
+      const { handler } = createTestHandler();
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+
+      const promise = handler.sendScalerOrphansAndWait(
+        'remote-peer',
+        {
+          type: 'peer.scaler.orphans.request',
+          messageId: 'or-1',
+          action: ScalerOrphansAction.enum.list,
+        },
+        5_000,
+      );
+      ws.simulateRawMessage(
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.scaler.orphans.response',
+            messageId: 'or-1',
+            ok: true,
+            firecrackerScalers: [],
+            vms: [],
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await promise).toMatchObject({ messageId: 'or-1', ok: true });
+    });
+
+    it('sendScalerOrphansAndWait resolves timeout when no response arrives', async () => {
+      const { handler } = createTestHandler();
+      const ws = new MockPeerWs();
+      await authenticateWithToken(handler, ws);
+
+      const promise = handler.sendScalerOrphansAndWait(
+        'remote-peer',
+        {
+          type: 'peer.scaler.orphans.request',
+          messageId: 'or-timeout',
+          action: ScalerOrphansAction.enum.list,
+        },
+        500,
+      );
+      await vi.advanceTimersByTimeAsync(600);
+
+      expect(await promise).toBe('timeout');
     });
   });
 

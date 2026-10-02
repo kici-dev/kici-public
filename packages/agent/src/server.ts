@@ -38,7 +38,6 @@ import {
   setupGracefulShutdown,
   validateRequiredTools,
   applyProxyKeepAliveTimeouts,
-  type ToolRequirement,
 } from '@kici-dev/shared';
 import type { JobDispatch, JobCancel } from '@kici-dev/engine';
 import {
@@ -55,6 +54,7 @@ import { verifyNpmAvailable } from './execution/npm-resolver.js';
 import { gcStaleAgentTmpDirs } from './execution/tmp-gc.js';
 import { issueReboot } from './execution/reboot.js';
 import { decideIdleShutdown } from './idle-shutdown.js';
+import { agentToolRequirements } from './required-tools.js';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // Workspace dep fingerprints power the SDK drift diagnostic: compare the agent's
@@ -171,11 +171,7 @@ await guardStartup(logger, async () => {
   });
 
   // 1b. Required tools startup check: verify external binaries are available.
-  const agentToolRequirements: ToolRequirement[] = [
-    { type: 'path-binary', name: 'git', reason: 'required for repository checkout' },
-    { type: 'path-binary', name: 'bash', reason: 'required for step execution' },
-  ];
-  const toolErrors = validateRequiredTools(agentToolRequirements);
+  const toolErrors = validateRequiredTools(agentToolRequirements(process.platform));
   if (toolErrors.length > 0) {
     // A job-image agent runs inside the customer's own image, so a missing tool
     // is a property of THAT image, not of the host — and the operator reading

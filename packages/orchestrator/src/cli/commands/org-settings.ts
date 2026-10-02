@@ -50,6 +50,9 @@ interface GlobalWorkflowSettings {
   rerouteSpawnWindowMs: number | null;
   rerouteAckTimeoutMs: number | null;
   rerouteMaxHops: number | null;
+  // Optional: an older orchestrator's response predates the field.
+  rerouteSpawnMaxAttempts?: number | null;
+  rerouteSpawnRetryBackoffMs?: number | null;
   backupStalenessWarnHours: number | null;
   queueTimeoutMs: number | null;
   // Optional: an older orchestrator's response predates the field.
@@ -86,6 +89,8 @@ interface PatchBody {
   rerouteSpawnWindowMs?: number | null;
   rerouteAckTimeoutMs?: number | null;
   rerouteMaxHops?: number | null;
+  rerouteSpawnMaxAttempts?: number | null;
+  rerouteSpawnRetryBackoffMs?: number | null;
   backupStalenessWarnHours?: number | null;
   queueTimeoutMs?: number | null;
   cacheUploadSettleTimeoutMs?: number | null;
@@ -146,6 +151,12 @@ function formatSettings(s: GlobalWorkflowSettings, format: string): string {
   );
   lines.push(
     `Reroute max hops:      ${s.rerouteMaxHops === null ? '(cluster default)' : `${s.rerouteMaxHops}`}`,
+  );
+  lines.push(
+    `Reroute spawn attempts:${s.rerouteSpawnMaxAttempts == null ? ' (cluster default)' : ` ${s.rerouteSpawnMaxAttempts}`}`,
+  );
+  lines.push(
+    `Reroute spawn backoff: ${s.rerouteSpawnRetryBackoffMs == null ? '(cluster default)' : `${s.rerouteSpawnRetryBackoffMs} ms`}`,
   );
   lines.push(
     `Backup staleness warn: ${s.backupStalenessWarnHours === null ? '(cluster default)' : `${s.backupStalenessWarnHours} h`}`,
@@ -412,9 +423,11 @@ function registerBackupFreshnessCommands(
  *
  * The per-org cross-peer reroute tunables: the post-ACK spawn window
  * (`reroute_spawn_window_ms`), the reroute ACK timeout
- * (`reroute_ack_timeout_ms`), and the max peer hops (`reroute_max_hops`). A
- * null (unset) value means the cluster-wide config default applies. `set`
- * flips one or more; `reset` clears all three overrides at once.
+ * (`reroute_ack_timeout_ms`), the max peer hops (`reroute_max_hops`), and the
+ * spawn-retry budget a worker applies to a rerouted job
+ * (`reroute_spawn_max_attempts`, `reroute_spawn_retry_backoff_ms`). A null
+ * (unset) value means the cluster-wide config default applies. `set` flips one
+ * or more; `reset` clears every reroute override the orchestrator reports.
  */
 function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
   const rr = orgSettings
@@ -439,13 +452,21 @@ function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApi
 
   rr.command('set')
     .description(
-      'Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops.',
+      'Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops / --spawn-max-attempts / --spawn-retry-backoff.',
     )
     .option('--customer-id <id>', 'Customer / org id (alias: --org)')
     .option('--org <id>', 'Alias for --customer-id')
     .option('--window <ms>', 'Spawn window (integer milliseconds, >= 1000)')
     .option('--ack-timeout <ms>', 'Reroute ACK timeout (integer milliseconds, >= 1000)')
     .option('--max-hops <n>', 'Maximum peer hops (integer >= 1)')
+    .option(
+      '--spawn-max-attempts <n>',
+      'Spawn attempts a worker makes for one rerouted job (integer >= 1)',
+    )
+    .option(
+      '--spawn-retry-backoff <ms>',
+      'Wait after a failed spawn before the next attempt (integer milliseconds, >= 0)',
+    )
     .option('--format <format>', 'Output format: json|table', 'table')
     .action(
       async (opts: {
@@ -454,6 +475,8 @@ function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApi
         window?: string;
         ackTimeout?: string;
         maxHops?: string;
+        spawnMaxAttempts?: string;
+        spawnRetryBackoff?: string;
         format: string;
       }) => {
         const customerId = resolveCustomerId(opts);
@@ -469,18 +492,22 @@ function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApi
     );
 
   rr.command('reset')
-    .description('Clear all per-org reroute overrides (fall back to the cluster defaults)')
+    .description('Clear every per-org reroute override (fall back to the cluster defaults)')
     .option('--customer-id <id>', 'Customer / org id (alias: --org)')
     .option('--org <id>', 'Alias for --customer-id')
     .option('--format <format>', 'Output format: json|table', 'table')
     .action(async (opts: { customerId?: string; org?: string; format: string }) => {
       const customerId = resolveCustomerId(opts);
       try {
+        const current = await fetchSettings(getClient(), customerId);
         const updated = await patchSettings(getClient(), {
           customerId,
           rerouteSpawnWindowMs: null,
           rerouteAckTimeoutMs: null,
           rerouteMaxHops: null,
+          // An older orchestrator's strict PATCH schema rejects a field it does not project.
+          ...('rerouteSpawnMaxAttempts' in current && { rerouteSpawnMaxAttempts: null }),
+          ...('rerouteSpawnRetryBackoffMs' in current && { rerouteSpawnRetryBackoffMs: null }),
         });
         console.log(formatSettings(updated, opts.format));
       } catch (err) {
@@ -493,7 +520,13 @@ function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApi
 /** Validate `reroute set` flags and assemble the PATCH body (exits on bad input). */
 function buildReroutePatch(
   customerId: string,
-  opts: { window?: string; ackTimeout?: string; maxHops?: string },
+  opts: {
+    window?: string;
+    ackTimeout?: string;
+    maxHops?: string;
+    spawnMaxAttempts?: string;
+    spawnRetryBackoff?: string;
+  },
 ): PatchBody {
   const patch: PatchBody = { customerId };
   if (opts.window !== undefined) {
@@ -505,12 +538,20 @@ function buildReroutePatch(
   if (opts.maxHops !== undefined) {
     patch.rerouteMaxHops = parseIntFlag(opts.maxHops, 1, 'max-hops');
   }
-  if (
-    patch.rerouteSpawnWindowMs === undefined &&
-    patch.rerouteAckTimeoutMs === undefined &&
-    patch.rerouteMaxHops === undefined
-  ) {
-    console.error('Error: pass at least one of --window / --ack-timeout / --max-hops');
+  if (opts.spawnMaxAttempts !== undefined) {
+    patch.rerouteSpawnMaxAttempts = parseIntFlag(opts.spawnMaxAttempts, 1, 'spawn-max-attempts');
+  }
+  if (opts.spawnRetryBackoff !== undefined) {
+    patch.rerouteSpawnRetryBackoffMs = parseIntFlag(
+      opts.spawnRetryBackoff,
+      0,
+      'spawn-retry-backoff (milliseconds)',
+    );
+  }
+  if (Object.keys(patch).length === 1) {
+    console.error(
+      'Error: pass at least one of --window / --ack-timeout / --max-hops / --spawn-max-attempts / --spawn-retry-backoff',
+    );
     process.exit(1);
   }
   return patch;

@@ -297,6 +297,9 @@ The orchestrator secrets admin API uses a fixed three-role model (defined in `pa
 | orchestrator.drain     | Y     | Y     | -       |
 | ci_trust.read          | Y     | Y     | -       |
 | ci_trust.admin         | Y     | Y     | -       |
+| scaler.read            | Y     | Y     | Y       |
+| scaler.manage          | Y     | Y     | -       |
+| peer.manage            | Y     | Y     | -       |
 
 ### Token authentication
 

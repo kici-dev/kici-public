@@ -46,6 +46,54 @@ If the database is briefly unreachable, the orchestrator keeps using the
 built-in defaults rather than blocking, so a settings read never stalls a hot
 path.
 
+## Confirm a change reached every orchestrator
+
+`kici-admin cluster-settings show` ends with a propagation section. It lists
+each coordinator and each worker that the coordinator you ask knows about, with
+the settings version that orchestrator applied:
+
+```text
+Propagation (current version 42, as seen by coord-a):
+  coord-a  coordinator  v42     in sync  this coordinator
+  coord-b  coordinator  v42     in sync  heartbeat 4s ago
+  arm-1    worker       v41     BEHIND   heartbeat 12s ago
+  mac-1    worker       v40     BEHIND   disconnected, last heartbeat 2h 0m ago
+2 of 4 orchestrators are not on the current version.
+```
+
+Every change to a cluster setting increases the current version. A coordinator
+reads the settings from the database. A worker has no database, so it gets the
+settings from a coordinator after a coordinator reports a newer version. The
+version of a worker is the version that its next spawn uses.
+
+- `BEHIND` — the orchestrator has not applied the newest change yet. A
+  coordinator reads the row again about every 10 seconds. A worker usually
+  applies a change within two minutes at the default
+  `KICI_CLUSTER_PEER_HEARTBEAT_INTERVAL_MS` of 30 seconds.
+- `AHEAD` — the orchestrator has a higher version than the database. This
+  occurs when the version of the settings row went back, for example after the
+  row was deleted or the database was restored from a backup. A worker in this
+  state does not get new settings. Restart the worker.
+- `disconnected` — the coordinator lost the connection to this orchestrator.
+  The row shows the last version it reported and the time of its last
+  heartbeat.
+
+The list shows only the orchestrators that are connected to the coordinator you
+ask. A worker connects to every coordinator in its
+`KICI_CLUSTER_COORDINATOR_URLS` list (or to the one
+`KICI_CLUSTER_COORDINATOR_URL`). The version does not show the cache-sizing
+knobs, which apply only at the next restart.
+
+`--format json` adds a `propagation` object with the same data:
+`propagation.currentVersion`, `reportedBy` (the coordinator that answered),
+`generatedAt` and `orchestrators`. Each entry in
+`propagation.orchestrators` has `instanceId`, `role`, `self`, `connected`,
+`appliedVersion`, `status` (`in-sync`, `behind` or `ahead`), `lastHeartbeatAt`
+and `lastHeartbeatAgeMs`. All other keys of the output do not change.
+
+An orchestrator that does not report propagation answers `show` with the
+settings only. `show` then writes a note to standard error and exits with 0.
+
 ## Available cluster-wide tunables
 
 | Knob (`--flag`)                                     | Default | Unit         | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -68,7 +116,7 @@ path.
 | `--provenance-retention-days`                       | 365     | days         | Retention window for `attestations` and `pending_attestations` rows. `0` disables the pruning.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `--held-run-retention-days`                         | 90      | days         | Retention window for **terminal** `held_runs` rows only. A pending hold is never pruned, whatever its age. `0` disables the pruning.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `--concurrency-wait-timeout-ms`                     | 1 h     | milliseconds | How long an agent waits for a busy concurrency slot to free before abandoning the wait. Pushed to the agent on each job dispatch.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `--agent-token-ttl-ms`                              | 1 h     | milliseconds | Lifetime of the ephemeral agent token minted when the orchestrator spawns an agent. Honored on both tiers: the leader resolves it live at spawn, and DB-less workers pull the value from the leader over the peer channel.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `--agent-token-ttl-ms`                              | 1 h     | milliseconds | Lifetime of the ephemeral agent token minted when the orchestrator spawns an agent. Honored on both tiers: coordinators read it live at spawn, and DB-less workers pull the value from a coordinator over the peer channel.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `--ownership-db-check-timeout-ms`                   | 5 s     | milliseconds | Deadline for one database lookup resolving whether an agent owns the job named in the message it just sent. Past the deadline the lookup is undecided: the message is refused, but no ownership violation is counted against the agent, so a slow database cannot disconnect the fleet.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `--sealed-secrets-retry-backoff-ms`                 | 1 min   | milliseconds | How long a coordinator stops offering a queued job it put back because it could not open the job's secrets, which were encrypted with a master key it does not hold. During a rolling [master-key rotation](../security/secrets.md#rotation-procedure), a coordinator that holds the key can take the job in that window. After it, this coordinator offers the job again; each claim it makes spends another dispatch attempt.                                                                                                                                                                                                                                                                                                                                                                                |
 | `--dashboard-verified-issuer`                       | unset   | http(s) URL  | Origin the web UI fetches your orchestrator's encryption key from directly for [encrypted dashboard writes](../security/encrypted-dashboard-writes.md). When it is unset, the Verified tier is not offered. Setting a build-attestation issuer (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`) does not enable the tier, and the tier does not require one — the encryption key is published either way. `set` probes the origin's JWKS afterwards and warns (without failing) when no encryption key is published there.                                                                                                                                                                                                                                                                                              |
@@ -92,6 +140,7 @@ path.
 | `--scaler-provision-backoff-base-ms`                | 30 s    | milliseconds | How long an event scaler is deferred after one provisioning failure. Each further consecutive failure doubles it, up to the ceiling below. Any successful registration clears the count. The state is per scaler name, so one failing scaler never defers another. Read when a failure is recorded, so a new value sizes the next deferral and one already running keeps its length. Floor: 1 s. See [when external provisioning fails](./event-scaler.md#when-external-provisioning-fails).                                                                                                                                                                                                                                                                                                                   |
 | `--scaler-provision-backoff-max-ms`                 | 15 min  | milliseconds | Ceiling on the doubling above, so a long provider outage settles into a steady retry cadence instead of growing without bound. Raise it for a provider whose outages last hours. Past ~25 minutes, widen the `ExternalProvisioningFailing` window in the monitoring pack with it, or that rule can go quiet during the outage. Read when a failure is recorded, so a new value caps the next deferral and one already running keeps its length. Floor: 1 s, and never below `--scaler-provision-backoff-base-ms`. A ceiling under the base is rejected, because it would hold every deferral at the ceiling from the first failure.                                                                                                                                                                            |
 | `--scaler-provision-max-consecutive-failures`       | 5       | count        | The consecutive-failure count at which a scaler's refusals name repeated failure as the cause, and the orchestrator logs that provisioning is failing consistently. At the default, the fifth failure in a row is the one that names it. Read per spawn request. Floor: 1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `--firecracker-api-socket-wait-ms`                  | 30 s    | milliseconds | How long a Firecracker spawn waits for the VM's API socket after the jailer starts. When the socket does not appear in time, the spawn fails with `Firecracker API socket not ready within <N> ms`. On a host whose disk is busy with writes, the jailer's copy of the firecracker binary into the chroot can take several seconds; raise this value there. Read per spawn: coordinators read it directly, and DB-less workers receive it from a coordinator with the other worker settings. Floor: 1 s.                                                                                                                                                                                                                                                                                                       |
 
 ### Cache knobs apply at the next restart
 

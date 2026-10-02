@@ -94,7 +94,12 @@ describe('deployStep', () => {
 | `$`        | Inject a fake shell for pure-logic tests that must not actually run commands.         |
 | `log`      | Replace the default console logger (e.g. a spy).                                      |
 
-Every other `StepContext` member (`cache`, `kici`, `artifacts`, `attestProvenance`, …) has a safe default and can be overridden the same way. The returned handle exposes `ctx` (pass to your step), `emitCalls` (assert emitted events), and `dispose()` (call in `afterEach` to clean up seeded secret state and restore any `process.env` variables the step set via `setEnv` / `addPath`).
+Every other `StepContext` member (`cache`, `kici`, `artifacts`, `attestProvenance`, …) has a safe default and can be overridden the same way. The returned handle exposes:
+
+- `ctx` — pass it to your step.
+- `emitCalls` — assert the emitted events.
+- `tempScope` — the allocator behind `ctx.mktemp` / `ctx.mktempFile`. Call `tempScope.disposeAll()` to remove every live temp path early.
+- `dispose()` — call it in `afterEach`. It cleans up seeded secret state and restores any `process.env` variables the step set via `setEnv` / `addPath`.
 
 Orchestrator-backed APIs — `ctx.kici.*`, `ctx.artifacts.*`, `ctx.attestProvenance(...)` — reject by default (there is no orchestrator in a unit test); override them with a stub if your step calls them.
 
@@ -161,7 +166,7 @@ export const pushMain = fixture('push-main', {
 
 // PR event
 export const prOpen = fixture('pr-open', {
-  event: pr({ branches: ['main'], actions: ['opened'] }),
+  event: pr({ target: 'main', events: ['opened'] }),
 });
 
 // Comment event
@@ -171,7 +176,7 @@ export const prComment = fixture('pr-comment', {
 
 // Tag event
 export const tagRelease = fixture('tag-release', {
-  event: tag({ tags: ['v*'] }),
+  event: tag({ patterns: ['v*'] }),
 });
 
 // Release event

@@ -1,13 +1,21 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Command } from 'commander';
 import {
+  PROPAGATION_UNSUPPORTED_NOTE,
   buildClusterPatch,
   buildClusterReset,
   checkVerifiedIssuerPublishes,
+  fetchPropagation,
+  formatPropagation,
   registerClusterSettingsCommands,
+  renderShow,
   unpairedEvalTimeoutWarnings,
 } from './cluster-settings.js';
 import type { AdminApiClient } from '../api-client.js';
+import {
+  SettingsPropagationStatus as Status,
+  type SettingsPropagationReport,
+} from '../../cluster/settings-propagation.js';
 
 describe('buildClusterPatch', () => {
   it('maps kebab flags to camelCase fields and parses integers', () => {
@@ -210,10 +218,11 @@ describe('buildClusterReset', () => {
     expect(patch.auditRetentionDays).toBeNull();
     expect(patch.provenanceRetentionDays).toBeNull();
     expect(patch.heldRunRetentionDays).toBeNull();
+    expect(patch.firecrackerApiSocketWaitMs).toBeNull();
     // Count guard: a knob added to KNOBS/STRING_KNOBS/BOOLEAN_KNOBS without a
     // reset path (or vice versa) shows up here rather than as a knob an operator
     // cannot clear.
-    expect(Object.keys(patch)).toHaveLength(42);
+    expect(Object.keys(patch)).toHaveLength(43);
   });
 
   it('clears only the check-run tracking TTL when that flag is given', () => {
@@ -344,5 +353,156 @@ describe('checkVerifiedIssuerPublishes', () => {
     })) as unknown as typeof fetch;
     const res = await checkVerifiedIssuerPublishes('https://orch.example.com', badJson);
     expect(res.ok).toBe(false);
+  });
+});
+
+const REPORT: SettingsPropagationReport = {
+  currentVersion: 42,
+  reportedBy: 'coord-a',
+  generatedAt: '2026-10-01T12:00:00.000Z',
+  orchestrators: [
+    {
+      instanceId: 'coord-a',
+      role: 'coordinator',
+      self: true,
+      connected: true,
+      appliedVersion: 42,
+      status: Status['in-sync'],
+      lastHeartbeatAt: null,
+      lastHeartbeatAgeMs: null,
+    },
+    {
+      instanceId: 'arm-1',
+      role: 'worker',
+      self: false,
+      connected: true,
+      appliedVersion: 41,
+      status: Status.behind,
+      lastHeartbeatAt: '2026-10-01T11:59:48.000Z',
+      lastHeartbeatAgeMs: 12_000,
+    },
+    {
+      instanceId: 'mac-1',
+      role: 'worker',
+      self: false,
+      connected: false,
+      appliedVersion: 40,
+      status: Status.behind,
+      lastHeartbeatAt: '2026-10-01T10:00:00.000Z',
+      lastHeartbeatAgeMs: 7_200_000,
+    },
+  ],
+};
+const SETTINGS = { queueMaxDepth: 500, firecrackerApiSocketWaitMs: null };
+
+describe('show: propagation', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // breaks-if-wrong: scripts read knob keys at the top level of `show --format json`
+  it('keeps every settings key top-level and adds one propagation key', () => {
+    const { stdout, stderr } = renderShow(SETTINGS, { kind: 'ok', report: REPORT }, 'json');
+    expect(JSON.parse(stdout)).toEqual({ ...SETTINGS, propagation: REPORT });
+    expect(stderr).toBeNull();
+  });
+
+  // fails-when: a newer CLI against an older orchestrator loses the settings output
+  it('prints the settings alone and a note when the orchestrator predates the route', () => {
+    const { stdout, stderr } = renderShow(SETTINGS, { kind: 'unsupported' }, 'json');
+    expect(JSON.parse(stdout)).toEqual(SETTINGS);
+    expect(stderr).toBe(PROPAGATION_UNSUPPORTED_NOTE);
+  });
+
+  it('prints the settings alone and a warning when the report fails', () => {
+    const { stdout, stderr } = renderShow(
+      SETTINGS,
+      { kind: 'error', reason: 'HTTP 500: boom' },
+      'json',
+    );
+    expect(JSON.parse(stdout)).toEqual(SETTINGS);
+    expect(stderr).toBe('Warning: could not read cluster-settings propagation: HTTP 500: boom');
+  });
+
+  it('appends the propagation section to the table, and only the table when it is missing', () => {
+    const ok = renderShow(SETTINGS, { kind: 'ok', report: REPORT }, 'table').stdout;
+    expect(ok).toContain('Queue max depth');
+    expect(ok).toContain('\n\nPropagation (current version 42, as seen by coord-a):');
+    const missing = renderShow(SETTINGS, { kind: 'unsupported' }, 'table');
+    expect(missing.stdout).not.toContain('Propagation');
+    expect(missing.stderr).toBe(PROPAGATION_UNSUPPORTED_NOTE);
+  });
+
+  it('maps a 404 to unsupported, other errors and malformed bodies to error', async () => {
+    const get = vi.fn();
+    const client = { get } as unknown as AdminApiClient;
+    get.mockRejectedValueOnce(new Error('HTTP 404: Not Found'));
+    expect(await fetchPropagation(client)).toEqual({ kind: 'unsupported' });
+    get.mockRejectedValueOnce(new Error('HTTP 500: boom'));
+    expect(await fetchPropagation(client)).toEqual({ kind: 'error', reason: 'HTTP 500: boom' });
+    get.mockResolvedValueOnce({ propagation: { currentVersion: 1 } });
+    expect((await fetchPropagation(client)).kind).toBe('error');
+    get.mockResolvedValueOnce({ propagation: REPORT });
+    expect(await fetchPropagation(client)).toEqual({ kind: 'ok', report: REPORT });
+    expect(get).toHaveBeenCalledWith('/api/v1/admin/cluster-settings/propagation');
+  });
+
+  // fails-when: a lagging or disconnected orchestrator is not visibly flagged
+  it('flags lagging and disconnected orchestrators in the table', () => {
+    const out = formatPropagation(REPORT);
+    expect(out).toContain('Propagation (current version 42, as seen by coord-a):');
+    expect(out).toMatch(/coord-a\s+coordinator\s+v42\s+in sync\s+this coordinator/);
+    expect(out).toMatch(/arm-1\s+worker\s+v41\s+BEHIND\s+heartbeat 12s ago/);
+    expect(out).toMatch(/mac-1\s+worker\s+v40\s+BEHIND\s+disconnected, last heartbeat 2h 0m ago/);
+    expect(out).toContain('2 of 3 orchestrators are not on the current version.');
+  });
+
+  it('flags an orchestrator ahead of the row', () => {
+    const ahead = {
+      ...REPORT,
+      orchestrators: [{ ...REPORT.orchestrators[1]!, appliedVersion: 43, status: Status.ahead }],
+    };
+    expect(formatPropagation(ahead)).toMatch(/arm-1\s+worker\s+v43\s+AHEAD/);
+  });
+
+  // breaks-if-wrong: an all-current cluster is not reported as lagging
+  it('says so when every orchestrator runs the current version', () => {
+    const inSync = { ...REPORT, orchestrators: [REPORT.orchestrators[0]!] };
+    expect(formatPropagation(inSync)).toContain('All 1 orchestrators run the current version.');
+  });
+
+  // breaks-if-wrong: a failed settings read still exits 1 and asks for nothing else
+  it('exits 1 on a settings failure without requesting propagation', async () => {
+    vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('exit');
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const get = vi.fn().mockRejectedValue(new Error('HTTP 503: down'));
+    const program = new Command();
+    program.exitOverride();
+    registerClusterSettingsCommands(program, () => ({ get }) as unknown as AdminApiClient);
+    await expect(
+      program.parseAsync(['cluster-settings', 'show'], { from: 'user' }),
+    ).rejects.toThrow('exit');
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it('prints the settings and exits 0 when the propagation route is missing', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('exit');
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ settings: SETTINGS })
+      .mockRejectedValueOnce(new Error('HTTP 404: Not Found'));
+    const program = new Command();
+    program.exitOverride();
+    registerClusterSettingsCommands(program, () => ({ get }) as unknown as AdminApiClient);
+    await program.parseAsync(['cluster-settings', 'show', '--format', 'json'], { from: 'user' });
+    expect(exit).not.toHaveBeenCalled();
+    expect(JSON.parse(log.mock.calls[0]![0] as string)).toEqual(SETTINGS);
+    expect(err).toHaveBeenCalledWith(PROPAGATION_UNSUPPORTED_NOTE);
   });
 });

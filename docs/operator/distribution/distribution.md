@@ -270,7 +270,7 @@ Used by the **bare-metal scaler**. The agent is installed on the host machine an
 npm install -g kici-admin
 ```
 
-The host must have git, a shell (bash on Linux/macOS, pwsh on Windows), node, and npm available. The bare-metal scaler starts agent processes directly, passing job configuration via environment variables.
+The host must have git, a shell (bash on Linux/macOS, pwsh on Windows), node, and npm available. The bare-metal scaler starts agent processes directly, passing job configuration via environment variables. On Windows, npm installs the binary as a `kici-agent.cmd` launcher in its global folder (`npm prefix -g`). Set the scaler's `binaryPath` to that file.
 
 ### Firecracker rootfs
 

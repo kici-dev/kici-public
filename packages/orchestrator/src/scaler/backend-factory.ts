@@ -48,7 +48,12 @@ export interface BackendFactoryContext {
   tokenTtlMs?: number;
   /** Live per-spawn resolver for the fleet-wide agent-token TTL. */
   tokenTtlProvider: () => Promise<number>;
-  /** DB-backed on the leader, in-memory on the worker. */
+  /**
+   * Live per-spawn resolver for the fleet-wide Firecracker API-socket wait.
+   * A coordinator reads `cluster_settings`; a worker reads its pulled snapshot.
+   */
+  firecrackerApiSocketWaitMsProvider: () => Promise<number>;
+  /** DB-backed on a coordinator, in-memory on a worker. */
   ipAllocator: (params: IpAllocatorParams) => IpAllocator;
   /**
    * The already-constructed scaler state store. The event backend's claim
@@ -160,6 +165,7 @@ export async function createScalerBackend(
       autoProvisionHost: fcNet?.autoProvisionHost ?? true,
       // Rootless hosts reach `ip` / `chown` / `chmod` / `nft` through `sudo -n`.
       requireSudo: s.requireSudo,
+      apiSocketWaitMsProvider: ctx.firecrackerApiSocketWaitMsProvider,
       ...shared,
     });
   }

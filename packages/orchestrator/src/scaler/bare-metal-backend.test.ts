@@ -53,6 +53,7 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
 const { BareMetalScalerBackend } = await import('./bare-metal-backend.js');
 const { createLogger } = await import('@kici-dev/shared');
 const childProcessModule = await import('node:child_process');
+const { DeterministicSpawnError } = await import('./spawn-errors.js');
 
 const defaultLabelSets: LabelSetConfig[] = [
   {
@@ -662,6 +663,14 @@ describe('BareMetalScalerBackend', () => {
       expect(result.valid).toBe(true);
     });
 
+    it('accepts a path with cmd.exe syntax on a Linux host', () => {
+      // breaks-if-wrong: the Windows-only refusal reaches a Linux host
+      const backend = createBackend();
+      expect(
+        backend.reload([{ labels: ['linux', 'bare-metal'], binaryPath: '/opt/a&b/kici-agent' }]),
+      ).toEqual({ valid: true });
+    });
+
     it('updates label sets on successful reload', () => {
       const backend = createBackend();
       const newLabelSets: LabelSetConfig[] = [
@@ -703,6 +712,65 @@ describe('BareMetalScalerBackend', () => {
     it('returns "bare-metal"', () => {
       const backend = createBackend();
       expect(backend.type).toBe('bare-metal');
+    });
+  });
+
+  describe('agent process exits before it registers', () => {
+    async function spawnWithEvents(agentId: string) {
+      const events: Array<{ eventType: string; detail: string }> = [];
+      const backend = createBackend();
+      await backend.spawn(['linux', 'bare-metal'], agentId, 'ws://localhost:4000/ws', (e) =>
+        events.push({ eventType: e.eventType, detail: e.detail }),
+      );
+      const failed = () =>
+        events.filter((e) => e.eventType === ScalerEventType.enum['scaler.failed']);
+      return { backend, failed };
+    }
+
+    function exitAfterWriting(line: string, code: number) {
+      mockChildProcess.stderr.write(`${line}\n`);
+      mockChildProcess.exitCode = code;
+      mockChildProcess.emit('exit', code, null);
+      mockChildProcess.stdout.end();
+      mockChildProcess.stderr.end();
+      mockChildProcess.emit('close', code, null);
+    }
+
+    it('reports scaler.failed with the exit code and the last output', async () => {
+      // fails-when: an exit before registering is only cleaned up — no scaler.failed,
+      // so the job never learns why and the slot waits for the stale-spawn prune.
+      const { backend, failed } = await spawnWithEvents('agent-exit-early');
+      exitAfterWriting('Fatal startup error: required-tools validation failed', 1);
+
+      await vi.waitFor(() => expect(failed()).toHaveLength(1));
+      expect(failed()[0]!.detail).toContain(
+        'agent process exited with code 1 before it registered',
+      );
+      expect(failed()[0]!.detail).toContain('required-tools validation failed');
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('reports nothing for an agent that registered first', async () => {
+      // breaks-if-wrong: an agent that registered and later exits is reported as a failed spawn
+      const { backend, failed } = await spawnWithEvents('agent-registered');
+      backend.markRegistered('agent-registered');
+      exitAfterWriting('shutting down', 0);
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(failed()).toHaveLength(0);
+    });
+
+    it('reports nothing for an agent destroy() stops', async () => {
+      // breaks-if-wrong: a teardown the scaler asked for is reported as a failed spawn
+      const { backend, failed } = await spawnWithEvents('agent-destroyed');
+      killSpy.mockImplementation(() => {
+        exitAfterWriting('terminated', 143);
+        return true;
+      });
+
+      await backend.destroy('agent-destroyed');
+      await new Promise((r) => setTimeout(r, 20));
+      expect(failed()).toHaveLength(0);
     });
   });
 
@@ -860,6 +928,142 @@ describe('BareMetalScalerBackend', () => {
       );
       expect(reqs.some((r) => r.type === 'path-binary' && r.name === 'node')).toBe(true);
       expect(reqs.some((r) => r.type === 'path-binary' && r.name === 'bwrap')).toBe(true);
+    });
+  });
+
+  describe('on a Windows host', () => {
+    let originalPlatform: PropertyDescriptor | undefined;
+    const savedEnv = { COMSPEC: process.env.COMSPEC, SystemRoot: process.env.SystemRoot };
+    const WIN_SETS: LabelSetConfig[] = [
+      { labels: ['windows', 'bare-metal'], binaryPath: 'C:\\kici\\agent\\kici-agent.cmd' },
+    ];
+    type ExecFileCb = (err: Error | null, stdout?: string, stderr?: string) => void;
+    const execFileMock = () =>
+      vi.mocked(childProcessModule.execFile) as unknown as {
+        mockImplementationOnce: (
+          fn: (f: string, a: string[], o: unknown, cb: ExecFileCb) => unknown,
+        ) => void;
+      };
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      process.env.COMSPEC = 'C:\\Windows\\system32\\cmd.exe';
+      process.env.SystemRoot = 'C:\\Windows';
+    });
+
+    afterEach(() => {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    it('starts a .cmd launcher through cmd.exe without a console window', async () => {
+      const backend = createBackend({ labelSets: WIN_SETS });
+      await backend.spawn(['windows', 'bare-metal'], 'agent-w1', 'ws://localhost:4000/ws');
+
+      expect(childProcessModule.spawn).toHaveBeenCalledWith(
+        'C:\\Windows\\system32\\cmd.exe',
+        ['/d', '/e:on', '/v:off', '/c', 'call', 'C:\\kici\\agent\\kici-agent.cmd', '<NUL'],
+        expect.objectContaining({
+          // Not detached: a detached cmd.exe has no console, and the agent it
+          // starts would write to a hidden console instead of the pipes.
+          detached: false,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }),
+      );
+    });
+
+    it('reports a launch the host refuses and rejects with DeterministicSpawnError', async () => {
+      // fails-when: the synchronous throw escapes uncaught — no scaler.failed, a plain Error
+      vi.mocked(childProcessModule.spawn).mockImplementationOnce(() => {
+        throw Object.assign(new Error('spawn EINVAL'), { code: 'EINVAL', syscall: 'spawn' });
+      });
+      const events: Array<{ eventType: string; detail: string }> = [];
+      const backend = createBackend({ labelSets: WIN_SETS });
+
+      await expect(
+        backend.spawn(['windows', 'bare-metal'], 'agent-w2', 'ws://x', (e) =>
+          events.push({ eventType: e.eventType, detail: e.detail }),
+        ),
+      ).rejects.toBeInstanceOf(DeterministicSpawnError);
+
+      const failed = events.filter((e) => e.eventType === ScalerEventType.enum['scaler.failed']);
+      expect(failed).toHaveLength(1);
+      expect(failed[0]!.detail).toContain('spawn EINVAL');
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('ends the agent process tree with taskkill', async () => {
+      const backend = createBackend({ labelSets: WIN_SETS });
+      await backend.spawn(['windows', 'bare-metal'], 'agent-w3', 'ws://x');
+      execFileMock().mockImplementationOnce((_f, _a, _o, cb) => {
+        mockChildProcess.exitCode = 1;
+        mockChildProcess.emit('exit', 1, null);
+        cb(null, '', '');
+        return new EventEmitter();
+      });
+
+      await backend.destroy('agent-w3');
+
+      expect(childProcessModule.execFile).toHaveBeenCalledWith(
+        'C:\\Windows\\System32\\taskkill.exe',
+        ['/T', '/F', '/PID', '12345'],
+        expect.objectContaining({ windowsHide: true }),
+        expect.any(Function),
+      );
+      // fails-when: destroy keeps process.kill(-pid), which Windows answers with ESRCH
+      expect(killSpy).not.toHaveBeenCalled();
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('treats taskkill exit 128 (the tree already exited) as done', async () => {
+      const backend = createBackend({ labelSets: WIN_SETS });
+      await backend.spawn(['windows', 'bare-metal'], 'agent-w4', 'ws://x');
+      execFileMock().mockImplementationOnce((_f, _a, _o, cb) => {
+        mockChildProcess.exitCode = 0;
+        cb(Object.assign(new Error('Command failed'), { code: 128 }), '', 'ERROR: not found.');
+        return new EventEmitter();
+      });
+
+      await expect(backend.destroy('agent-w4')).resolves.toBeUndefined();
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('rejects when taskkill fails for another reason', async () => {
+      const backend = createBackend({ labelSets: WIN_SETS });
+      await backend.spawn(['windows', 'bare-metal'], 'agent-w5', 'ws://x');
+      execFileMock().mockImplementationOnce((_f, _a, _o, cb) => {
+        cb(Object.assign(new Error('Command failed'), { code: 1 }), '', 'Access is denied.');
+        return new EventEmitter();
+      });
+
+      await expect(backend.destroy('agent-w5')).rejects.toThrow(
+        'taskkill /T /F /PID 12345 failed (exit 1): Access is denied.',
+      );
+    });
+
+    it('runs no taskkill once the child has exited (its pid may be reused)', async () => {
+      const backend = createBackend({ labelSets: WIN_SETS });
+      await backend.spawn(['windows', 'bare-metal'], 'agent-w6', 'ws://x');
+      mockChildProcess.exitCode = 0;
+
+      await backend.destroy('agent-w6');
+
+      expect(childProcessModule.execFile).not.toHaveBeenCalled();
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('reload refuses a batch path cmd.exe would read as syntax', () => {
+      const backend = createBackend({ labelSets: WIN_SETS });
+      const result = backend.reload([
+        { labels: ['windows', 'bare-metal'], binaryPath: 'C:\\a&b\\kici-agent.cmd' },
+      ]);
+      expect(result.valid).toBe(false);
+      if (!result.valid) expect(result.errors[0]).toContain('it contains "&"');
     });
   });
 });

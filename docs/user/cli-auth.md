@@ -54,7 +54,7 @@ This:
 
 1. Revokes the PAT on the server (preventing further use)
 2. Detaches the local dev plane if it is attached, so a logged-out user is not left with a hybrid plane holding an orphaned orchestrator key
-3. Clears the auth fields from the local config file — the PAT, its id and expiry, your email, and the active organization
+3. Clears the auth fields from the local config file — the PAT, its id and expiry, the API key from a `--token` login, your email, and the active organization
 4. Preserves the connection settings (per-org default clusters, Platform endpoint, orchestrator endpoint, OIDC issuer, routing key)
 
 Server revocation is best-effort: if the network call fails, the local config is still cleared.
@@ -142,11 +142,7 @@ The Platform exposes a versioned REST API under `/api/v1/*`. The same endpoints 
 
 ### Base URL
 
-| Deployment  | Base URL pattern                                                          |
-| ----------- | ------------------------------------------------------------------------- |
-| KiCI Cloud  | `https://<your-platform-host>/api/v1/`                                    |
-| Self-hosted | `https://<orchestrator-host>/<deployment-slug>/api/v1/` (slug is optional |
-|             | — `KICI_BASE_PATH` may add a prefix when the Platform is reverse-proxied) |
+The hosted KiCI Platform serves the API at `https://api.kici.dev/api/v1/`. The dashboard at `app.kici.dev` calls this host too. If you log in against another KiCI environment (`--platform-endpoint` or `KICI_PLATFORM_URL`), use that endpoint as the base instead.
 
 `/api/v1/*` requires authentication (see below). `/health`, `/metrics`, and `/ws` (WebSocket) sit outside that prefix and have their own access posture (`/metrics` is meant for Prometheus scrape, not public exposure).
 
@@ -187,16 +183,16 @@ The full route tree is the source of truth — every method, request schema, and
 
 ### Calling the API
 
-Two short examples — adapt the base URL and token to your deployment.
+Two short examples — replace the token and organization id with your own.
 
 **curl (PAT or API key):**
 
 ```bash
-TOKEN="$(grep -E '^pat=' ~/.kici/config | cut -d= -f2)"   # or paste a kici_sk_…
+TOKEN="$(jq -r .pat ~/.kici/config)"   # the config file is JSON; or paste a kici_sk_…
 ORG="<your-org-id>"
 curl -sS \
   -H "Authorization: Bearer $TOKEN" \
-  "https://<orchestrator-host>/<deployment-slug>/api/v1/orgs/$ORG/runs?limit=5" | jq
+  "https://api.kici.dev/api/v1/orgs/$ORG/runs?limit=5" | jq
 ```
 
 **Browser console (after dashboard login):**
@@ -209,7 +205,7 @@ renewal or sign-out.
 ```js
 // kici pat create --name console --expires-in-days 1   → prints the token
 const token = 'kici_pat_...';
-const res = await fetch('/<deployment-slug>/api/v1/orgs/<your-org-id>/runs?limit=5', {
+const res = await fetch('https://api.kici.dev/api/v1/orgs/<your-org-id>/runs?limit=5', {
   headers: { Authorization: `Bearer ${token}` },
 });
 console.log(await res.json());
@@ -217,7 +213,13 @@ console.log(await res.json());
 
 ### Rate limits and body size
 
-There is currently no per-token rate limit on `/api/v1/*`. A single global body-size cap applies to webhook ingress and dashboard API requests alike.
+There is no rate limit per token. Some route groups have a protective limit per organization and per user, and answer **429** with a `Retry-After` header when you go over it:
+
+- The run read routes (`/orgs/:customerId/runs…`).
+- The metric query routes, at 60 requests a minute.
+- Issue-report uploads (`kici report --upload`), at 10 a minute.
+
+A single global body-size cap applies to webhook ingress and dashboard API requests alike.
 
 ### Audit trail
 

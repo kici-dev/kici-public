@@ -176,6 +176,33 @@ describe('traceId/spanId enrichment', () => {
   });
 });
 
+describe('explicit fields over the ambient request context', () => {
+  it('keeps a runId the call site passed over the ambient context', async () => {
+    // fails-when: the trace format overwrites call-site fields (a prune running
+    // inside another job's request logged that request's run as the failed one)
+    const { logger, getLastLine } = createCaptureLogger();
+    await requestContext.run({ requestId: 'req-1', runId: 'ambient-run' }, async () => {
+      logger.warn('explicit', { runId: 'bound-run', jobId: null });
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    const output = getLastLine();
+    expect(output!.runId).toBe('bound-run');
+    expect(output!.jobId).toBeNull();
+    expect(output!.requestId).toBe('req-1');
+  });
+
+  it('still adds the ambient runId when the call site passed none', async () => {
+    // breaks-if-wrong: every line without explicit ids must keep its trace fields
+    const { logger, getLastLine } = createCaptureLogger();
+    await requestContext.run({ requestId: 'req-2', runId: 'ambient-run' }, async () => {
+      logger.info('implicit');
+      logger.info('explicit undefined', { runId: undefined });
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(getLastLine()!.runId).toBe('ambient-run');
+  });
+});
+
 describe('file rotation transport', () => {
   it('adds file rotation transport when KICI_LOG_DIR is set', () => {
     const origLogDir = process.env.KICI_LOG_DIR;
@@ -518,6 +545,30 @@ describe('flushLogFiles', () => {
       await flushLogFiles();
 
       expect(fileContent(tmp.path)).toContain('last line before exit');
+    } finally {
+      if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
+      else process.env.KICI_LOG_DIR = origLogDir;
+      await tmp.cleanup();
+    }
+  });
+
+  // fails-when: the rotated file's format overwrites a call-site runId with the
+  // ambient one (the file log is what a host-side shipper reads)
+  it('keeps a call-site runId in the rotated file', async () => {
+    const tmp = await makeTempDir('flush-test');
+    const origLogDir = process.env.KICI_LOG_DIR;
+    try {
+      process.env.KICI_LOG_DIR = tmp.path;
+      setServiceName('orchestrator');
+      const log = createLogger({ json: true });
+      requestContext.run({ requestId: 'req-f', runId: 'ambient-run' }, () => {
+        log.warn('file precedence', { runId: 'bound-run' });
+      });
+      await flushLogFiles();
+      const line = fileContent(tmp.path)
+        .split('\n')
+        .find((l) => l.includes('file precedence'));
+      expect(JSON.parse(line!)).toMatchObject({ runId: 'bound-run', requestId: 'req-f' });
     } finally {
       if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
       else process.env.KICI_LOG_DIR = origLogDir;

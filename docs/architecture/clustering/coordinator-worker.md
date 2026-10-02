@@ -80,14 +80,23 @@ GitHub/webhook --> Platform relay --> Coordinator orchestrator
 
 ### NAK-based flow control
 
-Workers do not have a local job queue. When a worker receives `job.reroute`:
+A worker holds an in-memory queue of the jobs it accepted. When a worker receives `job.reroute`:
 
-1. If it can dispatch immediately (matching agent with capacity) --> **ACK** and execute
-2. If it cannot handle the job (at capacity, no matching labels) --> **NAK** with reason
+1. If it can dispatch the job to a matching agent, or queue it for an agent its scaler spawns --> **ACK**
+2. If it cannot handle the job (draining, dispatch rejected) --> **NAK** with reason
 
 The coordinator tracks NAK count per peer with backoff. After repeated NAKs from the same peer, the coordinator deprioritizes that peer temporarily.
 
-If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the coordinator re-dispatches the job (to another peer or locally) rather than stranding the run. A bounded post-ACK spawn window backstops this: the first progress from the accepting peer disarms it, and a worker-relayed provisioning failure re-dispatches immediately. A worker relays progress because it holds no database. A peer coordinator instead writes the job's status to the shared database and relays nothing. So when the window elapses, the coordinator reads that row and disarms the backstop for a job the peer already started. The re-dispatch, the disarm, and a job's terminal cleanup are all keyed to the peer the job is tracked against. So the coordinator ignores a stale signal relayed for the same job by a superseded peer, after an earlier re-dispatch moved it. Such a signal cannot bounce the healthy replacement, wrongly mark the run finished, or strip the replacement's spawn-window backstop.
+If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the coordinator re-dispatches the job (to another peer or locally) rather than stranding the run. A bounded post-ACK spawn window backstops this: the first progress from the accepting peer disarms it, and a worker's report that its spawn retries ran out re-dispatches the job immediately (see [Worker spawn retries](#worker-spawn-retries)). A worker relays progress because it holds no database. A peer coordinator instead writes the job's status to the shared database and relays nothing. So when the window elapses, the coordinator reads that row and disarms the backstop for a job the peer already started. The re-dispatch, the disarm, and a job's terminal cleanup are all keyed to the peer the job is tracked against. So the coordinator ignores a stale signal relayed for the same job by a superseded peer, after an earlier re-dispatch moved it. Such a signal cannot bounce the healthy replacement, wrongly mark the run finished, or strip the replacement's spawn-window backstop.
+
+### Worker spawn retries
+
+A worker retries a failed agent spawn for a rerouted job, within a budget the coordinator sends on `job.reroute` (`spawnRetry: { maxAttempts, backoffMs }`, resolved from the org's `reroute_spawn_max_attempts` / `reroute_spawn_retry_backoff_ms`). A worker that receives no budget, from an older coordinator, applies its own cluster defaults.
+
+- **One spawn at a time.** Every scaler request for the job passes a per-job attempt gate. While a spawn is in flight, or during the backoff after a failure, the gate skips the job, so a capacity-freed re-drive cannot start a second spawn. When the backoff ends, the worker offers the job to its scaler again. The gate records which agent the in-flight spawn creates, and only that spawn's failure counts against the budget. A failure from an earlier spawn whose job was handed to another agent and then requeued is ignored, so it cannot open the gate while a newer spawn is in flight.
+- **A verdict on every failure.** The worker relays each `scaler.failed` for the job on `scaler.event` with `final: false` while attempts remain and `final: true` on the last one. A failure that arrives after an agent received the job is not a spawn failure, and its relay carries no verdict. A second report of the same failed spawn also carries no verdict, so the coordinator counts each spawn once.
+- **Exhaustion gives the job back.** After the final relay, the worker removes the job from its queue. It reports no terminal status for the job: the coordinator owns that verdict and re-dispatches or fails the job.
+- **A cancel removes a queued job.** On `peer.job.cancel` the worker removes the matching queued jobs and reports them `dequeued`. A dispatched job still gets its `job.cancel`, and its queue entry is stop-marked, so a requeue after its agent drops it does not bring it back.
 
 ## Reliable terminal-status relay
 

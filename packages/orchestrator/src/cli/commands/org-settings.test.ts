@@ -539,7 +539,9 @@ describe('kici-admin org-settings reroute', () => {
     expect(mockPatch).not.toHaveBeenCalled();
   });
 
-  it('reset clears all three overrides to null', async () => {
+  it('reset clears only the three overrides an older orchestrator reports', async () => {
+    // breaks-if-wrong: reset against an older orchestrator must still succeed — its
+    // strict PATCH schema rejects the spawn-retry fields it does not project.
     await runCommand(['org-settings', 'reroute', 'reset', '--org', ORG], client);
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
       customerId: ORG,
@@ -547,6 +549,88 @@ describe('kici-admin org-settings reroute', () => {
       rerouteAckTimeoutMs: null,
       rerouteMaxHops: null,
     });
+  });
+
+  it('reset also clears the spawn-retry budget when the orchestrator reports it', async () => {
+    // fails-when: reset leaves the spawn-retry overrides in place on a current orchestrator
+    mockGet.mockResolvedValue({
+      settings: {
+        ...SAMPLE_SETTINGS,
+        rerouteSpawnMaxAttempts: 2,
+        rerouteSpawnRetryBackoffMs: null,
+      },
+    });
+    await runCommand(['org-settings', 'reroute', 'reset', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      rerouteSpawnWindowMs: null,
+      rerouteAckTimeoutMs: null,
+      rerouteMaxHops: null,
+      rerouteSpawnMaxAttempts: null,
+      rerouteSpawnRetryBackoffMs: null,
+    });
+  });
+
+  it('set patches the spawn-retry budget flags', async () => {
+    await runCommand(
+      [
+        'org-settings',
+        'reroute',
+        'set',
+        '--customer-id',
+        ORG,
+        '--spawn-max-attempts',
+        '2',
+        '--spawn-retry-backoff',
+        '0',
+      ],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      rerouteSpawnMaxAttempts: 2,
+      rerouteSpawnRetryBackoffMs: 0,
+    });
+  });
+
+  it('set rejects a spawn budget below its floors', async () => {
+    for (const flags of [
+      ['--spawn-max-attempts', '0'],
+      ['--spawn-retry-backoff', '-1'],
+    ]) {
+      // fails-when: a floor is dropped, so a worker could be told to never spawn
+      const { exitCode } = await runCommand(
+        ['org-settings', 'reroute', 'set', '--customer-id', ORG, ...flags],
+        client,
+      );
+      expect(exitCode).toBe(1);
+    }
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('show prints the spawn-retry budget lines', async () => {
+    mockGet.mockResolvedValue({
+      settings: {
+        ...SAMPLE_SETTINGS,
+        rerouteSpawnMaxAttempts: 4,
+        rerouteSpawnRetryBackoffMs: 2500,
+      },
+    });
+    const { stdout } = await runCommand(
+      ['org-settings', 'reroute', 'show', '--customer-id', ORG],
+      client,
+    );
+    expect(stdout).toContain('Reroute spawn attempts: 4');
+    expect(stdout).toContain('Reroute spawn backoff: 2500 ms');
+  });
+
+  it('show prints the cluster default when an older orchestrator omits the budget', async () => {
+    const { stdout } = await runCommand(
+      ['org-settings', 'reroute', 'show', '--customer-id', ORG],
+      client,
+    );
+    expect(stdout).toContain('Reroute spawn attempts: (cluster default)');
+    expect(stdout).toContain('Reroute spawn backoff: (cluster default)');
   });
 });
 

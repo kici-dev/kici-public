@@ -218,12 +218,17 @@ export interface ManagedAgent {
  * Discriminated union on 'action' for exhaustive pattern matching.
  */
 export type ScaleResult =
-  | { action: 'spawning'; backendType: string }
+  /** A spawn started; `agentId` is the scaler-managed id the new agent will register with. */
+  | { action: 'spawning'; backendType: string; agentId: string }
   | { action: 'at-capacity' }
   | { action: 'no-backend'; labels: string[] }
   | { action: 'failed'; error: string }
-  /** Scale-up declined without attempting a spawn (e.g. coordinator draining). */
-  | { action: 'skipped'; reason: string };
+  /**
+   * Scale-up declined without attempting a spawn (e.g. coordinator draining).
+   * `retryAfterMs` is set when the scaler is deferring after failed launches:
+   * a request before then is declined the same way.
+   */
+  | { action: 'skipped'; reason: string; retryAfterMs?: number };
 
 /**
  * What triggered a pending-scale re-drive (`Dispatcher.retryPendingScaleRequests`):
@@ -306,6 +311,9 @@ export interface ScalerBackend {
    *   the provisioned resource for operator inspection.
    * @returns The managed agent tracking object
    * @throws If the label set is not supported by this backend
+   * @throws DeterministicSpawnError, after emitting `scaler.failed`, when the
+   *   host refused the launch itself. The manager defers the scaler instead of
+   *   freeing the capacity for an immediate retry.
    */
   spawn(
     labelSet: string[],
@@ -333,6 +341,15 @@ export interface ScalerBackend {
    *   teardown or a spawn timeout. Local backends accept and ignore it.
    */
   destroy(managedId: string, context?: ScalerDestroyContext): Promise<void>;
+
+  /**
+   * Record that a managed agent's process registered with the orchestrator.
+   * Called by ScalerManager when a spawn it started registers locally.
+   * Optional: a backend implements it when it must tell a compute that stops
+   * before registering (a failed spawn it tears down itself) from one that
+   * stops after (an agent whose disconnect triggers `destroy`).
+   */
+  markRegistered?(managedId: string): void;
 
   /**
    * Reclaim the HOST-LOCAL compute of a managed agent this backend no longer

@@ -100,6 +100,10 @@ The orchestrator exposes four counters and gauges for an event scaler, labeled b
 - `kici_orch_scaler_spawn_refusals_total` — Cumulative spawn requests refused by a cap, the cluster-wide `maxAgents` included. A rising rate means the cap is doing its job; raise it, or let jobs queue.
 - `kici_orch_scaler_cap_lock_failures_total{reason}` — Cumulative cap checks that failed, so the spawn was refused without the cap being evaluated. This is never a capacity signal. `reason="unreachable"` means the orchestrator database is stalled and event autoscaling is stopped until it recovers. `reason="contended"` means the database is healthy but several coordinators are scaling this scaler at once and one gave up waiting; the job is re-offered on the next dispatch pass. The `ScalerCapCheckUnreachable` rule in the [monitoring pack](../observability/monitoring-pack.md) alerts on the `unreachable` half only, because contention resolves itself on the next dispatch pass.
 
+A scale-up or scale-down that reaches no workflow has its own counter:
+
+- `kici_orch_event_unmatched_total{event_name,reason}` — Cumulative reserved `kici.scaler.*` events that matched no subscribing workflow. `reason` is the match outcome (`no-registration`, `no-target-repo`, `trust-blocked`, `no-trigger-match`, `buffered`). Any increment is a misconfiguration: a scale-up that no workflow provisions, or a scale-down that no workflow runs.
+
 The reaper described under [Teardown](#teardown) adds two unlabeled gauges:
 
 - `kici_orch_scaler_reap_unseen_provisions` — Provisions whose agent has been registered on no coordinator for at least the flap grace, being timed before teardown. An agent that reads as absent only briefly — its own reconnect, or a peer flap that empties a coordinator's advertised agent list — never reaches this gauge.
@@ -109,12 +113,36 @@ The reaper described under [Teardown](#teardown) adds two unlabeled gauges:
 
 An event scaler hands provisioning to your workflow, which drives your provider. The orchestrator never sees the provider's error, so the only signal it has is generic: the scale-up went out, and no agent came back. That signal is enough, and it reads the same for a provider incident, an exhausted quota, and a broken boot script.
 
-When a provision times out without registering, the orchestrator:
+When a provision times out without registering, the orchestrator records this cause:
+
+```text
+External provisioning for scaler `<name>` produced no agent: the scale-up event was emitted, but agent <id> never registered before the spawn timeout. Check that a provisioning workflow received the event (`kici-admin event list --name kici.scaler.scale-up`) and that the provider it drives started the agent.
+```
+
+It also does these things:
 
 - **Names the cause on the waiting job.** The job settles as timed out with the provisioning failure as its reason — not with a message about its `runsOn` labels. A backend did match the job; it could not deliver an agent, and telling you to check your labels would send you to fix something that is already correct.
 - **Counts it.** `kici_orch_scaler_external_provision_timeout_total{scaler}` goes up, and the `ExternalProvisioningFailing` rule in the [monitoring pack](../observability/monitoring-pack.md) fires about 25 minutes into a sustained failure. Its window is set against the backoff below, so widen it if you raise the ceiling past ~25 minutes.
 - **Shows it to the operator.** `kici-admin diagnose` lists the failure on the `scaler:<name>` row for that scaler, with the most recent cause.
 - **Backs off before asking again.** See below.
+
+A job can end while its provision is still pending: it is cancelled, it times out, or another agent runs it. The provision is then no longer needed. The orchestrator withdraws it within about 30 seconds and sends the teardown with reason `job-complete`. A withdrawn provision is not a failure: the orchestrator does not report it and does not back off.
+
+### Check whether a scale-up reached a workflow
+
+The cause above means the scale-up event was emitted. It does not say that a workflow received the event. Use `kici-admin event list` and `kici-admin event show` to see each event's match outcome:
+
+```bash
+kici-admin event list --name kici.scaler.scale-up --since 2026-10-01T00:00:00Z
+kici-admin event show <eventId>
+```
+
+- `matched` — at least one workflow received the event. `show` lists the runs it started.
+- `no-target-repo` — no repository in the scaler's `provisioningTargets` has a registered workflow for the event.
+- `no-registration` — no registered workflow has a `kiciEvent` trigger at all.
+- `no-trigger-match` — a workflow is registered in a target repository, but its trigger filter refused the event.
+
+The orchestrator also logs each unmatched reserved event at info level (`Reserved event matched no subscriber`), with the event id, name, reason and target repositories, and counts it in `kici_orch_event_unmatched_total`.
 
 ### Retry backoff
 
@@ -123,6 +151,8 @@ Without a deferral, a scaler whose provider is down is asked for a new provision
 Consecutive failures therefore arm a growing deferral. The first failure defers the next request by the base delay; each further consecutive failure doubles it, up to a ceiling. Any successful registration clears the count, including an agent another coordinator adopted — that provision worked, whichever coordinator the agent reached.
 
 The state is per scaler **name**, so one failing scaler never defers another. Two event scalers usually drive two different providers, and an outage at one says nothing about the other.
+
+A bare-metal or Firecracker scaler uses the same state and the same settings when an agent never starts: the host refuses the launch, or the agent stops before it connects. See [Launch failures](./auto-scaler/bare-metal.md#launch-failures).
 
 Each coordinator reports the provisions it asked for itself, so on a cluster every coordinator backs off — and answers `kici-admin diagnose` — from its own experience rather than waiting for the leader. The leader also reports the provisions its reaper condemns, whoever asked for them. A provision that another coordinator adopted is not a failure, so nobody reports it. The coordinator that asked for it is never told that the agent arrived, so it checks the durable record of what became of the provision before it reports. That record outlives the provision itself, so a provision that was adopted and has since been torn down is still recognised as one that worked. A coordinator that has not yet asked for a provision from a failing scaler has nothing to go on and makes one attempt, then defers like the rest. Inside one coordinator, a dead provision is reported once, however many of that coordinator's own observers see it. The count is per coordinator, so two coordinators that both see the same dead provision each count it once.
 
@@ -156,7 +186,7 @@ Every provisioned instance must be deleted. Teardown has two halves: the five in
 
 The orchestrator runs its own sweep for provisions no agent ever claimed. It is leader-gated, so on a multi-coordinator cluster exactly one coordinator sweeps and a provision is never torn down twice. Once a minute the leader looks for two shapes and emits `kici.scaler.scale-down` for each:
 
-- A provision whose agent never registered, past `KICI_SCALER_SPAWN_TIMEOUT_MS` (5 minutes by default). The reason is `spawn-timeout`, and it also increments `kici_orch_scaler_external_provision_timeout_total`. This is what covers a provisioning workflow that failed after the scale-up event — a cloud API error, a denied quota, a cancelled run — because the scale-up event is fire-and-forget and nothing else notices that the instance never appeared.
+- A provision whose agent never registered, past `KICI_SCALER_SPAWN_TIMEOUT_MS` (5 minutes by default). The reason is `spawn-timeout`, and it also increments `kici_orch_scaler_external_provision_timeout_total`. This is what covers a provisioning workflow that failed after the scale-up event — a cloud API error, a denied quota, a cancelled run — because the scale-up event is fire-and-forget and nothing else notices that the instance never appeared. If the provision's job already ended, the reason is `job-complete` instead, and nothing is counted or reported.
 - A provision whose agent has stayed unseen on every coordinator in the cluster, either because the coordinator that adopted it is gone or because the agent has been absent for the stranded window (30 minutes by default). The reason is `heartbeat-timeout`.
 
 Because every teardown deletes one of your instances, the sweep is deliberately slow to act:
@@ -184,13 +214,15 @@ That test holds only if you know both coordinators are being scraped. The same f
 This matters more than the remedy you pick, because two of the three remedies below are unsafe while a partition is live:
 
 :::danger
-**Do not restart a coordinator, and do not add one, in response to this alert alone.**
+**Do not restart a coordinator, add one, or forget its peer in response to this alert alone.**
 
 A coordinator learns its peers by handshake and keeps no roster across restarts. One that restarts _during a partition_ therefore boots knowing no peers. It decides it is a single-coordinator deployment and starts sweeping. Do that on both sides, and each one tears down the instances the other is still running.
 
 Adding a coordinator does the same damage by a different route. A new node that only one side can reach gives that side a connected peer again, so its sweep resumes — against the isolated side's live agents.
 
-Both are correct fixes for a permanently dead peer. Both are the worst possible move during a partition. The alert alone does not tell you which you have.
+`kici-admin peer forget` does the same damage as a restart, with no restart. It removes the peer from the peers the coordinator knows. The command refuses a peer that the coordinator can still treat as alive. For a peer that adopted provisions, that is the backstop's flap grace. For any other peer, it is the reroute flap grace, or the peer stale window if that is longer. Both graces are 2 minutes by default. It also asks for confirmation (or `--yes`) before it forgets the last coordinator peer and so starts the backstop again. A partition that lasts longer than that window passes both checks.
+
+All three are correct fixes for a permanently dead peer. All three are the worst possible move during a partition. The alert alone does not tell you which you have.
 :::
 
 Confirm the peer is permanently gone before acting: check that its host is down rather than merely unreachable from here, and that the alert is firing on one side only.
@@ -202,8 +234,8 @@ In order of preference:
 1. **Bring the dead peer back.** The only remedy that is safe in both situations, and the only one that needs no diagnosis first.
 2. **Run three coordinators — as a standing change, never during a live partition.** A third coordinator that only one side can reach restores that side's connected count on its own, which re-arms its sweep against the isolated side's live agents. It tears them down about two minutes later, because a coordinator it cannot reach counts as a dead adopter, and that case needs only the flap grace rather than the stranded window. Add the third node while the cluster is healthy. Losing one then still leaves a peer connected, so the backstop keeps running.
 3. **Remove the peer from the survivor — once you have confirmed it is permanently gone.** How depends on the mode, and a restart alone is not enough in independent mode:
-   - **Platform mode** (the HA-pair recipe, joined by token): restart the survivor. It boots knowing no peers and is a single-coordinator deployment again.
-   - **Independent mode** (`KICI_CLUSTER_PEERS` set): drop the dead peer from that variable _and then_ restart. A restart on its own leaves the peer named in config, and the guard counts it, so the coordinator stays blocked.
+   - **Platform mode** (the HA-pair recipe, joined by token): restart the survivor, or run `kici-admin peer forget <instance-id>` against it. The forget starts the backstop again, so the command asks you to confirm that, or you pass `--yes`. After a restart it boots knowing no peers; after a forget it no longer knows the dead peer. Either way it is a single-coordinator deployment again.
+   - **Independent mode** (`KICI_CLUSTER_PEERS` set): drop the dead peer from that variable _and then_ restart. A restart or a `peer forget` on its own leaves the peer named in config, and the guard counts it, so the coordinator stays blocked.
 
 #### Watching the absence window
 

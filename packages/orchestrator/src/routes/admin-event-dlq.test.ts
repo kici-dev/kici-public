@@ -45,6 +45,8 @@ function makeStoredEvent(overrides: Partial<StoredEvent> = {}): StoredEvent {
     nextRetryAt: null,
     dlqAt: new Date('2026-04-30T10:05:00Z'),
     dlqReason: 'exhausted_retries',
+    matchOutcome: null,
+    matchedCount: null,
     ...overrides,
   };
 }
@@ -176,6 +178,46 @@ describe('admin event-DLQ routes', () => {
     expect(body.limit).toBe(50);
     expect(body.nextCursor).toBeNull();
     expect(deps.listDlq).toHaveBeenCalledWith(50, undefined, undefined);
+  });
+
+  it('redacts a dead-lettered scale-up claim code', async () => {
+    // fails-when: the DLQ list echoes the single-use claim code
+    deps.listDlq.mockResolvedValue([
+      makeStoredEvent({
+        eventName: 'kici.scaler.scale-up',
+        payload: { agentId: 'scaler-event-1', claimCode: 'kcc_secret_value' },
+      }),
+    ]);
+    const res = await request(app, '/api/v1/admin/event-dlq', { token: TOKEN });
+    const text = await res.text();
+    expect(text).not.toContain('kcc_secret_value');
+    const body = JSON.parse(text) as any;
+    expect(body.events[0].payload).toEqual({ agentId: 'scaler-event-1', claimCode: '[redacted]' });
+  });
+
+  it('leaves a payload without a claim code as it is', async () => {
+    // breaks-if-wrong: ordinary event payloads stay readable for triage
+    deps.listDlq.mockResolvedValue([makeStoredEvent()]);
+    const body = (await (
+      await request(app, '/api/v1/admin/event-dlq', { token: TOKEN })
+    ).json()) as any;
+    expect(body.events[0].payload).toEqual({ env: 'production' });
+  });
+
+  it('lists DLQ metadata without payloads for an auditor', async () => {
+    // fails-when: event_dlq.read alone (the auditor role) reads payload bodies
+    (deps.tokenManager.validate as any).mockResolvedValue({
+      id: 'auditor-1',
+      role: 'auditor' as Role,
+      routingKey: null,
+      label: 'audit',
+    });
+    deps.listDlq.mockResolvedValue([makeStoredEvent()]);
+    const body = (await (
+      await request(app, '/api/v1/admin/event-dlq', { token: TOKEN })
+    ).json()) as any;
+    expect(body.events[0].payload).toBeNull();
+    expect(body.events[0].eventName).toBe('deploy-complete');
   });
 
   it('respects limit + before cursor', async () => {

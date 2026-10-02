@@ -63,6 +63,7 @@ import type { OrchestratorHooks } from './orchestrator-core.js';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
 import { runDetached } from './helpers/run-detached.js';
 import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
+import { answerScalerOrphansRequest } from './scaler/orphan-requests.js';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'standalone' });
@@ -234,6 +235,9 @@ await guardStartup(logger, async () => {
             }
             return reloader.executeReload({ source: 'cluster', drain: msg.drain });
           },
+          onPeerForgetRequest: sub.answerPeerForgetRequest,
+          onScalerOrphansRequest: (msg) =>
+            answerScalerOrphansRequest(sub.scalerManager ?? null, msg),
           onAuthenticated: (targetInstanceId) => {
             if (peerAddr === targetInstanceId) return;
             const existing = sub.peerClients.get(peerAddr);

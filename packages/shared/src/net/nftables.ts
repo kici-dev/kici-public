@@ -21,6 +21,7 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createLogger, toErrorMessage } from '@kici-dev/core';
+import { toCommandError } from '../command-error.js';
 
 /**
  * Network policy controlling RFC1918 and internet access for the agents or job
@@ -237,14 +238,22 @@ function tableOf(opts: NftOptions): string {
 /**
  * Execute an nft command with timeout.
  * @returns stdout from the command
- * @throws Error on non-zero exit or timeout
+ * @throws CommandError on non-zero exit, a signal, or the timeout, carrying
+ * nft's stderr tail
  */
 async function nft(opts: NftOptions, ...args: string[]): Promise<string> {
-  const useSudo = opts.requireSudo === true;
-  const { stdout } = useSudo
-    ? await execFile('sudo', ['-n', 'nft', ...args], { timeout: NFT_TIMEOUT_MS })
-    : await execFile('nft', args, { timeout: NFT_TIMEOUT_MS });
-  return stdout;
+  const [file, argv] = opts.requireSudo === true ? ['sudo', ['-n', 'nft', ...args]] : ['nft', args];
+  const startedAt = Date.now();
+  try {
+    const { stdout } = await execFile(file, argv, { timeout: NFT_TIMEOUT_MS });
+    return stdout;
+  } catch (err) {
+    throw toCommandError(err, {
+      command: [file, ...argv].join(' '),
+      timeoutMs: NFT_TIMEOUT_MS,
+      durationMs: Date.now() - startedAt,
+    });
+  }
 }
 
 /**

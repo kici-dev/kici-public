@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { Hono } from 'hono';
 import { createClusterSettingsRoutes } from './admin-cluster-settings.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
+import {
+  SettingsPropagationStatus as Status,
+  type PropagationPeer,
+} from '../cluster/settings-propagation.js';
 
 /**
  * Minimal stateful Kysely stub for the single-row `cluster_settings` path.
@@ -62,13 +66,32 @@ function makeClusterSettingsDbStub() {
   return { db, rows };
 }
 
-function buildApp(db: unknown) {
-  const inner = createClusterSettingsRoutes({ db: db as never, rbac: new RbacEnforcer() });
+interface BuildAppOptions {
+  role?: string;
+  routingKey?: string | null;
+  peers?: PropagationPeer[];
+  localVersion?: number;
+  /** false leaves the propagation source out, so the route is not mounted. */
+  propagation?: boolean;
+}
+
+function buildApp(db: unknown, opts: BuildAppOptions = {}) {
+  const inner = createClusterSettingsRoutes({
+    db: db as never,
+    rbac: new RbacEnforcer(),
+    ...(opts.propagation !== false && {
+      propagation: {
+        instanceId: 'coord-a',
+        peerRegistry: { getAllPeers: () => (opts.peers ?? []) as never },
+        localVersion: () => opts.localVersion ?? 0,
+      },
+    }),
+  });
   const root = new Hono();
   root.use('*', async (c, next) => {
-    c.set('role' as never, 'admin' as never);
+    c.set('role' as never, (opts.role ?? 'admin') as never);
     c.set('userId' as never, 'tester' as never);
-    c.set('routingKey' as never, null as never);
+    c.set('routingKey' as never, (opts.routingKey ?? null) as never);
     await next();
   });
   root.route('/', inner);
@@ -216,6 +239,28 @@ describe('admin cluster-settings route', () => {
     });
     expect(res.status).toBe(200);
     expect(rows.get('default')!.queue_max_depth).toBe(42);
+  });
+
+  it('round-trips firecrackerApiSocketWaitMs and refuses one below 1s', async () => {
+    const { db } = makeClusterSettingsDbStub();
+    const app = buildApp(db);
+    const patch = await app.request('/cluster-settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ firecrackerApiSocketWaitMs: 45_000 }),
+    });
+    expect(patch.status).toBe(200);
+    const get = (await (await app.request('/cluster-settings')).json()) as {
+      settings: Record<string, unknown>;
+    };
+    expect(get.settings.firecrackerApiSocketWaitMs).toBe(45_000);
+
+    const tooLow = await app.request('/cluster-settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ firecrackerApiSocketWaitMs: 500 }),
+    });
+    expect(tooLow.status).toBe(400);
   });
 
   it('PATCH rejects a webhookDedupTtlMs below the 1000ms floor (Zod)', async () => {
@@ -575,5 +620,88 @@ describe('admin cluster-settings route', () => {
       expect(Number(rows.get('default')?.version)).toBe(v1 + 1);
       expect(first.status).toBe(200);
     });
+  });
+});
+
+describe('GET /cluster-settings/propagation', () => {
+  interface PropagationBody {
+    propagation: {
+      currentVersion: number;
+      reportedBy: string;
+      orchestrators: Array<{ instanceId: string; status: string; appliedVersion: number }>;
+    };
+  }
+
+  it('reports the database version and one row per peer plus itself', async () => {
+    const { db, rows } = makeClusterSettingsDbStub();
+    rows.set('default', { id: 'default', version: '7' }); // pg returns BIGINT as a string
+    const app = buildApp(db, {
+      localVersion: 7,
+      peers: [
+        {
+          instanceId: 'arm-1',
+          role: 'worker',
+          connected: true,
+          lastHeartbeatAt: Date.now(),
+          clusterSettingsVersion: 6,
+        },
+      ],
+    });
+    const res = await app.request('/cluster-settings/propagation');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as PropagationBody;
+    expect(body.propagation.currentVersion).toBe(7);
+    expect(body.propagation.reportedBy).toBe('coord-a');
+    expect(
+      body.propagation.orchestrators.map((o) => [o.instanceId, o.appliedVersion, o.status]),
+    ).toEqual([
+      ['coord-a', 7, Status['in-sync']],
+      ['arm-1', 6, Status.behind],
+    ]);
+  });
+
+  // fails-when: currentVersion is read from the reader cache instead of the row
+  it('takes the current version from the row, not from this coordinator', async () => {
+    const { db, rows } = makeClusterSettingsDbStub();
+    rows.set('default', { id: 'default', version: 9 });
+    const res = await buildApp(db, { localVersion: 8 }).request('/cluster-settings/propagation');
+    const body = (await res.json()) as PropagationBody;
+    expect(body.propagation.currentVersion).toBe(9);
+    expect(body.propagation.orchestrators[0]).toMatchObject({
+      instanceId: 'coord-a',
+      appliedVersion: 8,
+      status: Status.behind,
+    });
+  });
+
+  it('reports version 0 when the row does not exist', async () => {
+    const { db } = makeClusterSettingsDbStub();
+    const res = await buildApp(db).request('/cluster-settings/propagation');
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as PropagationBody).propagation.currentVersion).toBe(0);
+  });
+
+  // fails-when: the new path is not covered by the unscoped-token guard
+  it('refuses a routing-key-scoped token', async () => {
+    const { db } = makeClusterSettingsDbStub();
+    const res = await buildApp(db, { routingKey: 'github:42' }).request(
+      '/cluster-settings/propagation',
+    );
+    expect(res.status).toBe(403);
+  });
+
+  // fails-when: the route skips the secret.read check — an auditor reads it
+  it('refuses a role without secret.read', async () => {
+    const { db } = makeClusterSettingsDbStub();
+    const res = await buildApp(db, { role: 'auditor' }).request('/cluster-settings/propagation');
+    expect(res.status).toBe(403);
+  });
+
+  // breaks-if-wrong: an app without a peer view still serves the settings themselves
+  it('is unmounted without a propagation source, leaving GET /cluster-settings intact', async () => {
+    const { db } = makeClusterSettingsDbStub();
+    const app = buildApp(db, { propagation: false });
+    expect((await app.request('/cluster-settings/propagation')).status).toBe(404);
+    expect((await app.request('/cluster-settings')).status).toBe(200);
   });
 });

@@ -93,7 +93,7 @@ The provisioning field that tells the backend _what_ to spawn is type-specific: 
 
 Per-job resource limits use a Kubernetes-style `requests` / `limits` split. `requests` are what the scaler bills against the per-scaler / global / machine-pool caps when deciding whether a spawn fits; `limits` are what the kernel enforces on the running agent (cgroup `memory.max`, CPU quota).
 
-The scaler accepts three input shapes and normalises them all to the same `{ requests, limits }` pair:
+The scaler accepts these input shapes and normalises them all to the same `{ requests, limits }` pair:
 
 - **Flat shorthand** (back-compat with legacy configs). `resources: { memory: '2g', cpus: 2 }` is treated as both the request and the limit.
 - **Request only.** `resources: { requests: { memory: '2g' } }` mirrors to `limits: { memory: '2g' }`.
@@ -377,7 +377,9 @@ Case never matters here. A pool declaring `mandatoryLabels: ['GPU']` gates on `g
           arch: x64          # x64 | arm64
         labelSets:
           - labels: [windows-builders, bare-metal]
-            binaryPath: C:\kici\kici-agent.cmd
+            binaryPath: C:\kici\agent\kici-agent.cmd
+
+On Windows, `binaryPath` names the `kici-agent.cmd` launcher. See [Windows launchers](./bare-metal.md#windows-launchers).
 
 When `platform` is set, BOTH the auto-injected `kici:os:*` / `kici:arch:*` labels AND the mandatory taint derive from this one field. A non-default `os` (`macos`, `windows`) or `arch` (`arm64`) taints the pool, and the plain taint token (`macos` / `windows` / `arm64`) is injected as a matchable label — so a job whose `runsOn` requests that platform is routed to the pool without you also declaring the platform in `labels`, even when the pool's plain labels use a non-canonical name (`windows-builders`, `osx`) that the label-based detection below would miss. When `platform` is omitted, a bare-metal pool derives its platform from the host OS/arch, and container / firecracker pools default to Linux.
 

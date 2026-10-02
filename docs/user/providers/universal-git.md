@@ -100,7 +100,8 @@ Then seed the PAT under the source's own secret scope:
 ```bash
 # The scope __source__/<sourceId> is the orchestrator's convention for
 # source-level credentials. Use the sourceId printed by `source add`.
-kici-admin secret set <orgId> "__source__/<sourceId>" pat --value "<your-forgejo-pat>"
+# --prompt reads the PAT without echoing it or leaving it in shell history.
+kici-admin secret set <orgId> "__source__/<sourceId>" pat --prompt
 ```
 
 Finally, configure the forge to deliver webhooks to:
@@ -168,7 +169,7 @@ For SSH instead of HTTPS:
 
    ```bash
    kici-admin secret set <orgId> "__source__/<sourceId>" deploy-key \
-     --value "$(cat ~/.ssh/forgejo-deploy-key)"
+     --from-file ~/.ssh/forgejo-deploy-key
    ```
 
    The orchestrator materialises this PEM into a tempfile (mode `0600`)
@@ -196,7 +197,7 @@ To rotate a PAT or SSH key, overwrite the value under the same scope +
 key and the next clone picks it up:
 
 ```bash
-kici-admin secret set <orgId> "__source__/<sourceId>" pat --value "<new-pat>"
+kici-admin secret set <orgId> "__source__/<sourceId>" pat --prompt
 ```
 
 The orchestrator re-reads the secret at each clone. No source update

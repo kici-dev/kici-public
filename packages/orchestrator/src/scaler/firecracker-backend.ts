@@ -18,24 +18,25 @@
  */
 
 import { execFile, spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import {
-  open,
-  link,
-  copyFile,
-  mkdir,
-  rm,
-  writeFile,
-  readFile,
-  readdir,
-  readlink,
-  stat,
-} from 'node:fs/promises';
+import { link, copyFile, mkdir, rm, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { openSync, closeSync, writeFileSync, readFileSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
-import { KICI_AGENT_ENV_PREFIX, scalerAgentLabels, ScalerBackendType } from '@kici-dev/engine';
-import { createLogger, toErrorMessage, type ToolRequirement } from '@kici-dev/shared';
+import {
+  KICI_AGENT_ENV_PREFIX,
+  scalerAgentLabels,
+  ScalerBackendType,
+  ScalerVmStopOutcome,
+  ScalerVmTracker,
+  type ScalerVmStopResult,
+} from '@kici-dev/engine';
+import {
+  createLogger,
+  toCommandError,
+  toErrorMessage,
+  type ToolRequirement,
+} from '@kici-dev/shared';
 import { normalizeLabelSet } from './label-matcher.js';
 import {
   ensureKiciTable,
@@ -52,6 +53,8 @@ import { tailFile } from './file-tail.js';
 import { forwardLine } from './log-forwarder.js';
 import { ScalerEventType } from './types.js';
 import { generateTapName } from './ip-allocator.js';
+import { OverlayTemplates } from './overlay-template.js';
+import type { LiveVmBackend, LiveVmProbe } from './live-vms.js';
 import type { IpAllocator, IpAllocationResult, IpAllocationRecord } from './ip-allocator.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import {
@@ -89,6 +92,12 @@ import { runDetached } from '../helpers/run-detached.js';
 
 const execFileAsync = promisify(execFile);
 
+/** Timeout for each host command a spawn or teardown step runs. */
+const EXEC_TIMEOUT_MS = 30_000;
+
+/** Overlay drive size when a label set sets none. */
+const DEFAULT_OVERLAY_MIB = 2048;
+
 const logger = createLogger({ prefix: 'firecracker-backend' });
 
 /**
@@ -107,6 +116,52 @@ const USER_HZ = 100;
  * the file names.
  */
 const PID_START_SLACK_MS = 60_000;
+
+/**
+ * A signal that aborts when the jailer exits with a non-zero code, carrying
+ * the code as its reason. A clean exit is normal: under `--new-pid-ns` the
+ * jailer parent exits 0 once firecracker runs.
+ */
+function watchJailerBootFailure(child: ChildProcess): AbortSignal {
+  const controller = new AbortController();
+  child.on('exit', (code) => {
+    if (code !== 0 && code !== null) controller.abort(code);
+  });
+  return controller.signal;
+}
+
+/**
+ * Field 22 (`starttime`, in USER_HZ ticks since boot) of a `/proc/<pid>/stat`
+ * line. `comm` is parenthesised and may itself contain spaces and parens, so
+ * the remaining fields start after the LAST ')'.
+ */
+function procStartTicks(procStat: string): number | undefined {
+  const commClose = procStat.lastIndexOf(')');
+  if (commClose < 0) return undefined;
+  const ticks = Number(
+    procStat
+      .slice(commClose + 1)
+      .trim()
+      .split(/\s+/)[19],
+  );
+  return Number.isFinite(ticks) ? ticks : undefined;
+}
+
+/**
+ * How long a spawn waits for the VM's API socket when nothing configures it.
+ * Generous on purpose: under heavy disk write-back the jailer's copy of the
+ * firecracker binary into the chroot alone can take several seconds.
+ */
+export const DEFAULT_API_SOCKET_WAIT_MS = 30_000;
+
+/** Interval between liveness probes of a spawned VM whose agent has not registered. */
+const UNREGISTERED_VM_PROBE_MS = 2_000;
+
+/**
+ * Consecutive probes that must find the VM's process gone before it is torn
+ * down, so one racy read of the PID file cannot destroy a live VM.
+ */
+const UNREGISTERED_VM_GONE_PROBES = 2;
 
 /** Log file names within the jailer chroot directory */
 const SERIAL_LOG_FILE = 'serial-console.log';
@@ -162,6 +217,12 @@ export interface FirecrackerManagedAgent extends ManagedAgent {
    * default from.
    */
   hostAccess?: string[];
+  /**
+   * Set once the VM's agent registered with the orchestrator. Until then a VM
+   * that stops on its own is a failed spawn, and nothing else will tear it
+   * down; afterwards the agent's disconnect does.
+   */
+  registered?: boolean;
 }
 
 export interface FirecrackerScalerBackendOptions {
@@ -220,6 +281,17 @@ export interface FirecrackerScalerBackendOptions {
    * `cluster_settings.agent_token_ttl_ms` override; falls back to `tokenTtlMs`.
    */
   tokenTtlProvider?: () => Promise<number>;
+  /**
+   * How long a spawn waits for the VM's API socket after the jailer starts, in
+   * ms. Default {@link DEFAULT_API_SOCKET_WAIT_MS}.
+   */
+  apiSocketWaitMs?: number;
+  /**
+   * Live per-spawn resolver for the API-socket wait, so the fleet-wide
+   * `cluster_settings.firecracker_api_socket_wait_ms` applies without a
+   * restart. Falls back to `apiSocketWaitMs`.
+   */
+  apiSocketWaitMsProvider?: () => Promise<number>;
   /** Agent roles for this scaler. undefined = all, [] = execution only. */
   roles?: string[];
   /**
@@ -257,14 +329,21 @@ export interface FirecrackerScalerBackendOptions {
  * `running` means a process with that number is on the host right now, and
  * `identityConfirmed` says whether it is provably this VM's own firecracker —
  * which decides whether that process may be signalled, not whether it exists.
+ * `startedAtMs` is the process start time `/proc/<pid>/stat` reports.
  */
 type VmPidProbe =
   | { state: 'gone' }
   | { state: 'recycled'; pid: number }
-  | { state: 'running'; pid: number; identityConfirmed: true }
-  | { state: 'running'; pid: number; identityConfirmed: false; detail: string };
+  | { state: 'running'; pid: number; startedAtMs: number; identityConfirmed: true }
+  | {
+      state: 'running';
+      pid: number;
+      startedAtMs: number;
+      identityConfirmed: false;
+      detail: string;
+    };
 
-export class FirecrackerScalerBackend implements ScalerBackend {
+export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   readonly type = ScalerBackendType.enum.firecracker;
   readonly spawnsOnLocalHost = true;
   maxAgents: number;
@@ -286,6 +365,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
    * the failure instead of leaving the reservation held until restart.
    */
   private readonly spawnFailureHandlers = new Map<string, (reason: string) => void>();
+  /** Liveness probes of spawned VMs whose agent has not registered yet, by agent id. */
+  private readonly registrationWatches = new Map<string, NodeJS.Timeout>();
 
   private _labelSets: LabelSetConfig[];
   private readonly name: string;
@@ -294,6 +375,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   private readonly jailerPath: string;
   private readonly kernelPath: string;
   private readonly chrootBaseDir: string;
+  /** Pre-formatted overlay drive templates under {@link chrootBaseDir}. */
+  private readonly overlayTemplates: OverlayTemplates;
   private readonly uid: number;
   private readonly gid: number;
   private readonly vcpuCount: number;
@@ -310,6 +393,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   private readonly tokenStore?: AgentTokenStore;
   private readonly tokenTtlMs: number;
   private readonly tokenTtlProvider?: () => Promise<number>;
+  private readonly apiSocketWaitMs: number;
+  private readonly apiSocketWaitMsProvider?: () => Promise<number>;
   private readonly roles: string[] | undefined;
   private readonly requireSudo: boolean;
   private readonly autoProvisionHost: boolean;
@@ -331,6 +416,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   /** Guard against re-entrant sweeps if a single run takes longer than the interval. */
   private orphanSweepInFlight = false;
 
+  /** Tail of the host reclaim chain; see {@link withHostReclaimLock}. */
+  private hostReclaimChain: Promise<unknown> = Promise.resolve();
+
   constructor(options: FirecrackerScalerBackendOptions) {
     this.name = options.name;
     this._labelSets = options.labelSets;
@@ -340,6 +428,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     this.jailerPath = options.jailerPath;
     this.kernelPath = options.kernelPath;
     this.chrootBaseDir = options.chrootBaseDir ?? '/srv/jailer';
+    this.overlayTemplates = new OverlayTemplates(this.chrootBaseDir, (cmd, args, timeoutMs) =>
+      this.execAsync(cmd, args, timeoutMs),
+    );
     this.uid = options.uid;
     this.gid = options.gid;
     this.vcpuCount = options.vcpuCount ?? 2;
@@ -354,6 +445,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     this.tokenStore = options.tokenStore;
     this.tokenTtlMs = options.tokenTtlMs ?? 3_600_000; // 1 hour default
     this.tokenTtlProvider = options.tokenTtlProvider;
+    this.apiSocketWaitMs = options.apiSocketWaitMs ?? DEFAULT_API_SOCKET_WAIT_MS;
+    this.apiSocketWaitMsProvider = options.apiSocketWaitMsProvider;
     this.roles = options.roles;
     this.requireSudo = options.requireSudo ?? false;
     this.autoProvisionHost = options.autoProvisionHost ?? false;
@@ -410,7 +503,12 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     reqs.push({
       type: 'path-binary',
       name: 'mkfs.ext4',
-      reason: `required by firecracker scaler "${name}" for overlay drive creation`,
+      reason: `required by firecracker scaler "${name}" for overlay drive templates`,
+    });
+    reqs.push({
+      type: 'path-binary',
+      name: 'cp',
+      reason: `required by firecracker scaler "${name}" for sparse overlay drive copies`,
     });
 
     return reqs;
@@ -567,7 +665,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
 
       // 8b. Create per-VM overlay drive (sparse ext4 for writable layer)
       const overlayPath = join(chrootDir, 'overlay.ext4');
-      const overlayMib = matchedLabelSet.overlayDriveSizeMib ?? 2048;
+      const overlayMib = matchedLabelSet.overlayDriveSizeMib ?? DEFAULT_OVERLAY_MIB;
       await this.createOverlayDrive(overlayPath, overlayMib);
 
       // 9-10. Build and write Firecracker config JSON.
@@ -624,8 +722,10 @@ export class FirecrackerScalerBackend implements ScalerBackend {
 
       emit(ScalerEventType.enum['scaler.provisioning'], 'booting microVM');
 
-      // 11c. Spawn jailer as detached child (no --daemonize).
-      // The child stays alive for the VM lifetime; stdout/stderr go to log files.
+      // 11c. Spawn jailer as detached child (no --daemonize, so firecracker
+      // inherits stdout/stderr, which go to the log files). With --new-pid-ns
+      // this child, the jailer parent, exits once firecracker runs in the new
+      // PID namespace; the VM's own PID is in its PID file.
       const child = nodeSpawn(
         this.jailerPath,
         [
@@ -639,7 +739,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
           String(this.gid),
           '--chroot-base-dir',
           this.chrootBaseDir,
-          // NO --daemonize -- child stays alive for VM lifetime
+          // NO --daemonize -- firecracker keeps the log-file stdout/stderr
           '--new-pid-ns',
           '--',
           '--config-file',
@@ -664,39 +764,20 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       // 11e. Set up log tailing (serial console + VMM logs, forwarded internally)
       this.startLogTailing(agentId, serialLogPath, vmmLogPath, child, alloc);
 
-      // 11f. Loosen the chroot dir mode so a non-root orchestrator can traverse
-      // it to reach the API socket. Jailer chmods the chroot to 0700 owned by
-      // its --uid (10000) right before pivot_root, which locks out the orch
-      // process when it isn't running as that user. We chmod back to 0755 from
-      // the host side; this only affects the orch's view (the chroot is locked
-      // from inside FC's perspective regardless). Only does anything when the
-      // backend is in requireSudo mode (root-running orchs already have access).
-      // 12. Wait for API socket. When the orch runs as a non-root user
-      // (requireSudo mode), keep recursively loosening permissions on the
-      // chroot tree in parallel — jailer chmods every new subdir (chroot root
-      // and /run) to 0700 owned by uid 10000, which locks out the orch from
-      // traversing down to /run/firecracker.socket. We do `chmod -R go+rX`
-      // every 100ms so as soon as FC creates /run, our next pass picks it up.
-      const socketPath = this.getSocketPath(agentId);
-      const api = new FirecrackerApi(socketPath, signal);
-      let chmodLoosenInterval: NodeJS.Timeout | undefined;
-      if (this.requireSudo) {
-        const vmDirHost = join(this.chrootBaseDir, 'firecracker', agentId);
-        const chrootHostPath = join(vmDirHost, 'root');
-        chmodLoosenInterval = setInterval(() => {
-          // Best-effort; ignore errors (the dir may not exist yet on the very
-          // first tick, or jailer may still be racing us).
-          this.execAsync('chmod', ['-R', 'go+rX', chrootHostPath]).catch(() => {});
-        }, 100);
-      }
-      let ready: boolean;
+      // 12. Wait for the API socket. A jailer that exits non-zero ends the
+      // wait at once instead of after the full wait. On a rootless host the
+      // chroot permissions are loosened in parallel (see
+      // `loosenChrootPermissions`).
+      const bootFailed = watchJailerBootFailure(child);
+      const api = new FirecrackerApi(
+        this.getSocketPath(agentId),
+        signal ? AbortSignal.any([signal, bootFailed]) : bootFailed,
+      );
+      const stopLoosening = this.requireSudo ? this.loosenChrootPermissions(agentId) : undefined;
       try {
-        ready = await api.waitForSocket(5000);
+        await this.waitForApiSocket(api, agentId, bootFailed);
       } finally {
-        if (chmodLoosenInterval) clearInterval(chmodLoosenInterval);
-      }
-      if (!ready) {
-        throw new Error(`Firecracker API socket not ready within 5s for agent ${agentId}`);
+        stopLoosening?.();
       }
 
       // Full label set the agent will present (base + scaler-assigned kici:
@@ -748,8 +829,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       emit(ScalerEventType.enum['scaler.ready'], 'microVM booted');
 
       // 14. Update tracking
-      managed.state = 'running';
-      managed.backendRef = agentId;
+      this.markSpawned(managed, alloc);
 
       emit(ScalerEventType.enum['agent.connecting'], 'waiting for agent WS registration from VM');
 
@@ -866,6 +946,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   }
 
   async ensureHostReady(): Promise<void> {
+    this.prewarmOverlayTemplates();
     if (!this.autoProvisionHost) return;
     const cfg = this.getBridgeConfig();
     const opts: ExecOptions = { requireSudo: this.requireSudo };
@@ -974,19 +1055,189 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     }
   }
 
+  markRegistered(managedId: string): void {
+    const managed = this.agents.get(managedId);
+    if (managed) managed.registered = true;
+    this.stopRegistrationWatch(managedId);
+  }
+
+  /**
+   * Wait for the VM's API socket for the live setting (else the configured
+   * default), and throw when it does not appear in that time.
+   */
+  private async waitForApiSocket(
+    api: FirecrackerApi,
+    agentId: string,
+    bootFailed: AbortSignal,
+  ): Promise<void> {
+    const waitMs = this.apiSocketWaitMsProvider
+      ? await this.apiSocketWaitMsProvider()
+      : this.apiSocketWaitMs;
+    if (await api.waitForSocket(waitMs)) return;
+    if (bootFailed.aborted) {
+      throw new Error(
+        `Jailer exited during boot (code ${String(bootFailed.reason)}) for agent ${agentId}`,
+      );
+    }
+    throw new Error(`Firecracker API socket not ready within ${waitMs} ms for agent ${agentId}`);
+  }
+
+  /**
+   * Keep loosening a rootless VM's chroot permissions while firecracker starts.
+   *
+   * The jailer chmods the chroot root and every directory it creates (`/run`)
+   * to 0700 owned by its `--uid`, which locks out an orchestrator running as
+   * another user from `/run/firecracker.socket`. A `chmod -R go+rX` every
+   * 100 ms reopens each one as soon as it appears; it only changes the
+   * host-side view. One chmod runs at a time: on a slow disk a `sudo chmod -R`
+   * can outlast the tick, and overlapping ones would pile up for the whole
+   * wait.
+   *
+   * @returns a function that stops the loosening
+   */
+  private loosenChrootPermissions(agentId: string): () => void {
+    const chrootHostPath = join(this.chrootBaseDir, 'firecracker', agentId, 'root');
+    let running = false;
+    const timer = setInterval(() => {
+      if (running) return;
+      running = true;
+      runDetached(
+        logger,
+        'Chroot permission loosening',
+        async () => {
+          try {
+            await this.execAsync('chmod', ['-R', 'go+rX', chrootHostPath]);
+          } catch {
+            // Best effort: the directory may not exist yet, or the jailer may
+            // still be changing it.
+          } finally {
+            running = false;
+          }
+        },
+        { agentId },
+      );
+    }, 100);
+    return () => clearInterval(timer);
+  }
+
+  /** Record a spawn that resolved, and watch its VM until its agent registers. */
+  private markSpawned(managed: FirecrackerManagedAgent, alloc: IpAllocationResult): void {
+    managed.state = 'running';
+    managed.backendRef = managed.id;
+    this.watchUntilRegistered(managed.id, alloc);
+  }
+
+  /**
+   * Tear the VM down if its process stops before its agent registers.
+   *
+   * A guest whose init exits — the agent's fatal startup error, a kernel panic
+   * — reboots, and firecracker exits. Its agent will never register, and
+   * nothing else releases the VM's `maxAgents` slot, TAP, nft rules, IP and
+   * chroot until the manager's stale-spawn prune. The jailer child's own exit
+   * cannot tell this: under `--new-pid-ns` it exits 0 right after the start.
+   * So the VM's process is probed through its PID file, and the probe stops
+   * once the agent registers (its disconnect owns the teardown from then on),
+   * the VM is being destroyed, or it is no longer tracked.
+   */
+  private watchUntilRegistered(agentId: string, alloc: IpAllocationResult): void {
+    // Firecracker started before this point, so a process holding its PID
+    // that started later is another process. Seconds since boot, so a
+    // wall-clock step cannot fake that.
+    const watchStartUptimeS = uptime();
+    let goneProbes = 0;
+    let probing = false;
+    const timer = setInterval(() => {
+      const managed = this.agents.get(agentId);
+      if (!managed || managed.state === 'destroying' || managed.registered) {
+        this.stopRegistrationWatch(agentId);
+        return;
+      }
+      if (probing) return;
+      probing = true;
+      runDetached(
+        logger,
+        'Unregistered VM liveness probe',
+        async () => {
+          try {
+            const gone = await this.isVmProcessGone(agentId, watchStartUptimeS);
+            // The agent may have registered, or destroy() begun, while the
+            // probe was reading.
+            if (this.registrationWatches.get(agentId) !== timer) return;
+            goneProbes = gone ? goneProbes + 1 : 0;
+            if (goneProbes < UNREGISTERED_VM_GONE_PROBES) return;
+            this.stopRegistrationWatch(agentId);
+            this.abandonSpawnDetached(agentId, alloc, 'VM exited before its agent registered');
+          } finally {
+            probing = false;
+          }
+        },
+        { agentId },
+      );
+    }, UNREGISTERED_VM_PROBE_MS);
+    timer.unref();
+    this.registrationWatches.set(agentId, timer);
+  }
+
+  /**
+   * Whether there is positive evidence that a VM's firecracker process is
+   * gone: its PID file does not exist, the PID it names no longer exists, or
+   * that PID now belongs to a process that started after `sinceUptimeS`
+   * (seconds since boot, taken once firecracker was already running).
+   *
+   * Any other failure — an unreadable PID file, a `/proc` this user cannot
+   * see — is not evidence, so the answer is "not gone". The caller tears the
+   * VM down on a "gone", and tearing down a live VM leaves firecracker running
+   * without its TAP, IP and chroot.
+   */
+  private async isVmProcessGone(vmId: string, sinceUptimeS: number): Promise<boolean> {
+    const pidFile = join(this.getChrootDir(vmId), 'firecracker.pid');
+    let pid: number;
+    try {
+      pid = parseInt(String(await readFile(pidFile, 'utf-8')).trim(), 10);
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+    if (!(pid > 0)) return false;
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      // EPERM: the process exists but runs as the jailer uid.
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return true;
+    }
+    let procStat: string;
+    try {
+      procStat = String(await readFile(`/proc/${pid}/stat`, 'utf-8'));
+    } catch {
+      return false;
+    }
+    const startTicks = procStartTicks(procStat);
+    // One second of slack: field 22 counts in USER_HZ ticks.
+    return startTicks !== undefined && startTicks / USER_HZ > sinceUptimeS + 1;
+  }
+
+  /** Stop forwarding a VM's serial console and VMM logs. */
+  private stopLogTailing(agentId: string): void {
+    this.tailAbortControllers.get(agentId)?.abort();
+    this.tailAbortControllers.delete(agentId);
+  }
+
+  private stopRegistrationWatch(agentId: string): void {
+    const timer = this.registrationWatches.get(agentId);
+    if (timer === undefined) return;
+    clearInterval(timer);
+    this.registrationWatches.delete(agentId);
+  }
+
   async destroy(managedId: string, _context?: ScalerDestroyContext): Promise<void> {
     // _context (teardown reason) is only meaningful to the event backend.
     const managed = this.agents.get(managedId);
     if (!managed) return;
 
     managed.state = 'destroying';
+    this.stopRegistrationWatch(managedId);
 
     // 0. Stop log tailing
-    const abortController = this.tailAbortControllers.get(managedId);
-    if (abortController) {
-      abortController.abort();
-      this.tailAbortControllers.delete(managedId);
-    }
+    this.stopLogTailing(managedId);
 
     // 1. Attempt graceful shutdown via SendCtrlAltDel (x86_64 only)
     try {
@@ -1003,13 +1254,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     // 2. Force kill, but only a PID that is provably still this VM's own
     //    firecracker process — see `readVmPid`.
     const forceKillPid = await this.readVmPid(managedId);
-    if (forceKillPid !== undefined) {
-      try {
-        process.kill(forceKillPid, 'SIGKILL');
-      } catch {
-        // ESRCH = process already dead -- expected
-      }
-    }
+    const stillRunning =
+      forceKillPid !== undefined && !(await this.signalVmProcessOrLog(managedId, forceKillPid));
 
     // 3. Clean up per-VM nftables rules (saddr-keyed, before TAP deletion)
     if (managed.ip) {
@@ -1032,11 +1278,15 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     // 5. Release IP
     await this.ipAllocator.release(managedId);
 
-    // 6. Clean up chroot directory
-    try {
-      await this.removeChrootDir(managedId);
-    } catch {
-      // Best effort
+    // 6. Clean up chroot directory, unless the process could not be signalled:
+    //    it still runs out of those files, and its chroot is what lets
+    //    `kici-admin scaler orphans` list and stop it once it is untracked.
+    if (!stillRunning) {
+      try {
+        await this.removeChrootDir(managedId);
+      } catch {
+        // Best effort
+      }
     }
 
     // 6. Remove from tracking
@@ -1065,20 +1315,17 @@ export class FirecrackerScalerBackend implements ScalerBackend {
    * peer's live VM has a row naming this very scaler. The row is read only to
    * finish a reclaim the chroot already authorized.
    */
-  async reapUnowned(managedId: string): Promise<boolean> {
+  reapUnowned(managedId: string): Promise<boolean> {
+    return this.withHostReclaimLock(() => this.reapUnownedLocked(managedId));
+  }
+
+  private async reapUnownedLocked(managedId: string): Promise<boolean> {
     if (this.agents.has(managedId)) {
       // Still tracked, so `destroy()` owns this id and holds the live TAP and
       // IP for it. Reaping underneath it would race its teardown.
       return false;
     }
 
-    const vmDir = join(this.chrootBaseDir, 'firecracker', managedId);
-    let hasChroot = false;
-    try {
-      hasChroot = (await stat(vmDir)).isDirectory();
-    } catch {
-      // No chroot for this id on this host.
-    }
     // THE ONE GATE. Without a chroot here, nothing places this VM on this host,
     // and a shared `ip_allocations` row cannot stand in for one: on an HA pair
     // both coordinators run the same named scalers against one database, so a
@@ -1088,49 +1335,91 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     // row-without-chroot case needs no reclaim anyway: with no chroot there is
     // no PID file to kill through, and `cleanupOrphans()` Pass 1 already
     // releases such a row (no PID file means `isChrootPidRunning` reads false).
-    if (!hasChroot) return false;
+    if (!(await this.hasChrootOnHost(managedId))) return false;
 
-    let alloc: IpAllocationRecord | null = null;
-    try {
-      alloc = await this.ipAllocator.getAllocationForVm(managedId);
-    } catch (err) {
-      // Best effort: the chroot already authorized the reclaim, and a failed
-      // read only costs the IP release, which the next sweep redoes.
-      logger.warn('firecracker: allocation lookup failed during orphan reclaim', {
+    // A running process this backend cannot identify is not signalled, and the
+    // files it may be running out of are not deleted under it.
+    const probe = await this.probeVmPid(managedId);
+    if (probe.state === 'running' && !probe.identityConfirmed) {
+      logger.warn('firecracker: unowned VM left alone, its process is not provably its own', {
         managedId,
-        error: toErrorMessage(err),
+        pid: probe.pid,
+        detail: probe.detail,
       });
+      return false;
     }
-    // A second firecracker scaler on this host has its own IP space and its own
-    // teardown, so only a row naming THIS scaler is ours to release.
-    const ownsAllocation = alloc !== null && alloc.scaler_name === this.name;
 
+    const alloc = await this.lookupAllocation(managedId);
     logger.warn('firecracker: reclaiming an unowned VM', {
       managedId,
-      ownsAllocation,
+      ownsAllocation: alloc !== null && alloc.scaler_name === this.name,
     });
-
-    // Forward whatever the serial console and VMM logs still hold before the
-    // chroot goes — this is the only record of why the VM was orphaned.
-    try {
-      await this.forwardRemainingLogs(managedId, this.getChrootDir(managedId));
-    } catch {
-      // Best effort — the log files may not exist.
-    }
 
     // Kill the jailer process. Unlike `destroy()` there is no graceful
     // SendCtrlAltDel first: the guest is a refused agent with no work in
     // flight, and the API socket belongs to a VM this process never opened.
-    const reapPid = await this.readVmPid(managedId);
-    if (reapPid !== undefined) {
-      try {
-        process.kill(reapPid, 'SIGKILL');
-      } catch {
-        // ESRCH — already dead, which is the outcome we wanted.
-      }
+    // A process that could not be signalled keeps running out of its chroot,
+    // so nothing is torn down under it and the chroot stays listable.
+    if (probe.state === 'running' && !(await this.signalVmProcessOrLog(managedId, probe.pid))) {
+      return false;
     }
 
-    if (alloc !== null && ownsAllocation) {
+    await this.teardownUntrackedVm(managedId, alloc);
+    return true;
+  }
+
+  /** Whether the jailer chroot for `vmId` exists on this host. */
+  private async hasChrootOnHost(vmId: string): Promise<boolean> {
+    try {
+      return (await stat(join(this.chrootBaseDir, 'firecracker', vmId))).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The `ip_allocations` row for `vmId`, or null. Best effort: a failed read
+   * only costs the IP release, which the next sweep redoes.
+   */
+  private async lookupAllocation(vmId: string): Promise<IpAllocationRecord | null> {
+    try {
+      return await this.ipAllocator.getAllocationForVm(vmId);
+    } catch (err) {
+      logger.warn('firecracker: allocation lookup failed during orphan reclaim', {
+        managedId: vmId,
+        error: toErrorMessage(err),
+      });
+      return null;
+    }
+  }
+
+  /** Whether this scaler's allocator holds the address of `vmId`. */
+  async ownsAllocationFor(vmId: string): Promise<boolean> {
+    const alloc = await this.lookupAllocation(vmId);
+    return alloc !== null && alloc.scaler_name === this.name;
+  }
+
+  /**
+   * Reclaim the host resources of a VM nothing tracks, once its process is
+   * dead: forward its remaining logs, remove its isolation rules, TAP and IP,
+   * and delete its chroot.
+   *
+   * A second firecracker scaler on this host has its own IP space and its own
+   * teardown, so only a row naming THIS scaler is ours to release. With no such
+   * row (a worker's in-memory allocator forgets every row on restart) the TAP
+   * named after the VM's id is deleted: the name derives from this VM's id
+   * alone, so it cannot be another VM's.
+   */
+  private async teardownUntrackedVm(vmId: string, alloc: IpAllocationRecord | null): Promise<void> {
+    // Forward whatever the serial console and VMM logs still hold before the
+    // chroot goes — this is the only record of why the VM was orphaned.
+    try {
+      await this.forwardRemainingLogs(vmId, this.getChrootDir(vmId));
+    } catch {
+      // Best effort — the log files may not exist.
+    }
+
+    if (alloc !== null && alloc.scaler_name === this.name) {
       try {
         await removeIsolationRules(alloc.ip, this.nftOpts());
       } catch {
@@ -1142,22 +1431,246 @@ export class FirecrackerScalerBackend implements ScalerBackend {
         // TAP may already be gone.
       }
       try {
-        await this.ipAllocator.release(managedId);
+        await this.ipAllocator.release(vmId);
       } catch (err) {
         logger.warn('firecracker: IP release failed during orphan reclaim', {
-          managedId,
+          managedId: vmId,
           error: toErrorMessage(err),
         });
+      }
+    } else {
+      try {
+        await this.execAsync('ip', ['link', 'del', generateTapName(vmId)]);
+      } catch {
+        // TAP may already be gone.
       }
     }
 
     try {
-      await this.removeChrootDir(managedId);
+      await this.removeChrootDir(vmId);
     } catch {
       // Best effort — the next sweep sees it now that the process is dead.
     }
+  }
 
-    return true;
+  /** Whether a live VM is one this backend spawned and still tracks. */
+  isTrackingVm(vmId: string): boolean {
+    return this.agents.has(vmId);
+  }
+
+  /**
+   * Every VM under this scaler's chroot base whose firecracker process is
+   * running right now. A VM whose process is gone, or whose PID number was
+   * recycled, is dead and belongs to the orphan sweep, so it is not listed.
+   */
+  async listLiveVms(): Promise<LiveVmProbe[]> {
+    let entries: string[];
+    try {
+      // A dot-entry is not a VM chroot: the overlay templates live in one.
+      entries = (await readdir(join(this.chrootBaseDir, 'firecracker'))).filter(
+        (entry) => !entry.startsWith('.'),
+      );
+    } catch {
+      // The chroot parent may not exist yet.
+      return [];
+    }
+    const live: LiveVmProbe[] = [];
+    for (const vmId of entries) {
+      const probe = await this.probeVmPid(vmId);
+      if (probe.state !== 'running') continue;
+      live.push({
+        vmId,
+        scaler: this.name,
+        pid: probe.pid,
+        startedAtMs: probe.startedAtMs,
+        chrootDir: this.getChrootDir(vmId),
+        identityConfirmed: probe.identityConfirmed,
+        ...(probe.identityConfirmed ? {} : { detail: probe.detail }),
+      });
+    }
+    return live;
+  }
+
+  /**
+   * Stop one live VM nothing on this node tracks, on an operator's request.
+   *
+   * The tracked check that authorises the kill and the first `kill(2)` run in
+   * one synchronous tick: tracking only changes between ticks (a registration,
+   * a rehydrated spawn row, a new spawn), so nothing can claim the VM between
+   * the check and the signal. The kernel can still recycle the PID number in
+   * that window; `destroy` and `reapUnowned` carry the same window, and Node
+   * has no pidfd to close it.
+   *
+   * Runs under the host reclaim lock, so a sweep cannot release this VM's
+   * address to a new VM while the stop is still removing its rules.
+   *
+   * @param trackersOf what else on this node tracks the VM, read in the
+   *   kill's tick; it must not await.
+   */
+  stopUntrackedVm(vmId: string, trackersOf: () => ScalerVmTracker[]): Promise<ScalerVmStopResult> {
+    return this.withHostReclaimLock(() => this.stopUntrackedVmLocked(vmId, trackersOf));
+  }
+
+  private async stopUntrackedVmLocked(
+    vmId: string,
+    trackersOf: () => ScalerVmTracker[],
+  ): Promise<ScalerVmStopResult> {
+    const refused = (
+      outcome: ScalerVmStopOutcome,
+      detail: string,
+      pid?: number,
+    ): ScalerVmStopResult => {
+      logger.warn('firecracker: untracked VM stop refused', { vmId, outcome, detail });
+      return { vmId, outcome, detail, ...(pid !== undefined ? { pid } : {}) };
+    };
+
+    // The id names a chroot directory through `join`, which resolves `..`. An
+    // id like `x/../<tracked id>` would reach a tracked VM's chroot while every
+    // tracker lookup below misses the string, so only one path segment is a VM id.
+    if (vmId.includes('/') || vmId === '.' || vmId === '..') {
+      return refused(ScalerVmStopOutcome.enum['not-found'], 'not a VM id: it names a path');
+    }
+    if (this.isTrackingVm(vmId)) {
+      return refused(ScalerVmStopOutcome.enum.tracked, `tracked: ${ScalerVmTracker.enum.backend}`);
+    }
+    if (!(await this.hasChrootOnHost(vmId))) {
+      return refused(ScalerVmStopOutcome.enum['not-found'], 'no chroot for this VM on this host');
+    }
+    const probe = await this.probeVmPid(vmId);
+    if (probe.state !== 'running') {
+      // A dead VM's chroot belongs to the orphan sweep and `reap-orphans`.
+      return refused(ScalerVmStopOutcome.enum['not-live'], 'the VM process is not running');
+    }
+    if (!probe.identityConfirmed) {
+      return refused(
+        ScalerVmStopOutcome.enum.unverified,
+        `PID ${probe.pid} is not provably this VM's firecracker (${probe.detail})`,
+        probe.pid,
+      );
+    }
+
+    // No await from here to the signal: see the method comment.
+    const trackers = [
+      ...(this.isTrackingVm(vmId) ? [ScalerVmTracker.enum.backend] : []),
+      ...trackersOf(),
+    ];
+    if (trackers.length > 0) {
+      return refused(
+        ScalerVmStopOutcome.enum.tracked,
+        `tracked: ${trackers.join(', ')}`,
+        probe.pid,
+      );
+    }
+    logger.warn('firecracker: stopping an untracked live VM', {
+      vmId,
+      pid: probe.pid,
+      scaler: this.name,
+    });
+    try {
+      // signalVmProcess opens with the synchronous kill(2), so the signal goes
+      // out in this tick.
+      await this.signalVmProcess(probe.pid);
+    } catch (err) {
+      return refused(ScalerVmStopOutcome.enum.error, toErrorMessage(err), probe.pid);
+    }
+
+    if (!(await this.waitForProcessExit(vmId, 5000))) {
+      return refused(
+        ScalerVmStopOutcome.enum.error,
+        'process did not exit after SIGKILL; chroot kept',
+        probe.pid,
+      );
+    }
+    await this.teardownUntrackedVm(vmId, await this.lookupAllocation(vmId));
+    return {
+      vmId,
+      outcome: ScalerVmStopOutcome.enum.stopped,
+      pid: probe.pid,
+      detail: 'stopped',
+    };
+  }
+
+  /**
+   * SIGKILL a VM's firecracker process.
+   *
+   * The jailer drops firecracker to `--uid`, so an orchestrator running as
+   * another unprivileged user gets EPERM from `kill(2)`. On a rootless host
+   * (`requireSudo`) the signal goes through `sudo -n -u #<uid> kill`; anywhere
+   * else EPERM means the process lacks CAP_KILL. ESRCH means the process is
+   * already gone, which is the outcome wanted.
+   *
+   * The first statement is the synchronous `kill(2)`: `stopUntrackedVm` relies
+   * on the signal leaving in its caller's tick.
+   */
+  private async signalVmProcess(pid: number): Promise<void> {
+    try {
+      process.kill(pid, 'SIGKILL');
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return;
+      if (code !== 'EPERM') throw err;
+    }
+    if (!this.requireSudo) {
+      throw new Error(
+        `EPERM signalling PID ${pid} (firecracker runs as uid ${this.uid}): grant the ` +
+          'orchestrator CAP_KILL, or run it as root',
+      );
+    }
+    try {
+      await this.execAsync('kill', ['-s', 'KILL', String(pid)]);
+    } catch (err) {
+      // The process may have exited on its own between the two signals.
+      if (!(await this.procEntryExists(pid))) return;
+      throw new Error(
+        `EPERM signalling PID ${pid}, and sudo could not signal it as uid ${this.uid} ` +
+          `(${toErrorMessage(err)}): add "<orchestrator user> ALL=(#${this.uid}) NOPASSWD: ` +
+          '/usr/bin/kill" to the sudoers allowlist',
+      );
+    }
+  }
+
+  /** Whether `/proc/<pid>` names a process right now. */
+  private async procEntryExists(pid: number): Promise<boolean> {
+    try {
+      await readFile(`/proc/${pid}/stat`, 'utf-8');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * {@link signalVmProcess} for the teardown paths: a failure is logged, never
+   * swallowed, and reported so the caller keeps the chroot of a process that
+   * still runs.
+   *
+   * @returns whether the process was signalled or was already gone
+   */
+  private async signalVmProcessOrLog(managedId: string, pid: number): Promise<boolean> {
+    try {
+      await this.signalVmProcess(pid);
+      return true;
+    } catch (err) {
+      logger.error('firecracker: could not signal a VM process; it keeps running', {
+        managedId,
+        pid,
+        error: toErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Serialise host reclaims: the orphan sweep, the unowned-VM reclaim and the
+   * operator stop. Each frees addresses and deletes rules and TAPs by name, so
+   * two interleaved can hand an address one is still tearing down to a new VM
+   * and then delete the new VM's rules.
+   */
+  private withHostReclaimLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.hostReclaimChain.then(fn, fn);
+    this.hostReclaimChain = run.catch(() => undefined);
+    return run;
   }
 
   async shutdownAll(): Promise<void> {
@@ -1229,7 +1742,11 @@ export class FirecrackerScalerBackend implements ScalerBackend {
    *
    * Returns the count of cleaned orphans.
    */
-  async cleanupOrphans(): Promise<number> {
+  cleanupOrphans(): Promise<number> {
+    return this.withHostReclaimLock(() => this.cleanupOrphansLocked());
+  }
+
+  private async cleanupOrphansLocked(): Promise<number> {
     let cleaned = 0;
 
     // Snapshot the set of VM IDs currently tracked in-memory. These are
@@ -1243,7 +1760,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     const chrootParent = join(this.chrootBaseDir, 'firecracker');
     let chrootEntries: string[] = [];
     try {
-      chrootEntries = await readdir(chrootParent);
+      // A dot-entry is not a VM chroot: the overlay templates live in one.
+      chrootEntries = (await readdir(chrootParent)).filter((entry) => !entry.startsWith('.'));
     } catch {
       // Chroot parent may not exist yet.
     }
@@ -1621,31 +2139,69 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   }
 
   /**
-   * Create a sparse ext4 overlay drive for per-VM writable layer.
-   * The file is sparse (allocates no disk blocks until written) and
-   * pre-formatted as ext4 so the guest can mount it immediately.
+   * Create the per-VM writable overlay drive: a sparse copy of this host's
+   * pre-formatted ext4 template for the size, so the guest can mount it
+   * immediately. See `overlay-template.ts` for why a spawn never formats.
    */
   private async createOverlayDrive(path: string, sizeMib: number): Promise<void> {
-    const fd = await open(path, 'w');
-    await fd.truncate(sizeMib * 1024 * 1024);
-    await fd.close();
-    await this.execAsync('mkfs.ext4', ['-qF', path]);
+    await this.overlayTemplates.createOverlay(path, sizeMib);
   }
 
   /**
-   * Promisified execFile wrapper with 30s timeout.
+   * Build the overlay template of every configured drive size in the
+   * background, so the first spawn after startup copies instead of formatting.
+   * A failure is logged; the first spawn of that size builds it instead.
+   */
+  private prewarmOverlayTemplates(): void {
+    const sizes = new Set(
+      this._labelSets.map((ls) => ls.overlayDriveSizeMib ?? DEFAULT_OVERLAY_MIB),
+    );
+    for (const sizeMib of sizes) {
+      runDetached(
+        logger,
+        'Overlay template pre-build',
+        () => this.overlayTemplates.ensure(sizeMib),
+        {
+          sizeMib,
+        },
+      );
+    }
+  }
+
+  /**
+   * Run a host command with a timeout (30s unless the caller passes one).
+   *
+   * A failure rejects with a `CommandError` whose message names the command,
+   * its exit code or signal, whether the timeout killed it, how long it ran,
+   * and the tail of its stderr. Spawn steps throw it as-is, so the same text
+   * reaches the `scaler.failed` event detail and the spawn-failure logs.
    */
   private async execAsync(
     cmd: string,
     args: string[],
+    timeoutMs = EXEC_TIMEOUT_MS,
   ): Promise<{ stdout: string; stderr: string }> {
-    // When the orchestrator runs as a non-root user (edge worker nodes), `ip`
-    // and `chown` need sudo. The operator must have a NOPASSWD sudoers entry
-    // for these binaries; we use `-n` to fail fast if sudo would prompt.
-    if (this.requireSudo && (cmd === 'ip' || cmd === 'chown' || cmd === 'chmod')) {
-      return execFileAsync('sudo', ['-n', cmd, ...args], { timeout: 30_000 });
+    // When the orchestrator runs as a non-root user (edge worker nodes), `ip`,
+    // `chown`, `chmod` and `kill` need sudo. The operator must have a NOPASSWD
+    // sudoers entry for these binaries; `-n` fails fast if sudo would prompt.
+    // `kill` runs as the jailer uid, so the sudoers grant for it can only
+    // signal jailer-owned processes.
+    const sudoArgv =
+      cmd === 'kill' ? ['-n', '-u', `#${this.uid}`, cmd, ...args] : ['-n', cmd, ...args];
+    const [file, argv] =
+      this.requireSudo && (cmd === 'ip' || cmd === 'chown' || cmd === 'chmod' || cmd === 'kill')
+        ? ['sudo', sudoArgv]
+        : [cmd, args];
+    const startedAt = Date.now();
+    try {
+      return await execFileAsync(file, argv, { timeout: timeoutMs });
+    } catch (err) {
+      throw toCommandError(err, {
+        command: [file, ...argv].join(' '),
+        timeoutMs,
+        durationMs: Date.now() - startedAt,
+      });
     }
-    return execFileAsync(cmd, args, { timeout: 30_000 });
   }
 
   /**
@@ -1707,8 +2263,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
    *     naming it was written;
    *  4. field 2 (`comm`) is `firecracker` (11 characters, so it is not
    *     truncated by the 15-character `comm` limit) and `/proc/<pid>/root` —
-   *     where the jailer pivot_roots — is this VM's chroot when the link is
-   *     readable at all. Those carry `identityConfirmed`, not liveness.
+   *     where the jailer pivot_roots — resolves to this VM's chroot (same
+   *     device and inode) when it is readable at all. Those carry
+   *     `identityConfirmed`, not liveness.
    */
   private async probeVmPid(vmId: string): Promise<VmPidProbe> {
     const pidFile = join(this.getChrootDir(vmId), 'firecracker.pid');
@@ -1759,18 +2316,28 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     }
 
     if (comm !== 'firecracker') {
-      return { state: 'running', pid, identityConfirmed: false, detail: `comm="${comm}"` };
+      return {
+        state: 'running',
+        pid,
+        startedAtMs: startedMs,
+        identityConfirmed: false,
+        detail: `comm="${comm}"`,
+      };
     }
 
+    // The jailer pivot_roots in its own mount namespace, so the text of
+    // `/proc/<pid>/root` reads `/` from the host for every VM. The directory
+    // the link resolves to is still the VM's chroot: compare device and inode.
+    const chrootDir = this.getChrootDir(vmId);
     try {
-      const procRoot = await readlink(`/proc/${pid}/root`);
-      const chrootDir = this.getChrootDir(vmId);
-      if (procRoot !== chrootDir) {
+      const [procRoot, chroot] = await Promise.all([stat(`/proc/${pid}/root`), stat(chrootDir)]);
+      if (procRoot.dev !== chroot.dev || procRoot.ino !== chroot.ino) {
         return {
           state: 'running',
           pid,
+          startedAtMs: startedMs,
           identityConfirmed: false,
-          detail: `rooted at ${procRoot}, not ${chrootDir}`,
+          detail: `its root directory is not ${chrootDir}`,
         };
       }
     } catch {
@@ -1778,7 +2345,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       // either way, and checks 3 and 4's `comm` already carry the identity.
     }
 
-    return { state: 'running', pid, identityConfirmed: true };
+    return { state: 'running', pid, startedAtMs: startedMs, identityConfirmed: true };
   }
 
   /**
@@ -1851,8 +2418,10 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       // signal 0 checks process existence without sending a signal
       process.kill(pid, 0);
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      // EPERM: the process exists but runs as the jailer uid, which an
+      // unprivileged orchestrator may not signal.
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
     }
   }
 
@@ -1891,8 +2460,13 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     // delete another VM's isolation rules and its TAP by name. `Map.delete`
     // reports whether the key was there, which makes the test-and-clear atomic
     // against the interleaving that produces the race.
+    //
+    // A VM `destroy()` is already tearing down is left to it: running both
+    // would release the same IP and TAP twice.
+    if (this.agents.get(agentId)?.state === 'destroying') return;
     if (!this.agents.delete(agentId)) return;
     this.spawnFailureHandlers.delete(agentId);
+    this.stopRegistrationWatch(agentId);
 
     // Release IP if allocated
     if (alloc) {
@@ -1917,9 +2491,13 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       }
     }
 
-    // Clean up chroot directory if created
+    this.stopLogTailing(agentId);
+
+    // Clean up chroot directory if created. `removeChrootDir` reclaims
+    // ownership first on rootless hosts: by now the chroot may already belong
+    // to the jailer uid, and a plain `rm` there fails with EACCES.
     try {
-      await rm(join(this.chrootBaseDir, 'firecracker', agentId), { recursive: true, force: true });
+      await this.removeChrootDir(agentId);
     } catch {
       // Best effort
     }
@@ -1968,11 +2546,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     child.on('exit', (code, sig) => {
       // Give a small delay for final log lines to be tailed
       setTimeout(() => {
-        abortController.abort();
-        this.tailAbortControllers.delete(agentId);
-
         // Emit structured boot failure event if exit was unexpected
         if (code !== 0 && code !== null) {
+          this.stopLogTailing(agentId);
           const failureType = this.detectFailureType(serialLogPath);
           forwardLine(
             JSON.stringify({
@@ -1998,6 +2574,11 @@ export class FirecrackerScalerBackend implements ScalerBackend {
             `jailer exited during boot (code ${code}${sig ? `, signal ${sig}` : ''}, ${failureType})`,
           );
         }
+        // A clean exit says nothing about the VM: with `--new-pid-ns` the
+        // jailer parent exits 0 as soon as it has started firecracker in the
+        // new PID namespace. So the log tails keep running (destroy() and
+        // the failed-spawn cleanup stop them), and the VM's own process is
+        // watched through its PID file (`watchUntilRegistered`).
       }, 500);
     });
   }

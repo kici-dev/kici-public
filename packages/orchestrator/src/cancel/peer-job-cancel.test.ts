@@ -23,12 +23,18 @@ function makeDeps(over: {
   dispatched?: DispatchedAgent[] | Error;
   noDatabase?: boolean;
   trackedForRun?: string[];
+  /** Wire a worker's queued-job release returning these ids (or throwing). */
+  releaseQueued?: string[] | Error;
 }) {
   const warn = vi.fn();
   const info = vi.fn();
   const lookup = vi.fn(async (): Promise<DispatchedAgent[]> => {
     if (over.dispatched instanceof Error) throw over.dispatched;
     return over.dispatched ?? [];
+  });
+  const release = vi.fn(async (): Promise<string[]> => {
+    if (over.releaseQueued instanceof Error) throw over.releaseQueued;
+    return over.releaseQueued ?? [];
   });
   const deps: PeerJobCancelDeps = {
     dispatcher: {
@@ -40,9 +46,10 @@ function makeDeps(over: {
         over.sockets?.[agentId] ? { ws: over.sockets[agentId] } : undefined,
     } as unknown as PeerJobCancelDeps['registry'],
     ...(over.noDatabase ? {} : { lookupDispatched: lookup }),
+    ...(over.releaseQueued !== undefined && { releaseQueued: release }),
     logger: { info, warn },
   };
-  return { deps, warn, info, lookup };
+  return { deps, warn, info, lookup, release };
 }
 
 const cancel = (extra: Partial<PeerJobCancel> = {}): PeerJobCancel => ({
@@ -253,5 +260,89 @@ describe('readDispatchedAgents', () => {
       { jobId: 'job-1', agentId: null },
     ]);
     expect(wheres).toHaveLength(2);
+  });
+});
+
+describe('deliverPeerJobCancel on a worker (releaseQueued wired)', () => {
+  it('a queued job the worker removed is reported dequeued', async () => {
+    const { deps, warn, info } = makeDeps({ noDatabase: true, releaseQueued: ['job-1'] });
+
+    const result = await deliverPeerJobCancel(deps, cancel());
+
+    // fails-when: a queued job survives its coordinator's cancel (reported not-tracked)
+    expect(result).toEqual([{ jobId: 'job-1', agentId: null, outcome: Outcome.dequeued }]);
+    expect(info).toHaveBeenCalledWith('Peer job cancel removed a queued job', {
+      runId: 'run-1',
+      jobId: 'job-1',
+      removed: 1,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('reports not-tracked when the worker holds nothing for the job', async () => {
+    const { deps, warn } = makeDeps({ noDatabase: true, releaseQueued: [] });
+
+    const result = await deliverPeerJobCancel(deps, cancel());
+
+    expect(result).toEqual([{ jobId: 'job-1', agentId: null, outcome: Outcome['not-tracked'] }]);
+    expect(warn).toHaveBeenCalledWith('Peer job cancel not delivered', {
+      runId: 'run-1',
+      jobId: 'job-1',
+      outcome: Outcome['not-tracked'],
+    });
+  });
+
+  it('a run-scoped cancel removes every queued job of the run', async () => {
+    const ws = socket();
+    const { deps, release } = makeDeps({
+      noDatabase: true,
+      mapped: { 'job-3': 'agent-1' },
+      sockets: { 'agent-1': ws },
+      trackedForRun: ['job-3'],
+      releaseQueued: ['job-1', 'job-2'],
+    });
+
+    const result = await deliverPeerJobCancel(deps, cancel({ jobId: undefined }));
+
+    expect(release).toHaveBeenCalledWith('run-1', undefined);
+    expect(result).toEqual([
+      { jobId: 'job-3', agentId: 'agent-1', outcome: Outcome.delivered },
+      { jobId: 'job-1', agentId: null, outcome: Outcome.dequeued },
+      { jobId: 'job-2', agentId: null, outcome: Outcome.dequeued },
+    ]);
+  });
+
+  it('a dispatched job is stop-marked before its cancel is delivered', async () => {
+    const ws = socket();
+    const { deps, release } = makeDeps({
+      noDatabase: true,
+      mapped: { 'job-1': 'agent-1' },
+      sockets: { 'agent-1': ws },
+      releaseQueued: [],
+    });
+
+    const result = await deliverPeerJobCancel(deps, cancel());
+
+    // breaks-if-wrong: the running job still gets its job.cancel
+    expect(result).toEqual([{ jobId: 'job-1', agentId: 'agent-1', outcome: Outcome.delivered }]);
+    expect(release.mock.invocationCallOrder[0]).toBeLessThan(ws.send.mock.invocationCallOrder[0]);
+  });
+
+  it('a failed release is a warn line, and the cancel still reaches the agent', async () => {
+    const ws = socket();
+    const { deps, warn } = makeDeps({
+      noDatabase: true,
+      mapped: { 'job-1': 'agent-1' },
+      sockets: { 'agent-1': ws },
+      releaseQueued: new Error('boom'),
+    });
+
+    const result = await deliverPeerJobCancel(deps, cancel());
+
+    expect(result).toEqual([{ jobId: 'job-1', agentId: 'agent-1', outcome: Outcome.delivered }]);
+    expect(warn).toHaveBeenCalledWith(
+      'Peer job cancel not delivered',
+      expect.objectContaining({ outcome: Outcome['lookup-failed'], error: 'boom' }),
+    );
   });
 });

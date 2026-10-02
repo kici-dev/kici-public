@@ -22,6 +22,10 @@ import { RbacEnforcer } from '../secrets/rbac.js';
 import { createAdminRoutes, type AdminRouteDeps } from './admin.js';
 import { createAdminRunRoutes, type AdminRunRoutesDeps } from './admin-runs.js';
 import { createAdminEventDlqRoutes, type AdminEventDlqRoutesDeps } from './admin-event-dlq.js';
+import {
+  createAdminEventInspectRoutes,
+  type AdminEventInspectRoutesDeps,
+} from './admin-event-inspect.js';
 import { createAdminEventLogRoutes, type AdminEventLogRoutesDeps } from './admin-event-log.js';
 import { createAdminEventRoutes } from './admin-events.js';
 import { createAdminAccessLogRoutes, type AdminAccessLogRoutesDeps } from './admin-access-log.js';
@@ -337,6 +341,37 @@ describe('routing-key scope sweep — admin-event-dlq.ts', () => {
     const res = await request(app, 'DELETE', 'http://localhost/api/v1/admin/event-dlq/evt-1', {
       token: VALID_TOKEN,
     });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('routing-key scope sweep — admin-event-inspect.ts', () => {
+  let deps: AdminEventInspectRoutesDeps;
+  let app: ReturnType<typeof createAdminEventInspectRoutes>;
+
+  beforeEach(() => {
+    deps = {
+      db: {} as any,
+      eventStore: {
+        list: vi.fn().mockResolvedValue([]),
+        getById: vi.fn().mockResolvedValue({
+          id: '0b5c7a52-6c1e-4b8e-9d3a-7f1e2a3b4c5d',
+          sourceRoutingKey: OTHER_ROUTING_KEY,
+        }),
+      } as any,
+      tokenManager: scopedTokenManager(ownerScopedToken()),
+      rbac: new RbacEnforcer(),
+    };
+    app = createAdminEventInspectRoutes(deps);
+  });
+
+  it('refuses GET /events/:id when the event belongs to a different routing key', async () => {
+    const res = await request(
+      app,
+      'GET',
+      'http://localhost/api/v1/admin/events/0b5c7a52-6c1e-4b8e-9d3a-7f1e2a3b4c5d',
+      { token: VALID_TOKEN },
+    );
     expect(res.status).toBe(403);
   });
 });

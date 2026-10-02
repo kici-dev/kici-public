@@ -104,7 +104,7 @@ is used for:
 | `bridge-utils`    | Optional `brctl` legacy tool; useful for inspection (`iproute2` covers actual bridge mgmt) |
 | `libcap2-bin`     | `setcap` / `getcap` for granting jailer file capabilities (Step 4)                         |
 | `debootstrap`     | Builds the Debian agent rootfs (Step 7) without needing a container runtime                |
-| `e2fsprogs`       | `mkfs.ext4` to format the agent rootfs image                                               |
+| `e2fsprogs`       | `mkfs.ext4` to format the agent rootfs image and the overlay drive templates               |
 | `util-linux`      | `flock`, `losetup` and `findmnt`, which the rootfs build uses (Step 7)                     |
 | `git`             | Clones the source repository that holds the setup scripts                                  |
 | `acl`             | `setfacl` if you need fine-grained `/dev/kvm` permissions (rarely needed)                  |
@@ -203,10 +203,14 @@ sudo tee /etc/sudoers.d/kici >/dev/null <<'SUDOERS'
 kici ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get, /usr/sbin/setcap, \
     /usr/sbin/usermod, /usr/sbin/useradd, /usr/sbin/groupadd, \
     /sbin/ip, /usr/sbin/nft, /sbin/sysctl, \
-    /usr/bin/install, /usr/bin/tee, /usr/sbin/modprobe, /usr/bin/curl
+    /usr/bin/install, /usr/bin/tee, /usr/sbin/modprobe, /usr/bin/curl, \
+    /usr/bin/chown, /usr/bin/chmod
+kici ALL=(#10000) NOPASSWD: /usr/bin/kill
 SUDOERS
 sudo chmod 440 /etc/sudoers.d/kici
 ```
+
+The last line lets an orchestrator that runs as `kici` with `requireSudo: true` stop its VMs. The jailer runs each VM's firecracker process as the jailer user (uid 10000, [Step 5](#step-5-create-the-jailer-user)), and the kernel does not let one unprivileged user signal another user's process. So the orchestrator runs `sudo -n -u '#10000' kill`. The line runs `kill` as the jailer uid, not as root, so it can signal only the jailer user's processes. Use your jailer uid if it is not 10000.
 
 If you later need to add a binary, edit the file with
 `sudo visudo -f /etc/sudoers.d/kici` (visudo runs the syntax check before
@@ -496,6 +500,16 @@ This script:
 - Enables `cpu`, `cpuset`, and `memory` controllers
 - Sets ownership so the jailer process can manage per-VM cgroups
 
+### Overlay drive templates
+
+Each VM gets a writable overlay drive: a sparse file that holds an empty ext4 filesystem. The orchestrator formats one template for each overlay size (`overlayDriveSizeMib`) on the host, and each spawn copies that template with `cp --sparse=always`. The copy writes only the allocated blocks and never waits for the disk to flush, so a spawn stays fast while other processes write heavily to the same disk. Formatting per spawn would call `fsync`, which waits for all the data that is queued for that disk.
+
+- **Location:** `<chrootBaseDir>/firecracker/.overlay-templates/overlay-<MiB>mib.ext4`, for example `/srv/jailer/firecracker/.overlay-templates/overlay-2048mib.ext4`. It sits beside the per-VM chroots, in the directory the orchestrator already creates them in, so it needs no extra permissions. The orphan cleanup skips it.
+- **When it is built:** in the background when the scaler starts, for each configured size. A spawn that finds no template builds it first, with a 5-minute timeout.
+- **Disk cost:** about 66 MB allocated for a 2048 MiB template (mostly its journal), and about 2 MB for each VM copy. The apparent size of both equals the overlay size.
+- **Validation:** a template whose size is wrong or that holds no ext4 filesystem is built again. A build writes to a temporary file and renames it into place, so an interrupted build leaves no partial template.
+- **Removal:** the templates are a reusable cache. The orchestrator does not delete them. You can delete the directory at any time; the next spawn builds the template again. A file named `overlay-<MiB>mib.ext4.tmp-<pid>-<id>` is left only by a build that a crash interrupted, and you can delete it.
+
 ## Step 10: Grant orchestrator capabilities
 
 The orchestrator process needs elevated privileges to manage TAP devices, nftables rules, and file ownership for the jailer chroot. Choose one of the three deployment modes below.
@@ -527,6 +541,7 @@ podman run -d \
 | `SYS_ADMIN` | Mount operations (cgroups, jailer chroot)                           |
 | `CHOWN`     | Change ownership of VM chroot directories to jailer UID             |
 | `FOWNER`    | Bypass permission checks on files owned by other users              |
+| `KILL`      | Stop VM processes that run as the jailer UID (in the default set)   |
 
 **Required device:** `/dev/kvm` (KVM hardware virtualization for Firecracker VMs).
 
@@ -552,10 +567,10 @@ User=kici
 Group=kici
 
 # Grant specific capabilities instead of running as root
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_KILL
 
 # Allow the process to use these capabilities
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_KILL
 
 # KVM device access
 SupplementaryGroups=kvm
@@ -577,6 +592,8 @@ NoNewPrivileges=false
 [Install]
 WantedBy=multi-user.target
 ```
+
+`CAP_KILL` lets the orchestrator stop a VM: the jailer runs each VM's firecracker process as the jailer user, and without `CAP_KILL` the kernel refuses the orchestrator's signal to it.
 
 **Important:** `NoNewPrivileges=false` is required — ambient capabilities are dropped when `NoNewPrivileges=true`, which would prevent child processes (jailer, ip, nft) from inheriting them.
 
@@ -622,7 +639,7 @@ scalers:
         rootfsPath: /opt/kici/agent-rootfs.ext4
 ```
 
-If the orchestrator runs as a non-root user that reaches privileged commands through the sudoers allowlist from [Step 2 Variant A1](#variant-a1-narrowed-nopasswd-allowlist-recommended) or [A2](#variant-a2-broad-nopasswd-fastest-single-purpose-lab-hosts), also set `requireSudo: true` on the scaler entry so `ip`, `chown`, `chmod`, and `nft` are invoked through `sudo -n`. Leave it unset for the capability-based ([Option A](#option-a-container-deployment-recommended) / [Option B](#option-b-systemd-service)) and root ([Option C](#option-c-run-as-root)) deployments — those already have the access, and `sudo -n` would fail instead of prompting.
+If the orchestrator runs as a non-root user that reaches privileged commands through the sudoers allowlist from [Step 2 Variant A1](#variant-a1-narrowed-nopasswd-allowlist-recommended) or [A2](#variant-a2-broad-nopasswd-fastest-single-purpose-lab-hosts), also set `requireSudo: true` on the scaler entry so `ip`, `chown`, `chmod`, and `nft` are invoked through `sudo -n`. With it, the orchestrator also stops a VM through `sudo -n -u '#<uid>' kill`, as the jailer user. Leave it unset for the capability-based ([Option A](#option-a-container-deployment-recommended) / [Option B](#option-b-systemd-service)) and root ([Option C](#option-c-run-as-root)) deployments — those already have the access, and `sudo -n` would fail instead of prompting.
 
 See the [Firecracker scaler backend](../auto-scaler/firecracker.md) and [Common configuration](../auto-scaler/common-config.md) for the full configuration reference including all Firecracker-specific fields, warm pools, network policies, and multi-backend setups.
 
@@ -801,6 +818,19 @@ Add the orchestrator user to the `kvm` group, then restart the service so the gr
 sudo usermod -aG kvm <orchestrator-user>
 ```
 
+### A spawn step fails
+
+A spawn runs host commands (`ip`, `chown`, `chmod`, `cp`, and `nft`), each with a timeout: 30 seconds, or 10 seconds for `nft`. The `mkfs.ext4` that builds an overlay template has a 5-minute timeout. When one fails, the `scaler.failed` event, the job's provisioning error and the `Scaler spawn failed` log line name the command and the reason:
+
+- `exited with code N` — the tool refused. The `stderr:` part carries the last 2 KB of its error output.
+- `timed out: killed by SIGTERM after … ms (timeout … ms)` — the command did not finish in time. The tool did not fail; the host was too slow. Check the disk under the chroot base directory (`iostat -x 1`), and the dirty page cache waiting for it (`grep -E 'Dirty|Writeback' /proc/meminfo`).
+- `was killed by SIGKILL` — a process outside the orchestrator killed the command, for example the kernel OOM killer.
+- `could not start after … ms: spawn <cmd> ENOENT` — the binary is not on the orchestrator's `PATH`.
+
+A spawn that fails with `Firecracker API socket not ready within <N> ms` started the jailer, but firecracker did not open its API socket in time. See [Slow VM spawn](#slow-vm-spawn).
+
+The `Failed to spawn agent` log line also carries these as fields: `command`, `exitCode`, `signal`, `timedOut` and `durationMs`.
+
 ### IP pool exhausted
 
 VM spawn fails with "no available IPs". Either the CIDR range is too small for the number of concurrent VMs, or orphaned allocations remain from crashed VMs. Increase the CIDR range in `scalers.yaml` (e.g., `/23` for 509 usable IPs) and restart the orchestrator to trigger orphan cleanup.
@@ -808,6 +838,13 @@ VM spawn fails with "no available IPs". Either the CIDR range is too small for t
 ### Slow VM spawn
 
 Spawn times consistently above 5 seconds usually mean large rootfs images (500 MB+ copy per VM), slow host disk I/O, or too many mount points degrading jailer performance. Keep rootfs images minimal (see the [rootfs build guide](./rootfs.md)), copy the rootfs to tmpfs for faster I/O, keep the mount-point count under 500 (`wc -l /proc/mounts`), and enable warm pools to hide copy latency from job dispatch.
+
+**A slow disk under heavy writes.** Other processes can write a lot of data to the disk under the chroot base directory. The kernel then lets that data wait in memory (the dirty page cache), up to a limit. At the limit, the kernel slows down every process that writes to the disk, including the jailer. The jailer copies the firecracker binary into each VM's chroot. On a slow disk, such as a USB flash drive, that copy alone can take several seconds. Two settings help:
+
+- Raise the API-socket wait: `kici-admin cluster-settings set --firecracker-api-socket-wait-ms 60000`. The default is 30 seconds. See [Cluster settings](../cluster-settings.md).
+- Limit how much dirty data the kernel holds in memory, so the backlog that slows writers stays small. These settings apply to every disk on the host. For example, `sysctl -w vm.dirty_background_bytes=33554432 vm.dirty_bytes=134217728` (32 MB and 128 MB). Persist the values in `/etc/sysctl.d/`. Lower values make large writes slower and keep each writer's wait short.
+
+Check the backlog with `grep -E 'Dirty|Writeback' /proc/meminfo` while the spawn runs.
 
 ### TAP devices accumulating
 
@@ -832,15 +869,40 @@ policy with `sudo -ll`. If `sudo -ll` shows two entries for `kici` — one from
 `/etc/sudoers.d/kici` (your allowlist) — `kici` was added to the `sudo` group
 and should be removed: `sudo gpasswd -d kici sudo`.
 
+### A live VM the orchestrator does not track
+
+`ps` shows a `firecracker --id scaler-firecracker-…` process that no run or agent in the dashboard matches, and it keeps its memory and its chroot under `<chrootBaseDir>/firecracker/`. The orphan sweep below never stops a live VM: when it sweeps blind, a running process is the only sign of a healthy VM. `kici-admin scaler reap-orphans` uses the same sweep, so it leaves the VM running too.
+
+Ask the orchestrator that runs the VM which live VMs it does not track:
+
+```bash
+# On a coordinator: the VMs on the coordinator itself
+kici-admin scaler orphans
+# On a worker: through a coordinator, named by the worker's instance id
+kici-admin scaler orphans --target <instance-id>
+```
+
+`kici-admin debug-bundle --fleet --list` shows the instance ids. The listing shows each VM's id, PID, age, chroot and status:
+
+- **orphaned** — nothing on the node tracks the VM: no in-memory VM, no spawn in progress, no registered agent, and no job bound to its agent.
+- **unverified** — a process runs at the PID the VM's PID file names, but the orchestrator cannot prove it is that VM's firecracker. Examine it by hand; the stop never signals it.
+- **tracked** — something tracks the VM. Shown only with `--all`.
+
+An agent can register with any coordinator of the cluster. While the coordinator that answers has no live connection to one of its coordinator peers, it cannot rule out an agent registered with that peer. So it lists every untracked VM as `unverified`, names the missing peers in the reason and in the `node.disconnectedCoordinators` JSON field, and refuses every stop until they reconnect.
+
+`kici-admin scaler orphans --stop` shows the orphaned VMs and asks for confirmation, then stops them and removes their TAP device, address and chroot. `--yes` skips the confirmation and `--dry-run` stops nothing. The orchestrator checks the VM again in the same step as the kill, so it never stops a VM that a spawn or an agent registration claims after the listing. A rootless orchestrator stops a VM through the `kill` line in [Variant A1](#variant-a1-narrowed-nopasswd-allowlist-recommended); a VM it cannot stop comes back as `error` with the reason. See [`kici-admin scaler`](../kici-admin/cluster-and-infra.md#scaler----scaler-maintenance) for the permissions.
+
 ## Orphan cleanup on startup
 
 On every startup, and again on a 15-minute timer while it runs, the Firecracker backend runs `cleanupOrphans()` to reconcile host state with the DB:
 
 1. **DB allocations with dead processes** — the Firecracker process is gone (PID file check), so the TAP is deleted, the IP released, and the chroot removed.
-2. **Chroot directories without DB records** — directory removed.
+2. **Chroot directories without DB records** — directory removed. The `.overlay-templates` directory is not a chroot and is kept.
 3. **Host TAP interfaces without DB allocations** — any interface matching `kici-[0-9a-f]{8}` that is not the scaler's bridge (`bridgeName`) and is not associated with a live DB allocation is deleted.
 
 Pass 3 matters because NetworkManager polls every link on the host, so a handful of leaked TAPs from a SIGKILLed orchestrator can peg a CPU. The periodic timer exists because long-lived orchestrators (weeks of uptime is normal) would otherwise accumulate leaked TAPs — for example from a test worker SIGKILLed mid-destroy — until the next restart. The per-VM pattern is narrow (`kici-<8-hex>`), so the default bridge `kici-br0` and operator-named interfaces like `kici-br1` or `kici-debug` are never deleted. The sweep also never deletes the scaler's own bridge, even when `bridgeName` has the per-VM shape. Do not give any other permanent interface a `kici-<8-hex>` name: the sweep deletes it.
+
+The sweep never stops a live VM. To stop a VM that runs but that the orchestrator does not track, use `kici-admin scaler orphans --stop` (see [A live VM the orchestrator does not track](#a-live-vm-the-orchestrator-does-not-track)).
 
 ## Security considerations
 

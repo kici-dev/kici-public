@@ -214,31 +214,31 @@ Response to a peer authentication request. **Encrypted** with the shared session
 
 Sent every 30 seconds by each peer. Carries agent inventory, scaler capacity, and Raft consensus state. This is the primary mechanism for routing decisions — the coordinator uses peer heartbeats to determine which peers can handle a job's label requirements.
 
-| Field                  | Type                    | Required | Description                                                        |
-| ---------------------- | ----------------------- | -------- | ------------------------------------------------------------------ |
-| type                   | `"peer.heartbeat"`      | Yes      | Message discriminator                                              |
-| instanceId             | string                  | Yes      | Sender's cluster instance ID                                       |
-| term                   | number                  | Yes      | Current Raft term                                                  |
-| leaderId               | string or null          | Yes      | Known Raft leader's instance ID                                    |
-| draining               | boolean                 | Yes      | Whether the sender is gracefully shutting down                     |
-| agents                 | PeerAgentSummary[]      | Yes      | Connected agent inventory                                          |
-| capabilities           | PeerCapabilities        | Yes      | Feature flags (S3 log access, log routing override)                |
-| scalerCapacity         | ScalerCapacitySummary[] | No       | On-demand backend capacity for routing decisions                   |
-| configVersion          | number                  | No       | Shared config version for sync detection                           |
-| registryVersion        | number                  | No       | Registry version for cross-orchestrator registration sync          |
-| clusterSettingsVersion | number                  | No       | Shared cluster-settings version for leader-to-worker settings pull |
-| timestamp              | number                  | Yes      | Unix timestamp (milliseconds)                                      |
-| hostname               | string                  | No       | Machine hostname (`os.hostname()`)                                 |
-| osRelease              | string                  | No       | OS kernel release (`os.release()`)                                 |
-| totalMemoryMb          | number                  | No       | Total system memory in MiB                                         |
-| memoryUsedMb           | number                  | No       | Used memory in MiB                                                 |
-| memoryAvailableMb      | number                  | No       | Available memory in MiB                                            |
-| cpuCount               | number                  | No       | Number of logical CPUs                                             |
-| uptimeSeconds          | number                  | No       | System uptime in seconds                                           |
-| nodeVersion            | string                  | No       | Node.js version                                                    |
-| runningAsUser          | string or null          | No       | Username of the OS user running the orchestrator                   |
-| runningAsUid           | number or null          | No       | UID of the OS user running the orchestrator                        |
-| version                | string                  | No       | Orchestrator version (e.g., `"0.0.1"`)                             |
+| Field                  | Type                    | Required | Description                                                                 |
+| ---------------------- | ----------------------- | -------- | --------------------------------------------------------------------------- |
+| type                   | `"peer.heartbeat"`      | Yes      | Message discriminator                                                       |
+| instanceId             | string                  | Yes      | Sender's cluster instance ID                                                |
+| term                   | number                  | Yes      | Current Raft term                                                           |
+| leaderId               | string or null          | Yes      | Known Raft leader's instance ID                                             |
+| draining               | boolean                 | Yes      | Whether the sender is gracefully shutting down                              |
+| agents                 | PeerAgentSummary[]      | Yes      | Connected agent inventory                                                   |
+| capabilities           | PeerCapabilities        | Yes      | Feature flags (S3 log access, log routing override)                         |
+| scalerCapacity         | ScalerCapacitySummary[] | No       | On-demand backend capacity for routing decisions                            |
+| configVersion          | number                  | No       | Shared config version for sync detection                                    |
+| registryVersion        | number                  | No       | Registry version for cross-orchestrator registration sync                   |
+| clusterSettingsVersion | number                  | No       | Shared cluster-settings version for the coordinator-to-worker settings pull |
+| timestamp              | number                  | Yes      | Unix timestamp (milliseconds)                                               |
+| hostname               | string                  | No       | Machine hostname (`os.hostname()`)                                          |
+| osRelease              | string                  | No       | OS kernel release (`os.release()`)                                          |
+| totalMemoryMb          | number                  | No       | Total system memory in MiB                                                  |
+| memoryUsedMb           | number                  | No       | Used memory in MiB                                                          |
+| memoryAvailableMb      | number                  | No       | Available memory in MiB                                                     |
+| cpuCount               | number                  | No       | Number of logical CPUs                                                      |
+| uptimeSeconds          | number                  | No       | System uptime in seconds                                                    |
+| nodeVersion            | string                  | No       | Node.js version                                                             |
+| runningAsUser          | string or null          | No       | Username of the OS user running the orchestrator                            |
+| runningAsUid           | number or null          | No       | UID of the OS user running the orchestrator                                 |
+| version                | string                  | No       | Orchestrator version (e.g., `"0.0.1"`)                                      |
 
 PeerAgentSummary:
 
@@ -313,40 +313,41 @@ Raft leader heartbeat (no log entries — KiCI uses Raft for leader election onl
 
 Sent by the coordinator to a peer when no local agent can handle a job. Contains the full resolved job configuration so the peer can dispatch without re-resolving.
 
-| Field                      | Type                    | Required | Description                                                                                                                                                                                                |
-| -------------------------- | ----------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type                       | `"job.reroute"`         | Yes      | Message discriminator                                                                                                                                                                                      |
-| messageId                  | string                  | Yes      | Unique message ID for ACK correlation                                                                                                                                                                      |
-| jobId                      | string                  | Yes      | Pre-allocated job ID. The sending coordinator allocates it before reroute so its `execution_runs` / `execution_jobs` rows reference the same id the receiving peer will dispatch under.                    |
-| runId                      | string                  | Yes      | Execution run identifier                                                                                                                                                                                   |
-| deliveryId                 | string                  | Yes      | Original webhook delivery ID                                                                                                                                                                               |
-| routingKey                 | string                  | Yes      | Provider routing key                                                                                                                                                                                       |
-| event, action              | string, string or null  | Yes      | Webhook event type and action                                                                                                                                                                              |
-| payload                    | Record<string, unknown> | Yes      | Full webhook payload                                                                                                                                                                                       |
-| jobName                    | string                  | Yes      | Job to execute                                                                                                                                                                                             |
-| workflowName               | string                  | Yes      | Workflow containing the job                                                                                                                                                                                |
-| runsOnLabels               | string[][]              | Yes      | Label sets the job requires                                                                                                                                                                                |
-| excludeLabels              | string[]                | No       | Labels that the dispatched agent must NOT have                                                                                                                                                             |
-| runsOnPatterns             | LabelMatcher[]          | No       | Glob/regex include matchers the receiving peer's agent labels must satisfy, applied on top of the exact `runsOnLabels` prefilter. Absent reads as `[]`; a pure-pattern job carries its whole selector here |
-| excludePatterns            | LabelMatcher[]          | No       | Glob/regex matchers that disqualify a candidate agent. Absent reads as `[]`                                                                                                                                |
-| triedConnections           | string[]                | Yes      | Instance IDs already tried (loop prevention)                                                                                                                                                               |
-| maxHops                    | number                  | Yes      | Maximum allowed hops (default: 3)                                                                                                                                                                          |
-| coordinatorId              | string                  | Yes      | Instance ID of the run coordinator                                                                                                                                                                         |
-| jobConfig                  | Record<string, unknown> | No       | Resolved job config (steps, rules, matrix, etc.)                                                                                                                                                           |
-| repoUrl                    | string                  | No       | Repository clone URL                                                                                                                                                                                       |
-| ref                        | string                  | No       | Git ref (branch name)                                                                                                                                                                                      |
-| sha                        | string                  | No       | Commit SHA                                                                                                                                                                                                 |
-| provider                   | string                  | No       | Provider type (e.g., `github`)                                                                                                                                                                             |
-| providerContext            | Record<string, unknown> | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                                         |
-| sourceTarUrl               | string                  | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                                                |
-| sourceTarDigest            | string                  | No       | SHA-256 of the source tarball's own bytes, for integrity verification                                                                                                                                      |
-| depsUrl                    | string                  | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                                              |
-| depsHash                   | string                  | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                                    |
-| cloneToken                 | string                  | No       | Pre-resolved clone token for workers without provider credentials                                                                                                                                          |
-| encryptedSecrets           | string                  | No       | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                                                  |
-| encryptedNamespacedSecrets | string                  | No       | Encrypted namespaced secrets envelope                                                                                                                                                                      |
-| requestId                  | string                  | No       | Trace ID for distributed tracing                                                                                                                                                                           |
-| traceId                    | string                  | No       | Additional trace context                                                                                                                                                                                   |
+| Field                      | Type                                         | Required | Description                                                                                                                                                                                                   |
+| -------------------------- | -------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type                       | `"job.reroute"`                              | Yes      | Message discriminator                                                                                                                                                                                         |
+| messageId                  | string                                       | Yes      | Unique message ID for ACK correlation                                                                                                                                                                         |
+| jobId                      | string                                       | Yes      | Pre-allocated job ID. The sending coordinator allocates it before reroute so its `execution_runs` / `execution_jobs` rows reference the same id the receiving peer will dispatch under.                       |
+| runId                      | string                                       | Yes      | Execution run identifier                                                                                                                                                                                      |
+| deliveryId                 | string                                       | Yes      | Original webhook delivery ID                                                                                                                                                                                  |
+| routingKey                 | string                                       | Yes      | Provider routing key                                                                                                                                                                                          |
+| event, action              | string, string or null                       | Yes      | Webhook event type and action                                                                                                                                                                                 |
+| payload                    | Record<string, unknown>                      | Yes      | Full webhook payload                                                                                                                                                                                          |
+| jobName                    | string                                       | Yes      | Job to execute                                                                                                                                                                                                |
+| workflowName               | string                                       | Yes      | Workflow containing the job                                                                                                                                                                                   |
+| runsOnLabels               | string[][]                                   | Yes      | Label sets the job requires                                                                                                                                                                                   |
+| excludeLabels              | string[]                                     | No       | Labels that the dispatched agent must NOT have                                                                                                                                                                |
+| runsOnPatterns             | LabelMatcher[]                               | No       | Glob/regex include matchers the receiving peer's agent labels must satisfy, applied on top of the exact `runsOnLabels` prefilter. Absent reads as `[]`; a pure-pattern job carries its whole selector here    |
+| excludePatterns            | LabelMatcher[]                               | No       | Glob/regex matchers that disqualify a candidate agent. Absent reads as `[]`                                                                                                                                   |
+| triedConnections           | string[]                                     | Yes      | Instance IDs already tried (loop prevention)                                                                                                                                                                  |
+| maxHops                    | number                                       | Yes      | Maximum allowed hops (default: 3)                                                                                                                                                                             |
+| spawnRetry                 | `{ maxAttempts: number, backoffMs: number }` | No       | Spawn-retry budget the receiving worker applies to the job: agent spawns it attempts (>= 1) and the wait after a failed one (ms, >= 0). Absent from an older coordinator: the worker applies its own defaults |
+| coordinatorId              | string                                       | Yes      | Instance ID of the run coordinator                                                                                                                                                                            |
+| jobConfig                  | Record<string, unknown>                      | No       | Resolved job config (steps, rules, matrix, etc.)                                                                                                                                                              |
+| repoUrl                    | string                                       | No       | Repository clone URL                                                                                                                                                                                          |
+| ref                        | string                                       | No       | Git ref (branch name)                                                                                                                                                                                         |
+| sha                        | string                                       | No       | Commit SHA                                                                                                                                                                                                    |
+| provider                   | string                                       | No       | Provider type (e.g., `github`)                                                                                                                                                                                |
+| providerContext            | Record<string, unknown>                      | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                                            |
+| sourceTarUrl               | string                                       | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                                                   |
+| sourceTarDigest            | string                                       | No       | SHA-256 of the source tarball's own bytes, for integrity verification                                                                                                                                         |
+| depsUrl                    | string                                       | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                                                 |
+| depsHash                   | string                                       | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                                       |
+| cloneToken                 | string                                       | No       | Pre-resolved clone token for workers without provider credentials                                                                                                                                             |
+| encryptedSecrets           | string                                       | No       | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                                                     |
+| encryptedNamespacedSecrets | string                                       | No       | Encrypted namespaced secrets envelope                                                                                                                                                                         |
+| requestId                  | string                                       | No       | Trace ID for distributed tracing                                                                                                                                                                              |
+| traceId                    | string                                       | No       | Additional trace context                                                                                                                                                                                      |
 
 LabelMatcher: `{ kind: "exact", value: string }` or `{ kind: "regex", source: string, flags: string }`. Globs are converted to regex at compile time, so the wire only ever carries these two forms.
 
@@ -558,7 +559,7 @@ Response from the target peer carrying the reload result fields.
 
 #### peer.clusterSettings.request
 
-Cluster-settings pull request: a DB-less worker asks the leader for the current worker-settings snapshot after observing the leader's advertised `clusterSettingsVersion` (on `peer.heartbeat`) ahead of its own. The leader replies with `peer.clusterSettings.response`.
+Cluster-settings pull request: a DB-less worker asks its first connected coordinator for the current worker-settings snapshot after a coordinator advertised a `clusterSettingsVersion` (on `peer.heartbeat`) ahead of its own. Every coordinator reads the same `cluster_settings` row, so any coordinator answers. The coordinator replies with `peer.clusterSettings.response`.
 
 | Field     | Type                             | Required | Description           |
 | --------- | -------------------------------- | -------- | --------------------- |
@@ -569,7 +570,7 @@ Cluster-settings pull request: a DB-less worker asks the leader for the current 
 
 #### peer.clusterSettings.response
 
-Cluster-settings pull response: the leader resolves the worker-relevant settings snapshot from its cluster settings and replies with it plus the current version. The snapshot is a typed, concrete object (not an open key/value bus) — each worker-consumed cluster knob is a field on it.
+Cluster-settings pull response: the coordinator resolves the worker-relevant settings snapshot from its cluster settings and replies with it plus the current version. The snapshot is a typed, concrete object (not an open key/value bus) — each worker-consumed cluster knob is a field on it.
 
 | Field     | Type                              | Required | Description                                        |
 | --------- | --------------------------------- | -------- | -------------------------------------------------- |
@@ -579,6 +580,67 @@ Cluster-settings pull response: the leader resolves the worker-relevant settings
 | settings  | WorkerClusterSettings             | Yes      | Worker-settings snapshot (e.g., `agentTokenTtlMs`) |
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerClusterSettingsResponseSchema`, `workerClusterSettingsSchema`
+
+### Scaler orphans (per-instance targeting)
+
+#### peer.scaler.orphans.request
+
+Request forwarded from a coordinator to the node an operator targeted with `kici-admin scaler orphans --target`. The node answers from its own host and its own tracking with `peer.scaler.orphans.response`.
+
+| Field     | Type                            | Required | Description                                         |
+| --------- | ------------------------------- | -------- | --------------------------------------------------- |
+| type      | `"peer.scaler.orphans.request"` | Yes      | Message discriminator                               |
+| messageId | string                          | Yes      | Unique message ID                                   |
+| action    | `"list"` \| `"stop"`            | Yes      | List the live Firecracker VMs, or stop some of them |
+| vmIds     | string[]                        | No       | `stop` only: the VM IDs the operator approved       |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerOrphansRequestSchema`
+
+#### peer.scaler.orphans.response
+
+Response from the target node. `vms` answers a `list`, and `results` answers a `stop`. When `ok` is false, the response carries the node's `error` instead.
+
+| Field              | Type                             | Required | Description                                                                                                    |
+| ------------------ | -------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------- |
+| type               | `"peer.scaler.orphans.response"` | Yes      | Message discriminator                                                                                          |
+| messageId          | string                           | Yes      | Matches the request                                                                                            |
+| ok                 | boolean                          | Yes      | Whether the node answered the request                                                                          |
+| error              | string                           | No       | Why the node could not answer                                                                                  |
+| firecrackerScalers | string[]                         | No       | The node's Firecracker scaler names; empty when it runs none                                                   |
+| vms                | object[]                         | No       | Each live VM: `vmId`, `scaler`, `pid`, `startedAt`, `ageSeconds`, `chrootDir`, `status`, `trackedBy`, `reason` |
+| results            | object[]                         | No       | Each stop result: `vmId`, `outcome`, `pid`, `detail`                                                           |
+
+A VM `status` is `orphaned`, `unverified` or `tracked`. A stop `outcome` is `stopped`, `tracked`, `unverified`, `not-live`, `not-found` or `error`. Only `stopped` signalled a process.
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerOrphansResponseSchema`
+
+### Peer forget fan-out
+
+#### peer.forget.request
+
+A coordinator that forgot a departed peer (`kici-admin peer forget`) sends this message to each connected sibling coordinator, so each one drops the peer from its own live peer registry. A peer accepts it from coordinators only.
+
+| Field               | Type                    | Required | Description                                                                               |
+| ------------------- | ----------------------- | -------- | ----------------------------------------------------------------------------------------- |
+| type                | `"peer.forget.request"` | Yes      | Message discriminator                                                                     |
+| messageId           | string                  | Yes      | Unique message ID                                                                         |
+| instanceId          | string                  | Yes      | The departed peer's instance ID                                                           |
+| acknowledgeBackstop | boolean                 | No       | The operator acknowledged that the forget may switch the event-provision backstop back on |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerForgetRequestSchema`
+
+#### peer.forget.response
+
+What the sibling did with the request. `outcome` is `forgotten`, `not-found`, `connected`, `recent`, `acknowledgement-required` or `error`. Every outcome except `forgotten` keeps the peer.
+
+| Field     | Type                     | Required | Description                             |
+| --------- | ------------------------ | -------- | --------------------------------------- |
+| type      | `"peer.forget.response"` | Yes      | Message discriminator                   |
+| messageId | string                   | Yes      | Matches the request                     |
+| outcome   | string                   | Yes      | What the forget did on this coordinator |
+| detail    | string                   | Yes      | The reason, readable by an operator     |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerForgetResponseSchema`
 
 ### Agent-token revoke fan-out
 
@@ -600,15 +662,16 @@ Broadcast to every peer when an agent token is revoked so each peer can close it
 
 Forwarded by a worker to the coordinator that owns the run when the worker's scaler emits a provisioning event correlated to a queued job (e.g. a failed agent spawn). Workers have no database, so they cannot persist provisioning failures themselves — the coordinator's `ExecutionTracker` writes the event to the provisioning log and the dispatch queue's last-error column.
 
-| Field       | Type             | Required | Description                                                     |
-| ----------- | ---------------- | -------- | --------------------------------------------------------------- |
-| type        | `"scaler.event"` | Yes      | Message discriminator                                           |
-| runId       | string           | Yes      | Execution run ID                                                |
-| jobId       | string           | Yes      | Job ID within the run                                           |
-| agentId     | string           | Yes      | The scaler-managed agent ID the event is about                  |
-| eventType   | enum             | Yes      | Scaler event type (a `ScalerEventType` enum member)             |
-| detail      | string           | Yes      | Human-readable detail, including any captured spawn stderr tail |
-| timestampMs | number           | Yes      | Event timestamp in epoch milliseconds                           |
+| Field       | Type             | Required | Description                                                                                                                                                                                                                                |
+| ----------- | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| type        | `"scaler.event"` | Yes      | Message discriminator                                                                                                                                                                                                                      |
+| runId       | string           | Yes      | Execution run ID                                                                                                                                                                                                                           |
+| jobId       | string           | Yes      | Job ID within the run                                                                                                                                                                                                                      |
+| agentId     | string           | Yes      | The scaler-managed agent ID the event is about                                                                                                                                                                                             |
+| eventType   | enum             | Yes      | Scaler event type (a `ScalerEventType` enum member)                                                                                                                                                                                        |
+| detail      | string           | Yes      | Human-readable detail, including any captured spawn stderr tail                                                                                                                                                                            |
+| timestampMs | number           | Yes      | Event timestamp in epoch milliseconds                                                                                                                                                                                                      |
+| final       | boolean          | No       | Retry verdict on a `scaler.failed` for a job under the worker's spawn-retry budget: `false` while attempts remain, `true` on the last one. Absent on a repeated report of one failed spawn, on every other relay, and from an older worker |
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerEventSchema`
 
@@ -802,7 +865,7 @@ All protocol messages are validated at runtime using Zod discriminated unions. E
 
 **Peer-to-peer layer:**
 
-- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.clusterSettings.request`, `peer.clusterSettings.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
+- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.scaler.orphans.request`, `peer.scaler.orphans.response`, `peer.forget.request`, `peer.forget.response`, `peer.clusterSettings.request`, `peer.clusterSettings.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
 
 The upstream layers (orchestrator↔KiCI and browser↔KiCI) have their own discriminated unions.
 

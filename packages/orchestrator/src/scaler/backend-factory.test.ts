@@ -28,6 +28,7 @@ function ctx(overrides: Partial<BackendFactoryContext> = {}): BackendFactoryCont
     injectAgentToken: false,
     tokenTtlMs: 3_600_000,
     tokenTtlProvider: async () => 3_600_000,
+    firecrackerApiSocketWaitMsProvider: async () => 30_000,
     ipAllocator: (net) => new InMemoryIpAllocator(net),
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never,
     ...overrides,
@@ -40,6 +41,17 @@ describe('createScalerBackend', () => {
     expect(backend).not.toBeNull();
     // `requireSudo` is private; assert via the field the option drives.
     expect((backend as unknown as { requireSudo: boolean }).requireSudo).toBe(true);
+  });
+
+  it('passes the live API-socket wait resolver to the firecracker backend', async () => {
+    const provider = async () => 45_000;
+    const backend = await createScalerBackend(
+      fcEntry(),
+      ctx({ firecrackerApiSocketWaitMsProvider: provider }),
+    );
+    expect(
+      (backend as unknown as { apiSocketWaitMsProvider: unknown }).apiSocketWaitMsProvider,
+    ).toBe(provider);
   });
 
   it('leaves requireSudo off when the entry does not ask for it', async () => {

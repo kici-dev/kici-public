@@ -7,7 +7,7 @@ KiCI ships a starter monitoring pack for a self-hosted orchestrator: one importa
 
 ## What's in the pack
 
-- **[Grafana dashboard](../../../monitoring-pack/kici-orchestrator-dashboard.json)** — a single "KiCI orchestrator health" board. It shows fleet size, dispatch queue by status and runner label, and the event DLQ with delivery outcomes. It also shows scaler CPU/memory reservation, spawn failures, and the event-scaler reaper guards. The last rows show consecutive job failures, declared-host reachability, database collation drift, inbound webhook rate, org trust-policy gate decisions, state-replay breaker trips, and warm-pool fill.
+- **[Grafana dashboard](../../../monitoring-pack/kici-orchestrator-dashboard.json)** — a single "KiCI orchestrator health" board. It shows fleet size, dispatch queue by status and runner label, and the event DLQ with delivery outcomes. It also shows scaler CPU/memory reservation, spawn failures, the event-scaler reaper guards, and reserved scaler events that reached no workflow. The last rows show consecutive job failures, declared-host reachability, database collation drift, inbound webhook rate, org trust-policy gate decisions, state-replay breaker trips, and warm-pool fill.
 - **[Alert rules](../../../monitoring-pack/kici-orchestrator-alerts.yaml)** — Prometheus alert rules with tuned thresholds and per-rule rationale. Each one is listed with its expression and threshold rationale below.
 
 ## Import the dashboard

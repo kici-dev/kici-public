@@ -582,6 +582,28 @@ describe('admin registration routes', () => {
       });
     });
 
+    it('upserts without removing registrations the lock file omits', async () => {
+      // fails-when: the manual route prunes sibling registrations (a one-workflow
+      // seed of a repo deleted that repo's provisioning workflow this way)
+      const replaceAll = vi.fn();
+      deps = createMockDeps({
+        registrationStore: {
+          ...(createMockDeps().registrationStore as any),
+          replaceAll,
+          bumpVersion: vi.fn().mockResolvedValue(7),
+        },
+      });
+      app = createAdminRegistrationRoutes(deps);
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+
+      const res = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: lockBody([]),
+      });
+      expect(res.status).toBe(200);
+      expect(replaceAll.mock.calls[0][4].prune).toBe(false);
+    });
+
     it('accepts a binding to environments with no configured record (lenient)', async () => {
       // The lock binds env names that have no environment record in this
       // orchestrator. matchContext returns null → the binding is satisfiable

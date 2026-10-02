@@ -171,6 +171,9 @@ const baseSchema = z.object({
   // row. An operator who needs both attempts inside the 5-minute window sets
   // this knob below 150s and lowers the round budget with it.
   globalEvalWaitTimeoutMs: z.coerce.number().default(240_000), // 4 minutes
+  // How long a Firecracker spawn waits for the VM's API socket after the jailer
+  // starts. The cluster-wide default for cluster_settings.firecracker_api_socket_wait_ms.
+  firecrackerApiSocketWaitMs: z.coerce.number().int().min(1000).default(30_000),
   // Dispatch queue
   queueMaxDepth: z.coerce.number().default(1000),
   queueTimeoutMs: z.coerce.number().default(3_600_000), // 1 hour, 0 = indefinite
@@ -300,7 +303,8 @@ const baseSchema = z.object({
   ingestOverflowClaimTimeoutMs: z.coerce.number().int().min(60_000).default(900_000),
   // Cluster-wide defaults for the cross-peer reroute subsystem. Per-org
   // overrides live in org_settings.reroute_spawn_window_ms /
-  // reroute_ack_timeout_ms / reroute_max_hops (set via kici-admin org-settings).
+  // reroute_ack_timeout_ms / reroute_max_hops / reroute_spawn_max_attempts /
+  // reroute_spawn_retry_backoff_ms (set via kici-admin org-settings).
   // rerouteSpawnWindowMs: after a peer ACKs a reroute, how long the coordinator
   // waits for the first job.progress before treating "accepted but no progress"
   // as a spawn failure and re-dispatching to another backend / local fallback.
@@ -309,6 +313,13 @@ const baseSchema = z.object({
   rerouteAckTimeoutMs: z.coerce.number().int().min(1000).default(15_000),
   // rerouteMaxHops: maximum peer hops for a rerouted job (loop prevention).
   rerouteMaxHops: z.coerce.number().int().min(1).default(3),
+  // rerouteSpawnMaxAttempts: agent spawns a worker attempts for one rerouted job
+  // before it gives the job back to the coordinator (which then re-dispatches or
+  // fails it).
+  rerouteSpawnMaxAttempts: z.coerce.number().int().min(1).default(3),
+  // rerouteSpawnRetryBackoffMs: wait after a failed spawn before the worker's next
+  // attempt for a rerouted job.
+  rerouteSpawnRetryBackoffMs: z.coerce.number().int().min(0).default(5_000),
   // rerouteFlapGraceMs: grace window during which a rerouted job stays deferred
   // from the recovery sweepers while its worker peer momentarily flaps. Matches
   // DEFAULT_REROUTE_FLAP_GRACE_MS in cluster/rerouted-job-guard.ts. Cluster-wide
@@ -1032,6 +1043,7 @@ export const envDef = defineEnv({
     globalEvalCandidateTimeoutMs: 'KICI_GLOBAL_EVAL_CANDIDATE_TIMEOUT_MS',
     globalEvalCacheMax: 'KICI_GLOBAL_EVAL_CACHE_MAX',
     globalEvalWaitTimeoutMs: 'KICI_GLOBAL_EVAL_WAIT_TIMEOUT_MS',
+    firecrackerApiSocketWaitMs: 'KICI_FIRECRACKER_API_SOCKET_WAIT_MS',
     queueMaxDepth: 'KICI_QUEUE_MAX_DEPTH',
     queueTimeoutMs: 'KICI_QUEUE_TIMEOUT_MS',
     unroutableGraceMs: 'KICI_UNROUTABLE_GRACE_MS',
@@ -1061,6 +1073,8 @@ export const envDef = defineEnv({
     rerouteSpawnWindowMs: 'KICI_REROUTE_SPAWN_WINDOW_MS',
     rerouteAckTimeoutMs: 'KICI_REROUTE_ACK_TIMEOUT_MS',
     rerouteMaxHops: 'KICI_REROUTE_MAX_HOPS',
+    rerouteSpawnMaxAttempts: 'KICI_REROUTE_SPAWN_MAX_ATTEMPTS',
+    rerouteSpawnRetryBackoffMs: 'KICI_REROUTE_SPAWN_RETRY_BACKOFF_MS',
     rerouteFlapGraceMs: 'KICI_REROUTE_FLAP_GRACE_MS',
     scalerSpawnTimeoutMs: 'KICI_SCALER_SPAWN_TIMEOUT_MS',
     backupStalenessWarnHours: 'KICI_BACKUP_STALENESS_WARN_HOURS',

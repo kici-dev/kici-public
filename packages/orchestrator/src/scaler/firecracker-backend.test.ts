@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { uptime as osUptime } from 'node:os';
+import { promisify } from 'node:util';
 import type { LabelSetConfig } from './types.js';
 import type { IpAllocationResult } from './ip-allocator.js';
 import type { BridgeHealth } from '../firecracker/host-network.js';
@@ -52,9 +53,6 @@ const mockWriteFile = vi.fn().mockResolvedValue(undefined);
 const mockReadFile = vi.fn().mockResolvedValue('12345');
 const mockReaddir = vi.fn().mockResolvedValue([]);
 const mockStat = vi.fn().mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
-const mockReadlink = vi
-  .fn()
-  .mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
 const mockFdTruncate = vi.fn().mockResolvedValue(undefined);
 const mockFdClose = vi.fn().mockResolvedValue(undefined);
 const mockOpen = vi.fn().mockResolvedValue({ truncate: mockFdTruncate, close: mockFdClose });
@@ -68,7 +66,6 @@ vi.mock('node:fs/promises', () => ({
   readFile: (...args: unknown[]) => mockReadFile(...args),
   readdir: (...args: unknown[]) => mockReaddir(...args),
   stat: (...args: unknown[]) => mockStat(...args),
-  readlink: (...args: unknown[]) => mockReadlink(...args),
 }));
 
 // ── /proc scaffolding for `readVmPid` ────────────────────────────
@@ -115,6 +112,38 @@ function pidFileStat() {
   return { mtimeMs: Date.now(), isDirectory: () => false };
 }
 
+/** A VM chroot directory, with the device and inode its process root is compared with. */
+const CHROOT_DIR_STAT = { isDirectory: () => true, mtimeMs: 0, dev: 66305, ino: 10754804 };
+
+/** Run `body` with `process.kill` replaced by `kill`. */
+function withMockedKill<T>(kill: unknown, body: () => Promise<T>): Promise<T> {
+  const origKill = process.kill;
+  process.kill = kill as never;
+  return body().finally(() => {
+    process.kill = origKill;
+  });
+}
+
+// The backend logger, captured so a test can assert on the lines it writes.
+const loggerCapture = vi.hoisted(() => ({ byPrefix: new Map<string, unknown>() }));
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: (...args: Parameters<typeof actual.createLogger>) => {
+      const created = actual.createLogger(...args);
+      loggerCapture.byPrefix.set(args[0]?.prefix ?? '', created);
+      return created;
+    },
+  };
+});
+
+type BackendLogger = ReturnType<(typeof import('@kici-dev/shared'))['createLogger']>;
+
+function fcLogger(): BackendLogger {
+  return loggerCapture.byPrefix.get('firecracker-backend') as BackendLogger;
+}
+
 // Mock file-tail (prevent real fs.watchFile/unwatchFile calls from tailFile)
 vi.mock('./file-tail.js', () => ({
   tailFile: async function* () {
@@ -129,7 +158,8 @@ const mockSendCtrlAltDel = vi.fn().mockResolvedValue(undefined);
 const mockWaitForSocket = vi.fn().mockResolvedValue(true);
 
 vi.mock('./firecracker-api.js', () => ({
-  FirecrackerApi: vi.fn().mockImplementation(function () {
+  FirecrackerApi: vi.fn().mockImplementation(function (_socketPath: string, signal?: AbortSignal) {
+    lastApiSignal = signal;
     return {
       putMmds: mockPutMmds,
       clearMmds: mockClearMmds,
@@ -138,6 +168,9 @@ vi.mock('./firecracker-api.js', () => ({
     };
   }),
 }));
+
+/** The signal the backend gave the most recently built FirecrackerApi. */
+let lastApiSignal: AbortSignal | undefined;
 
 // Mock nftables module
 const mockEnsureKiciTable = vi.fn().mockResolvedValue(undefined);
@@ -151,6 +184,25 @@ vi.mock('@kici-dev/shared/net', async (importOriginal) => ({
   addHostIsolationRules: (...args: unknown[]) => mockAddHostIsolationRules(...args),
   removeIsolationRules: (...args: unknown[]) => mockRemoveIsolationRules(...args),
 }));
+
+// Overlay templates: only `ensure` is stubbed (it reads and formats on the real
+// filesystem, which `node:fs/promises` above replaces). The real
+// `createOverlay` still runs, so the per-spawn `cp` goes through `execAsync`.
+// The template cache itself is covered on a real filesystem in
+// overlay-template.test.ts.
+const mockEnsureOverlayTemplate = vi.fn(
+  async (sizeMib: number) =>
+    `/srv/jailer/firecracker/.overlay-templates/overlay-${sizeMib}mib.ext4`,
+);
+vi.mock('./overlay-template.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./overlay-template.js')>();
+  class StubbedOverlayTemplates extends actual.OverlayTemplates {
+    override async ensure(sizeMib: number): Promise<string> {
+      return mockEnsureOverlayTemplate(sizeMib);
+    }
+  }
+  return { ...actual, OverlayTemplates: StubbedOverlayTemplates };
+});
 
 // Mock IpAllocator
 function createMockIpAllocator() {
@@ -173,6 +225,11 @@ function createMockIpAllocator() {
 
 // Import after mocking
 const { FirecrackerScalerBackend } = await import('./firecracker-backend.js');
+// Imported after the mocks: a static import pulls node:child_process into the
+// graph before the mock consts initialize.
+const { CommandError } = await import('@kici-dev/shared');
+const { generateTapName } = await import('./ip-allocator.js');
+const { ScalerVmStopOutcome, ScalerVmTracker } = await import('@kici-dev/engine');
 
 // ── Test setup ───────────────────────────────────────────────────
 
@@ -230,7 +287,6 @@ describe('FirecrackerScalerBackend', () => {
       if (String(p).endsWith('firecracker.pid')) return pidFileStat();
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
-    mockReadlink.mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
     mockLink.mockResolvedValue(undefined);
     mockMkdir.mockResolvedValue(undefined);
     mockRm.mockResolvedValue(undefined);
@@ -373,7 +429,7 @@ describe('FirecrackerScalerBackend', () => {
       );
 
       // waitForSocket called
-      expect(mockWaitForSocket).toHaveBeenCalledWith(5000);
+      expect(mockWaitForSocket).toHaveBeenCalledWith(30_000);
 
       // MMDS metadata injected (orchestrator URL, agent ID, labels, scaler-managed
       // flag). A scaler with no `extraHosts` gives the guest no host mapping.
@@ -507,6 +563,37 @@ describe('FirecrackerScalerBackend', () => {
       ).rejects.toThrow('Label set [windows, gpu] not supported by Firecracker backend "test-fc"');
     });
 
+    it('reclaims chroot ownership before removing a failed spawn on rootless nodes', async () => {
+      // By the time a spawn fails the chroot may already belong to the jailer
+      // uid. fails-when: a plain rm runs as the orchestrator user, fails with
+      // EACCES, and the chroot leaks until the disk fills.
+      const { backend } = createBackend({ requireSudo: true });
+      mockSpawn.mockImplementation(() => {
+        throw new Error('jailer failed');
+      });
+
+      await expect(
+        backend.spawn(['linux', 'firecracker'], 'agent-own', 'ws://localhost:8080/ws/agent'),
+      ).rejects.toThrow('jailer failed');
+
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'sudo',
+        [
+          '-n',
+          'chown',
+          '-R',
+          `${process.getuid!()}:${process.getgid!()}`,
+          '/srv/jailer/firecracker/agent-own',
+        ],
+        expect.any(Object),
+        expect.any(Function),
+      );
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/agent-own', {
+        recursive: true,
+        force: true,
+      });
+    });
+
     it('cleans up on failure: releases IP, deletes TAP, cleans chroot', async () => {
       const { backend, mockIpAllocator } = createBackend();
 
@@ -540,13 +627,193 @@ describe('FirecrackerScalerBackend', () => {
       expect(backend.getActiveCount()).toBe(0);
     });
 
+    /**
+     * Make the overlay `cp` reject with the error a REAL `execFile` produced
+     * for `script`, so the fields the backend reads are Node's own, not a guess.
+     */
+    async function overlayCopyFailsLike(script: string, timeoutMs?: number): Promise<void> {
+      const real = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      // Promisified, as in production: only that form attaches stdout/stderr
+      // to the rejection.
+      const realErr = await promisify(real.execFile)(
+        'sh',
+        ['-c', script],
+        timeoutMs ? { timeout: timeoutMs } : {},
+      ).then(
+        () => {
+          throw new Error(`expected \`${script}\` to fail`);
+        },
+        (e: unknown) => e as Error,
+      );
+      mockExecFile.mockImplementation((cmd, args, opts, callback) => {
+        if (cmd === 'cp') callback(realErr, { stdout: '', stderr: '' });
+        else defaultExecFileImpl(cmd, args, opts, callback);
+      });
+    }
+
+    it('reports a failed spawn step with its exit code and stderr', async () => {
+      const { backend } = createBackend();
+      await overlayCopyFailsLike(
+        'echo "cp: error writing \'overlay.ext4\': No space left on device" >&2; exit 1',
+      );
+      const failures: string[] = [];
+
+      const err = await backend
+        .spawn(['linux', 'firecracker'], 'agent-cp', 'ws://localhost:8080/ws/agent', (e) => {
+          if (e.eventType === 'scaler.failed') failures.push(e.detail ?? '');
+        })
+        .catch((e: unknown) => e);
+
+      // fails-when: execAsync rethrows the bare execFile error — the detail is
+      // then `Command failed: cp …` with no exit code.
+      expect(err).toBeInstanceOf(CommandError);
+      expect(err).toMatchObject({ exitCode: 1, timedOut: false });
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatch(
+        /^Command `cp --reflink=auto --sparse=always \/srv\/jailer\/firecracker\/\.overlay-templates\/overlay-2048mib\.ext4 \/srv\/jailer\/firecracker\/agent-cp\/root\/overlay\.ext4` exited with code 1 after \d+ ms; stderr: cp: error writing 'overlay\.ext4': No space left on device$/,
+      );
+      // breaks-if-wrong: the failed spawn must still be cleaned up.
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    it('reports a spawn step the 30s timeout killed, even when it printed nothing', async () => {
+      const { backend } = createBackend();
+      // A quiet command prints nothing; the kill is the only signal there is.
+      await overlayCopyFailsLike('sleep 5', 100);
+      const failures: string[] = [];
+
+      const err = await backend
+        .spawn(['linux', 'firecracker'], 'agent-slow', 'ws://localhost:8080/ws/agent', (e) => {
+          if (e.eventType === 'scaler.failed') failures.push(e.detail ?? '');
+        })
+        .catch((e: unknown) => e);
+
+      // fails-when: the detail stays the bare command line, which is what the
+      // arm64 worker logged for a failure nobody could diagnose.
+      expect(err).toMatchObject({ timedOut: true, signal: 'SIGTERM', exitCode: null });
+      expect(failures[0]).toContain(
+        'Command `cp --reflink=auto --sparse=always /srv/jailer/firecracker/.overlay-templates/overlay-2048mib.ext4 /srv/jailer/firecracker/agent-slow/root/overlay.ext4` timed out: killed by SIGTERM',
+      );
+      expect(failures[0]).toContain('(timeout 30000 ms); stderr: (empty)');
+    });
+
+    it('copies the overlay from the template and never formats during a spawn', async () => {
+      const { backend } = createBackend();
+
+      await backend.spawn(['linux', 'firecracker'], 'agent-ov', 'ws://localhost:8080/ws/agent');
+
+      const calls = mockExecFile.mock.calls.map((c) => [c[0], c[1]] as [string, string[]]);
+      // fails-when: the spawn path formats the overlay itself, whose fsync
+      // waits behind the host disk's write-back backlog.
+      expect(calls.filter(([cmd]) => cmd === 'mkfs.ext4')).toEqual([]);
+      expect(calls).toContainEqual([
+        'cp',
+        [
+          '--reflink=auto',
+          '--sparse=always',
+          '/srv/jailer/firecracker/.overlay-templates/overlay-2048mib.ext4',
+          '/srv/jailer/firecracker/agent-ov/root/overlay.ext4',
+        ],
+      ]);
+      expect(mockEnsureOverlayTemplate).toHaveBeenCalledWith(2048);
+    });
+
     it('throws when socket is not ready within timeout', async () => {
       const { backend } = createBackend();
       mockWaitForSocket.mockResolvedValue(false);
 
       await expect(
         backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent'),
-      ).rejects.toThrow('Firecracker API socket not ready within 5s');
+      ).rejects.toThrow('Firecracker API socket not ready within 30000 ms for agent agent-1');
+      // The default: generous enough for a jailer copying its binary on a busy disk.
+      expect(mockWaitForSocket).toHaveBeenCalledWith(30_000);
+    });
+
+    it('ends the socket wait as soon as the jailer exits with an error', async () => {
+      // fails-when: a jailer that died during boot holds the spawn for the
+      // full wait (30 s) and is then reported as a slow socket.
+      mockWaitForSocket.mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            const check = () => (lastApiSignal?.aborted ? resolve(false) : setTimeout(check, 10));
+            check();
+          }),
+      );
+      const { backend } = createBackend();
+      const spawning = backend
+        .spawn(['linux', 'firecracker'], 'agent-dies', 'ws://localhost:8080/ws/agent')
+        .catch((e: unknown) => e);
+      await vi.waitFor(() => expect(mockWaitForSocket).toHaveBeenCalled());
+      const exitListeners = mockChildProcess.on.mock.calls.filter((c) => c[0] === 'exit');
+
+      for (const [, listener] of exitListeners) (listener as (c: number) => void)(1);
+      const err = await spawning;
+
+      expect(String(err)).toContain('Jailer exited during boot (code 1) for agent agent-dies');
+    });
+
+    it('keeps waiting when the jailer parent exits cleanly', async () => {
+      // breaks-if-wrong: under --new-pid-ns the jailer parent exits 0 right
+      // after start; that must not end the wait.
+      let release!: (ready: boolean) => void;
+      mockWaitForSocket.mockImplementation(() => new Promise<boolean>((r) => (release = r)));
+      const { backend } = createBackend();
+      const spawning = backend.spawn(
+        ['linux', 'firecracker'],
+        'agent-clean',
+        'ws://localhost:8080/ws/agent',
+      );
+      await vi.waitFor(() => expect(mockWaitForSocket).toHaveBeenCalled());
+      for (const [event, listener] of mockChildProcess.on.mock.calls) {
+        if (event === 'exit') (listener as (c: number) => void)(0);
+      }
+
+      expect(lastApiSignal?.aborted).toBe(false);
+      release(true);
+      await expect(spawning).resolves.toBeDefined();
+    });
+
+    it('runs one chroot chmod at a time on a rootless host', async () => {
+      // fails-when: a slow `sudo chmod -R` is started again on every 100 ms
+      // tick, piling up processes on the slow-disk host the wait is raised for.
+      let chmodCalls = 0;
+      mockExecFile.mockImplementation((cmd, args, opts, callback) => {
+        if (cmd === 'sudo' && args[1] === 'chmod') {
+          chmodCalls += 1;
+          setTimeout(() => callback(null, { stdout: '', stderr: '' }), 600);
+        } else defaultExecFileImpl(cmd, args, opts, callback);
+      });
+      mockWaitForSocket.mockImplementation(
+        () => new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 650)),
+      );
+      const { backend } = createBackend({ requireSudo: true });
+
+      await backend.spawn(['linux', 'firecracker'], 'agent-slowfs', 'ws://localhost:8080/ws/agent');
+
+      expect(chmodCalls).toBeGreaterThanOrEqual(1);
+      expect(chmodCalls).toBeLessThanOrEqual(2);
+    });
+
+    it('reads the API-socket wait per spawn', async () => {
+      // fails-when: the wait is read once at construction (or hardcoded), so
+      // an operator's cluster_settings change needs a restart to apply.
+      let waitMs = 45_000;
+      const { backend } = createBackend({ apiSocketWaitMsProvider: async () => waitMs });
+
+      await backend.spawn(['linux', 'firecracker'], 'agent-w1', 'ws://localhost:8080/ws/agent');
+      waitMs = 60_000;
+      await backend.spawn(['linux', 'firecracker'], 'agent-w2', 'ws://localhost:8080/ws/agent');
+
+      expect(mockWaitForSocket.mock.calls.map((c) => c[0])).toEqual([45_000, 60_000]);
+    });
+
+    it('names the configured wait when the socket never appears', async () => {
+      const { backend } = createBackend({ apiSocketWaitMsProvider: async () => 45_000 });
+      mockWaitForSocket.mockResolvedValue(false);
+
+      await expect(
+        backend.spawn(['linux', 'firecracker'], 'agent-w3', 'ws://localhost:8080/ws/agent'),
+      ).rejects.toThrow('not ready within 45000 ms');
     });
 
     it('applies per-VM saddr-keyed nftables isolation rules during spawn', async () => {
@@ -963,14 +1230,6 @@ describe('FirecrackerScalerBackend', () => {
     /** A directory `stat` result — only `isDirectory()` is read. */
     const dirStat = { isDirectory: () => true };
 
-    function withMockedKill<T>(kill: ReturnType<typeof vi.fn>, body: () => Promise<T>): Promise<T> {
-      const origKill = process.kill;
-      process.kill = kill as never;
-      return body().finally(() => {
-        process.kill = origKill;
-      });
-    }
-
     it('reclaims a VM whose chroot is on this host but which the backend no longer tracks', async () => {
       // The leak: an orchestrator restart empties the in-memory agent map, so
       // `destroy()` returns at its first line while the VM keeps running, and
@@ -1125,6 +1384,604 @@ describe('FirecrackerScalerBackend', () => {
     });
   });
 
+  describe('listLiveVms()', () => {
+    const dirStat = { isDirectory: () => true };
+
+    it('lists a running, identity-confirmed VM with its pid, start time and chroot', async () => {
+      const { backend } = createBackend();
+      mockReaddir.mockResolvedValue(['.overlay-templates', 'scaler-firecracker-aaaa1111']);
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
+      );
+      mockPidFile('4242');
+
+      const vms = await backend.listLiveVms();
+
+      expect(vms).toEqual([
+        {
+          vmId: 'scaler-firecracker-aaaa1111',
+          scaler: 'test-fc',
+          pid: 4242,
+          startedAtMs: expect.any(Number),
+          identityConfirmed: true,
+          chrootDir: '/srv/jailer/firecracker/scaler-firecracker-aaaa1111/root',
+        },
+      ]);
+      // procStatLine starts the process five minutes ago.
+      expect(vms[0]!.startedAtMs).toBeLessThan(Date.now() - 4 * 60_000);
+      expect(vms[0]!.startedAtMs).toBeGreaterThan(Date.now() - 6 * 60_000);
+    });
+
+    it('lists an unconfirmed running process with the reason it is unconfirmed', async () => {
+      const { backend } = createBackend();
+      mockReaddir.mockResolvedValue(['scaler-firecracker-eeee5555']);
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
+      );
+      mockPidFile('4242', 'sleep');
+
+      const vms = await backend.listLiveVms();
+
+      expect(vms).toEqual([
+        expect.objectContaining({ identityConfirmed: false, detail: 'comm="sleep"' }),
+      ]);
+    });
+
+    // fails-when: a recycled PID (started after its PID file was written) reads as a live VM
+    it('omits a VM whose PID number was recycled', async () => {
+      const { backend } = createBackend();
+      mockReaddir.mockResolvedValue(['scaler-firecracker-bbbb2222']);
+      mockStat.mockImplementation(async () => ({
+        mtimeMs: Date.now() - 10 * 60_000,
+        isDirectory: () => true,
+      }));
+      mockReadFile.mockImplementation(async (p: string) =>
+        String(p).startsWith('/proc/') ? procStatLine('firecracker', 60_000) : '4242',
+      );
+
+      expect(await backend.listLiveVms()).toEqual([]);
+    });
+
+    it('omits a VM whose process is gone', async () => {
+      const { backend } = createBackend();
+      mockReaddir.mockResolvedValue(['scaler-firecracker-cccc3333']);
+      mockDeadPidFiles();
+
+      expect(await backend.listLiveVms()).toEqual([]);
+    });
+  });
+
+  describe('stopUntrackedVm()', () => {
+    const dirStat = { isDirectory: () => true };
+    const VM = 'scaler-firecracker-dddd4444';
+
+    /**
+     * A live VM with a chroot on this host whose firecracker process (PID
+     * 4242) exits once SIGKILL reaches it. Returns the `process.kill` mock.
+     */
+    function liveUntilKilled(): Mock<(pid: number, sig?: string | number) => boolean> {
+      let alive = true;
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
+      );
+      mockReadFile.mockImplementation(async (p: string) => {
+        if (String(p).startsWith('/proc/')) {
+          if (!alive) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+          return procStatLine('firecracker');
+        }
+        return '4242';
+      });
+      return vi.fn((_pid: number, sig?: string | number) => {
+        if (sig === 'SIGKILL') alive = false;
+        else if (!alive) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+        return true;
+      });
+    }
+
+    it('stops an untracked live VM and reclaims its TAP and chroot', async () => {
+      const { backend } = createBackend();
+      const kill = liveUntilKilled();
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result).toEqual({
+        vmId: VM,
+        outcome: ScalerVmStopOutcome.enum.stopped,
+        pid: 4242,
+        detail: 'stopped',
+      });
+      expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'ip',
+        ['link', 'del', generateTapName(VM)],
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockRm).toHaveBeenCalledWith(`/srv/jailer/firecracker/${VM}`, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    it('releases the address, rules and TAP its own allocation row names', async () => {
+      const { backend, mockIpAllocator } = createBackend();
+      const kill = liveUntilKilled();
+      mockIpAllocator.getAllocationForVm.mockResolvedValue({
+        ip: '10.0.0.7',
+        vm_id: VM,
+        scaler_name: 'test-fc',
+        tap_device: 'kici-dddd4444',
+        mac_address: '06:00:AC:00:00:07',
+      });
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum.stopped);
+      expect(mockRemoveIsolationRules).toHaveBeenCalledWith('10.0.0.7', expect.anything());
+      expect(mockIpAllocator.release).toHaveBeenCalledWith(VM);
+    });
+
+    // fails-when: the tracked check runs before the awaited /proc probe instead of in the signal's tick
+    it('race: a VM that turns tracked while its probe is awaited is never signalled', async () => {
+      const { backend } = createBackend();
+      const kill = liveUntilKilled();
+      let tracked = false;
+      const inner = mockReadFile.getMockImplementation()!;
+      mockReadFile.mockImplementation(async (p: string) => {
+        // A registration lands while the /proc probe is in flight.
+        if (String(p).startsWith('/proc/')) tracked = true;
+        return inner(p);
+      });
+
+      const result = await withMockedKill(kill, () =>
+        backend.stopUntrackedVm(VM, () => (tracked ? [ScalerVmTracker.enum.registered] : [])),
+      );
+
+      expect(result).toMatchObject({
+        outcome: ScalerVmStopOutcome.enum.tracked,
+        detail: 'tracked: registered',
+      });
+      expect(kill).not.toHaveBeenCalledWith(4242, 'SIGKILL');
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    it('refuses a VM the backend itself tracks', async () => {
+      const { backend } = createBackend();
+      await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
+      vi.clearAllMocks();
+      mockExecFile.mockImplementation(defaultExecFileImpl);
+      const kill = liveUntilKilled();
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm('agent-1', () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum.tracked);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    // fails-when: `x/../<tracked id>` reaches the tracked VM's chroot past every tracker lookup
+    it('refuses an id that aliases a tracked VM through a path, touching nothing', async () => {
+      const { backend } = createBackend();
+      await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
+      vi.clearAllMocks();
+      mockExecFile.mockImplementation(defaultExecFileImpl);
+      const kill = liveUntilKilled();
+
+      const result = await withMockedKill(kill, () =>
+        backend.stopUntrackedVm('scaler-firecracker-x/../agent-1', () => []),
+      );
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum['not-found']);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    // fails-when: a recycled PID is signalled
+    it('PID reuse: a recycled number is not-live, nothing signalled, chroot kept', async () => {
+      const { backend } = createBackend();
+      mockStat.mockImplementation(async () => ({
+        mtimeMs: Date.now() - 10 * 60_000,
+        isDirectory: () => true,
+      }));
+      mockReadFile.mockImplementation(async (p: string) =>
+        String(p).startsWith('/proc/') ? procStatLine('firecracker', 60_000) : '4242',
+      );
+      const kill = vi.fn();
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum['not-live']);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    // breaks-if-wrong: a PID that started before its PID file was written is still this VM's
+    it('PID reuse control: a process that predates its PID file is still stopped', async () => {
+      const { backend } = createBackend();
+      const kill = liveUntilKilled();
+      // The PID file was written a minute ago; the process started five minutes ago.
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid')
+          ? { mtimeMs: Date.now() - 60_000, isDirectory: () => false }
+          : dirStat,
+      );
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum.stopped);
+      expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
+    });
+
+    it('refuses a running process whose identity is unconfirmed, touching nothing', async () => {
+      const { backend } = createBackend();
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
+      );
+      mockPidFile('4242', 'postgres');
+      const kill = vi.fn();
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result).toMatchObject({
+        outcome: ScalerVmStopOutcome.enum.unverified,
+        pid: 4242,
+        detail: expect.stringContaining('comm="postgres"'),
+      });
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    it('reports not-found when this host has no chroot for the id', async () => {
+      const { backend } = createBackend();
+      // mockStat rejects ENOENT for every non-PID-file path by default.
+      const kill = vi.fn();
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum['not-found']);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    // fails-when: the sudo fallback runs kill as root instead of as the jailer uid
+    it('escalates an EPERM through sudo as the jailer uid on a rootless host', async () => {
+      const { backend } = createBackend({ requireSudo: true });
+      const kill = liveUntilKilled();
+      kill.mockImplementationOnce(() => {
+        throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      });
+      // The sudo kill succeeds and the process is gone afterwards.
+      mockExecFile.mockImplementation((cmd, args, _o, cb) => {
+        if (cmd === 'sudo' && args.includes('kill')) kill(4242, 'SIGKILL');
+        cb(null, { stdout: '', stderr: '' });
+      });
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'sudo',
+        ['-n', '-u', '#1000', 'kill', '-s', 'KILL', '4242'],
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum.stopped);
+      expect(mockRm).toHaveBeenCalledWith(`/srv/jailer/firecracker/${VM}`, expect.anything());
+    });
+
+    it('reports error naming the sudoers line when the sudo kill fails too', async () => {
+      const { backend } = createBackend({ requireSudo: true });
+      const kill = liveUntilKilled();
+      kill.mockImplementationOnce(() => {
+        throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      });
+      mockExecFile.mockImplementation((cmd, args, _o, cb) => {
+        if (cmd === 'sudo' && args.includes('kill')) {
+          cb(Object.assign(new Error('sudo: a password is required'), { code: 1 }), {
+            stdout: '',
+            stderr: 'sudo: a password is required',
+          });
+          return;
+        }
+        cb(null, { stdout: '', stderr: '' });
+      });
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum.error);
+      expect(result.detail).toContain('ALL=(#1000) NOPASSWD: /usr/bin/kill');
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    // fails-when: EPERM is swallowed as "already dead"
+    it('reports error and keeps the chroot when EPERM cannot be escalated', async () => {
+      const { backend } = createBackend();
+      const kill = liveUntilKilled();
+      kill.mockImplementation((_pid: number, sig?: string | number) => {
+        if (sig === 'SIGKILL') throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+        return true;
+      });
+
+      const result = await withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+
+      expect(result.outcome).toBe(ScalerVmStopOutcome.enum.error);
+      expect(result.detail).toContain('EPERM');
+      expect(result.detail).toContain('CAP_KILL');
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    it('reports error and keeps the chroot when the process survives SIGKILL', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+      try {
+        const { backend } = createBackend();
+        const kill = liveUntilKilled();
+        kill.mockImplementation(() => true);
+
+        const pending = withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+        await vi.advanceTimersByTimeAsync(6_000);
+        const result = await pending;
+
+        expect(result).toMatchObject({
+          outcome: ScalerVmStopOutcome.enum.error,
+          detail: 'process did not exit after SIGKILL; chroot kept',
+        });
+        expect(mockRm).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // fails-when: an EPERM from signal 0 reads as "exited", so the stop reports success
+    it('waits for a rootless process that answers signal 0 with EPERM', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+      try {
+        const { backend } = createBackend({ requireSudo: true });
+        liveUntilKilled();
+        // Every direct signal is refused; the sudo kill "succeeds" yet the
+        // process stays: an orchestrator that cannot see it exit must not
+        // report it stopped.
+        const kill = vi.fn(() => {
+          throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+        });
+
+        const pending = withMockedKill(kill, () => backend.stopUntrackedVm(VM, () => []));
+        await vi.advanceTimersByTimeAsync(6_000);
+        const result = await pending;
+
+        expect(result.outcome).toBe(ScalerVmStopOutcome.enum.error);
+        expect(mockRm).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('host reclaim lock', () => {
+    const dirStat = { isDirectory: () => true };
+    const VM = 'scaler-firecracker-ffff6666';
+
+    // fails-when: cleanupOrphans starts while a stop holds the lock
+    it('a cleanupOrphans call waits for an in-flight stop', async () => {
+      const { backend, mockIpAllocator } = createBackend();
+      let alive = true;
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
+      );
+      mockReadFile.mockImplementation(async (p: string) => {
+        if (String(p).startsWith('/proc/')) {
+          if (!alive) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+          return procStatLine('firecracker');
+        }
+        return '4242';
+      });
+      const kill = vi.fn((_pid: number, sig?: string | number) => {
+        if (sig === 'SIGKILL') alive = false;
+        return true;
+      });
+      // The stop's TAP deletion blocks until released.
+      let releaseTap!: () => void;
+      const tapGate = new Promise<void>((resolve) => {
+        releaseTap = resolve;
+      });
+      mockExecFile.mockImplementation((cmd, args, _o, cb) => {
+        if (cmd === 'ip' && args[0] === 'link' && args[1] === 'del') {
+          void tapGate.then(() => cb(null, { stdout: '', stderr: '' }));
+          return;
+        }
+        cb(null, { stdout: '', stderr: '' });
+      });
+
+      const origKill = process.kill;
+      process.kill = kill as never;
+      try {
+        const stop = backend.stopUntrackedVm(VM, () => []);
+        const sweep = backend.cleanupOrphans();
+        await vi.waitFor(() => {
+          expect(mockExecFile).toHaveBeenCalledWith(
+            'ip',
+            ['link', 'del', generateTapName(VM)],
+            expect.anything(),
+            expect.anything(),
+          );
+        });
+        expect(mockIpAllocator.getAllocations).not.toHaveBeenCalled();
+
+        releaseTap();
+        await stop;
+        await sweep;
+        expect(mockIpAllocator.getAllocations).toHaveBeenCalled();
+      } finally {
+        process.kill = origKill;
+      }
+    });
+
+    // breaks-if-wrong: a lone sweep still runs and reclaims a dead VM
+    it('cleanupOrphans alone still reclaims a dead VM', async () => {
+      const { backend, mockIpAllocator } = createBackend();
+      mockReaddir.mockResolvedValue(['dead-vm']);
+      mockDeadPidFiles();
+      mockIpAllocator.getAllocations.mockResolvedValue([]);
+
+      await backend.cleanupOrphans();
+      await backend.cleanupOrphans();
+
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/dead-vm', {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    // fails-when: a reclaim that rejects leaves the chain rejected, so every later reclaim fails
+    it('a rejected reclaim does not wedge the next one', async () => {
+      const { backend } = createBackend();
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
+      );
+      mockPidFile('4242');
+      const kill = vi.fn();
+
+      await expect(
+        withMockedKill(kill, () =>
+          backend.stopUntrackedVm(VM, () => {
+            throw new Error('tracker read failed');
+          }),
+        ),
+      ).rejects.toThrow('tracker read failed');
+      expect(kill).not.toHaveBeenCalled();
+
+      mockReaddir.mockResolvedValue(['dead-vm']);
+      mockDeadPidFiles();
+      await backend.cleanupOrphans();
+
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/dead-vm', expect.anything());
+    });
+  });
+
+  describe('signalVmProcess via destroy()', () => {
+    async function spawnLive(requireSudo: boolean) {
+      const created = createBackend({ requireSudo });
+      await created.backend.spawn(
+        ['linux', 'firecracker'],
+        'agent-1',
+        'ws://localhost:8080/ws/agent',
+      );
+      vi.clearAllMocks();
+      mockExecFile.mockImplementation(defaultExecFileImpl);
+      // arm64 shape: no graceful shutdown, so destroy goes straight to the kill.
+      mockSendCtrlAltDel.mockRejectedValue(new Error('unsupported'));
+      mockPidFile('4242');
+      return created;
+    }
+
+    it('destroy escalates EPERM on a rootless host and still tears down', async () => {
+      const { backend, mockIpAllocator } = await spawnLive(true);
+      const kill = vi.fn(() => {
+        throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      });
+
+      await withMockedKill(kill, () => backend.destroy('agent-1'));
+
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'sudo',
+        ['-n', '-u', '#1000', 'kill', '-s', 'KILL', '4242'],
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-1');
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/agent-1', expect.anything());
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    // fails-when: destroy deletes the chroot of a process it could not signal, so
+    // `kici-admin scaler orphans` can never list the VM that keeps running
+    it('destroy logs an EPERM it cannot escalate, releases the VM and keeps its chroot', async () => {
+      const { backend, mockIpAllocator } = await spawnLive(false);
+      const errorLog = vi.spyOn(fcLogger(), 'error');
+      const kill = vi.fn(() => {
+        throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      });
+
+      await withMockedKill(kill, () => backend.destroy('agent-1'));
+
+      expect(errorLog).toHaveBeenCalledWith(
+        'firecracker: could not signal a VM process; it keeps running',
+        expect.objectContaining({ pid: 4242, error: expect.stringContaining('CAP_KILL') }),
+      );
+      expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-1');
+      expect(mockRm).not.toHaveBeenCalled();
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    // breaks-if-wrong: an already-dead VM stays silent
+    it('destroy treats ESRCH as already dead without an error line', async () => {
+      const { backend, mockIpAllocator } = await spawnLive(true);
+      const errorLog = vi.spyOn(fcLogger(), 'error');
+      const kill = vi.fn(() => {
+        throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+      });
+
+      await withMockedKill(kill, () => backend.destroy('agent-1'));
+
+      expect(errorLog).not.toHaveBeenCalled();
+      expect(mockExecFile).not.toHaveBeenCalledWith(
+        'sudo',
+        expect.arrayContaining(['kill']),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-1');
+    });
+  });
+
+  describe('reapUnowned() identity gate', () => {
+    // fails-when: reapUnowned tears down a VM whose process it could not signal
+    it('keeps the chroot, address and rules of a process it cannot signal', async () => {
+      const { backend, mockIpAllocator } = createBackend();
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : { isDirectory: () => true },
+      );
+      mockPidFile('12345');
+      mockIpAllocator.getAllocationForVm.mockResolvedValue({
+        ip: '10.0.0.2',
+        vm_id: 'scaler-firecracker-eperm',
+        scaler_name: 'test-fc',
+        tap_device: 'kici-aaaaaaaa',
+        mac_address: '06:00:AC:00:00:02',
+      });
+      const kill = vi.fn(() => {
+        throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      });
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-eperm'),
+      );
+
+      expect(kill).toHaveBeenCalledWith(12345, 'SIGKILL');
+      expect(reaped).toBe(false);
+      expect(mockRm).not.toHaveBeenCalled();
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      expect(mockRemoveIsolationRules).not.toHaveBeenCalled();
+    });
+
+    // fails-when: reapUnowned deletes the chroot under a running process it cannot identify
+    it('keeps the chroot of a running process whose identity is unconfirmed', async () => {
+      const { backend, mockIpAllocator } = createBackend();
+      mockStat.mockImplementation(async (p: string) =>
+        String(p).endsWith('firecracker.pid') ? pidFileStat() : { isDirectory: () => true },
+      );
+      mockPidFile('4242', 'postgres');
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-unknown'),
+      );
+
+      expect(reaped).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+    });
+  });
+
   describe('shutdownAll()', () => {
     it('destroys all managed agents', async () => {
       const { backend, mockIpAllocator } = createBackend();
@@ -1250,6 +2107,27 @@ describe('FirecrackerScalerBackend', () => {
   });
 
   describe('cleanupOrphans()', () => {
+    it('leaves the overlay template directory alone', async () => {
+      // breaks-if-wrong: the templates sit beside the VM chroots; read as a VM
+      // id, the directory would be "reaped" on every sweep.
+      const { backend, mockIpAllocator } = createBackend();
+      mockIpAllocator.getAllocations.mockResolvedValue([]);
+      mockDeadPidFiles();
+      mockReaddir.mockResolvedValueOnce(['.overlay-templates', 'orphan-dir-1']);
+
+      const cleaned = await backend.cleanupOrphans();
+
+      expect(cleaned).toBe(1);
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/orphan-dir-1', {
+        recursive: true,
+        force: true,
+      });
+      expect(mockRm).not.toHaveBeenCalledWith(
+        '/srv/jailer/firecracker/.overlay-templates',
+        expect.anything(),
+      );
+    });
+
     it('releases stale IPs and cleans stale directories', async () => {
       const { backend, mockIpAllocator } = createBackend();
 
@@ -2071,32 +2949,24 @@ describe('FirecrackerScalerBackend', () => {
     // host process.
     const dirStat = { isDirectory: () => true, mtimeMs: Date.now() };
 
-    function withMockedKill<T>(kill: ReturnType<typeof vi.fn>, body: () => Promise<T>): Promise<T> {
-      const origKill = process.kill;
-      process.kill = kill as never;
-      return body().finally(() => {
-        process.kill = origKill;
-      });
-    }
-
     async function destroyWithProc(
       readFileImpl: (p: string) => Promise<string>,
       kill: ReturnType<typeof vi.fn>,
-      readlinkImpl?: (p: string) => Promise<string>,
+      procRootStat?: () => Promise<{ dev: number; ino: number }>,
     ): Promise<void> {
       const { backend } = createBackend();
       await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
       vi.clearAllMocks();
       mockExecFile.mockImplementation(defaultExecFileImpl);
       mockReadFile.mockImplementation(readFileImpl);
-      mockStat.mockImplementation(async (p: string) =>
-        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
-      );
-      if (readlinkImpl) {
-        mockReadlink.mockImplementation(readlinkImpl);
-      } else {
-        mockReadlink.mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
-      }
+      mockStat.mockImplementation(async (p: string) => {
+        if (String(p).endsWith('firecracker.pid')) return pidFileStat();
+        if (String(p).startsWith('/proc/')) {
+          if (procRootStat) return procRootStat();
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        }
+        return CHROOT_DIR_STAT;
+      });
       await withMockedKill(kill, () => backend.destroy('agent-1'));
     }
 
@@ -2135,9 +3005,22 @@ describe('FirecrackerScalerBackend', () => {
       await destroyWithProc(
         async (p) => (String(p).startsWith('/proc/') ? procStatLine('firecracker') : '4242'),
         kill,
-        async () => '/srv/jailer/firecracker/some-other-vm/root',
+        async () => ({ dev: CHROOT_DIR_STAT.dev, ino: CHROOT_DIR_STAT.ino + 1 }),
       );
       expect(kill).not.toHaveBeenCalled();
+    });
+
+    // breaks-if-wrong: the root check refuses every jailed VM, whose /proc/<pid>/root
+    // link reads `/` from the host because the jailer pivot_roots in its own mount
+    // namespace; only the device and inode it resolves to identify the chroot
+    it('kills a firecracker process whose root resolves to its own chroot', async () => {
+      const kill = vi.fn();
+      await destroyWithProc(
+        async (p) => (String(p).startsWith('/proc/') ? procStatLine('firecracker') : '4242'),
+        kill,
+        async () => ({ dev: CHROOT_DIR_STAT.dev, ino: CHROOT_DIR_STAT.ino }),
+      );
+      expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
     });
 
     it('still kills when /proc/<pid>/root is unreadable under the jailer uid drop', async () => {
@@ -2147,9 +3030,6 @@ describe('FirecrackerScalerBackend', () => {
       await destroyWithProc(
         async (p) => (String(p).startsWith('/proc/') ? procStatLine('firecracker') : '4242'),
         kill,
-        async () => {
-          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
-        },
       );
       expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
     });
@@ -2231,10 +3111,13 @@ describe('FirecrackerScalerBackend', () => {
       mockReadFile.mockImplementation(async (p: string) =>
         String(p).startsWith('/proc/') ? procStatLine('firecracker') : '4242',
       );
-      mockStat.mockImplementation(async (p: string) =>
-        String(p).endsWith('firecracker.pid') ? pidFileStat() : dirStat,
-      );
-      mockReadlink.mockResolvedValue('/srv/jailer/firecracker/some-other-vm/root');
+      mockStat.mockImplementation(async (p: string) => {
+        if (String(p).endsWith('firecracker.pid')) return pidFileStat();
+        if (String(p).startsWith('/proc/')) {
+          return { dev: CHROOT_DIR_STAT.dev, ino: CHROOT_DIR_STAT.ino + 1 };
+        }
+        return CHROOT_DIR_STAT;
+      });
       mockExecFile.mockImplementation((cmd, args, _o, cb) => {
         cb(null, { stdout: cmd === 'ip' && args[0] === '-br' ? '' : '', stderr: '' });
       });
@@ -2427,22 +3310,236 @@ describe('FirecrackerScalerBackend', () => {
       expect(events).toContain('scaler.failed');
     });
 
-    it('leaves a healthy VM tracked when the jailer exits cleanly', async () => {
-      // Negative control: `destroy()` ends with a clean exit, and a clean exit
-      // must not be read as a boot failure.
+    /** The `exit` listener the backend attached to the spawned jailer. */
+    function jailerExitHandler(): (code: number | null, sig: string | null) => void {
+      const handler = mockChildProcess.on.mock.calls.find((c) => c[0] === 'exit')?.[1];
+      expect(handler).toBeTypeOf('function');
+      return handler as (code: number | null, sig: string | null) => void;
+    }
+
+    it('leaves the VM tracked when the jailer parent exits cleanly', async () => {
+      // Under --new-pid-ns the jailer parent exits 0 as soon as firecracker
+      // runs in the new PID namespace, so a clean exit is no evidence about
+      // the VM.
       const { backend, mockIpAllocator } = createBackend();
+      mockPidFile('4242');
+      mockStat.mockResolvedValue(pidFileStat());
       await backend.spawn(['linux', 'firecracker'], 'agent-ok', 'ws://localhost:8080/ws/agent');
       mockIpAllocator.release.mockClear();
 
-      const exitHandler = mockChildProcess.on.mock.calls.find((c) => c[0] === 'exit')?.[1] as (
-        code: number | null,
-        sig: string | null,
-      ) => void;
-      exitHandler(0, null);
+      jailerExitHandler()(0, null);
       await new Promise<void>((r) => setTimeout(r, 600));
 
       expect(backend.getActiveCount()).toBe(1);
       expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      // fails-when: the serial and VMM tails stop half a second into every
+      // VM's life, because the watched process is the jailer parent.
+      const tails = (backend as unknown as { tailAbortControllers: Map<string, AbortController> })
+        .tailAbortControllers;
+      expect(tails.get('agent-ok')?.signal.aborted).toBe(false);
+    });
+
+    it('releases a VM once when destroy() races the spawn that fails under it', async () => {
+      // shutdownAll() can destroy a VM whose spawn() is still in flight; the
+      // spawn then fails and runs its own cleanup.
+      // fails-when: both teardowns run and release the same IP (and TAP) twice
+      // — the allocator may already have handed them to another VM.
+      const { backend, mockIpAllocator } = createBackend();
+      let socketReady!: (ready: boolean) => void;
+      mockWaitForSocket.mockImplementationOnce(
+        () => new Promise<boolean>((resolve) => (socketReady = resolve)),
+      );
+      const spawning = backend
+        .spawn(['linux', 'firecracker'], 'agent-race2', 'ws://localhost:8080/ws/agent')
+        .catch((e: unknown) => e);
+      await vi.waitFor(() => expect(socketReady).toBeTypeOf('function'));
+
+      // Hold destroy() mid-teardown, then let the spawn fail underneath it.
+      let releaseShutdown!: () => void;
+      mockSendCtrlAltDel.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseShutdown = resolve)),
+      );
+      const destroying = backend.destroy('agent-race2');
+      await vi.waitFor(() => expect(releaseShutdown).toBeTypeOf('function'));
+      socketReady(false);
+      await spawning;
+      // The spawn failed while destroy() still owns the VM: its own cleanup
+      // must have released nothing.
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      releaseShutdown();
+      await destroying;
+
+      expect(mockIpAllocator.release).toHaveBeenCalledTimes(1);
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
+    describe('a VM whose agent has not registered', () => {
+      beforeEach(() => {
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('is torn down when its process is gone', async () => {
+        // The guest's init exited (the agent's fatal startup error), the guest
+        // rebooted, and firecracker exited: the PID file names no process.
+        const { backend, mockIpAllocator } = createBackend();
+        const failures: string[] = [];
+        await backend.spawn(
+          ['linux', 'firecracker'],
+          'agent-gone',
+          'ws://localhost:8080/ws/agent',
+          (e) => {
+            if (e.eventType === 'scaler.failed') failures.push(e.detail ?? '');
+          },
+        );
+        mockIpAllocator.release.mockClear();
+        mockDeadPidFiles();
+
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        // fails-when: nothing watches the VM, so it stays counted against
+        // maxAgents and its IP is never released, wedging a one-slot scaler.
+        expect(backend.getActiveCount()).toBe(0);
+        expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-gone');
+        expect(failures).toEqual(['VM exited before its agent registered']);
+      });
+
+      /** Serve the PID file as `pid`, written `writtenAgoMs` ago, and `/proc` as a firecracker started `startedAgoMs` ago. */
+      function servePidFile(pid: number, writtenAgoMs = 0, startedAgoMs = 5 * 60_000): void {
+        mockReadFile.mockImplementation(async (p: string) =>
+          String(p).startsWith('/proc/') ? procStatLine('firecracker', startedAgoMs) : String(pid),
+        );
+        mockStat.mockResolvedValue({
+          mtimeMs: Date.now() - writtenAgoMs,
+          isDirectory: () => false,
+        });
+      }
+
+      it('is kept while its process is alive', async () => {
+        // breaks-if-wrong: a VM still booting must not be torn down.
+        const { backend, mockIpAllocator } = createBackend();
+        // A PID that exists: this test process stands in for firecracker.
+        servePidFile(process.pid);
+        await backend.spawn(['linux', 'firecracker'], 'agent-boot', 'ws://localhost:8080/ws/agent');
+        mockIpAllocator.release.mockClear();
+
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(backend.getActiveCount()).toBe(1);
+        expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      });
+
+      it('is kept while its PID file cannot be read', async () => {
+        // A rootless orchestrator may lose read access to the jailer-owned
+        // chroot. fails-when: an unreadable PID file counts as a dead VM, and a
+        // live firecracker is left running without its TAP, IP and chroot.
+        const { backend } = createBackend();
+        await backend.spawn(
+          ['linux', 'firecracker'],
+          'agent-eacces',
+          'ws://localhost:8080/ws/agent',
+        );
+        mockReadFile.mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
+
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(backend.getActiveCount()).toBe(1);
+      });
+
+      it('is torn down when its PID names no process', async () => {
+        const { backend } = createBackend();
+        await backend.spawn(
+          ['linux', 'firecracker'],
+          'agent-esrch',
+          'ws://localhost:8080/ws/agent',
+        );
+        // Above any pid_max Linux allows, so kill(pid, 0) answers ESRCH.
+        servePidFile(4_194_305);
+
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(backend.getActiveCount()).toBe(0);
+      });
+
+      it('is torn down when its PID now belongs to a later process', async () => {
+        // fails-when: a recycled PID reads as the VM, so the VM is only
+        // reclaimed by the manager's prune minutes later.
+        const { backend } = createBackend();
+        await backend.spawn(
+          ['linux', 'firecracker'],
+          'agent-recyc',
+          'ws://localhost:8080/ws/agent',
+        );
+        // The process now holding the number started after the watch began.
+        servePidFile(process.pid, 0, -5_000);
+
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(backend.getActiveCount()).toBe(0);
+      });
+
+      it('is kept when the wall clock stepped after its PID file was written', async () => {
+        // An RTC-less host syncing NTP after boot: the PID file's mtime reads
+        // 10 minutes old while firecracker started before the watch did.
+        // fails-when: the check compares wall-clock times and reads the step
+        // as a recycled PID, tearing down a live VM.
+        const { backend } = createBackend();
+        await backend.spawn(['linux', 'firecracker'], 'agent-ntp', 'ws://localhost:8080/ws/agent');
+        servePidFile(process.pid, 10 * 60_000, 60_000);
+
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(backend.getActiveCount()).toBe(1);
+      });
+
+      it('is not torn down by a probe that finishes after the agent registered', async () => {
+        // fails-when: the probe's verdict is acted on although the agent
+        // registered while it was reading.
+        const { backend } = createBackend();
+        await backend.spawn(['linux', 'firecracker'], 'agent-late', 'ws://localhost:8080/ws/agent');
+        // The first probe reads ENOENT; the second hangs until released.
+        let releaseRead!: () => void;
+        let reads = 0;
+        mockReadFile.mockImplementation(async () => {
+          reads += 1;
+          if (reads === 2) await new Promise<void>((r) => (releaseRead = r));
+          throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        });
+        await vi.advanceTimersByTimeAsync(4_100);
+        expect(releaseRead).toBeTypeOf('function');
+
+        backend.markRegistered('agent-late');
+        releaseRead();
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(backend.getActiveCount()).toBe(1);
+      });
+
+      it('is left to the disconnect path once its agent registered', async () => {
+        // breaks-if-wrong: an ephemeral agent that finished its job stops its
+        // VM, and that is not a failed spawn — no scaler.failed, no teardown.
+        const { backend, mockIpAllocator } = createBackend();
+        const failures: string[] = [];
+        await backend.spawn(
+          ['linux', 'firecracker'],
+          'agent-done',
+          'ws://localhost:8080/ws/agent',
+          (e) => {
+            if (e.eventType === 'scaler.failed') failures.push(e.detail ?? '');
+          },
+        );
+        backend.markRegistered('agent-done');
+        mockIpAllocator.release.mockClear();
+        mockDeadPidFiles();
+
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(backend.getActiveCount()).toBe(1);
+        expect(mockIpAllocator.release).not.toHaveBeenCalled();
+        expect(failures).toEqual([]);
+      });
     });
   });
 });

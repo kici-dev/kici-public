@@ -88,14 +88,19 @@ import {
 import type { PeerLogChunk } from '@kici-dev/engine';
 import { InMemoryExecutionTracker } from './worker/in-memory-execution-tracker.js';
 import { InMemoryJobQueue } from './worker/in-memory-job-queue.js';
+import {
+  createRerouteSpawnControl,
+  type RerouteSpawnControl,
+} from './worker/reroute-spawn-control.js';
 import { StaticAgentTokenStore } from './worker/static-agent-token-store.js';
+import { reapOrphansAtStartup } from './scaler/startup-orphan-sweep.js';
+import { answerScalerOrphansRequest } from './scaler/orphan-requests.js';
 import { StepLogBuffer } from './reporting/step-log-buffer.js';
 import { ObserverRegistry } from './ws/observer-registry.js';
 import { configureSecureWsServer } from './ws/server-options.js';
 import {
   ScalerManager,
   type ScalerManagerDeps,
-  ContainerScalerBackend,
   InMemoryIpAllocator,
   createScalerBackend,
   loadScalerConfig,
@@ -163,8 +168,8 @@ interface WorkerSubsystems {
 
 /**
  * Resolve the ephemeral agent-token TTL a worker-spawned agent should use:
- * the fleet-wide `agent_token_ttl_ms` pulled from the leader when a snapshot has
- * landed, otherwise the boot-time config default. This is the single seam the
+ * the fleet-wide `agent_token_ttl_ms` pulled from a coordinator when a snapshot
+ * has landed, otherwise the boot-time config default. This is the single seam the
  * worker's three scaler backends read at spawn.
  */
 export function resolveWorkerAgentTokenTtlMs(
@@ -172,6 +177,19 @@ export function resolveWorkerAgentTokenTtlMs(
   fallback: number,
 ): number {
   return pushed?.settings.agentTokenTtlMs ?? fallback;
+}
+
+/**
+ * Resolve the Firecracker API-socket wait a worker-spawned VM should use: the
+ * fleet-wide `firecracker_api_socket_wait_ms` pulled from a coordinator,
+ * otherwise the boot-time config default. A snapshot from a coordinator that
+ * predates the knob carries no value, and the default applies.
+ */
+export function resolveWorkerFirecrackerApiSocketWaitMs(
+  pushed: { settings: WorkerClusterSettings } | null,
+  fallback: number,
+): number {
+  return pushed?.settings.firecrackerApiSocketWaitMs ?? fallback;
 }
 
 /**
@@ -187,6 +205,8 @@ async function initializeWorkerScaler(
   tokenStore: StaticAgentTokenStore,
   onScalerEvent: (runId: string, jobId: string, event: ScalerEvent) => void,
   tokenTtlProvider: () => Promise<number>,
+  /** The fleet-wide Firecracker API-socket wait, from the pulled snapshot. */
+  firecrackerApiSocketWaitMsProvider: () => Promise<number>,
   /**
    * Read-only view of the agent registry, used by the warm pool to count the
    * agents that could already serve a job for a label set. Built before the
@@ -222,10 +242,11 @@ async function initializeWorkerScaler(
     injectAgentToken: config.agentAuth === 'token',
     hostServices: storageHostAccessEntries(config),
     tokenTtlMs: config.agentTokenTtlMs,
-    // Honor the fleet-wide agent_token_ttl_ms pulled from the leader (DB-less
+    // Honor the fleet-wide agent_token_ttl_ms pulled from a coordinator (DB-less
     // workers cannot read cluster_settings directly); falls back to
     // config.agentTokenTtlMs until the first pull lands.
     tokenTtlProvider,
+    firecrackerApiSocketWaitMsProvider,
     ipAllocator: ({ cidr, gateway, netmask }) =>
       new InMemoryIpAllocator({ cidr, gateway, netmask }),
     // No event emitter and no database in worker mode: `type: event` is
@@ -268,22 +289,9 @@ async function initializeWorkerScaler(
     createBackend: (entry, cfg) => createScalerBackend(entry, { ...factoryCtx, scalerConfig: cfg }),
   });
 
-  // Run orphan cleanup for container backends
-  for (const { name, backend } of backends) {
-    if (backend.type === 'container') {
-      try {
-        const cleaned = await (backend as ContainerScalerBackend).cleanupOrphans();
-        if (cleaned > 0) {
-          logger.info(`Cleaned up ${cleaned} orphaned containers`, { backend: name });
-        }
-      } catch (err) {
-        logger.warn('Container orphan cleanup failed', {
-          backend: name,
-          error: toErrorMessage(err),
-        });
-      }
-    }
-  }
+  // Run orphan cleanup for container and firecracker backends, and keep
+  // sweeping Firecracker while the worker runs — the same as a coordinator.
+  await reapOrphansAtStartup(backends);
 
   // Verify + self-provision each backend's host prerequisites (Firecracker
   // bridge) before spawning starts. Degraded-on-failure — never aborts startup.
@@ -355,7 +363,7 @@ async function failRefusedReroute(args: {
  * providerContext are already included in the job.reroute message and
  * embedded in the job's jobConfig.
  */
-function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
+function buildWorkerOnDispatch(agentRegistry: AgentRegistry, onDelivered: (jobId: string) => void) {
   return async (agentId: string, job: any) => {
     const entry = agentRegistry.get(agentId);
     if (!entry) return;
@@ -368,6 +376,7 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
         buildWorkerDispatchMessage(job, { messageId: randomUUID(), timestamp: Date.now() }),
       ),
     );
+    onDelivered(job.id);
 
     logger.info('Dispatched rerouted job to agent', {
       agentId,
@@ -471,10 +480,10 @@ export async function bootstrapWorker(
   const agentRegistry = new AgentRegistry();
   const jobQueue = new InMemoryJobQueue();
 
-  // Worker-relevant cluster settings pulled from the leader over the peer
+  // Worker-relevant cluster settings pulled from a coordinator over the peer
   // channel. A worker is DB-less, so it cannot read cluster_settings directly;
   // it advertises its last-pulled version on the heartbeat and pulls the
-  // snapshot when the leader is ahead. Until the first pull lands, every read
+  // snapshot when a coordinator advertises a newer version. Until the first pull lands, every read
   // falls back to the boot-time config default.
   const pushedClusterSettings: {
     current: { version: number; settings: WorkerClusterSettings } | null;
@@ -516,10 +525,14 @@ export async function bootstrapWorker(
         // Advance the registry's local version so the hook stops re-firing on
         // every subsequent heartbeat that still advertises this version.
         peerRegistry.setLocalClusterSettingsVersion(resp.version);
-        logger.info('Pulled cluster settings from leader; worker-spawned agents now use this TTL', {
-          version: resp.version,
-          agentTokenTtlMs: resp.settings.agentTokenTtlMs,
-        });
+        logger.info(
+          'Pulled cluster settings from a coordinator; worker-spawned agents now use them',
+          {
+            version: resp.version,
+            agentTokenTtlMs: resp.settings.agentTokenTtlMs,
+            firecrackerApiSocketWaitMs: resp.settings.firecrackerApiSocketWaitMs ?? null,
+          },
+        );
       }
     } catch (err) {
       logger.warn('Cluster-settings pull failed; keeping current worker settings', {
@@ -565,6 +578,7 @@ export async function bootstrapWorker(
     }
     client.send(msg as any);
   };
+  const spawnControlRef: { current: RerouteSpawnControl | null } = { current: null };
   const executionTracker = new InMemoryExecutionTracker({
     onStatusForward: (update) => {
       const ownerUrl = jobOwnership.get(update.jobId);
@@ -618,10 +632,33 @@ export async function bootstrapWorker(
       // `running` forever.
       if (update.type === 'job' && TERMINAL_JOB_STATES.has(update.status)) {
         jobOwnership.delete(update.jobId);
+        spawnControlRef.current?.onJobTerminal(update.jobId);
       }
     },
     observerRegistry,
   });
+
+  // The spawn-retry budget of every rerouted job: gates its scaler requests,
+  // relays each spawn failure with a retry verdict, and releases the job when the
+  // budget runs out or its coordinator cancels it. The dispatcher is late-bound:
+  // the scaler that emits events is built before it.
+  const dispatcherRef: { current: Dispatcher | null } = { current: null };
+  const spawnControl = createRerouteSpawnControl({
+    queue: jobQueue,
+    getDispatcher: () => {
+      if (!dispatcherRef.current) throw new Error('Worker dispatcher is not built yet');
+      return dispatcherRef.current;
+    },
+    executionTracker,
+    jobOwnership,
+    sendToOwningCoord,
+    defaults: {
+      maxAttempts: config.rerouteSpawnMaxAttempts,
+      backoffMs: config.rerouteSpawnRetryBackoffMs,
+    },
+    logger,
+  });
+  spawnControlRef.current = spawnControl;
 
   // 4. Initialize scaler
   // Workers have no database, so a scaler provisioning event is forwarded to
@@ -630,25 +667,24 @@ export async function bootstrapWorker(
   const scalerResult = await initializeWorkerScaler(
     config,
     tokenStore,
-    (runId, jobId, ev) => {
-      sendToOwningCoord(jobId, {
-        type: 'scaler.event',
-        runId,
-        jobId,
-        agentId: ev.agentId,
-        eventType: ev.eventType,
-        detail: ev.detail,
-        timestampMs: ev.timestampMs,
-      });
-    },
+    (runId, jobId, ev) => spawnControl.onScalerEvent(runId, jobId, ev),
     workerTokenTtlProvider,
+    () =>
+      Promise.resolve(
+        resolveWorkerFirecrackerApiSocketWaitMs(
+          pushedClusterSettings.current,
+          config.firecrackerApiSocketWaitMs,
+        ),
+      ),
     agentRegistry,
   );
   const scalerManager = scalerResult?.manager ?? null;
   const scalerConfig = scalerResult?.config ?? null;
 
   // 5. Create dispatcher with worker onDispatch
-  const onDispatch = buildWorkerOnDispatch(agentRegistry);
+  const onDispatch = buildWorkerOnDispatch(agentRegistry, (jobId) =>
+    spawnControl.onDelivered(jobId),
+  );
   const noopMetrics = {
     incJobsDispatched: () => {},
     setQueueDepth: () => {},
@@ -662,16 +698,7 @@ export async function bootstrapWorker(
     metrics: noopMetrics,
     onDispatch,
     onNoMatchingAgent: scalerManager
-      ? async (labels, jobId, runId, excludeLabels, resources, orgId, containerSpawn) =>
-          scalerManager.requestScale(
-            labels,
-            jobId,
-            runId,
-            excludeLabels,
-            resources,
-            orgId,
-            containerSpawn,
-          )
+      ? spawnControl.wrapScaleRequest((...args) => scalerManager.requestScale(...args))
       : undefined,
     scalerAgentView: scalerManager ? (agentId) => scalerManager.agentView(agentId) : undefined,
     // The worker has no DB; the deadline is the cluster-wide default.
@@ -699,6 +726,7 @@ export async function bootstrapWorker(
       }
     },
   });
+  dispatcherRef.current = dispatcher;
 
   // Capacity-freed re-drive: re-offer the oldest pending jobs to the scaler the
   // moment an agent releases its slot, instead of waiting for a timeout. The
@@ -809,6 +837,9 @@ export async function bootstrapWorker(
     const client: PeerClient = new PeerClient({
       url: wsUrl,
       onLogsCollectRequest: (msg, send) => workerFleetResponder(msg, send),
+      // `kici-admin scaler orphans --target <this worker>`, forwarded by the
+      // coordinator: answered from this host and this worker's own tracking.
+      onScalerOrphansRequest: (msg) => answerScalerOrphansRequest(scalerManager, msg),
       joinToken: config.cluster.joinToken,
       credentialFile: workerCredentialFile,
       authCoordinator: peerAuthCoordinator,
@@ -900,7 +931,15 @@ export async function bootstrapWorker(
         // lose ownership the moment the agent's first progress update arrived
         // ("No owning coord for job — dropping forward"), and the run on the
         // owning coordinator would never advance past `running`.
-        const result = await dispatcher.dispatch(jobInput);
+        // The budget exists before the dispatch: its first spawn starts inside it.
+        spawnControl.registerReroute(msg);
+        let result: Awaited<ReturnType<typeof dispatcher.dispatch>>;
+        try {
+          result = await dispatcher.dispatch(jobInput);
+        } catch (err) {
+          spawnControl.forgetReroute(msg.jobId);
+          throw err;
+        }
 
         if (result.status === 'duplicate') {
           // A dispatch_queue row for this preassigned jobId already exists — a
@@ -940,6 +979,7 @@ export async function bootstrapWorker(
             accepted: true,
           });
         } else {
+          spawnControl.forgetReroute(msg.jobId);
           client.send({
             type: 'job.reroute.ack',
             messageId: msg.messageId,
@@ -962,6 +1002,7 @@ export async function bootstrapWorker(
               {
                 dispatcher: dispatcher,
                 registry: agentRegistry,
+                releaseQueued: (runId, jobId) => spawnControl.releaseQueued(runId, jobId),
                 logger,
               },
               msg,

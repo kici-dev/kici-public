@@ -3149,6 +3149,39 @@ describe('DashboardHandler', () => {
       expect(response.nextCursor).toBeNull();
     });
 
+    it('redacts a dead-lettered scale-up claim code', async () => {
+      // fails-when: the dashboard DLQ view echoes the single-use claim code
+      const { db } = createMockDb();
+      const send = vi.fn();
+      const eventStore = {
+        listDlq: vi.fn().mockResolvedValue([
+          makeStoredEvent({
+            eventName: 'kici.scaler.scale-up',
+            payload: { agentId: 'a1', claimCode: 'kcc_secret_value' },
+          }),
+        ]),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any;
+      const handler = new DashboardHandler({
+        db,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        logStorage: createMockLogStorage() as any,
+        send,
+        eventStore,
+        ...noopCallbacks,
+      });
+      await handler.handleEventDlqList({
+        type: 'dashboard.event-dlq.list',
+        requestId: 'req-dlq-r',
+        orgId: 'org-001',
+        limit: 10,
+        actor: { type: 'user', sub: 'alice' },
+      });
+      const response = send.mock.calls[0][0];
+      expect(JSON.stringify(response)).not.toContain('kcc_secret_value');
+      expect(response.items[0].payload).toEqual({ agentId: 'a1', claimCode: '[redacted]' });
+    });
+
     it('emits nextCursor when the page is full', async () => {
       const { db } = createMockDb();
       const logStorage = createMockLogStorage();

@@ -247,6 +247,18 @@ export const METRIC_LABEL_POLICY: Partial<
     event_name: { maxUniqueValues: 50 },
     reason: { values: ['exhausted_retries'] },
   },
+  kici_orch_event_unmatched_total: {
+    event_name: { maxUniqueValues: 50 },
+    reason: {
+      values: [
+        'buffered',
+        'no-registration',
+        'no-target-repo',
+        'trust-blocked',
+        'no-trigger-match',
+      ],
+    },
+  },
   kici_orch_event_attempts: {
     event_name: { maxUniqueValues: 50 },
     result: { values: ['success', 'dlq'] },

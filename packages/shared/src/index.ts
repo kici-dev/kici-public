@@ -8,6 +8,14 @@ export {
   type EncryptedValue,
 } from './secret-crypto.js';
 export { RingBuffer } from './ring-buffer.js';
+export {
+  CommandError,
+  COMMAND_STDERR_TAIL_CHARS,
+  stderrTail,
+  toCommandError,
+  type CommandContext,
+  type CommandFailure,
+} from './command-error.js';
 // `redactConfig` / `scrubText` moved to @kici-dev/core (pure, CLI-reachable)
 // and reach this barrel through the `export * from '@kici-dev/core'` above, so
 // every existing `from '@kici-dev/shared'` import keeps resolving.
