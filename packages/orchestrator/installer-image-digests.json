@@ -1,7 +1,7 @@
 {
-  "version": "0.14.1",
+  "version": "0.14.2",
   "images": {
-    "kici-agent": "sha256:5d07a69a9a33f2aaf3d84d77a051038e35e32983bd3e1d8833b19b52916e7074",
-    "kici-orchestrator": "sha256:98207bb438b5f0dc571e303324ab47ac6e0b26f4402f63a660f9d419eec4b3cd"
+    "kici-agent": "sha256:81ca09ea2425128ce6a5d6f0179f10dc32f099d6a338ba2528f9e926dd288ea8",
+    "kici-orchestrator": "sha256:bb496ab6881b2cc23ed0fbf004d0eaee779acdb2c22112359b3ea8f250130e3e"
   }
 }

@@ -2,6 +2,12 @@
 
 Release notes for the public KiCI packages.
 
+## v0.14.2 — 2026-10-03
+
+### Other
+
+- Maintenance release.
+
 ## v0.14.1 — 2026-10-02
 
 ### Fixes

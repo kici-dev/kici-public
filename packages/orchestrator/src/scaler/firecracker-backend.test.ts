@@ -7,6 +7,17 @@ import type { BridgeHealth } from '../firecracker/host-network.js';
 
 // ── Mocks ────────────────────────────────────────────────────────
 
+// Seconds since boot, as the backend and procStatLine both read them: the real
+// value plus an hour, so it still advances. A process cannot start before boot,
+// so on a host booted minutes before the suite (a fresh CI runner) procStatLine
+// would clamp "started five minutes ago" to boot time.
+// fails-when: the real uptime is used on a host up for less than six minutes
+// breaks-if-wrong: the backend and the fixtures must read the same clock
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, uptime: () => actual.uptime() + 3600 };
+});
+
 // Default execFile implementation (always succeeds)
 const defaultExecFileImpl = (
   _cmd: string,
