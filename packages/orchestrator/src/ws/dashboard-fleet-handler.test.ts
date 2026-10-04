@@ -31,6 +31,8 @@ function makeDeps(overrides: Partial<FleetHandlerDeps> = {}): FleetHandlerDeps {
     getInventory: vi.fn().mockResolvedValue(null),
     get: vi.fn().mockResolvedValue(null),
     findFanoutTargets: vi.fn().mockResolvedValue([]),
+    listFleetHosts: vi.fn().mockResolvedValue([]),
+    getFleetHost: vi.fn().mockResolvedValue(null),
   } as unknown as FleetHandlerDeps['rosterStore'];
   // Minimal Kysely stub: returns an empty pinned-runs result.
   const db = {
@@ -60,25 +62,32 @@ function makeDeps(overrides: Partial<FleetHandlerDeps> = {}): FleetHandlerDeps {
 }
 
 describe('handleFleetHostsRequest', () => {
-  it('returns queryInventory output verbatim', async () => {
-    const hosts = [entry('a1', 'ready'), entry('a2', 'unreachable')];
+  it('returns listFleetHosts output verbatim, unconfirmed hosts included', async () => {
+    const hosts = [
+      { ...entry('a1', 'ready'), confirmed: true },
+      { ...entry('a2', 'unreachable'), confirmed: false },
+    ];
     const deps = makeDeps();
-    (deps.rosterStore.queryInventory as ReturnType<typeof vi.fn>).mockResolvedValue(hosts);
+    (deps.rosterStore.listFleetHosts as ReturnType<typeof vi.fn>).mockResolvedValue(hosts);
     const res = await handleFleetHostsRequest(deps, 'req-1');
     expect(res.type).toBe('dashboard.fleet.hosts.response');
     expect(res.requestId).toBe('req-1');
     expect(res.hosts).toEqual(hosts);
-    expect(deps.rosterStore.queryInventory).toHaveBeenCalledWith(undefined, 300_000);
+    expect(deps.rosterStore.listFleetHosts).toHaveBeenCalledWith(300_000);
+    expect(deps.rosterStore.queryInventory).not.toHaveBeenCalled();
   });
 });
 
 describe('handleFleetHostRequest', () => {
   it('returns the single host and an empty runs list', async () => {
     const deps = makeDeps();
-    (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockResolvedValue(
-      entry('a1', 'ready'),
-    );
+    (deps.rosterStore.getFleetHost as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...entry('a1', 'ready'),
+      confirmed: false,
+    });
     const res = await handleFleetHostRequest(deps, 'req-2', 'a1');
+    expect(deps.rosterStore.getFleetHost).toHaveBeenCalledWith('a1', 300_000);
+    expect(res.host?.confirmed).toBe(false);
     expect(res.type).toBe('dashboard.fleet.host.response');
     expect(res.host?.agentId).toBe('a1');
     expect(res.runs).toEqual([]);
@@ -110,7 +119,7 @@ describe('handleFleetHostRequest', () => {
       }),
     } as unknown as FleetHandlerDeps['db'];
     const deps = makeDeps({ db });
-    (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockResolvedValue(
+    (deps.rosterStore.getFleetHost as ReturnType<typeof vi.fn>).mockResolvedValue(
       entry('a1', 'ready'),
     );
     const res = await handleFleetHostRequest(deps, 'req-4', 'a1');
@@ -193,9 +202,12 @@ describe('handleFleetWorkflowsForHostRequest', () => {
     host: HostInventoryEntry | null,
     regs: unknown[],
     scalerManaged = false,
+    confirmed = true,
   ): FleetHandlerDeps {
     const deps = makeDeps();
-    (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockResolvedValue(host);
+    (deps.rosterStore.getFleetHost as ReturnType<typeof vi.fn>).mockResolvedValue(
+      host ? { ...host, confirmed } : null,
+    );
     (deps.rosterStore.get as ReturnType<typeof vi.fn>).mockResolvedValue(
       host ? { agent_id: host.agentId, scaler_managed: scalerManaged } : null,
     );
@@ -270,6 +282,25 @@ describe('handleFleetWorkflowsForHostRequest', () => {
 
     const scaler = await handleFleetWorkflowsForHostRequest(depsFor(host, regs, true), 'r9', 'h1');
     expect(scaler.workflows).toEqual([]);
+  });
+
+  it('an unconfirmed host lists NO fan-outs, though the same host otherwise would', async () => {
+    // fails-when: workflows-for-host ignores confirmed; the dispatcher never targets this host.
+    const host = { ...entry('h1', 'ready'), labels: ['role:web'] };
+    const regs = [reg('deploy-web', { include: [[exact('role:web')]], exclude: [] })];
+    const hidden = await handleFleetWorkflowsForHostRequest(
+      depsFor(host, regs, false, false),
+      'r',
+      'h1',
+    );
+    expect(hidden.workflows).toEqual([]);
+    // breaks-if-wrong: the same host confirmed lists its fan-out.
+    const shown = await handleFleetWorkflowsForHostRequest(
+      depsFor(host, regs, false, true),
+      'r',
+      'h1',
+    );
+    expect(shown.workflows.map((w) => w.workflowName)).toEqual(['deploy-web']);
   });
 
   it('ephemeral non-ready host: disposition skipped-ephemeral', async () => {

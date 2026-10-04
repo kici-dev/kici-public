@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import {
   PROTOCOL_VERSION,
+  WS_CLOSE_PROTOCOL_ERROR,
+  WS_CLOSE_UNAUTHORIZED,
   WS_MAX_PAYLOAD_BYTES,
+  jobRerouteSchema,
   ExecutionJobStatus,
   ScalerOrphansAction,
   ScalerVmStopOutcome,
@@ -18,7 +21,22 @@ import {
   decryptMessage,
 } from './peer-crypto.js';
 import { chunkBuffer } from '@kici-dev/shared';
-import { NO_AUTH_METHOD_MESSAGE, PeerClient, type PeerClientOptions } from './peer-client.js';
+import {
+  credentialPsk,
+  makeTestJoinToken,
+  refAppKey,
+  refClientProof,
+  refServerProof,
+  refTranscriptHash,
+  tokenPsk,
+} from '../__test-helpers__/peer-mutual-auth.js';
+import {
+  NO_AUTH_METHOD_MESSAGE,
+  PeerClient,
+  PeerDialOrigin,
+  PeerMutualAuthFailure,
+  type PeerClientOptions,
+} from './peer-client.js';
 import { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 import { PeerRegistry } from './peer-registry.js';
 
@@ -61,6 +79,13 @@ vi.mock('ws', async () => {
       this.readyState = 3;
       setImmediate(() => {
         this.emit('close', code ?? 1000, Buffer.from(reason ?? ''));
+      });
+    }
+
+    terminate(): void {
+      this.readyState = 3;
+      setImmediate(() => {
+        this.emit('close', 1006, Buffer.from(''));
       });
     }
   }
@@ -138,6 +163,25 @@ function simulateOpen(mock: MockWsInstance): void {
 
 // ── Test helpers ────────────────────────────────────────────────────
 
+/** A join token in the production format; the client parses it now. */
+const TEST_TOKEN = makeTestJoinToken({
+  orgId: 'org-1',
+  routingKey: 'github:42',
+  expiry: Date.now() + 3_600_000,
+  role: 'coordinator',
+});
+/** A second token, for the tests that tell two tokens apart. */
+const ONE_SHOT_TOKEN = makeTestJoinToken({
+  orgId: 'org-1',
+  routingKey: 'github:43',
+  expiry: Date.now() + 3_600_000,
+  role: 'coordinator',
+});
+const TOKEN_HASH_BY_ROUTING = new Map([
+  [TEST_TOKEN.routingB64, TEST_TOKEN.tokenHash],
+  [ONE_SHOT_TOKEN.routingB64, ONE_SHOT_TOKEN.tokenHash],
+]);
+
 function makeLocalInventory(): Omit<PeerHeartbeat, 'type'> {
   return {
     instanceId: 'local-orch',
@@ -175,10 +219,10 @@ function createPeerClient(overrides: Partial<PeerClientOptions> = {}): {
   const registry = new PeerRegistry();
   const credentialFile = overrides.credentialFile ?? '/tmp/test-credential';
   const instanceId = overrides.instanceId ?? 'local-orch';
-  const joinToken = 'joinToken' in overrides ? overrides.joinToken : 'kici_join_v1.test.token';
+  const joinToken = 'joinToken' in overrides ? overrides.joinToken : TEST_TOKEN.token;
   const client = new PeerClient({
     url: 'ws://192.168.1.10:8080/peer',
-    joinToken: 'kici_join_v1.test.token',
+    joinToken: TEST_TOKEN.token,
     credentialFile: '/tmp/test-credential',
     authCoordinator:
       overrides.authCoordinator ?? makeCoordinator(credentialFile, instanceId, joinToken),
@@ -195,69 +239,142 @@ function createPeerClient(overrides: Partial<PeerClientOptions> = {}): {
   return { client, registry };
 }
 
-/**
- * Simulate the server side of ECDH handshake and return the session key.
- * The server sends peer.hello, the client sends peer.hello.response.
- */
-function simulateServerHandshake(mock: MockWsInstance): {
+interface ServerHandshake {
+  /** K_hs: the auth request and response travel under it. */
   sessionKey: Buffer;
   nonce: Buffer;
-} {
-  // Generate server's ECDH key pair
-  const serverEcdh = generateEcdhKeyPair();
-  const nonce = randomBytes(32);
-
-  // Server sends peer.hello (plaintext)
-  const helloMsg = {
-    type: 'peer.hello',
-    ephemeralPublicKey: serverEcdh.publicKey.toString('base64'),
-    nonce: nonce.toString('base64'),
-  };
-  mock.emit('message', JSON.stringify(helloMsg));
-
-  // Client should have sent peer.hello.response
-  const lastSent = mock.sentMessages[mock.sentMessages.length - 1];
-  const clientResponse = JSON.parse(lastSent);
-  expect(clientResponse.type).toBe('peer.hello.response');
-
-  // Derive session key from server's perspective
-  const clientPubKey = Buffer.from(clientResponse.ephemeralPublicKey, 'base64');
-  const sessionKey = deriveSessionKey(serverEcdh.privateKey, clientPubKey, nonce);
-
-  return { sessionKey, nonce };
+  /** TH, computed by the independent helper over the hello the test sent. */
+  transcriptHash: Buffer;
 }
 
 /**
- * Complete full ECDH + auth flow. Returns session key for further message exchange.
+ * Play the server's peer.hello (advertising mutual-v2 unless told otherwise)
+ * and read the client's peer.hello.response.
+ */
+function simulateServerHandshake(
+  mock: MockWsInstance,
+  opts: { authSchemes?: string[] | null } = {},
+): ServerHandshake {
+  const serverEcdh = generateEcdhKeyPair();
+  const nonce = randomBytes(32);
+  const authSchemes = opts.authSchemes === undefined ? ['mutual-v2'] : opts.authSchemes;
+
+  mock.emit(
+    'message',
+    JSON.stringify({
+      type: 'peer.hello',
+      ephemeralPublicKey: serverEcdh.publicKey.toString('base64'),
+      nonce: nonce.toString('base64'),
+      ...(authSchemes && { authSchemes }),
+    }),
+  );
+
+  const clientResponse = JSON.parse(mock.sentMessages[mock.sentMessages.length - 1]);
+  expect(clientResponse.type).toBe('peer.hello.response');
+  const clientPub = Buffer.from(clientResponse.ephemeralPublicKey, 'base64');
+  return {
+    sessionKey: deriveSessionKey(serverEcdh.privateKey, clientPub, nonce),
+    nonce,
+    transcriptHash: refTranscriptHash(serverEcdh.publicKey, nonce, authSchemes ?? [], clientPub),
+  };
+}
+
+/** The client's decrypted peer.auth.request (the last frame it sent). */
+function readAuthRequest(mock: MockWsInstance, handshakeKey: Buffer): Record<string, any> {
+  return JSON.parse(decryptMessage(mock.sentMessages[mock.sentMessages.length - 1], handshakeKey));
+}
+
+/** The PSK the client proved with: its token hash, or sha256 of its credential file. */
+async function pskFor(authRequest: Record<string, any>): Promise<Buffer> {
+  if (authRequest.mode === 'token') {
+    return tokenPsk(TOKEN_HASH_BY_ROUTING.get(authRequest.tokenRouting)!);
+  }
+  const file = await mockReadCredentialFile.getMockImplementation()?.();
+  return credentialPsk(file.credential);
+}
+
+interface AcceptOptions {
+  psk?: Buffer;
+  remoteInstanceId?: string;
+  grantedRole?: string;
+  /** Defaults to a fresh credential in token mode, none in credential mode. */
+  sessionCredential?: string | null;
+  /** null sends no serverProof; a Buffer sends that proof instead of the right one. */
+  serverProof?: Buffer | null;
+}
+
+/** Send the server's accepted response for a handshake already played; returns K_app. */
+async function acceptOn(
+  mock: MockWsInstance,
+  hs: ServerHandshake,
+  opts: AcceptOptions = {},
+): Promise<Buffer> {
+  const authRequest = readAuthRequest(mock, hs.sessionKey);
+  const psk = opts.psk ?? (await pskFor(authRequest));
+  const clientProof = Buffer.from(String(authRequest.clientProof), 'hex');
+  const remoteInstanceId = opts.remoteInstanceId ?? 'remote-orch';
+  const grantedRole = opts.grantedRole ?? 'coordinator';
+  const sessionCredential =
+    opts.sessionCredential !== undefined
+      ? opts.sessionCredential
+      : authRequest.mode === 'token'
+        ? randomBytes(32).toString('hex')
+        : null;
+  const rightProof = refServerProof({
+    psk,
+    th: hs.transcriptHash,
+    clientProof,
+    serverInstanceId: remoteInstanceId,
+    grantedRole,
+    sessionCredential,
+  });
+  const serverProof = opts.serverProof === undefined ? rightProof : opts.serverProof;
+  mock.emit(
+    'message',
+    encryptMessage(
+      JSON.stringify({
+        type: 'peer.auth.response',
+        accepted: true,
+        instanceId: remoteInstanceId,
+        role: grantedRole,
+        ...(serverProof && { serverProof: serverProof.toString('hex') }),
+        ...(sessionCredential !== null && { sessionCredential }),
+        agents: [],
+        capabilities: { s3LogAccess: false },
+      }),
+      hs.sessionKey,
+    ),
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  return refAppKey({
+    handshakeKey: hs.sessionKey,
+    psk,
+    th: hs.transcriptHash,
+    clientProof,
+    serverProof: rightProof,
+  });
+}
+
+/**
+ * Complete the full ECDH + mutual-v2 flow. Returns K_app as `sessionKey` for
+ * further message exchange, and K_hs as `handshakeKey`.
  */
 async function authenticateClient(
   client: PeerClient,
-  overrides: { withCredential?: boolean } = {},
-): Promise<{ mock: MockWsInstance; sessionKey: Buffer }> {
+  opts: AcceptOptions = {},
+): Promise<{
+  mock: MockWsInstance;
+  sessionKey: Buffer;
+  handshakeKey: Buffer;
+  hs: ServerHandshake;
+}> {
   client.connect();
   const mock = getLatestMock();
   simulateOpen(mock);
-
-  // Simulate server ECDH handshake
-  const { sessionKey } = simulateServerHandshake(mock);
-
-  // Wait for async auth request to be sent
+  const hs = simulateServerHandshake(mock);
   await vi.advanceTimersByTimeAsync(0);
-
-  // Server sends encrypted auth response (accepted)
-  const authResponse = {
-    type: 'peer.auth.response',
-    accepted: true,
-    instanceId: 'remote-orch',
-    agents: [],
-    capabilities: { s3LogAccess: false },
-  };
-  mock.emit('message', encryptMessage(JSON.stringify(authResponse), sessionKey));
-
-  // Wait for async credential write
-  await vi.advanceTimersByTimeAsync(0);
-
-  return { mock, sessionKey };
+  const sessionKey = await acceptOn(mock, hs, opts);
+  return { mock, sessionKey, handshakeKey: hs.sessionKey, hs };
 }
 
 // ── Setup / Teardown ────────────────────────────────────────────────
@@ -323,7 +440,7 @@ describe('PeerClient', () => {
 
   describe('token-based authentication', () => {
     it('sends encrypted auth request with token', async () => {
-      const { client } = createPeerClient({ joinToken: 'kici_join_v1.test.token' });
+      const { client } = createPeerClient();
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
@@ -341,7 +458,35 @@ describe('PeerClient', () => {
       expect(decrypted.type).toBe('peer.auth.request');
       expect(decrypted.instanceId).toBe('local-orch');
       expect(decrypted.protocolVersion).toBe(PROTOCOL_VERSION);
-      expect(decrypted.token).toBe('kici_join_v1.test.token');
+      expect(decrypted).toMatchObject({
+        scheme: 'mutual-v2',
+        mode: 'token',
+        tokenRouting: TEST_TOKEN.routingB64,
+      });
+      expect(decrypted).not.toHaveProperty('token');
+      expect(decrypted).not.toHaveProperty('proof');
+    });
+
+    it('proves the token with a client proof bound to the transcript', async () => {
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      const hs = simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+      const decrypted = readAuthRequest(mock, hs.sessionKey);
+      // breaks-if-wrong: the server recomputes this exact proof from its own view
+      expect(decrypted.clientProof).toBe(
+        refClientProof({
+          psk: tokenPsk(TEST_TOKEN.tokenHash),
+          th: hs.transcriptHash,
+          mode: 'token',
+          instanceId: 'local-orch',
+          role: 'coordinator',
+          protocolVersion: PROTOCOL_VERSION,
+          tokenRouting: TEST_TOKEN.routingB64,
+        }).toString('hex'),
+      );
     });
 
     it('persists credential to file after receiving sessionCredential', async () => {
@@ -350,19 +495,11 @@ describe('PeerClient', () => {
       const mock = getLatestMock();
       simulateOpen(mock);
 
-      const { sessionKey } = simulateServerHandshake(mock);
+      const hs = simulateServerHandshake(mock);
       await vi.advanceTimersByTimeAsync(0);
 
-      // Server sends auth response with sessionCredential
-      const authResponse = {
-        type: 'peer.auth.response',
-        accepted: true,
-        instanceId: 'remote-orch',
-        sessionCredential: 'a'.repeat(64),
-        role: 'coordinator',
-      };
-      mock.emit('message', encryptMessage(JSON.stringify(authResponse), sessionKey));
-      await vi.advanceTimersByTimeAsync(0);
+      // Server accepts with a sessionCredential its proof covers
+      await acceptOn(mock, hs, { sessionCredential: 'a'.repeat(64) });
 
       expect(mockWriteCredentialFile).toHaveBeenCalledWith(
         '/tmp/test-credential',
@@ -390,25 +527,25 @@ describe('PeerClient', () => {
       const mock = getLatestMock();
       simulateOpen(mock);
 
-      const { sessionKey, nonce } = simulateServerHandshake(mock);
+      const hs = simulateServerHandshake(mock);
       await vi.advanceTimersByTimeAsync(0);
 
-      // Find the encrypted auth request
-      const lastMsg = mock.sentMessages[mock.sentMessages.length - 1];
-      const decrypted = JSON.parse(decryptMessage(lastMsg, sessionKey));
-
+      const decrypted = readAuthRequest(mock, hs.sessionKey);
       expect(decrypted.type).toBe('peer.auth.request');
-      expect(decrypted.proof).toBeDefined();
-      expect(decrypted.token).toBeUndefined();
-
-      // Verify the HMAC proof is correct
-      const credentialHash = createHash('sha256').update('b'.repeat(64)).digest('hex');
-      const nonceB64 = nonce.toString('base64');
-      const expectedProof = createHmac('sha256', Buffer.from(credentialHash, 'hex'))
-        .update(nonceB64 + ':' + 'local-orch')
-        .digest('hex');
-
-      expect(decrypted.proof).toBe(expectedProof);
+      expect(decrypted.mode).toBe('credential');
+      expect(decrypted).not.toHaveProperty('token');
+      expect(decrypted).not.toHaveProperty('tokenRouting');
+      expect(decrypted.clientProof).toBe(
+        refClientProof({
+          psk: credentialPsk('b'.repeat(64)),
+          th: hs.transcriptHash,
+          mode: 'credential',
+          instanceId: 'local-orch',
+          role: 'coordinator',
+          protocolVersion: PROTOCOL_VERSION,
+          tokenRouting: '',
+        }).toString('hex'),
+      );
     });
 
     it('reuses credential across different target peer URLs (identity-scoped, not URL-scoped)', async () => {
@@ -427,30 +564,30 @@ describe('PeerClient', () => {
 
       const { client } = createPeerClient({
         url: 'ws://different-host:8080/peer',
-        joinToken: 'my-token',
+        joinToken: ONE_SHOT_TOKEN.token,
       });
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
 
-      const { sessionKey, nonce } = simulateServerHandshake(mock);
+      const hs = simulateServerHandshake(mock);
       await vi.advanceTimersByTimeAsync(0);
 
-      const lastMsg = mock.sentMessages[mock.sentMessages.length - 1];
-      const decrypted = JSON.parse(decryptMessage(lastMsg, sessionKey));
-
+      const decrypted = readAuthRequest(mock, hs.sessionKey);
       expect(decrypted.type).toBe('peer.auth.request');
       // Should use credential-based auth, NOT fall back to token
-      expect(decrypted.proof).toBeDefined();
-      expect(decrypted.token).toBeUndefined();
-
-      // Verify the HMAC proof is computed against our shared credential
-      const credentialHash = createHash('sha256').update('b'.repeat(64)).digest('hex');
-      const nonceB64 = nonce.toString('base64');
-      const expectedProof = createHmac('sha256', Buffer.from(credentialHash, 'hex'))
-        .update(nonceB64 + ':' + 'local-orch')
-        .digest('hex');
-      expect(decrypted.proof).toBe(expectedProof);
+      expect(decrypted.mode).toBe('credential');
+      expect(decrypted.clientProof).toBe(
+        refClientProof({
+          psk: credentialPsk('b'.repeat(64)),
+          th: hs.transcriptHash,
+          mode: 'credential',
+          instanceId: 'local-orch',
+          role: 'coordinator',
+          protocolVersion: PROTOCOL_VERSION,
+          tokenRouting: '',
+        }).toString('hex'),
+      );
     });
 
     it('falls back to token when credential file has different instanceId', async () => {
@@ -463,7 +600,7 @@ describe('PeerClient', () => {
         issuedAt: '2026-03-22T00:00:00Z',
       });
 
-      const { client } = createPeerClient({ joinToken: 'my-token' });
+      const { client } = createPeerClient({ joinToken: ONE_SHOT_TOKEN.token });
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
@@ -475,8 +612,8 @@ describe('PeerClient', () => {
       const decrypted = JSON.parse(decryptMessage(lastMsg, sessionKey));
 
       expect(decrypted.type).toBe('peer.auth.request');
-      expect(decrypted.token).toBe('my-token');
-      expect(decrypted.proof).toBeUndefined();
+      expect(decrypted.mode).toBe('token');
+      expect(decrypted.tokenRouting).toBe(ONE_SHOT_TOKEN.routingB64);
     });
 
     it('one credential file serves N peer-clients in a multi-coordinator mesh', async () => {
@@ -495,36 +632,21 @@ describe('PeerClient', () => {
 
       const { client: client1 } = createPeerClient({
         url: 'ws://peer-a:8080/peer',
-        joinToken: 'one-shot-token',
+        joinToken: ONE_SHOT_TOKEN.token,
       });
       client1.connect();
       const mock1 = getLatestMock();
       simulateOpen(mock1);
-      const { sessionKey: sk1 } = simulateServerHandshake(mock1);
+      const hs1 = simulateServerHandshake(mock1);
       await vi.advanceTimersByTimeAsync(0);
 
       // Verify client #1 sent token-based auth
-      const auth1 = JSON.parse(
-        decryptMessage(mock1.sentMessages[mock1.sentMessages.length - 1], sk1),
-      );
-      expect(auth1.token).toBe('one-shot-token');
-      expect(auth1.proof).toBeUndefined();
+      const auth1 = readAuthRequest(mock1, hs1.sessionKey);
+      expect(auth1.mode).toBe('token');
+      expect(auth1.tokenRouting).toBe(ONE_SHOT_TOKEN.routingB64);
 
       // Server accepts and issues a sessionCredential. Client writes it.
-      mock1.emit(
-        'message',
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.response',
-            accepted: true,
-            instanceId: 'peer-a',
-            sessionCredential: 'c'.repeat(64),
-            role: 'coordinator',
-          }),
-          sk1,
-        ),
-      );
-      await vi.advanceTimersByTimeAsync(0);
+      await acceptOn(mock1, hs1, { remoteInstanceId: 'peer-a', sessionCredential: 'c'.repeat(64) });
 
       // Confirm the shared credential was written
       expect(mockWriteCredentialFile).toHaveBeenCalledWith(
@@ -547,7 +669,7 @@ describe('PeerClient', () => {
       // Peer-client #2 → peer-b (DIFFERENT URL than what's in the cred file)
       const { client: client2 } = createPeerClient({
         url: 'ws://peer-b:8080/peer',
-        joinToken: 'one-shot-token', // same token; if this fires, auth fails in prod
+        joinToken: ONE_SHOT_TOKEN.token, // same token; if this fires, auth fails in prod
       });
       client2.connect();
       const mock2 = getLatestMock();
@@ -559,13 +681,12 @@ describe('PeerClient', () => {
         decryptMessage(mock2.sentMessages[mock2.sentMessages.length - 1], sk2),
       );
       // Must be credential-based, NOT token fallback
-      expect(auth2.proof).toBeDefined();
-      expect(auth2.token).toBeUndefined();
+      expect(auth2.mode).toBe('credential');
 
       // Peer-client #3 → peer-c (yet another URL)
       const { client: client3 } = createPeerClient({
         url: 'ws://peer-c:8080/peer',
-        joinToken: 'one-shot-token',
+        joinToken: ONE_SHOT_TOKEN.token,
       });
       client3.connect();
       const mock3 = getLatestMock();
@@ -576,8 +697,7 @@ describe('PeerClient', () => {
       const auth3 = JSON.parse(
         decryptMessage(mock3.sentMessages[mock3.sentMessages.length - 1], sk3),
       );
-      expect(auth3.proof).toBeDefined();
-      expect(auth3.token).toBeUndefined();
+      expect(auth3.mode).toBe('credential');
     });
   });
 
@@ -1070,22 +1190,9 @@ describe('PeerClient', () => {
       await vi.advanceTimersByTimeAsync(60_000);
       const third = getLatestMock();
       simulateOpen(third);
-      const { sessionKey } = simulateServerHandshake(third);
+      const thirdHs = simulateServerHandshake(third);
       await vi.advanceTimersByTimeAsync(0);
-      third.emit(
-        'message',
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.response',
-            accepted: true,
-            instanceId: 'remote-orch',
-            agents: [],
-            capabilities: { s3LogAccess: false },
-          }),
-          sessionKey,
-        ),
-      );
-      await vi.advanceTimersByTimeAsync(0);
+      await acceptOn(third, thirdHs);
       expect(client.state).toBe('connected');
 
       mockReadCredentialFile.mockResolvedValue(null);
@@ -1141,7 +1248,7 @@ describe('PeerClient', () => {
 
   describe('auth request includes softwareVersion and role', () => {
     it('includes softwareVersion and role in token-based auth request', async () => {
-      const { client } = createPeerClient({ joinToken: 'kici_join_v1.test.token', role: 'worker' });
+      const { client } = createPeerClient({ role: 'worker' });
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
@@ -1159,7 +1266,7 @@ describe('PeerClient', () => {
     });
 
     it('defaults role to coordinator when not specified', async () => {
-      const { client } = createPeerClient({ joinToken: 'kici_join_v1.test.token' });
+      const { client } = createPeerClient();
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
@@ -1668,6 +1775,447 @@ describe('PeerClient', () => {
       expect(options).toBeDefined();
 
       expect(options!['maxPayload']).toBe(WS_MAX_PAYLOAD_BYTES);
+    });
+  });
+
+  describe('mutual-v2 client', () => {
+    /** A schema-valid job.reroute, so a negative assertion cannot pass on a dropped fixture. */
+    function makeJobReroute(): JobReroute {
+      return jobRerouteSchema.parse({
+        type: 'job.reroute',
+        messageId: `msg-${randomBytes(4).toString('hex')}`,
+        jobId: 'job-1',
+        runId: 'run-1',
+        deliveryId: 'del-1',
+        routingKey: 'github:42',
+        event: 'push',
+        action: null,
+        payload: {},
+        jobName: 'build',
+        workflowName: 'ci',
+        runsOnLabels: [['linux']],
+        triedConnections: [],
+        maxHops: 3,
+        coordinatorId: 'orch-1',
+      });
+    }
+
+    /** Accept with a caller-chosen serverProof built from the server's view of the handshake. */
+    async function acceptWith(
+      client: PeerClient,
+      makeProof: (hs: ServerHandshake, authRequest: Record<string, any>) => Buffer,
+      extra: Record<string, unknown> = {},
+    ): Promise<MockWsInstance> {
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      const hs = simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+      const authRequest = readAuthRequest(mock, hs.sessionKey);
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.auth.response',
+            accepted: true,
+            instanceId: 'remote-orch',
+            role: 'coordinator',
+            serverProof: makeProof(hs, authRequest).toString('hex'),
+            sessionCredential: 'issued',
+            agents: [],
+            capabilities: { s3LogAccess: false },
+            ...extra,
+          }),
+          hs.sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      return mock;
+    }
+
+    it('refuses a server that accepts without a serverProof and routes nothing (adversarial server)', async () => {
+      const onJobReroute = vi.fn().mockResolvedValue(undefined);
+      const onAuthenticated = vi.fn();
+      const onConnected = vi.fn();
+      const { client, registry } = createPeerClient({ onJobReroute, onAuthenticated, onConnected });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      const hs = simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+      const authRequest = readAuthRequest(mock, hs.sessionKey);
+      const psk = await pskFor(authRequest);
+      const clientProof = Buffer.from(String(authRequest.clientProof), 'hex');
+      // The key a client that skipped the check would switch to.
+      const wouldBeAppKey = refAppKey({
+        handshakeKey: hs.sessionKey,
+        psk,
+        th: hs.transcriptHash,
+        clientProof,
+        serverProof: randomBytes(32),
+      });
+      // Pipelined in one tick: an unproven acceptance, then job.reroute under K_hs and K_app.
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.auth.response',
+            accepted: true,
+            instanceId: 'remote-orch',
+            role: 'coordinator',
+            sessionCredential: 'issued',
+            agents: [],
+            capabilities: { s3LogAccess: false },
+          }),
+          hs.sessionKey,
+        ),
+      );
+      mock.emit('message', encryptMessage(JSON.stringify(makeJobReroute()), hs.sessionKey));
+      mock.emit('message', encryptMessage(JSON.stringify(makeJobReroute()), wouldBeAppKey));
+      await vi.advanceTimersByTimeAsync(0);
+      // fails-when: the client accepts without checking serverProof
+      expect(client.state).not.toBe('connected');
+      expect(registry.getPeer('remote-orch')).toBeUndefined();
+      expect(onAuthenticated).not.toHaveBeenCalled();
+      expect(onConnected).not.toHaveBeenCalled();
+      expect(onJobReroute).not.toHaveBeenCalled();
+      expect(mock.closeCode).toBe(WS_CLOSE_UNAUTHORIZED);
+      expect(mockWriteCredentialFile).not.toHaveBeenCalled();
+    });
+
+    it('accepts a correct serverProof and routes job.reroute under K_app', async () => {
+      // breaks-if-wrong: the same flow with a proof computed by test code reaches connected
+      const onJobReroute = vi.fn().mockResolvedValue(undefined);
+      const { client, registry } = createPeerClient({ onJobReroute });
+      const { mock, sessionKey, handshakeKey } = await authenticateClient(client);
+      expect(client.state).toBe('connected');
+      expect(registry.getPeer('remote-orch')!.authScheme.outbound).toBe('mutual-v2');
+      // A frame under K_hs after acceptance is not routed.
+      mock.emit('message', encryptMessage(JSON.stringify(makeJobReroute()), handshakeKey));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onJobReroute).not.toHaveBeenCalled();
+      mock.emit('message', encryptMessage(JSON.stringify(makeJobReroute()), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onJobReroute).toHaveBeenCalledTimes(1);
+    });
+
+    it('resets the outbound scheme when the connection closes', async () => {
+      const { client, registry } = createPeerClient();
+      const { mock } = await authenticateClient(client);
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+      expect(registry.getPeer('remote-orch')!.authScheme.outbound).toBeNull();
+    });
+
+    it.each([
+      [
+        'a reflected clientProof',
+        (_hs: ServerHandshake, req: Record<string, any>) =>
+          Buffer.from(String(req.clientProof), 'hex'),
+      ],
+      ['a random proof', () => randomBytes(32)],
+      [
+        'a proof under the wrong key',
+        (hs: ServerHandshake, req: Record<string, any>) =>
+          refServerProof({
+            psk: randomBytes(32),
+            th: hs.transcriptHash,
+            clientProof: Buffer.from(String(req.clientProof), 'hex'),
+            serverInstanceId: 'remote-orch',
+            grantedRole: 'coordinator',
+            sessionCredential: 'issued',
+          }),
+      ],
+      [
+        'a proof over another transcript',
+        (_hs: ServerHandshake, req: Record<string, any>) =>
+          refServerProof({
+            psk: tokenPsk(TEST_TOKEN.tokenHash),
+            th: randomBytes(32),
+            clientProof: Buffer.from(String(req.clientProof), 'hex'),
+            serverInstanceId: 'remote-orch',
+            grantedRole: 'coordinator',
+            sessionCredential: 'issued',
+          }),
+      ],
+      [
+        'a proof that does not cover the issued credential',
+        (hs: ServerHandshake, req: Record<string, any>) =>
+          refServerProof({
+            psk: tokenPsk(TEST_TOKEN.tokenHash),
+            th: hs.transcriptHash,
+            clientProof: Buffer.from(String(req.clientProof), 'hex'),
+            serverInstanceId: 'remote-orch',
+            grantedRole: 'coordinator',
+            sessionCredential: 'another-credential',
+          }),
+      ],
+    ])('refuses %s', async (_label, makeProof) => {
+      const { client, registry } = createPeerClient();
+      const mock = await acceptWith(client, makeProof);
+      expect(client.state).not.toBe('connected');
+      expect(registry.getPeer('remote-orch')).toBeUndefined();
+      expect(mock.closeCode).toBe(WS_CLOSE_UNAUTHORIZED);
+      expect(mockWriteCredentialFile).not.toHaveBeenCalled();
+    });
+
+    it('refuses an acceptance without instanceId', async () => {
+      const { client } = createPeerClient();
+      const mock = await acceptWith(client, () => randomBytes(32), { instanceId: undefined });
+      expect(client.state).not.toBe('connected');
+      expect(mock.closeCode).toBe(WS_CLOSE_UNAUTHORIZED);
+    });
+
+    it('refuses a discovered target that answers with another instance id, and does not redial it', async () => {
+      const onMutualAuthFailed = vi.fn();
+      const { client, registry } = createPeerClient({
+        origin: PeerDialOrigin.Discovered,
+        expectedInstanceId: 'announced-id',
+        onMutualAuthFailed,
+      });
+      await authenticateClient(client, { remoteInstanceId: 'someone-else' });
+      // fails-when: expectedInstanceId is not enforced
+      expect(client.state).not.toBe('connected');
+      expect(registry.getPeer('someone-else')).toBeUndefined();
+      expect(onMutualAuthFailed).toHaveBeenCalledWith(PeerMutualAuthFailure.InstanceIdMismatch);
+      const sockets = mockInstances.length;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockInstances.length).toBe(sockets);
+    });
+
+    it('a discovered target that answers with the announced instance id connects', async () => {
+      // breaks-if-wrong: the instance-id check must pass a genuine announced peer
+      const { client } = createPeerClient({
+        origin: PeerDialOrigin.Discovered,
+        expectedInstanceId: 'remote-orch',
+      });
+      await authenticateClient(client);
+      expect(client.state).toBe('connected');
+    });
+
+    it('a hello without mutual-v2 gets no auth request and a close', async () => {
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      mock.emit(
+        'message',
+        JSON.stringify({
+          type: 'peer.hello',
+          ephemeralPublicKey: generateEcdhKeyPair().publicKey.toString('base64'),
+          nonce: randomBytes(32).toString('base64'),
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      // fails-when: the client proceeds without the scheme
+      expect(mock.sentMessages).toHaveLength(0);
+      expect(mock.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+    });
+
+    it('a static client refused for the missing scheme reconnects with backoff', async () => {
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      mock.emit(
+        'message',
+        JSON.stringify({
+          type: 'peer.hello',
+          ephemeralPublicKey: generateEcdhKeyPair().publicKey.toString('base64'),
+          nonce: randomBytes(32).toString('base64'),
+          authSchemes: ['mutual-v1'],
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mock.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+      const sockets = mockInstances.length;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockInstances.length).toBeGreaterThan(sockets);
+    });
+
+    it('a hello with a short nonce gets no auth request', async () => {
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      mock.emit(
+        'message',
+        JSON.stringify({
+          type: 'peer.hello',
+          ephemeralPublicKey: generateEcdhKeyPair().publicKey.toString('base64'),
+          nonce: randomBytes(16).toString('base64'),
+          authSchemes: ['mutual-v2'],
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mock.sentMessages).toHaveLength(0);
+      expect(mock.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+    });
+
+    it('proceeds when the hello lists an unknown scheme beside mutual-v2', async () => {
+      // Both sides hash the raw advertised list, so the proofs verify.
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      const hs = simulateServerHandshake(mock, { authSchemes: ['mutual-v3', 'mutual-v2'] });
+      await vi.advanceTimersByTimeAsync(0);
+      await acceptOn(mock, hs);
+      expect(client.state).toBe('connected');
+    });
+
+    it('never sends the token or its secret in token mode', async () => {
+      const { client } = createPeerClient();
+      const { mock, handshakeKey, sessionKey } = await authenticateClient(client);
+      const plaintexts = mock.sentMessages.map((m) => {
+        for (const key of [handshakeKey, sessionKey]) {
+          try {
+            return decryptMessage(m, key);
+          } catch {
+            // not under this key
+          }
+        }
+        return m;
+      });
+      // fails-when: the raw token is sent
+      for (const text of plaintexts) {
+        expect(text).not.toContain(TEST_TOKEN.secretHex);
+        expect(text).not.toContain(TEST_TOKEN.tokenHash);
+      }
+      // sentMessages[1] is the auth request, right after the hello.response.
+      expect(JSON.parse(decryptMessage(mock.sentMessages[1], handshakeKey))).toMatchObject({
+        mode: 'token',
+        tokenRouting: TEST_TOKEN.routingB64,
+      });
+    });
+
+    it('a token join writes the issued credential through joinComplete', async () => {
+      // breaks-if-wrong: the credential the server issued, bound into serverProof, is persisted
+      const { client } = createPeerClient();
+      await authenticateClient(client, { sessionCredential: 'issued-cred' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockWriteCredentialFile).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ credential: 'issued-cred' }),
+      );
+    });
+
+    it('refuses a token-mode acceptance without a sessionCredential', async () => {
+      const { client } = createPeerClient();
+      const { mock } = await authenticateClient(client, { sessionCredential: null });
+      expect(client.state).not.toBe('connected');
+      expect(mock.closeCode).toBe(WS_CLOSE_UNAUTHORIZED);
+      expect(mockWriteCredentialFile).not.toHaveBeenCalled();
+    });
+
+    it('refuses a token that is not a valid join token before sending anything secret', async () => {
+      const { client } = createPeerClient({ joinToken: 'kici_join_v1.not-a.token' });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mock.sentMessages).toHaveLength(1); // the hello.response only
+      expect(mock.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+    });
+
+    it('closes on an undecryptable frame while authenticating', async () => {
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+      mock.emit('message', 'not-a-ciphertext');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mock.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+    });
+
+    it('closes on an unexpected frame type while authenticating', async () => {
+      const { client } = createPeerClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      const hs = simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+      mock.emit('message', encryptMessage(JSON.stringify(makeJobReroute()), hs.sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mock.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+      expect(client.state).not.toBe('connected');
+    });
+
+    it('closes a server silent after open at handshakeTimeoutMs and schedules a reconnect', async () => {
+      const { client } = createPeerClient({ handshakeTimeoutMs: 15_000 });
+      client.connect();
+      simulateOpen(getLatestMock());
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(getLatestMock().readyState).toBe(1);
+      // fails-when: no handshake timer
+      await vi.advanceTimersByTimeAsync(1);
+      expect((mockInstances[0] as unknown as MockWsInstance).readyState).toBe(3);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockInstances.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('a server that completes inside the timeout is not closed', async () => {
+      // breaks-if-wrong: the timer must not close a connected client
+      const { client } = createPeerClient({ handshakeTimeoutMs: 15_000 });
+      await authenticateClient(client);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(client.state).toBe('connected');
+      expect(getLatestMock().readyState).toBe(1);
+    });
+
+    it('a timer armed for an earlier socket never closes a later one', async () => {
+      const { client } = createPeerClient({
+        handshakeTimeoutMs: 15_000,
+        maxReconnectDelayMs: 1_000,
+      });
+      client.connect();
+      const first = getLatestMock();
+      simulateOpen(first);
+      await vi.advanceTimersByTimeAsync(5_000);
+      first.close(1006, 'server went away');
+      await vi.advanceTimersByTimeAsync(1_000);
+      const second = getLatestMock();
+      expect(second).not.toBe(first);
+      simulateOpen(second);
+      const hs = simulateServerHandshake(second);
+      await vi.advanceTimersByTimeAsync(0);
+      await acceptOn(second, hs);
+      expect(client.state).toBe('connected');
+      await vi.advanceTimersByTimeAsync(10_000); // past the first socket's deadline
+      expect(second.readyState).toBe(1);
+      expect(client.state).toBe('connected');
+    });
+  });
+
+  describe('a replaced client', () => {
+    it('a disconnected client whose socket closes late does not mark its successor disconnected', async () => {
+      // fails-when: the late close event of the old socket runs markDisconnected
+      const registry = new PeerRegistry();
+      const { client: first } = createPeerClient({ peerRegistry: registry });
+      const { mock: firstSocket } = await authenticateClient(first);
+      const { client: second } = createPeerClient({ peerRegistry: registry });
+      first.disconnect();
+      await authenticateClient(second);
+      // The first socket's close event arrives only now, after the successor registered.
+      firstSocket.emit('close', 1000, Buffer.from('Client disconnect'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(second.state).toBe('connected');
+      expect(registry.getPeer('remote-orch')!.connected).toBe(true);
+      expect(registry.getPeer('remote-orch')!.authScheme.outbound).toBe('mutual-v2');
+    });
+
+    it('a close of the current socket still marks the peer disconnected and reconnects', async () => {
+      // breaks-if-wrong: the guard must not swallow a real close
+      const { client, registry } = createPeerClient();
+      const { mock } = await authenticateClient(client);
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+      expect(registry.getPeer('remote-orch')!.connected).toBe(false);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockInstances.length).toBeGreaterThan(1);
     });
   });
 });

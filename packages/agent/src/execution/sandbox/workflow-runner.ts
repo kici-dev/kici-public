@@ -114,6 +114,7 @@ import {
 } from '../cache/index.js';
 import { createArtifactsApi, type ArtifactTransport } from '../artifacts/artifact-engine.js';
 import { createSecretMasker, LogMasker, maskMessageText } from './log-masker.js';
+import { buildFatalReport } from './fatal-report.js';
 import { applyEnvDelta } from './env-delta.js';
 import { createEnvFiles, readEnvDelta, truncateEnvFiles, type EnvFiles } from './env-file.js';
 import { buildMergedFlatSecrets } from './secret-merge.js';
@@ -151,17 +152,19 @@ const AGENT_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION
 
 // --- Global error handlers (must be first) ---
 
+// The agent turns this stderr into the job error when the runner exits without
+// a job.complete, so it is masked with the job's masker once one exists.
 process.on('uncaughtException', (err) => {
-  process.stderr.write(`[workflow-runner] UNCAUGHT EXCEPTION: ${err.message}\n`);
-  if (err.stack) process.stderr.write(`[workflow-runner] Stack: ${err.stack}\n`);
+  process.stderr.write(maskFatalText(`[workflow-runner] UNCAUGHT EXCEPTION: ${err.message}\n`));
+  if (err.stack) process.stderr.write(maskFatalText(`[workflow-runner] Stack: ${err.stack}\n`));
   process.exit(99);
 });
 
 process.on('unhandledRejection', (reason) => {
   const msg = toErrorMessage(reason);
   const stack = reason instanceof Error ? reason.stack : undefined;
-  process.stderr.write(`[workflow-runner] UNHANDLED REJECTION: ${msg}\n`);
-  if (stack) process.stderr.write(`[workflow-runner] Stack: ${stack}\n`);
+  process.stderr.write(maskFatalText(`[workflow-runner] UNHANDLED REJECTION: ${msg}\n`));
+  if (stack) process.stderr.write(maskFatalText(`[workflow-runner] Stack: ${stack}\n`));
   process.exit(98);
 });
 
@@ -196,6 +199,18 @@ const origStderrWrite = process.stderr.write.bind(process.stderr);
  * async-context source of {@link currentCaptureStepIndex}).
  */
 let capturePrepareActive = false;
+
+/**
+ * The job's secret masker, set in main() as soon as the execute request (and
+ * so the job's secrets) is known. The fatal-error handler masks its report
+ * with it; before it is set no job secret exists to mask.
+ */
+let fatalMasker: LogMasker | null = null;
+
+/** Mask `text` with the job's masker, or return it as it is before one exists. */
+function maskFatalText(text: string): string {
+  return fatalMasker?.hasSecrets() ? fatalMasker.mask(text) : text;
+}
 
 /** The maskedSend function used by the output capture. Set during main(). */
 let captureSendFn: ((msg: RunnerToAgentMessage) => void) | null = null;
@@ -2105,16 +2120,15 @@ export function buildConcurrencyGroupContext(request: JobExecutionRequest): {
 /**
  * Phase 4b — Evaluate the user-defined `concurrency.group(...)` function with
  * a timeout, report the resulting key to the orchestrator, and act on the
- * returned ack. `wait` and `cancel` paths exit the process directly (the run
- * is over from the runner's perspective). Returns 'proceed' to the caller in
- * the success path.
- *
- * Returns 'failed' instead of exiting when group evaluation throws, so
- * main() can keep its single exit-on-error point.
+ * returned ack. `wait` and `cancel` paths, and a group function that throws,
+ * exit the process directly (the run is over from the runner's perspective).
+ * Returns 'proceed' to the caller in the success path. Every message goes
+ * through `send`, the job's masked send.
  */
 async function evaluateConcurrencyGroupIfPresent(
   workflow: Workflow,
   request: JobExecutionRequest,
+  send: (msg: RunnerToAgentMessage) => void,
 ): Promise<ConcurrencyAction> {
   if (!workflow.concurrency?.group) return 'proceed';
   trace('evaluating concurrency group function');
@@ -2140,19 +2154,19 @@ async function evaluateConcurrencyGroupIfPresent(
       clearTimeout(concurrencyTimer);
     }
     trace(`concurrency group evaluated: ${groupKey}`);
-    sendMessage({
+    send({
       type: 'log.line',
       stepIndex: -1,
       line: `[kici] Concurrency group: ${groupKey}`,
     });
 
-    sendMessage({ type: 'concurrency.report', group: groupKey });
+    send({ type: 'concurrency.report', group: groupKey });
     trace('waiting for concurrency ack');
     let ack = await waitForConcurrencyAck(concurrencyTimeoutMs);
     trace(`concurrency ack received: action=${ack.action}, reason=${ack.reason ?? 'none'}`);
 
     if (ack.action === 'proceed') {
-      sendMessage({
+      send({
         type: 'log.line',
         stepIndex: -1,
         line: '[kici] Concurrency: proceeding with execution',
@@ -2165,7 +2179,7 @@ async function evaluateConcurrencyGroupIfPresent(
       // SAME WS connection. The agent stays connected; we re-arm the
       // single-slot pending-ack waiter and block until the orchestrator
       // notifies us, the connection drops, or the configured cap elapses.
-      sendMessage({
+      send({
         type: 'log.line',
         stepIndex: -1,
         line: `[kici] Concurrency: queued${ack.reason ? ` (${ack.reason})` : ''}, waiting for slot to free`,
@@ -2180,12 +2194,12 @@ async function evaluateConcurrencyGroupIfPresent(
         ack = await waitForConcurrencyAck(waitCapMs);
       } catch (waitErr) {
         const waitErrMsg = toErrorMessage(waitErr);
-        sendMessage({
+        send({
           type: 'log.line',
           stepIndex: -1,
           line: `[kici] [error] Concurrency wait timed out: ${waitErrMsg}`,
         });
-        sendMessage({
+        send({
           type: 'job.complete',
           status: ExecutionJobStatus.enum.failed,
           stepResults: [],
@@ -2195,7 +2209,7 @@ async function evaluateConcurrencyGroupIfPresent(
       }
       trace(`concurrency follow-up ack: action=${ack.action}, reason=${ack.reason ?? 'none'}`);
       if (ack.action === 'proceed') {
-        sendMessage({
+        send({
           type: 'log.line',
           stepIndex: -1,
           line: '[kici] Concurrency: slot acquired, proceeding with execution',
@@ -2206,12 +2220,12 @@ async function evaluateConcurrencyGroupIfPresent(
         // Defensive: a second `wait` is unexpected (the orchestrator only sends
         // unsolicited acks on slot release). Treat as failure rather than
         // looping forever — the agent is in an inconsistent state.
-        sendMessage({
+        send({
           type: 'log.line',
           stepIndex: -1,
           line: '[kici] [error] Concurrency: unexpected second `wait` ack; aborting',
         });
-        sendMessage({
+        send({
           type: 'job.complete',
           status: ExecutionJobStatus.enum.failed,
           stepResults: [],
@@ -2222,12 +2236,12 @@ async function evaluateConcurrencyGroupIfPresent(
       // ack.action === 'cancel' — fall through to the cancel branch below.
     }
     // ack.action === 'cancel'
-    sendMessage({
+    send({
       type: 'log.line',
       stepIndex: -1,
       line: `[kici] Concurrency: cancelled${ack.reason ? ` (${ack.reason})` : ''}`,
     });
-    sendMessage({
+    send({
       type: 'job.complete',
       status: ExecutionJobStatus.enum.failed,
       stepResults: [],
@@ -2237,12 +2251,12 @@ async function evaluateConcurrencyGroupIfPresent(
   } catch (err) {
     const errMsg = toErrorMessage(err);
     trace(`concurrency group evaluation failed: ${errMsg}`);
-    sendMessage({
+    send({
       type: 'log.line',
       stepIndex: -1,
       line: `[kici] [error] Concurrency group evaluation failed: ${errMsg}`,
     });
-    sendMessage({
+    send({
       type: 'job.complete',
       status: ExecutionJobStatus.enum.failed,
       stepResults: [],
@@ -2954,7 +2968,7 @@ async function runInitPhaseOrFailJob(args: {
 
   if (!initResult.ok) {
     const errorBody = initResult.error ?? '';
-    sendMessage({
+    maskedSend({
       type: 'job.complete',
       status: ExecutionJobStatus.enum.failed,
       stepResults: [],
@@ -3024,6 +3038,8 @@ async function main(): Promise<void> {
   const sourceDir = isGlobal ? join(workDir, 'source') : workDir;
 
   const masker = createSecretMasker(request);
+  // From here on a fatal error is reported through the job's masker.
+  fatalMasker = masker;
   const maskedSend = (msg: RunnerToAgentMessage): void => {
     sendMessage(maskMessageText(msg, masker));
   };
@@ -3079,7 +3095,7 @@ async function main(): Promise<void> {
   // Phase 4: concurrency group eval (may exit the process for wait/cancel).
   // Skipped for a cleanup-only re-run — the slot was already released when the
   // original job ended; re-acquiring it here would wait or cancel spuriously.
-  if (!request.cleanupOnly) await evaluateConcurrencyGroupIfPresent(workflow, request);
+  if (!request.cleanupOnly) await evaluateConcurrencyGroupIfPresent(workflow, request, maskedSend);
 
   // Phase 5: inject the global-workflow env + repo pair, then extract steps
   // (dynamic source eval or static lookup) and normalize.
@@ -3390,29 +3406,14 @@ function findJob(workflow: { jobs: readonly JobOrFactory[] }, jobName: string): 
 // --- Entry Point ---
 
 main().catch((error) => {
-  // Unhandled error in the job lifecycle
-  const message = toErrorMessage(error);
-  const stack = error instanceof Error ? error.stack : undefined;
+  // Unhandled error in the job lifecycle, reported through the job's masker.
+  const report = buildFatalReport(error, fatalMasker);
 
   // Write to stderr for container log capture (IPC might not flush before exit)
-  process.stderr.write(`[workflow-runner] Fatal error: ${message}\n`);
-  if (stack) {
-    process.stderr.write(`[workflow-runner] Stack: ${stack}\n`);
-  }
+  process.stderr.write(report.stderr);
 
-  // Send error via IPC for agent-level visibility
-  sendMessage({
-    type: 'log.line',
-    stepIndex: -1,
-    line: `[workflow-runner] [error] Fatal: ${message}`,
-  });
-
-  sendMessage({
-    type: 'job.complete',
-    status: ExecutionJobStatus.enum.failed,
-    stepResults: [],
-    error: message,
-  });
+  // Send the error via IPC for agent-level visibility
+  for (const msg of report.messages) sendMessage(msg);
 
   // Give IPC messages time to flush before exiting
   setTimeout(() => process.exit(1), 100);

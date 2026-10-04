@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   NPM_PUBLIC_REGISTRY,
   allowedRegistries,
@@ -7,13 +10,13 @@ import {
   isRegistryTarball,
   isRepoNpmrcKey,
   isToolReadEnvName,
-  loadNpmIni,
+  loadHostNpmIni,
   parseRepoNpmrc,
   pickAllowed,
   serializeNpmrc,
 } from './npmrc-allowlist.js';
 
-const ini = loadNpmIni();
+const ini = loadHostNpmIni().ini;
 
 /** A lone CR hides a second key inside what a LF-only reader sees as one line. */
 const LONE_CR_PAYLOAD =
@@ -253,5 +256,51 @@ describe('isToolReadEnvName', () => {
     // breaks-if-wrong: the exemption stays exact-case, so a name npm could read
     // as config (npm_config_* in any case) or a longer NPM_ name is still refused.
     expect(isToolReadEnvName(name)).toBe(true);
+  });
+});
+
+describe('loadHostNpmIni', () => {
+  let base: string;
+
+  beforeEach(async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), 'kici-host-ini-')));
+  });
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true });
+  });
+
+  it('loads the parser of the npm the lookup found, and names the npm it refused', async () => {
+    const root = join(base, 'usr', 'share', 'nodejs', 'npm');
+    const cli = join(root, 'bin', 'npm-cli.js');
+    await mkdir(join(root, 'bin'), { recursive: true });
+    await writeFile(cli, '');
+    for (const id of ['ini', '@npmcli/arborist', 'semver']) {
+      const dir = join(root, 'node_modules', id);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'package.json'), JSON.stringify({ name: id, main: 'index.js' }));
+      await writeFile(
+        join(dir, 'index.js'),
+        id === 'ini'
+          ? "module.exports = { decode: () => ({ from: 'fixture' }), encode: () => '' };\n"
+          : 'module.exports = {};\n',
+      );
+    }
+    const env = {
+      execPath: join(base, 'usr', 'bin', 'node'),
+      pathEnv: '',
+      distributionCliPaths: [cli],
+    };
+
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'npm', version: '12.0.2' }));
+    // fails-when: the parser does not come from the npm the lookup found.
+    expect(loadHostNpmIni(env).ini?.decode('')).toEqual({ from: 'fixture' });
+
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'npm', version: '11.9.0' }));
+    // breaks-if-wrong: an npm below the minimum lends the check its parser.
+    expect(loadHostNpmIni(env)).toEqual({
+      ini: null,
+      detail: `${cli} is npm 11.9.0, older than 11.10.0`,
+    });
   });
 });

@@ -104,6 +104,7 @@ export function createClusterHealthRoutes(deps: ClusterHealthRoutesDeps): Hono {
       draining: peer.draining,
       capabilities: peer.capabilities,
       role: peer.role,
+      authScheme: peer.authScheme,
       // scalerCapacity is the per-peer scaler advertisement carried in heartbeats;
       // exposing it here lets operators (and test setup helpers) verify cross-coord
       // scaler discovery without poking at the registry directly.

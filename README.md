@@ -1,6 +1,6 @@
 # KiCI
 
-> CI/CD in typed TypeScript, with a dev loop on your real infrastructure — run your working tree, uncommitted changes included, on your own agents with `kici run remote` before you push. KiCI never receives your source or secrets.
+> CI/CD with a full dev loop your coding agent can own — on your own infrastructure. KiCI is a complete CI/CD system that runs your pipelines on machines you control. Your agent compiles a workflow, runs your working tree on your own agents with `kici run remote` before it pushes, and reads and re-runs the result over MCP. KiCI never receives your source or secrets.
 
 `kici` is the developer CLI for [KiCI](https://kici.dev): scaffold a `.kici/` workflow directory, compile workflows, dry-run them against synthetic or real events, and execute them locally or against a remote orchestrator.
 

@@ -352,7 +352,7 @@ In your GitHub App's settings:
 
 - **Webhook URL**: the URL printed above.
 - **Webhook secret**: the same `--webhook-secret` you passed in step 9.
-- **Subscribe to events**: at minimum `push` and `pull_request`.
+- **Subscribe to events**: at minimum `push` and `pull_request`. To answer security holds with `/kici approve` comments, also set the **Issues** permission to read and subscribe to `issue_comment` (see [Pull-request comment commands](../providers/github.md#pull-request-comment-commands)).
 
 Click **Save changes** in GitHub.
 

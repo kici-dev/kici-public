@@ -150,14 +150,14 @@ All three tiers expose health endpoints for monitoring:
 
 ### Orchestrator
 
-| Endpoint          | Description                                               |
-| ----------------- | --------------------------------------------------------- |
-| `/health`         | Basic liveness check                                      |
-| `/ready`          | Readiness check (database connected)                      |
-| `/metrics`        | Prometheus metrics (prefix: `kici_orch_`)                 |
-| `/cluster/health` | Cluster health: status, role, term, leader, peers, agents |
-| `/cluster/peers`  | Per-peer details: instance ID, connection state, agents   |
-| `/cluster/runs`   | Active execution runs with job routing summary            |
+| Endpoint          | Description                                                                                     |
+| ----------------- | ----------------------------------------------------------------------------------------------- |
+| `/health`         | Basic liveness check                                                                            |
+| `/ready`          | Readiness check (database connected)                                                            |
+| `/metrics`        | Prometheus metrics (prefix: `kici_orch_`)                                                       |
+| `/cluster/health` | Cluster health: status, role, term, leader, peers, agents                                       |
+| `/cluster/peers`  | Per-peer details: instance ID, connection state, agents, and each link direction's `authScheme` |
+| `/cluster/runs`   | Active execution runs with job routing summary                                                  |
 
 ### Agent
 

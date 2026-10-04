@@ -14,7 +14,8 @@ kici-admin source add github --name <name> --manifest [--github-org <slug>] [--w
 # Manual: store credentials for a GitHub App you already created
 kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin]
 kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--customer-id <orgId>]
-# Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth)
+# Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth);
+# also reports missing events, permissions and installations pending approval
 kici-admin source refresh <routingKey> [--json]
 kici-admin source refresh --all [--json]
 kici-admin source get-webhook-secret <routingKey>
@@ -38,23 +39,24 @@ kici-admin source remove <routingKey> --local [--hard] [--yes]
 kici-admin source trigger-local <id> [--event push|pull_request] [--ref <ref>] [--sha <sha>] [--repo-full-name <name>] [--base-url <url>]
 kici-admin source install-hook <id> [--repo <path>] [--base-url <url>]
 
-# List all sources (without --org, only GitHub sources are shown)
+# List all sources (without --org, only GitHub sources are shown).
+# GitHub rows show the direct ingress URL (`ingress:`)
 kici-admin source list [--org <orgId>] [--include-deleted]
 ```
 
 **One-click manifest setup** (`--manifest`): the recommended path for a brand-new App. The CLI builds a pre-filled GitHub App manifest (permissions, events, webhook URL), opens GitHub for you to click **"Create GitHub App"** once, captures the returned credentials, stores them encrypted on the orchestrator, and walks you through installing the App on your repos. It always creates a **new** App on GitHub. Flags:
 
-| Flag                  | Description                                                                                                                                                                         |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`)                                                                        |
-| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                                                                                         |
-| `--webhook-url <url>` | Advanced/self-hosted: bake this `https://` URL into the App webhook verbatim and skip platform-mode URL resolution. KiCI adds no ingress at this URL — your own infra owns delivery |
-| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin                                                                        |
-| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                                                                                          |
+| Flag                  | Description                                                                                                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`)                                                                                            |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                                                                                                             |
+| `--webhook-url <url>` | Advanced/self-hosted: bake this `https://` URL into the App webhook verbatim instead of the URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own infra owns delivery |
+| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin                                                                                            |
+| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                                                                                                              |
 
-**`source refresh`**: re-reads a GitHub source's display name + slug from GitHub (`GET /app`) and updates the orchestrator + dashboard if they drifted (e.g. after renaming the App in GitHub's UI). For GitHub App sources GitHub is the source of truth for the displayed name — `--name` is only the name requested at creation. Pass a `<routingKey>` for one source or `--all` for every GitHub source; the command prints `old → new` for any changed field and is a no-op when GitHub already matches. The orchestrator also runs this refresh automatically once a day (`KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS`, default 24h). Non-GitHub routing keys are rejected.
+**`source refresh`**: re-reads a GitHub source's display name + slug from GitHub (`GET /app`) and updates the orchestrator + dashboard if they drifted (e.g. after renaming the App in GitHub's UI). For GitHub App sources GitHub is the source of truth for the displayed name — `--name` is only the name requested at creation. Pass a `<routingKey>` for one source or `--all` for every GitHub source; the command prints `old → new` for any changed field and is a no-op when GitHub already matches. The orchestrator also runs this refresh automatically once a day (`KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS`, default 24h). Non-GitHub routing keys are rejected. It also compares the App with what KiCI needs: it warns when the App lacks a permission or an event, and lists the installations that have not accepted a new permission yet. `--json` carries the same findings as `missingEvents`, `missingPermissions` and `installationsPendingApproval`.
 
-See the [GitHub provider guide](../../../user/providers/github.md) for the full one-click walkthrough. The manifest flow resolves the App's webhook URL from the orchestrator's Platform connection, so it requires a **platform** or **hybrid** orchestrator. **Independent-mode** orchestrators have no Platform connection (and therefore no GitHub-App ingress), so the pre-flight returns no webhook URL and the flow aborts — use a generic webhook source there instead.
+See the [GitHub provider guide](../../../user/providers/github.md) for the full one-click walkthrough. The manifest flow works in every mode. In **platform** and **hybrid** mode it bakes the hosted Platform's webhook URL into the App. In **observed** and **independent** mode it bakes the orchestrator's own org-scoped URL, `<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`, so set `KICI_WEBHOOK_PUBLIC_URL` first.
 
 **Secret input modes** (for private keys and webhook secrets — the manual path):
 
@@ -190,19 +192,19 @@ Synopsis: `kici-admin source add github [options]`
 
 **Options**
 
-| Option                        | Default | Description                                                                                                                                                                        |
-| ----------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--name <name>`               |         | Human-readable source name                                                                                                                                                         |
-| `--app-id <id>`               |         | GitHub App ID (omit when using --manifest)                                                                                                                                         |
-| `--private-key <pathOrValue>` |         | Private key (prefix with @ for file path)                                                                                                                                          |
-| `--webhook-secret <secret>`   |         | Webhook secret (use "-" to read from stdin)                                                                                                                                        |
-| `--from-env <varName>`        |         | Read private key from environment variable                                                                                                                                         |
-| `--stdin`                     |         | Read private key from stdin                                                                                                                                                        |
-| `--manifest`                  |         | One-click setup: create and configure a new GitHub App via the App Manifest flow                                                                                                   |
-| `--no-browser`                |         | Headless manifest setup: print a URL and paste the setup code back                                                                                                                 |
-| `--github-org <slug>`         |         | Create the App under a GitHub org instead of your personal account                                                                                                                 |
-| `--webhook-url <url>`         |         | Advanced/self-hosted: bake this https:// URL into the App webhook verbatim and skip platform-mode URL resolution. KiCI adds no ingress at this URL — your own infra owns delivery. |
-| `--json`                      |         | Emit raw JSON (the API response) instead of formatted text                                                                                                                         |
+| Option                        | Default | Description                                                                                                                                                                                            |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--name <name>`               |         | Human-readable source name                                                                                                                                                                             |
+| `--app-id <id>`               |         | GitHub App ID (omit when using --manifest)                                                                                                                                                             |
+| `--private-key <pathOrValue>` |         | Private key (prefix with @ for file path)                                                                                                                                                              |
+| `--webhook-secret <secret>`   |         | Webhook secret (use "-" to read from stdin)                                                                                                                                                            |
+| `--from-env <varName>`        |         | Read private key from environment variable                                                                                                                                                             |
+| `--stdin`                     |         | Read private key from stdin                                                                                                                                                                            |
+| `--manifest`                  |         | One-click setup: create and configure a new GitHub App via the App Manifest flow                                                                                                                       |
+| `--no-browser`                |         | Headless manifest setup: print a URL and paste the setup code back                                                                                                                                     |
+| `--github-org <slug>`         |         | Create the App under a GitHub org instead of your personal account                                                                                                                                     |
+| `--webhook-url <url>`         |         | Advanced/self-hosted: bake this https:// URL into the App webhook verbatim instead of the URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own infra owns delivery. |
+| `--json`                      |         | Emit raw JSON (the API response) instead of formatted text                                                                                                                                             |
 
 ### `kici-admin source add local`
 
@@ -365,7 +367,7 @@ Synopsis: `kici-admin source redeliver <routingKey> [options]`
 
 ### `kici-admin source refresh`
 
-Re-sync a GitHub source's name and slug from GitHub (use --all for every source)
+Re-sync a GitHub source's name and slug from GitHub and report missing events or permissions (use --all for every source)
 
 Synopsis: `kici-admin source refresh [routingKey] [options]`
 

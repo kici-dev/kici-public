@@ -47,8 +47,7 @@ Mode: observed
   The Platform connection carries runs/jobs/steps/logs/events so the hosted
   dashboard still works, and sources register as observe-only (never routed).
   Requires KICI_PLATFORM_URL, KICI_PLATFORM_TOKEN, and KICI_WEBHOOK_PUBLIC_URL.
-  GitHub-App sources are unsupported here (they are relay-ingested) — use a
-  generic or local source, or pick hybrid.
+  GitHub-App and generic sources both deliver to this orchestrator's own URL.
 
 Mode: independent
   GitHub  -->  Orchestrator  --WS-->  Agents
@@ -69,7 +68,7 @@ Mode: independent
 
 ### Webhook secrets are per-source
 
-There is **no global `WEBHOOK_SECRET` env var**. Every webhook source has its own secret, registered via `kici-admin source add github ...` (or `source add generic ...`) and stored encrypted in the orchestrator DB. Direct HTTP webhook ingestion flows through `POST /webhook/:orgId/github/:sourceId` (GitHub App sources) or `POST /webhook/:orgId/generic/:sourceId` (generic sources), and the orchestrator reads the secret for that source from its `scoped_secrets` table on demand via `PgSecretStore`. See [Registering a GitHub App](#registering-a-github-app) below for the per-source registration flow.
+There is **no global `WEBHOOK_SECRET` env var**. Every webhook source has its own secret, registered via `kici-admin source add github ...` (or `source add generic ...`) and stored encrypted in the orchestrator DB. Direct HTTP webhook ingestion flows through `POST /webhook/:orgId/github` or `POST /webhook/:orgId/github/:sourceId` (GitHub App sources) or `POST /webhook/:orgId/generic/:sourceId` (generic sources), and the orchestrator reads the secret for that source from its `scoped_secrets` table on demand via `PgSecretStore`. See [Registering a GitHub App](#registering-a-github-app) below for the per-source registration flow.
 
 ## Prerequisites
 
@@ -402,7 +401,7 @@ The orchestrator keeps an idle keep-alive connection open for 130 seconds. That 
 
 ### One port for every source
 
-The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered webhook source (GitHub Apps and generic) is served from that one listener, distinguished by URL path (`/webhook/<orgId>/github/<sourceId>`, `/webhook/<orgId>/generic/<sourceId>`) rather than by port number. There is no per-source port option in `kici-admin source add` and no `port` column on the source row. If you need different public URLs / hostnames / TLS certs per source, terminate that mapping at your reverse proxy and have it forward to the orchestrator's single port. See [Multi-provider setup](configuration.md#multi-provider-setup) for the full discussion.
+The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered webhook source (GitHub Apps and generic) is served from that one listener, distinguished by URL path (`/webhook/<orgId>/github`, `/webhook/<orgId>/github/<sourceId>`, `/webhook/<orgId>/generic/<sourceId>`) rather than by port number. There is no per-source port option in `kici-admin source add` and no `port` column on the source row. If you need different public URLs / hostnames / TLS certs per source, terminate that mapping at your reverse proxy and have it forward to the orchestrator's single port. See [Multi-provider setup](configuration.md#multi-provider-setup) for the full discussion.
 
 ## Feature availability and keeping the orchestrator current
 

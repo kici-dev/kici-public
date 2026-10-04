@@ -167,8 +167,9 @@ describe('createRestageAgentHandler', () => {
       present: new Set([agentPackageKey('2.0.0', 'linux-x64')]),
       properties: {},
     });
+    // fails-when: the text names a flag kici-admin host declare does not have (--property).
     await expect(createRestageAgentHandler(deps)(OPS, { targetAgentId: TARGET })).rejects.toThrow(
-      /no restart method/i,
+      /no restart method.*kici-admin host declare --prop\b/is,
     );
   });
 

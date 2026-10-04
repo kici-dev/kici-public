@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import JSZip from 'jszip';
+import { DashboardClientError } from '../../remote/dashboard-client.js';
 import { createReportBundle, type ReportBundleDeps } from './collect.js';
 
 let tmp: string;
@@ -239,5 +240,126 @@ describe('createReportBundle redaction completeness', () => {
         deps: deps(),
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe('createReportBundle identifying fields', () => {
+  const PAT = 'kici_pat_0123abcd0123abcd0123abcd';
+  const LOGGED_IN = {
+    platformEndpoint: 'https://api.kici.dev',
+    oidcIssuer: 'https://auth.kici.dev',
+    pat: PAT,
+    patId: '6f1c2b0e-8a8d-4c3e-9a51-0d6c1f3e2a77',
+    patExpiresAt: '2026-12-31T00:00:00.000Z',
+    activeOrgId: 'org_prod00001',
+  };
+  const loggedIn = async () => ({ ...LOGGED_IN });
+  const runNotFound = async (): Promise<never> => {
+    throw new DashboardClientError('not_found', 'Run not found', 404);
+  };
+
+  it('keeps the endpoint, issuer, org and PAT expiry readable in config.json', async () => {
+    const { entries } = await build({ loadConfig: loggedIn });
+    const config = JSON.parse(entries['config/config.json']!);
+    // fails-when: config.json is built with the plain shared redactConfig.
+    expect(config.platformEndpoint).toBe('https://api.kici.dev');
+    expect(config.oidcIssuer).toBe('https://auth.kici.dev');
+    expect(config.activeOrgId).toBe('org_prod00001');
+    expect(config.patExpiresAt).toBe('2026-12-31T00:00:00.000Z');
+  });
+
+  it('still masks the PAT and its id', async () => {
+    const { entries } = await build({ loadConfig: loggedIn });
+    const raw = entries['config/config.json']!;
+    const config = JSON.parse(raw);
+    // breaks-if-wrong: the readable allowlist must not reach the credential.
+    expect(config.pat).toBe('****');
+    expect(config.patId).toBe('****');
+    expect(raw).not.toContain(PAT);
+  });
+
+  it('masks a password embedded in a readable endpoint URL', async () => {
+    // The endpoint is readable; the free-text scrubber still runs over it.
+    const { entries } = await build({
+      loadConfig: async () => ({
+        ...LOGGED_IN,
+        platformEndpoint: 'https://ops:s3cr3tpassw0rd@api.example.com',
+      }),
+    });
+    const raw = entries['config/config.json']!;
+    expect(raw).not.toContain('s3cr3tpassw0rd');
+    expect(raw).toContain('api.example.com');
+  });
+
+  it('names the searched endpoint and org when the run is not found', async () => {
+    const { result, entries } = await build(
+      { loadConfig: loggedIn, fetchRun: runNotFound },
+      { runId: '0b5e8a4c-1f2d-4e6a-9b7c-3d2e1f0a9b8c' },
+    );
+    const run = result.collectionReport.find((e) => e.collector === 'run');
+    expect(run?.status).toBe('error');
+    // fails-when: the run collector records the raw "Run not found" message.
+    expect(run?.note).toBe('Run not found (searched org org_prod00001 on https://api.kici.dev)');
+    // The manifest copy carries the same note through the scrubber.
+    const manifest = JSON.parse(entries['manifest.json']!);
+    expect(manifest.collectionReport).toEqual(result.collectionReport);
+  });
+
+  it('leaves a non-not-found run error unchanged when the target is known', async () => {
+    // The config names an endpoint and an org, so the lookup target exists:
+    // only the error kind keeps the note bare.
+    // fails-when: the fetch wrapper names the target on every error kind.
+    const { result } = await build(
+      {
+        loadConfig: loggedIn,
+        fetchRun: async () => {
+          throw new DashboardClientError('forbidden', 'Access denied.', 403);
+        },
+      },
+      { runId: 'r1' },
+    );
+    expect(result.collectionReport.find((e) => e.collector === 'run')?.note).toBe('Access denied.');
+  });
+
+  it('keeps the remedy text of an org-less CLI', async () => {
+    // breaks-if-wrong: an org-less CLI keeps its own remedy text.
+    const { result } = await build(
+      {
+        loadConfig: async () => ({ platformEndpoint: 'https://api.kici.dev', pat: PAT }),
+        fetchRun: async () => {
+          throw new DashboardClientError(
+            'no_active_org',
+            'No active organization. Run `kici org use <name>` to set one.',
+          );
+        },
+      },
+      { runId: 'r1' },
+    );
+    expect(result.collectionReport.find((e) => e.collector === 'run')?.note).toBe(
+      'No active organization. Run `kici org use <name>` to set one.',
+    );
+  });
+
+  it('still records a found run as ok', async () => {
+    // breaks-if-wrong: the fetch wrapper must not swallow a success.
+    const { result, entries } = await build({ loadConfig: loggedIn }, { runId: 'r1' });
+    expect(result.collectionReport.find((e) => e.collector === 'run')).toEqual({
+      collector: 'run',
+      status: 'ok',
+    });
+    expect(entries['runs/r1/detail.json']).toBeDefined();
+  });
+
+  it('records a not-found run unchanged when the config could not be read', async () => {
+    const { result } = await build(
+      {
+        loadConfig: async () => {
+          throw new Error('Config file contains invalid JSON.');
+        },
+        fetchRun: runNotFound,
+      },
+      { runId: 'r1' },
+    );
+    expect(result.collectionReport.find((e) => e.collector === 'run')?.note).toBe('Run not found');
   });
 });

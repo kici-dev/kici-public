@@ -42,7 +42,7 @@ import {
   type DashboardFleetHostRequest,
   type DashboardFleetPreviewRequest,
   type DashboardFleetWorkflowsForHostRequest,
-  type JoinRequest,
+  isJoinRequestFrame,
   type JoinResponse,
   type SourceRegistration,
   type DeploymentIdentity,
@@ -347,8 +347,11 @@ export interface PlatformClientOptions {
   onTrustPolicyUpdate?: FrameHandler<TrustPolicyUpdate>;
   /** Optional callback for stale check run cleanup requests from Platform. */
   onStaleCheckrunCleanup?: FrameHandler<StaleCheckrunCleanup>;
-  /** Optional callback for join requests relayed via Platform. */
-  onJoinRequest?: (msg: JoinRequest) => Promise<JoinResponse>;
+  /**
+   * Optional handler for join.request frames relayed by the Platform. It answers
+   * every such frame. Wiring it advertises the clusterJoinV2 capability.
+   */
+  onJoinRequest?: (raw: unknown) => Promise<JoinResponse>;
   /** Custom orchestrator capabilities to merge with ORCH_CAPABILITIES in auth.request. */
   orchCapabilities?: Partial<OrchCapabilities>;
   /**
@@ -555,6 +558,9 @@ export class PlatformClient {
   /** Canonical Platform org id from `auth.success`; see {@link getOrgId}. */
   private _orgId?: string;
 
+  /** The Platform's org-scoped GitHub webhook URL from the last `auth.success`. */
+  private _githubWebhookUrl?: string | null;
+
   /**
    * Returns the cached public alias of the orchestrator's owning org,
    * or `undefined` if Platform has not supplied one yet. Read by
@@ -578,6 +584,16 @@ export class PlatformClient {
    */
   getOrgId(): string | undefined {
     return this._orgId;
+  }
+
+  /**
+   * The hosted Platform's org-scoped GitHub App webhook URL
+   * (`<base>/webhook/<orgId>/github`) from the last `auth.success`. `null` when
+   * the Platform has no public webhook base; `undefined` before the first
+   * successful auth or when the Platform does not send the field.
+   */
+  getGithubWebhookUrl(): string | null | undefined {
+    return this._githubWebhookUrl;
   }
 
   constructor(options: PlatformClientOptions) {
@@ -648,6 +664,8 @@ export class PlatformClient {
     const capabilitiesTransform = options.capabilitiesTransform ?? ((c: OrchCapabilities) => c);
     this.orchCapabilities = capabilitiesTransform({
       ...ORCH_CAPABILITIES,
+      // Advertised only when this orchestrator answers join protocol v2 frames.
+      ...(options.onJoinRequest ? { clusterJoinV2: true } : {}),
       ...options.orchCapabilities,
     });
     this.onVerifyInbound = options.onVerifyInbound;
@@ -1318,9 +1336,9 @@ export class PlatformClient {
   }
 
   /**
-   * Try the two non-mainline schemas (log-pull, cluster join.request) when
-   * the primary `platformToOrchestratorMessageSchema` failed to parse. Falls
-   * back to a structured warning if neither schema matches.
+   * Try the non-mainline frames (log-pull, cluster join.request) when the
+   * primary `platformToOrchestratorMessageSchema` failed to parse. Falls back to
+   * a structured warning if none matches.
    */
   private handleNonStandardMessage(raw: unknown, primaryIssues: unknown): void {
     // Try log pull messages (separate schema union)
@@ -1330,10 +1348,11 @@ export class PlatformClient {
       return;
     }
 
-    // Try join.request messages (relayed via Platform for cluster join flow)
-    const joinParsed = joinRequestSchema.safeParse(raw);
-    if (joinParsed.success && this.onJoinRequest) {
-      this.onJoinRequest(joinParsed.data)
+    // A join.request relayed by the Platform. The join handler answers every such
+    // frame, a refused version-1 or malformed one included, so the Platform never
+    // waits out its relay timeout.
+    if (isJoinRequestFrame(raw) && this.onJoinRequest) {
+      this.onJoinRequest(raw)
         .then((response) => {
           this.sendRaw(response);
         })
@@ -1833,6 +1852,8 @@ export class PlatformClient {
       this._orgId = msg.orgId;
       this.onOrgIdentified?.({ orgId: msg.orgId, clusterId: this.clusterId ?? null });
     }
+    // Each authentication replaces the Platform's GitHub webhook URL.
+    this._githubWebhookUrl = msg.githubWebhookUrl;
     // Surface the provenance trust root so the agent-handler can verify
     // provenance bundles at ingest. Fires on every (re)connect; `null` when
     // the Platform has no provenance issuer configured.

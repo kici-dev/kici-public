@@ -45,6 +45,15 @@ export const authSuccessSchema = z.object({
    * rather than silently `verified`.
    */
   provenanceIssuer: z.string().nullable().optional(),
+  /**
+   * The Platform's org-scoped GitHub App webhook URL
+   * (`<WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`). It is known before any
+   * App exists, so the orchestrator's manifest flow bakes it into a new App in
+   * platform and hybrid mode. `null` when the Platform has no public webhook
+   * base. Absent from a Platform that does not send it; the orchestrator then
+   * reports the URL as unknown.
+   */
+  githubWebhookUrl: z.string().nullable().optional(),
 });
 
 /** Auth failure response sent by Platform to orchestrator when authentication fails. */

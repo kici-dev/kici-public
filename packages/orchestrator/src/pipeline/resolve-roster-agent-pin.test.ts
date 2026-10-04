@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { resolveRosterAgentPin, runsOnSelectorsForLockJob } from './dispatch-matched-workflow.js';
 import type { HostRosterStore } from '../agent/host-roster.js';
+import { HostIdentitySource } from '../db/types.js';
 
 function fakeStore(
-  rows: Record<string, { connected_instance_id: string | null }>,
+  rows: Record<
+    string,
+    { connected_instance_id: string | null; identity_source?: HostIdentitySource }
+  >,
 ): HostRosterStore {
   return {
     get: async (agentId: string) => (rows[agentId] ? (rows[agentId] as any) : null),
@@ -19,6 +23,33 @@ describe('resolveRosterAgentPin', () => {
       hostRosterStore: store,
     });
     expect(pin).toEqual({ pinnedAgentId: 'agent-eu-1', connectedInstanceId: 'orch-b' });
+  });
+
+  it('does not pin to an unconfirmed (platform) roster row', async () => {
+    // fails-when: the pin ignores identity_source, so a placeholder named like a
+    // label turns every runsOn job on that label into a pin to an absent agent.
+    const store = fakeStore({
+      gpu: { connected_instance_id: null, identity_source: HostIdentitySource.platform },
+    });
+    const pin = await resolveRosterAgentPin({
+      runsOnExact: ['gpu'],
+      runsOnPatterns: [],
+      hostRosterStore: store,
+    });
+    expect(pin).toBeNull();
+  });
+
+  it('pins to a confirmed (operator) roster row', async () => {
+    // breaks-if-wrong: an operator-declared host is the documented inventory pin target.
+    const store = fakeStore({
+      gpu: { connected_instance_id: null, identity_source: HostIdentitySource.operator },
+    });
+    const pin = await resolveRosterAgentPin({
+      runsOnExact: ['gpu'],
+      runsOnPatterns: [],
+      hostRosterStore: store,
+    });
+    expect(pin).toEqual({ pinnedAgentId: 'gpu', connectedInstanceId: null });
   });
 
   it('returns null when the single label is not a roster host', async () => {

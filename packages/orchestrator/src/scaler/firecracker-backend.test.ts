@@ -3509,8 +3509,10 @@ describe('FirecrackerScalerBackend', () => {
         // fails-when: the probe's verdict is acted on although the agent
         // registered while it was reading.
         const { backend } = createBackend();
-        await backend.spawn(['linux', 'firecracker'], 'agent-late', 'ws://localhost:8080/ws/agent');
-        // The first probe reads ENOENT; the second hangs until released.
+        // The first probe reads ENOENT; the second hangs until released. Served
+        // before the spawn: the clock here also advances with real time, so on a
+        // loaded host a probe can run while spawn() is still returning, and under
+        // the default PID-file mock it would read a dead PID and count as gone.
         let releaseRead!: () => void;
         let reads = 0;
         mockReadFile.mockImplementation(async () => {
@@ -3518,6 +3520,7 @@ describe('FirecrackerScalerBackend', () => {
           if (reads === 2) await new Promise<void>((r) => (releaseRead = r));
           throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
         });
+        await backend.spawn(['linux', 'firecracker'], 'agent-late', 'ws://localhost:8080/ws/agent');
         await vi.advanceTimersByTimeAsync(4_100);
         expect(releaseRead).toBeTypeOf('function');
 

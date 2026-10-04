@@ -1,4 +1,4 @@
-import { githubIngressPath } from '@kici-dev/engine';
+import { githubIngressPath, githubWebhookPath } from '@kici-dev/engine';
 
 /**
  * Build the orchestrator's OWN direct GitHub ingress URL for a source, from
@@ -14,4 +14,17 @@ export function buildLocalGithubIngressUrl(
   if (!webhookPublicUrl) return null;
   const base = webhookPublicUrl.replace(/\/$/, '');
   return `${base}${githubIngressPath(orgId, sourceId)}`;
+}
+
+/**
+ * Build the orchestrator's OWN org-scoped GitHub App ingress URL
+ * (`<base>/webhook/<orgId>/github`), served by the org-scoped direct route.
+ * Null when no public base is configured.
+ */
+export function buildLocalGithubAppIngressUrl(
+  webhookPublicUrl: string | undefined,
+  orgId: string,
+): string | null {
+  if (!webhookPublicUrl) return null;
+  return `${webhookPublicUrl.replace(/\/$/, '')}${githubWebhookPath(orgId)}`;
 }

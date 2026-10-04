@@ -128,12 +128,16 @@ export async function createScalerBackend(
   }
 
   if (s.type === ScalerBackendType.enum['bare-metal']) {
-    return new BareMetalScalerBackend({
+    // `create` refuses a job-image label set on a host that cannot run nft the
+    // way `requireSudo` asks, so the scaler fails at load, not at every spawn.
+    return BareMetalScalerBackend.create({
       name: s.name,
       labelSets: s.labelSets,
       maxAgents: s.maxAgents,
       defaultResources: ctx.scalerConfig.defaults?.resources,
       enforceCgroups: s.enforceCgroups,
+      requireSudo: s.requireSudo,
+      extraHosts: s.extraHosts,
       ...shared,
     });
   }

@@ -38,6 +38,7 @@ import {
   npmInstallCommand,
   type HostInstallTool,
 } from './host-isolated-install.js';
+import { resolveNpmModule } from './npm-resolver.js';
 import { isRegistryTarball } from './npmrc-allowlist.js';
 
 /** The parts of a dependency edge in npm's arborist tree this check reads. */
@@ -94,13 +95,18 @@ function refuse(refusal: HostInstallRefusal, detail: string): HostInstallRefused
  * The lockfile reader (its `@npmcli/arborist`) and version parser (its
  * `semver`) of the npm at `npmCliPath`, so the check reads the lockfile exactly
  * as the `npm ci` it guards will. `null` when that npm ships either one in a
- * shape this check cannot use.
+ * shape this check cannot use, or when either one resolves outside that npm's
+ * install ({@link resolveNpmModule}): a module a parent or global folder
+ * supplies belongs to another npm.
  */
 export function npmLockReader(npmCliPath: string): NpmLockReader | null {
+  const arborist = resolveNpmModule(npmCliPath, '@npmcli/arborist');
+  const semverModule = resolveNpmModule(npmCliPath, 'semver');
+  if ('reason' in arborist || 'reason' in semverModule) return null;
   try {
     const require = createRequire(npmCliPath);
-    const Arborist = require('@npmcli/arborist') as unknown;
-    const semver = require('semver') as { valid?: unknown };
+    const Arborist = require(arborist.file) as unknown;
+    const semver = require(semverModule.file) as { valid?: unknown };
     if (typeof Arborist !== 'function' || typeof semver.valid !== 'function') return null;
     const Ctor = Arborist as new (opts: { path: string }) => {
       loadVirtual(): Promise<LockTree>;

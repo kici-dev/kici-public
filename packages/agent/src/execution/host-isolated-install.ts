@@ -12,8 +12,9 @@
  * the allowlist cannot reach the package manager. The repository's pnpmfiles,
  * workspace files and `package.json` scripts are never in reach either.
  *
- * The package manager is the agent's own: the npm that ships next to the Node
- * running the agent, or the pinned pnpm bundle, each started with that Node
+ * The package manager is the agent's own: the npm installed with the Node
+ * running the agent, or else a distribution or PATH npm at 11.10.0 or later,
+ * or the pinned pnpm bundle, each started with that Node
  * directly — never a corepack shim, which would follow the repository's
  * `packageManager` field. Both run with scripts disabled and git dependencies
  * refused. npm 11.15.0 and later runs `npm install` and refuses URL, file and
@@ -30,9 +31,16 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { makeTempDir } from '@kici-dev/core/tmp';
 import { PNPM_IGNORE_BUILD_GATE_ARG, PackageManager } from '@kici-dev/shared/package-manager';
+import { attachNpmDebugLog } from './install-failure.js';
 import type { HostInstallPlan } from './host-install-eligibility.js';
 import { renderAgentLines, tokenEnvName, type NpmRegistrySpec } from './npm-registry-config.js';
-import { resolveNpm } from './npm-resolver.js';
+import {
+  NPM_ALLOW_GIT_MIN,
+  hostNpmLookupEnv,
+  lookupHostNpm,
+  versionAtLeast,
+  type HostNpmLookupEnv,
+} from './npm-resolver.js';
 import { authEnvReferences, isToolReadEnvName, serializeNpmrc } from './npmrc-allowlist.js';
 
 const execFileAsync = promisify(execFile);
@@ -40,8 +48,6 @@ const execFileAsync = promisify(execFile);
 /** The pnpm the agent image pins (packages/agent/Dockerfile, `corepack prepare`). */
 export const PINNED_PNPM_VERSION = '11.3.0';
 
-/** First npm with `--allow-git` (11.10.0). */
-const NPM_ALLOW_GIT_MIN: readonly number[] = [11, 10, 0];
 /** First npm with `--allow-remote` / `--allow-file` / `--allow-directory` (11.15.0). */
 const NPM_ALLOW_SOURCES_MIN: readonly number[] = [11, 15, 0];
 
@@ -69,19 +75,6 @@ export interface HostInstallTool {
   version: string;
 }
 
-/** Numeric `major.minor.patch` compare; prerelease tags are ignored. */
-export function versionAtLeast(version: string, min: readonly number[]): boolean {
-  const parts = version
-    .split(/[.+-]/)
-    .slice(0, 3)
-    .map((p) => Number.parseInt(p, 10));
-  for (let i = 0; i < 3; i++) {
-    const have = Number.isFinite(parts[i]) ? parts[i]! : 0;
-    if (have !== min[i]) return have > min[i]!;
-  }
-  return true;
-}
-
 async function readPackageVersion(pkgJson: string, name: string): Promise<string | null> {
   try {
     const pkg = JSON.parse(await readFile(pkgJson, 'utf-8')) as {
@@ -102,16 +95,22 @@ export function npmInstallCommand(version: string): NpmInstallCommand {
 }
 
 /**
- * The npm bundled with the Node running the agent, when it is new enough to
- * refuse git dependencies. A bare `npm` on `PATH` is never used: it may be a
- * shim that picks its own version.
+ * The npm the host install runs: the one {@link lookupHostNpm} finds, so it is
+ * always the npm whose parser read the `.npmrc` files, at 11.10.0 or later,
+ * started with the Node running the agent. A version-manager shim on PATH is
+ * never used: it may pick its own npm.
  */
-export async function resolveHostNpm(): Promise<HostInstallTool | null> {
-  const { npmCliPath, nodeExe } = resolveNpm();
-  if (!npmCliPath) return null;
-  const version = await readPackageVersion(join(dirname(npmCliPath), '..', 'package.json'), 'npm');
-  if (!version || !versionAtLeast(version, NPM_ALLOW_GIT_MIN)) return null;
-  return { packageManager: PackageManager.Npm, nodeExe, script: npmCliPath, version };
+export async function resolveHostNpm(
+  env: HostNpmLookupEnv = hostNpmLookupEnv(),
+): Promise<HostInstallTool | null> {
+  const npm = lookupHostNpm(env);
+  if (!npm.found || !npm.version || !versionAtLeast(npm.version, NPM_ALLOW_GIT_MIN)) return null;
+  return {
+    packageManager: PackageManager.Npm,
+    nodeExe: env.execPath,
+    script: npm.npmCliPath,
+    version: npm.version,
+  };
 }
 
 /**
@@ -309,18 +308,26 @@ export async function runHostIsolatedInstall(args: RunHostInstallArgs): Promise<
       store: join(stage.path, 'store'),
       userconfig: join(home, '.npmrc'),
     });
-    await execFileAsync(args.tool.nodeExe, argv, {
-      cwd: project,
-      env: buildHostInstallEnv({
-        baseEnv: args.baseEnv,
-        nodeDir: dirname(args.tool.nodeExe),
-        stageHome: home,
-        extra: npmrc.env,
-      }),
-      timeout: INSTALL_TIMEOUT_MS,
-      maxBuffer: INSTALL_MAX_BUFFER,
-      ...(args.signal ? { signal: args.signal } : {}),
-    });
+    try {
+      await execFileAsync(args.tool.nodeExe, argv, {
+        cwd: project,
+        env: buildHostInstallEnv({
+          baseEnv: args.baseEnv,
+          nodeDir: dirname(args.tool.nodeExe),
+          stageHome: home,
+          extra: npmrc.env,
+        }),
+        timeout: INSTALL_TIMEOUT_MS,
+        maxBuffer: INSTALL_MAX_BUFFER,
+        ...(args.signal ? { signal: args.signal } : {}),
+      });
+    } catch (err) {
+      // npm's debug log lives in the staged cache removed below.
+      if (args.tool.packageManager === PackageManager.Npm) {
+        await attachNpmDebugLog(err, join(stage.path, 'cache'));
+      }
+      throw err;
+    }
     await moveNodeModules(join(project, 'node_modules'), args.kiciDir);
   } finally {
     await rm(stage.path, { recursive: true, force: true }).catch(() => {});

@@ -32,7 +32,9 @@ const patch = job('patch', {
 
 `runsOnAll` targets the hosts you declare as members of your fleet. A host becomes
 a target when it registers with the orchestrator under a stable agent identity, or
-when an operator declares it with `kici-admin host declare`.
+when an operator declares it with `kici-admin host declare`. A host declared from the
+dashboard is not a target until its agent registers or an operator confirms it with
+`kici-admin host declare`.
 
 Agents that an auto-scaler starts are **not** targets, even when their labels match
 the predicate. An auto-scaler starts an agent at the fixed shape of its pool, so a

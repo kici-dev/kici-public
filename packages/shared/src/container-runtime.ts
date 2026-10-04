@@ -113,7 +113,60 @@ export function runtimeInjectBind(hostRuntimeDir: string): string {
 }
 
 /**
- * Command that starts the agent from the INJECTED runtime.
+ * Image label naming the init an agent image ships in its runtime tree.
+ *
+ * The scalers start an agent inside a job's own image from the injected
+ * runtime, so its init has to come from that runtime too: the job's image is
+ * not required to ship one. An agent image built before the label existed
+ * carries no init in its runtime tree, and its agent starts as PID 1 as it
+ * always did.
+ */
+export const RUNTIME_INIT_LABEL = 'kici.runtime.init';
+
+/** The inits an agent image can name in {@link RUNTIME_INIT_LABEL}. */
+export const RuntimeInit = z.enum(['tini']);
+export type RuntimeInit = z.infer<typeof RuntimeInit>;
+
+/** The static tini the agent image ships in its runtime tree. */
+export const RUNTIME_TINI_PATH = `${RUNTIME_MOUNT}/bin/tini`;
+
+/**
+ * The command prefix for each init. Typed by the enum, so a new member needs an
+ * entry. `-s` keeps tini a reaper if the runtime puts its own init at PID 1.
+ */
+const RUNTIME_INIT_COMMANDS: Record<RuntimeInit, readonly string[]> = {
+  [RuntimeInit.enum.tini]: [RUNTIME_TINI_PATH, '-s', '--'],
+};
+
+/**
+ * The init command to start an injected agent under, from the agent image's
+ * labels.
+ *
+ * Empty when the image names no init, or one this release does not know: that
+ * agent then starts as PID 1 and says so in its startup log.
+ */
+export function runtimeInitCommand(labels: Record<string, string> | null | undefined): string[] {
+  const init = RuntimeInit.safeParse(labels?.[RUNTIME_INIT_LABEL]);
+  return init.success ? [...RUNTIME_INIT_COMMANDS[init.data]] : [];
+}
+
+/**
+ * The agent image's labels. The image is already present: the runtime volume
+ * was materialized from it.
+ */
+export async function agentImageLabels(
+  docker: Docker,
+  agentImage: string,
+): Promise<Record<string, string> | undefined> {
+  const info = (await docker.getImage(agentImage).inspect()) as {
+    Config?: { Labels?: Record<string, string> | null };
+  };
+  return info.Config?.Labels ?? undefined;
+}
+
+/**
+ * Command that starts the agent from the INJECTED runtime, under `init` (from
+ * {@link runtimeInitCommand}) when the agent image ships one.
  *
  * Only meaningful when the runtime is mounted. A spawned job image has its own
  * default CMD — python's shell, a node REPL, whatever the customer's image
@@ -123,8 +176,12 @@ export function runtimeInjectBind(hostRuntimeDir: string): string {
  * Absolute on both halves: the image is not required to ship Node, and the
  * agent lives inside the runtime tree rather than at the image's own /app.
  */
-export function injectedAgentCommand(): string[] {
-  return [`${RUNTIME_MOUNT}/node/bin/node`, `${RUNTIME_MOUNT}/app/packages/agent/dist/server.js`];
+export function injectedAgentCommand(init: readonly string[] = []): string[] {
+  return [
+    ...init,
+    `${RUNTIME_MOUNT}/node/bin/node`,
+    `${RUNTIME_MOUNT}/app/packages/agent/dist/server.js`,
+  ];
 }
 
 /**

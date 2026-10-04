@@ -4,12 +4,14 @@ import {
   canonicalizeLabel,
   canonicalizeLabels,
   canonicalizeMatcher,
+  type FleetHostEntry,
+  FleetHostWriteRefusal,
   type HostInventoryEntry,
   type InventorySelector,
   type LabelMatcher,
   matcherSatisfiedBy,
 } from '@kici-dev/engine';
-import type { Database, HostRosterRow } from '../db/types.js';
+import { type Database, HostIdentitySource, type HostRosterRow } from '../db/types.js';
 
 /** Typed host-vars bag carried by roster rows (`string | number | boolean`). */
 export type HostProperties = Record<string, string | number | boolean>;
@@ -47,21 +49,100 @@ function canonicalizeHostname(raw: string | null | undefined): string | null {
   return raw === null || raw === undefined ? null : canonicalizeLabel(raw);
 }
 
+/** Prefix of the orchestrator-reserved namespace for host labels and property keys. */
+const RESERVED_HOST_KEY_PREFIX = 'kici:';
+
 /**
- * Drop every orchestrator-reserved `kici:`-namespaced key from an
- * agent-reported host-property bag. Agent-reported properties win the roster
- * shallow-merge, so without this an agent could FORGE reserved keys the
- * orchestrator trusts — the staged-version convergence gate and the
- * root-executed restart commands both read `kici:` keys. Only orchestrator
- * writes (`recordStagedVersion`) and operator declares (`declareStatic`) set
- * this namespace; a registering agent never may.
+ * True when a host label or property key is in the orchestrator-reserved
+ * `kici:` namespace. Trimmed and case-insensitive, matching how labels fold on
+ * read (`canonicalizeLabel`).
+ */
+export function isReservedHostKey(key: string): boolean {
+  return key.trim().toLowerCase().startsWith(RESERVED_HOST_KEY_PREFIX);
+}
+
+/**
+ * Drop every reserved `kici:` key from an agent-reported host-property bag.
+ * Agent-reported properties win the roster shallow-merge, and the staged-version
+ * convergence gate and the restart commands the re-stage runs over SSH both
+ * read `kici:` keys, so a registering agent must never set them. Reserved keys
+ * come only from orchestrator code (`recordStagedVersion`) and a local
+ * `kici-admin host declare`.
  */
 export function stripReservedProperties(props: HostProperties): HostProperties {
   const out: HostProperties = {};
   for (const [key, value] of Object.entries(props)) {
-    if (!key.startsWith('kici:')) out[key] = value;
+    if (!isReservedHostKey(key)) out[key] = value;
   }
   return out;
+}
+
+/** Who is writing a static host declaration or removal. */
+export enum HostWriteAuthority {
+  /** A local `kici-admin` declare or remove. */
+  operator = 'operator',
+  /** A Platform-relayed dashboard write. The default. */
+  platform = 'platform',
+}
+
+/** A host write refused because of the writer's authority. */
+export class HostWriteRefusedError extends Error {
+  constructor(
+    readonly code: FleetHostWriteRefusal,
+    readonly detail: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+
+/** A Platform write named a reserved `kici:` label or property key. */
+export class ReservedHostKeyError extends HostWriteRefusedError {
+  constructor(readonly keys: string[]) {
+    super(
+      FleetHostWriteRefusal.enum.reserved_property,
+      keys.join(','),
+      `reserved kici: labels and properties are set only with kici-admin host declare: ${keys.join(', ')}`,
+    );
+  }
+}
+
+/** A Platform declare named a host that already exists. */
+export class HostExistsError extends HostWriteRefusedError {
+  constructor(agentId: string) {
+    super(
+      FleetHostWriteRefusal.enum.host_exists,
+      agentId,
+      `host ${agentId} already exists; change it with kici-admin host declare`,
+    );
+  }
+}
+
+/** A Platform remove named a host an agent or operator confirmed. */
+export class HostConfirmedError extends HostWriteRefusedError {
+  constructor(agentId: string) {
+    super(
+      FleetHostWriteRefusal.enum.host_confirmed,
+      agentId,
+      `host ${agentId} is confirmed; remove it with kici-admin host remove`,
+    );
+  }
+}
+
+/** Input of {@link HostRosterStore.declareStatic}. */
+export interface DeclareStaticInput {
+  agentId: string;
+  labels?: string[];
+  hostname?: string;
+  properties?: HostProperties;
+  address?: string;
+  sshUser?: string;
+  sshPort?: number;
+  sshKeySecret?: string;
+  s3Reachable?: boolean;
+  /** Who is writing. Omitted ⇒ `platform`, the most restricted. */
+  authority?: HostWriteAuthority;
 }
 
 /**
@@ -213,13 +294,10 @@ export class HostRosterStore {
   async upsert(input: UpsertHostInput): Promise<void> {
     const labelsJson = JSON.stringify(input.labels);
     const hostname = canonicalizeHostname(input.hostname);
-    // Strip the orchestrator-reserved `kici:` namespace from agent-reported
-    // properties before it is merged (agent-reported keys win the merge). This
-    // is a SECURITY boundary: without it, a compromised agent could forge
+    // Strip the reserved `kici:` namespace from agent-reported properties. This
+    // is a security boundary: a compromised agent could otherwise forge
     // `kici:staged-agent-version` (evading the fleet-upgrade convergence) or
-    // `kici:agent-restart-*` (a root command the ops agent would run over SSH).
-    // Only orchestrator code (recordStagedVersion) and operator declares
-    // (declareStatic) may set `kici:` keys.
+    // `kici:agent-restart-*` (a command the re-stage runs over SSH).
     const reportedJson = JSON.stringify(stripReservedProperties(input.properties ?? {}));
     await this.db
       .insertInto('host_roster')
@@ -234,6 +312,7 @@ export class HostRosterStore {
         arch: input.arch,
         connected_instance_id: input.instanceId,
         host_properties: reportedJson,
+        identity_source: HostIdentitySource.agent,
         last_seen: sql`now()`,
         updated_at: sql`now()`,
       })
@@ -250,10 +329,15 @@ export class HostRosterStore {
           platform: input.platform,
           arch: input.arch,
           connected_instance_id: input.instanceId,
-          // Shallow-merge: existing bag on the left, agent-reported on the
-          // right (right keys win). Operator-declared keys the agent does not
-          // report are preserved.
-          host_properties: sql`COALESCE(host_roster.host_properties, '{}'::jsonb) || ${reportedJson}::jsonb`,
+          // An agent registration confirms the host. A row a dashboard declare
+          // created is replaced by what the agent reports; any other row keeps a
+          // shallow merge (agent keys win, operator keys it does not report
+          // survive). PostgreSQL evaluates every SET expression against the
+          // existing row, so this CASE reads the source before the update.
+          host_properties: sql`CASE WHEN host_roster.identity_source = ${HostIdentitySource.platform}
+            THEN ${reportedJson}::jsonb
+            ELSE COALESCE(host_roster.host_properties, '{}'::jsonb) || ${reportedJson}::jsonb END`,
+          identity_source: HostIdentitySource.agent,
           last_seen: sql`now()`,
           updated_at: sql`now()`,
         }),
@@ -282,34 +366,38 @@ export class HostRosterStore {
   }
 
   /**
-   * Operator pre-declare of a static host. A re-declare of an existing agent_id
-   * converges the operator-owned columns (labels, hostname, reach,
-   * host_properties) to the newly-declared values while preserving the
-   * agent-reported liveness/identity columns (connected_instance_id, last_seen,
-   * platform, arch, lifecycle_class, token_id, reboot_pending_until). The
-   * optional reach fields (`address`/`sshUser`/`sshPort`/`sshKeySecret`) carry
-   * how to SSH to the host for bootstrap bring-up. Each operator field is
-   * preserve-on-omit: an omitted field keeps the existing column value.
-   *
-   * Returns `{ created: true }` when the declare inserted a new row,
-   * `{ created: false }` when it converged an existing one.
+   * Declare a static host. Under `operator` authority (a local `kici-admin`),
+   * it inserts or converges the row; under `platform` authority (a dashboard
+   * write, the default) it only creates a new, unconfirmed row. Returns
+   * `{ created: true }` when the declare inserted the row.
    */
-  async declareStatic(input: {
-    agentId: string;
-    labels?: string[];
-    hostname?: string;
-    properties?: HostProperties;
-    address?: string;
-    sshUser?: string;
-    sshPort?: number;
-    sshKeySecret?: string;
-    s3Reachable?: boolean;
-  }): Promise<{ created: boolean }> {
-    // Operator-declared field binds: undefined ⇒ NULL ⇒ COALESCE preserves the
-    // existing column on update; on insert the .values() defaults apply.
-    const labelsBind = input.labels === undefined ? null : JSON.stringify(input.labels);
-    const propsBind = input.properties === undefined ? null : JSON.stringify(input.properties);
-    const hostnameBind = canonicalizeHostname(input.hostname);
+  async declareStatic(input: DeclareStaticInput): Promise<{ created: boolean }> {
+    const authority = input.authority ?? HostWriteAuthority.platform;
+    return authority === HostWriteAuthority.operator
+      ? this.declareAsOperator(input)
+      : this.createPlaceholder(input);
+  }
+
+  /**
+   * A Platform declare: create a new `platform` row, never touch an existing
+   * one. Reserved `kici:` labels or properties refuse the whole write before
+   * any SQL, and the insert-or-nothing statement leaves no check-then-write race.
+   */
+  private async createPlaceholder(input: DeclareStaticInput): Promise<{ created: boolean }> {
+    const reserved = [...(input.labels ?? []), ...Object.keys(input.properties ?? {})].filter(
+      isReservedHostKey,
+    );
+    if (reserved.length > 0) throw new ReservedHostKeyError(reserved);
+    const reach = [
+      input.address,
+      input.sshUser,
+      input.sshPort,
+      input.sshKeySecret,
+      input.s3Reachable,
+    ];
+    if (reach.some((v) => v !== undefined)) {
+      throw new Error('declareStatic: reach fields need HostWriteAuthority.operator');
+    }
     const row = await this.db
       .insertInto('host_roster')
       .values({
@@ -317,32 +405,74 @@ export class HostRosterStore {
         token_id: null,
         lifecycle_class: 'static',
         labels: JSON.stringify(input.labels ?? []),
-        hostname: hostnameBind,
+        hostname: canonicalizeHostname(input.hostname),
         connected_instance_id: null,
         host_properties: JSON.stringify(input.properties ?? {}),
+        identity_source: HostIdentitySource.platform,
+        last_seen: sql`now()`,
+        updated_at: sql`now()`,
+      })
+      .onConflict((oc) => oc.column('agent_id').doNothing())
+      .returning('agent_id')
+      .executeTakeFirst();
+    if (!row) throw new HostExistsError(input.agentId);
+    return { created: true };
+  }
+
+  /**
+   * An operator declare. A re-declare converges the operator-owned columns
+   * (labels, hostname, reach, host_properties) and preserves the agent-reported
+   * liveness and identity columns (connected_instance_id, last_seen, platform,
+   * arch, lifecycle_class, token_id, reboot_pending_until). Each operator field
+   * is preserve-on-omit, and properties shallow-merge — except on a row a
+   * dashboard declare created: there the operator's values replace labels,
+   * hostname and properties outright, so no Platform-chosen value survives the
+   * confirmation, and the row becomes `operator`. An `agent` row stays `agent`.
+   * PostgreSQL evaluates every SET expression against the existing row, so each
+   * CASE reads the source before this statement changes it.
+   */
+  private async declareAsOperator(input: DeclareStaticInput): Promise<{ created: boolean }> {
+    // undefined ⇒ NULL ⇒ COALESCE preserves the existing column on update.
+    const labelsBind = input.labels === undefined ? null : JSON.stringify(input.labels);
+    const propsBind = input.properties === undefined ? null : JSON.stringify(input.properties);
+    const hostnameBind = canonicalizeHostname(input.hostname);
+    const labelsJson = JSON.stringify(input.labels ?? []);
+    const propsJson = JSON.stringify(input.properties ?? {});
+    const adopting = sql<boolean>`host_roster.identity_source = ${HostIdentitySource.platform}`;
+    const row = await this.db
+      .insertInto('host_roster')
+      .values({
+        agent_id: input.agentId,
+        token_id: null,
+        lifecycle_class: 'static',
+        labels: labelsJson,
+        hostname: hostnameBind,
+        connected_instance_id: null,
+        host_properties: propsJson,
         address: input.address ?? null,
         ssh_user: input.sshUser ?? null,
         ssh_port: input.sshPort ?? null,
         ssh_key_secret: input.sshKeySecret ?? null,
         s3_reachable: input.s3Reachable ?? null,
+        identity_source: HostIdentitySource.operator,
         last_seen: sql`now()`,
         updated_at: sql`now()`,
       })
       .onConflict((oc) =>
-        // Re-declare converges operator-owned columns only — never the
-        // agent-reported liveness/identity columns (connected_instance_id,
-        // last_seen, platform, arch, lifecycle_class, token_id,
-        // reboot_pending_until). Each field is preserve-on-omit via COALESCE;
-        // host_properties shallow-merges like the agent upsert.
         oc.column('agent_id').doUpdateSet({
-          labels: sql`COALESCE(${labelsBind}, host_roster.labels)`,
-          hostname: sql`COALESCE(${hostnameBind}, host_roster.hostname)`,
-          host_properties: sql`COALESCE(host_roster.host_properties, '{}'::jsonb) || COALESCE(${propsBind}::jsonb, '{}'::jsonb)`,
+          labels: sql`CASE WHEN ${adopting} THEN ${labelsJson}::text
+            ELSE COALESCE(${labelsBind}::text, host_roster.labels) END`,
+          hostname: sql`CASE WHEN ${adopting} THEN ${hostnameBind}::text
+            ELSE COALESCE(${hostnameBind}::text, host_roster.hostname) END`,
+          host_properties: sql`CASE WHEN ${adopting} THEN ${propsJson}::jsonb
+            ELSE COALESCE(host_roster.host_properties, '{}'::jsonb) || COALESCE(${propsBind}::jsonb, '{}'::jsonb) END`,
           address: sql`COALESCE(${input.address ?? null}, host_roster.address)`,
           ssh_user: sql`COALESCE(${input.sshUser ?? null}, host_roster.ssh_user)`,
           ssh_port: sql`COALESCE(${input.sshPort ?? null}, host_roster.ssh_port)`,
           ssh_key_secret: sql`COALESCE(${input.sshKeySecret ?? null}, host_roster.ssh_key_secret)`,
           s3_reachable: sql`COALESCE(${input.s3Reachable ?? null}, host_roster.s3_reachable)`,
+          identity_source: sql<HostIdentitySource>`CASE WHEN ${adopting} THEN ${HostIdentitySource.operator}::text
+            ELSE host_roster.identity_source END`,
           updated_at: sql`now()`,
         }),
       )
@@ -387,7 +517,7 @@ export class HostRosterStore {
    * reserved key so the convergence gate can compare it against the target
    * INDEPENDENTLY of the agent's own self-reported bundle version (two payloads
    * can carry the same self-report but different staged keys). Shallow-merged, so
-   * it survives agent re-register (the agent never reports this reserved key).
+   * it survives an agent re-register (the agent's reserved keys are stripped).
    */
   async recordStagedVersion(agentId: string, version: string): Promise<void> {
     const patch = JSON.stringify({ [STAGED_AGENT_VERSION_KEY]: version });
@@ -411,6 +541,16 @@ export class HostRosterStore {
 
   async listAll(): Promise<HostRosterRow[]> {
     return this.db.selectFrom('host_roster').selectAll().orderBy('agent_id', 'asc').execute();
+  }
+
+  /** Every confirmed roster row (agent- or operator-set identity), by agent id. */
+  private async listConfirmed(): Promise<HostRosterRow[]> {
+    return this.db
+      .selectFrom('host_roster')
+      .selectAll()
+      .where('identity_source', '!=', HostIdentitySource.platform)
+      .orderBy('agent_id', 'asc')
+      .execute();
   }
 
   /**
@@ -465,7 +605,13 @@ export class HostRosterStore {
     graceMs: number,
     excludeScalerManaged: boolean,
   ): Promise<MatchedHost[]> {
-    const rows = await this.db.selectFrom('host_roster').selectAll().execute();
+    // A row a dashboard declare created is an unconfirmed placeholder: it is
+    // never a fan-out or inventory target until its agent or an operator confirms it.
+    const rows = await this.db
+      .selectFrom('host_roster')
+      .selectAll()
+      .where('identity_source', '!=', HostIdentitySource.platform)
+      .execute();
     const now = Date.now();
     const out: MatchedHost[] = [];
     for (const row of rows) {
@@ -530,14 +676,14 @@ export class HostRosterStore {
    * Query the roster as canonical {@link HostInventoryEntry} records. With a
    * selector, reuses `findMatching`'s label filtering (server-side, glob/regex);
    * property filtering is done client-side in the workflow. Omit the selector ⇒
-   * every host.
+   * every host. Unconfirmed rows a dashboard declare created are omitted.
    */
   async queryInventory(
     selector: InventorySelector | undefined,
     graceMs: number,
   ): Promise<HostInventoryEntry[]> {
     if (!selector || (!selector.include && !selector.exclude)) {
-      const rows = await this.listAll();
+      const rows = await this.listConfirmed();
       return rows.map((r) => this.toInventoryEntry(r, graceMs));
     }
     const matched = await this.findMatching(
@@ -546,14 +692,35 @@ export class HostRosterStore {
       graceMs,
     );
     const byId = new Map(matched.map((m) => [m.agentId, m]));
-    const rows = await this.listAll();
+    const rows = await this.listConfirmed();
     return rows.filter((r) => byId.has(r.agent_id)).map((r) => this.toInventoryEntry(r, graceMs));
   }
 
-  /** Single-host inventory lookup; null when the agent is not in the roster. */
+  /** Single-host inventory lookup; null when the agent is absent or unconfirmed. */
   async getInventory(agentId: string, graceMs: number): Promise<HostInventoryEntry | null> {
     const row = await this.get(agentId);
-    return row ? this.toInventoryEntry(row, graceMs) : null;
+    return row && row.identity_source !== HostIdentitySource.platform
+      ? this.toInventoryEntry(row, graceMs)
+      : null;
+  }
+
+  /** A roster row as the dashboard sees it: the inventory entry plus `confirmed`. */
+  toFleetEntry(row: HostRosterRow, graceMs: number): FleetHostEntry {
+    return {
+      ...this.toInventoryEntry(row, graceMs),
+      confirmed: row.identity_source !== HostIdentitySource.platform,
+    };
+  }
+
+  /** Every roster host for the dashboard, unconfirmed placeholders included. */
+  async listFleetHosts(graceMs: number): Promise<FleetHostEntry[]> {
+    return (await this.listAll()).map((r) => this.toFleetEntry(r, graceMs));
+  }
+
+  /** One roster host for the dashboard, or null when the agent id has no row. */
+  async getFleetHost(agentId: string, graceMs: number): Promise<FleetHostEntry | null> {
+    const row = await this.get(agentId);
+    return row ? this.toFleetEntry(row, graceMs) : null;
   }
 
   /**
@@ -562,25 +729,40 @@ export class HostRosterStore {
    * {@link deriveHostStatus} so the count never diverges from what
    * `kici-admin host list` shows. A not-currently-connected static host reads
    * `unreachable` regardless of grace (only the connected-but-stale case
-   * depends on `graceMs`).
+   * depends on `graceMs`). An unconfirmed dashboard-created row never raises
+   * the alarm.
    */
   async countStaticUnreachable(graceMs: number): Promise<number> {
     const rows = await this.db
       .selectFrom('host_roster')
       .selectAll()
       .where('lifecycle_class', '=', 'static')
+      .where('identity_source', '!=', HostIdentitySource.platform)
       .execute();
     const now = Date.now();
     return rows.filter((r) => deriveHostStatus(r, now, graceMs) === HostStatus.unreachable).length;
   }
 
-  /** Remove a host from the roster by agent id. Returns rows deleted. */
-  async removeStatic(agentId: string): Promise<number> {
-    const res = await this.db
-      .deleteFrom('host_roster')
-      .where('agent_id', '=', agentId)
-      .executeTakeFirst();
-    return Number(res.numDeletedRows ?? 0n);
+  /**
+   * Remove a host from the roster by agent id. Returns rows deleted (0 when no
+   * row matches). Under `platform` authority (the default) only an unconfirmed
+   * row a dashboard declare created is removed; a confirmed row throws
+   * {@link HostConfirmedError}.
+   */
+  async removeStatic(
+    agentId: string,
+    opts: { authority?: HostWriteAuthority } = {},
+  ): Promise<number> {
+    const authority = opts.authority ?? HostWriteAuthority.platform;
+    let query = this.db.deleteFrom('host_roster').where('agent_id', '=', agentId);
+    if (authority === HostWriteAuthority.platform) {
+      query = query.where('identity_source', '=', HostIdentitySource.platform);
+    }
+    const deleted = Number((await query.executeTakeFirst()).numDeletedRows ?? 0n);
+    if (deleted === 0 && authority === HostWriteAuthority.platform && (await this.get(agentId))) {
+      throw new HostConfirmedError(agentId);
+    }
+    return deleted;
   }
 
   /** Delete ephemeral rows whose last_seen is older than ttl. Returns count. */

@@ -28,7 +28,6 @@ import {
 } from '@kici-dev/shared';
 import {
   OrchRole,
-  githubWebhookPath,
   PLATFORM_CONNECTED_MODES,
   RELAY_INGRESS_MODES,
   type ActorPrincipal,
@@ -102,7 +101,7 @@ const { BindingStore } = await import('./contexts/binding-store.js');
 const { handleRerun } = await import('./pipeline/rerun.js');
 const { handleManualSchedule } = await import('./pipeline/manual-schedule.js');
 const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
-const { PeerClient, PeerAuthCoordinator, coordinatorSelfIssuer } =
+const { PeerClient, PeerAuthCoordinator, coordinatorSelfIssuer, coordinatorRejectionCorroborator } =
   await import('./cluster/index.js');
 const { HeldRunStore } = await import('./contexts/held-runs.js');
 const { TrustPolicyStore } = await import('./security/trust-policy-store.js');
@@ -145,6 +144,8 @@ import type { OrchestratorHooks } from './orchestrator-core.js';
 import type { OrchestratorFaultInjection } from './fault-injection-types.js';
 import type { AppConfig } from './config.js';
 import type { PeerClient as PeerClientT } from './cluster/peer-client.js';
+import { PeerDialOrigin } from './cluster/peer-client.js';
+import { PeerDiscovery } from './cluster/peer-discovery.js';
 import {
   tryResolveVerifiedIssuer,
   verifiedIssuerCapabilityUpdate,
@@ -154,7 +155,13 @@ import { verifyInboundWebhook } from './webhook/verify-inbound.js';
 import { deliveryFromRelay } from './webhook/ingest-overflow-types.js';
 import { recordShedBreadcrumb } from './webhook/shed-breadcrumb.js';
 import { buildRelayReinject } from './webhook/relay-reinject.js';
-import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
+import {
+  WebhookUrlNote,
+  type WebhookUrlResolution,
+  resolveAddedGithubSourceUrl,
+  resolveManifestGithubWebhookUrl,
+  resolveListedGithubIngressUrl,
+} from './sources/webhook-url-resolvers.js';
 import {
   createUnavailableSecretStore,
   loadRoutableStores,
@@ -944,13 +951,30 @@ export async function runServer(
                   agentMaxReconnectDelayMs: config.agentMaxReconnectDelayMs,
                   clusterInstanceHeartbeatMs: config.clusterInstanceHeartbeatMs,
                 }),
+            // Any dialled endpoint can send a rejection; the coordinator's own database
+            // decides whether the credential file goes.
+            corroborateRejection: config.cluster.singleNode
+              ? undefined
+              : coordinatorRejectionCorroborator({ db: sub.db, instanceId: config.instanceId }),
           });
 
-          const createOutboundPeerClient = (rawUrl: string, initialKey: string): PeerClientT => {
+          const createOutboundPeerClient = (
+            rawUrl: string,
+            initialKey: string,
+            opts: {
+              origin: PeerDialOrigin;
+              expectedInstanceId?: string;
+              onAuthenticated?: () => void;
+              onMutualAuthFailed?: () => void;
+            },
+          ): PeerClientT => {
             const peerUrl = rawUrl.replace(/^https?:\/\//, 'ws://') + '/ws/peer';
             let client: PeerClientT;
             client = new PeerClient({
               url: peerUrl,
+              origin: opts.origin,
+              expectedInstanceId: opts.expectedInstanceId,
+              onMutualAuthFailed: opts.onMutualAuthFailed,
               joinToken: config.cluster.joinToken,
               credentialFile: peerCredentialFile,
               authCoordinator: peerAuthCoordinator,
@@ -1016,7 +1040,12 @@ export async function runServer(
                 answerScalerOrphansRequest(sub.scalerManager ?? null, msg),
               onLogsCollectRequest: (msg, send) => sub.fleetCollectResponder(msg, send),
               onAuthenticated: (targetInstanceId) => {
+                opts.onAuthenticated?.();
+                // Discovery owns the map slots of the clients it dials.
+                if (opts.origin === PeerDialOrigin.Discovered) return;
                 if (initialKey === targetInstanceId) return;
+                // A static client owns its peer: a discovered duplicate goes first.
+                peerDiscovery.releaseToStatic(targetInstanceId);
                 const existing = sub.peerClients.get(initialKey);
                 if (existing === client) {
                   sub.peerClients.delete(initialKey);
@@ -1026,6 +1055,24 @@ export async function runServer(
             });
             return client;
           };
+
+          // Platform-announced peers are hints: a discovered client becomes a
+          // peer only after mutual authentication, and KICI_CLUSTER_PEER_DISCOVERY=static
+          // turns the dialling off.
+          const peerDiscovery = new PeerDiscovery({
+            mode: config.cluster.peerDiscovery,
+            selfInstanceId: config.instanceId,
+            peerClients: sub.peerClients,
+            redialAfterFailureMs: config.cluster.peerMaxReconnectDelayMs,
+            createClient: (address, expectedInstanceId, hooks) =>
+              createOutboundPeerClient(address, expectedInstanceId, {
+                origin: PeerDialOrigin.Discovered,
+                expectedInstanceId,
+                onAuthenticated: hooks.onAuthenticated,
+                onMutualAuthFailed: hooks.onMutualAuthFailed,
+              }),
+          });
+          peerDiscovery.start();
 
           // Fleet read-relay (roster, host detail, runsOnAll preview). Each read
           // answers from the host roster store and writes a platform_proxy
@@ -1569,36 +1616,7 @@ export async function runServer(
                 orchRole: peer.orchRole,
               });
 
-              // Skip workers — they're edge elements that dial OUT to every coord
-              // (one PeerClient per coord) and do NOT host /ws/peer servers.
-              // Treat undefined orchRole as coordinator for back-compat with peers
-              // that don't yet advertise the field.
-              if (peer.orchRole === 'worker') {
-                return;
-              }
-
-              if (peer.address && peer.instanceId) {
-                if (peer.instanceId === config.instanceId) return;
-
-                // If a PeerClient already exists for this peer (e.g. from a previous
-                // connection), close it and create a fresh one. This resets the
-                // exponential backoff so the reconnect happens immediately instead
-                // of waiting up to 60s for the old backoff timer to expire.
-                const existingClient = sub.peerClients.get(peer.instanceId);
-                if (existingClient) {
-                  existingClient.disconnect();
-                  sub.peerClients.delete(peer.instanceId);
-                }
-
-                const client = createOutboundPeerClient(peer.address, peer.instanceId);
-                sub.peerClients.set(peer.instanceId, client);
-                client.connect();
-
-                logger.info('PeerClient created for discovered peer', {
-                  peerId: peer.instanceId,
-                  address: peer.address,
-                });
-              }
+              peerDiscovery.announce(peer);
             },
             onAuthenticated: async () => {
               // Post-cutover: customer HMAC secrets never leave the orchestrator.
@@ -2120,76 +2138,65 @@ export async function runServer(
               logger.info('Skipping self in static peer list', { rawUrl });
               continue;
             }
-            const client = createOutboundPeerClient(rawUrl, rawUrl);
+            const client = createOutboundPeerClient(rawUrl, rawUrl, {
+              origin: PeerDialOrigin.Static,
+            });
             sub.peerClients.set(rawUrl, client);
             client.connect();
             logger.info('Static peer client dialing', { rawUrl });
           }
 
-          // Resolve a newly added source's public webhook URL for the CLI. GitHub-App
-          // ingress is Platform-relayed, so we register the source and read the URL
-          // the Platform computed back on the ack. The full-source push also doubles
-          // as the live propagation for this add (the NOTIFY-driven republish then
-          // diffs to a no-op).
+          // The Platform org this orchestrator authenticated as. `auth.success`
+          // is authoritative; the remote-source anchor covers a reconnect window.
+          const currentOrgId = (): string | undefined =>
+            platformClient.getOrgId() ?? resolvedOrgContext?.orgId;
+
+          // The URL `source add github` prints. The full-source push doubles
+          // as the live propagation of the add (the NOTIFY-driven republish then
+          // diffs to a no-op). Mode rules: webhook-url-resolvers.ts.
           const resolveSourceWebhookUrl = async (params: {
             routingKey: string;
             provider: string;
             sourceId: string;
-          }): Promise<{ webhookUrl: string | null; webhookNote?: string }> => {
+          }): Promise<WebhookUrlResolution> => {
             if (params.provider !== 'github') {
-              return { webhookUrl: null, webhookNote: 'unsupported-provider' };
+              return { webhookUrl: null, webhookNote: WebhookUrlNote.enum['unsupported-provider'] };
             }
-            try {
-              const fullSources = await buildPlatformProviderSources(
-                sub.sourceManager,
-                loadGenericRows,
-              );
-              const webhookUrl = await platformClient.registerSourceAndAwait(
-                fullSources,
-                params.routingKey,
-              );
-              if (webhookUrl) {
-                return { webhookUrl };
-              }
-              // Platform relayed no public URL — fall back to this orchestrator's
-              // own direct GitHub ingress if a public base is configured.
-              const local = buildLocalGithubIngressUrl(
-                config.webhookPublicUrl,
-                resolvedOrgContext?.orgId ?? '__default__',
-                params.sourceId,
-              );
-              return local
-                ? { webhookUrl: local }
-                : { webhookUrl: null, webhookNote: 'platform-no-public-url' };
-            } catch (err) {
-              logger.warn('Failed to resolve GitHub webhook URL from Platform', {
-                routingKey: params.routingKey,
-                error: toErrorMessage(err),
-              });
-              return { webhookUrl: null, webhookNote: 'platform-unavailable' };
-            }
+            return resolveAddedGithubSourceUrl({
+              mode: config.mode,
+              webhookPublicUrl: config.webhookPublicUrl,
+              orgId: currentOrgId(),
+              sourceId: params.sourceId,
+              registerAndAwait: async () =>
+                platformClient.registerSourceAndAwait(
+                  await buildPlatformProviderSources(sub.sourceManager, loadGenericRows),
+                  params.routingKey,
+                ),
+              onRegisterError: (err) =>
+                logger.warn('Failed to register the added source with the Platform', {
+                  routingKey: params.routingKey,
+                  error: toErrorMessage(err),
+                }),
+            });
           };
 
-          // Resolve the org-scoped GitHub webhook URL for the manifest setup
-          // pre-flight. The URL is org-scoped (not app-scoped), so it can be
-          // computed before any App exists. The org id comes from the
-          // Platform-identified `remote_sources` anchor; the public base from
-          // `config.webhookPublicUrl`. Returns null + a note when either is
-          // missing so the CLI can surface an honest "not yet available" message.
-          const resolveGithubWebhookUrl = async (): Promise<{
-            webhookUrl: string | null;
-            webhookNote?: string;
-          }> => {
-            const orgId = resolvedOrgContext?.orgId;
-            if (!orgId) {
-              return { webhookUrl: null, webhookNote: 'org-not-identified' };
-            }
-            if (!config.webhookPublicUrl) {
-              return { webhookUrl: null, webhookNote: 'platform-no-public-url' };
-            }
-            const base = config.webhookPublicUrl.replace(/\/$/, '');
-            return { webhookUrl: `${base}${githubWebhookPath(orgId)}` };
-          };
+          // The manifest pre-flight URL, by mode (webhook-url-resolvers.ts).
+          const resolveGithubWebhookUrl = async (): Promise<WebhookUrlResolution> =>
+            resolveManifestGithubWebhookUrl({
+              mode: config.mode,
+              webhookPublicUrl: config.webhookPublicUrl,
+              orgId: currentOrgId(),
+              platformGithubWebhookUrl: platformClient.getGithubWebhookUrl(),
+            });
+
+          // The direct-ingress URL `source list` prints per GitHub source.
+          const resolveSourceIngressUrl = (row: { id: string; customerId: string | null }) =>
+            resolveListedGithubIngressUrl({
+              mode: config.mode,
+              webhookPublicUrl: config.webhookPublicUrl,
+              orgId: currentOrgId(),
+              sourceId: row.id,
+            });
 
           return {
             appDepsExtras: {
@@ -2205,6 +2212,7 @@ export async function runServer(
               globalWorkflowPolicy,
               resolveSourceWebhookUrl,
               resolveGithubWebhookUrl,
+              resolveSourceIngressUrl,
               // Resume a workflow whose install-gate wait-timer / concurrency hold
               // released (same path as a reviewer approval).
               onWorkflowRelease: (signal: ReleaseSignal) =>
@@ -2282,6 +2290,12 @@ export async function runServer(
                 label: 'Stopping verified-issuer poller',
                 fn: () => {
                   stopVerifiedIssuerPoller?.();
+                },
+              },
+              {
+                label: 'Stopping peer discovery',
+                fn: () => {
+                  peerDiscovery.stop();
                 },
               },
               {

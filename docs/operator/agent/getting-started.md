@@ -66,6 +66,8 @@ docker run -d \
   kici-agent
 ```
 
+The image's entrypoint is tini, which runs the agent as its child and reaps the processes a job leaves behind. If you override the entrypoint, pass `--init` to `docker run` (or set `init: true` in Compose). Otherwise the agent runs as PID 1 and logs a warning at startup.
+
 ### Docker Compose
 
 Example with orchestrator and agent:

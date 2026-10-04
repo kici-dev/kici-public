@@ -14,7 +14,7 @@ import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import type { OrchestratorMode } from '@kici-dev/engine';
 import { loadLocalConfig } from './loader.js';
-import { appConfigSchema } from './schema.js';
+import { appConfigSchema, PeerDiscoveryMode } from './schema.js';
 import { applyEnvOverrides, deepMerge } from './env-overlay.js';
 import type { AppConfig, SharedConfig } from './types.js';
 import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
@@ -247,6 +247,7 @@ function flattenToAppConfig(merged: Record<string, unknown>): Record<string, unk
     role: cluster?.role ?? 'coordinator',
     coordinatorUrl: cluster?.coordinatorUrl as string | undefined,
     peerStaleTimeoutMs: cluster?.peerStaleTimeoutMs ?? 60_000,
+    peerDiscovery: cluster?.peerDiscovery ?? PeerDiscoveryMode.enum.platform,
   };
 
   // Misc

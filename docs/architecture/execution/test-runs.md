@@ -56,6 +56,12 @@ Developer workstation            Orchestrator              Agent
   17. Show summary + exit code        |                      |
 ```
 
+### Request path
+
+The diagram draws the CLI's control calls as if they go straight to the orchestrator. They reach it through the hosted KiCI Platform. The CLI calls the Platform's `/api/v1/orgs/:customerId/test/...` endpoints with the developer's personal access token. The Platform relays each call to the orchestrator over the orchestrator's WebSocket connection as a `test.relay.*` message: `test.relay.uploads.init`, `test.relay.trigger`, `test.relay.run.status`, `test.relay.run.logs`, or `test.relay.cancel`. So the orchestrator does not have to be reachable from the developer's network. Each relayed request carries the developer's identity, which the orchestrator writes to its `access_log`.
+
+The overlay tarball does not go through the relay. The CLI uploads it straight to object storage through the external presigned URL that `test.relay.uploads.init` returns.
+
 ## Upload encryption
 
 Test run tarballs are encrypted using ephemeral X25519 ECDH key exchange with AES-256-GCM symmetric encryption. This ensures that uploaded content is protected in transit and at rest in object storage.

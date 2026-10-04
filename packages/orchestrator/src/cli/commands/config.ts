@@ -490,7 +490,7 @@ instance:
   # - hybrid: Platform relay + direct webhook ingestion
   # - observed: direct webhook ingestion only (nothing transits KiCI), but keeps
   #   the Platform connection for the hosted dashboard. Requires
-  #   KICI_WEBHOOK_PUBLIC_URL; GitHub-App sources are unsupported.
+  #   KICI_WEBHOOK_PUBLIC_URL.
   # - independent: standalone, direct webhook ingestion only
   mode: "platform"
 

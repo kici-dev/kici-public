@@ -83,6 +83,7 @@ function createPeer(overrides: Partial<PeerInfo> = {}): PeerInfo {
     configVersion: overrides.configVersion ?? 0,
     registryVersion: overrides.registryVersion ?? 0,
     role: overrides.role ?? 'coordinator',
+    authScheme: overrides.authScheme ?? { inbound: null, outbound: null },
   };
 }
 
@@ -245,6 +246,21 @@ describe('cluster health API', () => {
   // ── GET /cluster/peers ───────────────────────────────────────
 
   describe('GET /cluster/peers', () => {
+    it('reports each direction authentication scheme', async () => {
+      deps.peerRegistry = mockPeerRegistry({
+        peers: [
+          createPeer({
+            instanceId: 'peer-1',
+            authScheme: { inbound: 'mutual-v2', outbound: null },
+          }),
+        ],
+      });
+      const res = await createClusterHealthRoutes(deps).request('/cluster/peers');
+      const body = await res.json();
+      // fails-when: the route drops the registry's authScheme
+      expect(body.peers[0].authScheme).toEqual({ inbound: 'mutual-v2', outbound: null });
+    });
+
     it('should return peer list from PeerRegistry', async () => {
       const peers = [
         createPeer({

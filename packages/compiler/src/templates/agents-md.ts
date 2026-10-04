@@ -6,8 +6,9 @@
  */
 export const agentsMdTemplate = `# KiCI workflow authoring guide
 
-This project uses KiCI — a TypeScript-native CI/CD workflow engine — instead
-of YAML-based CI. Workflows live in \`.kici/workflows/*.ts\`, are compiled
+This project uses KiCI, a complete CI/CD system that runs your pipelines on
+machines you control, with workflows written in TypeScript instead of YAML.
+Workflows live in \`.kici/workflows/*.ts\`, are compiled
 into a portable lock file, and executed by self-hosted agents.
 
 ## Where the API surface lives

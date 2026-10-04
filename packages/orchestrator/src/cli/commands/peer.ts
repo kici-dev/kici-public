@@ -251,7 +251,7 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
           console.log('');
           console.log(token);
           console.log('');
-          console.log('This token can only be used once. Store it securely.');
+          console.log('This token works until it expires. Treat it like a password.');
         } catch (err) {
           console.error(`Error: ${toErrorMessage(err)}`);
           process.exit(1);

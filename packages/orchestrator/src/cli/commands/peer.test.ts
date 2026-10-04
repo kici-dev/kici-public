@@ -115,7 +115,7 @@ describe('peer CLI commands', () => {
       );
       expect(stdout).toContain('kici_join_v1.routing.secret123');
       expect(stdout).toContain('role: coordinator');
-      expect(stdout).toContain('only be used once');
+      expect(stdout).toContain('works until it expires');
     });
 
     it('creates token with specified role and expiry', async () => {
@@ -172,7 +172,7 @@ describe('peer CLI commands', () => {
         '--json',
       ]);
 
-      // Stdout must be a single JSON document — no prose, no "only be used once"
+      // Stdout must be a single JSON document — no prose, no "works until it expires"
       // footer — so callers can pipe through `JSON.parse` safely.
       const parsed = JSON.parse(stdout);
       expect(parsed).toEqual(
@@ -184,7 +184,7 @@ describe('peer CLI commands', () => {
         }),
       );
       expect(typeof parsed.expiresAt).toBe('string');
-      expect(stdout).not.toContain('only be used once');
+      expect(stdout).not.toContain('works until it expires');
       expect(mockCreateToken).toHaveBeenCalledWith(
         expect.objectContaining({
           createdBy: 'deploy-app',

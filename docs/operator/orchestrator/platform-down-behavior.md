@@ -70,7 +70,7 @@ for how to read the current lag.
 
 **With the Platform up, direct ingress changes one meter, not your plan.** The
 matrix above describes a full outage. In a Platform-connected mode that serves
-its own ingress — `hybrid`, or `observed` with a generic or local source — the
+its own ingress — `hybrid`, or `observed` with any source — the
 Platform still meters your
 organization, and direct ingress bypasses the relayed-webhook quota alone: the
 delivery never reaches the relay that counts it. Every other plan dimension

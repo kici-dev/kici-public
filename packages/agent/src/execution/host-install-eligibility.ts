@@ -41,11 +41,12 @@ import {
   isRegistryTarball,
   isRepoNpmrcKey,
   isToolReadEnvName,
-  loadNpmIni,
+  loadHostNpmIni,
   npmrcKeys,
   parseRepoNpmrc,
   pickAllowed,
   registryOrigin,
+  type HostNpmIni,
   type IniCodec,
   type NpmrcEntries,
 } from './npmrc-allowlist.js';
@@ -105,7 +106,7 @@ export interface HostInstallEligibilityOptions {
   workflowRegistries?: readonly NpmRegistrySpec[];
   /** The operator's `KICI_HOST_INSTALL_REGISTRIES` origins, already normalized. */
   hostInstallRegistries?: readonly string[];
-  /** npm's `.npmrc` parser; defaults to the one bundled with the agent's npm. */
+  /** npm's `.npmrc` parser; defaults to the parser of the npm `loadHostNpmIni` finds. */
   ini?: IniCodec | null;
   /** The operator's `.npmrc` text; defaults to the agent user's `~/.npmrc`. */
   operatorNpmrc?: string | null;
@@ -557,10 +558,21 @@ async function resolveNpmrc(
   kiciDir: string,
   opts: HostInstallEligibilityOptions,
 ): Promise<HostInstallPlan['npmrc'] | Refused> {
-  const ini = opts.ini === undefined ? loadNpmIni() : opts.ini;
-  if (!ini) {
-    return refuse(HostInstallRefusal.NpmrcParserUnavailable, "the agent's npm is not available");
+  const parser: HostNpmIni =
+    opts.ini === undefined
+      ? loadHostNpmIni()
+      : opts.ini === null
+        ? { ini: null, detail: 'no parser was passed' }
+        : { ini: opts.ini };
+  // fails-when: a failed lookup lets the check go on with no parser, or hides
+  // which npm it refused.
+  if (!parser.ini) {
+    return refuse(
+      HostInstallRefusal.NpmrcParserUnavailable,
+      `the agent's npm is not available: ${parser.detail}`,
+    );
   }
+  const ini = parser.ini;
   const workflow = opts.workflowRegistries ?? [];
   if (
     workflow.some(

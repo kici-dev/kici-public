@@ -87,7 +87,7 @@ OCI-compliant container images are built for the orchestrator and agent.
 | `kici-orchestrator:<version>` | Orchestrator with all dependencies, ready for Docker/Podman/Kubernetes                  |
 | `kici-agent:<version>`        | Agent with git, bash, node, npm, and the native TypeScript loader binding pre-installed |
 
-The agent container image is self-contained -- it includes all required runtime dependencies and can execute workflows without any additional host-level tools.
+The agent container image is self-contained -- it includes all required runtime dependencies and can execute workflows without any additional host-level tools. The image's entrypoint is tini, which runs the agent as its child and reaps the processes a job leaves behind.
 
 ### Multi-architecture support
 
@@ -324,7 +324,7 @@ The check compares the host's staged version against the orchestrator target and
 - **Availability-gated.** The convergence never rolls a host onto a version whose payload objects don't exist for the host's platform — it holds the host at its current version and reports the block instead. A missing payload can never produce a version skew.
 - **External-actor re-stage.** The re-stage is driven by the ops agent over SSH — it swaps the install and restarts the target's agent, which reconnects on its own persistent credential. The host's agent never updates its own running binary.
 
-Declare how a host restarts its agent so the convergence can drive it, via host properties on `kici-admin host declare`: either a systemd unit name (`kici:agent-service`) or explicit `kici:agent-restart-stop` / `kici:agent-restart-start` commands, plus an optional `kici:agent-install-dir` (default `/opt/kici-agent`). Combine `agentVersionConverge()` with a run-level check mode and drift approval for a controlled, health-gated rolling upgrade across the fleet.
+Declare how a host restarts its agent so the convergence can drive it, via host properties on `kici-admin host declare`: either a systemd unit name (`kici:agent-service`) or explicit `kici:agent-restart-stop` / `kici:agent-restart-start` commands, plus an optional `kici:agent-install-dir` (default `/opt/kici-agent`). Only `kici-admin host declare` sets these reserved `kici:` keys: an agent cannot report them and the dashboard refuses them. Combine `agentVersionConverge()` with a run-level check mode and drift approval for a controlled, health-gated rolling upgrade across the fleet.
 
 ---
 
@@ -345,6 +345,8 @@ Every agent deployment requires the following runtime dependencies, regardless o
 The container image and Firecracker rootfs include all required dependencies. A full standalone `kici-agent` package includes node, npm and the TypeScript loader binding, so the host provides git and the shell. For any other bare-metal deployment, the operator must ensure these are available on the host.
 
 npm is the only package manager used -- pnpm is not bundled. npm ships with Node.js and the agent resolves `npm-cli.js` from the Node installation directory.
+
+Some Node.js packages, such as Debian's, have no npm of their own. For a container job's host install, an agent on such a Node.js also uses the npm at `/usr/share/nodejs/npm` or an npm on its `PATH`, at version 11.10.0 or later. See [Where `.kici/` dependencies install](../agent/configuration.md#where-kici-dependencies-install).
 
 ### Optional host-level tools
 

@@ -99,17 +99,19 @@ This phase is the primary cross-job cleanup. The agent's startup temp-directory 
 ```typescript
 import { workflow, job, step, z } from '@kici-dev/sdk';
 
+const compile = step('compile', {
+  outputs: { artifact: z.string() },
+  run: async () => ({ artifact: 'app.tar.gz' }),
+});
+
 const build = job('build', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   steps: [
-    step('compile', {
-      outputs: { artifact: z.string() },
-      run: async () => ({ artifact: 'app.tar.gz' }),
-    }),
+    compile,
     step('publish', {
-      // `compile.result.artifact` is typed from the `outputs` schema above.
-      run: async ({ steps }) => {
-        await Promise.resolve(steps.compile.result.artifact);
+      run: async (ctx) => {
+        // `compile.result.artifact` is typed from the `outputs` schema above.
+        ctx.log.info(`publishing ${compile.result.artifact}`);
       },
     }),
   ],

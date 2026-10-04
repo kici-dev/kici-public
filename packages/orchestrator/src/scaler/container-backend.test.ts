@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { LabelSetConfig } from './types.js';
+import { RUNTIME_INIT_LABEL } from '@kici-dev/shared/container-runtime';
 
 // Mock node:fs/promises for socket detection tests
 const mockAccess = vi.fn();
@@ -1183,6 +1184,19 @@ describe('ContainerScalerBackend', () => {
       expect(backend.getActiveCount()).toBe(0);
     });
 
+    it('fails closed, and removes the container, when it has no address on the agent network', async () => {
+      // fails-when: the spawn keeps a running container that no rule covers;
+      // the chains' policy is accept.
+      mockContainerInspect.mockResolvedValueOnce({ NetworkSettings: { Networks: {} } });
+      const backend = await createBackend();
+      await expect(
+        backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000'),
+      ).rejects.toThrow(/no address on kici-agent-net/);
+      expect(mockAddIsolationRules).not.toHaveBeenCalled();
+      expect(mockRemove).toHaveBeenCalled();
+      expect(backend.getActiveCount()).toBe(0);
+    });
+
     it('calls validateNftablesAvailability and ensureKiciTable during creation, addIsolationRules during spawn', async () => {
       const callOrder: string[] = [];
       mockValidateNftablesAvailability.mockImplementation(async () => {
@@ -1341,6 +1355,9 @@ describe('ContainerScalerBackend per-job image', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockCreateContainer.mockResolvedValue(mockContainer);
+    // Resets any per-test implementation, such as the one the private-pull
+    // test leaves.
+    mockGetImage.mockReturnValue({ inspect: mockImageInspect });
     mockVolumeInspect.mockResolvedValue({});
     mockGetVolume.mockReturnValue({ inspect: mockVolumeInspect, remove: mockVolumeRemove });
   });
@@ -1374,6 +1391,31 @@ describe('ContainerScalerBackend per-job image', () => {
     // A per-job image declares its OWN default CMD, so without naming the agent
     // the container runs the customer's entrypoint and never registers.
     expect((created as { Cmd?: string[] }).Cmd).toEqual([
+      '/opt/kici/node/bin/node',
+      '/opt/kici/app/packages/agent/dist/server.js',
+    ]);
+  });
+
+  it('starts the agent under the runtime tini when the agent image names it', async () => {
+    // fails-when: the backend ignores the agent image's init label, so the
+    // agent inside the job's own image is PID 1.
+    mockGetImage.mockImplementation(() => ({
+      inspect: vi.fn().mockResolvedValue({
+        Id: 'sha256:' + 'b'.repeat(64),
+        Config: { Labels: { [RUNTIME_INIT_LABEL]: 'tini' } },
+      }),
+    }));
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-tini', 'ws://orch/ws', () => {}, undefined, {
+      container: jobContainer,
+    });
+
+    const created = mockCreateContainer.mock.calls.at(-1)![0] as { Cmd?: string[] };
+    expect(created.Cmd).toEqual([
+      '/opt/kici/bin/tini',
+      '-s',
+      '--',
       '/opt/kici/node/bin/node',
       '/opt/kici/app/packages/agent/dist/server.js',
     ]);

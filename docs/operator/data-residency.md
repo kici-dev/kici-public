@@ -77,8 +77,9 @@ The guarantee is enforced on both sides: the Platform excludes an observed
 orchestrator from every relay-candidate lookup, and the orchestrator refuses any
 relayed webhook it somehow receives. Its sources are registered as
 **observe-only** — visible in the dashboard Sources page and attributable to
-runs, but never routed. GitHub-App sources are unsupported in this mode because
-they are relay-ingested by construction; use a generic or local source.
+runs, but never routed. GitHub-App sources work in this mode: GitHub delivers to
+the orchestrator's own URL, and check runs, App clone tokens and `/kici approve`
+comments work as in `hybrid`.
 
 Everything else on this page is unchanged: run, job, step, log, and event
 metadata still stream to the hosted Platform exactly as in `hybrid`.

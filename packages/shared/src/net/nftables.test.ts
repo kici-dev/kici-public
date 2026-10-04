@@ -18,6 +18,8 @@ const {
   removeHostIsolationRules,
   readForwardChain,
   removeIsolationRules,
+  probeNftables,
+  validateNftablesAvailability,
 } = await import('./nftables.js');
 
 /** Make every `nft` invocation answer with `stdout`. */
@@ -617,5 +619,66 @@ describe('nft failure diagnostics', () => {
     ).toBe(true);
     expect((err as CommandError).message).toContain('exited with code 1 after');
     expect((err as CommandError).message).toContain('stderr: Error: No such file or directory');
+  });
+});
+
+describe('probeNftables', () => {
+  it('runs nft list tables directly and reports success as null', async () => {
+    nftReturns('table ip kici\n');
+    expect(await probeNftables()).toBeNull();
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    expect(mockExecFile.mock.calls[0]!.slice(0, 2)).toEqual(['nft', ['list', 'tables']]);
+  });
+
+  it('runs the probe through sudo -n when requireSudo is set', async () => {
+    // fails-when: the probe ignores requireSudo and execs a bare nft, so a
+    // non-root orchestrator with a sudoers rule is refused at load.
+    nftReturns('');
+    expect(await probeNftables({ requireSudo: true })).toBeNull();
+    expect(mockExecFile.mock.calls[0]!.slice(0, 2)).toEqual([
+      'sudo',
+      ['-n', 'nft', 'list', 'tables'],
+    ]);
+  });
+
+  it('returns the failure text instead of throwing', async () => {
+    // fails-when: a failed exec reads as success (null).
+    nftFails('Error: Operation not permitted (you must be root)');
+    const failure = await probeNftables();
+    expect(failure).toContain('Operation not permitted (you must be root)');
+  });
+});
+
+describe('validateNftablesAvailability', () => {
+  // breaks-if-wrong: the container backend and the agent's job network surface
+  // these messages; rebuilding the check on probeNftables must not change them.
+  it('resolves when nft answers', async () => {
+    nftReturns('');
+    await expect(validateNftablesAvailability()).resolves.toBeUndefined();
+  });
+
+  it('names a missing binary', async () => {
+    nftFails('spawn nft ENOENT');
+    await expect(validateNftablesAvailability()).rejects.toThrow(
+      'nftables binary not found at /usr/sbin/nft. ' +
+        'The orchestrator container image must include nftables (apk add nftables). ' +
+        'Network isolation for agents cannot be established without nftables.',
+    );
+  });
+
+  it('names a missing NET_ADMIN capability', async () => {
+    nftFails('Error: Operation not permitted (you must be root)');
+    await expect(validateNftablesAvailability()).rejects.toThrow(
+      'nftables operation denied -- missing NET_ADMIN capability. ' +
+        'Start the orchestrator container with --cap-add=NET_ADMIN. ' +
+        'Network isolation for agents requires this capability.',
+    );
+  });
+
+  it('passes any other failure through', async () => {
+    nftFails('sudo: a password is required');
+    await expect(validateNftablesAvailability({ requireSudo: true })).rejects.toThrow(
+      /^nftables validation failed: .*sudo: a password is required/s,
+    );
   });
 });

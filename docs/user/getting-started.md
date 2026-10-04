@@ -3,7 +3,7 @@ title: Getting started with workflows
 description: Install the SDK, write your first workflow, compile and test locally
 ---
 
-KiCI lets you define CI/CD workflows in TypeScript instead of YAML. You get full language power -- type safety, autocompletion, loops, conditionals, and async/await -- for your build pipelines.
+KiCI workflows are TypeScript, so you and your coding agent write pipelines with full language power -- type safety, autocompletion, loops, conditionals, and async/await -- and check them before anything runs.
 
 ## Prerequisites
 
@@ -331,7 +331,7 @@ Or add the flag to your root `package.json`:
 
 ## Authoring KiCI workflows with LLM coding agents
 
-KiCI is LLM-ready by design. Because workflows are real, typed TypeScript, coding agents reason over the SDK's `.d.ts` signatures instead of guessing a bespoke YAML DSL — and they verify their own pipelines with the same `kici preview` and `kici run <event> --local` loop you use, so there's no push-to-find-out round-trip. First-class agent context ships in the box, so an agent is briefed the moment it opens the project.
+Your coding agent can own the full dev loop. Because workflows are real, typed TypeScript, coding agents reason over the SDK's `.d.ts` signatures instead of guessing a bespoke YAML DSL. They also verify their own pipelines with the same `kici preview` and `kici run <event> --local` loop you use, so there's no push-to-find-out round-trip. First-class agent context ships in the box, so an agent is briefed the moment it opens the project.
 
 KiCI ships first-class context for LLM coding agents (Claude Code, Cursor, Aider, etc.). When you scaffold a project with `kici init`, the CLI writes `.kici/AGENTS.md`, a one-page briefing that tells the agent:
 

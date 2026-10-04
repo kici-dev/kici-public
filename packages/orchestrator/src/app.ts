@@ -115,6 +115,7 @@ import type { CronScheduler } from './cron/cron-scheduler.js';
 import { createConfigAdminRoutes, type ConfigRouteDeps } from './routes/admin-config.js';
 import { createHealthRoutes } from './routes/health.js';
 import { createCapabilitiesRoutes } from './routes/capabilities.js';
+import { createClusterJoinRoutes } from './routes/cluster-join.js';
 import { createProvenanceOidcRoutes } from './routes/provenance-oidc.js';
 import { createVerifyAttestationRoutes } from './routes/verify-attestation.js';
 import { createMetricsRoutes } from '@kici-dev/shared';
@@ -362,6 +363,8 @@ export interface AppDependencies {
    * pre-flight (before any App exists). Passed into the admin source routes.
    */
   resolveGithubWebhookUrl?: AdminRouteDeps['resolveGithubWebhookUrl'];
+  /** Builds the direct-ingress URL for `source list`. Passed into the admin source routes. */
+  resolveSourceIngressUrl?: AdminRouteDeps['resolveSourceIngressUrl'];
   /** Config admin API route dependencies. Optional -- mounted when config management is available. */
   configRouteDeps?: ConfigRouteDeps;
   /** Event router for internal event delivery. Optional -- if not set, event routing is inactive. */
@@ -450,10 +453,8 @@ export interface AppDependencies {
     sendToPeer: (targetInstanceId: string, msg: PeerToPeerMessage) => boolean;
     getConnectionCount: () => number;
   };
-  /** Optional join handler for direct peer join requests. */
-  onJoinRequest?: (
-    msg: import('@kici-dev/engine').JoinRequest,
-  ) => Promise<import('@kici-dev/engine').JoinResponse>;
+  /** Optional join handler for direct peer join requests; answers any join.request frame. */
+  onJoinRequest?: (raw: unknown) => Promise<import('@kici-dev/engine').JoinResponse>;
   /** Optional callback when agent inventory changes (connect/disconnect). Triggers peer heartbeat broadcast. */
   onAgentInventoryChanged?: () => void;
   /** Run coordinator for multi-orch claim/reroute. Optional -- if not set, jobs dispatch locally. */
@@ -1342,13 +1343,6 @@ export function createApp(deps: AppDependencies) {
     c.req.path.startsWith(CACHE_BLOB_PATH_PREFIX) ? next() : webhookBodyLimit(c, next),
   );
 
-  // The legacy single-secret /webhook/:orgId/github direct endpoint has been
-  // removed. Direct HTTP webhook ingestion now flows exclusively through the
-  // per-source generic-webhook routes mounted further below (search for
-  // createGenericWebhookRoutes), which look up the secret per source from
-  // the DB via cluster/webhook-secret-manager. To register a GitHub App,
-  // use `kici-admin source add github ...`.
-
   // Cache HTTP routes — only mounted when the FILESYSTEM backend is active.
   //
   // Production / S3 backend uses pre-signed S3 URLs directly. The filesystem
@@ -1734,6 +1728,7 @@ export function createApp(deps: AppDependencies) {
         accessLog: deps.accessLogWriter,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
+        resolveSourceIngressUrl: deps.resolveSourceIngressUrl,
         retryAttestations: deps.retryAttestations,
         globalWorkflowsEnabledDefault: deps.config.globalWorkflowsEnabled,
         databaseUrl: deps.config.databaseUrl,
@@ -1971,21 +1966,9 @@ export function createApp(deps: AppDependencies) {
     );
   }
 
-  // Direct peer join endpoint (for `kici-orchestrator join --peer` transport)
+  // Direct peer join endpoint (the `kici-admin join --peer` transport).
   if (deps.onJoinRequest) {
-    const joinHandler = deps.onJoinRequest;
-    app.post('/api/v1/cluster/join', async (c) => {
-      try {
-        const body = await c.req.json();
-        if (!body?.token || typeof body.token !== 'string') {
-          return c.json({ type: 'join.response', success: false, error: 'Missing token' }, 400);
-        }
-        const response = await joinHandler({ type: 'join.request', token: body.token });
-        return c.json(response, response.success ? 200 : 401);
-      } catch (_err) {
-        return c.json({ type: 'join.response', success: false, error: 'Internal error' }, 500);
-      }
-    });
+    app.route('/', createClusterJoinRoutes(deps.onJoinRequest));
   }
 
   // Health and readiness routes

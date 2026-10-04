@@ -1,23 +1,37 @@
 /**
- * Join client for zero-knowledge cluster bootstrap.
+ * Join client: the joiner side of `kici-admin join` (join protocol v2).
  *
- * Provides the joiner-side logic for `kici-admin join`:
- * 1. Connect to Platform relay (WS) or direct peer (HTTP POST)
- * 2. Send join.request with the join token
- * 3. Receive join.response with encrypted config bundle
- * 4. Decrypt bundle using token-derived AES-256-GCM key
- * 5. Write the decrypted config as an env file the orchestrator boots from
+ * 1. Build a join.request from the token: its routing part, a one-time X25519
+ *    public key, a nonce, and a proof that this host holds the token secret.
+ *    The secret itself stays on this host.
+ * 2. Send it through the Platform relay (WS) or directly to a peer (HTTP POST).
+ * 3. Check the existing orchestrator's proof in the join.response, then open the
+ *    configuration bundle sealed to the one-time key.
+ * 4. Write the bundle as the env file the orchestrator boots from.
  *
- * The token carries routing info (cleartext for Platform relay) and a secret
- * (used for HKDF key derivation). Only the joiner and the token creator
- * can derive the encryption key -- the Platform relay sees only ciphertext.
+ * A relay sees the routing part, the public keys, the nonces, the proofs and the
+ * ciphertext; none of them lets it read or change the bundle.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { WS_MAX_PAYLOAD_BYTES, type JoinRequest, type JoinResponse } from '@kici-dev/engine';
+import {
+  JOIN_PROTOCOL_UNSUPPORTED_MESSAGE,
+  JOIN_PROTOCOL_VERSION,
+  JoinErrorCode,
+  PROTOCOL_VERSION,
+  WS_MAX_PAYLOAD_BYTES,
+  joinResponseSchema,
+  type JoinRequest,
+  type JoinResponse,
+} from '@kici-dev/engine';
 
 import { writeFileSecurely } from '../helpers/secure-write.js';
-import { parseToken, deriveKeys, decryptBundle } from './join-token.js';
+import { parseToken, tokenHashOf } from './join-token.js';
+import {
+  createJoinRequest,
+  openJoinResponse,
+  type SealedJoinResponse,
+} from './join-protocol-v2.js';
 import type { ConfigBundle } from './join-handler.js';
 
 const logger = createLogger({ prefix: 'join-client' });
@@ -40,12 +54,35 @@ export const DEFAULT_JOIN_ENV_FILE = './kici-orchestrator.env';
 /** Mode for the join artifact: it carries the cluster's master secret key. */
 const SECRET_FILE_MODE = 0o600;
 
-/**
- * Decrypt a base64-encoded encrypted config bundle using a derived encryption key.
- */
-export function decryptAndParseBundle(encryptedB64: string, encryptionKey: Buffer): ConfigBundle {
-  const bundleData = Buffer.from(encryptedB64, 'base64');
-  return decryptBundle(bundleData, encryptionKey) as ConfigBundle;
+/** How long a join waits for the join.response, through either transport. */
+export const JOIN_TIMEOUT_MS = 30_000;
+
+/** POST target for `--peer`, keeping any base path of the peer URL. */
+export function joinEndpointUrl(peerUrl: string): string {
+  return new URL('api/v1/cluster/join', peerUrl.endsWith('/') ? peerUrl : `${peerUrl}/`).toString();
+}
+
+/** One-line operator message for a refused join. */
+export function describeJoinRefusal(response: JoinResponse): string {
+  if (response.errorCode === JoinErrorCode.enum.join_protocol_unsupported) {
+    return JOIN_PROTOCOL_UNSUPPORTED_MESSAGE;
+  }
+  const code = response.errorCode ? ` (${response.errorCode})` : '';
+  return `Join rejected: ${response.error ?? 'unknown error'}${code}`;
+}
+
+function sealedResponseOf(response: JoinResponse): SealedJoinResponse {
+  const { joinProtocol, serverPublicKey, serverNonce, serverProof, encryptedBundle } = response;
+  if (
+    joinProtocol !== JOIN_PROTOCOL_VERSION ||
+    !serverPublicKey ||
+    !serverNonce ||
+    !serverProof ||
+    !encryptedBundle
+  ) {
+    throw new Error('Join response is missing its join protocol v2 fields');
+  }
+  return { joinProtocol, serverPublicKey, serverNonce, serverProof, encryptedBundle };
 }
 
 /**
@@ -151,14 +188,17 @@ export class JoinClient {
   }
 
   /**
-   * Execute the join flow:
-   * 1. Send join.request with token to Platform relay or direct peer
-   * 2. Receive join.response with encrypted config bundle
-   * 3. Decrypt bundle using token-derived key
-   * 4. Write the env file the orchestrator boots from
+   * Execute the join flow: send the v2 join.request, check the existing
+   * orchestrator's proof, open the sealed bundle, and write the env file. Nothing
+   * is written when the response fails its proof.
    */
   async join(): Promise<void> {
-    const request: JoinRequest = { type: 'join.request', token: this.options.token };
+    const parsed = parseToken(this.options.token);
+    const { fields, state } = createJoinRequest({
+      routingB64: parsed.routingB64,
+      tokenHash: Buffer.from(tokenHashOf(parsed.secretHex), 'hex'),
+    });
+    const request: JoinRequest = { type: 'join.request', ...fields };
 
     logger.info('Sending join request...');
     const response = this.options.platformUrl
@@ -166,17 +206,11 @@ export class JoinClient {
       : await this.joinViaPeer(request);
 
     if (!response.success) {
-      throw new Error(`Join rejected: ${response.error ?? 'unknown error'}`);
+      throw new Error(describeJoinRefusal(response));
     }
 
-    if (!response.encryptedBundle) {
-      throw new Error('Join response missing encrypted bundle');
-    }
-
-    // Decrypt the bundle
-    const parsed = parseToken(this.options.token);
-    const keys = deriveKeys(Buffer.from(parsed.secretHex, 'hex'));
-    const bundle = decryptAndParseBundle(response.encryptedBundle, keys.encryptionKey);
+    // openJoinResponse checks the server proof before it opens the bundle.
+    const bundle = openJoinResponse(state, sealedResponseOf(response)) as ConfigBundle;
 
     logger.info('Join successful, writing config...', { clusterId: bundle.clusterId });
 
@@ -189,7 +223,8 @@ export class JoinClient {
   }
 
   /**
-   * Join via Platform relay: connect WS, authenticate, send join.request, receive join.response.
+   * Join via Platform relay: connect WS, authenticate with the API key, send the
+   * join.request, receive the join.response.
    */
   async joinViaPlatform(request: JoinRequest): Promise<JoinResponse> {
     const url = this.options.platformUrl!;
@@ -214,80 +249,103 @@ export class JoinClient {
         },
       });
       let authenticated = false;
-      let resolved = false;
+      let settled = false;
 
-      const finish = (fn: () => void) => {
-        if (!resolved) {
-          resolved = true;
-          fn();
-        }
-      };
+      const timer = setTimeout(() => {
+        ws.close();
+        finish(() => reject(new Error(`Join request timed out (${JOIN_TIMEOUT_MS / 1000}s)`)));
+      }, JOIN_TIMEOUT_MS);
+
+      function finish(fn: () => void): void {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn();
+      }
 
       ws.on('open', () => {
         ws.send(
           JSON.stringify({
             type: 'auth.request',
-            apiKey,
-            role: 'orchestrator',
+            token: apiKey,
+            protocolVersion: PROTOCOL_VERSION,
           }),
         );
       });
 
       ws.on('message', (data: Buffer | string) => {
+        let msg: { type?: unknown; reason?: unknown };
         try {
-          const msg = JSON.parse(typeof data === 'string' ? data : data.toString());
-
-          if (msg.type === 'auth.success' && !authenticated) {
-            authenticated = true;
-            ws.send(JSON.stringify(request));
-          } else if (msg.type === 'auth.failure') {
-            ws.close();
-            finish(() => reject(new Error(`Platform auth failed: ${msg.reason ?? 'unknown'}`)));
-          } else if (msg.type === 'join.response') {
-            ws.close();
-            finish(() => resolve(msg as JoinResponse));
-          }
+          msg = JSON.parse(typeof data === 'string' ? data : data.toString());
         } catch (err) {
           ws.close();
           finish(() =>
             reject(new Error(`Failed to parse Platform message: ${toErrorMessage(err)}`)),
           );
+          return;
         }
+
+        if (msg.type === 'auth.success' && !authenticated) {
+          authenticated = true;
+          ws.send(JSON.stringify(request));
+        } else if (msg.type === 'auth.failure') {
+          ws.close();
+          finish(() =>
+            reject(new Error(`Platform auth failed: ${String(msg.reason ?? 'unknown')}`)),
+          );
+        } else if (msg.type === 'join.response') {
+          ws.close();
+          const parsed = joinResponseSchema.safeParse(msg);
+          finish(() =>
+            parsed.success
+              ? resolve(parsed.data)
+              : reject(new Error('Malformed join response from the Platform')),
+          );
+        }
+        // Every other frame (capabilities, plan headroom, ...) is ignored.
       });
 
       ws.on('error', (err: Error) => {
         finish(() => reject(new Error(`WebSocket error: ${toErrorMessage(err)}`)));
       });
 
-      ws.on('close', () => {
-        if (!authenticated) {
-          finish(() => reject(new Error('WebSocket closed before auth')));
-        }
+      ws.on('close', (code: number, reason: Buffer) => {
+        const detail = `code ${code}${reason.length > 0 ? `: ${reason.toString()}` : ''}`;
+        finish(() =>
+          reject(
+            new Error(
+              authenticated
+                ? `WebSocket closed before the join response arrived (${detail})`
+                : `WebSocket closed before auth (${detail})`,
+            ),
+          ),
+        );
       });
-
-      // Timeout after 30 seconds
-      setTimeout(() => {
-        ws.close();
-        finish(() => reject(new Error('Join request timed out (30s)')));
-      }, 30_000);
     });
   }
 
   /**
-   * Join via direct peer: POST to peer's join endpoint.
+   * Join via direct peer: POST the join.request to the peer's join endpoint.
+   * There is no fallback to an earlier join protocol.
    */
   async joinViaPeer(request: JoinRequest): Promise<JoinResponse> {
-    const url = new URL('/api/v1/cluster/join', this.options.peerUrl!);
-    const res = await fetch(url.toString(), {
+    const peerUrl = this.options.peerUrl!;
+    const res = await fetch(joinEndpointUrl(peerUrl), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: request.token }),
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(JOIN_TIMEOUT_MS),
     });
-
-    if (!res.ok) {
-      throw new Error(`Peer join request failed: HTTP ${res.status}`);
+    const body: unknown = await res.json().catch(() => undefined);
+    const parsed = joinResponseSchema.safeParse(body);
+    // An orchestrator that predates join protocol v2 answers a body without
+    // `token` with this 400.
+    if (res.status === 400 && parsed.success && parsed.data.error === 'Missing token') {
+      throw new Error(
+        `The orchestrator at ${peerUrl} predates join protocol v2. Upgrade it, then join again.`,
+      );
     }
-
-    return (await res.json()) as JoinResponse;
+    if (parsed.success) return parsed.data;
+    throw new Error(`Peer join request failed: HTTP ${res.status}`);
   }
 }

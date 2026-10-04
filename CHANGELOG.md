@@ -2,6 +2,47 @@
 
 Release notes for the public KiCI packages.
 
+## v0.15.0 — 2026-10-04
+
+### Features
+
+- Observed-mode orchestrators accept GitHub App sources. GitHub delivers to the orchestrator's own URL, so check runs, App clone tokens and `/kici approve` comments work without the Platform relay. The orchestrator also serves an org-level GitHub App URL, `/webhook/<orgId>/github`.
+- `kici-admin source add github --manifest` works in every mode. It sets the App's webhook URL to the hosted Platform's URL in platform and hybrid mode, and to the orchestrator's own URL in observed and independent mode. `kici-admin source list` prints each GitHub source's direct ingress URL.
+- `kici-admin source refresh` reports a GitHub App that lacks an event or permission KiCI needs, such as the Issue comment event, and lists installations that have not accepted a new permission. The daily refresh logs a warning for each such App.
+
+### Fixes
+
+- kici report keeps the Platform endpoint, OIDC issuer, active organization id and token expiry readable in the bundle. When a run is not found, the bundle names the Platform and organization the command searched. The token and its id stay redacted.
+- An agent on a Debian-packaged Node.js, whose npm is installed separately, now runs a container job's host install when that npm is 11.10.0 or later. The agent uses Node's own npm when it has one. Otherwise it uses /usr/share/nodejs/npm, or an npm on its PATH that is not a version-manager shim. When no npm qualifies, the job container installs as before, and the setup log names the npm the agent refused and its version.
+- `kici-admin --version` now prints the CLI version instead of failing with "unknown option '--version'". `-V` and `--cli-version` keep working, and `--version` after a command name (`kici-admin orchestrator upgrade --version <version>`) still sets that command's option.
+- kici-admin now gives a command its own option when that option has the same name as a global option. `kici-admin orchestrator upgrade --url <url>` and `agent upgrade --url <url>` download the archive from that URL, and `--token` reaches `join`, `agent install`, `backend add` and `backend test`. Before, kici-admin read these values as the global orchestrator URL or admin token, so the command did not get them (`join` failed with "required option '--token <token>' not specified"). Put `--url` or `--token` before the command name, or use `-u` or `-t`, to set the global option for these commands.
+- kici-admin now gives a command option a value that starts with `-u`, `-t` or `-V`, or that is `--url` or `--token`, such as `db create-role --password -uP4ss`. Before, kici-admin read the value as a global option, so the command failed, or kici-admin printed its version and did not run the command.
+- When the agent cannot install a workflow's `.kici` dependencies, the job error now gives the installer's exit code, the end of its stderr and stdout, and for npm the end of npm's debug log, with registry tokens masked. Before, the error could be only the install command line, for example when npm wrote its error to stdout or exited without output.
+- The agent keeps masking a job's secrets in its logs, step errors and failure reason after the job requests an OIDC token or mounts a secret as a file. Before, each of those later registrations replaced the set of masked values, so the secrets registered before it showed in clear text. The job failure reason from a failed init command, a concurrency-group error and a runner crash is now masked too.
+- The agent no longer runs as PID 1 in Firecracker microVMs or in the agent container image. tini is PID 1 and runs the agent as its child. It reaps the processes a job leaves behind, so a killed step leaves no zombie processes, and its process group no longer reads as alive. Refresh each Firecracker rootfs with build-agent-rootfs.sh --agent-only to install tini. When the container scaler or a bare-metal scaler runs a job's own container image as the agent, the agent starts under tini from the KiCI runtime, so the image needs no init.
+- A bare-metal scaler that runs a job's own container image as the agent (a label set with an `image` and no `binaryPath`) now works on an orchestrator that runs as a non-root user. Set `requireSudo: true` on the scaler, and give the orchestrator's user a NOPASSWD sudoers rule for `nft`; the scaler then runs its nftables isolation rules through `sudo -n`. The orchestrator checks this when it loads the scaler: if it cannot run `nft` that way, it refuses to start and names both fixes, instead of failing every job. The scaler refuses a rootless container runtime for these agents, because the host's nftables rules never see a rootless runtime's traffic. It also creates the `kici` nftables table before the first rule, and passes its `extraHosts` to the agent containers. The container scaler and the bare-metal scaler now remove an agent container that gets no address on the isolated network, instead of leaving it running without isolation rules.
+- The dashboard can no longer set reserved kici: host labels or properties, change an existing fleet host, or remove a host its agent or kici-admin confirmed. A host declared from the dashboard stays unconfirmed, and out of runsOnAll fan-out, inventory queries and the unreachable-host alarm, until its agent registers or an operator confirms it with kici-admin host declare.
+- kici-admin host declare without --labels now keeps the host's stored labels, as documented. It used to clear them, so adding a --prop to an existing host dropped it out of runsOnAll targeting.
+- `kici-admin source add github --manifest` now creates the GitHub App with the Issues read permission and the Issue comment event, so `/kici approve` and `/kici reject` pull-request comments reach the orchestrator. To enable them on an App you already have, see the GitHub App provider guide.
+- The hosted Platform answers 409 to a webhook for a source that only observed-mode orchestrators serve, instead of buffering a delivery that no orchestrator can accept. The response tells you to send the webhook to the orchestrator's own URL.
+- A GitHub App created with the manifest flow receives its first deliveries at once. The creation ping that reaches the hosted Platform before the source is registered no longer blocks the App for five minutes.
+- The hosted Platform forgets a cached 404 for a webhook source when an orchestrator registers that source, so a source added after a failed delivery receives the next delivery at once.
+- An orchestrator takes a peer's role and routing key from the join token it issued, not from the token's editable routing part.
+- Breaking: kici-admin join uses join protocol v2. The join secret never leaves the joining host, and the configuration bundle is sealed to a one-time key the Platform cannot derive. Orchestrators refuse the earlier exchange, so an older kici-admin cannot join, and a new kici-admin cannot join a cluster whose orchestrators are older. Upgrade the cluster's orchestrators first, then kici-admin. Join tokens keep their format.
+- kici-admin join --platform authenticates with the Platform. It used to send a malformed auth message, and the Platform closed the connection.
+- kici-admin join exits as soon as the join completes, instead of waiting up to 30 seconds.
+- kici-admin peer create-token no longer says a join token can be used once: it works until it expires.
+- An orchestrator answers a join that fails on an internal error, such as a database error, with a generic message; the detail stays in its log.
+- kici-admin join writes KICI_SECRET_KEY even when the cluster's shared configuration holds no secrets.key: the answering orchestrator hands over its own secrets key, as the env file already said.
+- kici-admin join --env-file and kici-admin orchestrator install --env-file reach the CLI: Node reads --env-file from script arguments too, so the join exited before it started and install loaded the file into the CLI's own environment.
+- Breaking: peer authentication between orchestrators is mutual and bound to the handshake. An orchestrator accepts no message from a peer it dials until that peer proves it holds the same credential or join token. A join token no longer leaves the joining host. Orchestrators refuse the earlier peer handshake, so upgrade every coordinator and worker in a cluster together. Until the last one is upgraded, upgraded and older orchestrators do not connect to each other. KICI_CLUSTER_PEER_DISCOVERY=static turns off Platform peer discovery, so a coordinator dials only KICI_CLUSTER_PEERS. A peer's rejection no longer deletes a coordinator's credential file while the coordinator's own database holds that credential as valid.
+- An orchestrator no longer marks a peer disconnected when the outbound connection it replaced closes after the new one is up.
+- An orchestrator keeps a peer's inbound connection when that peer reconnects before its earlier connection closes, and stops the earlier connection's heartbeats.
+
+### Documentation
+
+- The website and documentation now lead with KiCI as a complete CI/CD system on your own infrastructure, with a full dev loop your coding agent can own.
+
 ## v0.14.2 — 2026-10-03
 
 ### Other

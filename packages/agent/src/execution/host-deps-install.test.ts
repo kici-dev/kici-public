@@ -9,6 +9,7 @@ import {
   type InstallKiciDepsOnHostArgs,
 } from './host-deps-install.js';
 import { HostInstallRefusal } from './host-install-eligibility.js';
+import { INSTALL_FAILURE_TAIL_CHARS } from './install-failure.js';
 import type { HostInstallTool } from './host-isolated-install.js';
 
 /** Facts under which the host installs; each test flips one of them. */
@@ -219,6 +220,44 @@ describe('installKiciDepsOnHost', () => {
     expect(args.lines.join('\n')).not.toContain(TOKEN);
     expect(args.lines.join('\n')).not.toContain(INSTALL_SECRET);
     expect(args.lines.at(-1)).toMatch(/^\[host-install\] \[error\] npm error 401/);
+  });
+
+  // fails-when: the logged and rethrown message is the raw execFile message,
+  // which has no exit code and drops stdout.
+  it('carries the installer exit code and stdout in the rethrown error', async () => {
+    const failure = Object.assign(new Error('Command failed: node npm-cli.js ci\n'), {
+      code: 1,
+      signal: null,
+      killed: false,
+      stdout: `npm error code EBUSY (token ${TOKEN})`,
+      stderr: '',
+    });
+    const args = makeArgs({ runInstall: vi.fn(async () => Promise.reject(failure)) });
+
+    const thrown = (await installKiciDepsOnHost(args).catch((err: unknown) => err)) as Error;
+
+    expect(thrown.message).toContain('exit code 1');
+    expect(thrown.message).toContain('stdout:\nnpm error code EBUSY');
+    expect(thrown.message).not.toContain(TOKEN);
+  });
+
+  // fails-when: the output is cut to its end before redaction, so a token that
+  // straddles the start of the kept window leaves its remainder in the error.
+  it('redacts a token that straddles the cut of a long installer output', async () => {
+    const failure = Object.assign(new Error('Command failed: node npm-cli.js ci\n'), {
+      code: 1,
+      signal: null,
+      killed: false,
+      stdout: `${TOKEN}${'x'.repeat(INSTALL_FAILURE_TAIL_CHARS - 10)}`,
+      stderr: '',
+    });
+    const args = makeArgs({ runInstall: vi.fn(async () => Promise.reject(failure)) });
+
+    const thrown = (await installKiciDepsOnHost(args).catch((err: unknown) => err)) as Error;
+
+    expect(thrown.message).toContain('[…]');
+    expect(thrown.message).not.toContain(TOKEN.slice(-10));
+    expect(args.lines.join('\n')).not.toContain(TOKEN.slice(-10));
   });
 });
 

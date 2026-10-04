@@ -458,7 +458,7 @@ function renderIndex(groups, siteBaseUrl, bundles) {
   lines.push('# KiCI');
   lines.push('');
   lines.push(
-    '> KiCI is a TypeScript-native CI/CD workflow engine. Workflows are defined in TypeScript (not YAML), compiled into a portable lock file, and executed by self-hosted agents. The docs below cover the SDK, the CLI, workflow patterns, and the runtime architecture an LLM coding agent needs to author and test KiCI workflows.',
+    '> KiCI is a complete CI/CD system that runs your pipelines on machines you control. Workflows are defined in TypeScript (not YAML), compiled into a portable lock file, and executed by self-hosted agents. The docs below cover the SDK, the CLI, workflow patterns, and the runtime architecture an LLM coding agent needs to author and test KiCI workflows.',
   );
   lines.push('');
   lines.push(

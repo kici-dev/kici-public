@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
+import { accessSync, constants } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, open, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   OVERLAY_TEMPLATE_DIR,
@@ -15,6 +16,28 @@ import {
 
 const execFileAsync = promisify(execFile);
 const MIB = 1024 * 1024;
+
+/** mkfs.ext4 and e2fsck live in /usr/sbin, which a login user's PATH often omits. */
+const SBIN_PATH = [process.env.PATH, '/usr/sbin', '/sbin'].filter(Boolean).join(delimiter);
+
+/** The first executable named `name` on `searchPath`, or null when there is none. */
+function findExecutable(name: string, searchPath: string): string | null {
+  for (const dir of searchPath.split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Not in this directory: try the next one.
+    }
+  }
+  return null;
+}
+
+/** The e2fsprogs tools the real-filesystem case runs; null on a host without e2fsprogs. */
+const MKFS_EXT4 = findExecutable('mkfs.ext4', SBIN_PATH);
+const E2FSCK = findExecutable('e2fsck', SBIN_PATH);
 /** `s_magic` of an ext4 superblock, as `mkfs.ext4` writes it. */
 const EXT4_MAGIC_OFFSET = 1024 + 0x38;
 
@@ -173,26 +196,33 @@ describe('OverlayTemplates', () => {
     expect(await isOverlayTemplate(overlayTemplatePath(base, 16), 16)).toBe(true);
   });
 
-  it('builds a real ext4 template with mkfs.ext4 and copies it sparsely with cp', async () => {
-    // The real tools, so the magic offset, the size check and the cp flags are
-    // checked against what mkfs.ext4 and GNU cp actually do.
-    // mkfs.ext4 lives in /usr/sbin, which a login user's PATH often omits.
-    const env = { ...process.env, PATH: `${process.env.PATH ?? ''}:/usr/sbin:/sbin` };
-    const run: OverlayCommandRunner = async (cmd, args, timeoutMs) =>
-      execFileAsync(cmd, args, { timeout: timeoutMs, env });
-    const templates = new OverlayTemplates(base, run);
-    const dest = join(base, 'overlay.ext4');
+  // Skipped on a host without e2fsprogs, such as a minimal container: this case
+  // needs the real mkfs.ext4 and e2fsck. The recording-runner cases above cover
+  // the template logic on every host.
+  // breaks-if-wrong: on a host with e2fsprogs (a Debian workstation, GitHub's ubuntu
+  // runner) the case runs, and the verbose reporter shows it passed.
+  it.skipIf(!MKFS_EXT4 || !E2FSCK)(
+    'builds a real ext4 template with mkfs.ext4 and copies it sparsely with cp',
+    async () => {
+      // The real tools, so the magic offset, the size check and the cp flags are
+      // checked against what mkfs.ext4 and GNU cp actually do.
+      const env = { ...process.env, PATH: SBIN_PATH };
+      const run: OverlayCommandRunner = async (cmd, args, timeoutMs) =>
+        execFileAsync(cmd, args, { timeout: timeoutMs, env });
+      const templates = new OverlayTemplates(base, run);
+      const dest = join(base, 'overlay.ext4');
 
-    await templates.createOverlay(dest, 64);
+      await templates.createOverlay(dest, 64);
 
-    expect(await isOverlayTemplate(dest, 64)).toBe(true);
-    // Sparse: a 64 MiB drive allocates a small fraction of its size.
-    const { blocks, size } = await stat(dest);
-    expect(size).toBe(64 * MIB);
-    expect(blocks * 512).toBeLessThan(size / 4);
-    // The copy is a valid filesystem, not just the right first bytes.
-    await execFileAsync('/usr/sbin/e2fsck', ['-fn', dest]);
-  });
+      expect(await isOverlayTemplate(dest, 64)).toBe(true);
+      // Sparse: a 64 MiB drive allocates a small fraction of its size.
+      const { blocks, size } = await stat(dest);
+      expect(size).toBe(64 * MIB);
+      expect(blocks * 512).toBeLessThan(size / 4);
+      // The copy is a valid filesystem, not just the right first bytes.
+      await execFileAsync(E2FSCK!, ['-fn', dest]);
+    },
+  );
 });
 
 describe('isOverlayTemplate', () => {

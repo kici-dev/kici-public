@@ -50,6 +50,11 @@ The bundle holds:
 - a collection report saying which of those the command could and could not
   read.
 
+If `--run` names a run the Platform cannot find, the collection report names
+the Platform endpoint and the organization the command searched. The usual
+cause is a CLI that is logged in to a different Platform or organization than
+the one that ran the job.
+
 Open the file and read it. It is yours until you decide to share it.
 
 ### What gets redacted
@@ -64,6 +69,10 @@ KiCI removes known secret shapes before anything enters the bundle:
 
 Configuration is redacted twice: an allowlist keeps only known-safe fields, and
 the free-text scrubber runs over what remains.
+
+The configuration fields that tell where the CLI looks stay readable: the
+Platform endpoint, the OIDC issuer, the active organization id, and the expiry
+time of your personal access token. The token and its id stay redacted.
 
 **Redaction is best effort.** A secret in a format KiCI does not recognize can
 survive it. Review the bundle before you share it. `--no-redact` turns

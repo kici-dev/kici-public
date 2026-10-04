@@ -17,8 +17,9 @@
  * - The checkout must pass the allowlist in `host-install-eligibility.ts`: a
  *   plain npm or pnpm project with registry-only dependencies, no workspace,
  *   no pnpm hooks, no yarn, no symlinked manifest.
- * - The agent must have its own package manager to run: the npm bundled with
- *   its Node (new enough to refuse git dependencies) or the pinned pnpm.
+ * - The agent must have its own package manager to run: its npm (new enough
+ *   to refuse git dependencies; `lookupHostNpm` in `npm-resolver.ts` finds it)
+ *   or the pinned pnpm.
  *   `host-isolated-install.ts` runs it away from the checkout, with a
  *   sanitized `.npmrc` and environment.
  * - An npm too old to refuse URL and file sources itself runs `npm ci`, and
@@ -35,13 +36,13 @@
 
 import { join } from 'node:path';
 import type { JobDispatch } from '@kici-dev/engine';
-import { toErrorMessage } from '@kici-dev/shared';
 import type {
   HostInstallEligibility,
   HostInstallPlan,
   HostInstallRefused,
 } from './host-install-eligibility.js';
 import type { HostInstallTool, RunHostInstallArgs } from './host-isolated-install.js';
+import { describeInstallFailure } from './install-failure.js';
 import { redactNpmOutput, type NpmRegistrySpec } from './npm-registry-config.js';
 
 /**
@@ -261,7 +262,8 @@ export async function installKiciDepsOnHost(
       ...(args.signal ? { signal: args.signal } : {}),
     });
   } catch (err) {
-    const message = redact(toErrorMessage(err));
+    // Redact before the output is cut to its end, so a cut never leaves part of a token.
+    const message = describeInstallFailure(err, secrets);
     say(`${LOG_PREFIX} [error] ${message}`);
     // fails-when: the raw error (whose text carries the installer's stderr) is
     // rethrown, so a registry token it echoes reaches job.status.error.

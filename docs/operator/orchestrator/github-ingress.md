@@ -10,10 +10,12 @@ Platform is only relaying bytes. If you would rather not depend on the Platform
 for the one step that must never miss a push, point GitHub directly at your
 orchestrator.
 
-`kici-admin orchestrator install` writes `KICI_MODE=hybrid`, so a fresh
-orchestrator already serves this ingress route. Two steps turn it into a live
-delivery path: set `KICI_WEBHOOK_PUBLIC_URL` to the public base at which the
-route is reachable, then point GitHub at the URL the CLI prints.
+`hybrid`, `independent` and `observed` orchestrators serve both direct GitHub
+routes: the org-scoped `/webhook/<org>/github` and the per-source
+`/webhook/<org>/github/<source-id>`. `kici-admin orchestrator install` writes
+`KICI_MODE=hybrid`, so a fresh orchestrator already serves them. Two steps turn
+them into a live delivery path: set `KICI_WEBHOOK_PUBLIC_URL` to the public base
+at which the routes are reachable, then point GitHub at the URL the CLI prints.
 
 This page covers exposing that ingress, the two delivery topologies, the
 clustered-ingress topology, and why direct-ingress webhooks are not metered. For
@@ -35,22 +37,32 @@ kici-admin source add github \
 
 Set `KICI_WEBHOOK_PUBLIC_URL` to the public base at which your orchestrator's
 ingress is reachable (for example `https://ci.example.com`). The install stub
-carries the variable commented out, so uncomment it and restart. With it set, the
-CLI prints the exact ingress URL for this source:
+carries the variable commented out, so uncomment it and restart. With it set,
+`kici-admin source list` prints the exact ingress URL under each GitHub source
+(`ingress: …`). In `observed` and `independent` mode, `source add` prints it
+too:
 
 ```
 https://ci.example.com/webhook/<org>/github/<source-id>
 ```
 
-That is the receiving endpoint. Paste it into GitHub as described below. Without
-`KICI_WEBHOOK_PUBLIC_URL`, the CLI cannot print a URL and tells you to set it.
+That is the per-source receiving endpoint. Paste it into GitHub as described
+below. Without `KICI_WEBHOOK_PUBLIC_URL`, the CLI cannot print a URL and tells
+you to set it.
 
 ## Topology 1 — App-level repoint (full bypass)
 
 Point the GitHub App's single **Webhook URL** (App settings → General → Webhook)
-at the printed `…/webhook/<org>/github/<source-id>` URL. GitHub now delivers
-every event for every installation directly to your orchestrator, and the hosted
-Platform never sees the event.
+at one of the orchestrator's GitHub URLs. GitHub now delivers every event for
+every installation directly to your orchestrator, and the hosted Platform never
+sees the event. Either URL works for an App:
+
+- **The org-scoped URL**, `<base>/webhook/<org>/github`. The orchestrator finds
+  the source from the App's installation-target headers. This URL exists before
+  the App does, so the manifest flow bakes it into a new App in `observed` and
+  `independent` mode.
+- **The per-source URL**, `<base>/webhook/<org>/github/<source-id>`, which
+  `kici-admin source list` prints.
 
 GitHub sends the App installation-target headers
 (`X-GitHub-Hook-Installation-Target-Type: integration` and
@@ -70,9 +82,19 @@ job. This is the reliability reason to run hybrid mode. For the full picture of
 what the Platform still provides, see
 [What requires the hosted Platform](./platform-capabilities.md).
 
-A classic per-repo webhook does not carry the App installation-target headers;
-the source id in the URL already identifies the source, so the orchestrator
-skips the App-header check for those deliveries.
+A classic per-repo webhook does not carry the App installation-target headers,
+so it must use the per-source URL. The source id in the URL identifies the
+source, and the orchestrator skips the App-header check for those deliveries.
+The org-scoped URL answers 400 to a delivery without App headers.
+
+## An App still pointed at the hosted Platform
+
+An `observed` orchestrator never receives relayed deliveries. When its GitHub
+App still points at the hosted Platform, the Platform answers each delivery with
+409 `OBSERVE_ONLY_SOURCE`. GitHub shows the 409 under the App's _Advanced →
+Recent Deliveries_. To fix it, set the App's webhook URL to the URL
+`kici-admin source list` prints for the source, or to the org-scoped
+`<base>/webhook/<org>/github`.
 
 ## Cluster ingress
 
@@ -111,7 +133,7 @@ This exemption covers the relayed-webhook quota alone. If you also run the hoste
 Platform (`hybrid` mode), every other plan dimension applies as usual — see
 [platform-down
 behavior](./platform-down-behavior.md#the-independence-boundary). `observed` mode
-does not accept GitHub-App sources at all, so this ingress needs `hybrid` — see
+serves this ingress too and keeps the hosted dashboard without the relay — see
 [what requires the hosted Platform](./platform-capabilities.md).
 
 ## Advanced: pointing the App at a custom URL

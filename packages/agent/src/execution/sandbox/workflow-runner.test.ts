@@ -1910,3 +1910,58 @@ describe('buildConcurrencyGroupContext', () => {
     expect(buildConcurrencyGroupContext(req({ branch: undefined })).branch).toBe('headsha');
   });
 });
+
+describe('fatal and early-exit paths send through the job masker', () => {
+  // No unit test can reach main()'s catch or the process-level handlers without
+  // driving a whole sandbox job, so the wiring is asserted at the source level.
+  // fails-when: `fatalMasker = masker` is removed, the catch reports with a null
+  // masker, or an exit path goes back to the raw sendMessage.
+  const source = readFileSync(
+    fileURLToPath(new URL('./workflow-runner.ts', import.meta.url)),
+    'utf8',
+  );
+
+  /** The body of the function declared by `signature`, up to its closing brace. */
+  function bodyOf(signature: string): string {
+    const at = source.indexOf(signature);
+    expect(at, signature).toBeGreaterThan(-1);
+    return source.slice(at, source.indexOf('\n}\n', at));
+  }
+
+  it('sets the fatal masker right after the job masker is built', () => {
+    const at = source.indexOf('const masker = createSecretMasker(request);');
+    expect(at).toBeGreaterThan(-1);
+    expect(source.slice(at, at + 200)).toContain('fatalMasker = masker;');
+  });
+
+  it('reports a fatal error through buildFatalReport with the fatal masker', () => {
+    const at = source.indexOf('main().catch((error) => {');
+    expect(at).toBeGreaterThan(-1);
+    const handler = source.slice(at, at + 600);
+    expect(handler).toContain('buildFatalReport(error, fatalMasker)');
+    expect(handler).not.toMatch(/sendMessage\(\{/);
+  });
+
+  it('masks the process-level crash handlers', () => {
+    for (const event of ["process.on('uncaughtException'", "process.on('unhandledRejection'"]) {
+      const at = source.indexOf(event);
+      expect(at, event).toBeGreaterThan(-1);
+      const handler = source.slice(at, source.indexOf('});', at));
+      expect(handler).toContain('maskFatalText(');
+      expect(handler).not.toMatch(/stderr\.write\(`/);
+    }
+  });
+
+  it('sends the init-failure and concurrency exits through the masked send', () => {
+    for (const signature of [
+      'async function runInitPhaseOrFailJob(',
+      'async function evaluateConcurrencyGroupIfPresent(',
+    ]) {
+      const body = bodyOf(signature);
+      // Positive control: the body really sends job.complete.
+      expect(body, signature).toContain("type: 'job.complete'");
+      expect(body, signature).not.toContain('sendMessage(');
+    }
+    expect(source).toContain('evaluateConcurrencyGroupIfPresent(workflow, request, maskedSend)');
+  });
+});

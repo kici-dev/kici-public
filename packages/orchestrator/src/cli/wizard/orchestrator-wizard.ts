@@ -217,14 +217,10 @@ export async function runOrchestratorWizard(
     );
   }
 
-  // 7. Source setup (optional). Observed mode refuses GitHub-App sources —
-  // they are ingested through the Platform relay, which observed never accepts.
+  // 7. Source setup (optional). Every mode can hold a GitHub App source.
   let source: OrchestratorInstallConfig['source'];
-  const canAddGithubSource = mode !== OrchestratorMode.enum.observed;
   console.log('');
-  const addSource = canAddGithubSource
-    ? await promptConfirm('Add a GitHub App source?', false)
-    : false;
+  const addSource = await promptConfirm('Add a GitHub App source?', false);
   if (addSource) {
     const sourceName = await input({ message: 'Source name (e.g. main-org):' });
     const appId = await input({

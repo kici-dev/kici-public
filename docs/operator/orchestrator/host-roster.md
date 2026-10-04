@@ -16,7 +16,8 @@ One row per agent, keyed by its agent id:
 - **Connected instance** — which orchestrator instance currently holds the agent's live connection, or empty when the agent is disconnected. In a cluster this is the shared liveness signal: every instance agrees on a host's status because it derives from this shared column, not from any one instance's in-memory registry.
 - **Last seen** — a coarse heartbeat timestamp (updated on register, on a throttled cadence while connected, and cleared of ownership on disconnect).
 - **Hostname / platform / arch** — metadata reported by the agent.
-- **Properties** — a typed host-vars bag (`string | number | boolean` values), the place for facts like `region`, `cores`, or `gpu`. Distinct from labels: labels are the flat-string grouping/targeting dimension, properties are typed key/value host-vars. Reported by the agent (`KICI_PROPERTIES`) and/or pre-declared by the operator (`host declare --prop`), shallow-merged on each registration so agent-reported keys win and operator-set keys the agent does not report are preserved.
+- **Properties** — a typed host-vars bag (`string | number | boolean` values), the place for facts like `region`, `cores`, or `gpu`. Distinct from labels: labels are the flat-string grouping/targeting dimension, properties are typed key/value host-vars. Reported by the agent (`KICI_PROPERTIES`) and/or pre-declared by the operator (`host declare --prop`), shallow-merged on each registration so agent-reported keys win and operator-set keys the agent does not report are preserved. Keys that start with `kici:` are reserved for the orchestrator: only `kici-admin host declare` sets them, an agent's reported `kici:` keys are dropped, and the dashboard refuses them.
+- **Identity source** — `agent` (the agent registered), `operator` (declared with `kici-admin host declare`) or `platform` (declared from the dashboard and not yet confirmed). A `platform` host is not a `runsOnAll` target, an inventory result, an agent-id pin or an unreachable-alarm count. Shown in the `Source` column of `kici-admin host list`.
 
 The roster lives in the orchestrator's shared cluster database (one table, all instances read and write it).
 
@@ -108,7 +109,7 @@ kici-admin host remove --agent-id web-09
 
 A pre-declared static host is the bootstrap path: you record that a box _should_ exist (with its labels) before it has ever connected, so its absence is visible from the moment it is declared rather than only after it has connected once.
 
-Re-declaring the same agent id converges the operator-owned fields — labels, hostname, properties, and SSH reach — to the values you pass, while preserving the agent-reported liveness/identity columns (connection state, platform, architecture). Operator fields you omit keep their stored value (reach metadata set earlier is never wiped by a labels-only re-declare), and properties shallow-merge the same way an agent registration does.
+Re-declaring the same agent id with `kici-admin` converges the operator-owned fields — labels, hostname, properties and SSH reach — to the values you pass. It keeps the agent-reported liveness columns (connection state, platform, architecture). Omitted fields keep their stored value (reach metadata set earlier is never wiped by a labels-only re-declare), and properties shallow-merge the same way an agent registration does. A host declared from the dashboard is the exception: your declare replaces its labels, hostname and properties outright and confirms it. A host with an agent takes its labels and hostname from the agent at each registration, so a `kici-admin` relabel of such a host lasts until the agent next registers.
 
 ### Host properties
 

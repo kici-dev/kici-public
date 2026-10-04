@@ -15,6 +15,10 @@ import { z } from 'zod';
 import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 
+/** Whether a coordinator dials the peers the Platform announces. */
+export const PeerDiscoveryMode = z.enum(['platform', 'static']);
+export type PeerDiscoveryMode = z.infer<typeof PeerDiscoveryMode>;
+
 /**
  * Schema for the local YAML configuration file.
  * All fields optional except database.url.
@@ -122,6 +126,7 @@ export const sharedConfigSchema = z.object({
       role: z.enum(['coordinator', 'worker']).optional(),
       coordinatorUrl: z.string().optional(),
       peerStaleTimeoutMs: z.coerce.number().optional(),
+      peerDiscovery: PeerDiscoveryMode.optional(),
     })
     .optional(),
   webhookPayloadDir: z.string().optional(),
@@ -232,6 +237,8 @@ export const appConfigSchema = z
         coordinatorUrl: z.string().optional(),
         /** Stale peer timeout in ms. */
         peerStaleTimeoutMs: z.coerce.number().default(60_000),
+        /** Whether this coordinator dials Platform-announced peers (platform) or only `peers` (static). */
+        peerDiscovery: PeerDiscoveryMode.default(PeerDiscoveryMode.enum.platform),
       })
       .prefault({}),
     webhookPayloadDir: z.string().optional(),

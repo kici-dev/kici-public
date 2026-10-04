@@ -82,14 +82,20 @@ GitHub App "my-org" is live.
   Webhook: https://<platform-host>/webhook/<orgId>/github
 ```
 
+In `platform` and `hybrid` mode the baked webhook URL is the hosted Platform's
+(`https://<platform-host>/webhook/<orgId>/github`). In `observed` and
+`independent` mode it is the orchestrator's own
+(`<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`; independent mode uses
+`__default__` as the org segment). `--webhook-url` overrides it in every mode.
+
 **Flags:**
 
-| Flag                  | Effect                                                                                                                                                                                                                                                                                |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--name <name>`       | The App name you _request_ on GitHub (required). GitHub assigns the final name + slug; the stored, displayed name always comes from GitHub (see [Display name and slug](#display-name-and-slug)).                                                                                     |
-| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account.                                                                                                                                                                                                          |
-| `--webhook-url <url>` | **Advanced / self-hosted.** Bake this `https://` URL into the App's webhook verbatim and skip the platform-mode webhook-URL resolution (so it works even where the auto-resolved KiCI Platform URL is unavailable). See [Self-hosted webhook URL](#self-hosted-webhook-url-override). |
-| `--no-browser`        | Headless mode: the CLI prints a `kici.dev` URL to open, then reads the setup code you paste back. The page is pure client-side — it only displays the short-lived code, which is useless once the CLI exchanges it.                                                                   |
+| Flag                  | Effect                                                                                                                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--name <name>`       | The App name you _request_ on GitHub (required). GitHub assigns the final name + slug; the stored, displayed name always comes from GitHub (see [Display name and slug](#display-name-and-slug)).                   |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account.                                                                                                                                        |
+| `--webhook-url <url>` | **Advanced / self-hosted.** Bake this `https://` URL into the App's webhook verbatim instead of the URL the orchestrator resolves for its mode. See [Self-hosted webhook URL](#self-hosted-webhook-url-override).   |
+| `--no-browser`        | Headless mode: the CLI prints a `kici.dev` URL to open, then reads the setup code you paste back. The page is pure client-side — it only displays the short-lived code, which is useless once the CLI exchanges it. |
 
 The manifest flow always creates a **new** App on GitHub. If a source for
 that App id already exists on the orchestrator, the command refuses — use
@@ -100,9 +106,11 @@ captured App id and writes the private key to a `0600` file, then tells
 you how to finish with the manual `source add github` command — so a
 created App is never orphaned.
 
-Independent-mode orchestrators have no GitHub-App ingress (it is
-Platform-relayed), so the manifest flow is unavailable there; use a
-generic webhook source instead.
+An `independent` orchestrator receives App deliveries on its own direct
+ingress. The manifest flow bakes
+`<KICI_WEBHOOK_PUBLIC_URL>/webhook/__default__/github`, so set
+`KICI_WEBHOOK_PUBLIC_URL` first. See
+[Direct GitHub ingress](../../operator/orchestrator/github-ingress.md).
 
 ## Manual setup (fallback)
 
@@ -119,20 +127,28 @@ the manifest flow — follow these steps.
    Apps -> New GitHub App_ (org-level is _Settings -> Developer
    settings -> GitHub Apps_ on the org page).
 
-3. **Set the webhook URL.** KiCI exposes one webhook endpoint per org:
+3. **Set the webhook URL.** The URL depends on the orchestrator's mode:
+   - `platform` and `hybrid`: the hosted Platform endpoint, one per org.
+     The Platform relays each delivery to your orchestrator over its
+     outbound connection.
 
-   ```
-   https://<platform-host>/webhook/<orgId>/github
-   ```
+     ```
+     https://<platform-host>/webhook/<orgId>/github
+     ```
 
-   GitHub App webhooks are always delivered to this Platform endpoint and
-   relayed to your orchestrator over its outbound connection — platform and
-   hybrid orchestrators both receive GitHub events this way. Independent-mode
-   orchestrators have no Platform connection and therefore no GitHub-App
-   ingress; use a generic webhook source instead. The `<orgId>` segment is
-   the KiCI organization ID the source belongs to; the `<appId>` is
-   discovered from `X-GitHub-Hook-Installation-Target-ID` at request time and
-   is _not_ part of the URL.
+   - `observed` and `independent`: the orchestrator's own URL. Use the
+     org-scoped URL for an App-level webhook, or the per-source URL
+     `<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github/<source-id>` for a
+     classic repository webhook. An `independent` orchestrator uses
+     `__default__` as the `<orgId>` segment.
+
+     ```
+     <KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github
+     ```
+
+   The `<orgId>` segment is the KiCI organization ID the source belongs to;
+   the `<appId>` is discovered from `X-GitHub-Hook-Installation-Target-ID`
+   at request time and is _not_ part of the URL.
 
 4. **Set the webhook secret.** Generate a random hex string (e.g.
    `openssl rand -hex 32`) and save it for step 4 of the orchestrator
@@ -141,21 +157,24 @@ the manifest flow — follow these steps.
 
 5. **Pick permissions.** Minimum required:
 
-   | Scope                       | Access       | Why                                  |
-   | --------------------------- | ------------ | ------------------------------------ |
-   | Repository -> Contents      | Read         | Clone the repo to read the lock file |
-   | Repository -> Metadata      | Read (auto)  | Default for every App                |
-   | Repository -> Pull requests | Read         | Match `pull_request` triggers        |
-   | Repository -> Checks        | Read & write | Post KiCI's enriched Check runs      |
+   | Scope                       | Access       | Why                                                                         |
+   | --------------------------- | ------------ | --------------------------------------------------------------------------- |
+   | Repository -> Contents      | Read         | Clone the repo to read the lock file                                        |
+   | Repository -> Metadata      | Read (auto)  | Default for every App                                                       |
+   | Repository -> Pull requests | Read         | Match `pull_request` triggers                                               |
+   | Repository -> Checks        | Read & write | Post KiCI's enriched Check runs                                             |
+   | Repository -> Issues        | Read         | Receive `issue_comment` events: `/kici approve` and `/kici reject` comments |
 
-   Those four cover the whole flow: clone, trigger matching, Check runs.
+   These cover the whole flow: clone, trigger matching, Check runs, and
+   pull-request comment commands.
    [CI trust](../../architecture/security/ci-security.md) needs no
    permission of its own — it reads the fork relationship straight out of
    the webhook payload and calls no GitHub API.
 
 6. **Subscribe to events.** At minimum: `push`, `pull_request`,
-   `check_run`, `check_suite`. Add others (`issues`, `release`, ...) if
-   your workflows use those triggers.
+   `check_run`, `check_suite`, and `issue_comment`. GitHub offers
+   `issue_comment` only after you grant the Issues permission above. Add
+   others (`issues`, `release`, ...) if your workflows use those triggers.
 
 7. **Generate a private key.** Scroll to the bottom of the App settings
    and click _Generate a private key_. A `.pem` file downloads —
@@ -191,10 +210,14 @@ Webhook URL:  https://<platform-host>/webhook/<orgId>/github
   ↳ Paste this into your GitHub App's "Webhook URL" field.
 ```
 
-When the orchestrator runs in independent mode (no Platform connection) the
-URL line reads `(unavailable — this orchestrator runs in independent mode)`,
-because GitHub-App ingress is Platform-relayed. The private key and webhook
-secret are stored encrypted in the orchestrator database under
+In `observed` and `independent` mode the URL is the orchestrator's own
+per-source URL, `<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github/<source-id>`.
+When `KICI_WEBHOOK_PUBLIC_URL` is not set, the line reads
+`(unavailable — KICI_WEBHOOK_PUBLIC_URL is not set on the orchestrator)` with a
+hint to set it. `kici-admin source list` prints the URL again under each
+GitHub source (`ingress: …`).
+
+The private key and webhook secret are stored encrypted in the orchestrator database under
 `KICI_SECRET_KEY`; no restart needed — the orchestrator accepts webhooks from
 this App immediately.
 
@@ -264,10 +287,17 @@ sync two ways:
   GitHub already matches what KiCI has stored. Non-GitHub routing keys are
   rejected — name/slug sync applies only to GitHub App sources.
 
+`source refresh` also compares the App with what KiCI needs. It warns when the
+App lacks a permission or an event (for example the Issues permission or the
+Issue comment event), and lists the installations that have not accepted a new
+permission yet. `--json` carries the same findings as `missingEvents`,
+`missingPermissions` and `installationsPendingApproval`. The daily refresh
+logs a warning for each App with a gap.
+
 ## Self-hosted webhook URL override
 
-By default the manifest flow bakes the KiCI Platform webhook endpoint
-(`https://<platform-host>/webhook/<orgId>/github`) into the App. If you run
+By default the manifest flow bakes the URL the orchestrator resolves for its
+mode (see [One-click setup](#one-click-setup-recommended)). If you run
 your own ingress and want GitHub to deliver events to it instead, pass
 `--webhook-url` when creating the App:
 
@@ -280,9 +310,7 @@ The supplied URL must be an absolute `https://` URL; it is written into the
 App's webhook configuration **verbatim**. This is the operator asserting "I own
 webhook delivery": KiCI adds **no** ingress at this URL and does **not** receive
 events there — your own infrastructure is responsible for accepting GitHub's
-deliveries and routing them onward. Supplying the flag also decouples App
-creation from platform-mode URL resolution, so it works even in a configuration
-where the auto-resolved KiCI Platform URL is unavailable.
+deliveries and routing them onward.
 
 ## Global workflows
 
@@ -338,6 +366,41 @@ therefore visible in GitHub itself without opening the KiCI dashboard.
 
 For architecture details see
 [GitHub checks architecture](../../architecture/webhooks/github-checks.md).
+
+## Pull-request comment commands
+
+A `/kici approve` or `/kici reject` comment on a pull request releases or
+rejects a security hold (see
+[CI security](../../architecture/security/ci-security.md#approval-channels)).
+GitHub sends each comment to KiCI as an `issue_comment` event. An App can
+subscribe to that event only when it has read access to the **Issues**
+repository permission. The one-click setup requests both. A workflow with a
+[`comment()`](../sdk/triggers.md#comment) trigger needs the same subscription.
+
+### Enable comment commands on an existing App
+
+Open the App's _Settings -> Developer settings -> GitHub Apps -> (your App)
+-> Edit -> Permissions & events_. For an org-owned App, start from the org's
+_Settings_ page. If **Repository permissions -> Issues** is set to _No
+access_, or **Subscribe to events -> Issue comment** is clear, the App sends
+no comments to KiCI. To fix this:
+
+1. Set **Repository permissions -> Issues** to **Read-only**.
+2. Under **Subscribe to events**, select **Issue comment**.
+3. Click **Save changes**.
+4. Accept the new permission on every installation. GitHub emails the
+   owner of each account where the App is installed, and the installation's
+   _Configure_ page shows a request to review the new permissions. GitHub
+   does not apply the permission to an installation until its owner accepts
+   it, so the repos of that installation send no comments until then.
+5. Run `kici-admin source refresh github:<appId>`. It warns while the App
+   still lacks the Issues permission or the Issue comment event, and lists
+   each installation that has not accepted the permission yet.
+
+The orchestrator needs no change: it already handles `issue_comment`
+deliveries. To confirm, post a comment on a pull request in an installed repo
+and look for an `issue_comment` delivery under the App's _Advanced -> Recent
+Deliveries_.
 
 ## Rotation
 
@@ -398,6 +461,12 @@ target headers`.** The request isn't actually from a GitHub App
 webhook, use the App's _Recent Deliveries_ tab on GitHub to re-send a
 real one.
 
+**GitHub's _Recent Deliveries_ show 409 `OBSERVE_ONLY_SOURCE`.** The App
+still points at the hosted Platform, but the orchestrator that serves the
+source runs in `observed` mode and takes deliveries only on its own URL. Set
+the App's webhook URL to the URL `kici-admin source list` prints. See
+[An App still pointed at the hosted Platform](../../operator/orchestrator/github-ingress.md#an-app-still-pointed-at-the-hosted-platform).
+
 **Webhook arrives but no run fires.** The orchestrator accepted the
 webhook but no workflow registration matched. Causes (in order of
 likelihood): the repo isn't registered with the orchestrator yet
@@ -417,6 +486,17 @@ the one GitHub knows about (rotate it).
 Re-request permissions in _App settings -> Permissions & events_
 (GitHub will prompt installers to accept the new scope on next visit)
 and confirm the App is installed on that repo.
+
+**A `/kici approve` comment has no effect.** Look under the App's
+_Advanced -> Recent Deliveries_ for an `issue_comment` delivery. If there is
+none, the App does not have the Issues permission or the Issue comment
+subscription, or the installation has not accepted the permission yet. See
+[Enable comment commands on an existing App](#enable-comment-commands-on-an-existing-app).
+If the delivery is there, the commenter needs a linked GitHub identity and
+`ci_trust:write` (see
+[Identity linking](../../operator/security/security.md#identity-linking)). A
+comment acts only on security holds; release a reviewer hold from the
+dashboard or with `kici approve`.
 
 ## See also
 

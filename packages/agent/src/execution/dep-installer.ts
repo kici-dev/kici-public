@@ -33,6 +33,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { attachNpmDebugLog, describeInstallFailure } from './install-failure.js';
 import {
   PNPM_IGNORE_BUILD_GATE_ARG,
   PackageManager,
@@ -192,12 +193,13 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
       await runNpmInstall({ kiciDir, ignoreScripts, registryConfig, baseEnv });
     }
   } catch (e) {
-    const tokens = registryConfig.tokensForRedaction;
-    process.stderr.write(
-      `[dep-installer:trace] INSTALL FAILED: ${redactNpmOutput(toErrorMessage(e), tokens)}\n`,
-    );
-    logSubprocessStreams(e, tokens);
-    throw e;
+    // The rethrown message is what reaches the job error and the run log, so it
+    // carries the exit code and the redacted end of the installer's output.
+    // fails-when: the raw execFile error is rethrown — its message is the
+    // command line plus stderr only, and stderr can be empty.
+    const description = describeInstallFailure(e, registryConfig.tokensForRedaction);
+    process.stderr.write(`[dep-installer:trace] INSTALL FAILED: ${description}\n`);
+    throw new Error(description);
   } finally {
     await registryConfig.cleanup();
   }
@@ -280,6 +282,10 @@ async function runNpmInstall(args: {
       timeout: INSTALL_TIMEOUT_MS,
       maxBuffer: INSTALL_MAX_BUFFER,
     });
+  } catch (e) {
+    // npm's debug log lives in the per-job cache removed below.
+    await attachNpmDebugLog(e, cacheDir);
+    throw e;
   } finally {
     await cleanup().catch(() => {});
   }

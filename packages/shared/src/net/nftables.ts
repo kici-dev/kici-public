@@ -257,6 +257,24 @@ async function nft(opts: NftOptions, ...args: string[]): Promise<string> {
 }
 
 /**
+ * Whether this process can run nft, the way `opts` will run it.
+ *
+ * Runs `nft list tables` (through `sudo -n` when `opts.requireSudo` is set) and
+ * returns `null` when it succeeds, or the failure text when it does not: a
+ * missing binary, a missing NET_ADMIN capability, or a sudo that would prompt.
+ * It never throws, so a caller can record the answer and decide later whether
+ * it matters.
+ */
+export async function probeNftables(opts: NftOptions = {}): Promise<string | null> {
+  try {
+    await nft(opts, 'list', 'tables');
+    return null;
+  } catch (err) {
+    return toErrorMessage(err);
+  }
+}
+
+/**
  * Validate that nftables is available and the process has NET_ADMIN capability.
  * Attempts `nft list tables` -- if it fails:
  *   - ENOENT: nft binary not installed
@@ -264,10 +282,8 @@ async function nft(opts: NftOptions, ...args: string[]): Promise<string> {
  * Throws with a clear error message in both cases.
  */
 export async function validateNftablesAvailability(opts: NftOptions = {}): Promise<void> {
-  try {
-    await nft(opts, 'list', 'tables');
-  } catch (err) {
-    const message = toErrorMessage(err);
+  const message = await probeNftables(opts);
+  if (message !== null) {
     if (message.includes('ENOENT') || message.includes('not found')) {
       throw new Error(
         'nftables binary not found at /usr/sbin/nft. ' +

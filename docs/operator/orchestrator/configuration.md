@@ -17,12 +17,12 @@ The startup schema lives in `packages/orchestrator/src/config.ts`. The [env var 
 
 ### Which surface reads which store
 
-| Store                          | Read by                                                                                                                                                                                                                               | Not read by                           |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| `KICI_*` environment variables | orchestrator startup, every `kici-admin` command that loads the startup config, the reload path, and `kici-admin scaler`                                                                                                              | --                                    |
-| Local YAML                     | the reload path, `kici-admin config diff`, and `kici-admin scaler`                                                                                                                                                                    | orchestrator startup                  |
-| Shared DB                      | `kici-admin config seed`, `set`, `delete`, `export`, `diff`, `history` and `rollback`; `kici-admin rotate-key`; and `kici-admin join`, which copies `storage` and `secrets.key` into the env file the joining orchestrator boots from | orchestrator startup, the reload path |
-| Built-in defaults              | every surface, each against its own schema                                                                                                                                                                                            | --                                    |
+| Store                          | Read by                                                                                                                                                                                                                                                                                                     | Not read by                           |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `KICI_*` environment variables | orchestrator startup, every `kici-admin` command that loads the startup config, the reload path, and `kici-admin scaler`                                                                                                                                                                                    | --                                    |
+| Local YAML                     | the reload path, `kici-admin config diff`, and `kici-admin scaler`                                                                                                                                                                                                                                          | orchestrator startup                  |
+| Shared DB                      | `kici-admin config seed`, `set`, `delete`, `export`, `diff`, `history` and `rollback`; `kici-admin rotate-key`; and `kici-admin join`, which copies `storage` and `secrets.key` (with no `secrets.key`, the answering orchestrator's own secrets key) into the env file the joining orchestrator boots from | orchestrator startup, the reload path |
+| Built-in defaults              | every surface, each against its own schema                                                                                                                                                                                                                                                                  | --                                    |
 
 Environment variables win over YAML values on the reload path, and YAML values win over defaults. `kici-admin scaler` reverses the first rule: it prefers `scaler.configPath` / `scaler.configDir` from the YAML file and falls back to `KICI_SCALER_CONFIG_PATH` / `KICI_SCALER_CONFIG_DIR`.
 
@@ -71,15 +71,14 @@ instance:
   # Operating mode: platform | hybrid | observed | independent
   # - platform (default): WS to Platform relay only; rejects direct webhooks.
   #     Requires platform.url + platform.token (or KICI_PLATFORM_URL + KICI_PLATFORM_TOKEN).
-  # - hybrid: Platform relay + direct per-source webhook ingestion (deduplicated).
+  # - hybrid: Platform relay + direct webhook ingestion (deduplicated).
   #     Requires Platform credentials. Per-source webhook secrets live in the
   #     orchestrator DB (kici-admin source add ...) — there is no global
   #     webhook-secret env var.
-  # - observed: direct per-source webhook ingestion only, but keeps the Platform
+  # - observed: direct webhook ingestion only, but keeps the Platform
   #     connection for the hosted dashboard. No webhook ever transits KiCI.
-  #     Requires Platform credentials AND KICI_WEBHOOK_PUBLIC_URL. GitHub-App
-  #     sources are refused (they are relay-only) — use generic/local sources.
-  # - independent: standalone, direct per-source webhook ingestion only.
+  #     Requires Platform credentials AND KICI_WEBHOOK_PUBLIC_URL.
+  # - independent: standalone, direct webhook ingestion only.
   #     Different entry point (`standalone.js`). Per-source secrets in DB.
   # Mode is optional — defaults to "platform" — but the credentials the mode
   # requires must be present at startup or the orchestrator refuses to boot.
@@ -183,6 +182,7 @@ variables, with type/default/required metadata generated from the config schema:
 | `KICI_CLUSTER_INSTANCE_ID`                             | no       | "<computed>"              | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_JOIN_TOKEN`                              | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_NAME`                                    | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_CLUSTER_PEER_DISCOVERY`                          | no       | "platform"                | enum:platform\|static                        |         |                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_PEER_HEARTBEAT_INTERVAL_MS`              | no       | 30000                     | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_PEER_MAX_RECONNECT_DELAY_MS`             | no       | 60000                     | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_PEER_STALE_TIMEOUT_MS`                   | no       | 60000                     | number                                       |         |                                                                                                                                                                                                                                             |
@@ -408,6 +408,7 @@ The `KICI_STORAGE_*`, `KICI_ROSTER_*` and `KICI_CLUSTER_COORDINATOR_URLS` rows a
 | `KICI_CLUSTER_COORDINATOR_URL`                         | `cluster.coordinatorUrl`                    | Workers require this or `KICI_CLUSTER_COORDINATOR_URLS`                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_COORDINATOR_URLS`                        | `cluster.coordinatorUrls`                   | Comma-separated. Multi-coordinator worker: connects to every listed coordinator; takes precedence over `KICI_CLUSTER_COORDINATOR_URL` when both are set                                                                                                                                                                                                                                                                                                                                             |
 | `KICI_CLUSTER_PEER_STALE_TIMEOUT_MS`                   | `cluster.peerStaleTimeoutMs`                | Default: `60000` (1m). Coerced to number                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `KICI_CLUSTER_PEER_DISCOVERY`                          | `cluster.peerDiscovery`                     | Default: `platform`. `platform` or `static`                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `KICI_EVENT_ROUTER_MAX_CHAIN_DEPTH`                    | `eventRouter.maxChainDepth`                 | Default: `10`. Coerced to number. Maximum depth for chained event routing                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `KICI_EVENT_ROUTER_RATE_LIMIT_PER_WORKFLOW_PER_MINUTE` | `eventRouter.rateLimitPerWorkflowPerMinute` | Default: `100`. Coerced to number. Rate limit per workflow per minute for event routing                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `KICI_EVENT_ROUTER_EVENT_TTL_SECONDS`                  | `eventRouter.eventTtlSeconds`               | Default: `604800` (7d). Coerced to number. Time-to-live for routed events                                                                                                                                                                                                                                                                                                                                                                                                                           |
@@ -560,6 +561,7 @@ Each app registers its own routing key (e.g., `github:12345`, `github:67890`) wi
 
 Every webhook source — GitHub Apps, generic webhooks, internal sources — is served from the **single HTTP listener** the orchestrator binds at startup. The listener address is controlled by `KICI_PORT` (one numeric value, no list, no per-source override) and the orchestrator routes inbound deliveries by **path**, not by port:
 
+- `POST /webhook/:orgId/github` — one path per org for an App-level webhook; the App's installation-target headers name the source. Served in the own-ingress modes.
 - `POST /webhook/:orgId/github/:sourceId` — one path per GitHub App source, distinguished by the `sourceId` segment. Served only in the own-ingress modes (`hybrid`, `independent`, `observed`); in `platform` mode GitHub deliveries arrive through the relay.
 - `POST /webhook/:orgId/generic/:sourceId` — one path per generic source, distinguished by the `sourceId` segment
 
@@ -725,10 +727,10 @@ KICI_WEBHOOK_PUBLIC_URL=https://kici.example.com
 ```
 
 `KICI_WEBHOOK_PUBLIC_URL` is mandatory in this mode — the orchestrator serves its
-own ingress, so it must advertise the base URL providers post to. GitHub-App
-sources are refused (both at startup and by `kici-admin source add`) because they
-are ingested through the Platform relay; use a generic or local source, or switch
-to `hybrid` if you want the relay.
+own ingress, so it must advertise the base URL providers post to. GitHub-App and
+generic sources both deliver to that URL: point a GitHub App's webhook at
+`<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`. See
+[Direct GitHub ingress](github-ingress.md).
 
 ### Multi-app hybrid mode
 

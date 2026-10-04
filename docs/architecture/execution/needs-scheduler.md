@@ -62,11 +62,14 @@ onJobStatus(runId, jobName, terminal_state)
      else:
        check ALL upstreams of this downstream (not just the one that triggered)
        if all terminal and every status is in its edge's run_on:
-         SET needs_satisfied = true, ready_at = NOW()
+         SET needs_satisfied = true, ready_at = NOW() WHERE needs_satisfied = false
+         if the UPDATE changed no row: skip (another evaluation claimed it)
          return { action: 'dispatch' }
        else:
          skip (not all upstreams ready yet)
 ```
+
+The `needs_satisfied = false` predicate on the update is a claim. When several upstreams of one fan-in job reach a terminal state at almost the same time, each runs its own `evaluateDownstreams`, and each sees every upstream satisfied. Only one update changes the row, so only that evaluation dispatches the job, and the job runs once.
 
 When a downstream is skipped due to failure propagation, the skip itself triggers `onJobStatus` recursively, cascading through the DAG. The DAG is acyclic (validated at compile time and eval time), so recursion terminates naturally.
 
@@ -146,11 +149,12 @@ In the cluster coordinator path, the coordinator subscribes to peer `onJobStatus
 
 ## Source
 
-| Component                | Source                                                                     |
-| ------------------------ | -------------------------------------------------------------------------- |
-| Scheduler module         | `packages/orchestrator/src/pipeline/needs-scheduler.ts`                    |
-| Execution tracker hook   | `packages/orchestrator/src/reporting/execution-tracker.ts`                 |
-| Migration                | Squashed into `packages/orchestrator/src/db/migrations/001_initial.ts`     |
-| Edge insertion (static)  | `packages/orchestrator/src/pipeline/processor.ts` (insertEdgesForRun call) |
-| Edge insertion (dynamic) | `packages/orchestrator/src/pipeline/processor.ts` (resolveGroupEdges call) |
-| Dispatch callback        | `packages/orchestrator/src/pipeline/processor.ts` (dispatchReadyJob)       |
+| Component                | Source                                                                                                            |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| Scheduler module         | `packages/orchestrator/src/pipeline/needs-scheduler.ts`                                                           |
+| Execution tracker hook   | `packages/orchestrator/src/reporting/execution-tracker.ts`                                                        |
+| Restart recovery         | `packages/orchestrator/src/orchestrator-core.ts` (recomputeNeedsSatisfied over pending jobs of non-terminal runs) |
+| Migration                | Squashed into `packages/orchestrator/src/db/migrations/001_initial.ts`                                            |
+| Edge insertion (static)  | `packages/orchestrator/src/pipeline/dispatch-matched-workflow.ts` (insertEdgesForRun call)                        |
+| Edge insertion (dynamic) | `packages/orchestrator/src/pipeline/dispatch-matched-workflow.ts` (resolveGroupEdges call)                        |
+| Dispatch callback        | `packages/orchestrator/src/pipeline/processor.ts` (dispatchReadyJob)                                              |

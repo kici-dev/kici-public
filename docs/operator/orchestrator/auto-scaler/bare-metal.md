@@ -35,7 +35,9 @@ build, so the label set's `image` is where it comes from:
   the same Node build mounted in. There is no host process. Use this for a pool
   that only ever runs container jobs. The agent runs inside the job's image here,
   so that image must also ship `git` and `bash`; the agent refuses to start
-  without them.
+  without them. The agent runs under the tini that the agent image ships with
+  the Node build, so tini is PID 1 of the container and reaps the processes a
+  step leaves behind.
 - **`binaryPath` only** — No Node build is available to inject, so a
   `container` job runs on the image's own `node`. That works for an image
   that ships one, such as `node:24-slim`.
@@ -43,9 +45,11 @@ build, so the label set's `image` is where it comes from:
 The host needs docker or podman for any of this. See
 [Container jobs](../../../user/container-jobs.md) for the job-side contract.
 
-**Scaler-level field:**
+**Scaler-level fields:**
 
 - `enforceCgroups` — When `true`, wrap each agent in a transient `systemd-run --user --scope --slice=kici-scaler` with `CPUQuota=` / `MemoryMax=` derived from the resolved resource limits. Default: `false` (advisory limits only). Linux-only; on macOS / Windows the flag silently no-ops with a startup warning. See [cgroup enforcement](#cgroup-enforcement).
+- `requireSudo` — Run the `nft` commands of `image`-only label sets through `sudo -n`. Set it `true` when the orchestrator runs as a non-root user, for example a user-mode systemd unit. Default: `false`. Only `image`-only label sets need `nft`. The load check below runs for every bare-metal scaler, but it refuses a scaler only when the scaler has an `image`-only label set. See [Job images on a non-root orchestrator](#job-images-on-a-non-root-orchestrator).
+- `extraHosts` — Extra `host:address` mappings for the agent containers of `image`-only label sets, for example `registry.local:host-gateway`. The scaler adds no host alias of its own. Process mode ignores this field.
 
 ## Process management
 
@@ -104,6 +108,40 @@ What isolates an agent depends on how its label set launches it.
 - **Container mode** (`image` only — see [Container jobs](#container-jobs)) joins the agent container to the isolated `kici-agent-net` network and applies the same per-address nftables rules as the [container backend](./container.md): the RFC1918 and cloud-metadata drops, plus the label set's `networkPolicy`.
 
 See [Agent execution security](../../security/agent-security.md) for the isolation trade-offs across backends.
+
+### Job images on a non-root orchestrator
+
+Container mode always applies its nftables rules. There is no `networkIsolation` switch for it. The orchestrator must be able to run `nft`:
+
+- **As root, or with the `CAP_NET_ADMIN` capability.** Leave `requireSudo` unset.
+- **As a non-root user**, such as an orchestrator installed as a user service. Set `requireSudo: true` on the scaler, and give the orchestrator's user a NOPASSWD sudoers rule for `nft`:
+
+  ```
+  kici ALL=(root) NOPASSWD: /usr/sbin/nft
+  ```
+
+  Replace `kici` with the user the orchestrator runs as. Use the path that `sudo sh -c 'command -v nft'` prints if `nft` is not in `/usr/sbin`. `sudo -n` fails at once instead of asking for a password, so set `requireSudo` only where `sudo` is installed and the rule exists. An orchestrator that holds `CAP_NET_ADMIN` needs neither.
+
+  A user service often has no `/usr/sbin` on its `PATH`, so a plain `nft` is not found. Through `sudo`, the command is found on the sudo `secure_path`.
+
+The orchestrator checks this when it loads the scaler. It runs `nft list tables` the way the scaler asks, and creates the `kici` nftables table. If that fails, a scaler with an `image`-only label set stops the orchestrator from starting, and a reload that adds such a label set fails. The message names the label sets and both fixes. A scaler with no `image`-only label set is never refused. `requireSudo` cannot change on a reload while a label set runs job images: restart the orchestrator to apply it.
+
+The container runtime must be rootful. A rootless Docker or Podman keeps its networks in a network namespace of its own, so the nftables rules on the host never see an agent container's traffic. A job-image agent on a rootless runtime is refused at load when the runtime is already reachable, and at every spawn. An agent container that gets no address on `kici-agent-net` is removed instead of started without rules.
+
+The agent runs inside its container, so `ws://127.0.0.1:<port>/ws` reaches the container itself, not the orchestrator. Set the scaler's `orchestratorUrl` to an address the container reaches. The `kici-agent-net` gateway, `172.30.0.1`, is the orchestrator's host. The orchestrator must listen on that address, for example on `0.0.0.0`. By default the agent container reaches only the orchestrator's port, DNS on the gateway, and the object-storage endpoint the orchestrator directed it at. To reach another host service, list it in the label set's [`networkPolicy.hostAccess`](./common-config.md#hostaccess-what-an-agent-reaches-on-the-host). That list replaces the default, so include the orchestrator's port in it too.
+
+```yaml
+version: 1
+scalers:
+  - name: job-images
+    type: bare-metal
+    maxAgents: 4
+    requireSudo: true
+    orchestratorUrl: ws://172.30.0.1:4000/ws
+    labelSets:
+      - labels: ['linux', 'job-image']
+        image: quay.io/kici-dev/kici-agent:<version>
+```
 
 ## Remote orchestrator configuration (macOS / Windows)
 

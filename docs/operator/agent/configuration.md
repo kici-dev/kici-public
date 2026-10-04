@@ -233,15 +233,28 @@ into the checkout, when all of these are true:
   - `.kici`, its `package.json`, its lockfile or its `.npmrc` is a symlink, or
     so is the repository root's `package.json` or `.npmrc`. The manifest or
     the lockfile does not parse.
-- The agent has its own package manager for the project: the npm bundled with
-  the Node that runs the agent, version 11.10.0 or later, or pnpm `11.3.0` in
-  the agent's corepack cache (`COREPACK_HOME`, else `~/.cache/node/corepack`).
-  The agent never runs a corepack shim, and never follows the project's
-  `packageManager` field. The agent image sets `COREPACK_HOME=/opt/corepack`
-  and bakes pnpm `11.3.0` there, owned by root, so the agent user cannot
-  change the pnpm the host install runs.
-- The npm bundled with the Node that runs the agent is present, for a pnpm
-  project too. The agent reads every `.npmrc` with that npm's parser.
+- The agent has its own package manager for the project: the agent's npm
+  (below), version 11.10.0 or later, or pnpm `11.3.0` in the agent's corepack
+  cache (`COREPACK_HOME`, else `~/.cache/node/corepack`). The agent never runs
+  a corepack shim, and never follows the project's `packageManager` field. The
+  agent image sets `COREPACK_HOME=/opt/corepack` and bakes pnpm `11.3.0` there,
+  owned by root, so the agent user cannot change the pnpm the host install runs.
+- The agent's npm is present, for a pnpm project too. The agent reads every
+  `.npmrc` with that npm's parser. The agent's npm is the first of these that
+  applies:
+  - The npm installed with the Node that runs the agent, as the Node.js
+    archives and installers ship it.
+  - When that Node has no npm of its own, as on a Debian or Ubuntu system
+    whose `nodejs` and `npm` packages are separate: the npm at
+    `/usr/share/nodejs/npm`, then an `npm` on the agent's `PATH` whose real
+    path is an npm package's `bin/npm-cli.js`. The agent skips a relative
+    `PATH` entry and a version manager's launcher script. It uses such an npm
+    only at version 11.10.0 or later, and only when npm's own modules load
+    from the directory that holds that npm.
+
+  When the agent has no npm, the job container installs instead. The setup log
+  names each npm the agent refused and why.
+
 - With an npm older than 11.15.0, `.kici/` has a `package-lock.json` or
   `npm-shrinkwrap.json` of lockfile version 2 or 3 that pins every package.
   That npm has no `--allow-remote`, `--allow-file` or `--allow-directory`, so
@@ -261,11 +274,11 @@ into the checkout, when all of these are true:
 
 The host install never runs in the checkout. The agent copies
 `.kici/package.json` and its lockfile into a fresh staging directory and writes
-the only `.npmrc` the install reads. The agent parses `.kici/.npmrc` and the
-agent user's `~/.npmrc` with the `ini` parser of the npm it runs. npm and pnpm
-read `.npmrc` files with the same parser. The agent then writes a new file from
-the kept key-value pairs, and copies no line of either file. The file holds only
-these keys:
+the `.npmrc` the install reads as its user config. The agent parses
+`.kici/.npmrc` and the agent user's `~/.npmrc` with the `ini` parser of the npm
+it runs. npm and pnpm read `.npmrc` files with the same parser. The agent then
+writes a new file from the kept key-value pairs, and copies no line of either
+file. The file holds only these keys:
 
 - From `.kici/.npmrc` and from the agent user's `~/.npmrc`: `registry`,
   `@scope:registry`, `always-auth`, and the per-registry `_authToken`, `_auth`,
@@ -284,6 +297,14 @@ install environment, not the job's `env`, `contextVars` or `jobEnv`. It keeps on
 temp variables from the agent, and points `HOME` into the staging directory.
 `NODE_OPTIONS`, `npm_config_*` and `pnpm_config_*` never pass.
 
+npm also reads the global npmrc of the npm the agent runs. With Debian's or
+Ubuntu's npm, that file is `/etc/npmrc`. With the npm installed with Node.js, it
+is `$PREFIX/etc/npmrc`, where `$PREFIX` is the Node.js installation directory.
+The agent does not filter the global npmrc: every key in it reaches the install,
+including `registry`, `node-options` and the proxy settings. A repository cannot
+write this file, because it belongs to the operator of the agent host. Put
+host-wide CA and proxy settings there, or in the agent user's `~/.npmrc`.
+
 npm 11.15.0 and later runs `npm install` with `--ignore-scripts
 --allow-git=none --allow-remote=none --allow-file=none --allow-directory=none`.
 An older npm runs `npm ci --ignore-scripts --allow-git=none`, which installs
@@ -295,7 +316,9 @@ install, and the agent then creates no job container.
 
 In every other case the runner installs inside the job container, and the
 registry must be reachable from the job network. A failed host install fails the
-job with the installer's error, with registry tokens and install secrets masked.
+job with the installer's error: its exit code, the end of its stderr and stdout,
+and for npm the end of npm's debug log, with registry tokens and install secrets
+masked.
 The agent never retries the install inside the container.
 
 All of this applies to a container job's own `.kici/` install. Other jobs
@@ -319,6 +342,8 @@ the operator chose:
 
 - the public npm registry, `https://registry.npmjs.org/`;
 - a `registry` or `@scope:registry` in the agent user's `~/.npmrc`;
+- a `registry` or `@scope:registry` in the global npmrc, which npm reads
+  directly (see above);
 - the origins listed in `KICI_HOST_INSTALL_REGISTRIES`.
 
 `KICI_HOST_INSTALL_REGISTRIES` takes comma-separated origins, for example

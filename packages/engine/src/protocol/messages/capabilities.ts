@@ -71,6 +71,12 @@ export const orchCapabilitiesSchema = z
      * tier is not offered and the Convenient tier applies.
      */
     dashboardVerifiedIssuer: z.string().nullable().optional(),
+    /**
+     * The orchestrator answers join protocol v2 `join.request` frames. The Platform
+     * relays a join only to an orchestrator that advertises this, because an older
+     * build drops a v2 frame without a reply.
+     */
+    clusterJoinV2: z.boolean().optional(),
   })
   .passthrough();
 
@@ -96,6 +102,10 @@ export function hasOrchCapability(
 ): boolean {
   return (capabilities as Record<string, unknown> | undefined)?.[flag] === true;
 }
+
+/** Flag names of {@link orchCapabilitiesSchema}, for {@link hasOrchCapability} lookups. */
+export const OrchCapabilityFlag = z.enum(['clusterJoinV2']);
+export type OrchCapabilityFlag = z.infer<typeof OrchCapabilityFlag>;
 
 /**
  * Platform-advertised capabilities sent to the orchestrator after auth.

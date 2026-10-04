@@ -74,7 +74,7 @@ import { flattenLockSteps } from './flatten-lock-steps.js';
 import { storeWebhookPayload } from './webhook-payload-store.js';
 import type { Database, HeldRun } from '../db/types.js';
 import type { RerunLineage } from '../reporting/execution-tracker.js';
-import { JobKind } from '../db/types.js';
+import { HostIdentitySource, JobKind } from '../db/types.js';
 import { NEEDS_PENDING_JOB_ID_PREFIX } from '../db/synthetic-job-ids.js';
 import { resolveRunEventContext, type RunEventContext } from './run-event-context.js';
 import { isInvokeGate, invokeParamsFromLockJob, type InvokeGateParams } from './invoke-gate.js';
@@ -1931,7 +1931,9 @@ export async function resolveRosterAgentPin(args: {
   if (runsOnExact.length !== 1 || runsOnPatterns.length > 0) return null;
   const candidate = runsOnExact[0];
   const row = await hostRosterStore.get(candidate);
-  if (!row) return null;
+  // An unconfirmed row a dashboard declare created is not an inventory host, so
+  // it never turns a label into a pin.
+  if (!row || row.identity_source === HostIdentitySource.platform) return null;
   return { pinnedAgentId: candidate, connectedInstanceId: row.connected_instance_id ?? null };
 }
 

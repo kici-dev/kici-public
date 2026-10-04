@@ -22,6 +22,18 @@ export enum JobKind {
 }
 
 /**
+ * Who last set a roster host's identity (labels, hostname, properties).
+ * `platform` marks an unconfirmed placeholder created from the dashboard: it
+ * is never a fan-out, inventory, agent-pin or unreachable-alarm target until
+ * its agent registers (`agent`) or an operator declares it (`operator`).
+ */
+export enum HostIdentitySource {
+  agent = 'agent',
+  operator = 'operator',
+  platform = 'platform',
+}
+
+/**
  * PostgreSQL-only database types.
  * Column names use snake_case matching the actual database column names.
  */
@@ -211,8 +223,9 @@ export type NewClusterMeta = Insertable<ClusterMetaTable>;
 
 /**
  * Join tokens table
- * Stores hashed join tokens for zero-knowledge cluster bootstrap.
- * Tokens are one-time use (consumed_at set after validation).
+ * Stores hashed join tokens. `kici-admin join` and peer token mode find a row by
+ * its hash; a token is consumed on first use and re-usable by the instance that
+ * consumed it until it expires.
  */
 export interface JoinTokenTable {
   /** UUID primary key */
@@ -3105,6 +3118,12 @@ export interface HostRosterTable {
    * presigned URL). NULL / false ⇒ the conservative `ssh-push` fallback.
    */
   s3_reachable: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
+  /** Who last set the host's identity. See {@link HostIdentitySource}. */
+  identity_source: ColumnType<
+    HostIdentitySource,
+    HostIdentitySource | undefined,
+    HostIdentitySource
+  >;
   created_at: Generated<Date>;
   updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
 }

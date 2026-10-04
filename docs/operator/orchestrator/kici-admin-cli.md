@@ -8,7 +8,8 @@ The `kici-admin` CLI manages the KiCI orchestrator: configuration, secrets, toke
 Some command groups deliberately bypass that API, because they must work while the orchestrator is down (or before it exists):
 
 - **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `check-run`, `cluster`, `signing-key`, `dashboard-encryption-key`, `remote-source`, and `peer prune-credentials` / `reset-raft-state`. `host` and the other `peer` verbs (`create-token`, `list`, `revoke`, `revoke-all`) also go straight to the database, but they read `KICI_DATABASE_URL` only. They carry no `--database-url` flag. Several API-backed commands offer a direct-DB mode through the same flag — each one says so in its guide entry.
-- **Local host only** (no orchestrator, no database): `firecracker`, `scaler`, `inspect-bundle`, and the `agent` / `orchestrator` service-lifecycle verbs (`install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs`, `upgrade`, plus `agent package`; `orchestrator drain` / `resume` are API-backed).
+- **Direct object storage** (the orchestrator's `KICI_STORAGE_*` configuration; no database, no admin token): `cache`.
+- **Local host only** (no orchestrator, no database): `firecracker`, `scaler reap-orphans`, `inspect-bundle`, and the `agent` / `orchestrator` service-lifecycle verbs (`install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs`, `upgrade`, plus `agent package`; `orchestrator drain` / `resume` are API-backed).
 - **Own transport**: `join` connects straight to the Platform relay or a peer orchestrator.
 
 ## Installation
@@ -61,13 +62,17 @@ kici-admin token create compliance-bot --role auditor
 
 These options apply to every command:
 
-| Option                  | Environment variable | Default                 | Description            |
-| ----------------------- | -------------------- | ----------------------- | ---------------------- |
-| `--url <url>`, `-u`     | `KICI_ADMIN_URL`     | `http://localhost:8080` | Orchestrator HTTP URL  |
-| `--token <token>`, `-t` | `KICI_ADMIN_TOKEN`   | (required)              | Admin API Bearer token |
-| `-V`, `--cli-version`   |                      |                         | Show CLI version       |
+| Option                             | Environment variable | Default                 | Description            |
+| ---------------------------------- | -------------------- | ----------------------- | ---------------------- |
+| `--url <url>`, `-u`                | `KICI_ADMIN_URL`     | `http://localhost:8080` | Orchestrator HTTP URL  |
+| `--token <token>`, `-t`            | `KICI_ADMIN_TOKEN`   | (required)              | Admin API Bearer token |
+| `--version`, `-V`, `--cli-version` |                      |                         | Show CLI version       |
 
 Running `--help` on any command works without a token.
+
+`kici-admin --version` prints the CLI version only when `--version` comes before the command name. After a command name, `--version` belongs to that command: `kici-admin orchestrator upgrade --version 0.3.0` sets the target version of the upgrade. `-V` and `--cli-version` print the CLI version in any position.
+
+Some commands declare their own option under a global flag: `--url` on `orchestrator upgrade` and `agent upgrade`, and `--token` on `join`, `agent install`, `backend add` and `backend test`. After the name of such a command, the flag sets the option of that command. For example, `kici-admin orchestrator upgrade --url <archive-url>` downloads the archive from that URL. To also give the global option to such a command, put `--url` or `--token` before the command name, use `-u` or `-t`, or set `KICI_ADMIN_URL` or `KICI_ADMIN_TOKEN`. After any other command, `--url` and `--token` set the global options.
 
 ## Output streams
 

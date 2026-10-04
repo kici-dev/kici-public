@@ -544,7 +544,7 @@ interface HostInventoryEntry {
 }
 ```
 
-Two dimensions describe a host. **Labels** are flat strings used for grouping and targeting (the same labels `runsOn` / `runsOnAll` match). **Properties** are typed host-vars (`string | number | boolean`) — the place for facts like `region`, `cores`, or `gpu`. A host reports its own properties via the agent's `KICI_PROPERTIES` config, and an operator can pre-declare them with `kici-admin host declare --prop key=value`; the two are shallow-merged (agent-reported keys win).
+Two dimensions describe a host. **Labels** are flat strings used for grouping and targeting (the same labels `runsOn` / `runsOnAll` match). **Properties** are typed host-vars (`string | number | boolean`) — the place for facts like `region`, `cores`, or `gpu`. A host reports its own properties via the agent's `KICI_PROPERTIES` config, and an operator can pre-declare them with `kici-admin host declare --prop key=value`; the two are shallow-merged (agent-reported keys win). Inventory queries return only confirmed hosts: a host declared from the dashboard appears once its agent registers or an operator confirms it.
 
 `labels` and `hostname` come back lowercase — KiCI folds both, so a pool declaring `Docker` reports `docker`. Compare against a lowercase value: `h.labels.includes('gpu')`, not `h.labels.includes('GPU')`. A label selector passed to `query()` folds too, so `{ include: [['GPU']] }` matches. `agentId` and `properties` keep their case.
 

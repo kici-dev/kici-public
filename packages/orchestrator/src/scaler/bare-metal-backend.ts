@@ -27,6 +27,8 @@ import {
   ensureRuntimeVolume,
   runtimeInjectBind,
   injectedAgentCommand,
+  agentImageLabels,
+  runtimeInitCommand,
 } from '@kici-dev/shared/container-runtime';
 import { KICI_RUNTIME_DOCKER_LABEL } from './container-routing.js';
 import { spawnsInJobImage } from './agent-fit.js';
@@ -40,9 +42,11 @@ import { resolveAgentHostAccess } from './host-access.js';
 import {
   addIsolationRules,
   addHostIsolationRules,
+  ensureKiciTable,
+  probeNftables,
   removeIsolationRules,
 } from '@kici-dev/shared/net';
-import type { NetworkPolicy } from '@kici-dev/shared/net';
+import type { NetworkPolicy, NftOptions } from '@kici-dev/shared/net';
 import type { ResolvedContainerSpawn } from './types.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import type {
@@ -80,6 +84,86 @@ function exitedBeforeRegisteringDetail(
   const detail = `agent process exited with ${how} before it registered`;
   const tail = stderrTail(output);
   return tail ? `${detail}\n--- captured output ---\n${tail}` : detail;
+}
+
+/**
+ * Indexes of the label sets that run the job's own image as the agent: an
+ * `image` and no `binaryPath`. Only these spawn agent containers, so only these
+ * need nftables.
+ */
+function jobImageLabelSetIndexes(labelSets: LabelSetConfig[]): number[] {
+  return labelSets.flatMap((ls, i) =>
+    spawnsInJobImage(ScalerBackendType.enum['bare-metal'], ls) ? [i] : [],
+  );
+}
+
+/** The sudoers line the refusal and the docs suggest. */
+const NFT_SUDOERS_EXAMPLE = 'kici ALL=(root) NOPASSWD: /usr/sbin/nft';
+
+/**
+ * Why a bare-metal scaler with job-image label sets cannot run here, and the
+ * two ways to fix it.
+ */
+function nftUnusableMessage(
+  name: string,
+  indexes: number[],
+  requireSudo: boolean,
+  failure: string,
+): string {
+  const sets = indexes.map((i) => `labelSets[${i}]`).join(', ');
+  // A non-root service often has no /usr/sbin on its PATH, which reads as a
+  // missing binary rather than a missing privilege. Through sudo, the binary
+  // that could not start may be sudo itself.
+  const notFound = !/ENOENT/.test(failure)
+    ? ''
+    : requireSudo
+      ? `sudo or nft is not installed, or sudo is not on the orchestrator's PATH. `
+      : `nft is not installed, or not on the orchestrator's PATH. `;
+  const head =
+    `Bare-metal scaler "${name}" runs agents in job images (${sets}: an image and no ` +
+    `binaryPath). Each such agent container is isolated with nftables rules, and this ` +
+    `orchestrator cannot run nft${requireSudo ? ' through "sudo -n"' : ''}: ${failure.trim()}. ` +
+    notFound;
+  return requireSudo
+    ? head +
+        `requireSudo is set, so give the orchestrator's user a NOPASSWD sudoers rule for nft, ` +
+        `for example "${NFT_SUDOERS_EXAMPLE}".`
+    : head +
+        `Run the orchestrator as root or with the CAP_NET_ADMIN capability, or set ` +
+        `"requireSudo: true" on the scaler and give the orchestrator's user a NOPASSWD sudoers ` +
+        `rule for nft, for example "${NFT_SUDOERS_EXAMPLE}".`;
+}
+
+/**
+ * Whether the runtime behind `docker` runs rootless. A rootless runtime keeps its
+ * networks in a network namespace of its own, so the per-address rules this
+ * backend writes into the host's nftables never see an agent container's
+ * traffic. Docker and Podman both list `name=rootless` in `SecurityOptions`.
+ */
+async function runtimeIsRootless(docker: Docker): Promise<boolean> {
+  const info = (await docker.info()) as { SecurityOptions?: string[] };
+  return (info.SecurityOptions ?? []).some((option) => option.split(',').includes('name=rootless'));
+}
+
+/** Why a job-image agent cannot run on a rootless runtime. */
+function rootlessRefusal(name: string, socketPath: string): string {
+  return (
+    `Bare-metal scaler "${name}" cannot run a job image as the agent through ${socketPath}: ` +
+    `the container runtime is rootless, so its networks live in a network namespace of their ` +
+    `own and the host's nftables isolation rules would never apply to the agent container. ` +
+    `Point the orchestrator at a rootful Docker or Podman socket.`
+  );
+}
+
+/**
+ * Whether this host can run nft the way the scaler will: `null` when it can,
+ * or why it cannot. nftables exists on Linux only, so elsewhere nothing is run.
+ */
+async function probeNftForScaler(requireSudo: boolean): Promise<string | null> {
+  if (process.platform !== 'linux') {
+    return `nftables is available on Linux only, and this host is ${process.platform}`;
+  }
+  return probeNftables({ requireSudo });
 }
 
 /**
@@ -142,6 +226,18 @@ export interface BareMetalScalerBackendOptions {
    * (`systemd-run` does not exist), with a one-time startup warning.
    */
   enforceCgroups?: boolean;
+  /**
+   * Run the `nft` calls of job-image mode (the scaler-level `requireSudo`)
+   * through `sudo -n`, for an orchestrator that runs as a non-root user with a
+   * NOPASSWD sudoers rule for nft. Process mode runs no nft. Default false.
+   */
+  requireSudo?: boolean;
+  /**
+   * Extra `host:address` mappings (the scaler-level `extraHosts`) for the agent
+   * containers of job-image mode, passed to the runtime as `ExtraHosts`.
+   * Process mode ignores them.
+   */
+  extraHosts?: string[];
 }
 
 export class BareMetalScalerBackend implements ScalerBackend {
@@ -167,9 +263,63 @@ export class BareMetalScalerBackend implements ScalerBackend {
   private readonly logCaptures = new Map<string, LogCapture>();
   /** Container-mode agents' IPs on the isolated network, for nftables cleanup. */
   private readonly containerIps = new Map<string, string>();
+  /** Whether job-image mode's nft calls run through `sudo -n`. */
+  private readonly requireSudo: boolean;
+  private readonly extraHosts?: string[];
+  /**
+   * Why this host cannot run nft the way {@link requireSudo} asks, as `create`
+   * probed it; `null` when it can. `reload` is synchronous and reads it to
+   * refuse job-image label sets a reload adds.
+   */
+  private readonly nftFailure: string | null;
 
-  constructor(options: BareMetalScalerBackendOptions) {
+  /**
+   * Build a backend and check, once, that this host can run nft the way the
+   * scaler asks. A scaler with a job-image label set is refused here when it
+   * cannot, so the orchestrator stops at startup (and a reload that adds the
+   * scaler fails) instead of failing every spawn. A process-only scaler is
+   * never refused: process mode runs no nft.
+   */
+  static async create(options: BareMetalScalerBackendOptions): Promise<BareMetalScalerBackend> {
+    const requireSudo = options.requireSudo ?? false;
+    const nftFailure = await probeNftForScaler(requireSudo);
+    const imageSets = jobImageLabelSetIndexes(options.labelSets);
+    if (imageSets.length > 0) {
+      if (nftFailure !== null) {
+        throw new Error(nftUnusableMessage(options.name, imageSets, requireSudo, nftFailure));
+      }
+      // The first write, at load rather than on the first job, and what every
+      // per-container rule needs to exist.
+      try {
+        await ensureKiciTable({ requireSudo });
+      } catch (err) {
+        throw new Error(
+          nftUnusableMessage(options.name, imageSets, requireSudo, toErrorMessage(err)),
+          { cause: err },
+        );
+      }
+      // A rootless runtime is refused here too when it is already reachable;
+      // every spawn checks again, since the runtime may come up later.
+      const runtime = await detectRuntime();
+      if (runtime) {
+        const rootless = await runtimeIsRootless(
+          new Docker({ socketPath: runtime.socketPath }),
+        ).catch(() => false);
+        if (rootless) throw new Error(rootlessRefusal(options.name, runtime.socketPath));
+      }
+    }
+    return new BareMetalScalerBackend(options, nftFailure);
+  }
+
+  /**
+   * @param nftFailure - The `create` probe's answer. A backend built directly
+   * was not probed, and is treated as able to run nft.
+   */
+  constructor(options: BareMetalScalerBackendOptions, nftFailure: string | null = null) {
     this.name = options.name;
+    this.requireSudo = options.requireSudo ?? false;
+    this.extraHosts = options.extraHosts;
+    this.nftFailure = nftFailure;
     this._labelSets = options.labelSets;
     this.maxAgents = options.maxAgents;
     this.defaultResources = options.defaultResources;
@@ -203,6 +353,31 @@ export class BareMetalScalerBackend implements ScalerBackend {
     }
 
     this.warnNetworkPolicy(options.labelSets);
+  }
+
+  /**
+   * Why a reload's job-image label sets cannot run here. `reload` is
+   * synchronous and cannot probe nft, so it reads what `create` probed — which
+   * holds only for the `requireSudo` the backend was built with.
+   */
+  private jobImageReloadErrors(labelSets: LabelSetConfig[], entry?: ScalerEntry): string[] {
+    const imageSets = jobImageLabelSetIndexes(labelSets);
+    if (imageSets.length === 0) return [];
+    if (entry && (entry.requireSudo ?? false) !== this.requireSudo) {
+      return [
+        `Bare-metal scaler "${this.name}": requireSudo cannot change on reload while a label ` +
+          `set runs job images; restart the orchestrator to apply`,
+      ];
+    }
+    if (this.nftFailure !== null) {
+      return [nftUnusableMessage(this.name, imageSets, this.requireSudo, this.nftFailure)];
+    }
+    return [];
+  }
+
+  /** How every nft call of job-image mode runs: through `sudo -n` or not. */
+  private nftOpts(): NftOptions {
+    return { requireSudo: this.requireSudo };
   }
 
   /**
@@ -635,6 +810,11 @@ export class BareMetalScalerBackend implements ScalerBackend {
     env.KICI_JOB_IMAGE_AGENT = '1';
 
     const docker = new Docker({ socketPath: runtime.socketPath });
+    // Fail closed before anything starts: on a rootless runtime the isolation
+    // rules below would be written and match nothing.
+    if (await runtimeIsRootless(docker)) {
+      throw new Error(rootlessRefusal(this.name, runtime.socketPath));
+    }
 
     await pullImageIfMissing({
       docker,
@@ -650,16 +830,22 @@ export class BareMetalScalerBackend implements ScalerBackend {
       ...(signal ? { signal } : {}),
       onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
     });
+    const agentInit = runtimeInitCommand(await agentImageLabels(docker, agentImage));
 
     await ensureIsolatedNetwork(docker);
+    // The table and its chains must exist before the first per-container rule:
+    // nothing else on a bare-metal host is guaranteed to have created them, and a
+    // reload can add a job-image label set after `create` ran. Idempotent.
+    await ensureKiciTable(this.nftOpts());
 
     emit(ScalerEventType.enum['scaler.provisioning'], 'creating container');
     const created = await docker.createContainer({
       Image: container.image,
       Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
       // The agent runs on the INJECTED node, never the image's own — the image
-      // is not required to ship one.
-      Cmd: injectedAgentCommand(),
+      // is not required to ship one — and under the runtime's tini when the
+      // agent image ships it.
+      Cmd: injectedAgentCommand(agentInit),
       Labels: {
         'kici-managed': 'true',
         'kici-scaler-name': this.name,
@@ -673,6 +859,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
       HostConfig: buildAgentContainerHostConfig({
         ...(effectiveLimits ? { limits: effectiveLimits } : {}),
         binds: [runtimeInjectBind(runtimeVolume)],
+        ...(this.extraHosts ? { extraHosts: this.extraHosts } : {}),
       }),
       // On the isolated network, like every other agent container. Without it
       // the job container sat on the runtime's default bridge with full LAN,
@@ -703,13 +890,24 @@ export class BareMetalScalerBackend implements ScalerBackend {
         this.containerIps.set(managed.id, containerIp);
         // Pre-clean: the network recycles addresses, so without this the new
         // container inherits whatever the previous holder was allowed.
-        await removeIsolationRules(containerIp);
-        await addIsolationRules(containerIp, ISOLATED_NETWORK_GATEWAY, networkPolicy, 'saddr');
+        await removeIsolationRules(containerIp, this.nftOpts());
+        await addIsolationRules(
+          containerIp,
+          ISOLATED_NETWORK_GATEWAY,
+          networkPolicy,
+          'saddr',
+          this.nftOpts(),
+        );
         // Host-destined packets arrive on the input hook, which the forward
         // rules above never see.
-        await addHostIsolationRules(containerIp, args.hostAccess, 'saddr');
+        await addHostIsolationRules(containerIp, args.hostAccess, 'saddr', this.nftOpts());
       } else {
-        logger.warn('Could not determine container IP for nftables rules', { agentId });
+        // Fail closed: without an address there are no rules, and the chains'
+        // policy is accept. The catch below removes the container.
+        throw new Error(
+          `Agent container ${created.id.slice(0, 12)} has no address on ${ISOLATED_NETWORK_NAME}, ` +
+            `so its network isolation rules cannot be applied`,
+        );
       }
     } catch (err) {
       this.agents.delete(managed.id);
@@ -717,7 +915,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
       if (failedIp) {
         this.containerIps.delete(managed.id);
         try {
-          await removeIsolationRules(failedIp);
+          await removeIsolationRules(failedIp, this.nftOpts());
         } catch {
           // Best effort — a stale rule is inert once the container is gone.
         }
@@ -787,7 +985,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
       if (containerIp) {
         this.containerIps.delete(managedId);
         try {
-          await removeIsolationRules(containerIp);
+          await removeIsolationRules(containerIp, this.nftOpts());
         } catch {
           // Best effort — a stale rule is inert once the container is gone,
           // and the orphan sweep reclaims it.
@@ -924,6 +1122,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
         if (refusal) errors.push(`Label set [${i}]: ${refusal}`);
       }
     });
+    errors.push(...this.jobImageReloadErrors(labelSets, opts?.entry));
 
     if (errors.length > 0) {
       return { valid: false, errors };

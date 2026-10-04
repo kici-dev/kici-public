@@ -55,6 +55,46 @@ export enum CredentialIssueReason {
   FileMismatch = 'credential-file-mismatch',
 }
 
+/** What a coordinator's own cluster database says about a credential a peer rejected. */
+export enum RejectionCorroboration {
+  /** An unrevoked, unexpired row holds this credential: the peer's rejection is not this cluster's view. */
+  HeldValid = 'held-valid',
+  /** No live row holds it: the rejection is right, and the file goes. */
+  NotHeld = 'not-held',
+  /** The database could not be read: keep the file and retry on the next attempt. */
+  Unreadable = 'unreadable',
+}
+
+/**
+ * The `corroborateRejection` callback a coordinator's `PeerAuthCoordinator`
+ * runs before it deletes its credential file after a peer rejected it. Any
+ * dialled endpoint can send a rejection, so the coordinator's own database
+ * decides: an expired or revoked row does not hold the credential, and the file
+ * then goes so the self-issue path reconciles.
+ */
+export function coordinatorRejectionCorroborator(opts: {
+  db: Kysely<Database>;
+  instanceId: string;
+  logger?: Logger;
+}): (credential: string) => Promise<RejectionCorroboration> {
+  const store = new PeerCredentialStore(opts.db);
+  const log = opts.logger ?? moduleLogger;
+  return async (credential) => {
+    try {
+      const row = await store.findByInstanceId(opts.instanceId);
+      return row && row.credentialHash === sha256(credential)
+        ? RejectionCorroboration.HeldValid
+        : RejectionCorroboration.NotHeld;
+    } catch (err) {
+      log.warn('Could not read this coordinator peer credential to check a peer rejection', {
+        instanceId: opts.instanceId,
+        error: toErrorMessage(err),
+      });
+      return RejectionCorroboration.Unreadable;
+    }
+  };
+}
+
 export const COORDINATOR_CREDENTIAL_REVOKED_MESSAGE =
   'Peer credential for this coordinator was revoked; not issuing a new one';
 

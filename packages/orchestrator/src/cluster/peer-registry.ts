@@ -6,7 +6,12 @@
  * same label-matching semantics as agent/registry.ts for consistency.
  */
 
-import type { PeerHeartbeat, PeerCapabilities, ScalerCapacitySummary } from '@kici-dev/engine';
+import type {
+  PeerAuthScheme,
+  PeerHeartbeat,
+  PeerCapabilities,
+  ScalerCapacitySummary,
+} from '@kici-dev/engine';
 import { canonicalizeLabels, canonicalizeLabelSet } from '@kici-dev/engine';
 
 /**
@@ -88,6 +93,18 @@ function peerAgentMatchesRequiredLabels(
 
 // --- Types ---
 
+/** Which side of a peer link authenticated: the peer dialled us, or we dialled it. */
+export enum PeerLinkDirection {
+  Inbound = 'inbound',
+  Outbound = 'outbound',
+}
+
+/** The scheme each direction of a peer link authenticated with; null while that direction is down. */
+export interface PeerAuthSchemes {
+  inbound: PeerAuthScheme | null;
+  outbound: PeerAuthScheme | null;
+}
+
 export interface PeerAgentInfo {
   agentId: string;
   labels: string[];
@@ -135,6 +152,8 @@ export interface PeerInfo {
   clusterSettingsVersion: number;
   /** Cluster role of the peer. */
   role: 'coordinator' | 'worker';
+  /** The authentication scheme of each link direction. */
+  authScheme: PeerAuthSchemes;
   // --- OS metadata (from heartbeats) ---
   hostname?: string;
   osRelease?: string;
@@ -256,11 +275,25 @@ export class PeerRegistry {
       registryVersion: 0,
       clusterSettingsVersion: 0,
       role: info.role ?? 'coordinator',
+      // Each direction resets its own value when it closes, so a direction
+      // that is still up survives the other direction re-adding the peer.
+      authScheme: existing?.authScheme ?? { inbound: null, outbound: null },
     });
     // A fresh add (or a disconnected peer reconnecting) changes the connected
     // set, so a coordinator re-reports membership. The metadata-only reconnect
     // branch above returns before this and correctly does not fire.
     this.onMembershipChange?.();
+  }
+
+  /** Record the scheme one direction of the link authenticated with, or null when it closed. */
+  setAuthScheme(
+    instanceId: string,
+    direction: PeerLinkDirection,
+    scheme: PeerAuthScheme | null,
+  ): void {
+    const peer = this.peers.get(instanceId);
+    if (!peer) return;
+    peer.authScheme = { ...peer.authScheme, [direction]: scheme };
   }
 
   /**

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -19,18 +19,18 @@ import {
   resolveHostNpm,
   resolvePinnedPnpm,
   runHostIsolatedInstall,
-  versionAtLeast,
   type HostInstallTool,
 } from './host-isolated-install.js';
+import { versionAtLeast } from './npm-resolver.js';
 import {
   isOperatorNpmrcKey,
   isRepoNpmrcKey,
-  loadNpmIni,
+  loadHostNpmIni,
   pickAllowed,
   type IniCodec,
 } from './npmrc-allowlist.js';
 
-const ini = loadNpmIni();
+const ini = loadHostNpmIni().ini;
 const execFileAsync = promisify(execFile);
 
 /** The `.npmrc` part of a plan, picked from file texts the way the eligibility check picks it. */
@@ -293,6 +293,60 @@ describe('versionAtLeast', () => {
   });
 });
 
+describe('resolveHostNpm — the npm the lookup trusts', () => {
+  let base: string;
+
+  beforeEach(async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), 'kici-host-npm-')));
+  });
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true });
+  });
+
+  /** An npm package at `root` with its own copies of the modules the agent loads. */
+  async function npmAt(root: string, version: string): Promise<string> {
+    await mkdir(join(root, 'bin'), { recursive: true });
+    await writeFile(join(root, 'bin', 'npm-cli.js'), '');
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'npm', version }));
+    for (const id of ['ini', '@npmcli/arborist', 'semver']) {
+      const dir = join(root, 'node_modules', id);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'package.json'), JSON.stringify({ name: id, main: 'index.js' }));
+      await writeFile(join(dir, 'index.js'), 'module.exports = {};\n');
+    }
+    return join(root, 'bin', 'npm-cli.js');
+  }
+
+  it('runs a Debian-style npm at the minimum with the agent Node', async () => {
+    const cli = await npmAt(join(base, 'usr', 'share', 'nodejs', 'npm'), '11.10.0');
+    const execPath = join(base, 'usr', 'bin', 'node');
+    // fails-when: the install tool ignores the lookup and stays on Node's own
+    // npm, so the check passes with a parser the install never gets.
+    expect(await resolveHostNpm({ execPath, pathEnv: '', distributionCliPaths: [cli] })).toEqual({
+      packageManager: PackageManager.Npm,
+      nodeExe: execPath,
+      script: cli,
+      version: '11.10.0',
+    });
+  });
+
+  it("refuses Node's own npm below the minimum, as before, without trying another", async () => {
+    await mkdir(join(base, 'node', 'bin'), { recursive: true });
+    await npmAt(join(base, 'node', 'lib', 'node_modules', 'npm'), '10.9.0');
+    const debian = await npmAt(join(base, 'usr', 'share', 'nodejs', 'npm'), '12.0.2');
+    // breaks-if-wrong: a host whose Node ships an old npm changes behavior: the
+    // install would switch to a different npm than the one that parsed .npmrc.
+    expect(
+      await resolveHostNpm({
+        execPath: join(base, 'node', 'bin', 'node'),
+        pathEnv: '',
+        distributionCliPaths: [debian],
+      }),
+    ).toBeNull();
+  });
+});
+
 describe('resolvePinnedPnpm', () => {
   let dir: string;
   beforeEach(async () => {
@@ -382,32 +436,37 @@ describe('runHostIsolatedInstall — real package managers', () => {
       // the repository's .npmrc is never the config npm reads. The error must
       // name the git refusal: one raised before the fetch (a missing lockfile,
       // say) would leave the flag untested.
-      await expect(
-        runHostIsolatedInstall({
-          kiciDir: kici,
-          plan: {
-            packageManager: PackageManager.Npm,
-            lockfile: 'package-lock.json',
-            registries: [],
-            npmrc: npmrcFrom(ini!, repoNpmrc),
-          },
-          tool: npmTool!,
+      const failure = (await runHostIsolatedInstall({
+        kiciDir: kici,
+        plan: {
+          packageManager: PackageManager.Npm,
+          lockfile: 'package-lock.json',
           registries: [],
-          installEnvSecrets: {},
-          jobIdShort: 'job12345',
-          baseEnv: { PATH: process.env.PATH },
-        }),
-      ).rejects.toThrow(/EALLOWGIT/);
+          npmrc: npmrcFrom(ini!, repoNpmrc),
+        },
+        tool: npmTool!,
+        registries: [],
+        installEnvSecrets: {},
+        jobIdShort: 'job12345',
+        baseEnv: { PATH: process.env.PATH },
+      }).catch((e: unknown) => e)) as Error & { npmDebugLog?: unknown };
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toMatch(/EALLOWGIT/);
+      // fails-when: npm's debug log is read after the staged cache is removed,
+      // or not at all — the install failure then carries no debug log.
+      expect(String(failure.npmDebugLog)).toMatch(/EALLOWGIT/);
       // fails-when: the install runs in the checkout or without --allow-git=none,
       // so npm spawns the repository's git= program to fetch the dependency.
       expect(existsSync(marker)).toBe(false);
 
       // Positive control: npm run in the checkout the ordinary way (scripts
-      // disabled) spawns it.
+      // disabled) spawns it. `--allow-git=all` is npm 11's default; npm 12
+      // defaults to none, so the control states it to stay live on every npm
+      // the host install runs (11.10.0 and later all know the flag).
       try {
         execFileSync(
           npmTool!.nodeExe,
-          [npmTool!.script, 'install', '--ignore-scripts', '--no-audit'],
+          [npmTool!.script, 'install', '--ignore-scripts', '--no-audit', '--allow-git=all'],
           {
             cwd: kici,
             stdio: 'pipe',

@@ -165,4 +165,18 @@ describe('runOrchestratorWizard — mode prompt', () => {
     expect(promptOptionalUrl).not.toHaveBeenCalled();
     expect(cfg.webhookPublicUrl).toBeUndefined();
   });
+
+  // fails-when: observed mode still skips the GitHub App source prompt.
+  // breaks-if-wrong: hybrid and platform still ask it.
+  it('offers the GitHub App source prompt in every Platform-connected mode', async () => {
+    for (const mode of ['observed', 'hybrid', 'platform'] as const) {
+      vi.mocked(promptConfirm).mockClear();
+      vi.mocked(promptSelect).mockResolvedValue(mode);
+      await runOrchestratorWizard();
+      expect(
+        vi.mocked(promptConfirm).mock.calls.map((c) => c[0]),
+        mode,
+      ).toContain('Add a GitHub App source?');
+    }
+  });
 });

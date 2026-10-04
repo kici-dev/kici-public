@@ -21,14 +21,14 @@ A host's recent runs link back to the run detail page so you can trace what each
 
 ## Managing hosts
 
-Members who hold the `fleet:write` permission can change the host inventory from the dashboard: declare a static host into the roster, and remove a host. Both actions are also available from the command line via `kici-admin host declare` and `kici-admin host remove`.
+Members who hold the `fleet:write` permission can change the host inventory from the dashboard: declare a new static host into the roster, and remove a host that nobody confirmed. The command-line equivalents, `kici-admin host declare` and `kici-admin host remove`, can change and remove any host.
 
 ### Declare a host
 
 
-Declaring a host names an expected member of the fleet ahead of time, so a `runsOnAll` fan-out can target it (and report it as unreachable) instead of silently skipping a host that has not connected yet. The command-line equivalent is `kici-admin host declare --agent-id <id> --labels <a,b>`.
+A host declared with `kici-admin host declare --agent-id <id> --labels <a,b>` is confirmed at once. It names an expected member of the fleet ahead of time, so a `runsOnAll` fan-out can target it (and report it as unreachable) instead of silently skipping a host that has not connected yet.
 
-Re-declaring an existing host converges it to the fields you submit: the labels, hostname, and properties you provide overwrite the stored values, while fields you leave blank keep their current values and the host's agent-reported liveness (connection state, platform, architecture) is left untouched. The result tells you whether the host was newly created or an existing one was updated.
+The dashboard only creates hosts. It refuses a declare for an agent id that already exists (HTTP 409 `host_exists`). It also refuses labels or properties in the reserved `kici:` namespace (HTTP 400 `reserved_property`). To change an existing host, or to set reserved keys such as the agent restart commands, use `kici-admin host declare`. When the agent registers, its own labels, hostname and properties replace the declared ones.
 
 ### Remove a host
 

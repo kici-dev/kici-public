@@ -28,10 +28,10 @@ sequenceDiagram
 
     Note over O1,O2: Layer 2: Orchestrator ↔ Orchestrator (P2P)
 
-    O2->>O1: peer.hello (ephemeralPublicKey, nonce)
+    O2->>O1: peer.hello (ephemeralPublicKey, nonce, authSchemes)
     O1->>O2: peer.hello.response (ephemeralPublicKey)
-    O1->>O2: peer.auth.request (encrypted: token or credential proof)
-    O2->>O1: peer.auth.response (encrypted: accepted, sessionCredential)
+    O1->>O2: peer.auth.request (encrypted: scheme, mode, clientProof, tokenRouting)
+    O2->>O1: peer.auth.response (encrypted: accepted, serverProof, sessionCredential)
     O1->>O2: peer.heartbeat (agents, scalerCapacity, raft state)
     O2->>O1: peer.heartbeat (agents, scalerCapacity, raft state)
 
@@ -142,6 +142,7 @@ Sent by the connecting party (orchestrator to Platform, or agent to orchestrator
 | supportedDashboardRequests | string[]                                                                           | No       | Every dashboard request type this orchestrator build understands (the `dashboard.*` family plus the proxied `run.*` and `test.relay.*` requests), so the upstream can detect a version mismatch explicitly. Absent means "unknown", never "supports nothing"                                                                                                                                                                                                   |
 | dashboardEncryptionKey     | OKP/X25519 JWK                                                                     | No       | The orchestrator's active dashboard-encryption public key (`use: "enc"`), used by the browser to seal a secret / variable value under the `encrypted` posture. Absent when the orchestrator has no key provisioned                                                                                                                                                                                                                                             |
 | dashboardVerifiedIssuer    | string \| null                                                                     | No       | Origin the browser should fetch that encryption key from directly, bypassing the control plane. Null / absent means the control-plane proxy is used instead                                                                                                                                                                                                                                                                                                    |
+| clusterJoinV2              | boolean                                                                            | No       | The orchestrator answers join protocol v2 `join.request` frames. The Platform relays a join only to an orchestrator that advertises it                                                                                                                                                                                                                                                                                                                         |
 
 The schema uses `.passthrough()` so newer orchestrators can send additional flags without breaking older upstream versions. Unknown flags are preserved.
 
@@ -158,6 +159,7 @@ Sent by the server after successful authentication.
 | orgPublicAlias   | string           | No       | Public alias (`oal_<12-char>`) of the authenticated orchestrator's owning org. Used by the orchestrator's check-run emitter to build a `details_url` that points at the dashboard's resolver route, so the canonical `org_<12-char>` id never appears in public surfaces                                                                                  |
 | orgId            | string           | No       | Canonical org id (`org_<...>`) of the authenticated orchestrator's owning org. The orchestrator auto-provisions a remote-run anchor (`remote:<orgId>`) from it so a relayed `kici run remote` resolves the real tenant. When absent, that provisioning is skipped                                                                                         |
 | provenanceIssuer | string \| null   | No       | Provenance trust root (the OIDC issuer) the server mints build-provenance tokens under. The orchestrator derives the JWKS URI (`<issuer>/.well-known/jwks.json`) from it to verify provenance bundles at ingest. `null` or absent means provenance is not configured, and each attestation's verdict is recorded as `unverifiable` rather than `verified` |
+| githubWebhookUrl | string \| null   | No       | The org-scoped GitHub App webhook URL of the hosted Platform (`<base>/webhook/<orgId>/github`). The orchestrator's manifest flow bakes it into a new GitHub App in `platform` and `hybrid` mode. `null` when the Platform has no public webhook base. When the field is absent, the orchestrator reports the URL as unknown                               |
 
 Every field after `connectionId` is optional so an orchestrator can connect to a server that does not supply it -- each one degrades to the behavior described in its own row rather than failing the handshake.
 

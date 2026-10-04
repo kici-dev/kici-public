@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { PackageManager } from '@kici-dev/shared/package-manager';
 import {
   HostInstallRefusal,
@@ -12,12 +13,30 @@ import {
   isRegistrySpec,
   type HostInstallEligibilityOptions,
 } from './host-install-eligibility.js';
-import { allowedRegistries, loadNpmIni } from './npmrc-allowlist.js';
+import { allowedRegistries, loadHostNpmIni } from './npmrc-allowlist.js';
 
 /** The public npm registry plus one private registry the config names. */
 const REGISTRIES = allowedRegistries([{ '@s:registry': 'http://registry.local:4873/' }], []);
 /** The registries a plan carries when the operator configured none: npm's public one. */
 const PUBLIC_REGISTRY = [new URL('https://registry.npmjs.org/')];
+
+/** npm's parser as the agent's own lookup finds it on this host, or null. */
+const AGENT_INI = loadHostNpmIni().ini;
+
+/**
+ * Whether this Node ships its own npm, checked from the Node.js archive layouts
+ * directly rather than through the lookup under test.
+ */
+const NODE_SHIPS_NPM = [
+  join(dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+].some((p) => existsSync(p));
+
+it.runIf(NODE_SHIPS_NPM)("finds npm's parser on a host whose Node ships npm", () => {
+  // fails-when: the lookup loses Node's own npm. The suite below skips when the
+  // lookup finds nothing, so without this guard that regression reads as a skip.
+  expect(AGENT_INI).not.toBeNull();
+});
 
 describe('isRegistrySpec', () => {
   it.each([
@@ -198,7 +217,10 @@ describe('findNonRegistryOverride', () => {
   });
 });
 
-describe('checkHostInstallEligibility', () => {
+// Runs through the agent's real npm lookup: Node's own npm, or a distribution
+// or PATH npm at 11.10.0 or later. Skipped only on a host where the lookup
+// finds none; the guard above keeps that from hiding a regression.
+describe.skipIf(!AGENT_INI)('checkHostInstallEligibility', () => {
   let repo: string;
   let kici: string;
 
@@ -258,6 +280,13 @@ describe('checkHostInstallEligibility', () => {
         npmrc: npmrcPlan(),
       },
     });
+  });
+
+  it('reads .npmrc with the parser of the npm the lookup found', async () => {
+    const result = await check(repo);
+    // fails-when: the check parses .npmrc with a parser other than the one the
+    // lookup found, so the check and the install can disagree on the keys.
+    expect(result.eligible && result.plan.npmrc.ini).toBe(AGENT_INI);
   });
 
   it('accepts a standalone pnpm project and its registry lockfile', async () => {
@@ -445,7 +474,7 @@ describe('checkHostInstallEligibility', () => {
       .filter(Boolean)
       .map((l) => l.split('=')[0]);
     expect(lfOnlyKeys).toEqual(['registry']);
-    expect(Object.keys(loadNpmIni()!.decode(payload))).toEqual(['registry', 'pnpmfile']);
+    expect(Object.keys(AGENT_INI!.decode(payload))).toEqual(['registry', 'pnpmfile']);
 
     await write('.kici/.npmrc', payload);
     // fails-when: the check reads keys line by line on LF, so the pnpmfile

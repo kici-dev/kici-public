@@ -9,8 +9,9 @@ Orchestrator peers authenticate using persistent credentials. A peer gets its cr
 
 1. **First join:** A worker, or a coordinator given a token, authenticates with a one-time join token (`KICI_CLUSTER_JOIN_TOKEN`); the coordinator it connects to validates the token and issues a persistent credential. A coordinator without a token issues its own credential from the shared database on its first peer connection, unless an operator revoked its credential
 2. **Credential persistence:** The credential is saved to `KICI_CLUSTER_CREDENTIAL_FILE` (default: `~/.kici/peer-credential`) with `0600` permissions
-3. **Subsequent connections:** The orchestrator loads its credential file and proves possession via HMAC (the credential itself is never sent over the wire)
-4. **Encrypted channel:** All authentication happens over an ECDH-encrypted channel -- no auth material is transmitted in cleartext
+3. **Subsequent connections:** The orchestrator loads its credential file and proves possession with a proof bound to the handshake (the credential itself is never sent over the wire)
+4. **Mutual proof:** The orchestrator it connects to answers with its own proof that it holds the same credential, and the connecting orchestrator accepts nothing until that proof verifies. On first join the joining peer proves its token the same way and never sends the token
+5. **Rejections:** A coordinator keeps its credential file when a peer rejects a credential that the coordinator's own database holds as valid. It deletes the file only when its database also no longer holds the credential (revoked, expired or missing), and then issues a new one
 
 ## CLI commands
 
@@ -36,7 +37,7 @@ kici-admin peer create-token --role coordinator
 kici-admin peer create-token --role worker
 ```
 
-Tokens expire after 1 hour by default and can only be used once.
+Tokens expire after 1 hour by default. A peer that joins with a token binds it to its own instance; `kici-admin join` can repeat with the same token until it expires, so treat a token like a password.
 
 ### Revoke a peer
 

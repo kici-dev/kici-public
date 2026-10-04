@@ -70,4 +70,15 @@ describe('kici-admin join', () => {
     expect(stdout).toContain('cat ./o.env');
     expect(stdout).toContain('install --env-file ./o.env');
   });
+
+  it('names join protocol v2 in the help', async () => {
+    let help = '';
+    const program = buildProgram();
+    program.commands
+      .find((c) => c.name() === 'join')!
+      .configureOutput({ writeOut: (s) => (help += s), writeErr: () => {} });
+    await expect(program.parseAsync(['join', '--help'], { from: 'user' })).rejects.toThrow();
+    expect(help).toContain('join protocol v2');
+    expect(help).toContain('The join secret stays on this host');
+  });
 });

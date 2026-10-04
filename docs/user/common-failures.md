@@ -64,8 +64,8 @@ label.
 - `Lock file is out of date: workflow source changed without regenerating
 kici.lock.json ...`
 - a schema-version message for a lock **older** than the orchestrator's
-  compatibility window: `Lock file schema vX predates the oldest supported
-version vY — recompile with a current SDK ('kici compile') and push again.`
+  compatibility window: ``Lock file schema vX predates the oldest supported
+version vY — recompile with a current SDK (`kici compile`) and push again.``
 - a schema-version message for a lock **newer** than the window, naming the
   orchestrator version it needs: `Lock file requires orchestrator schema >= vX
 but this orchestrator understands <= vY — upgrade the orchestrator to a newer

@@ -33,6 +33,8 @@ import {
   ensureRuntimeVolume,
   runtimeInjectBind,
   injectedAgentCommand,
+  agentImageLabels,
+  runtimeInitCommand,
 } from '@kici-dev/shared/container-runtime';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import type { NetworkPolicy } from '@kici-dev/shared/net';
@@ -495,10 +497,12 @@ export class ContainerScalerBackend implements ScalerBackend {
     const containerIp = info.NetworkSettings?.Networks?.[ISOLATED_NETWORK_NAME]?.IPAddress as
       string | undefined;
     if (!containerIp) {
-      logger.warn('Could not determine container IP for nftables rules', {
-        agentId: args.agentId,
-      });
-      return;
+      // Fail closed: without an address there are no rules, and the chains'
+      // policy is accept. The spawn's catch removes the container.
+      throw new Error(
+        `Agent container ${args.containerId.slice(0, 12)} has no address on ` +
+          `${ISOLATED_NETWORK_NAME}, so its network isolation rules cannot be applied`,
+      );
     }
 
     this.containerIps.set(args.managedId, containerIp);
@@ -669,6 +673,7 @@ export class ContainerScalerBackend implements ScalerBackend {
       // Inject the KiCI runtime for a per-job image. Materialized out of the
       // agent image into a named volume, because a bind mount needs a HOST path
       // and the orchestrator may itself be containerized.
+      let agentInit: string[] = [];
       if (jobContainer) {
         // Tell the agent it IS the job's image. Without this it sees the job's
         // `container:` field, decides it needs a container, and nests a second
@@ -682,6 +687,9 @@ export class ContainerScalerBackend implements ScalerBackend {
           onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
         });
         binds.push(runtimeInjectBind(runtimeVolume));
+        // The agent starts from the runtime, so it starts under the runtime's
+        // init when the agent image ships one.
+        agentInit = runtimeInitCommand(await agentImageLabels(this.docker, matchedLabelSet.image!));
       }
 
       // Create container attached to the isolated network
@@ -694,7 +702,7 @@ export class ContainerScalerBackend implements ScalerBackend {
         // explicitly or the container runs the customer's entrypoint and no
         // agent ever registers. The pool's own agent image already starts the
         // agent by default, so it keeps its CMD.
-        ...(jobContainer ? { Cmd: injectedAgentCommand() } : {}),
+        ...(jobContainer ? { Cmd: injectedAgentCommand(agentInit) } : {}),
         Env: env,
         Labels: {
           'kici-managed': 'true',

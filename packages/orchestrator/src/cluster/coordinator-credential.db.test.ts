@@ -18,6 +18,8 @@ import { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 import {
   COORDINATOR_CREDENTIAL_REVOKED_MESSAGE,
   CoordinatorCredentialOutcome as Outcome,
+  RejectionCorroboration,
+  coordinatorRejectionCorroborator,
   coordinatorSelfIssuer,
   ensureCoordinatorCredential,
 } from './coordinator-credential.js';
@@ -119,6 +121,49 @@ describeDb('ensureCoordinatorCredential against Postgres', () => {
       .where('revoked_at', 'is', null)
       .execute();
   }
+
+  describe('coordinatorRejectionCorroborator', () => {
+    it('holds the file credential valid until the row is revoked', async () => {
+      expect(await run()).toBe(Outcome.Issued);
+      const written = await readCredentialFile(file);
+      const corroborate = coordinatorRejectionCorroborator({ db, instanceId: INSTANCE, logger });
+      // fails-when: the check ignores the row and lets any rejection delete the file
+      expect(await corroborate(written!.credential)).toBe(RejectionCorroboration.HeldValid);
+      expect(await corroborate('not-the-credential')).toBe(RejectionCorroboration.NotHeld);
+      await store.revoke(INSTANCE);
+      // breaks-if-wrong: an operator revoke must still let the file go
+      expect(await corroborate(written!.credential)).toBe(RejectionCorroboration.NotHeld);
+    });
+
+    it('does not hold an expired row valid', async () => {
+      expect(await run()).toBe(Outcome.Issued);
+      const written = await readCredentialFile(file);
+      await sql`UPDATE peer_credentials SET expires_at = now() - interval '1 minute'`.execute(db);
+      const corroborate = coordinatorRejectionCorroborator({ db, instanceId: INSTANCE, logger });
+      expect(await corroborate(written!.credential)).toBe(RejectionCorroboration.NotHeld);
+    });
+
+    it('reports an unreadable database', async () => {
+      const broken = new Kysely<any>({
+        dialect: new PostgresDialect({
+          pool: new pg.Pool({
+            connectionString: withDatabase(adminUrl, 'kici_no_such_database_for_corroboration'),
+          }),
+        }),
+      });
+      try {
+        const corroborate = coordinatorRejectionCorroborator({
+          db: broken,
+          instanceId: INSTANCE,
+          logger,
+        });
+        expect(await corroborate('anything')).toBe(RejectionCorroboration.Unreadable);
+        expect(logger.warn).toHaveBeenCalled();
+      } finally {
+        await broken.destroy();
+      }
+    });
+  });
 
   describe('store primitives', () => {
     it('findUnrevokedByInstanceId returns an expired unrevoked row', async () => {

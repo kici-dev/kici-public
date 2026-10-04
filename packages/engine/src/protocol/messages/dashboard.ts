@@ -1948,6 +1948,17 @@ export const fleetPreviewHostSchema = z.object({
 });
 export type FleetPreviewHost = z.infer<typeof fleetPreviewHostSchema>;
 
+/**
+ * A roster host as the dashboard sees it: the SDK inventory entry plus whether
+ * an agent registration or an operator declaration confirmed it. An
+ * unconfirmed host was created from the dashboard and is not a fan-out or
+ * inventory target. Optional so an older orchestrator's frames still parse.
+ */
+export const fleetHostEntrySchema = HostInventoryEntry.extend({
+  confirmed: z.boolean().optional(),
+});
+export type FleetHostEntry = z.infer<typeof fleetHostEntrySchema>;
+
 // Requests (Platform -> orch)
 export const dashboardFleetHostsRequestSchema = z.object({
   type: z.literal('dashboard.fleet.hosts'),
@@ -1971,12 +1982,12 @@ export const dashboardFleetPreviewRequestSchema = z.object({
 export const dashboardFleetHostsResponseSchema = z.object({
   type: z.literal('dashboard.fleet.hosts.response'),
   requestId: z.string(),
-  hosts: z.array(HostInventoryEntry),
+  hosts: z.array(fleetHostEntrySchema),
 });
 export const dashboardFleetHostResponseSchema = z.object({
   type: z.literal('dashboard.fleet.host.response'),
   requestId: z.string(),
-  host: HostInventoryEntry.nullable(),
+  host: fleetHostEntrySchema.nullable(),
   runs: z.array(fleetPinnedRunSchema),
 });
 export const dashboardFleetPreviewResponseSchema = z.object({
@@ -2029,13 +2040,24 @@ export type DashboardFleetWorkflowsForHostResponse = z.infer<
 
 // --- Fleet host writes (Model C: declare / remove) ---
 
+/**
+ * Why the orchestrator refused a Platform-relayed fleet host write. Travels in
+ * the response `error` field, as `operation_disabled` does.
+ *
+ * - `reserved_property` — a label or property key is in the reserved `kici:` namespace.
+ * - `host_exists` — a dashboard declare named a host that already exists.
+ * - `host_confirmed` — a dashboard remove named a host an agent or operator confirmed.
+ */
+export const FleetHostWriteRefusal = z.enum(['reserved_property', 'host_exists', 'host_confirmed']);
+export type FleetHostWriteRefusal = z.infer<typeof FleetHostWriteRefusal>;
+
 /** Declare a static host into the roster (wraps HostRosterStore.declareStatic). */
 export const fleetHostDeclareRequestSchema = z.object({
   type: z.literal('dashboard.fleet.host.declare'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   agentId: z.string(),
-  // Optional so a re-declare can omit labels (preserve-on-omit at the store).
+  // Optional: an omitted labels field declares a host with no labels.
   labels: z.array(z.string()).optional(),
   hostname: z.string().optional(),
   properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
@@ -2044,10 +2066,11 @@ export const fleetHostDeclareResponseSchema = z.object({
   type: z.literal('dashboard.fleet.host.declare.response'),
   requestId: z.string(),
   declared: z.boolean().optional(),
-  // true when the declare inserted a new roster row; false on a converging
-  // re-declare (existing row updated). Lets the dashboard report created vs updated.
+  // true when the declare inserted a new roster row.
   created: z.boolean().optional(),
   error: z.string().optional(),
+  /** The reserved keys behind a `reserved_property` refusal. */
+  reservedKeys: z.array(z.string()).optional(),
 });
 
 /** Remove a host from the roster by agent id (HostRosterStore.removeStatic). */
@@ -2060,8 +2083,9 @@ export const fleetHostRemoveRequestSchema = z.object({
 export const fleetHostRemoveResponseSchema = z.object({
   type: z.literal('dashboard.fleet.host.remove.response'),
   requestId: z.string(),
-  // false ⇒ no row matched (not-found); the `error` field stays reserved for
-  // internal errors, which the Platform maps to HTTP 500.
+  // false ⇒ no row matched (not-found). The `error` field carries a
+  // FleetHostWriteRefusal code or an internal error, which the Platform maps
+  // to HTTP 409 or 500.
   removed: z.boolean().optional(),
   error: z.string().optional(),
 });

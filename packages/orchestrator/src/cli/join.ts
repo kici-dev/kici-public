@@ -2,8 +2,8 @@
  * `kici-admin join` command.
  *
  * Bootstraps a new orchestrator by connecting to an existing cluster via
- * Platform relay or direct peer, receiving an encrypted config bundle, and
- * writing an env file the orchestrator boots from.
+ * Platform relay or direct peer, receiving the configuration bundle sealed to
+ * this host, and writing an env file the orchestrator boots from.
  *
  * Usage:
  *   kici-admin join --token kici_join_v1.xxx.yyy --platform wss://api.kici.dev/ws --api-key KEY
@@ -37,6 +37,11 @@ Token vocabulary:
   an existing cluster. For a first, standalone orchestrator you do NOT need a join
   token -- install it with \`kici-admin orchestrator install\` and set
   KICI_PLATFORM_TOKEN to the dashboard REGISTRATION token (kici_ok_...).
+
+Join protocol:
+  The join secret stays on this host. kici-admin proves it holds the token, and the
+  cluster seals its configuration to a one-time key of this host. Joining needs the
+  cluster's orchestrators on a release with join protocol v2: upgrade them first.
 `,
     )
     .action(

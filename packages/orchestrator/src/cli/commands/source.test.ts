@@ -7,7 +7,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { Command } from 'commander';
-import { registerSourceCommands, resolveWebhookSecret } from './source.js';
+import { registerSourceCommands, renderSourceListText, resolveWebhookSecret } from './source.js';
 import type { AdminApiClient } from '../api-client.js';
 import { UNIVERSAL_GIT_PRESETS } from '../../providers/universal-git/index.js';
 
@@ -176,6 +176,7 @@ describe('kici-admin source list --json', () => {
         config: { appId: '42' },
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
+        ingressUrl: 'https://ci.example.com/webhook/org-a/github/s1',
       },
     ];
     const genericSources = [
@@ -220,7 +221,72 @@ describe('kici-admin source list --json', () => {
     expect(parsed).toHaveProperty('generic');
     expect(parsed.github[0].routingKey).toBe('github:42');
     expect(parsed.github[0].customerId).toBe('org-a');
+    expect(parsed.github[0].ingressUrl).toBe('https://ci.example.com/webhook/org-a/github/s1');
     expect(parsed.generic[0].routing_key).toBe('generic:org-a:gen');
+  });
+});
+
+describe('kici-admin source list (text)', () => {
+  const row = {
+    id: 's1',
+    provider: 'github',
+    name: 'main',
+    routingKey: 'github:42',
+    customerId: 'org-a',
+    config: { appId: '42' },
+    createdAt: '2024-01-01T00:00:00.000Z',
+    updatedAt: '2024-01-01T00:00:00.000Z',
+  };
+  const clientWith = (sources: unknown[]): Partial<AdminApiClient> => ({
+    get: async <T>(): Promise<T> => ({ sources }) as unknown as T,
+  });
+
+  // fails-when: the URL line is missing.
+  it('prints the ingress URL under each GitHub source', async () => {
+    const { stdout } = await runCommand(
+      ['source', 'list'],
+      clientWith([{ ...row, ingressUrl: 'https://ci.example.com/webhook/org-a/github/s1' }]),
+    );
+    expect(stdout).toContain('ingress: https://ci.example.com/webhook/org-a/github/s1');
+  });
+
+  // breaks-if-wrong: a null or absent field (platform mode, an older orchestrator)
+  //   prints no blank line.
+  it('prints no ingress line when the orchestrator reports none', async () => {
+    for (const r of [{ ...row, ingressUrl: null }, row]) {
+      const { stdout } = await runCommand(['source', 'list'], clientWith([r]));
+      expect(stdout).not.toContain('ingress:');
+      expect(stdout).toContain('github:42');
+    }
+  });
+});
+
+describe('renderSourceListText direct-DB note', () => {
+  function capture(fn: () => void): string {
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => logs.push(a.join(' '));
+    try {
+      fn();
+    } finally {
+      console.log = orig;
+    }
+    return logs.join('\n');
+  }
+  const github = [{ routingKey: 'github:42', name: 'main', provider: 'github' }];
+
+  // fails-when: a direct-DB listing gives no sign that ingress URLs exist.
+  // breaks-if-wrong: the HTTP listing, and an empty direct-DB listing, print no note.
+  it('says where the ingress URLs are only for a non-empty direct-DB listing', () => {
+    expect(capture(() => renderSourceListText(github, [], false, { directDb: true }))).toContain(
+      'run without --database-url',
+    );
+    expect(
+      capture(() => renderSourceListText(github, [], false, { directDb: false })),
+    ).not.toContain('--database-url');
+    expect(capture(() => renderSourceListText([], [], false, { directDb: true }))).not.toContain(
+      '--database-url',
+    );
   });
 });
 
@@ -771,5 +837,83 @@ describe('kici-admin source redeliver', () => {
     } as unknown as Partial<AdminApiClient>);
 
     expect(JSON.parse(stdout)).toMatchObject({ routingKey: 'github:42', matched: 2 });
+  });
+});
+
+describe('kici-admin source refresh', () => {
+  const base = {
+    routingKey: 'github:42',
+    changed: false,
+    oldName: 'a',
+    newName: 'a',
+    oldSlug: 'a',
+    newSlug: 'a',
+  };
+  const clientReturning = (result: object): Partial<AdminApiClient> => ({
+    post: async <T>(): Promise<T> => result as T,
+  });
+
+  // fails-when: the warning is silent for an App lacking issue_comment.
+  it('warns when the App lacks a required event or permission', async () => {
+    const { stdout } = await runCommand(
+      ['source', 'refresh', 'github:42'],
+      clientReturning({
+        ...base,
+        missingEvents: ['issue_comment'],
+        missingPermissions: ['issues'],
+        installationsPendingApproval: [
+          { installationId: 7, account: 'acme', missingPermissions: ['issues'] },
+        ],
+      }),
+    );
+    expect(stdout).toContain('missing permissions: issues');
+    expect(stdout).toContain('missing events: issue_comment');
+    expect(stdout).toContain('installation acme has not accepted: issues');
+  });
+
+  // fails-when: the up-to-date branch returns before the gap warning prints.
+  it('warns on an updated App too, and for each result of --all', async () => {
+    const { stdout } = await runCommand(
+      ['source', 'refresh', '--all'],
+      clientReturning({
+        results: [
+          { ...base, changed: true, newName: 'b', missingEvents: ['issue_comment'] },
+          { ...base, routingKey: 'github:43', missingPermissions: ['checks'] },
+        ],
+        errors: [],
+      }),
+    );
+    expect(stdout).toContain('github:42: updated');
+    expect(stdout).toContain('missing events: issue_comment');
+    expect(stdout).toContain('missing permissions: checks');
+    expect(stdout.match(/WARNING/g)).toHaveLength(2);
+  });
+
+  // breaks-if-wrong: --json passes the route's gap fields through unchanged.
+  it('--json prints the gap fields as the route returns them', async () => {
+    const result = {
+      ...base,
+      missingEvents: [],
+      missingPermissions: [],
+      installationsPendingApproval: [],
+    };
+    const { stdout } = await runCommand(
+      ['source', 'refresh', 'github:42', '--json'],
+      clientReturning(result),
+    );
+    expect(JSON.parse(stdout)).toEqual(result);
+  });
+
+  // breaks-if-wrong: a complete App, and an older orchestrator that sends no gap
+  //   fields, print the unchanged "up to date" output and no warning.
+  it('prints no warning for a complete App or an older orchestrator', async () => {
+    for (const r of [
+      { ...base, missingEvents: [], missingPermissions: [], installationsPendingApproval: [] },
+      base,
+    ]) {
+      const { stdout } = await runCommand(['source', 'refresh', 'github:42'], clientReturning(r));
+      expect(stdout).toContain('up to date');
+      expect(stdout).not.toContain('WARNING');
+    }
   });
 });

@@ -82,6 +82,7 @@ const DIRECT_MAPPINGS: Record<string, string[]> = {
   CLUSTER_ROLE: ['cluster', 'role'],
   CLUSTER_COORDINATOR_URL: ['cluster', 'coordinatorUrl'],
   CLUSTER_PEER_STALE_TIMEOUT_MS: ['cluster', 'peerStaleTimeoutMs'],
+  CLUSTER_PEER_DISCOVERY: ['cluster', 'peerDiscovery'],
 
   // Logging/environment
   LOG_LEVEL: ['logLevel'],

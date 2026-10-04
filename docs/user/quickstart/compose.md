@@ -211,7 +211,7 @@ In your GitHub App's settings:
 
 - **Webhook URL**: the URL printed above.
 - **Webhook secret**: the same `--webhook-secret` you passed in step 6.
-- **Subscribe to events**: at minimum `push` and `pull_request`.
+- **Subscribe to events**: at minimum `push` and `pull_request`. To answer security holds with `/kici approve` comments, also set the **Issues** permission to read and subscribe to `issue_comment` (see [Pull-request comment commands](../providers/github.md#pull-request-comment-commands)).
 
 Click **Save changes** in GitHub.
 
@@ -246,7 +246,7 @@ GitHub                Platform (api.kici.dev)              your box
   dashboard reads run state from Platform
 ```
 
-The Platform handles webhook ingress + signature verification + audit logging. Your orchestrator owns the trigger matching, job queue, and per-source secrets — and spawns one agent container per job via the bind-mounted container runtime socket. Each agent runs exactly one job, then exits.
+The Platform handles webhook ingress, relay and audit logging. Your orchestrator owns signature verification, the trigger matching, job queue, and per-source secrets — and spawns one agent container per job via the bind-mounted container runtime socket. Each agent runs exactly one job, then exits.
 
 ## Upgrading
 

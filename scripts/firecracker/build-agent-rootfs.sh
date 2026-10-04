@@ -8,8 +8,8 @@
 #   Phase 1 (base) — debootstrap, packages, Node.js, pnpm, oxc-transform, dockerode
 #     shim. Cached at BASE_CACHE_PATH; only rebuilt when missing, when the host
 #     Node.js version or this script changes, or when --force-base is passed.
-#   Phase 2 (inject) — Rolldown-bundle agent + workflow-runner, copy them and the
-#     VM /init (agent-init.sh, beside this script) into the rootfs. Fast
+#   Phase 2 (inject) — Rolldown-bundle agent + workflow-runner, copy them, tini
+#     and the VM /init (agent-init.sh, beside this script) into the rootfs. Fast
 #     (~seconds), runs on every invocation.
 #
 # Run it from a clone of the KiCI source repository, checked out at the release
@@ -35,6 +35,7 @@
 #   BASE_CACHE_PATH     Base image cache path (default: /var/lib/kici/rootfs-base.ext4).
 #                       Its stamp files sit beside it, named after it.
 #   KICI_NPM_REGISTRY   npm registry for the base image's installs (default: npmjs)
+#   KICI_TINI_BASE_URL  Where tini's release assets are served (default: GitHub)
 #
 # Must be run as root or with sudo.
 
@@ -452,13 +453,22 @@ SHIM_JS
 }
 
 # ── inject_agent() ──────────────────────────────────────────────────────────
-# Bundles agent + workflow-runner with Rolldown and copies them, and the VM
-# /init, into the rootfs.
+# Bundles agent + workflow-runner with Rolldown and copies them, tini and the
+# VM /init into the rootfs.
 
 inject_agent() {
   local TARGET="$1"
 
   info "Injecting agent into ${TARGET}"
+
+  # tini is PID 1 of the VM once /init execs it, so it moves with /init on
+  # every injection, not with the cached base: an --agent-only refresh never
+  # rebuilds the base. The verified copy is cached beside the base, so a
+  # refresh needs no network once it is there. Fetched before the image is
+  # mounted, so a failed fetch leaves the image untouched.
+  local TINI_CACHE
+  TINI_CACHE="$(dirname "$BASE_CACHE_PATH")/tini-static-${ARCH}"
+  bash "$SCRIPT_DIR/fetch-tini.sh" "$ARCH" "$TINI_CACHE"
 
   # Bundle with Rolldown
   BUNDLE_TMP=$(mktemp -d -t kici-fc-XXXXXX)
@@ -507,6 +517,11 @@ inject_agent() {
 }
 CORE_PKG
   ok "Refreshed @kici-dev/core/ts-loader-hook stub"
+
+  # tini before the /init that execs it: an inject that fails between the two
+  # leaves the previous /init, never one whose tini is missing.
+  install -m 755 "$TINI_CACHE" "$MOUNT_POINT"/usr/local/bin/tini
+  ok "Installed /usr/local/bin/tini"
 
   # The VM /init reads the MMDS keys the orchestrator writes, so it moves with
   # the agent, not with the cached base: an --agent-only refresh of an old image

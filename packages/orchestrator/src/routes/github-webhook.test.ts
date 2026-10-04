@@ -39,6 +39,17 @@ function makeDeps(overrides?: Partial<GithubWebhookRoutesDeps>): {
               config: {},
             }
           : null,
+      getSource: async (routingKey: string) =>
+        routingKey === `github:${APP_ID}`
+          ? {
+              id: SOURCE_ID,
+              provider: 'github',
+              routing_key: `github:${APP_ID}`,
+              customer_id: ORG_ID,
+              name: 'a',
+              config: {},
+            }
+          : null,
     } as never,
     verifyDeps: { db, secretStore, genericSourceManager: {} } as never,
     onWebhook,
@@ -220,5 +231,126 @@ describe('createGithubWebhookRoutes', () => {
       expect(res.status).toBe(202);
       expect(onWebhook).toHaveBeenCalledOnce();
     });
+  });
+});
+
+async function postOrgScoped(
+  app: ReturnType<typeof createGithubWebhookRoutes>,
+  opts: { body: string; headers: Record<string, string> },
+) {
+  return app.request(`/webhook/${ORG_ID}/github`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...opts.headers },
+    body: opts.body,
+  });
+}
+
+function appHeaders(deliveryId: string, appId = APP_ID): Record<string, string> {
+  return {
+    'x-github-delivery': deliveryId,
+    'x-github-event': 'push',
+    'x-github-hook-installation-target-type': 'integration',
+    'x-github-hook-installation-target-id': appId,
+  };
+}
+
+describe('org-scoped route POST /webhook/:orgId/github', () => {
+  const body = JSON.stringify({ ref: 'refs/heads/main', repository: { full_name: 'o/r' } });
+
+  // fails-when: the route is missing (404 from the framework) or maps the
+  //   target id to the wrong routing key.
+  it('accepts a signed App delivery and resolves the source by App id', async () => {
+    const { deps, onWebhook } = makeDeps();
+    const res = await postOrgScoped(createGithubWebhookRoutes(deps), {
+      body,
+      headers: { 'x-hub-signature-256': sign(body), ...appHeaders('o-1') },
+    });
+    expect(res.status).toBe(202);
+    expect((onWebhook.mock.calls[0]![0] as WebhookInfo).routingKey).toBe(`github:${APP_ID}`);
+  });
+
+  // fails-when: a headerless (classic repository hook) delivery falls through to resolution.
+  // breaks-if-wrong: the per-source route still accepts headerless deliveries (test above).
+  it('answers 400 without App target headers and names the per-source URL', async () => {
+    const { deps, onWebhook } = makeDeps();
+    const res = await postOrgScoped(createGithubWebhookRoutes(deps), {
+      body,
+      headers: {
+        'x-hub-signature-256': sign(body),
+        'x-github-delivery': 'o-2',
+        'x-github-event': 'push',
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { reason: string }).reason).toContain(
+      `/webhook/${ORG_ID}/github/<source-id>`,
+    );
+    expect(onWebhook).not.toHaveBeenCalled();
+  });
+
+  it('answers 400 for a non-integration target type', async () => {
+    const { deps } = makeDeps();
+    const res = await postOrgScoped(createGithubWebhookRoutes(deps), {
+      body,
+      headers: {
+        'x-hub-signature-256': sign(body),
+        ...appHeaders('o-3'),
+        'x-github-hook-installation-target-type': 'repository',
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  // fails-when: the route accepts an App that has no local sources row, or the
+  //   route is missing (the framework's plain-text 404 is not this JSON body).
+  it('answers 404 for an App with no local source', async () => {
+    const { deps, onWebhook } = makeDeps();
+    const res = await postOrgScoped(createGithubWebhookRoutes(deps), {
+      body,
+      headers: { 'x-hub-signature-256': sign(body), ...appHeaders('o-4', '777') },
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ rejected: true, reason: 'Unknown source' });
+    expect(onWebhook).not.toHaveBeenCalled();
+  });
+
+  // fails-when: the org-scoped path skips signature verification.
+  it('answers 401 for a delivery signed with the wrong secret', async () => {
+    const { deps, onWebhook } = makeDeps();
+    const wrong = 'sha256=' + createHmac('sha256', 'not-the-secret').update(body).digest('hex');
+    const res = await postOrgScoped(createGithubWebhookRoutes(deps), {
+      body,
+      headers: { 'x-hub-signature-256': wrong, ...appHeaders('o-5') },
+    });
+    expect(res.status).toBe(401);
+    expect(onWebhook).not.toHaveBeenCalled();
+  });
+
+  // fails-when: the org-scoped path scopes X-GitHub-Delivery differently, so the
+  //   same delivery reaching both URLs runs twice.
+  it('hands the raw X-GitHub-Delivery to ingest on both routes', async () => {
+    const claimed = new Set<string>();
+    const onWebhook = vi.fn(async (info: WebhookInfo) => {
+      if (claimed.has(info.deliveryId)) return WebhookIngestOutcome.enum.duplicate;
+      claimed.add(info.deliveryId);
+      return WebhookIngestOutcome.enum.processed;
+    });
+    const { deps } = makeDeps({ onWebhook });
+    const app = createGithubWebhookRoutes(deps);
+    const first = await post(app, {
+      body,
+      headers: { 'x-hub-signature-256': sign(body), ...appHeaders('same-1') },
+    });
+    const second = await postOrgScoped(app, {
+      body,
+      headers: { 'x-hub-signature-256': sign(body), ...appHeaders('same-1') },
+    });
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({ duplicate: true });
+    expect(onWebhook.mock.calls.map((c) => (c[0] as WebhookInfo).deliveryId)).toEqual([
+      'same-1',
+      'same-1',
+    ]);
   });
 });

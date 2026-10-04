@@ -225,7 +225,7 @@ Users can unlink a provider account from their personal settings. After unlinkin
 
 ## GitHub App permissions
 
-Trust resolution reads the webhook payload and calls no provider API, so it needs no permission of its own. The App permissions KiCI needs are the ordinary ones — Contents, Metadata, Pull requests, and Checks. See [GitHub provider setup](../../user/providers/github.md).
+Trust resolution reads the webhook payload and calls no provider API, so it needs no permission of its own. The App permissions KiCI needs are the ordinary ones: Contents, Metadata, Pull requests, Checks, and Issues (read). The Issues permission lets the App subscribe to Issue comment events, which carry `/kici approve` and `/kici reject`. Without it, a comment never reaches the orchestrator. See [GitHub provider setup](../../user/providers/github.md#pull-request-comment-commands).
 
 ## Monitoring
 

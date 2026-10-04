@@ -43,6 +43,10 @@ Container and Firecracker jobs run behind egress filtering that blocks private (
 
 Secrets are delivered to workflow code over an internal channel (`ctx.secrets`) rather than environment variables, and enter the process environment only when a workflow explicitly calls `ctx.secrets.expose()`. Agent credentials never enter the sandbox at all: the job environment is built from an explicit allowlist, and everything else — including all agent-internal variables — is excluded. See [Secrets management](./secrets.md).
 
+### Peer links authenticate both ways
+
+Orchestrators in a cluster connect to each other on `/ws/peer`. Both sides of every peer link prove that they hold the same credential or join token, and an orchestrator accepts no message from a peer it dialled until that peer has proved itself. No credential or join token crosses the wire. A peer address the hosted Platform announces is only a hint until that proof succeeds. Peer links use `ws://`, so keep `/ws/peer` on a private network and never expose it to the internet. If your cluster lists its peers in `KICI_CLUSTER_PEERS`, set `KICI_CLUSTER_PEER_DISCOVERY=static` to turn off dialling of announced addresses. See [Clustering](../orchestrator/clustering.md#security-properties).
+
 ### The hosted relay never sees your code
 
 The same property that makes you self-host also protects you: KiCI's hosted Platform is a thin webhook relay. Your source, secrets, and artifacts stay on your orchestrator and agents. Run metadata (names, statuses, timings) is relayed for the hosted dashboard, and log lines transit the relay only while you stream them — the Platform never stores log content. The full field-level breakdown is in [Data residency](../data-residency.md).

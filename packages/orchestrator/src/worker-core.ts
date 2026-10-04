@@ -79,7 +79,7 @@ import { AgentRegistry } from './agent/registry.js';
 import { assertAgentAuthBindSafe } from './storage/loopback-guard.js';
 import { Dispatcher } from './agent/dispatcher.js';
 import { incScalerRedispatch } from './metrics/prometheus.js';
-import { PeerClient, PeerRegistry, PeerAuthCoordinator } from './cluster/index.js';
+import { PeerClient, PeerDialOrigin, PeerRegistry, PeerAuthCoordinator } from './cluster/index.js';
 import {
   ExecutionJobStatus,
   TERMINAL_JOB_STATES,
@@ -836,6 +836,7 @@ export async function bootstrapWorker(
 
     const client: PeerClient = new PeerClient({
       url: wsUrl,
+      origin: PeerDialOrigin.Static,
       onLogsCollectRequest: (msg, send) => workerFleetResponder(msg, send),
       // `kici-admin scaler orphans --target <this worker>`, forwarded by the
       // coordinator: answered from this host and this worker's own tracking.

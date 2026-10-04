@@ -55,6 +55,46 @@ export function validateWebhookUrl(value: string): string {
   return value;
 }
 
+/** Access levels of a GitHub App permission, lowest first. */
+const PERMISSION_LEVELS = ['read', 'write', 'admin'] as const;
+type GithubPermissionLevel = (typeof PERMISSION_LEVELS)[number];
+
+/**
+ * Every permission and event a KiCI GitHub App needs. The manifest requests
+ * exactly these, and `kici-admin source refresh` reports an existing App that
+ * lacks any of them.
+ */
+export const GITHUB_APP_REQUIREMENTS = {
+  permissions: {
+    contents: 'read',
+    metadata: 'read',
+    pull_requests: 'read',
+    checks: 'write',
+    members: 'read',
+    // GitHub subscribes an App to `issue_comment` only with Issues read access.
+    // The event carries `/kici approve|reject` PR comments and the comments
+    // `comment()` triggers match.
+    issues: 'read',
+  },
+  events: ['push', 'pull_request', 'check_run', 'check_suite', 'issue_comment'],
+} as const satisfies {
+  permissions: Record<string, GithubPermissionLevel>;
+  events: readonly string[];
+};
+
+/** Organization permissions; an installation on a user account cannot hold them. */
+const ORGANIZATION_PERMISSIONS: ReadonlySet<string> = new Set(['members']);
+
+/**
+ * Events GitHub subscribes an App to automatically once it holds a permission
+ * level, without listing them in `GET /app`'s `events`. An App with Checks
+ * write receives `check_run` and `check_suite`.
+ */
+const IMPLICIT_EVENT_GRANTS: Readonly<Record<string, readonly [string, GithubPermissionLevel]>> = {
+  check_run: ['checks', 'write'],
+  check_suite: ['checks', 'write'],
+};
+
 export function buildGithubAppManifest(input: GithubManifestInput): GithubAppManifest {
   return {
     name: input.name,
@@ -63,14 +103,8 @@ export function buildGithubAppManifest(input: GithubManifestInput): GithubAppMan
     redirect_url: input.redirectUrl,
     ...(input.setupUrl ? { setup_url: input.setupUrl } : {}),
     public: false,
-    default_permissions: {
-      contents: 'read',
-      metadata: 'read',
-      pull_requests: 'read',
-      checks: 'write',
-      members: 'read',
-    },
-    default_events: ['push', 'pull_request', 'check_run', 'check_suite'],
+    default_permissions: { ...GITHUB_APP_REQUIREMENTS.permissions },
+    default_events: [...GITHUB_APP_REQUIREMENTS.events],
   };
 }
 
@@ -126,11 +160,22 @@ export async function convertManifestCode(
   };
 }
 
+/** What `GET /app` says about the App: identity plus its grant. */
+export interface GithubAppIdentity {
+  name: string;
+  slug: string;
+  /** Events the App subscribes to. */
+  events: string[];
+  /** The App's permissions, name → access level. */
+  permissions: Record<string, string>;
+}
+
 /**
  * Ask GitHub who this App is (`GET /app`, authenticated as the App via its
- * JWT) and return its authoritative display `name` + `slug`. This is the single
- * "fetch the App's identity from GitHub" helper, reused at source creation, by
- * the daily refresher, and by `kici-admin source refresh`.
+ * JWT) and return its authoritative display `name` + `slug`, plus the events
+ * and permissions the App holds, which the requirement gap check reads. This is
+ * the single "fetch the App's identity from GitHub" helper, reused at source
+ * creation, by the daily refresher, and by `kici-admin source refresh`.
  *
  * GitHub is the source of truth: a rename in the GitHub UI changes the value
  * `GET /app` returns, which is what keeps the dashboard name fresh.
@@ -138,11 +183,125 @@ export async function convertManifestCode(
 export async function fetchGithubAppIdentity(
   creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
   deps: { appOctokit?: Pick<Octokit, 'request'> } = {},
-): Promise<{ name: string; slug: string }> {
+): Promise<GithubAppIdentity> {
   const octokit = deps.appOctokit ?? createAppOctokit(creds);
   const { data } = await octokit.request('GET /app');
-  const d = data as { name: string; slug: string };
-  return { name: d.name, slug: d.slug };
+  const d = data as {
+    name: string;
+    slug: string;
+    events?: string[];
+    permissions?: Record<string, string>;
+  };
+  return { name: d.name, slug: d.slug, events: d.events ?? [], permissions: d.permissions ?? {} };
+}
+
+/** One installation's grant, as the gap check reads it. */
+export interface GithubAppInstallationGrant {
+  id: number;
+  /** Login of the account the App is installed on (an enterprise's slug). */
+  account: string;
+  /** `Organization`, `User`, or null for an enterprise installation. */
+  accountType: string | null;
+  permissions: Record<string, string>;
+}
+
+const INSTALLATIONS_PAGE_SIZE = 100;
+
+/** Every installation of the App (`GET /app/installations`, all pages), as the App. */
+export async function listGithubAppInstallations(
+  creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
+  deps: { appOctokit?: Pick<Octokit, 'request'> } = {},
+): Promise<GithubAppInstallationGrant[]> {
+  const octokit = deps.appOctokit ?? createAppOctokit(creds);
+  const grants: GithubAppInstallationGrant[] = [];
+  for (let page = 1; ; page++) {
+    const { data } = await octokit.request('GET /app/installations', {
+      per_page: INSTALLATIONS_PAGE_SIZE,
+      page,
+    });
+    const rows = data as Array<{
+      id: number;
+      account?: { login?: string; slug?: string; type?: string } | null;
+      permissions?: Record<string, string>;
+    }>;
+    for (const r of rows) {
+      grants.push({
+        id: r.id,
+        account: r.account?.login ?? r.account?.slug ?? '',
+        accountType: r.account?.type ?? null,
+        permissions: r.permissions ?? {},
+      });
+    }
+    if (rows.length < INSTALLATIONS_PAGE_SIZE) return grants;
+  }
+}
+
+/** Required events and permissions an App or its installations lack. */
+export interface GithubAppRequirementGaps {
+  missingEvents: string[];
+  missingPermissions: string[];
+  /** Installations that have not accepted a permission the App itself holds. */
+  installationsPendingApproval: Array<{
+    installationId: number;
+    account: string;
+    missingPermissions: string[];
+  }>;
+}
+
+/**
+ * Whether `actual` grants at least `required`. A higher level satisfies a lower
+ * one; a missing or unknown level string grants nothing.
+ */
+function grantsLevel(actual: string | undefined, required: GithubPermissionLevel): boolean {
+  const held = PERMISSION_LEVELS.indexOf(actual as GithubPermissionLevel);
+  return held >= 0 && held >= PERMISSION_LEVELS.indexOf(required);
+}
+
+/** Whether the App receives an event: listed in its subscription, or implied by a permission. */
+function receivesEvent(
+  app: Pick<GithubAppIdentity, 'events' | 'permissions'>,
+  event: string,
+): boolean {
+  if (app.events.includes(event)) return true;
+  const implied = IMPLICIT_EVENT_GRANTS[event];
+  return implied !== undefined && grantsLevel(app.permissions[implied[0]], implied[1]);
+}
+
+/** Compare an App and its installations with {@link GITHUB_APP_REQUIREMENTS}. */
+export function findGithubAppRequirementGaps(
+  app: Pick<GithubAppIdentity, 'events' | 'permissions'>,
+  installations: GithubAppInstallationGrant[],
+): GithubAppRequirementGaps {
+  const required = Object.entries(GITHUB_APP_REQUIREMENTS.permissions) as Array<
+    [string, GithubPermissionLevel]
+  >;
+  const appHolds = ([name, level]: [string, GithubPermissionLevel]) =>
+    grantsLevel(app.permissions[name], level);
+  return {
+    missingEvents: GITHUB_APP_REQUIREMENTS.events.filter((e) => !receivesEvent(app, e)),
+    missingPermissions: required.filter((r) => !appHolds(r)).map(([name]) => name),
+    installationsPendingApproval: installations.flatMap((inst) => {
+      const missing = required
+        .filter(
+          ([name]) => inst.accountType === 'Organization' || !ORGANIZATION_PERMISSIONS.has(name),
+        )
+        .filter((r) => appHolds(r) && !grantsLevel(inst.permissions[r[0]], r[1]))
+        .map(([name]) => name);
+      return missing.length > 0
+        ? [{ installationId: inst.id, account: inst.account, missingPermissions: missing }]
+        : [];
+    }),
+  };
+}
+
+/** Whether any gap array is non-empty. */
+export function hasRequirementGaps(gaps: GithubAppRequirementGaps): boolean {
+  return (
+    gaps.missingEvents.length +
+      gaps.missingPermissions.length +
+      gaps.installationsPendingApproval.length >
+    0
+  );
 }
 
 /**

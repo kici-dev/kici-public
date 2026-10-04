@@ -79,13 +79,34 @@ const scalerCapacitySummarySchema = z
 
 // --- ECDH handshake ---
 
-/** Peer hello: initiator sends ephemeral X25519 public key and nonce. */
+/** Peer authentication schemes. A server lists the ones it accepts in `peer.hello`. */
+export const PeerAuthScheme = z.enum(['mutual-v2']);
+export type PeerAuthScheme = z.infer<typeof PeerAuthScheme>;
+
+/** How a peer proves itself: with its persisted credential, or with a join token on first join. */
+export const PeerAuthMode = z.enum(['credential', 'token']);
+export type PeerAuthMode = z.infer<typeof PeerAuthMode>;
+
+/**
+ * The reason a server gives a peer that authenticates without mutual-v2 (a
+ * proof or token field, or no scheme). It is none of the credential-divergence
+ * reasons, so that peer keeps its credential file.
+ */
+export const PEER_MUTUAL_AUTH_REQUIRED_REASON = 'Mutual peer authentication required';
+
+/** Peer hello: the server sends its ephemeral X25519 public key, a nonce and its schemes. */
 export const peerHelloSchema = z.object({
   type: z.literal('peer.hello'),
   /** Base64-encoded X25519 DER SPKI ephemeral public key. */
   ephemeralPublicKey: z.string(),
   /** Base64-encoded 32-byte random nonce (HKDF salt). */
   nonce: z.string(),
+  /**
+   * The authentication schemes this server accepts. Strings rather than an
+   * enum, so a hello naming a scheme this build does not know still parses.
+   * Optional so a hello naming none reaches the client's explicit refusal.
+   */
+  authSchemes: z.array(z.string()).optional(),
 });
 
 /** Peer hello response: responder sends their ephemeral X25519 public key. */
@@ -95,21 +116,28 @@ export const peerHelloResponseSchema = z.object({
   ephemeralPublicKey: z.string(),
 });
 
-// --- Peer authentication ---
+// --- Peer authentication (mutual-v2) ---
+// Both messages travel under the handshake key. The client proves the shared
+// key (its credential, or its join token) with an HMAC over the handshake
+// transcript; the server answers with its own HMAC over the transcript and the
+// client proof. The client accepts nothing until that server proof verifies,
+// and every later frame uses an application key derived from the shared key.
 
-/** Peer auth request sent after ECDH handshake (encrypted channel established). */
+/** Peer auth request sent after the ECDH handshake, under the handshake key. */
 export const peerAuthRequestSchema = z.object({
   type: z.literal('peer.auth.request'),
   instanceId: z.string(),
-  /** Join token (first connection via token-based auth). */
-  token: z.string().optional(),
-  /** HMAC proof of credential ownership (reconnection). */
-  proof: z.string().optional(),
   protocolVersion: z.number(),
-  /** Software version of the connecting peer (for version compat check). */
+  /** Software version of the connecting peer (logged). */
   softwareVersion: z.string().optional(),
-  /** Role of the connecting peer. */
+  /** Role of the connecting peer, as it declares it. */
   role: z.enum(['coordinator', 'worker']).optional(),
+  scheme: PeerAuthScheme,
+  mode: PeerAuthMode,
+  /** Hex HMAC-SHA256 proof bound to the handshake transcript. */
+  clientProof: z.string(),
+  /** The join token's base64url routing segment. The server requires it in token mode. */
+  tokenRouting: z.string().optional(),
 });
 
 /** Peer auth response indicating whether the connection was accepted. */
@@ -118,6 +146,8 @@ export const peerAuthResponseSchema = z.object({
   accepted: z.boolean(),
   instanceId: z.string().optional(),
   reason: z.string().optional(),
+  /** Hex proof that the server holds the same credential or token; present on every acceptance. */
+  serverProof: z.string().optional(),
   /** Session credential issued on first join (worker stores for reconnection). */
   sessionCredential: z.string().optional(),
   /** Assigned role echoed back to the connecting peer. */
@@ -738,6 +768,9 @@ export const peerFromPeerMessageSchema = z.discriminatedUnion('type', [
 export type PeerCapabilities = z.infer<typeof peerCapabilitiesSchema>;
 export type ScalerCapacitySummary = z.infer<typeof scalerCapacitySummarySchema>;
 export type PeerHeartbeat = z.infer<typeof peerHeartbeatSchema>;
+export type PeerHello = z.infer<typeof peerHelloSchema>;
+export type PeerAuthRequest = z.infer<typeof peerAuthRequestSchema>;
+export type PeerAuthResponse = z.infer<typeof peerAuthResponseSchema>;
 export type JobReroute = z.infer<typeof jobRerouteSchema>;
 export type RerouteSpawnRetry = z.infer<typeof rerouteSpawnRetrySchema>;
 export type JobProgress = z.infer<typeof jobProgressSchema>;

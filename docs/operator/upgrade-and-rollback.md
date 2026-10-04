@@ -45,6 +45,20 @@ encrypted dispatches the jobs a newer coordinator queued without their secrets.
 Upgrade every coordinator in the same maintenance window, and do not leave an
 older one running next to a newer one.
 
+**Upgrade every coordinator and worker of a cluster together.** A release with
+mutual peer authentication changes how peers connect. Orchestrators with mutual peer authentication and
+older orchestrators do not connect to each other in either direction, so until
+the last one is upgraded the cluster splits. The upgraded side logs
+`Peer does not support mutual authentication; upgrade every orchestrator in the cluster`,
+and the older side's connection is refused with `Mutual peer authentication required`.
+Single orchestrators, the hosted Platform and agents are not affected.
+
+**Join with a matching `kici-admin`.** `kici-admin join` and the cluster's
+orchestrators must both be on a release with join protocol v2; there is no
+mixed-version join. Upgrade the cluster's orchestrators, then the `kici-admin`
+you join with. Join tokens created before the upgrade keep working until they
+expire.
+
 ## Drain before upgrading
 
 Restarting an orchestrator to upgrade it severs the WebSocket connection to any

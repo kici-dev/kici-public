@@ -8,13 +8,18 @@
  * Global options:
  *   --url / -u    Orchestrator URL (env: KICI_ADMIN_URL, default: http://localhost:8080)
  *   --token / -t  Admin API token (env: KICI_ADMIN_TOKEN, required)
+ *   -V / --cli-version / --version  Print the CLI version (--version only before a command)
+ *
+ * A command that declares its own option under one of these flags (for
+ * example `orchestrator upgrade --url`) owns that flag after its name; see
+ * `root-option-routing.ts`.
  */
 
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
-import { Command } from 'commander';
+import { Command, type ParseOptionsResult } from 'commander';
 import { AdminApiClient } from './api-client.js';
 import { registerSecretCommands } from './commands/secret.js';
 import { registerRotateCommand } from './commands/rotate.js';
@@ -62,6 +67,7 @@ import { registerCacheCommands } from './commands/cache.js';
 import { registerFirecrackerCommands } from './commands/firecracker/index.js';
 import { registerScalerCommands } from './commands/scaler.js';
 import { registerJoinCommand } from './join.js';
+import { ROOT_VERSION_FLAG, routeRootArgs } from './root-option-routing.js';
 
 declare const KICI_PKG_VERSION: string;
 
@@ -77,6 +83,24 @@ declare const KICI_PKG_VERSION: string;
 export const CLI_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
 
 /**
+ * The kici-admin root command: a Commander `Command` whose own option parsing
+ * first routes the argv through {@link routeRootArgs}. A leading `--version`
+ * prints the CLI version, and an option a command declares under a root
+ * option's flag reaches that command. Subcommands are plain `Command`s, so
+ * their option parsing is unchanged.
+ */
+class KiciAdminProgram extends Command {
+  override parseOptions(args: string[]): ParseOptionsResult {
+    const routed = routeRootArgs(this, args);
+    const parsed = super.parseOptions(routed.args);
+    return {
+      operands: parsed.operands.map(routed.restore),
+      unknown: parsed.unknown.map(routed.restore),
+    };
+  }
+}
+
+/**
  * Build the kici-admin Commander program with every command group registered.
  * Exported so the surface registry can walk the real command tree without
  * parsing argv (no action runs during a tree walk, so `getClient` is
@@ -84,12 +108,16 @@ export const CLI_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VE
  */
 
 export function buildProgram(): Command {
-  const program = new Command();
+  const program = new KiciAdminProgram();
 
   program
     .name('kici-admin')
     .description('KiCI orchestrator admin CLI for managing config, secrets, and tokens')
-    .version(CLI_VERSION, '-V, --cli-version')
+    .version(
+      CLI_VERSION,
+      `-V, ${ROOT_VERSION_FLAG}`,
+      'output the version number (--version also works before a command)',
+    )
     .option(
       '-u, --url <url>',
       'Orchestrator URL',

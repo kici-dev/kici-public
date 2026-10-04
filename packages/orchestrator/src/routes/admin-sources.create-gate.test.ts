@@ -43,8 +43,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createSourceRoutes } from './admin-sources.js';
 import type { SourceStore } from '../sources/source-store.js';
 import * as sourceValidator from '../sources/source-validator.js';
-import { OrchestratorMode } from '@kici-dev/engine';
-import { OBSERVED_GITHUB_APP_SOURCE_ERROR } from '../sources/source-manager.js';
 
 vi.mock('../sources/source-validator.js', () => ({
   validateGitHubSource: vi.fn(),
@@ -215,61 +213,34 @@ describe('source-create gate invariants', () => {
   });
 });
 
-describe('observed-mode GitHub-App source refusal', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+describe('GitHub-App source creation in observed mode', () => {
+  beforeEach(() => vi.clearAllMocks());
 
-  it('rejects GitHub-App source creation and never validates or persists', async () => {
-    const addSource = vi.fn();
-    const sourceStore = createMockSourceStore({ addSource });
-    const app = createSourceRoutes({ sourceStore, mode: OrchestratorMode.enum.observed });
-
-    const res = await app.request('/sources', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider: 'github',
-        name: 'relay-source',
-        appId: '42',
-        privateKey: '-----BEGIN RSA PRIVATE KEY-----\nLEGIT\n-----END RSA PRIVATE KEY-----',
-        webhookSecret: 'wh-secret',
-      }),
-    });
-
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe(OBSERVED_GITHUB_APP_SOURCE_ERROR);
-    expect(sourceValidator.validateGitHubSource).not.toHaveBeenCalled();
-    expect(addSource).not.toHaveBeenCalled();
-  });
-
-  it('still accepts GitHub-App source creation in hybrid mode', async () => {
+  // fails-when: the observed 400 gate exists.
+  // breaks-if-wrong: an invalid key still answers the validator's 400 (the
+  //   ownership-gate test above), so the mode change opens no bypass.
+  it('validates credentials and creates the source', async () => {
     vi.mocked(sourceValidator.validateGitHubSource).mockResolvedValueOnce({
       valid: true,
       appName: 'Legitimate App',
     });
-    const addSource = vi.fn().mockResolvedValue({
-      id: 's1',
-      routing_key: 'github:42',
-      name: 'legit-source',
+    const addSource = vi.fn().mockResolvedValue({ id: 's1', routing_key: 'github:42', name: 'x' });
+    const app = createSourceRoutes({
+      sourceStore: createMockSourceStore({ addSource }),
     });
-    const sourceStore = createMockSourceStore({ addSource });
-    const app = createSourceRoutes({ sourceStore, mode: OrchestratorMode.enum.hybrid });
-
     const res = await app.request('/sources', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         provider: 'github',
-        name: 'legit-source',
+        name: 'observed-source',
         appId: '42',
         privateKey: '-----BEGIN RSA PRIVATE KEY-----\nLEGIT\n-----END RSA PRIVATE KEY-----',
         webhookSecret: 'wh-secret',
       }),
     });
-
     expect(res.status).toBe(201);
+    expect(sourceValidator.validateGitHubSource).toHaveBeenCalledWith('42', expect.any(String));
     expect(addSource).toHaveBeenCalledTimes(1);
   });
 });

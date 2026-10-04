@@ -23,7 +23,7 @@ The split matters:
 
 Every `access_log` row carries a `source` naming how the action reached the orchestrator. The audit trail is transport-independent — the same mutation is recorded whether an operator drove it over HTTP or straight against the database:
 
-- **`platform_proxy`** — a dashboard action relayed through the hosted Platform (e.g. the fleet host declare/remove buttons).
+- **`platform_proxy`** — a dashboard action relayed through the hosted Platform (e.g. the fleet host declare/remove buttons). A refused fleet write records outcome `denied` with an error of the form `<code>:<detail>`, where the code is `reserved_property`, `host_exists` or `host_confirmed` (or `operation_disabled` when the dashboard-write policy turned the operation off).
 - **`admin_http`** — a call to the orchestrator's Bearer-authed `/api/v1/admin/*` surface.
 - **`admin_cli`** — the direct-DB `kici-admin` subcommands that act straight against Postgres, bypassing the admin HTTP API. These are attributed to a `service_account` actor keyed on the operator's OS identity (`<user>@<host>`) since there is no dashboard login on the box. The recording subcommands are:
   - `host declare`, `host remove` — emit `fleet.host.declare` / `fleet.host.remove` (the same action values as the dashboard fleet-write path, so the two transports are audit-parity).

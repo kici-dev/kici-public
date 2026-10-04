@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { PeerHeartbeat, PeerLogChunk } from '@kici-dev/engine';
 import {
@@ -19,10 +19,15 @@ import {
   decryptMessage,
 } from './peer-crypto.js';
 import {
+  PEER_MUTUAL_AUTH_REQUIRED_REASON,
   PROTOCOL_VERSION,
   MIN_PROTOCOL_VERSION,
+  WS_CLOSE_INVALID_MESSAGE,
   WS_CLOSE_PROTOCOL_ERROR,
+  WS_CLOSE_UNAUTHORIZED,
   ScalerEventType,
+  jobRerouteSchema,
+  type JobReroute,
 } from '@kici-dev/engine';
 import {
   createPeerHandler,
@@ -32,6 +37,34 @@ import {
 } from './peer-handler.js';
 import { PeerRegistry } from './peer-registry.js';
 import { TOKEN_ALREADY_USED_MESSAGE } from './join-token.js';
+import {
+  credentialPsk,
+  makeTestJoinToken,
+  refAppKey,
+  refClientProof,
+  refServerProof,
+  refTranscriptHash,
+  tokenPsk,
+} from '../__test-helpers__/peer-mutual-auth.js';
+
+// ── Capture the peer-handler logger (wraps the real one) ────────────
+
+const loggerHolder = vi.hoisted(() => ({
+  peerHandler: undefined as
+    undefined | { info: (...a: unknown[]) => unknown; warn: (...a: unknown[]) => unknown },
+}));
+
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: (opts?: { prefix?: string }) => {
+      const real = actual.createLogger(opts);
+      if (opts?.prefix === 'peer-handler') loggerHolder.peerHandler = real as never;
+      return real;
+    },
+  };
+});
 
 // ── Mock WebSocket ──────────────────────────────────────────────────
 
@@ -72,17 +105,48 @@ class MockPeerWs extends EventEmitter implements PeerWsLike {
 
 // ── Mock JoinTokenManager ──────────────────────────────────────────
 
-function createMockTokenManager(overrides: Partial<Record<string, unknown>> = {}) {
-  const validationHash = 'test-validation-hash';
+const TOKEN_ROUTING = { orgId: 'org-1', routingKey: 'github:42', expiry: Date.now() + 3_600_000 };
+
+/** The join token the default token manager double holds a row for. */
+const DEFAULT_TOKEN = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' });
+
+type TokenRow = { tokenHash: string; role: 'coordinator' | 'worker' };
+
+/**
+ * Role and routing come from the token row, so the double answers with the
+ * row's values. `resolveLiveTokenByRouting` offers every row to the caller's
+ * proof check, as the real lookup does for rows sharing one routing triple.
+ */
+function createMockTokenManager(
+  overrides: { role?: 'coordinator' | 'worker'; rows?: TokenRow[] } = {},
+) {
+  const rows: TokenRow[] = overrides.rows ?? [
+    { tokenHash: DEFAULT_TOKEN.tokenHash, role: overrides.role ?? 'coordinator' },
+  ];
+  const claimed = (row: TokenRow) => ({
+    tokenHash: row.tokenHash,
+    role: row.role,
+    routing: { ...TOKEN_ROUTING, role: row.role },
+  });
   return {
-    validateAndConsumeToken: vi.fn().mockResolvedValue({
-      routing: {
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        expiry: Date.now() + 3600_000,
-        role: (overrides.role as string) ?? 'coordinator',
+    token: DEFAULT_TOKEN,
+    rows,
+    resolveLiveTokenByRouting: vi.fn(
+      async (_claimed: unknown, accepts: (tokenHash: string) => boolean) => {
+        for (const row of rows) {
+          if (accepts(row.tokenHash)) return { status: 'live' as const, tokenHash: row.tokenHash };
+        }
+        return { status: 'unknown' as const };
       },
-      keys: { encryptionKey: Buffer.alloc(32), validationHash },
+    ),
+    claimByHash: vi.fn(async (tokenHash: string) => {
+      const row = rows.find((r) => r.tokenHash === tokenHash);
+      if (!row) throw new Error('Invalid join token');
+      return claimed(row);
+    }),
+    readByHash: vi.fn(async (tokenHash: string) => {
+      const row = rows.find((r) => r.tokenHash === tokenHash);
+      return row ? { routing: claimed(row).routing, role: row.role } : null;
     }),
     createToken: vi.fn(),
   };
@@ -128,8 +192,12 @@ function makeLocalInventory(): Omit<PeerHeartbeat, 'type'> {
 
 function createTestHandler(overrides: Partial<PeerHandlerDeps> = {}) {
   const registry = new PeerRegistry();
-  const tokenManager = createMockTokenManager(overrides as any);
-  const credentialStore = createMockCredentialStore();
+  const tokenManager =
+    (overrides.tokenManager as unknown as ReturnType<typeof createMockTokenManager>) ??
+    createMockTokenManager(overrides as any);
+  const credentialStore =
+    (overrides.credentialStore as unknown as ReturnType<typeof createMockCredentialStore>) ??
+    createMockCredentialStore();
   const deps: PeerHandlerDeps = {
     tokenManager: tokenManager as any,
     credentialStore: credentialStore as any,
@@ -148,61 +216,230 @@ function createTestHandler(overrides: Partial<PeerHandlerDeps> = {}) {
   return { handler, registry, deps, tokenManager, credentialStore };
 }
 
-/**
- * Complete the ECDH handshake phase and return the derived session key.
- * After calling this, the server is waiting for an encrypted peer.auth.request.
- */
-function completeEcdhHandshake(ws: MockPeerWs): {
+interface ClientHandshake {
+  /** K_hs: the auth request and response travel under it. */
   sessionKey: Buffer;
   serverNonce: Buffer;
-} {
-  // The server sends peer.hello as first message
+  /** TH, computed by the independent helper over the hello the server sent. */
+  transcriptHash: Buffer;
+}
+
+/**
+ * Complete the ECDH handshake phase as a client would. After this, the server
+ * is waiting for a peer.auth.request under K_hs.
+ */
+function completeEcdhHandshake(ws: MockPeerWs): ClientHandshake {
   expect(ws.sentMessages.length).toBeGreaterThanOrEqual(1);
   const helloMsg = JSON.parse(ws.sentMessages[0]);
   expect(helloMsg.type).toBe('peer.hello');
+  expect(helloMsg.authSchemes).toEqual(['mutual-v2']);
 
   const serverPubKey = Buffer.from(helloMsg.ephemeralPublicKey, 'base64');
   const serverNonce = Buffer.from(helloMsg.nonce, 'base64');
-
-  // Client generates its own ECDH key pair
   const clientEcdh = generateEcdhKeyPair();
-
-  // Client derives session key using server's public key and nonce
   const sessionKey = deriveSessionKey(clientEcdh.privateKey, serverPubKey, serverNonce);
 
-  // Client sends peer.hello.response
   ws.simulateMessage({
     type: 'peer.hello.response',
     ephemeralPublicKey: clientEcdh.publicKey.toString('base64'),
   });
 
-  return { sessionKey, serverNonce };
+  return {
+    sessionKey,
+    serverNonce,
+    transcriptHash: refTranscriptHash(
+      serverPubKey,
+      serverNonce,
+      helloMsg.authSchemes,
+      clientEcdh.publicKey,
+    ),
+  };
+}
+
+/** A presented join token's routing segment and stored hash; a malformed one becomes an unknown token. */
+function asTestToken(token: string): { routingB64: string; tokenHash: string } {
+  const parts = token.split('.');
+  if (parts.length === 3 && parts[0] === 'kici_join_v1' && /^[0-9a-f]{64}$/.test(parts[2])) {
+    return {
+      routingB64: parts[1],
+      tokenHash: createHash('sha256').update(Buffer.from(parts[2], 'hex')).digest('hex'),
+    };
+  }
+  return makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' });
 }
 
 /**
- * Complete full authentication with a join token.
+ * A mutual-v2 peer.auth.request under K_hs, as a client builds it. `token`
+ * proves that join token; `credential` proves that credential; `proof` sends
+ * a fixed credential-mode proof as-is.
+ */
+const sentProofs = new WeakMap<ClientHandshake, { psk: Buffer; clientProof: Buffer }>();
+
+function authFrame(hs: ClientHandshake, req: Record<string, any>): string {
+  const { token, proof, credential, ...rest } = req;
+  let mode: 'credential' | 'token';
+  let psk: Buffer | null = null;
+  let tokenRouting = '';
+  if (credential !== undefined) {
+    mode = 'credential';
+    psk = credentialPsk(credential);
+  } else if (proof !== undefined) {
+    mode = 'credential';
+  } else if (token !== undefined) {
+    mode = 'token';
+    const t = asTestToken(token);
+    psk = tokenPsk(t.tokenHash);
+    tokenRouting = t.routingB64;
+  } else {
+    throw new Error('authFrame needs a token, a credential or a proof');
+  }
+  const clientProof =
+    psk === null
+      ? String(proof)
+      : refClientProof({
+          psk,
+          th: hs.transcriptHash,
+          mode,
+          instanceId: req.instanceId,
+          role: req.role ?? '',
+          protocolVersion: req.protocolVersion,
+          tokenRouting,
+        }).toString('hex');
+  if (psk) sentProofs.set(hs, { psk, clientProof: Buffer.from(clientProof, 'hex') });
+  return encryptMessage(
+    JSON.stringify({
+      ...rest,
+      scheme: 'mutual-v2',
+      mode,
+      clientProof,
+      ...(mode === 'token' && { tokenRouting }),
+    }),
+    hs.sessionKey,
+  );
+}
+
+/** K_app after the server accepted the request `authFrame` built on this handshake. */
+function appKeyOf(ws: MockPeerWs, hs: ClientHandshake): Buffer {
+  const sent = sentProofs.get(hs)!;
+  const response = authResponseOf(ws, hs.sessionKey);
+  expect(response?.accepted).toBe(true);
+  return refAppKey({
+    handshakeKey: hs.sessionKey,
+    psk: sent.psk,
+    th: hs.transcriptHash,
+    clientProof: sent.clientProof,
+    serverProof: Buffer.from(response.serverProof, 'hex'),
+  });
+}
+
+/** The decrypted peer.auth.response the server sent under K_hs, or null. */
+function authResponseOf(ws: MockPeerWs, handshakeKey: Buffer): any {
+  for (const msg of ws.sentMessages.slice(1)) {
+    try {
+      const parsed = JSON.parse(decryptMessage(msg, handshakeKey));
+      if (parsed.type === 'peer.auth.response') return parsed;
+    } catch {
+      // not under this key
+    }
+  }
+  return null;
+}
+
+/**
+ * Drive a full mutual-v2 authentication: `credential` mode proves the PSK
+ * given, `token` mode proves a join token's hash with its routing segment.
+ * On acceptance it checks the server proof with the independent helper and
+ * returns K_app as `sessionKey`.
+ */
+async function authenticateV2(
+  handler: ReturnType<typeof createPeerHandler>,
+  ws: MockPeerWs,
+  opts: {
+    mode: 'credential' | 'token';
+    psk: Buffer;
+    peerInstanceId?: string;
+    role?: 'coordinator' | 'worker';
+    tokenRouting?: string;
+    ip?: string;
+  },
+): Promise<{ sessionKey: Buffer; handshakeKey: Buffer; response: Record<string, any> }> {
+  handler.handleConnection(ws, opts.ip);
+  const hs = completeEcdhHandshake(ws);
+  const peerInstanceId = opts.peerInstanceId ?? 'remote-peer';
+  const role = opts.role ?? 'coordinator';
+  const clientProof = refClientProof({
+    psk: opts.psk,
+    th: hs.transcriptHash,
+    mode: opts.mode,
+    instanceId: peerInstanceId,
+    role,
+    protocolVersion: PROTOCOL_VERSION,
+    tokenRouting: opts.tokenRouting ?? '',
+  });
+  ws.simulateRawMessage(
+    encryptMessage(
+      JSON.stringify({
+        type: 'peer.auth.request',
+        instanceId: peerInstanceId,
+        protocolVersion: PROTOCOL_VERSION,
+        role,
+        scheme: 'mutual-v2',
+        mode: opts.mode,
+        clientProof: clientProof.toString('hex'),
+        ...(opts.tokenRouting && { tokenRouting: opts.tokenRouting }),
+      }),
+      hs.sessionKey,
+    ),
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  const response = authResponseOf(ws, hs.sessionKey);
+  if (!response?.accepted) {
+    return { sessionKey: hs.sessionKey, handshakeKey: hs.sessionKey, response };
+  }
+  const serverProof = Buffer.from(response.serverProof, 'hex');
+  // The server's proof, checked by an independent computation
+  expect(
+    serverProof.equals(
+      refServerProof({
+        psk: opts.psk,
+        th: hs.transcriptHash,
+        clientProof,
+        serverInstanceId: 'handler-orch',
+        grantedRole: response.role,
+        sessionCredential: response.sessionCredential ?? null,
+      }),
+    ),
+  ).toBe(true);
+  return {
+    sessionKey: refAppKey({
+      handshakeKey: hs.sessionKey,
+      psk: opts.psk,
+      th: hs.transcriptHash,
+      clientProof,
+      serverProof,
+    }),
+    handshakeKey: hs.sessionKey,
+    response,
+  };
+}
+
+/** Token-mode options for a test join token. */
+const tokenOpts = (t: { tokenHash: string; routingB64: string }) => ({
+  mode: 'token' as const,
+  psk: tokenPsk(t.tokenHash),
+  tokenRouting: t.routingB64,
+});
+
+/**
+ * Complete full authentication with the default join token. Returns K_app as
+ * `sessionKey`, and K_hs as `handshakeKey`.
  */
 async function authenticateWithToken(
   handler: ReturnType<typeof createPeerHandler>,
   ws: MockPeerWs,
   peerInstanceId = 'remote-peer',
-): Promise<{ sessionKey: Buffer }> {
-  handler.handleConnection(ws);
-  const { sessionKey, serverNonce } = completeEcdhHandshake(ws);
-
-  // Send encrypted auth request with token
-  const authRequest = {
-    type: 'peer.auth.request',
-    instanceId: peerInstanceId,
-    protocolVersion: PROTOCOL_VERSION,
-    token: 'kici_join_v1.test.token',
-  };
-  ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
-
-  // Wait for async auth handling
-  await vi.advanceTimersByTimeAsync(0);
-
-  return { sessionKey };
+): Promise<{ sessionKey: Buffer; handshakeKey: Buffer; response: Record<string, any> }> {
+  return authenticateV2(handler, ws, { ...tokenOpts(DEFAULT_TOKEN), peerInstanceId });
 }
 
 // ── Setup / Teardown ────────────────────────────────────────────────
@@ -241,7 +478,8 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       // Session key should be 32 bytes
       expect(sessionKey.length).toBe(32);
@@ -255,13 +493,13 @@ describe('PeerHandler', () => {
       const { handler, tokenManager, credentialStore } = createTestHandler();
       const ws = new MockPeerWs();
 
-      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const { handshakeKey: sessionKey } = await authenticateWithToken(handler, ws);
 
-      // Atomic validate+consume should have fired with the token, this
+      // The atomic claim should have fired with the token's hash, this
       // coordinator's instance ID as the consumedBy attribution, and the
       // joining peer's instanceId recorded as consumed_by_instance.
-      expect(tokenManager.validateAndConsumeToken).toHaveBeenCalledWith(
-        'kici_join_v1.test.token',
+      expect(tokenManager.claimByHash).toHaveBeenCalledWith(
+        DEFAULT_TOKEN.tokenHash,
         'handler-orch',
         'remote-peer',
       );
@@ -314,11 +552,11 @@ describe('PeerHandler', () => {
       credentialStore.findByInstanceId.mockResolvedValue(null);
       const ws = new MockPeerWs();
 
-      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const { handshakeKey: sessionKey } = await authenticateWithToken(handler, ws);
 
-      // The manager was asked to validate with the joining peer's instanceId.
-      expect(tokenManager.validateAndConsumeToken).toHaveBeenCalledWith(
-        'kici_join_v1.test.token',
+      // The manager was asked to claim with the joining peer's instanceId.
+      expect(tokenManager.claimByHash).toHaveBeenCalledWith(
+        DEFAULT_TOKEN.tokenHash,
         'handler-orch',
         'remote-peer',
       );
@@ -349,12 +587,13 @@ describe('PeerHandler', () => {
 
     it('rejects invalid join token', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Invalid join token'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Invalid join token'));
       const { handler } = createTestHandler({ tokenManager: tokenManager as any });
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const authRequest = {
         type: 'peer.auth.request',
@@ -362,7 +601,7 @@ describe('PeerHandler', () => {
         protocolVersion: PROTOCOL_VERSION,
         token: 'bad-token',
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
 
       await vi.advanceTimersByTimeAsync(0);
 
@@ -378,15 +617,16 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'remote-peer',
         protocolVersion: PROTOCOL_VERSION,
-        token: 'worker-token',
+        token: DEFAULT_TOKEN.token,
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
 
       await vi.advanceTimersByTimeAsync(0);
 
@@ -409,9 +649,61 @@ describe('PeerHandler', () => {
     });
   });
 
+  describe('token role comes from the token row', () => {
+    // fails-when: the first-claim branch reads the role from the presented token.
+    it('refuses a coordinator-only join when the row is a worker token, whatever the token says', async () => {
+      const presented = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' });
+      const tokenManager = createMockTokenManager({
+        rows: [{ tokenHash: presented.tokenHash, role: 'worker' }],
+      });
+      const { handler, credentialStore } = createTestHandler({
+        tokenManager: tokenManager as any,
+        acceptedRoles: ['coordinator'],
+      });
+      const ws = new MockPeerWs();
+      handler.handleConnection(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
+      const token = presented.token;
+      ws.simulateRawMessage(
+        authFrame(hs, {
+          type: 'peer.auth.request',
+          instanceId: 'remote-peer',
+          protocolVersion: PROTOCOL_VERSION,
+          token,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      let authResponse: any = null;
+      for (const msg of ws.sentMessages.slice(1)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.auth.response') authResponse = parsed;
+        } catch {
+          /* not this message */
+        }
+      }
+      expect(authResponse?.accepted).toBe(false);
+      expect(authResponse?.reason).toBe('Role mismatch');
+      expect(credentialStore.save).not.toHaveBeenCalled();
+    });
+
+    it('saves the token hash and routing key the claim returns', async () => {
+      const { handler, credentialStore } = createTestHandler();
+      await authenticateWithToken(handler, new MockPeerWs());
+      expect(credentialStore.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceTokenHash: DEFAULT_TOKEN.tokenHash,
+          routingKeys: ['github:42'],
+        }),
+      );
+    });
+  });
+
   describe('idempotent token retry (multi-coord mesh race)', () => {
     // Helper: build a real-format token + matching validation hash so the
-    // recovery path's parseToken()/deriveKeys() call chain works end-to-end.
+    // recovery path's parseToken()/tokenHashOf() call chain works end-to-end.
     function makeRealToken(role: 'coordinator' | 'worker' = 'coordinator') {
       const routing = {
         orgId: 'org-1',
@@ -433,9 +725,22 @@ describe('PeerHandler', () => {
       token: string,
       credentialStoreOverride?: ReturnType<typeof createMockCredentialStore>,
       acceptedRoles: Array<'coordinator' | 'worker'> = ['coordinator'],
+      readByHashResult?: {
+        routing: Record<string, unknown>;
+        role: 'coordinator' | 'worker';
+      } | null,
     ) {
-      const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error(ALREADY_USED));
+      const tokenManager = createMockTokenManager({
+        rows: [
+          {
+            tokenHash: asTestToken(token).tokenHash,
+            role: readByHashResult?.role ?? 'coordinator',
+          },
+        ],
+      });
+      tokenManager.claimByHash.mockRejectedValue(new Error(ALREADY_USED));
+      if (readByHashResult !== undefined)
+        tokenManager.readByHash.mockResolvedValue(readByHashResult as never);
       const credentialStore = credentialStoreOverride ?? createMockCredentialStore();
       const { handler } = createTestHandler({
         tokenManager: tokenManager as any,
@@ -445,18 +750,16 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       ws.simulateRawMessage(
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.request',
-            instanceId: 'remote-peer',
-            protocolVersion: PROTOCOL_VERSION,
-            token,
-          }),
-          sessionKey,
-        ),
+        authFrame(hs, {
+          type: 'peer.auth.request',
+          instanceId: 'remote-peer',
+          protocolVersion: PROTOCOL_VERSION,
+          token,
+        }),
       );
       await vi.advanceTimersByTimeAsync(0);
 
@@ -513,7 +816,7 @@ describe('PeerHandler', () => {
           sourceTokenHash: validationHash,
         }),
       );
-      expect(tokenManager.validateAndConsumeToken).toHaveBeenCalledTimes(1);
+      expect(tokenManager.claimByHash).toHaveBeenCalledTimes(1);
 
       expect(authResponse).not.toBeNull();
       expect(authResponse.accepted).toBe(true);
@@ -620,7 +923,15 @@ describe('PeerHandler', () => {
         authResponse,
         ws,
         credentialStore: cs,
-      } = await presentAlreadyUsedToken(token, credentialStore, ['coordinator']);
+      } = await presentAlreadyUsedToken(token, credentialStore, ['coordinator'], {
+        routing: {
+          orgId: 'org-1',
+          routingKey: 'github:42',
+          expiry: Date.now() + 3600_000,
+          role: 'worker',
+        },
+        role: 'worker',
+      });
 
       expect(cs.save).not.toHaveBeenCalled();
       expect(authResponse).not.toBeNull();
@@ -629,9 +940,105 @@ describe('PeerHandler', () => {
       expect(ws.closeCode).toBe(4001);
     });
 
+    function activeCredential(sourceTokenHash: string) {
+      return {
+        id: 'cred-1',
+        instanceId: 'remote-peer',
+        credentialHash: 'previously-issued-hash',
+        role: 'coordinator',
+        routingKeys: ['github:42'],
+        sourceTokenHash,
+        createdAt: new Date(),
+        lastSeenAt: null,
+        lastValidatedBy: null,
+        expiresAt: new Date(Date.now() + 86400_000),
+        revokedAt: null,
+      };
+    }
+
+    // fails-when: the retry branch reads the role from the presented token, not its row.
+    it('refuses the idempotent retry when the row is a worker token, whatever the token says', async () => {
+      const { token, validationHash } = makeRealToken('coordinator');
+      const credentialStore = createMockCredentialStore();
+      credentialStore.findByInstanceId.mockResolvedValue(activeCredential(validationHash));
+      const {
+        authResponse,
+        credentialStore: cs,
+        tokenManager,
+      } = await presentAlreadyUsedToken(token, credentialStore, ['coordinator'], {
+        routing: {
+          orgId: 'org-1',
+          routingKey: 'github:42',
+          expiry: Date.now() + 3600_000,
+          role: 'worker',
+        },
+        role: 'worker',
+      });
+      expect(tokenManager.readByHash).toHaveBeenCalledWith(validationHash);
+      expect(authResponse.accepted).toBe(false);
+      expect(authResponse.reason).toBe('Role mismatch');
+      expect(cs.save).not.toHaveBeenCalled();
+    });
+
+    it('saves the routing key of the token row on an idempotent retry', async () => {
+      const { token, validationHash } = makeRealToken('coordinator');
+      const credentialStore = createMockCredentialStore();
+      credentialStore.findByInstanceId.mockResolvedValue(activeCredential(validationHash));
+      const { credentialStore: cs } = await presentAlreadyUsedToken(
+        token,
+        credentialStore,
+        ['coordinator'],
+        {
+          routing: {
+            orgId: 'org-1',
+            routingKey: 'github:row',
+            expiry: Date.now() + 3600_000,
+            role: 'coordinator',
+          },
+          role: 'coordinator',
+        },
+      );
+      expect(cs.save).toHaveBeenCalledWith(
+        expect.objectContaining({ routingKeys: ['github:row'], sourceTokenHash: validationHash }),
+      );
+    });
+
+    it('refuses the idempotent retry when the token row is gone', async () => {
+      const { token, validationHash } = makeRealToken('coordinator');
+      const credentialStore = createMockCredentialStore();
+      credentialStore.findByInstanceId.mockResolvedValue(activeCredential(validationHash));
+      const { authResponse, credentialStore: cs } = await presentAlreadyUsedToken(
+        token,
+        credentialStore,
+        ['coordinator'],
+        null,
+      );
+      expect(authResponse.accepted).toBe(false);
+      expect(authResponse.reason).toBe('Invalid token');
+      expect(cs.save).not.toHaveBeenCalled();
+    });
+
+    // fails-when: `sourceTokenHash: presentedHash` stays on the log line.
+    it('logs a token fingerprint, never the token hash, on an idempotent retry', async () => {
+      const infoSpy = vi.spyOn(loggerHolder.peerHandler!, 'info');
+      const { token, validationHash } = makeRealToken('coordinator');
+      const credentialStore = createMockCredentialStore();
+      credentialStore.findByInstanceId.mockResolvedValue(activeCredential(validationHash));
+      const { authResponse } = await presentAlreadyUsedToken(token, credentialStore);
+      expect(authResponse.accepted).toBe(true);
+      const call = infoSpy.mock.calls.find(([m]) => m === 'Peer idempotent token retry accepted');
+      expect(call?.[1]).toMatchObject({
+        tokenFingerprint: expect.stringMatching(/^[0-9a-f]{12}$/),
+      });
+      const logged = JSON.stringify(infoSpy.mock.calls);
+      expect(logged).not.toContain(validationHash);
+      expect(logged).not.toMatch(/"[0-9a-f]{64}"/);
+      infoSpy.mockRestore();
+    });
+
     it('does not trigger recovery for non-"already used" validation errors', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Join token has expired'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Join token has expired'));
       const credentialStore = createMockCredentialStore();
       // Seed a matching credential — recovery would otherwise accept it
       credentialStore.findByInstanceId.mockResolvedValue({
@@ -653,19 +1060,17 @@ describe('PeerHandler', () => {
       });
       const ws = new MockPeerWs();
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const { token } = makeRealToken();
       ws.simulateRawMessage(
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.request',
-            instanceId: 'remote-peer',
-            protocolVersion: PROTOCOL_VERSION,
-            token,
-          }),
-          sessionKey,
-        ),
+        authFrame(hs, {
+          type: 'peer.auth.request',
+          instanceId: 'remote-peer',
+          protocolVersion: PROTOCOL_VERSION,
+          token,
+        }),
       );
       await vi.advanceTimersByTimeAsync(0);
 
@@ -676,8 +1081,8 @@ describe('PeerHandler', () => {
     });
   });
 
-  describe('credential-based authentication (HMAC proof)', () => {
-    it('accepts valid HMAC proof', async () => {
+  describe('credential-based authentication', () => {
+    it('accepts a valid credential proof', async () => {
       // Create a stored credential
       const rawCredential = randomBytes(32).toString('hex');
       const credentialHash = createHash('sha256').update(rawCredential).digest('hex');
@@ -700,21 +1105,17 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey, serverNonce } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
-      // Compute HMAC proof like the client would
-      const nonceB64 = serverNonce.toString('base64');
-      const proof = createHmac('sha256', Buffer.from(credentialHash, 'hex'))
-        .update(nonceB64 + ':' + 'remote-peer')
-        .digest('hex');
-
+      // A client proof over this handshake's transcript, built like the client does
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'remote-peer',
         protocolVersion: PROTOCOL_VERSION,
-        proof,
+        credential: rawCredential,
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
 
       await vi.advanceTimersByTimeAsync(0);
 
@@ -738,7 +1139,7 @@ describe('PeerHandler', () => {
       expect(authResponse.accepted).toBe(true);
     });
 
-    it('rejects invalid HMAC proof (timingSafeEqual)', async () => {
+    it('rejects an invalid credential proof', async () => {
       const credentialStore = createMockCredentialStore();
       credentialStore.findByInstanceId.mockResolvedValue({
         id: 'cred-1',
@@ -757,7 +1158,8 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const authRequest = {
         type: 'peer.auth.request',
@@ -765,7 +1167,7 @@ describe('PeerHandler', () => {
         protocolVersion: PROTOCOL_VERSION,
         proof: 'b'.repeat(64), // wrong proof
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
 
       await vi.advanceTimersByTimeAsync(0);
 
@@ -780,7 +1182,8 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const authRequest = {
         type: 'peer.auth.request',
@@ -788,7 +1191,7 @@ describe('PeerHandler', () => {
         protocolVersion: PROTOCOL_VERSION,
         proof: 'a'.repeat(64),
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
 
       await vi.advanceTimersByTimeAsync(0);
 
@@ -814,7 +1217,7 @@ describe('PeerHandler', () => {
   describe('rate limiting', () => {
     it('rate limits after 5 failed auth attempts from same IP', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Invalid'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Invalid'));
 
       const { handler } = createTestHandler({ tokenManager: tokenManager as any });
 
@@ -822,14 +1225,15 @@ describe('PeerHandler', () => {
       for (let i = 0; i < 5; i++) {
         const ws = new MockPeerWs();
         handler.handleConnection(ws, '192.168.1.100');
-        const { sessionKey } = completeEcdhHandshake(ws);
+        const hs = completeEcdhHandshake(ws);
+        const { sessionKey } = hs;
         const authRequest = {
           type: 'peer.auth.request',
           instanceId: `peer-${i}`,
           protocolVersion: PROTOCOL_VERSION,
           token: 'bad-token',
         };
-        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        ws.simulateRawMessage(authFrame(hs, authRequest));
         await vi.advanceTimersByTimeAsync(0);
       }
 
@@ -842,7 +1246,7 @@ describe('PeerHandler', () => {
 
     it('does not rate limit different IPs', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Invalid'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Invalid'));
 
       const { handler } = createTestHandler({ tokenManager: tokenManager as any });
 
@@ -850,14 +1254,15 @@ describe('PeerHandler', () => {
       for (let i = 0; i < 5; i++) {
         const ws = new MockPeerWs();
         handler.handleConnection(ws, `192.168.1.${i}`);
-        const { sessionKey } = completeEcdhHandshake(ws);
+        const hs = completeEcdhHandshake(ws);
+        const { sessionKey } = hs;
         const authRequest = {
           type: 'peer.auth.request',
           instanceId: `peer-${i}`,
           protocolVersion: PROTOCOL_VERSION,
           token: 'bad-token',
         };
-        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        ws.simulateRawMessage(authFrame(hs, authRequest));
         await vi.advanceTimersByTimeAsync(0);
       }
 
@@ -875,7 +1280,7 @@ describe('PeerHandler', () => {
   describe('dual rate limiting (per-IP + per-instance-ID)', () => {
     it('rate limits by instance ID after RATE_LIMIT_MAX failures from different IPs', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Invalid'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Invalid'));
 
       const { handler } = createTestHandler({ tokenManager: tokenManager as any });
       const sameInstanceId = 'attacker-instance';
@@ -884,14 +1289,15 @@ describe('PeerHandler', () => {
       for (let i = 0; i < 5; i++) {
         const ws = new MockPeerWs();
         handler.handleConnection(ws, `10.0.${i}.1`);
-        const { sessionKey } = completeEcdhHandshake(ws);
+        const hs = completeEcdhHandshake(ws);
+        const { sessionKey } = hs;
         const authRequest = {
           type: 'peer.auth.request',
           instanceId: sameInstanceId,
           protocolVersion: PROTOCOL_VERSION,
           token: 'bad-token',
         };
-        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        ws.simulateRawMessage(authFrame(hs, authRequest));
         await vi.advanceTimersByTimeAsync(0);
       }
 
@@ -909,7 +1315,7 @@ describe('PeerHandler', () => {
 
     it('records failures in both IP and instance ID maps', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Invalid'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Invalid'));
 
       const { handler } = createTestHandler({ tokenManager: tokenManager as any });
 
@@ -917,14 +1323,15 @@ describe('PeerHandler', () => {
       for (let i = 0; i < 5; i++) {
         const ws = new MockPeerWs();
         handler.handleConnection(ws, '192.168.1.100');
-        const { sessionKey } = completeEcdhHandshake(ws);
+        const hs = completeEcdhHandshake(ws);
+        const { sessionKey } = hs;
         const authRequest = {
           type: 'peer.auth.request',
           instanceId: 'bad-peer',
           protocolVersion: PROTOCOL_VERSION,
           token: 'bad-token',
         };
-        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        ws.simulateRawMessage(authFrame(hs, authRequest));
         await vi.advanceTimersByTimeAsync(0);
       }
 
@@ -937,7 +1344,7 @@ describe('PeerHandler', () => {
 
     it('rate limit resets after window expires', async () => {
       const tokenManager = createMockTokenManager();
-      tokenManager.validateAndConsumeToken.mockRejectedValue(new Error('Invalid'));
+      tokenManager.claimByHash.mockRejectedValue(new Error('Invalid'));
 
       const { handler } = createTestHandler({ tokenManager: tokenManager as any });
 
@@ -945,14 +1352,15 @@ describe('PeerHandler', () => {
       for (let i = 0; i < 5; i++) {
         const ws = new MockPeerWs();
         handler.handleConnection(ws, '192.168.1.100');
-        const { sessionKey } = completeEcdhHandshake(ws);
+        const hs = completeEcdhHandshake(ws);
+        const { sessionKey } = hs;
         const authRequest = {
           type: 'peer.auth.request',
           instanceId: `peer-${i}`,
           protocolVersion: PROTOCOL_VERSION,
           token: 'bad-token',
         };
-        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        ws.simulateRawMessage(authFrame(hs, authRequest));
         await vi.advanceTimersByTimeAsync(0);
       }
 
@@ -1163,17 +1571,18 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       // Send auth request with role: 'worker'
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'worker-peer',
         protocolVersion: PROTOCOL_VERSION,
-        token: 'kici_join_v1.test.token',
+        token: DEFAULT_TOKEN.token,
         role: 'worker',
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
       await vi.advanceTimersByTimeAsync(0);
 
       const peer = registry.getPeer('worker-peer');
@@ -1268,14 +1677,15 @@ describe('PeerHandler', () => {
       const { handler, registry } = createTestHandler();
       const ws = new MockPeerWs();
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'remote-peer',
         protocolVersion,
-        token: 'kici_join_v1.test.token',
+        token: DEFAULT_TOKEN.token,
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
       await vi.advanceTimersByTimeAsync(0);
       return { ws, registry, authResponse: findAuthResponse(ws, sessionKey) };
     };
@@ -1309,15 +1719,16 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'remote-peer',
         protocolVersion: MIN_PROTOCOL_VERSION,
-        token: 'kici_join_v1.test.token',
+        token: DEFAULT_TOKEN.token,
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
       await vi.advanceTimersByTimeAsync(0);
 
       const peer = registry.getPeer('remote-peer');
@@ -1331,15 +1742,16 @@ describe('PeerHandler', () => {
       const ws = new MockPeerWs();
 
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
+      const { sessionKey } = hs;
 
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'remote-peer',
         protocolVersion: MIN_PROTOCOL_VERSION + 99, // future version
-        token: 'kici_join_v1.test.token',
+        token: DEFAULT_TOKEN.token,
       };
-      ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+      ws.simulateRawMessage(authFrame(hs, authRequest));
       await vi.advanceTimersByTimeAsync(0);
 
       const peer = registry.getPeer('remote-peer');
@@ -1352,20 +1764,7 @@ describe('PeerHandler', () => {
       const { handler } = createTestHandler();
       const ws = new MockPeerWs();
 
-      const { sessionKey } = await authenticateWithToken(handler, ws);
-
-      let authResponse: any = null;
-      for (const msg of ws.sentMessages.slice(1)) {
-        try {
-          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
-          if (parsed.type === 'peer.auth.response') {
-            authResponse = parsed;
-            break;
-          }
-        } catch {
-          // ignore
-        }
-      }
+      const { response: authResponse } = await authenticateWithToken(handler, ws);
 
       expect(authResponse).not.toBeNull();
       expect(authResponse.accepted).toBe(true);
@@ -1620,20 +2019,18 @@ describe('PeerHandler', () => {
       });
       const ws = new MockPeerWs();
       handler.handleConnection(ws);
-      const { sessionKey } = completeEcdhHandshake(ws);
+      const hs = completeEcdhHandshake(ws);
       ws.simulateRawMessage(
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.request',
-            instanceId: 'remote-peer',
-            protocolVersion: PROTOCOL_VERSION,
-            token: 'kici_join_v1.worker.token',
-            role: 'coordinator',
-          }),
-          sessionKey,
-        ),
+        authFrame(hs, {
+          type: 'peer.auth.request',
+          instanceId: 'remote-peer',
+          protocolVersion: PROTOCOL_VERSION,
+          token: DEFAULT_TOKEN.token,
+          role: 'coordinator',
+        }),
       );
       await vi.advanceTimersByTimeAsync(0);
+      const sessionKey = appKeyOf(ws, hs);
       const countBefore = ws.sentMessages.length;
 
       ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
@@ -1753,16 +2150,17 @@ describe('PeerHandler', () => {
         });
         const ws = new MockPeerWs();
         handler.handleConnection(ws);
-        const { sessionKey } = completeEcdhHandshake(ws);
+        const hs = completeEcdhHandshake(ws);
         const authRequest = {
           type: 'peer.auth.request',
           instanceId: 'remote-peer',
           protocolVersion: PROTOCOL_VERSION,
-          token: 'kici_join_v1.worker.token',
+          token: DEFAULT_TOKEN.token,
           ...(declaredRole ? { role: declaredRole } : {}),
         };
-        ws.simulateRawMessage(encryptMessage(JSON.stringify(authRequest), sessionKey));
+        ws.simulateRawMessage(authFrame(hs, authRequest));
         await vi.advanceTimersByTimeAsync(0);
+        const sessionKey = appKeyOf(ws, hs);
         // The registry keeps the declared role; only the token's role is authenticated.
         expect(registry.getPeer('remote-peer')?.role).toBe(declaredRole ?? 'coordinator');
         const countBefore = ws.sentMessages.length;
@@ -2165,4 +2563,423 @@ describe('shouldAdmitWorker', () => {
   it('refuses a worker at a zero ceiling', () => {
     expect(shouldAdmitWorker('worker', 0, 0)).toBe(false);
   });
+
+  describe('mutual-v2 server', () => {
+    /** A schema-valid job.reroute, so a negative assertion cannot pass on a dropped fixture. */
+    function makeJobReroute(): JobReroute {
+      return jobRerouteSchema.parse({
+        type: 'job.reroute',
+        messageId: `msg-${randomBytes(4).toString('hex')}`,
+        jobId: 'job-1',
+        runId: 'run-1',
+        deliveryId: 'del-1',
+        routingKey: 'github:42',
+        event: 'push',
+        action: null,
+        payload: {},
+        jobName: 'build',
+        workflowName: 'ci',
+        runsOnLabels: [['linux']],
+        triedConnections: [],
+        maxHops: 3,
+        coordinatorId: 'orch-1',
+      });
+    }
+
+    /** A credential-mode request built against one handshake, so it can be replayed into another. */
+    function credentialRequest(hs: ClientHandshake, psk: Buffer, peerInstanceId = 'remote-peer') {
+      const clientProof = refClientProof({
+        psk,
+        th: hs.transcriptHash,
+        mode: 'credential',
+        instanceId: peerInstanceId,
+        role: 'coordinator',
+        protocolVersion: PROTOCOL_VERSION,
+        tokenRouting: '',
+      });
+      return JSON.stringify({
+        type: 'peer.auth.request',
+        instanceId: peerInstanceId,
+        protocolVersion: PROTOCOL_VERSION,
+        role: 'coordinator',
+        scheme: 'mutual-v2',
+        mode: 'credential',
+        clientProof: clientProof.toString('hex'),
+      });
+    }
+
+    /** A credential store holding one live credential for remote-peer. */
+    function storeWith(credential: string) {
+      const credentialStore = createMockCredentialStore();
+      credentialStore.findByInstanceId.mockResolvedValue({
+        id: 'cred-1',
+        instanceId: 'remote-peer',
+        credentialHash: createHash('sha256').update(credential).digest('hex'),
+        role: 'coordinator',
+        routingKeys: ['github:42'],
+        sourceTokenHash: null,
+        createdAt: new Date(),
+        lastSeenAt: null,
+        expiresAt: new Date(Date.now() + 86_400_000),
+        revokedAt: null,
+      } as never);
+      return credentialStore;
+    }
+
+    it('advertises mutual-v2 in peer.hello', () => {
+      const { handler } = createTestHandler();
+      const ws = new MockPeerWs();
+      handler.handleConnection(ws);
+      expect((ws.getSentMessages()[0] as { authSchemes: string[] }).authSchemes).toEqual([
+        'mutual-v2',
+      ]);
+    });
+
+    it('a frame under K_hs after acceptance is dropped; K_app frames are routed', async () => {
+      const onJobReroute = vi.fn().mockResolvedValue(undefined);
+      const { handler } = createTestHandler({ onJobReroute });
+      const ws = new MockPeerWs();
+      const { handshakeKey, sessionKey } = await authenticateWithToken(handler, ws);
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(makeJobReroute()), handshakeKey));
+      await vi.advanceTimersByTimeAsync(0);
+      // fails-when: the server keeps using K_hs after acceptance
+      expect(onJobReroute).not.toHaveBeenCalled();
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(makeJobReroute()), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onJobReroute).toHaveBeenCalledTimes(1);
+    });
+
+    it('relay splice: a client auth request re-encrypted into a second session is refused with Invalid proof', async () => {
+      const CRED = randomBytes(32).toString('hex');
+      const psk = credentialPsk(CRED);
+      const { handler } = createTestHandler({ credentialStore: storeWith(CRED) as never });
+      // The genuine client's session with the relay: its request is bound to that transcript.
+      const ws1 = new MockPeerWs();
+      handler.handleConnection(ws1);
+      const hs1 = completeEcdhHandshake(ws1);
+      const request = credentialRequest(hs1, psk);
+      // The relay's own session with the server: same request, re-encrypted.
+      const ws2 = new MockPeerWs();
+      handler.handleConnection(ws2);
+      const hs2 = completeEcdhHandshake(ws2);
+      ws2.simulateRawMessage(encryptMessage(request, hs2.sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+      // fails-when: the proof omits the ephemeral keys
+      expect(authResponseOf(ws2, hs2.sessionKey)).toMatchObject({
+        accepted: false,
+        reason: 'Invalid proof',
+      });
+      expect(ws2.closeCode).toBe(WS_CLOSE_UNAUTHORIZED);
+      // breaks-if-wrong: the same request on its own session is accepted
+      ws1.simulateRawMessage(encryptMessage(request, hs1.sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(authResponseOf(ws1, hs1.sessionKey).accepted).toBe(true);
+    });
+
+    it.each([
+      ['a proof field', { proof: 'ab'.repeat(32) }],
+      ['a token field', { token: 'kici_join_v1.x.y' }],
+      ['neither, and no scheme', {}],
+    ])(
+      'refuses an old-shape request carrying %s without charging the rate limit',
+      async (_label, extra) => {
+        const { handler } = createTestHandler();
+        for (let i = 0; i < 6; i++) {
+          const ws = new MockPeerWs();
+          handler.handleConnection(ws, '10.0.0.9');
+          const hs = completeEcdhHandshake(ws);
+          ws.simulateRawMessage(
+            encryptMessage(
+              JSON.stringify({
+                type: 'peer.auth.request',
+                instanceId: 'old-peer',
+                protocolVersion: PROTOCOL_VERSION,
+                ...extra,
+              }),
+              hs.sessionKey,
+            ),
+          );
+          await vi.advanceTimersByTimeAsync(0);
+          // fails-when: the old shape is processed, or the reason is a divergence reason
+          expect(authResponseOf(ws, hs.sessionKey)).toMatchObject({
+            accepted: false,
+            reason: PEER_MUTUAL_AUTH_REQUIRED_REASON,
+          });
+          expect(ws.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
+        }
+        // breaks-if-wrong: six refusals later, a v2 request from the same IP is still accepted
+        const { response } = await authenticateV2(handler, new MockPeerWs(), {
+          ...tokenOpts(DEFAULT_TOKEN),
+          ip: '10.0.0.9',
+        });
+        expect(response.accepted).toBe(true);
+      },
+    );
+
+    it('fix A: a worker token whose routing segment says coordinator gets the worker role', async () => {
+      const t = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' }); // rewritten text
+      const tokenManager = createMockTokenManager({
+        rows: [{ tokenHash: t.tokenHash, role: 'worker' }],
+      });
+      const { handler, credentialStore } = createTestHandler({
+        tokenManager: tokenManager as never,
+        acceptedRoles: ['coordinator', 'worker'],
+      });
+      const { response } = await authenticateV2(handler, new MockPeerWs(), tokenOpts(t));
+      // fails-when: the role is read from the token
+      expect(response.role).toBe('worker');
+      expect(credentialStore.save).toHaveBeenCalledWith(
+        expect.objectContaining({ role: 'worker' }),
+      );
+    });
+
+    it('fix A on the idempotent-retry path: readByHash supplies the role', async () => {
+      const t = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' });
+      const tokenManager = createMockTokenManager({
+        rows: [{ tokenHash: t.tokenHash, role: 'worker' }],
+      });
+      tokenManager.claimByHash.mockRejectedValueOnce(new Error(TOKEN_ALREADY_USED_MESSAGE));
+      const credentialStore = createMockCredentialStore();
+      credentialStore.findByInstanceId.mockResolvedValue({
+        id: 'c',
+        instanceId: 'remote-peer',
+        credentialHash: 'x',
+        role: 'worker',
+        routingKeys: ['github:42'],
+        sourceTokenHash: t.tokenHash,
+        createdAt: new Date(),
+        lastSeenAt: null,
+        expiresAt: new Date(Date.now() + 86_400_000),
+        revokedAt: null,
+      } as never);
+      const { handler } = createTestHandler({
+        tokenManager: tokenManager as never,
+        credentialStore: credentialStore as never,
+        acceptedRoles: ['coordinator', 'worker'],
+      });
+      const { response } = await authenticateV2(handler, new MockPeerWs(), tokenOpts(t));
+      expect(tokenManager.readByHash).toHaveBeenCalledWith(t.tokenHash);
+      expect(response.role).toBe('worker');
+      expect(credentialStore.save).toHaveBeenCalledWith(
+        expect.objectContaining({ role: 'worker' }),
+      );
+    });
+
+    it('breaks-if-wrong: an unmodified coordinator token gets the coordinator role', async () => {
+      const { handler } = createTestHandler();
+      const { response } = await authenticateV2(
+        handler,
+        new MockPeerWs(),
+        tokenOpts(DEFAULT_TOKEN),
+      );
+      expect(response).toMatchObject({ accepted: true, role: 'coordinator' });
+    });
+
+    it('same-millisecond tokens: the proof selects the right row and the other is not claimed', async () => {
+      const a = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'worker' });
+      const b = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'worker' });
+      const tokenManager = createMockTokenManager({
+        rows: [
+          { tokenHash: a.tokenHash, role: 'worker' },
+          { tokenHash: b.tokenHash, role: 'worker' },
+        ],
+      });
+      const { handler } = createTestHandler({
+        tokenManager: tokenManager as never,
+        acceptedRoles: ['worker'],
+      });
+      const { response } = await authenticateV2(handler, new MockPeerWs(), {
+        ...tokenOpts(b),
+        role: 'worker',
+      });
+      expect(response.accepted).toBe(true);
+      expect(tokenManager.claimByHash).toHaveBeenCalledTimes(1);
+      expect(tokenManager.claimByHash).toHaveBeenCalledWith(
+        b.tokenHash,
+        'handler-orch',
+        'remote-peer',
+      );
+    });
+
+    it('caps the token candidates it checks per request', async () => {
+      const t = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' });
+      const decoys = Array.from({ length: 8 }, () => ({
+        tokenHash: randomBytes(32).toString('hex'),
+        role: 'coordinator' as const,
+      }));
+      // The right row sits ninth: past the cap, so it is never checked.
+      const tokenManager = createMockTokenManager({
+        rows: [...decoys, { tokenHash: t.tokenHash, role: 'coordinator' }],
+      });
+      const { handler } = createTestHandler({ tokenManager: tokenManager as never });
+      const { response } = await authenticateV2(handler, new MockPeerWs(), tokenOpts(t));
+      // fails-when: no cap
+      expect(response).toMatchObject({ accepted: false, reason: 'Invalid token' });
+      expect(tokenManager.claimByHash).not.toHaveBeenCalled();
+    });
+
+    it('accepts the right row at the cap', async () => {
+      // breaks-if-wrong: the cap must not refuse the eighth candidate
+      const t = makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' });
+      const decoys = Array.from({ length: 7 }, () => ({
+        tokenHash: randomBytes(32).toString('hex'),
+        role: 'coordinator' as const,
+      }));
+      const tokenManager = createMockTokenManager({
+        rows: [...decoys, { tokenHash: t.tokenHash, role: 'coordinator' }],
+      });
+      const { handler } = createTestHandler({ tokenManager: tokenManager as never });
+      const { response } = await authenticateV2(handler, new MockPeerWs(), tokenOpts(t));
+      expect(response.accepted).toBe(true);
+    });
+
+    it('a token-mode request without tokenRouting is refused with Invalid token', async () => {
+      const { handler } = createTestHandler();
+      const { response } = await authenticateV2(handler, new MockPeerWs(), {
+        mode: 'token',
+        psk: tokenPsk(DEFAULT_TOKEN.tokenHash),
+      });
+      expect(response).toMatchObject({ accepted: false, reason: 'Invalid token' });
+    });
+
+    it('a malformed clientProof is refused with Invalid proof', async () => {
+      const CRED = randomBytes(32).toString('hex');
+      const { handler } = createTestHandler({ credentialStore: storeWith(CRED) as never });
+      const ws = new MockPeerWs();
+      handler.handleConnection(ws);
+      const hs = completeEcdhHandshake(ws);
+      ws.simulateRawMessage(
+        authFrame(hs, {
+          type: 'peer.auth.request',
+          instanceId: 'remote-peer',
+          protocolVersion: PROTOCOL_VERSION,
+          proof: 'zz',
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(authResponseOf(ws, hs.sessionKey)).toMatchObject({
+        accepted: false,
+        reason: 'Invalid proof',
+      });
+    });
+
+    it('a second frame while authentication is in flight closes the socket', async () => {
+      const CRED = randomBytes(32).toString('hex');
+      const credentialStore = storeWith(CRED);
+      const stored = await credentialStore.findByInstanceId('remote-peer');
+      let release!: () => void;
+      credentialStore.findByInstanceId.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve(stored);
+          }),
+      );
+      const { handler, registry } = createTestHandler({
+        credentialStore: credentialStore as never,
+      });
+      const ws = new MockPeerWs();
+      handler.handleConnection(ws);
+      const hs = completeEcdhHandshake(ws);
+      ws.simulateRawMessage(
+        encryptMessage(credentialRequest(hs, credentialPsk(CRED)), hs.sessionKey),
+      );
+      ws.simulateRawMessage(
+        encryptMessage(credentialRequest(hs, credentialPsk(CRED)), hs.sessionKey),
+      );
+      // fails-when: the second frame is parsed as another auth request
+      expect(ws.closeCode).toBe(WS_CLOSE_INVALID_MESSAGE);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      // The first request's acceptance does not register a peer on the closed socket.
+      expect(registry.getPeer('remote-peer')).toBeUndefined();
+    });
+
+    it('records the inbound scheme and resets it on close', async () => {
+      const { handler, registry } = createTestHandler();
+      const ws = new MockPeerWs();
+      await authenticateWithToken(handler, ws);
+      expect(registry.getPeer('remote-peer')!.authScheme.inbound).toBe('mutual-v2');
+      ws.emit('close');
+      expect(registry.getPeer('remote-peer')!.authScheme.inbound).toBeNull();
+    });
+
+    it('never logs a proof, PSK or token hash', async () => {
+      const infoSpy = vi.spyOn(loggerHolder.peerHandler!, 'info');
+      const warnSpy = vi.spyOn(loggerHolder.peerHandler!, 'warn');
+      try {
+        const { handler } = createTestHandler();
+        const { response } = await authenticateWithToken(handler, new MockPeerWs());
+        // A refused request logs too.
+        await authenticateV2(
+          handler,
+          new MockPeerWs(),
+          tokenOpts(makeTestJoinToken({ ...TOKEN_ROUTING, role: 'coordinator' })),
+        );
+        const logged = JSON.stringify([...infoSpy.mock.calls, ...warnSpy.mock.calls]);
+        expect(logged).not.toContain(DEFAULT_TOKEN.tokenHash);
+        expect(logged).not.toContain(DEFAULT_TOKEN.secretHex);
+        expect(logged).not.toContain(response.serverProof);
+        expect(logged).not.toMatch(/[0-9a-f]{64}/);
+      } finally {
+        infoSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
+  describe('a peer that reconnects inbound', () => {
+    it('the old socket closing does not drop the new connection', async () => {
+      // fails-when: the close handler cleans up whatever connection holds the peer id
+      const { handler, registry } = createTestHandler();
+      const oldWs = new MockPeerWs();
+      await authenticateWithToken(handler, oldWs);
+      const newWs = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, newWs);
+      oldWs.emit('close');
+      expect(registry.getPeer('remote-peer')!.connected).toBe(true);
+      expect(registry.getPeer('remote-peer')!.authScheme.inbound).toBe('mutual-v2');
+      expect(handler.getConnectionCount()).toBe(1);
+      const before = newWs.sentMessages.length;
+      expect(handler.sendToPeer('remote-peer', makeHeartbeatMessage())).toBe(true);
+      expect(newWs.sentMessages.length).toBe(before + 1);
+      expect(JSON.parse(decryptMessage(newWs.sentMessages[before], sessionKey)).type).toBe(
+        'peer.heartbeat',
+      );
+    });
+
+    it('the old socket stops sending heartbeats after it closes', async () => {
+      const { handler } = createTestHandler();
+      const oldWs = new MockPeerWs();
+      await authenticateWithToken(handler, oldWs);
+      await authenticateWithToken(handler, new MockPeerWs());
+      oldWs.emit('close');
+      oldWs.readyState = 1; // were the timer still armed, it would send here
+      const before = oldWs.sentMessages.length;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(oldWs.sentMessages.length).toBe(before);
+    });
+
+    it('the current socket closing still drops the connection', async () => {
+      // breaks-if-wrong: the guard must not swallow a real close
+      const { handler, registry } = createTestHandler();
+      const ws = new MockPeerWs();
+      await authenticateWithToken(handler, ws);
+      ws.emit('close');
+      expect(registry.getPeer('remote-peer')!.connected).toBe(false);
+      expect(handler.getConnectionCount()).toBe(0);
+    });
+  });
 });
+
+function makeHeartbeatMessage() {
+  return {
+    type: 'peer.heartbeat' as const,
+    instanceId: 'handler-orch',
+    term: 1,
+    leaderId: null,
+    draining: false,
+    agents: [],
+    capabilities: { s3LogAccess: false },
+    timestamp: Date.now(),
+  };
+}

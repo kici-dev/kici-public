@@ -161,6 +161,7 @@ import * as m153 from './migrations/153_execution_runs_cancel_force.js';
 import * as m154 from './migrations/154_cluster_settings_firecracker_api_socket_wait.js';
 import * as m155 from './migrations/155_org_settings_reroute_spawn_retry.js';
 import * as m156 from './migrations/156_kici_events_match_outcome.js';
+import * as m157 from './migrations/157_host_roster_identity_source.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -322,6 +323,7 @@ export function createMigrationProvider(): MigrationProvider {
         '154_cluster_settings_firecracker_api_socket_wait': m154,
         '155_org_settings_reroute_spawn_retry': m155,
         '156_kici_events_match_outcome': m156,
+        '157_host_roster_identity_source': m157,
       };
     },
   };

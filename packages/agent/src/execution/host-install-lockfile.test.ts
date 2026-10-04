@@ -4,9 +4,9 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { c as tarCreate } from 'tar';
 import { PackageManager } from '@kici-dev/shared/package-manager';
@@ -338,7 +338,7 @@ async function listen(
 
 const npmTool = await resolveHostNpm();
 
-describe.skipIf(!npmTool)('npmLockReader — the npm bundled with this Node', () => {
+describe.skipIf(!npmTool)("npmLockReader — the agent's npm on this host", () => {
   it("reads versions with npm's own semver", () => {
     const reader = npmLockReader(npmTool!.script);
     expect(reader).not.toBeNull();
@@ -355,6 +355,60 @@ describe.skipIf(!npmTool)('npmLockReader — the npm bundled with this Node', ()
 
   it('is null for a path that holds no npm', () => {
     expect(npmLockReader(join(tmpdir(), 'no-npm-here', 'bin', 'npm-cli.js'))).toBeNull();
+  });
+});
+
+describe('npmLockReader — modules from outside the npm', () => {
+  let base: string;
+  beforeEach(async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), 'kici-lock-reader-')));
+  });
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true });
+  });
+
+  /** Stub `@npmcli/arborist` and `semver` packages the reader accepts, under `nodeModules`. */
+  async function writeReaderModules(nodeModules: string): Promise<void> {
+    for (const [id, body] of [
+      ['@npmcli/arborist', 'module.exports = class Arborist {};\n'],
+      ['semver', 'module.exports = { valid: () => null };\n'],
+    ] as const) {
+      await mkdir(join(nodeModules, id), { recursive: true });
+      await writeFile(
+        join(nodeModules, id, 'package.json'),
+        JSON.stringify({ name: id, main: 'index.js' }),
+      );
+      await writeFile(join(nodeModules, id, 'index.js'), body);
+    }
+  }
+
+  /** An empty `bin/npm-cli.js` for an npm package at `<root>/share/nodejs/npm`. */
+  async function writeCli(root: string): Promise<string> {
+    const cli = join(root, 'share', 'nodejs', 'npm', 'bin', 'npm-cli.js');
+    await mkdir(dirname(cli), { recursive: true });
+    await writeFile(cli, '');
+    return cli;
+  }
+
+  it('refuses modules a parent folder supplies', async () => {
+    // Modules only in <root>/node_modules, outside <root>/share/nodejs: Node
+    // finds them by walking up, as it finds a Node global folder such as
+    // /usr/share/nodejs from any path.
+    const root = join(base, 'outside');
+    const cli = await writeCli(root);
+    await writeReaderModules(join(root, 'node_modules'));
+    // fails-when: the reader takes another npm's lockfile reader from a parent
+    // or global folder, so the check reads the lockfile unlike the npm ci it guards.
+    expect(npmLockReader(cli)).toBeNull();
+  });
+
+  it('reads with the modules inside the npm', async () => {
+    const root = join(base, 'inside');
+    const cli = await writeCli(root);
+    await writeReaderModules(join(root, 'share', 'nodejs', 'npm', 'node_modules'));
+    // breaks-if-wrong: an npm that ships its own modules (Node's own npm,
+    // Debian's /usr/share/nodejs) still gets a reader.
+    expect(npmLockReader(cli)).not.toBeNull();
   });
 });
 
@@ -474,6 +528,10 @@ describe.skipIf(!npmTool)('npm ci on the agent host — real npm, loopback regis
     });
     expect(argv[1]).toBe(NpmInstallCommand.Ci);
     argv[1] = command;
+    // An npm older than 11.15.0 has no source flags and fetches every source.
+    // npm 12 refuses URL sources by default, so state the older behavior: an
+    // npm that does not know these flags only warns about them.
+    argv.push('--allow-remote=all', '--allow-file=all', '--allow-directory=all');
     await execFileAsync(ciTool.nodeExe, argv, {
       cwd: kici,
       env: { PATH: process.env.PATH, HOME: home },

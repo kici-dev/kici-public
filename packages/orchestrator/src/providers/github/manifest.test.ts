@@ -14,17 +14,39 @@ describe('buildGithubAppManifest', () => {
     redirectUrl: 'http://127.0.0.1:51823/cb',
   });
 
+  // fails-when: the manifest lacks `issues: 'read'` or `issue_comment` — GitHub
+  //   then never delivers PR comments, so `/kici approve` cannot reach the App.
+  // breaks-if-wrong: every pre-existing permission and event must survive; the
+  //   exact toEqual fails on a removal or an over-grant as well as an omission.
   it('bakes in KiCI permissions and events', () => {
-    expect(m.default_permissions).toMatchObject({
+    expect(m.default_permissions).toEqual({
       contents: 'read',
       metadata: 'read',
       pull_requests: 'read',
       checks: 'write',
       members: 'read',
+      issues: 'read',
     });
-    expect(m.default_events).toEqual(
-      expect.arrayContaining(['push', 'pull_request', 'check_run', 'check_suite']),
-    );
+    expect(m.default_events).toEqual([
+      'push',
+      'pull_request',
+      'check_run',
+      'check_suite',
+      'issue_comment',
+    ]);
+  });
+
+  it('requests the same permissions and events whatever the callback urls', () => {
+    // The --no-browser flow builds with the static callback page instead of
+    // the loopback; the grant must not depend on which one.
+    const headless = buildGithubAppManifest({
+      name: 'acme-prod',
+      webhookUrl: 'https://api.kici.dev/webhook/org_x/github',
+      redirectUrl: 'https://kici.dev/gh-manifest-callback',
+      setupUrl: 'https://kici.dev/gh-manifest-installed',
+    });
+    expect(headless.default_permissions).toEqual(m.default_permissions);
+    expect(headless.default_events).toEqual(m.default_events);
   });
 
   it('configures an active webhook with the supplied url', () => {

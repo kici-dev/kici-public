@@ -5,18 +5,25 @@ import pg from 'pg';
 import { createMigrationProvider } from '../db/migration-provider.js';
 import {
   deriveHostStatus,
+  HostConfirmedError,
+  HostExistsError,
   HostRosterStore,
   HostStatus,
+  HostWriteAuthority,
+  isReservedHostKey,
   parseHostProperties,
+  ReservedHostKeyError,
   stripReservedProperties,
 } from './host-roster.js';
+import { resolveRestartSpec } from '../ws/bringup-api.js';
 import type { LabelMatcher } from '@kici-dev/engine';
 import { matchHostPattern } from '@kici-dev/engine/context/host-match';
-import type { Database } from '../db/types.js';
+import { type Database, HostIdentitySource } from '../db/types.js';
 import { terminateTestDbBackends } from '../__test-helpers__/test-db.js';
 
 /** An exact-match matcher, the post-compile equivalent of a plain label string. */
 const exact = (value: string): LabelMatcher => ({ kind: 'exact', value });
+const OP = HostWriteAuthority.operator;
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -204,7 +211,12 @@ describeDb('HostRosterStore', () => {
   });
 
   it('declareStatic inserts a pre-declared static row (never-connected)', async () => {
-    await store.declareStatic({ agentId: 'web-09', labels: ['role:web'], hostname: 'web-09' });
+    await store.declareStatic({
+      authority: OP,
+      agentId: 'web-09',
+      labels: ['role:web'],
+      hostname: 'web-09',
+    });
     const row = await store.get('web-09');
     expect(row?.lifecycle_class).toBe('static');
     expect(row?.connected_instance_id).toBeNull();
@@ -213,6 +225,7 @@ describeDb('HostRosterStore', () => {
 
   it('declareStatic persists reach metadata (incl. s3Reachable) and getReach reads it back', async () => {
     await store.declareStatic({
+      authority: OP,
       agentId: 'box-00007',
       labels: ['role:fresh'],
       address: '10.0.0.7',
@@ -232,7 +245,7 @@ describeDb('HostRosterStore', () => {
   });
 
   it('getReach returns nulls for a host declared without reach metadata', async () => {
-    await store.declareStatic({ agentId: 'no-reach', labels: [] });
+    await store.declareStatic({ authority: OP, agentId: 'no-reach', labels: [] });
     expect(await store.getReach('no-reach')).toEqual({
       agentId: 'no-reach',
       address: null,
@@ -248,17 +261,30 @@ describeDb('HostRosterStore', () => {
   });
 
   it('declareStatic returns created:true on insert, created:false on update', async () => {
-    expect((await store.declareStatic({ agentId: 'web-09', labels: ['role:web'] })).created).toBe(
-      true,
-    );
     expect(
-      (await store.declareStatic({ agentId: 'web-09', labels: ['role:web', 'region:eu'] })).created,
+      (await store.declareStatic({ authority: OP, agentId: 'web-09', labels: ['role:web'] }))
+        .created,
+    ).toBe(true);
+    expect(
+      (
+        await store.declareStatic({
+          authority: OP,
+          agentId: 'web-09',
+          labels: ['role:web', 'region:eu'],
+        })
+      ).created,
     ).toBe(false);
   });
 
   it('declareStatic re-declare updates operator fields', async () => {
-    await store.declareStatic({ agentId: 'web-09', labels: ['role:web'], hostname: 'old' });
     await store.declareStatic({
+      authority: OP,
+      agentId: 'web-09',
+      labels: ['role:web'],
+      hostname: 'old',
+    });
+    await store.declareStatic({
+      authority: OP,
       agentId: 'web-09',
       labels: ['role:web', 'region:eu'],
       hostname: 'new',
@@ -269,9 +295,9 @@ describeDb('HostRosterStore', () => {
   });
 
   it('declareStatic folds the hostname on insert and on re-declare', async () => {
-    await store.declareStatic({ agentId: 'web-09', hostname: 'Web-09.Prod' });
+    await store.declareStatic({ authority: OP, agentId: 'web-09', hostname: 'Web-09.Prod' });
     expect((await store.get('web-09'))!.hostname).toBe('web-09.prod');
-    await store.declareStatic({ agentId: 'web-09', hostname: 'WEB-09.STAGING' });
+    await store.declareStatic({ authority: OP, agentId: 'web-09', hostname: 'WEB-09.STAGING' });
     expect((await store.get('web-09'))!.hostname).toBe('web-09.staging');
   });
 
@@ -287,7 +313,7 @@ describeDb('HostRosterStore', () => {
       arch: 'x64',
       instanceId: 'orch-A',
     });
-    await store.declareStatic({ agentId: 'web-09', labels: ['role:db'] });
+    await store.declareStatic({ authority: OP, agentId: 'web-09', labels: ['role:db'] });
     const row = await store.get('web-09');
     // Operator labels DID update...
     expect(JSON.parse(row!.labels)).toEqual(['role:db']);
@@ -299,13 +325,14 @@ describeDb('HostRosterStore', () => {
   });
 
   it('declareStatic re-declare with omitted labels preserves existing labels', async () => {
-    await store.declareStatic({ agentId: 'web-09', labels: ['role:web'] });
-    await store.declareStatic({ agentId: 'web-09', hostname: 'h' });
+    await store.declareStatic({ authority: OP, agentId: 'web-09', labels: ['role:web'] });
+    await store.declareStatic({ authority: OP, agentId: 'web-09', hostname: 'h' });
     expect(JSON.parse((await store.get('web-09'))!.labels)).toEqual(['role:web']);
   });
 
   it('declareStatic re-declare with omitted reach preserves CLI-set reach', async () => {
     await store.declareStatic({
+      authority: OP,
       agentId: 'box-7',
       labels: [],
       address: '10.0.0.7',
@@ -313,7 +340,7 @@ describeDb('HostRosterStore', () => {
       sshPort: 2222,
       sshKeySecret: 'prod/bootstrap/ssh',
     });
-    await store.declareStatic({ agentId: 'box-7', labels: ['role:fresh'] });
+    await store.declareStatic({ authority: OP, agentId: 'box-7', labels: ['role:fresh'] });
     expect(await store.getReach('box-7')).toEqual({
       agentId: 'box-7',
       address: '10.0.0.7',
@@ -326,11 +353,17 @@ describeDb('HostRosterStore', () => {
 
   it('declareStatic re-declare shallow-merges host_properties', async () => {
     await store.declareStatic({
+      authority: OP,
       agentId: 'web-09',
       labels: [],
       properties: { region: 'eu', tier: 'gold' },
     });
-    await store.declareStatic({ agentId: 'web-09', labels: [], properties: { tier: 'silver' } });
+    await store.declareStatic({
+      authority: OP,
+      agentId: 'web-09',
+      labels: [],
+      properties: { tier: 'silver' },
+    });
     expect(parseHostProperties((await store.get('web-09'))!.host_properties)).toEqual({
       region: 'eu',
       tier: 'silver',
@@ -338,15 +371,281 @@ describeDb('HostRosterStore', () => {
   });
 
   it('removeStatic deletes the row and returns the count', async () => {
-    await store.declareStatic({ agentId: 'h1', labels: ['role:db'] });
-    expect(await store.removeStatic('h1')).toBe(1);
+    await store.declareStatic({ authority: OP, agentId: 'h1', labels: ['role:db'] });
+    expect(await store.removeStatic('h1', { authority: OP })).toBe(1);
     expect(await store.get('h1')).toBeNull();
-    expect(await store.removeStatic('nope')).toBe(0);
+    expect(await store.removeStatic('nope', { authority: OP })).toBe(0);
+  });
+
+  describe('write authority', () => {
+    const agentReg = (
+      agentId: string,
+      extra: Partial<Parameters<HostRosterStore['upsert']>[0]> = {},
+    ) =>
+      store.upsert({
+        agentId,
+        tokenId: null,
+        lifecycleClass: 'static',
+        labels: ['role:web'],
+        hostname: 'agent-reported',
+        platform: 'linux',
+        arch: 'x64',
+        instanceId: 'orch-A',
+        ...extra,
+      });
+
+    it('a default (platform) declare with a reserved property throws and writes nothing', async () => {
+      // fails-when: the default authority is operator, or the reserved check is removed.
+      await expect(
+        store.declareStatic({
+          agentId: 'h-res',
+          properties: { region: 'eu', 'kici:agent-restart-start': 'touch /tmp/pwn' },
+        }),
+      ).rejects.toBeInstanceOf(ReservedHostKeyError);
+      expect(await store.get('h-res')).toBeNull();
+    });
+
+    it('refuses reserved keys case- and whitespace-insensitively', async () => {
+      // fails-when: the predicate is case-sensitive or skips the trim canonicalizeLabel applies.
+      const err = await store
+        .declareStatic({
+          agentId: 'h-case',
+          labels: [' KICI:host:x'],
+          properties: { 'KICI:agent-service': 'x' },
+        })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ReservedHostKeyError);
+      expect((err as ReservedHostKeyError).keys).toEqual([' KICI:host:x', 'KICI:agent-service']);
+      expect(await store.get('h-case')).toBeNull();
+      expect(isReservedHostKey('kici:x')).toBe(true);
+      expect(isReservedHostKey('region')).toBe(false);
+    });
+
+    it('stores a kici: label under operator and refuses it under platform', async () => {
+      await expect(
+        store.declareStatic({ agentId: 'h-lbl', labels: ['kici:host:x'] }),
+      ).rejects.toBeInstanceOf(ReservedHostKeyError);
+      await store.declareStatic({ agentId: 'h-lbl', labels: ['kici:host:x'], authority: OP });
+      expect(JSON.parse((await store.get('h-lbl'))!.labels)).toEqual(['kici:host:x']);
+    });
+
+    it('operator stores every restart, install and service key, and the re-stage reads them', async () => {
+      // breaks-if-wrong: kici-admin declares that set the restart commands must still work.
+      const props = {
+        'kici:agent-restart-stop': 'stop-cmd',
+        'kici:agent-restart-start': 'start-cmd',
+        'kici:agent-install-dir': '/opt/kici-agent',
+        'kici:agent-service': 'kici-agent.service',
+      };
+      await store.declareStatic({ agentId: 'h-op', properties: props, authority: OP });
+      const stored = parseHostProperties((await store.get('h-op'))!.host_properties);
+      expect(stored).toEqual(props);
+      expect(resolveRestartSpec(stored)).toEqual({
+        stop: 'stop-cmd',
+        start: 'start-cmd',
+        installDir: '/opt/kici-agent',
+      });
+    });
+
+    it('a platform create stamps platform and stores ordinary properties', async () => {
+      // breaks-if-wrong: ordinary non-kici: properties from the dashboard must still be stored.
+      expect(
+        await store.declareStatic({
+          agentId: 'h-new',
+          labels: ['role:db'],
+          properties: { region: 'eu' },
+        }),
+      ).toEqual({ created: true });
+      const row = await store.get('h-new');
+      expect(row?.identity_source).toBe(HostIdentitySource.platform);
+      expect(parseHostProperties(row!.host_properties)).toEqual({ region: 'eu' });
+    });
+
+    it('a platform declare refuses reach fields', async () => {
+      await expect(
+        store.declareStatic({ agentId: 'h-reach', address: '10.0.0.1' }),
+      ).rejects.toThrow(/operator/);
+      expect(await store.get('h-reach')).toBeNull();
+    });
+
+    for (const source of [
+      HostIdentitySource.agent,
+      HostIdentitySource.operator,
+      HostIdentitySource.platform,
+    ]) {
+      it(`a platform declare onto an existing ${source} row throws HostExistsError and changes nothing`, async () => {
+        // fails-when: the platform branch still runs ON CONFLICT DO UPDATE.
+        if (source === HostIdentitySource.agent) await agentReg('h-ex');
+        if (source === HostIdentitySource.operator)
+          await store.declareStatic({
+            agentId: 'h-ex',
+            labels: ['role:web'],
+            hostname: 'agent-reported',
+            authority: OP,
+          });
+        if (source === HostIdentitySource.platform)
+          await store.declareStatic({
+            agentId: 'h-ex',
+            labels: ['role:web'],
+            hostname: 'agent-reported',
+          });
+        const before = await store.get('h-ex');
+        await expect(
+          store.declareStatic({ agentId: 'h-ex', labels: ['env:prod'], hostname: 'b' }),
+        ).rejects.toBeInstanceOf(HostExistsError);
+        const after = await store.get('h-ex');
+        expect(after?.labels).toBe(before?.labels);
+        expect(after?.hostname).toBe(before?.hostname);
+        expect(after?.identity_source).toBe(source);
+      });
+    }
+
+    it('an agent registration confirms a platform row and keeps none of its properties', async () => {
+      // fails-when: upsert still merges host_properties for platform rows.
+      await store.declareStatic({
+        agentId: 'h-conf',
+        labels: ['env:prod'],
+        hostname: 'b',
+        properties: { tier: 'gold' },
+      });
+      await agentReg('h-conf', { properties: { region: 'eu' } });
+      const row = await store.get('h-conf');
+      expect(row?.identity_source).toBe(HostIdentitySource.agent);
+      expect(JSON.parse(row!.labels)).toEqual(['role:web']);
+      expect(row?.hostname).toBe('agent-reported');
+      expect(parseHostProperties(row!.host_properties)).toEqual({ region: 'eu' });
+    });
+
+    it('an agent registration onto an operator row keeps the operator properties', async () => {
+      // breaks-if-wrong: the operator-declared region must survive a re-register (the shallow merge).
+      await store.declareStatic({ agentId: 'h-keep', properties: { region: 'eu' }, authority: OP });
+      await agentReg('h-keep', { properties: { cores: 8 } });
+      const row = await store.get('h-keep');
+      expect(row?.identity_source).toBe(HostIdentitySource.agent);
+      expect(parseHostProperties(row!.host_properties)).toEqual({ region: 'eu', cores: 8 });
+    });
+
+    it('race: platform create then agent registration ends with the agent identity', async () => {
+      await store.declareStatic({ agentId: 'h-race1', labels: ['env:prod'] });
+      await agentReg('h-race1');
+      const row = await store.get('h-race1');
+      expect(row?.identity_source).toBe(HostIdentitySource.agent);
+      expect(JSON.parse(row!.labels)).toEqual(['role:web']);
+    });
+
+    it('race: agent registration then platform create is refused', async () => {
+      await agentReg('h-race2');
+      await expect(
+        store.declareStatic({ agentId: 'h-race2', labels: ['env:prod'] }),
+      ).rejects.toBeInstanceOf(HostExistsError);
+      expect(JSON.parse((await store.get('h-race2'))!.labels)).toEqual(['role:web']);
+    });
+
+    it('adopt: an operator declare onto a platform row replaces labels, hostname and properties', async () => {
+      // fails-when: COALESCE preserves the Platform values.
+      await store.declareStatic({
+        agentId: 'h-adopt',
+        labels: ['env:prod'],
+        hostname: 'b',
+        properties: { tier: 'gold' },
+      });
+      await store.declareStatic({ agentId: 'h-adopt', labels: [], authority: OP });
+      const row = await store.get('h-adopt');
+      expect(row?.identity_source).toBe(HostIdentitySource.operator);
+      expect(JSON.parse(row!.labels)).toEqual([]);
+      expect(row?.hostname).toBeNull();
+      expect(parseHostProperties(row!.host_properties)).toEqual({});
+    });
+
+    it('adopt: an operator re-declare of an operator row keeps an omitted hostname', async () => {
+      // breaks-if-wrong: preserve-on-omit must still hold for operator rows.
+      await store.declareStatic({
+        agentId: 'h-keep2',
+        labels: [],
+        hostname: 'kept',
+        authority: OP,
+      });
+      await store.declareStatic({ agentId: 'h-keep2', labels: [], authority: OP });
+      expect((await store.get('h-keep2'))?.hostname).toBe('kept');
+    });
+
+    it('an operator declare onto an agent row keeps agent', async () => {
+      // fails-when: the declare overwrites the source unconditionally.
+      await agentReg('h-agent');
+      await store.declareStatic({ agentId: 'h-agent', labels: ['role:db'], authority: OP });
+      expect((await store.get('h-agent'))?.identity_source).toBe(HostIdentitySource.agent);
+    });
+
+    it('a platform remove refuses a confirmed row and deletes a platform row', async () => {
+      await agentReg('h-rm-agent');
+      await store.declareStatic({ agentId: 'h-rm-op', authority: OP });
+      await store.declareStatic({ agentId: 'h-rm-plat' });
+      await expect(store.removeStatic('h-rm-agent')).rejects.toBeInstanceOf(HostConfirmedError);
+      await expect(store.removeStatic('h-rm-op')).rejects.toBeInstanceOf(HostConfirmedError);
+      expect(await store.get('h-rm-agent')).not.toBeNull();
+      expect(await store.get('h-rm-op')).not.toBeNull();
+      expect(await store.removeStatic('h-rm-plat')).toBe(1);
+      expect(await store.removeStatic('h-rm-missing')).toBe(0);
+      // breaks-if-wrong: an operator remove deletes any row.
+      expect(await store.removeStatic('h-rm-agent', { authority: OP })).toBe(1);
+    });
+  });
+
+  describe('unconfirmed placeholders', () => {
+    const seed = async () => {
+      await store.declareStatic({ agentId: 'p-db', labels: ['role:db'] }); // platform
+      await store.declareStatic({ agentId: 'o-db', labels: ['role:db'], authority: OP });
+      await store.upsert({
+        agentId: 'a-db',
+        tokenId: null,
+        lifecycleClass: 'static',
+        labels: ['role:db'],
+        hostname: null,
+        platform: 'linux',
+        arch: 'x64',
+        instanceId: 'orch-A',
+      });
+    };
+    const ids = (hosts: Array<{ agentId: string }>) => hosts.map((h) => h.agentId).sort();
+    const roleDb = [[exact('role:db')]];
+
+    it('targeting and inventory reads skip a platform row', async () => {
+      // fails-when: matchRows or the inventory methods lack the filter.
+      await seed();
+      expect(ids(await store.findFanoutTargets(roleDb, [], 60_000))).toEqual(['a-db', 'o-db']);
+      expect(ids(await store.findMatching(roleDb, [], 60_000))).toEqual(['a-db', 'o-db']);
+      expect(ids(await store.queryInventory(undefined, 60_000))).toEqual(['a-db', 'o-db']);
+      expect(ids(await store.queryInventory({ include: roleDb }, 60_000))).toEqual([
+        'a-db',
+        'o-db',
+      ]);
+      expect(await store.getInventory('p-db', 60_000)).toBeNull();
+      // breaks-if-wrong: operator and agent rows are still matched (above) and readable.
+      expect(await store.getInventory('o-db', 60_000)).not.toBeNull();
+    });
+
+    it('the dashboard reads include a platform row flagged unconfirmed', async () => {
+      await seed();
+      const hosts = await store.listFleetHosts(60_000);
+      expect(Object.fromEntries(hosts.map((h) => [h.agentId, h.confirmed]))).toEqual({
+        'a-db': true,
+        'o-db': true,
+        'p-db': false,
+      });
+      expect((await store.getFleetHost('p-db', 60_000))?.confirmed).toBe(false);
+      expect(await store.getFleetHost('missing', 60_000)).toBeNull();
+    });
+
+    it('countStaticUnreachable ignores a platform row', async () => {
+      // fails-when: the alarm query lacks the filter (p-db and o-db are both static and unconnected).
+      await seed();
+      expect(await store.countStaticUnreachable(60_000)).toBe(1);
+    });
   });
 
   describe('reboot-pending flag', () => {
     it('set / clear / isRebootPending round-trips with the deadline', async () => {
-      await store.declareStatic({ agentId: 'h1', labels: [] });
+      await store.declareStatic({ authority: OP, agentId: 'h1', labels: [] });
       const now = Date.now();
       await store.setRebootPending('h1', new Date(now + 600_000));
       expect(await store.isRebootPending('h1', now)).toBe(true);
@@ -357,9 +656,9 @@ describeDb('HostRosterStore', () => {
     });
 
     it('listExpiredRebootPending returns only hosts past their deadline', async () => {
-      await store.declareStatic({ agentId: 'expired', labels: [] });
-      await store.declareStatic({ agentId: 'live', labels: [] });
-      await store.declareStatic({ agentId: 'none', labels: [] });
+      await store.declareStatic({ authority: OP, agentId: 'expired', labels: [] });
+      await store.declareStatic({ authority: OP, agentId: 'live', labels: [] });
+      await store.declareStatic({ authority: OP, agentId: 'none', labels: [] });
       const now = Date.now();
       await store.setRebootPending('expired', new Date(now - 1));
       await store.setRebootPending('live', new Date(now + 600_000));
@@ -371,7 +670,7 @@ describeDb('HostRosterStore', () => {
     });
 
     it('isRebootPending is false for a host with no flag set', async () => {
-      await store.declareStatic({ agentId: 'h1', labels: [] });
+      await store.declareStatic({ authority: OP, agentId: 'h1', labels: [] });
       expect(await store.isRebootPending('h1', Date.now())).toBe(false);
     });
   });
@@ -455,7 +754,11 @@ describeDb('HostRosterStore', () => {
         arch: 'x64',
         instanceId: 'orch-A',
       });
-      await store.declareStatic({ agentId: 'a3', labels: ['role:web', 'kici:host:web-09'] });
+      await store.declareStatic({
+        authority: OP,
+        agentId: 'a3',
+        labels: ['role:web', 'kici:host:web-09'],
+      });
 
       const web = await store.findMatching([[exact('role:web')]], [], grace);
       expect(web.map((h) => h.agentId)).toEqual(['a1', 'a3']);
@@ -548,7 +851,12 @@ describeDb('HostRosterStore', () => {
     });
 
     it('returns a declared-but-absent static host as unreachable', async () => {
-      await store.declareStatic({ agentId: 'web-09', labels: ['role:web'], hostname: 'web-09' });
+      await store.declareStatic({
+        authority: OP,
+        agentId: 'web-09',
+        labels: ['role:web'],
+        hostname: 'web-09',
+      });
       const [host] = await store.findMatching([[exact('role:web')]], [], grace);
       expect(host.status).toBe(HostStatus.unreachable);
       expect(host.connectedInstanceId).toBeNull();
@@ -641,7 +949,7 @@ describeDb('HostRosterStore', () => {
     });
 
     it('a host declared by the operator is never scaler-managed', async () => {
-      await store.declareStatic({ agentId: 'declared-1', labels: ['role:web'] });
+      await store.declareStatic({ authority: OP, agentId: 'declared-1', labels: ['role:web'] });
       const targets = await store.findFanoutTargets([[exact('role:web')]], [], grace);
       expect(targets.map((h) => h.agentId)).toEqual(['declared-1']);
     });
@@ -681,6 +989,8 @@ describeDb('HostRosterStore', () => {
             region: 'us',
             'kici:staged-agent-version': '2.0.0',
             'kici:agent-restart-start': 'rm -rf /',
+            // fails-when: the strip is case-sensitive.
+            'KICI:agent-restart-start': 'x',
           },
         }),
       );
@@ -695,12 +1005,13 @@ describeDb('HostRosterStore', () => {
 
     it('declareStatic sets properties to the provided bag (default {})', async () => {
       await store.declareStatic({
+        authority: OP,
         agentId: 'd1',
         labels: ['role:db'],
         properties: { region: 'us' },
       });
       expect((await store.get('d1'))?.host_properties).toEqual({ region: 'us' });
-      await store.declareStatic({ agentId: 'd2', labels: [] });
+      await store.declareStatic({ authority: OP, agentId: 'd2', labels: [] });
       expect((await store.get('d2'))?.host_properties).toEqual({});
     });
 
@@ -712,7 +1023,7 @@ describeDb('HostRosterStore', () => {
 
     it('queryInventory(undefined) returns every host as a HostInventoryEntry', async () => {
       await store.upsert(baseUpsert({ agentId: 'inv-a', properties: { region: 'eu' } }));
-      await store.declareStatic({ agentId: 'inv-b', labels: ['role:web'] });
+      await store.declareStatic({ authority: OP, agentId: 'inv-b', labels: ['role:web'] });
       const all = await store.queryInventory(undefined, grace);
       expect(all.map((h) => h.agentId).sort()).toEqual(['inv-a', 'inv-b']);
       const a = all.find((h) => h.agentId === 'inv-a')!;
@@ -757,6 +1068,9 @@ describe('stripReservedProperties', () => {
   });
   it('is a no-op on a bag with no reserved keys', () => {
     expect(stripReservedProperties({ region: 'us' })).toEqual({ region: 'us' });
+  });
+  it('drops a reserved key in any case', () => {
+    expect(stripReservedProperties({ 'KICI:a': 1, ok: 2 })).toEqual({ ok: 2 });
   });
 });
 

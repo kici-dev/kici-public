@@ -25,13 +25,12 @@ Each item lists the local substitute where one exists.
   Viewing your webhook sources and their ingress URLs is part of this dashboard
   (read-only). Substitute when self-hosted: the `kici-admin` CLI, which reads the
   same run, log, and source data directly from your orchestrator.
-- **One-click GitHub App install and webhook relay.** The GitHub-App manifest
-  install flow resolves the App's webhook URL from the orchestrator's Platform
-  connection, so it needs a Platform-connected (platform or hybrid) orchestrator,
-  and the Platform's webhook relay forwards App events to you. Self-hosted
-  substitute: register a source with `kici-admin source add` (this is always how
-  sources are registered — see the note below) and expose
-  [direct webhook ingress](./github-ingress.md) so events arrive without the relay.
+- **GitHub App webhook relay.** In `platform` and `hybrid` mode the Platform's
+  webhook relay forwards App events to you, and the one-click GitHub-App manifest
+  flow bakes the Platform's webhook URL into a new App. Self-hosted substitute:
+  expose [direct webhook ingress](./github-ingress.md) so events arrive without
+  the relay. The manifest flow then bakes the orchestrator's own URL, and you
+  register sources with `kici-admin source add` as always (see the note below).
 - **User identity and login.** Signing in (OIDC), personal access tokens, and the
   `kici login` developer flow authenticate against the hosted Platform. A
   self-hosted orchestrator authenticates callers with local bearer tokens and
@@ -53,8 +52,8 @@ Each item lists the local substitute where one exists.
 - **Billing, quotas, and usage metering.** Plan limits and metering are a
   Platform concept. They do not apply to a self-hosted orchestrator, and
   direct-ingress webhooks are never metered.
-- **Webhook relay and relayed-delivery records.** Forwarding a signature-verified
-  webhook from the Platform to your orchestrator (and recording that delivery) is
+- **Webhook relay and relayed-delivery records.** Forwarding a webhook from the
+  Platform to your orchestrator, which verifies its signature, (and recording that delivery) is
   Platform-side. Self-hosted, events arrive by direct ingress instead.
 - **Dynamic peer matchmaking.** Platform-connected clusters discover peers through
   the Platform. Independent clusters configure their peers statically.
@@ -108,10 +107,10 @@ organizations, billing, and relay — is what the hosted Platform adds.
 list above **except** the webhook relay: providers deliver straight to your
 orchestrator's own ingress (no payload transits KiCI) while the Platform
 connection stays up, so the hosted dashboard, identity, organizations, and
-billing all keep working. The trade-off is the relay-dependent items: the
-one-click GitHub-App install flow and GitHub-App sources in general are
-unsupported in this mode — use a generic or local source, or pick `hybrid` if you
-want the relay. See [Configuration](./configuration.md) and
+billing all keep working. The one-click GitHub-App manifest flow and GitHub-App
+sources work in this mode: the App delivers to the orchestrator's own URL. Only
+the relay is absent. See [Configuration](./configuration.md),
+[Direct GitHub webhook ingress](./github-ingress.md) and
 [Data residency](../data-residency.md).
 
 ## Related

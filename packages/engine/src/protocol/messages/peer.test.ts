@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  PEER_MUTUAL_AUTH_REQUIRED_REASON,
+  PeerAuthMode,
+  PeerAuthScheme,
   peerHelloSchema,
   peerHelloResponseSchema,
   peerAuthRequestSchema,
@@ -85,27 +88,52 @@ describe('peerAuthRequestSchema', () => {
   const valid = {
     type: 'peer.auth.request',
     instanceId: 'orch-1',
-    token: 'kici_join_v1.routing.secret',
     protocolVersion: 1,
+    role: 'coordinator',
+    scheme: PeerAuthScheme.enum['mutual-v2'],
+    mode: PeerAuthMode.enum.credential,
+    clientProof: 'ab'.repeat(32),
   };
 
-  it('validates a well-formed auth request with token', () => {
+  it('validates a well-formed credential-mode request', () => {
+    // breaks-if-wrong: the request a current client sends must parse
     expect(peerAuthRequestSchema.parse(valid)).toEqual(valid);
   });
 
-  it('validates auth request with proof instead of token', () => {
-    const msg = {
-      type: 'peer.auth.request',
-      instanceId: 'orch-1',
-      proof: 'hmac-proof',
-      protocolVersion: 1,
-    };
+  it('validates a token-mode request with its routing segment', () => {
+    const msg = { ...valid, mode: PeerAuthMode.enum.token, tokenRouting: 'cm91dGluZw' };
     expect(peerAuthRequestSchema.parse(msg)).toEqual(msg);
   });
 
-  it('validates auth request with both token and proof omitted', () => {
-    const msg = { type: 'peer.auth.request', instanceId: 'orch-1', protocolVersion: 1 };
-    expect(peerAuthRequestSchema.parse(msg)).toEqual(msg);
+  it('rejects a request without clientProof, scheme or mode', () => {
+    for (const key of ['clientProof', 'scheme', 'mode'] as const) {
+      const { [key]: _omit, ...rest } = valid;
+      expect(peerAuthRequestSchema.safeParse(rest).success).toBe(false);
+    }
+  });
+
+  it('rejects the proof-only and token-only shapes of earlier releases', () => {
+    // fails-when: the old shapes still parse
+    expect(
+      peerAuthRequestSchema.safeParse({
+        type: 'peer.auth.request',
+        instanceId: 'orch-1',
+        protocolVersion: 1,
+        proof: 'hmac-proof',
+      }).success,
+    ).toBe(false);
+    expect(
+      peerAuthRequestSchema.safeParse({
+        type: 'peer.auth.request',
+        instanceId: 'orch-1',
+        protocolVersion: 1,
+        token: 'kici_join_v1.routing.secret',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects an unknown scheme', () => {
+    expect(peerAuthRequestSchema.safeParse({ ...valid, scheme: 'mutual-v3' }).success).toBe(false);
   });
 
   it('rejects missing instanceId', () => {
@@ -116,6 +144,38 @@ describe('peerAuthRequestSchema', () => {
   it('round-trips through JSON serialization', () => {
     const roundTripped = JSON.parse(JSON.stringify(valid));
     expect(peerAuthRequestSchema.parse(roundTripped)).toEqual(valid);
+  });
+});
+
+describe('mutual-v2 hello and response', () => {
+  const hello = { type: 'peer.hello', ephemeralPublicKey: 'a', nonce: 'b' };
+
+  it('a hello naming a scheme this build does not know still parses', () => {
+    // fails-when: authSchemes is a strict enum array
+    expect(
+      peerHelloSchema.parse({ ...hello, authSchemes: ['mutual-v3', 'mutual-v2'] }).authSchemes,
+    ).toEqual(['mutual-v3', 'mutual-v2']);
+  });
+
+  it('a hello without authSchemes parses, so the client can refuse it explicitly', () => {
+    expect(peerHelloSchema.safeParse(hello).success).toBe(true);
+  });
+
+  it('an accepted response carries serverProof', () => {
+    expect(
+      peerAuthResponseSchema.parse({
+        type: 'peer.auth.response',
+        accepted: true,
+        serverProof: 'cd',
+      }).serverProof,
+    ).toBe('cd');
+  });
+
+  it('exports the refusal reason, which is no credential-divergence reason', () => {
+    expect(PEER_MUTUAL_AUTH_REQUIRED_REASON).toBe('Mutual peer authentication required');
+    expect(['Invalid proof', 'Unknown credential', 'Credential revoked']).not.toContain(
+      PEER_MUTUAL_AUTH_REQUIRED_REASON,
+    );
   });
 });
 
@@ -817,8 +877,11 @@ describe('peerToPeerMessageSchema', () => {
     const msg = {
       type: 'peer.auth.request',
       instanceId: 'orch-1',
-      token: 'join-token',
       protocolVersion: 1,
+      scheme: PeerAuthScheme.enum['mutual-v2'],
+      mode: PeerAuthMode.enum.token,
+      clientProof: 'ab'.repeat(32),
+      tokenRouting: 'cm91dGluZw',
     };
     expect(peerToPeerMessageSchema.parse(msg)).toEqual(msg);
   });

@@ -1,5 +1,21 @@
-import { describe, it, expect, vi } from 'vitest';
-import { createScalerBackend, requiredToolsFor } from './backend-factory.js';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// The bare-metal backend probes nft at load. A unit test must never run the
+// host's real nft (or sudo), so both helpers it calls are stubbed.
+const mockProbeNftables = vi.fn<(opts?: { requireSudo?: boolean }) => Promise<string | null>>();
+const mockEnsureKiciTable = vi.fn().mockResolvedValue(undefined);
+vi.mock('@kici-dev/shared/net', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@kici-dev/shared/net')>()),
+  probeNftables: (opts?: { requireSudo?: boolean }) => mockProbeNftables(opts),
+  ensureKiciTable: (...args: unknown[]) => mockEnsureKiciTable(...args),
+}));
+// Nor reach the host's container runtime: no runtime is found at load.
+vi.mock('./container-backend.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-backend.js')>()),
+  detectRuntime: async () => null,
+}));
+
+const { createScalerBackend, requiredToolsFor } = await import('./backend-factory.js');
 import type { BackendFactoryContext } from './backend-factory.js';
 import type { ScalerEntry } from './types.js';
 import { InMemoryIpAllocator } from './ip-allocator.js';
@@ -36,6 +52,11 @@ function ctx(overrides: Partial<BackendFactoryContext> = {}): BackendFactoryCont
 }
 
 describe('createScalerBackend', () => {
+  beforeEach(() => {
+    mockProbeNftables.mockReset().mockResolvedValue(null);
+    mockEnsureKiciTable.mockClear();
+  });
+
   it('passes requireSudo through to the firecracker backend', async () => {
     const backend = await createScalerBackend(fcEntry(), ctx());
     expect(backend).not.toBeNull();
@@ -158,5 +179,56 @@ describe('requiredToolsFor', () => {
     expect(
       requiredToolsFor([fcEntry({ name: 'evt', type: 'event', provisioningTargets: ['o/i'] })]),
     ).toEqual([]);
+  });
+});
+
+describe('createScalerBackend — bare-metal job-image mode', () => {
+  const jobImageEntry = (overrides: Partial<ScalerEntry> = {}) =>
+    fcEntry({
+      name: 'bm-img',
+      type: 'bare-metal',
+      requireSudo: false,
+      labelSets: [{ labels: ['bm-img'], image: 'quay.io/kici-dev/kici-agent:1' }],
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    mockProbeNftables.mockReset().mockResolvedValue(null);
+    mockEnsureKiciTable.mockClear();
+  });
+
+  it('passes requireSudo and extraHosts through to the bare-metal backend', async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    let backend;
+    try {
+      backend = await createScalerBackend(
+        jobImageEntry({
+          requireSudo: true,
+          extraHosts: ['registry.example.internal:host-gateway'],
+        }),
+        ctx(),
+      );
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
+    const fields = backend as unknown as { requireSudo: boolean; extraHosts?: string[] };
+    expect(fields.requireSudo).toBe(true);
+    expect(fields.extraHosts).toEqual(['registry.example.internal:host-gateway']);
+  });
+
+  it('fails to build a job-image scaler on a host that cannot run nft', async () => {
+    // fails-when: the factory constructs the backend directly and skips the
+    // load-time probe, so startup succeeds and every spawn fails instead.
+    mockProbeNftables.mockResolvedValue('Error: Operation not permitted (you must be root)');
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    try {
+      await expect(createScalerBackend(jobImageEntry(), ctx())).rejects.toThrow(
+        /Bare-metal scaler "bm-img".*CAP_NET_ADMIN/s,
+      );
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
   });
 });

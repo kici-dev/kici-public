@@ -82,6 +82,9 @@ describe('DashboardFleetWriteHandler', () => {
       hostname: 'web-1',
       properties: undefined,
     });
+    // fails-when: the handler passes HostWriteAuthority.operator (or any authority).
+    expect(declareStatic.mock.calls[0]).toHaveLength(1);
+    expect(declareStatic.mock.calls[0]![0]).not.toHaveProperty('authority');
     expect(sent).toEqual([
       {
         type: 'dashboard.fleet.host.declare.response',
@@ -89,6 +92,26 @@ describe('DashboardFleetWriteHandler', () => {
         declared: true,
         created: false,
       },
+    ]);
+  });
+
+  it('declare forwards only the four declared fields, never reach fields', async () => {
+    // fails-when: the handler spreads the message into the store input.
+    const { handler, declareStatic } = buildHandler(undefined);
+    await handler.handleMessage({
+      type: 'dashboard.fleet.host.declare',
+      requestId: 'req-x',
+      actor: ACTOR,
+      agentId: 'host-x',
+      address: '10.0.0.9',
+      sshKeySecret: 'prod/ssh',
+      authority: 'operator',
+    } as never);
+    expect(Object.keys(declareStatic.mock.calls[0]![0] as object).sort()).toEqual([
+      'agentId',
+      'hostname',
+      'labels',
+      'properties',
     ]);
   });
 
@@ -126,6 +149,8 @@ describe('DashboardFleetWriteHandler', () => {
     } as never);
 
     expect(removeStatic).toHaveBeenCalledWith('host-3');
+    // fails-when: the handler passes an authority to removeStatic.
+    expect(removeStatic.mock.calls[0]).toHaveLength(1);
     expect(sent).toEqual([
       { type: 'dashboard.fleet.host.remove.response', requestId: 'req-3', removed: true },
     ]);

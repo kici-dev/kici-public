@@ -1,13 +1,25 @@
 ---
 title: Why KiCI
-description: The case for running CI on infrastructure you control, with typed TypeScript workflows you test locally
+description: The case for a complete CI/CD system on infrastructure you control, with a full dev loop your coding agent can own
 ---
 
-Most CI platforms ask you to hand your source, your secrets, and your build machines to someone else. KiCI is built the other way around: your code runs on infrastructure you control, and you describe the pipeline in real TypeScript you can run before you push. This page is the short argument for that trade -- what it buys you, and what it costs.
+Most CI platforms ask you to hand your source, your secrets, and your build machines to someone else. They also make you push a commit to find out whether a pipeline works. KiCI is built the other way around. It is a complete CI/CD system that runs your pipelines on machines you control. You and your coding agent get the full dev loop on that real infrastructure, before anything reaches your branch. This page is the short argument for that trade -- what it buys you, and what it costs.
+
+## Your coding agent owns the dev loop
+
+A pipeline is software, and software is not done until it has run. In KiCI, whoever writes the pipeline can run it on the real infrastructure, read the result, and fix it.
+
+Before the push, `kici compile --check` reports a type error in seconds, and `kici run remote` runs your working tree on your own agents with test-scoped secrets. After the push, KiCI's MCP server lets your agent read the run and the failing step's logs, and re-run it. Every action uses an agent identity you control, and every action is audited. See [AI coding agents](ai-agents.md).
+
+KiCI has no model in the loop. It works with the agent you already run.
+
+## A complete CI system
+
+KiCI is not a layer on another CI. Triggers, dispatch, autoscaling, secrets, approvals and the dashboard are all part of it. Events come from pushes and pull requests, schedules, and any HTTP webhook. Your git host still sends the events; no other CI runs underneath.
 
 ## Your infrastructure runs the code
 
-KiCI is a three-tier relay. The hosted platform is a thin webhook router: it verifies the incoming webhook signature and relays the event to your orchestrator over a WebSocket. Your **orchestrator** decides what to run and dispatches jobs to your **agents**, which clone the repository, execute the steps, and stream logs back. The orchestrator and agents run on machines you own.
+KiCI is a three-tier relay. The hosted platform is a thin webhook router: it relays the incoming webhook to your orchestrator over a WebSocket, and your orchestrator verifies the signature with a secret that only it holds. Your **orchestrator** decides what to run and dispatches jobs to your **agents**, which clone the repository, execute the steps, and stream logs back. The orchestrator and agents run on machines you own.
 
 Because of that split, the hosted platform sees only the envelope, never the payload:
 

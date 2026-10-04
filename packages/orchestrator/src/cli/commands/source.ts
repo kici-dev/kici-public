@@ -38,6 +38,7 @@ import {
   sendLocalTrigger,
 } from './local-trigger.js';
 import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
+import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
 import { runGithubManifestSetup } from './source-manifest.js';
 import { confirmPrompt } from './shared/confirm.js';
 
@@ -74,6 +75,9 @@ interface GithubSourceRow {
   config: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+  /** This orchestrator's direct-ingress URL. Set by the HTTP route only; a
+   *  direct DB read leaves it unset (it needs the running orchestrator). */
+  ingressUrl?: string | null;
 }
 
 /** Secret-free direct read of the GitHub `sources` table, shaped to the same
@@ -137,16 +141,29 @@ interface ListableGenericRow {
 
 /** Render the human-readable `source list` output shared by the HTTP and the
  *  direct-DB branches. `hasOrg` mirrors whether `--org` was passed (generic
- *  sources are only listed for a specific org). */
-function renderSourceListText(
-  githubSources: Array<{ routingKey: string; name: string; provider: string }>,
+ *  sources are only listed for a specific org). `opts.directDb` marks a direct
+ *  DB read, which has no ingress URLs to print. */
+export function renderSourceListText(
+  githubSources: Array<{
+    routingKey: string;
+    name: string;
+    provider: string;
+    ingressUrl?: string | null;
+  }>,
   genericSources: ListableGenericRow[],
   hasOrg: boolean,
+  opts: { directDb: boolean },
 ): void {
   if (githubSources.length > 0) {
     console.log('GitHub sources:');
     for (const s of githubSources) {
       console.log(`  ${s.routingKey.padEnd(20)} ${s.name.padEnd(30)} (${s.provider})`);
+      if (s.ingressUrl) console.log(`    ingress: ${s.ingressUrl}`);
+    }
+    if (opts.directDb) {
+      console.log(
+        '  (ingress URLs need the running orchestrator: run without --database-url to see them)',
+      );
     }
   }
 
@@ -217,35 +234,6 @@ function safeParse(value: string): unknown {
 }
 
 /**
- * Short reason shown in `(unavailable — <reason>)` when no webhook URL could be
- * resolved for an added source.
- */
-function webhookNoteReason(note: string | undefined): string {
-  switch (note) {
-    case 'no-public-url':
-      return 'KICI_WEBHOOK_PUBLIC_URL is not set on the orchestrator';
-    case 'platform-no-public-url':
-      return 'the Platform has no public webhook URL configured';
-    case 'platform-unavailable':
-      return 'could not reach the Platform';
-    default:
-      return 'webhook URL could not be determined';
-  }
-}
-
-/** Actionable next-step hint paired with {@link webhookNoteReason}. */
-function webhookNoteHint(note: string | undefined): string {
-  switch (note) {
-    case 'no-public-url':
-      return "Set KICI_WEBHOOK_PUBLIC_URL to the orchestrator's public base, then re-run; paste the printed URL into your GitHub App or repo webhook.";
-    case 'platform-unavailable':
-      return 'Retry once the orchestrator reconnects, or find the URL in the dashboard under Sources.';
-    default:
-      return 'Find the webhook URL in the dashboard under Sources.';
-  }
-}
-
-/**
  * Resolve a secret value from various input modes.
  * Returns undefined if no input mode is specified.
  */
@@ -312,6 +300,14 @@ interface RefreshResultJson {
   newName: string;
   oldSlug: string | null;
   newSlug: string;
+  // The gap fields are optional: an older orchestrator omits them.
+  missingEvents?: string[];
+  missingPermissions?: string[];
+  installationsPendingApproval?: Array<{
+    installationId: number;
+    account: string;
+    missingPermissions: string[];
+  }>;
 }
 
 /** One delivery in a `source redeliver` response. */
@@ -379,18 +375,46 @@ function printRedeliverResult(res: RedeliverResponseJson): void {
   console.log(`  ${res.redelivered} redelivered, ${res.failed} failed${partial}.`);
 }
 
-/** Print a `source refresh` result, showing old → new for name + slug. */
+/**
+ * Print a `source refresh` result, showing old → new for name + slug, then any
+ * missing event or permission.
+ */
 function printRefreshResult(r: RefreshResultJson): void {
   if (!r.changed) {
     console.log(`${r.routingKey}: up to date (name "${r.newName}", slug "${r.newSlug}")`);
-    return;
+  } else {
+    console.log(`${r.routingKey}: updated`);
+    if (r.oldName !== r.newName) {
+      console.log(`  name: ${r.oldName} → ${r.newName}`);
+    }
+    if (r.oldSlug !== r.newSlug) {
+      console.log(`  slug: ${r.oldSlug ?? '(none)'} → ${r.newSlug}`);
+    }
   }
-  console.log(`${r.routingKey}: updated`);
-  if (r.oldName !== r.newName) {
-    console.log(`  name: ${r.oldName} → ${r.newName}`);
+  printRequirementGaps(r);
+}
+
+/** Warn when the App, or one of its installations, lacks what KiCI needs. */
+function printRequirementGaps(r: RefreshResultJson): void {
+  const events = r.missingEvents ?? [];
+  const permissions = r.missingPermissions ?? [];
+  const pending = r.installationsPendingApproval ?? [];
+  if (events.length + permissions.length + pending.length === 0) return;
+  console.log('  WARNING: this GitHub App lacks events or permissions KiCI needs.');
+  if (permissions.length > 0) console.log(`    missing permissions: ${permissions.join(', ')}`);
+  if (events.length > 0) console.log(`    missing events: ${events.join(', ')}`);
+  if (permissions.length + events.length > 0) {
+    console.log("    Add them in the App's settings under Permissions & events.");
   }
-  if (r.oldSlug !== r.newSlug) {
-    console.log(`  slug: ${r.oldSlug ?? '(none)'} → ${r.newSlug}`);
+  for (const p of pending) {
+    console.log(
+      `    installation ${p.account || p.installationId} has not accepted: ${p.missingPermissions.join(', ')}`,
+    );
+  }
+  if (pending.length > 0) {
+    console.log(
+      "    An owner of each listed account must accept the new permissions on the installation's Configure page.",
+    );
   }
 }
 
@@ -580,8 +604,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     )
     .option(
       '--webhook-url <url>',
-      'Advanced/self-hosted: bake this https:// URL into the App webhook verbatim and skip ' +
-        'platform-mode URL resolution. KiCI adds no ingress at this URL — your own infra owns delivery.',
+      'Advanced/self-hosted: bake this https:// URL into the App webhook verbatim instead of the ' +
+        'URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own ' +
+        'infra owns delivery.',
     )
     .option('--json', 'Emit raw JSON (the API response) instead of formatted text')
     .action(async (opts) => {
@@ -923,7 +948,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
             );
             return;
           }
-          renderSourceListText(githubSources, genericSources, Boolean(opts.org));
+          renderSourceListText(githubSources, genericSources, Boolean(opts.org), {
+            directDb: true,
+          });
           return;
         }
 
@@ -938,6 +965,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
             config: Record<string, unknown>;
             createdAt: string;
             updatedAt: string;
+            ingressUrl?: string | null;
           }>;
         }>('/api/v1/admin/sources');
 
@@ -961,7 +989,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           return;
         }
 
-        renderSourceListText(githubSources, genericSources, Boolean(opts.org));
+        renderSourceListText(githubSources, genericSources, Boolean(opts.org), {
+          directDb: false,
+        });
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
@@ -1077,10 +1107,14 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
   // -- source refresh <routingKey> --
   // Re-sync a GitHub source's display name + slug from GitHub. GitHub is the
   // source of truth: this fetches `GET /app` now and applies any drift, printing
-  // old → new for both fields. With --all, every GitHub source is refreshed.
+  // old → new for both fields, then warns about any missing event or permission
+  // and any installation pending approval. With --all, every GitHub source is
+  // refreshed.
   src
     .command('refresh [routingKey]')
-    .description("Re-sync a GitHub source's name and slug from GitHub (use --all for every source)")
+    .description(
+      "Re-sync a GitHub source's name and slug from GitHub and report missing events or permissions (use --all for every source)",
+    )
     .option('--all', 'Refresh every GitHub source')
     .option('--json', 'Emit raw JSON instead of formatted text')
     .action(async (routingKey: string | undefined, opts) => {

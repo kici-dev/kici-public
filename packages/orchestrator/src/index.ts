@@ -29,8 +29,8 @@ export {
 // Peer auth coordinator (exported for cluster tests)
 export {
   PeerAuthCoordinator,
+  RejectionAction,
   type AuthDecision,
-  type RejectionAction,
 } from './cluster/peer-auth-coordinator.js';
 
 // Cluster join-token manager (exported for tests that drive a real database)

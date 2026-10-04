@@ -310,7 +310,9 @@ installs on its host only when all of these are true:
   `registries:` block or `.kici/.npmrc`, or a lockfile URL, outside the
   registries the operator allows, or an `.npmrc` with CRLF line endings or
   another control character.
-- **The agent has its own npm or pnpm to run the install.**
+- **The agent has its own npm or pnpm to run the install.** On a Debian or
+  Ubuntu agent host, the separately packaged npm counts when it is version
+  11.10.0 or later.
 - **With an agent npm older than 11.15.0, `.kici/` has a lockfile that pins
   every package to a registry tarball.** That npm cannot refuse a URL
   dependency itself, so the agent runs `npm ci`. Commit the
@@ -333,9 +335,10 @@ for the exact allowlist.
 
 When the install runs inside the container, the registry must be reachable from
 the job's network. A failed install on the host fails the job with the
-installer's error. The job's setup log records the host checkout and the host
-install. `kici runs logs <run-id>` prints it under a `<job> › (setup)` heading, the
-dashboard shows it as the job's Setup section, and
+installer's error: its exit code, the end of its stderr and stdout, and for
+npm the end of npm's debug log. The job's setup log records the host checkout
+and the host install. `kici runs logs <run-id>` prints it under a
+`<job> › (setup)` heading, the dashboard shows it as the job's Setup section, and
 `kici-admin runs logs <run-id> --job <job-id> --step=-1` prints it on its own.
 
 All of this applies to a container job's own install. The jobs that prepare

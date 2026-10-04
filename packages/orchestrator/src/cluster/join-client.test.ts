@@ -1,92 +1,297 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, linkSync, statSync } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WebSocketServer, type WebSocket as WsSocket } from 'ws';
 import { z } from 'zod';
+import {
+  JOIN_PROTOCOL_UNSUPPORTED_MESSAGE,
+  JoinErrorCode,
+  PROTOCOL_VERSION,
+  authRequestSchema,
+  buildJoinRefusal,
+  joinRequestSchema,
+} from '@kici-dev/engine';
 
 import { envDef, loadConfig } from '../config.js';
 import { sharedConfigSchema } from '../config/schema.js';
-import { deriveKeys, encryptBundle } from './join-token.js';
 import {
+  SERVER_PROOF_MISMATCH_MESSAGE,
+  deriveJoinKeys,
+  requestTranscript,
+  sealJoinResponse,
+  verifyJoinerProof,
+} from './join-protocol-v2.js';
+import {
+  JOIN_TIMEOUT_MS,
+  JoinClient,
   STORAGE_ENV_VARS,
   buildEnvFile,
-  decryptAndParseBundle,
+  joinEndpointUrl,
   writeEnvFile,
 } from './join-client.js';
 
-describe('decryptAndParseBundle', () => {
-  it('correctly decrypts a valid encrypted bundle using token-derived key', () => {
-    const secret = randomBytes(32);
-    const keys = deriveKeys(secret);
-    const bundle = {
-      databaseUrl: 'postgres://localhost/kici',
-      clusterId: 'cluster-1',
-      storage: { type: 's3' as const, bucket: 'my-bucket' },
-      secretKey: 'secret-key-value',
-    };
+const BUNDLE = {
+  databaseUrl: 'postgresql://joiner:pw@db:5432/kici',
+  clusterId: 'cluster-1',
+  storage: { type: 's3' as const, bucket: 'kici-cache' },
+  secretKey: 'c'.repeat(64),
+};
 
-    const encrypted = encryptBundle(bundle, keys.encryptionKey);
-    const encryptedB64 = encrypted.toString('base64');
+/** A real-format token; the hash is computed with node:crypto, independent of the module. */
+function makeToken(): { token: string; secretHex: string; tokenHash: Buffer } {
+  const secret = randomBytes(32);
+  const routing = Buffer.from(
+    JSON.stringify({ orgId: 'org', routingKey: 'rk', expiry: Date.now() + 60_000 }),
+  ).toString('base64url');
+  return {
+    token: `kici_join_v1.${routing}.${secret.toString('hex')}`,
+    secretHex: secret.toString('hex'),
+    tokenHash: createHash('sha256').update(secret).digest(),
+  };
+}
 
-    const result = decryptAndParseBundle(encryptedB64, keys.encryptionKey);
-    expect(result).toEqual(bundle);
-  });
+/** What an existing orchestrator holding `tokenHash` answers to a v2 request. */
+function answerFor(tokenHash: Buffer, request: Record<string, unknown>, bundle: object = BUNDLE) {
+  const req = joinRequestSchema.parse(request);
+  const keys = deriveJoinKeys(tokenHash);
+  const requestT = requestTranscript(
+    req.routing,
+    Buffer.from(req.joinerPublicKey, 'base64'),
+    Buffer.from(req.joinerNonce, 'base64'),
+  );
+  if (!verifyJoinerProof(keys, requestT, req.joinerProof)) {
+    return buildJoinRefusal(req.messageId, JoinErrorCode.enum.invalid_token, 'Invalid join token');
+  }
+  return {
+    type: 'join.response' as const,
+    messageId: req.messageId,
+    success: true,
+    ...sealJoinResponse({
+      keys,
+      requestT,
+      joinerPublicKey: Buffer.from(req.joinerPublicKey, 'base64'),
+      bundle,
+    }),
+  };
+}
 
-  it('throws with wrong key', () => {
-    const secret1 = randomBytes(32);
-    const secret2 = randomBytes(32);
-    const keys1 = deriveKeys(secret1);
-    const keys2 = deriveKeys(secret2);
+/** A Platform stand-in on a real WebSocket server that records every frame it receives. */
+async function fakeRelay(onFrame: (frame: any, socket: WsSocket) => void) {
+  const server = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+  const frames: any[] = [];
+  server.on('connection', (socket) =>
+    socket.on('message', (data) => {
+      const frame = JSON.parse(String(data));
+      frames.push(frame);
+      onFrame(frame, socket);
+    }),
+  );
+  const { port } = server.address() as { port: number };
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    frames,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
 
-    const bundle = { databaseUrl: 'postgres://localhost/kici', clusterId: 'c1' };
-    const encrypted = encryptBundle(bundle, keys1.encryptionKey);
-    const encryptedB64 = encrypted.toString('base64');
-
-    expect(() => decryptAndParseBundle(encryptedB64, keys2.encryptionKey)).toThrow();
-  });
+const originalFetch = globalThis.fetch;
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  vi.restoreAllMocks();
 });
 
-describe('JoinClient joinViaPeer', () => {
-  it('sends POST to peer URL and returns parsed JoinResponse', async () => {
-    const { JoinClient } = await import('./join-client.js');
-
-    const mockResponse = {
-      type: 'join.response' as const,
-      success: true,
-      encryptedBundle: 'base64data',
-    };
-
-    // Mock global fetch
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(mockResponse),
-    }) as any;
-
+describe('JoinClient through the Platform relay', () => {
+  // fails-when: the {apiKey, role} auth shape remains (an independently authored schema refuses it).
+  it('authenticates with the auth.request the Platform accepts', async () => {
+    const relay = await fakeRelay((frame, socket) => {
+      if (frame.type === 'auth.request') {
+        socket.send(JSON.stringify({ type: 'auth.failure', reason: 'nope' }));
+      }
+    });
     try {
-      const client = new JoinClient({
-        token: 'kici_join_v1.dummyrouting.dummysecret',
-        peerUrl: 'https://orch-1:8080',
+      const { token } = makeToken();
+      await expect(
+        new JoinClient({ token, platformUrl: relay.url, apiKey: 'api-key-1' }).join(),
+      ).rejects.toThrow('Platform auth failed: nope');
+      expect(authRequestSchema.safeParse(relay.frames[0]).success).toBe(true);
+      expect(relay.frames[0]).toMatchObject({
+        token: 'api-key-1',
+        protocolVersion: PROTOCOL_VERSION,
       });
+    } finally {
+      await relay.close();
+    }
+  });
 
-      const result = await (client as any).joinViaPeer({
-        type: 'join.request',
-        token: 'kici_join_v1.dummyrouting.dummysecret',
-      });
+  // fails-when: the request carries the token or its hash, or the client retries with v1.
+  it('sends no secret and does not fall back after join_protocol_unsupported', async () => {
+    const relay = await fakeRelay((frame, socket) => {
+      if (frame.type === 'auth.request') socket.send(JSON.stringify({ type: 'auth.success' }));
+      if (frame.type === 'join.request') {
+        socket.send(
+          JSON.stringify(
+            buildJoinRefusal(undefined, JoinErrorCode.enum.join_protocol_unsupported, 'old'),
+          ),
+        );
+      }
+    });
+    try {
+      const { token, secretHex, tokenHash } = makeToken();
+      await expect(
+        new JoinClient({ token, platformUrl: relay.url, apiKey: 'k' }).join(),
+      ).rejects.toThrow(JOIN_PROTOCOL_UNSUPPORTED_MESSAGE);
+      const wire = JSON.stringify(relay.frames);
+      expect(wire).not.toContain(secretHex);
+      expect(wire).not.toContain(tokenHash.toString('hex'));
+      expect(relay.frames).toHaveLength(2);
+      expect('token' in relay.frames[1]).toBe(false);
+      expect(joinRequestSchema.safeParse(relay.frames[1]).success).toBe(true);
+    } finally {
+      await relay.close();
+    }
+  });
 
-      expect(result).toEqual(mockResponse);
-      expect(globalThis.fetch).toHaveBeenCalledWith(
-        'https://orch-1:8080/api/v1/cluster/join',
-        expect.objectContaining({
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-        }),
+  // fails-when: the join timer is not cleared, so the process waits out 30 s.
+  it('clears its join timer once the join completes', async () => {
+    const { token, tokenHash } = makeToken();
+    const relay = await fakeRelay((frame, socket) => {
+      if (frame.type === 'auth.request') socket.send(JSON.stringify({ type: 'auth.success' }));
+      if (frame.type === 'join.request') socket.send(JSON.stringify(answerFor(tokenHash, frame)));
+    });
+    const dir = await mkdtemp(join(tmpdir(), 'kici-join-relay-'));
+    const setSpy = vi.spyOn(globalThis, 'setTimeout');
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      await new JoinClient({
+        token,
+        platformUrl: relay.url,
+        apiKey: 'k',
+        envFilePath: join(dir, 'relay.env'),
+      }).join();
+      const index = setSpy.mock.calls.findIndex(([, delay]) => delay === JOIN_TIMEOUT_MS);
+      expect(index).toBeGreaterThanOrEqual(0);
+      const handle = setSpy.mock.results[index].value;
+      expect(clearSpy).toHaveBeenCalledWith(handle);
+      expect(await readFile(join(dir, 'relay.env'), 'utf-8')).toContain(
+        `KICI_SECRET_KEY=${'c'.repeat(64)}`,
       );
     } finally {
-      globalThis.fetch = originalFetch;
+      await relay.close();
+      await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it('names the close code and reason when the Platform closes before auth', async () => {
+    const relay = await fakeRelay((frame, socket) => {
+      if (frame.type === 'auth.request') socket.close(4008, 'Plan limit: maximum 5 orchestrators');
+    });
+    try {
+      const { token } = makeToken();
+      const err = await new JoinClient({ token, platformUrl: relay.url, apiKey: 'k' })
+        .join()
+        .catch((e: Error) => e);
+      expect(String(err)).toContain('4008');
+      expect(String(err)).toContain('Plan limit');
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it('fails at once when the socket closes after auth, before the join response', async () => {
+    const relay = await fakeRelay((frame, socket) => {
+      if (frame.type === 'auth.request') socket.send(JSON.stringify({ type: 'auth.success' }));
+      if (frame.type === 'join.request') socket.close(1011, 'gone');
+    });
+    try {
+      const { token } = makeToken();
+      const started = Date.now();
+      await expect(
+        new JoinClient({ token, platformUrl: relay.url, apiKey: 'k' }).join(),
+      ).rejects.toThrow(/before the join response/);
+      expect(Date.now() - started).toBeLessThan(2_000);
+    } finally {
+      await relay.close();
+    }
+  }, 5_000);
+});
+
+describe('JoinClient directly to a peer', () => {
+  function mockFetch(status: number, body: unknown) {
+    const fn = vi.fn().mockResolvedValue({
+      ok: status < 400,
+      status,
+      json: () => Promise.resolve(body),
+    });
+    globalThis.fetch = fn as unknown as typeof fetch;
+    return fn;
+  }
+
+  it('posts the v2 request to the join endpoint', async () => {
+    const fn = mockFetch(401, buildJoinRefusal(undefined, JoinErrorCode.enum.invalid_token, 'x'));
+    const { token } = makeToken();
+    await expect(
+      new JoinClient({ token, peerUrl: 'https://orch-1:8080' }).join(),
+    ).rejects.toThrow();
+    expect(fn).toHaveBeenCalledWith(
+      'https://orch-1:8080/api/v1/cluster/join',
+      expect.objectContaining({ method: 'POST', headers: { 'Content-Type': 'application/json' } }),
+    );
+    const body = JSON.parse(fn.mock.calls[0][1].body);
+    expect(joinRequestSchema.safeParse(body).success).toBe(true);
+    expect('token' in body).toBe(false);
+  });
+
+  it('names an orchestrator that predates join protocol v2, without a fallback', async () => {
+    const fn = mockFetch(400, { type: 'join.response', success: false, error: 'Missing token' });
+    const { token } = makeToken();
+    await expect(new JoinClient({ token, peerUrl: 'https://old:8080' }).join()).rejects.toThrow(
+      /https:\/\/old:8080 predates join protocol v2/,
+    );
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a refusal with its message and code', async () => {
+    mockFetch(
+      401,
+      buildJoinRefusal(undefined, JoinErrorCode.enum.invalid_token, 'Invalid join token'),
+    );
+    const { token } = makeToken();
+    await expect(new JoinClient({ token, peerUrl: 'https://orch-1:8080' }).join()).rejects.toThrow(
+      'Join rejected: Invalid join token (invalid_token)',
+    );
+  });
+
+  // fails-when: the client opens the bundle or writes the file before checking the server proof.
+  it('writes nothing when the server proof is forged', async () => {
+    const { token, tokenHash } = makeToken();
+    const dir = await mkdtemp(join(tmpdir(), 'kici-join-forged-'));
+    const envPath = join(dir, 'forged.env');
+    globalThis.fetch = vi.fn(async (_url: unknown, init: { body: string }) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ...answerFor(tokenHash, JSON.parse(init.body)),
+        serverProof: 'a'.repeat(64),
+      }),
+    })) as unknown as typeof fetch;
+    try {
+      await expect(
+        new JoinClient({ token, peerUrl: 'https://orch-1:8080', envFilePath: envPath }).join(),
+      ).rejects.toThrow(SERVER_PROOF_MISMATCH_MESSAGE);
+      expect(existsSync(envPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the base path of a peer URL', () => {
+    expect(joinEndpointUrl('https://h/kici')).toBe('https://h/kici/api/v1/cluster/join');
+    expect(joinEndpointUrl('https://h/kici/')).toBe('https://h/kici/api/v1/cluster/join');
+    expect(joinEndpointUrl('https://h:8080')).toBe('https://h:8080/api/v1/cluster/join');
   });
 });
 
@@ -292,42 +497,14 @@ describe('writeEnvFile', () => {
 });
 
 describe('JoinClient artifact', () => {
-  function makeToken(): { token: string; encryptionKey: Buffer } {
-    const secret = randomBytes(32);
-    const routing = Buffer.from(
-      JSON.stringify({ orgId: 'org', routingKey: 'rk', expiry: Date.now() + 60_000 }),
-    ).toString('base64url');
-    return {
-      token: `kici_join_v1.${routing}.${secret.toString('hex')}`,
-      encryptionKey: deriveKeys(secret).encryptionKey,
-    };
-  }
-
   async function runJoin(options: { envFilePath?: string }): Promise<void> {
-    const { JoinClient } = await import('./join-client.js');
-    const { token, encryptionKey } = makeToken();
-    const bundle = {
-      databaseUrl: 'postgresql://joiner:pw@db:5432/kici',
-      clusterId: 'cluster-1',
-      storage: { type: 's3' as const, bucket: 'kici-cache' },
-      secretKey: 'c'.repeat(64),
-    };
-
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn().mockResolvedValue({
+    const { token, tokenHash } = makeToken();
+    globalThis.fetch = vi.fn(async (_url: unknown, init: { body: string }) => ({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          type: 'join.response',
-          success: true,
-          encryptedBundle: encryptBundle(bundle, encryptionKey).toString('base64'),
-        }),
-    }) as unknown as typeof fetch;
-    try {
-      await new JoinClient({ token, peerUrl: 'https://orch-1:8080', ...options }).join();
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+      status: 200,
+      json: async () => answerFor(tokenHash, JSON.parse(init.body)),
+    })) as unknown as typeof fetch;
+    await new JoinClient({ token, peerUrl: 'https://orch-1:8080', ...options }).join();
   }
 
   // fails-when: a YAML artifact is written beside the env file again. The env

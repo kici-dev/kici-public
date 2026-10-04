@@ -14,7 +14,7 @@ Because the rootfs image is large (~500MB+), it is **not distributed as a pre-bu
 | **Linux host**         | Required for `debootstrap`, mount operations, and Firecracker execution              |
 | **Root access**        | Build script uses `mount`, `chroot`, and `mkfs.ext4`                                 |
 | **debootstrap**        | Debian/Ubuntu bootstrap tool (`apt install debootstrap`)                             |
-| **curl**               | For downloading Node.js                                                              |
+| **curl**               | For downloading Node.js and tini                                                     |
 | **mkfs.ext4**          | Part of `e2fsprogs` (usually pre-installed)                                          |
 | **util-linux**         | `flock`, `losetup` and `findmnt` (usually pre-installed)                             |
 | **Git**                | To clone the source repository                                                       |
@@ -75,6 +75,7 @@ sudo env PATH="$PATH" bash scripts/firecracker/build-agent-rootfs.sh --force-bas
 | -------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `BASE_CACHE_PATH`    | `/var/lib/kici/rootfs-base.ext4` | Location of the cached base image. Its stamp files sit beside it                                                      |
 | `KICI_NPM_REGISTRY`  | unset (npmjs)                    | npm registry for the base image's installs (pnpm and the TypeScript transform binding), for example a registry mirror |
+| `KICI_TINI_BASE_URL` | the tini GitHub releases         | Where the build fetches tini's release assets, for example a mirror. The pinned SHA-256 still decides                 |
 
 `sudo` resets the environment, so set these variables inside the `env` command:
 
@@ -105,7 +106,7 @@ Creates the base rootfs with the operating system and runtime dependencies. This
 5. The native TypeScript transform binding (matching the version the workspace installs, with native NAPI bindings) so the runtime TS loader hook resolves inside the VM. The `@kici-dev/core/ts-loader-hook` stub under `/opt/kici/node_modules/` is also seeded here, but it is refreshed on every agent injection (see Phase 2) so it always matches the bundled agent code
 6. Dockerode ESM shim (agent imports it, but Docker is not available in Firecracker VMs)
 
-> **`--force-base` after upgrades:** When rolling this out to a new host or after a Node.js version change, rebuild the base image explicitly: `sudo env PATH="$PATH" bash scripts/firecracker/build-agent-rootfs.sh --force-base`. The native TypeScript transform binding (a native NAPI build) lives in the base image and only updates on a base rebuild, so a Node major bump needs `--force-base`. The fast-path (`--agent-only`) re-injects the agent bundle **and** refreshes the `@kici-dev/core/ts-loader-hook` stub and the `/init` script, so an agent version bump that changes the bundle's externalized loader-hook dependency does not require a base rebuild.
+> **`--force-base` after upgrades:** When rolling this out to a new host or after a Node.js version change, rebuild the base image explicitly: `sudo env PATH="$PATH" bash scripts/firecracker/build-agent-rootfs.sh --force-base`. The native TypeScript transform binding (a native NAPI build) lives in the base image and only updates on a base rebuild, so a Node major bump needs `--force-base`. The fast-path (`--agent-only`) re-injects the agent bundle **and** refreshes the `@kici-dev/core/ts-loader-hook` stub, tini and the `/init` script, so an agent version bump that changes the bundle's externalized loader-hook dependency does not require a base rebuild.
 
 **Stripping:** Man pages, docs, locales, and apt caches are removed to minimize image size.
 
@@ -117,7 +118,8 @@ Bundles the agent, the workflow runner and the eval runner into single-file Java
 - `workflow-runner.js` at `/opt/kici/sandbox/workflow-runner.js`
 - `eval-runner.js` at `/opt/kici/eval-runner.js` — the agent forks it for every evaluation job (a workflow with a `filter`, a dynamic `env` / `environment` / `concurrencyGroup` / `matrix`, or a dynamic job). It sits beside `agent.js` because the agent resolves it from its own directory
 - The `@kici-dev/core/ts-loader-hook` stub at `/opt/kici/node_modules/@kici-dev/core/` (`package.json` + the loader-hook dist files)
-- The `/init` script (PID 1 process that bootstraps the VM and starts the agent), from `scripts/firecracker/agent-init.sh` beside the build script. It reads the metadata the orchestrator writes, so it is refreshed with the agent and matches the orchestrator version
+- `tini` at `/usr/local/bin/tini`: the static release binary, checked against the SHA-256 the build script pins, and cached beside the base image (`tini-static-<arch>`) so a later injection needs no network. `/init` runs the agent under it
+- The `/init` script (the first process of the VM, which bootstraps it and starts the agent under tini), from `scripts/firecracker/agent-init.sh` beside the build script. It reads the metadata the orchestrator writes, so it is refreshed with the agent and matches the orchestrator version
 
 The bundles externalize `@kici-dev/core/ts-loader-hook` and resolve it at runtime, so the stub is a property of the current bundle, not of the base image. Refreshing it on every injection keeps the stub in lockstep with the agent code — an agent bundle that changes which package the loader hook ships from stays self-sufficient without a base rebuild.
 
@@ -147,7 +149,7 @@ sudo env PATH="$PATH" pnpm build
 sudo env PATH="$PATH" bash scripts/firecracker/build-agent-rootfs.sh /path/to/agent-rootfs.ext4
 ```
 
-The run without flags re-injects the agent code, and it rebuilds the base image when the build script or the host Node.js version changed. `--agent-only` re-injects the agent code into the existing image and keeps the cached base as it is. Without an image path, the script builds `/var/lib/kici/agent-rootfs.ext4`, and a scaler that reads another path keeps booting the old agent.
+The run without flags re-injects the agent code, and it rebuilds the base image when the build script or the host Node.js version changed. `--agent-only` re-injects the agent code, tini and `/init` into the existing image and keeps the cached base as it is. Without an image path, the script builds `/var/lib/kici/agent-rootfs.ext4`, and a scaler that reads another path keeps booting the old agent.
 
 ## Scaler configuration
 
@@ -189,7 +191,7 @@ s3://spec.ccfc.min/firecracker-ci/v1.14/x86_64/vmlinux-5.10.245
 s3://spec.ccfc.min/firecracker-ci/v1.14/aarch64/vmlinux-5.10.245
 ```
 
-## VM /init process
+## VM /init and PID 1
 
 The rootfs includes an `/init` script that runs as PID 1 inside the microVM. It:
 
@@ -198,7 +200,9 @@ The rootfs includes an `/init` script that runs as PID 1 inside the microVM. It:
 3. Reads configuration from Firecracker MMDS (orchestrator URL, agent ID, labels, token)
 4. Adds the scaler's [`extraHosts`](../auto-scaler/firecracker.md#firecracker-specific-fields) mappings to `/etc/hosts`. A scaler that sets none gets no mapping
 5. Starts a background resource monitor (memory, processes, OOM events)
-6. Executes the agent: `exec /usr/local/bin/node /opt/kici/agent.js`
+6. Runs the agent under tini: `exec /usr/local/bin/tini -- /usr/local/bin/node /opt/kici/agent.js`
+
+tini is PID 1 from then on, and the agent is its child. tini reaps the processes a job leaves behind, and forwards SIGTERM, SIGINT and SIGUSR1 to the agent. An image whose agent layer predates tini runs the agent as PID 1: refresh it with `--agent-only`.
 
 The agent receives its configuration via MMDS metadata, injected by the Firecracker scaler at VM launch time.
 

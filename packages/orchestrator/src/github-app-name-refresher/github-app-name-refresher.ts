@@ -10,6 +10,11 @@
  * the Platform `webhook_sources` row and the dashboard Sources tab pick up the
  * new name/slug without any extra plumbing here.
  *
+ * The same pass checks each App against the events and permissions KiCI needs
+ * (`GITHUB_APP_REQUIREMENTS`) and the permissions each installation has
+ * accepted, and logs one warning per App with gaps. A gap never blocks the name
+ * and slug sync.
+ *
  * Lifecycle mirrors `StaleRunDetector`: `start()` runs an immediate refresh
  * (so a rename made while the orchestrator was down propagates on next boot)
  * then a `setInterval`; `stop()` clears it. Per-source errors are logged and
@@ -17,6 +22,13 @@
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import {
+  findGithubAppRequirementGaps,
+  hasRequirementGaps,
+  type GithubAppIdentity,
+  type GithubAppInstallationGrant,
+  type GithubAppRequirementGaps,
+} from '../providers/github/manifest.js';
 
 const logger = createLogger({ prefix: 'github-app-name-refresher' });
 
@@ -49,10 +61,16 @@ export interface RefreshableSourceStore {
 export type FetchGithubAppIdentity = (creds: {
   appId: string;
   privateKey: string;
-}) => Promise<{ name: string; slug: string }>;
+}) => Promise<GithubAppIdentity>;
 
-/** Outcome of a single source refresh. */
-export interface RefreshResult {
+/** List a GitHub App's installations. Matches `listGithubAppInstallations`. */
+export type FetchGithubAppInstallations = (creds: {
+  appId: string;
+  privateKey: string;
+}) => Promise<GithubAppInstallationGrant[]>;
+
+/** Outcome of a single source refresh: the name and slug sync plus the requirement gaps. */
+export interface RefreshResult extends GithubAppRequirementGaps {
   routingKey: string;
   changed: boolean;
   oldName: string;
@@ -63,14 +81,17 @@ export interface RefreshResult {
 
 /**
  * Refresh one already-resolved GitHub source's identity from GitHub and persist
- * it when the name or slug drifted. The caller supplies the row it already holds,
- * so this never lists the sources table. Throws for a non-GitHub row or missing
- * credentials.
+ * it when the name or slug drifted, then compare the App and its installations
+ * with the required events and permissions. The caller supplies the row it
+ * already holds, so this never lists the sources table. Throws for a non-GitHub
+ * row or missing credentials. A failed installations listing throws after the
+ * name and slug sync has been written, so the sync never waits on the gap check.
  */
 export async function refreshResolvedGithubSource(
   sourceStore: Pick<RefreshableSourceStore, 'getSourceWithSecrets' | 'updateSource'>,
   row: SourceIdentityRow,
   fetchIdentity: FetchGithubAppIdentity,
+  fetchInstallations: FetchGithubAppInstallations,
 ): Promise<RefreshResult> {
   if (row.provider !== 'github') {
     throw new Error(
@@ -88,15 +109,26 @@ export async function refreshResolvedGithubSource(
   const config = (
     typeof withSecrets.config === 'string' ? JSON.parse(withSecrets.config) : withSecrets.config
   ) as { appId: string };
-  const identity = await fetchIdentity({
-    appId: config.appId,
-    privateKey: withSecrets.privateKey,
-  });
+  const creds = { appId: config.appId, privateKey: withSecrets.privateKey };
+  const identity = await fetchIdentity(creds);
 
   const changed = identity.name !== row.name || identity.slug !== row.slug;
   if (changed) {
     await sourceStore.updateSource(row.routing_key, { name: identity.name, slug: identity.slug });
   }
+
+  // A gap never blocks the name and slug sync above; it is reported beside it.
+  let installations: GithubAppInstallationGrant[];
+  try {
+    installations = await fetchInstallations(creds);
+  } catch (err) {
+    throw new Error(
+      `${row.routing_key}: name and slug synced, but listing the GitHub App installations failed: ` +
+        toErrorMessage(err),
+      { cause: err },
+    );
+  }
+  const gaps = findGithubAppRequirementGaps(identity, installations);
 
   return {
     routingKey: row.routing_key,
@@ -105,31 +137,34 @@ export async function refreshResolvedGithubSource(
     newName: identity.name,
     oldSlug: row.slug,
     newSlug: identity.slug,
+    ...gaps,
   };
 }
 
 /**
  * Re-fetch one GitHub source's identity from GitHub and persist it when the
- * name or slug drifted. Resolves the row by routing key (one sources read) then
- * delegates. Shared by `kici-admin source refresh`. Throws for a missing or
+ * name or slug drifted, and report requirement gaps. Resolves the row by routing
+ * key (one sources read) then delegates. Shared by `kici-admin source refresh`. Throws for a missing or
  * non-GitHub routing key.
  */
 export async function refreshGithubSourceIdentity(
   sourceStore: RefreshableSourceStore,
   routingKey: string,
   fetchIdentity: FetchGithubAppIdentity,
+  fetchInstallations: FetchGithubAppInstallations,
 ): Promise<RefreshResult> {
   const all = await sourceStore.listSources();
   const row = all.find((s) => s.routing_key === routingKey);
   if (!row) {
     throw new Error(`Source not found: ${routingKey}`);
   }
-  return refreshResolvedGithubSource(sourceStore, row, fetchIdentity);
+  return refreshResolvedGithubSource(sourceStore, row, fetchIdentity, fetchInstallations);
 }
 
 export interface GithubAppNameRefresherDeps {
   sourceStore: RefreshableSourceStore;
   fetchIdentity: FetchGithubAppIdentity;
+  fetchInstallations: FetchGithubAppInstallations;
   /** Refresh cadence in ms. Default cluster value: 24h (`config.githubAppNameRefreshIntervalMs`). */
   scanIntervalMs: number;
 }
@@ -137,12 +172,14 @@ export interface GithubAppNameRefresherDeps {
 export class GithubAppNameRefresher {
   private readonly sourceStore: RefreshableSourceStore;
   private readonly fetchIdentity: FetchGithubAppIdentity;
+  private readonly fetchInstallations: FetchGithubAppInstallations;
   private readonly scanIntervalMs: number;
   private interval: ReturnType<typeof setInterval> | null = null;
 
   constructor(deps: GithubAppNameRefresherDeps) {
     this.sourceStore = deps.sourceStore;
     this.fetchIdentity = deps.fetchIdentity;
+    this.fetchInstallations = deps.fetchInstallations;
     this.scanIntervalMs = deps.scanIntervalMs;
   }
 
@@ -174,6 +211,7 @@ export class GithubAppNameRefresher {
           this.sourceStore,
           source,
           this.fetchIdentity,
+          this.fetchInstallations,
         );
         if (result.changed) {
           updated += 1;
@@ -183,6 +221,16 @@ export class GithubAppNameRefresher {
             newName: result.newName,
             oldSlug: result.oldSlug,
             newSlug: result.newSlug,
+          });
+        }
+        if (hasRequirementGaps(result)) {
+          logger.warn('GitHub App lacks events or permissions KiCI needs', {
+            routingKey: result.routingKey,
+            missingEvents: result.missingEvents,
+            missingPermissions: result.missingPermissions,
+            installationsPendingApproval: result.installationsPendingApproval.map(
+              (i) => i.account || String(i.installationId),
+            ),
           });
         }
       } catch (err) {

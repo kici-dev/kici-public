@@ -304,6 +304,28 @@ describe('maskMessageText', () => {
   });
 });
 
+describe('LogMasker registrations add up', () => {
+  // fails-when: a later registerSecrets call rebuilds the pattern from its own
+  // values only, so an OIDC token or mounted file unmasks every job secret.
+  it('keeps masking earlier secrets after a later registration', () => {
+    const masker = new LogMasker();
+    masker.registerSecrets({ JOB: 'job-secret-aaa' });
+    masker.registerSecrets({ __oidc_token__: 'oidc-token-bbb' });
+    expect(masker.mask('x job-secret-aaa y oidc-token-bbb')).toBe('x *** y ***');
+    expect(masker.mask(Buffer.from('job-secret-aaa').toString('base64'))).toBe('***');
+  });
+
+  // breaks-if-wrong: a registration with no qualifying value leaves the
+  // existing secrets in force.
+  it('keeps its secrets after an empty registration', () => {
+    const masker = new LogMasker();
+    masker.registerSecrets({ JOB: 'job-secret-aaa' });
+    masker.registerSecrets({ SHORT: 'ab' });
+    expect(masker.hasSecrets()).toBe(true);
+    expect(masker.mask('job-secret-aaa')).toBe('***');
+  });
+});
+
 describe('createSecretMasker', () => {
   it('collects flat and namespaced secrets', () => {
     const masker = createSecretMasker({

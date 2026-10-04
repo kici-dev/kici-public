@@ -208,7 +208,7 @@ a stub env file to edit by hand. The wizard asks only essential questions with s
 3. **Port** -- HTTP server port (default: 4000)
 4. **Secrets key** -- 32-byte hex encryption key (auto-generated with option to customize)
 5. **Platform connection** (if Hybrid/Platform/Observed mode) -- Platform URL and API key. Observed mode then asks for the orchestrator's own public webhook base URL (required); Hybrid asks for the same URL as an optional answer -- leave it blank to run relay-only for now and set `KICI_WEBHOOK_PUBLIC_URL` when you expose the ingress
-6. **GitHub App source** (optional, not offered in Observed mode) -- source name, App ID, private-key path, and webhook secret
+6. **GitHub App source** (optional) -- source name, App ID, private-key path, and webhook secret
 
 ```bash
 kici-admin orchestrator install

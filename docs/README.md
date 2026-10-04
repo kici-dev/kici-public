@@ -1,4 +1,4 @@
-KiCI runs your CI/CD on infrastructure you control. The hosted platform relays webhooks and renders the dashboard without ever seeing your source or secrets -- your own orchestrator and agents clone the code, run the jobs, and hold the logs. Workflows are typed TypeScript you can run locally before you push, so the pipeline you test on your laptop is the pipeline that runs in production.
+KiCI is a complete CI/CD system that runs your pipelines on machines you control. The hosted platform relays webhooks and renders the dashboard without ever seeing your source or secrets -- your own orchestrator and agents clone the code, run the jobs, and hold the logs. You and your coding agent get the full dev loop on that infrastructure: compile, run your working tree on your own agents, push, then read and re-run the result.
 
 ## Start here
 
@@ -6,7 +6,7 @@ New to KiCI? Follow these in order:
 
 1. **[Green run in ~5 minutes](user/quickstart.md)** -- stand up an orchestrator and agent (Docker / Podman or bare metal) and watch your first workflow go green.
 2. **[Getting started](user/getting-started.md)** -- install the SDK, write your first workflow, compile it, and test it locally.
-3. **[Why KiCI](user/why-kici.md)** -- the case for running CI on your own infrastructure with typed TypeScript workflows.
+3. **[Why KiCI](user/why-kici.md)** -- the case for a complete CI/CD system on your own infrastructure, with a dev loop your coding agent can own.
 4. **[GitHub App provider](user/providers/github.md)** -- connect your first source and route real events.
 
 ## Documentation sections

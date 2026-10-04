@@ -26,6 +26,7 @@ import {
 } from '@kici-dev/shared/env';
 import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX } from './cluster/cluster-identity.js';
+import { PeerDiscoveryMode } from './config/schema.js';
 
 /** How long the database pool waits for a connection when `KICI_DB_POOL_ACQUIRE_TIMEOUT_MS` is unset. */
 export const DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS = 5_000;
@@ -103,11 +104,11 @@ const baseSchema = z.object({
   provenanceSignerCommand: z.string().optional(),
   /**
    * Public base URL at which this orchestrator's own webhook ingress is
-   * reachable (independent/hybrid self-serve generic webhooks:
-   * `<base>/webhook/<customerId>/generic/<sourceId>`). Used by
-   * `kici-admin source add` to print a generic source's webhook URL. GitHub-App
-   * ingress is Platform-relayed, so GitHub URLs come from the Platform's
-   * `source.register.ack`, not this value. Trailing slash optional.
+   * reachable. It is the base of the GitHub ingress URLs
+   * (`<base>/webhook/<orgId>/github` for an App-level webhook,
+   * `<base>/webhook/<orgId>/github/<sourceId>` per source) and of the generic
+   * ingress URLs (`<base>/webhook/<orgId>/generic/<sourceId>`) that
+   * `kici-admin source add` and `source list` print. Trailing slash optional.
    */
   webhookPublicUrl: z.string().optional(),
   /**
@@ -782,6 +783,13 @@ const baseSchema = z.object({
         .union([z.boolean(), z.string()])
         .default(false)
         .transform((v) => (typeof v === 'boolean' ? v : v === 'true')),
+      /**
+       * Whether this coordinator dials the peers the Platform announces
+       * (platform) or only the KICI_CLUSTER_PEERS list (static). An announced
+       * address is a hint either way: it becomes a peer only after mutual
+       * authentication. Default: platform.
+       */
+      peerDiscovery: PeerDiscoveryMode.default(PeerDiscoveryMode.enum.platform),
       /** Trusted proxy IPs/CIDRs for X-Forwarded-For/X-Real-IP extraction. Comma-separated. */
       trustedProxies: z
         .string()
@@ -1150,6 +1158,7 @@ export const envDef = defineEnv({
       peerStaleTimeoutMs: 'KICI_CLUSTER_PEER_STALE_TIMEOUT_MS',
       electionGracePeriodMs: 'KICI_CLUSTER_ELECTION_GRACE_PERIOD_MS',
       singleNode: 'KICI_CLUSTER_SINGLE_NODE',
+      peerDiscovery: 'KICI_CLUSTER_PEER_DISCOVERY',
       trustedProxies: 'KICI_CLUSTER_TRUSTED_PROXIES',
     },
   },

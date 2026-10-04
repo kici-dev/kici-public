@@ -211,7 +211,9 @@ Gather a diagnostic bundle to share when you report a problem. `kici doctor`
 tells you what is wrong; `kici report` packages the context somebody else needs
 to see it. The bundle holds your CLI, Node and orchestrator versions, your
 redacted configuration, and your project's workflow and lock-file state. With
-`--run` it also holds the failing run's detail and logs.
+`--run` it also holds the failing run's detail and logs. If the Platform cannot
+find that run, the bundle names the Platform endpoint and the organization the
+command searched.
 
 For every orchestrator the probe returned the bundle also records where that
 orchestrator's own config files live — the paths only, never the contents. An
@@ -241,7 +243,10 @@ kici report -o /tmp/bug.zip --metadata ticket=1234 --metadata severity=high
 
 **Redaction.** KiCI removes known secret shapes — API keys, tokens, `Authorization`
 headers, private keys, passwords in connection URLs — from configuration and
-from log text. This is best effort. A secret in a format KiCI does not
+from log text. The configuration fields that tell where the CLI looks stay
+readable: the Platform endpoint, the OIDC issuer, the active organization id,
+and the token expiry time. The personal access token and its id stay
+redacted. Redaction is best effort. A secret in a format KiCI does not
 recognize can survive, so review the bundle before you share it. `--no-redact`
 turns redaction off and prints a warning; use it only on a bundle you keep.
 

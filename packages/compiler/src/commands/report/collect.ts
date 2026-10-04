@@ -19,7 +19,8 @@ import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { ZipArchive } from 'archiver';
 import { z } from 'zod';
-import { redactConfig, scrubText } from '@kici-dev/core/diagnostics-redaction';
+import { scrubText } from '@kici-dev/core/diagnostics-redaction';
+import { lookupTarget, redactCliConfig, withLookupTarget } from './cli-config.js';
 import { collectIdentity, type ReportIdentity } from './identity.js';
 import type { ProbeOutcome } from '../doctor.js';
 
@@ -259,14 +260,16 @@ export async function createReportBundle(
   )) as ReportIdentity | undefined;
   if (identity) append(identity, 'identity.json');
 
-  const config = await runCollector(report, 'config', () => deps.loadConfig(), scrub);
+  const config = (await runCollector(report, 'config', () => deps.loadConfig(), scrub)) as
+    Record<string, unknown> | undefined;
   // Allowlist redaction first, then free-text scrubbing on the way in — the
   // two catch different things, and a credential in an unknown field survives
   // only if neither runs. Both are gated on `redact`: `--no-redact` promises
-  // an unredacted bundle, and leaving the allowlist on regardless made the
-  // flag's help text and the published docs wrong about what it does.
+  // an unredacted bundle. The CLI allowlist keeps the fields that say which
+  // Platform and organization the CLI uses readable; every credential stays
+  // masked.
   if (config !== undefined) {
-    append(options.redact ? redactConfig(config) : config, 'config/config.json');
+    append(options.redact ? redactCliConfig(config) : config, 'config/config.json');
   }
 
   const project = await runCollector(
@@ -281,11 +284,23 @@ export async function createReportBundle(
   if (system !== undefined) append(system, 'system/info.json');
 
   if (options.runId) {
-    const run = (await runCollector(report, 'run', () => deps.fetchRun(options.runId!), scrub)) as
-      RunMaterial | undefined;
+    // A not-found note names where the CLI looked: a CLI logged in to another
+    // Platform or organization than the run's is the common cause, and the
+    // bare message cannot tell that apart from a deleted run.
+    const target = lookupTarget(config);
+    const runId = options.runId;
+    const run = (await runCollector(
+      report,
+      'run',
+      () =>
+        deps.fetchRun(runId).catch((err: unknown) => {
+          throw withLookupTarget(err, target);
+        }),
+      scrub,
+    )) as RunMaterial | undefined;
     if (run !== undefined) {
-      append(run.detail, `runs/${options.runId}/detail.json`);
-      archive.append(scrub(run.logs), { name: `runs/${options.runId}/logs.txt` });
+      append(run.detail, `runs/${runId}/detail.json`);
+      archive.append(scrub(run.logs), { name: `runs/${runId}/logs.txt` });
       fileCount += 1;
     }
   } else {

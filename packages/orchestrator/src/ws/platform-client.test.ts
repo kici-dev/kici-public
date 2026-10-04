@@ -4,6 +4,8 @@ import {
   DASHBOARD_REQUEST_TYPE_SET,
   ORCH_CAPABILITIES,
   PROTOCOL_VERSION,
+  JoinErrorCode,
+  buildJoinRefusal,
   type OrchestratorToPlatformMessage,
 } from '@kici-dev/engine';
 import {
@@ -138,6 +140,33 @@ afterEach(() => {
 // ── Tests ───────────────────────────────────────────────────────────
 
 describe('PlatformClient', () => {
+  describe('getGithubWebhookUrl', () => {
+    function authWith(extra: Record<string, unknown>) {
+      const client = createClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      simulateMessage(mock, { type: 'auth.success', connectionId: 'c1', orgId: 'org_a', ...extra });
+      return client;
+    }
+
+    // fails-when: the value from auth.success is not stored.
+    // breaks-if-wrong: getOrgId() is unchanged.
+    it('returns the URL from the last auth.success', () => {
+      const client = authWith({ githubWebhookUrl: 'https://api.kici.dev/webhook/org_a/github' });
+      expect(client.getGithubWebhookUrl()).toBe('https://api.kici.dev/webhook/org_a/github');
+      expect(client.getOrgId()).toBe('org_a');
+    });
+
+    it('returns null when the Platform sends null', () => {
+      expect(authWith({ githubWebhookUrl: null }).getGithubWebhookUrl()).toBeNull();
+    });
+
+    it('is undefined when the Platform omits the field', () => {
+      expect(authWith({}).getGithubWebhookUrl()).toBeUndefined();
+    });
+  });
+
   describe('connection lifecycle', () => {
     it('starts in disconnected state', () => {
       const client = createClient();
@@ -212,6 +241,18 @@ describe('PlatformClient', () => {
   });
 
   describe('capability exchange', () => {
+    // fails-when: the flag is advertised unconditionally, or not at all.
+    it('advertises clusterJoinV2 only when a join handler is wired', () => {
+      expect(createClient({ onJoinRequest: vi.fn() }).getCapabilities().clusterJoinV2).toBe(true);
+      expect(createClient().getCapabilities().clusterJoinV2).toBeUndefined();
+
+      const client = createClient({ onJoinRequest: vi.fn() });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      expect(JSON.parse(mock.sentMessages[0]).capabilities.clusterJoinV2).toBe(true);
+    });
+
     it('sends orchestrator capabilities in auth.request', () => {
       const client = createClient();
       client.connect();
@@ -343,6 +384,43 @@ describe('PlatformClient', () => {
       expect(advertised).not.toContain('dashboard.contexts.list');
       // …while a sibling type is untouched.
       expect(advertised).toContain('dashboard.contexts.get');
+    });
+  });
+
+  describe('relayed join.request', () => {
+    // fails-when: frames failing joinRequestSchema are dropped (the Platform would then wait 30s).
+    it('hands every join.request frame to the join handler and sends its answer', async () => {
+      const onJoinRequest = vi
+        .fn()
+        .mockResolvedValue(
+          buildJoinRefusal('m-9', JoinErrorCode.enum.join_protocol_v1_removed, 'x'),
+        );
+      const client = createClient({ onJoinRequest });
+      const mock = authenticateClient(client);
+      mock.sentMessages = [];
+      simulateMessage(mock, { type: 'join.request', messageId: 'm-9', token: 'kici_join_v1.a.b' });
+      await vi.waitFor(() =>
+        expect(getSentMessages(mock)).toContainEqual(
+          expect.objectContaining({
+            type: 'join.response',
+            messageId: 'm-9',
+            errorCode: JoinErrorCode.enum.join_protocol_v1_removed,
+          }),
+        ),
+      );
+      expect(onJoinRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ token: 'kici_join_v1.a.b' }),
+      );
+    });
+
+    // breaks-if-wrong: a non-join frame never reaches the join handler.
+    it('does not hand other unrecognized frames to the join handler', async () => {
+      const onJoinRequest = vi.fn();
+      const client = createClient({ onJoinRequest });
+      const mock = authenticateClient(client);
+      simulateMessage(mock, { type: 'join.unknown', messageId: 'm-1' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onJoinRequest).not.toHaveBeenCalled();
     });
   });
 

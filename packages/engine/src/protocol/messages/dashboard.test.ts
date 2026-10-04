@@ -32,6 +32,10 @@ import {
   dashboardFleetWorkflowsForHostResponseSchema,
   fleetHostDeclareRequestSchema,
   fleetHostDeclareResponseSchema,
+  FleetHostWriteRefusal,
+  fleetHostEntrySchema,
+  dashboardFleetHostsResponseSchema,
+  dashboardFleetHostResponseSchema,
   dashboardRunStructuredRequestSchema,
   dashboardRunStructuredResponseSchema,
   contextCreateRequestSchema,
@@ -1754,5 +1758,74 @@ describe('context repoPatterns', () => {
     expect(update({ repoPatterns: 'acme/*' }).success).toBe(false);
     expect(update({ repoPatterns: [1] }).success).toBe(false);
     expect(update({ repoPatterns: null }).success).toBe(false);
+  });
+});
+
+const INVENTORY_ENTRY = {
+  agentId: 'db-01',
+  labels: ['role:db'],
+  properties: {},
+  hostname: null,
+  platform: null,
+  arch: null,
+  lifecycleClass: 'static' as const,
+  status: 'unreachable' as const,
+  lastSeen: '2026-10-02T00:00:00.000Z',
+};
+
+describe('fleet host write refusals', () => {
+  it('enumerates exactly the three refusal codes', () => {
+    expect(FleetHostWriteRefusal.options).toEqual([
+      'reserved_property',
+      'host_exists',
+      'host_confirmed',
+    ]);
+  });
+
+  it('the declare response carries a refusal code and the reserved keys', () => {
+    // fails-when: the response schema strips reservedKeys at the Platform's parse.
+    const parsed = fleetHostDeclareResponseSchema.parse({
+      type: 'dashboard.fleet.host.declare.response',
+      requestId: 'r1',
+      error: FleetHostWriteRefusal.enum.reserved_property,
+      reservedKeys: ['kici:agent-restart-start'],
+    });
+    expect(parsed.reservedKeys).toEqual(['kici:agent-restart-start']);
+  });
+
+  it('a declare response without reservedKeys still parses', () => {
+    // breaks-if-wrong: an older orchestrator never sends reservedKeys.
+    const parsed = fleetHostDeclareResponseSchema.parse({
+      type: 'dashboard.fleet.host.declare.response',
+      requestId: 'r1',
+      declared: true,
+      created: true,
+    });
+    expect(parsed.reservedKeys).toBeUndefined();
+  });
+});
+
+describe('fleet host entries carry confirmed', () => {
+  it('keeps confirmed on the hosts and host responses', () => {
+    // fails-when: the responses still use the bare HostInventoryEntry, whose
+    // z.object strips `confirmed` at the Platform's parse.
+    const hosts = dashboardFleetHostsResponseSchema.parse({
+      type: 'dashboard.fleet.hosts.response',
+      requestId: 'r1',
+      hosts: [{ ...INVENTORY_ENTRY, confirmed: false }],
+    });
+    expect(hosts.hosts[0]?.confirmed).toBe(false);
+    const host = dashboardFleetHostResponseSchema.parse({
+      type: 'dashboard.fleet.host.response',
+      requestId: 'r2',
+      host: { ...INVENTORY_ENTRY, confirmed: true },
+      runs: [],
+    });
+    expect(host.host?.confirmed).toBe(true);
+  });
+
+  it('an entry without confirmed still parses', () => {
+    // breaks-if-wrong: an older orchestrator sends entries with no confirmed.
+    expect(fleetHostEntrySchema.parse(INVENTORY_ENTRY).confirmed).toBeUndefined();
   });
 });

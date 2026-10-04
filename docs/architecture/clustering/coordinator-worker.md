@@ -181,7 +181,7 @@ Schemas use `.passthrough()` so newer peers sending unknown flags don't get stri
 
 ### Software version (diagnostic only)
 
-Both sides send `softwareVersion` in the peer auth handshake for logging and debugging. It is not used for compatibility gating. Coordinators and workers can be upgraded in any order as long as every node's protocol version is at or above the minimum the others accept.
+Both sides send `softwareVersion` in the peer auth handshake for logging and debugging. It is not used for compatibility gating. `peer.hello` lists the authentication schemes the accepting side supports (`authSchemes`), and both sides require `mutual-v2`. Every coordinator and worker in a cluster runs a release with mutual peer authentication, so upgrade them together: an orchestrator with it and an older one do not connect to each other.
 
 ### CLI capability probe (REST)
 

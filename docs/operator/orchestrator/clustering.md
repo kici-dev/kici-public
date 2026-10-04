@@ -68,7 +68,7 @@ The shared database ensures:
 
 ### Peer authentication
 
-Peer-to-peer WebSocket connections use an ECDH key exchange, then authenticate with a join token or a credential. A coordinator without `KICI_CLUSTER_JOIN_TOKEN` issues its own credential the first time it connects to a peer. It writes to the shared database, which is the same authority `kici-admin peer create-token` uses. A worker has no database, so a worker joins with a one-time join token, and the coordinator that accepts the token issues the worker's credential. A coordinator can also join with a token. After the first join, every peer authenticates with its credential.
+Peer-to-peer WebSocket connections use an ECDH key exchange, then authenticate with a join token or a credential. Authentication is mutual: both sides prove that they hold the same credential or join token, and the dialling side accepts nothing until the peer it dialled proves it. A coordinator without `KICI_CLUSTER_JOIN_TOKEN` issues its own credential the first time it connects to a peer. It writes to the shared database, which is the same authority `kici-admin peer create-token` uses. A worker has no database, so a worker joins with a one-time join token, and the coordinator that accepts the token issues the worker's credential. A coordinator can also join with a token. After the first join, every peer authenticates with its credential.
 
 ### Network connectivity
 
@@ -89,6 +89,7 @@ Cluster configuration uses the `KICI_CLUSTER_*` environment variable prefix.
 | `KICI_CLUSTER_INSTANCE_ID`                  | random UUID               | Recommended                    | Unique identifier for this orchestrator instance. Auto-generated if not set, which gives a restarted orchestrator a new id and orphans the rows its previous boot wrote — set a stable value on every orchestrator, see [recovery is scoped to the owning instance](#recovery-is-scoped-to-the-owning-instance). A coordinator retires the credential its previous run issued when it issues a new one. |
 | `KICI_CLUSTER_ADDRESS`                      | --                        | When peers set                 | This orchestrator's reachable address (e.g., `ws://10.0.0.1:4000`). Required when `KICI_CLUSTER_PEERS` is set.                                                                                                                                                                                                                                                                                          |
 | `KICI_CLUSTER_PEERS`                        | --                        | Multi-orch independent         | Comma-separated list of peer addresses (e.g., `ws://10.0.0.2:4000,ws://10.0.0.3:4000`). Only needed for multi-orchestrator independent mode (Platform/hybrid uses automatic peer discovery).                                                                                                                                                                                                            |
+| `KICI_CLUSTER_PEER_DISCOVERY`               | `platform`                | --                             | Whether this coordinator dials the peers the Platform announces. `platform` dials them; an announced address becomes a peer only after mutual authentication with the announced instance ID. `static` dials only `KICI_CLUSTER_PEERS`. A coordinator with `static` and no `KICI_CLUSTER_PEERS` dials no peer, and other coordinators can still dial it.                                                 |
 | `KICI_CLUSTER_RAFT_ELECTION_TIMEOUT_MIN_MS` | `5000`                    | --                             | Minimum Raft election timeout (ms).                                                                                                                                                                                                                                                                                                                                                                     |
 | `KICI_CLUSTER_RAFT_ELECTION_TIMEOUT_MAX_MS` | `10000`                   | --                             | Maximum Raft election timeout (ms).                                                                                                                                                                                                                                                                                                                                                                     |
 | `KICI_CLUSTER_RAFT_HEARTBEAT_MS`            | `2000`                    | --                             | Raft leader heartbeat interval (ms).                                                                                                                                                                                                                                                                                                                                                                    |
@@ -106,12 +107,12 @@ Cluster configuration uses the `KICI_CLUSTER_*` environment variable prefix.
 ### Mode-specific requirements
 
 - **Single-orchestrator (any mode):** No cluster env vars needed. Cluster components initialize in dormant mode automatically.
-- **Multi-orchestrator Platform/hybrid mode:** Coordinators need no join token: each issues its own credential. Workers need a join token from `kici-admin peer create-token --role worker`. The Platform matchmaker handles peer discovery automatically.
+- **Multi-orchestrator Platform/hybrid mode:** Coordinators need no join token: each issues its own credential. Workers need a join token from `kici-admin peer create-token --role worker`. The Platform matchmaker handles peer discovery automatically. To dial only the peers you list, set `KICI_CLUSTER_PEER_DISCOVERY=static` and `KICI_CLUSTER_PEERS`.
 - **Multi-orchestrator independent mode:** `KICI_CLUSTER_ADDRESS` and `KICI_CLUSTER_PEERS` are required because there is no Platform matchmaker for peer discovery. Workers also need `KICI_CLUSTER_JOIN_TOKEN`.
 
 ## Peer authentication flow
 
-Peer authentication uses ECDH (X25519) key exchange to establish an encrypted channel before any credentials are transmitted.
+Peer authentication uses an ECDH (X25519) key exchange, then mutual authentication. In `peer.hello` the accepting side lists the schemes it accepts (`mutual-v2`). The dialling side proves that it holds the shared key (its credential, or its join token on first join) with a proof that covers both ephemeral keys. The accepting side answers with its own proof. No credential and no join token crosses the wire.
 
 ### A coordinator's own credential
 
@@ -135,10 +136,11 @@ A restart without a stable instance ID gives the orchestrator a new instance ID.
    ```bash
    KICI_CLUSTER_JOIN_TOKEN=kici_join_v1.xxx.yyy
    ```
-4. **ECDH handshake** -- the peer and coordinator exchange ephemeral X25519 public keys via `peer.hello` / `peer.hello.response` messages
-5. **Encrypted auth** -- the peer sends the join token in an encrypted `peer.auth.request`. The coordinator validates the token and responds with an encrypted `peer.auth.response` containing a session credential
-6. **Credential persistence** -- the peer saves the issued credential to `KICI_CLUSTER_CREDENTIAL_FILE` (default: `~/.kici/peer-credential`)
-7. **Token bound to the peer** -- the join token is marked consumed and recorded against the joining peer's instance ID. Until the token expires, the **same** peer instance may present it again to re-acquire a credential (self-healing rejoin after a transient outage); a _different_ instance cannot reuse it
+4. **ECDH handshake** -- the peer and coordinator exchange ephemeral X25519 public keys via `peer.hello` / `peer.hello.response` messages. The coordinator's `peer.hello` lists `mutual-v2`
+5. **Token proof** -- the peer sends the token's routing part and a proof that it holds the token, in an encrypted `peer.auth.request`. The token itself stays on the peer. The coordinator finds the token in its database, checks the proof, and takes the peer's role and routing key from the token it issued
+6. **Coordinator proof** -- the coordinator answers with a session credential and its own proof, which covers that credential. The peer accepts the answer only when the proof verifies. Every later message uses a key that needs the token
+7. **Credential persistence** -- the peer saves the issued credential to `KICI_CLUSTER_CREDENTIAL_FILE` (default: `~/.kici/peer-credential`)
+8. **Token bound to the peer** -- the join token is marked consumed and recorded against the joining peer's instance ID. Until the token expires, the **same** peer instance may present it again to re-acquire a credential (self-healing rejoin after a transient outage); a _different_ instance cannot reuse it
 
 ### Subsequent connections (with credential)
 
@@ -146,17 +148,20 @@ After the first join, the orchestrator uses its persisted credential file for al
 
 1. The orchestrator loads the credential from `KICI_CLUSTER_CREDENTIAL_FILE`
 2. ECDH handshake establishes an encrypted channel
-3. The orchestrator sends an HMAC proof of the credential (never the credential itself)
-4. The coordinator verifies the HMAC proof using `timingSafeEqual`
-5. Connection authenticated -- the peer resumes normal operation
+3. The orchestrator sends a proof of the credential that covers both ephemeral keys (never the credential itself)
+4. The coordinator checks the proof against the credential hash in the shared database, and answers with its own proof
+5. The orchestrator checks the coordinator's proof. Only then does it accept the connection and process messages from the coordinator
 
 ### Security properties
 
-- **No cleartext auth material** -- all authentication happens over the ECDH-encrypted channel
+- **No auth material on the wire** -- a peer sends a proof, never its credential or join token
+- **Mutual authentication** -- the dialling side accepts no message until the peer it dialled proves that it holds the same credential or join token
+- **Bound to the connection** -- each proof covers both ephemeral keys, so a relay that runs its own key exchange with each side cannot reuse a proof
 - **Instance-bound tokens** -- a join token is consumed on first use and bound to the joining peer's instance ID; only that same instance may re-present it (until expiry) to self-heal, so a returning peer recovers without a full cluster redeploy while a leaked token cannot be replayed by a different instance
-- **HMAC credential proof** -- credentials are never sent over the wire; only an HMAC proof is transmitted
 - **Rate limiting** -- failed authentication attempts are rate-limited (5 attempts per IP within 60 seconds)
-- **Post-auth encryption** -- all subsequent messages (heartbeats, reroutes, Raft) use the ECDH-derived session key
+- **Post-auth encryption** -- all later messages (heartbeats, reroutes, Raft) use a key derived from the ECDH secret and the shared credential or token
+- **Announced addresses are hints** -- a peer address the Platform announces becomes a peer only after mutual authentication with the announced instance ID. A dialled address that fails it is dropped and dialled again only when the Platform announces it again. Set `KICI_CLUSTER_PEER_DISCOVERY=static` to turn off dialling of announced addresses
+- **A rejection does not delete a valid credential** -- a coordinator keeps its credential file when a peer rejects a credential that its own database holds as valid
 
 ## Deployment recipes
 
@@ -382,7 +387,7 @@ The orchestrator bridges env vars into `config.storage` at startup. Once migrate
 
 ## Cluster join tokens
 
-Join tokens enable zero-knowledge cluster bootstrap. A new orchestrator can join an existing cluster with a single command -- no manual config copying required.
+Join tokens let a new orchestrator join an existing cluster with one command -- no manual config copying required.
 
 ### Creating a join token
 
@@ -442,11 +447,12 @@ If a peer later loses its credential (a transient outage during a token rotation
 
 ### Token security
 
-- Tokens are **instance-bound** -- consumed on first use and recorded against the joining peer's instance ID. The same instance may re-present an unexpired token to self-heal; a different instance is rejected as already used
-- Reuse is bounded by both the token's expiry and the consuming instance ID, so a leaked consumed token cannot be replayed as a different peer
-- Token hashes (not plaintext) are stored in the database
-- Auth material is transmitted over an ECDH-encrypted channel (never in cleartext)
-- Tokens carry a role (`coordinator` or `worker`) enforced at join time
+- `kici-admin join` keeps the join secret on the joining host. It sends a proof, and the cluster seals its configuration to a one-time key of that host, so the Platform relay cannot read the configuration.
+- Peer token mode (`KICI_CLUSTER_JOIN_TOKEN`) binds a token to the first instance that uses it. That instance may present the unexpired token again to self-heal; another instance is refused.
+- The bootstrap join (`kici-admin join`) can be repeated by anyone who holds the token until it expires. Keep tokens short-lived (the default is one hour) and treat a token like a password.
+- A peer's role and routing key come from the token row the cluster issued, not from the token text.
+- The database stores the SHA-256 of the token secret, never the secret. That hash still completes a `kici-admin join` until the token expires, so protect database read access and backups like the tokens themselves.
+- In peer token mode, the token travels over the ECDH-encrypted peer channel.
 
 ## Credential management
 
@@ -538,8 +544,18 @@ Three cluster HTTP endpoints are always mounted:
 | Endpoint              | Description                                                                                                           |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `GET /cluster/health` | Overall cluster health: status (healthy/degraded/unhealthy), role, term, leader, peer count, agent count, active runs |
-| `GET /cluster/peers`  | Per-peer details: instance ID, connection state, agent count, draining status, capabilities                           |
+| `GET /cluster/peers`  | Per-peer details: instance ID, connection state, agent count, draining status, capabilities, and `authScheme`         |
 | `GET /cluster/runs`   | Active execution runs with job routing summary                                                                        |
+
+`authScheme` reports the scheme each direction of a peer link authenticated with: `inbound` when the peer dialled this orchestrator, `outbound` when this orchestrator dialled the peer. A direction that is down reports `null`. A coordinator never dials a worker, so a worker link has `inbound` only.
+
+```json
+{
+  "instanceId": "orch-b",
+  "connected": true,
+  "authScheme": { "inbound": "mutual-v2", "outbound": "mutual-v2" }
+}
+```
 
 **Health status logic:**
 
@@ -617,9 +633,17 @@ Without this setting, rate limiting uses the socket IP (the proxy), which may in
 **Checks:**
 
 1. **Join token expired** -- tokens expire after 1 hour by default. Create a new one with `kici-admin peer create-token`
-2. **Token already consumed** -- join tokens are one-time use. Create a new one for each peer
+2. **Token already consumed** -- a peer token binds to the first instance that uses it, and another instance is refused. Create a new one for each peer
 3. **Credential revoked** -- if the credential was revoked via `kici-admin peer revoke`, the peer needs a new join token, including a coordinator
 4. **Rate limited** -- after 5 failed auth attempts within 60 seconds, the IP is temporarily blocked. Wait and retry
+
+### A peer does not support mutual authentication
+
+**Symptom:** The dialling orchestrator logs `Peer does not support mutual authentication; upgrade every orchestrator in the cluster`, or the dialled orchestrator logs `Peer used an authentication scheme this release no longer accepts; upgrade every orchestrator in the cluster` and refuses with `Mutual peer authentication required`.
+
+The cluster runs a mix of releases. Orchestrators with mutual peer authentication and older orchestrators do not connect to each other in either direction. An older orchestrator keeps its credential file and retries with backoff.
+
+**Fix:** upgrade every coordinator and worker in the cluster to the same release. See [Upgrade and rollback](../upgrade-and-rollback.md).
 
 ### `No peer auth method` in the logs
 

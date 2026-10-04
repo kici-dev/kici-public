@@ -33,6 +33,8 @@ function escapeRegExp(s: string): string {
  */
 export class LogMasker {
   private pattern: RegExp | null = null;
+  /** Every value registered so far, raw and base64-encoded. */
+  private readonly values = new Set<string>();
 
   /**
    * Register secret values to be masked in log output.
@@ -58,23 +60,18 @@ export class LogMasker {
    *
    * Both are strictly safer than leaking the body, and no heuristic separates a
    * structural line from a body line without risking the reverse mistake.
+   *
+   * Registrations add up: a later call (a mounted file's content, an OIDC
+   * token) extends the set, and every value registered before stays masked.
    */
   registerSecrets(secrets: Record<string, string>): void {
-    // Collect unique values that qualify for masking
-    const seen = new Set<string>();
-    const values: string[] = [];
-
     const add = (candidate: string): void => {
-      if (candidate.length < MIN_MASK_LENGTH || seen.has(candidate)) return;
-      seen.add(candidate);
-      values.push(candidate);
+      if (candidate.length < MIN_MASK_LENGTH) return;
+      this.values.add(candidate);
 
       // Also register the base64-encoded variant
       const b64 = Buffer.from(candidate).toString('base64');
-      if (b64.length >= MIN_MASK_LENGTH && !seen.has(b64)) {
-        seen.add(b64);
-        values.push(b64);
-      }
+      if (b64.length >= MIN_MASK_LENGTH) this.values.add(b64);
     };
 
     for (const value of Object.values(secrets)) {
@@ -90,13 +87,13 @@ export class LogMasker {
       }
     }
 
-    if (values.length === 0) {
+    if (this.values.size === 0) {
       this.pattern = null;
       return;
     }
 
     // Sort by length descending to mask longer values first
-    values.sort((a, b) => b.length - a.length);
+    const values = [...this.values].sort((a, b) => b.length - a.length);
 
     // Build a single combined regex using alternation
     this.pattern = new RegExp(values.map((v) => escapeRegExp(v)).join('|'), 'g');

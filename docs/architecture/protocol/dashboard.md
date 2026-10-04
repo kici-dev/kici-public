@@ -114,7 +114,7 @@ Auth failure response sent by orchestrator to agent.
 
 ## Join messages
 
-Join messages enable zero-knowledge cluster bootstrap. A new orchestrator sends a `join.request` with a join token, and an existing orchestrator responds with an AES-256-GCM encrypted config bundle. The Platform relay sees only the token's cleartext routing part and opaque ciphertext -- zero knowledge of customer configuration.
+Join messages carry join protocol v2. A new orchestrator proves it holds a join token without sending the token or its secret. An existing orchestrator answers with its own proof and the configuration bundle sealed to a one-time key of the new orchestrator. A relay sees the token's routing part, both public keys, both nonces, both proofs and the ciphertext. None of these lets it read or change the bundle. A `join.request` that carries a `token` field is refused with `join_protocol_v1_removed`.
 
 > Authoritative source: `packages/engine/src/protocol/messages/join.ts`
 
@@ -124,25 +124,50 @@ Join messages enable zero-knowledge cluster bootstrap. A new orchestrator sends 
 
 Sent by a new orchestrator to request cluster config from an existing orchestrator.
 
-| Field     | Type             | Required | Description                                                                                          |
-| --------- | ---------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| type      | `"join.request"` | Yes      | Message discriminator                                                                                |
-| messageId | string           | No       | Correlation ID for Platform relay routing (injected by Platform to match response to correct joiner) |
-| token     | string           | Yes      | Full join token: `kici_join_v1.<base64url_routing>.<secret_hex>`                                     |
+| Field           | Type             | Required | Description                                                                                          |
+| --------------- | ---------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| type            | `"join.request"` | Yes      | Message discriminator                                                                                |
+| messageId       | string           | No       | Correlation ID for Platform relay routing (injected by Platform to match response to correct joiner) |
+| joinProtocol    | `2`              | Yes      | Join protocol version                                                                                |
+| routing         | string           | Yes      | The token's base64url routing part, exactly as it appears in the token                               |
+| joinerPublicKey | string           | Yes      | The new orchestrator's one-time X25519 public key (DER SPKI, base64)                                 |
+| joinerNonce     | string           | Yes      | 32 random bytes, base64                                                                              |
+| joinerProof     | string           | Yes      | HMAC-SHA256 over the request transcript, lowercase hex                                               |
 
 ### Existing orchestrator -> new orchestrator (via Platform relay or direct peer)
 
 #### join.response
 
-Response from an existing orchestrator with an encrypted config bundle or error.
+Response from an existing orchestrator with the sealed config bundle, or a refusal.
 
-| Field           | Type              | Required | Description                                                     |
-| --------------- | ----------------- | -------- | --------------------------------------------------------------- |
-| type            | `"join.response"` | Yes      | Message discriminator                                           |
-| messageId       | string            | No       | Correlation ID echoed from join.request for relay routing       |
-| success         | boolean           | Yes      | Whether the join was successful                                 |
-| encryptedBundle | string            | No       | Base64-encoded AES-256-GCM encrypted config bundle (on success) |
-| error           | string            | No       | Error message (on failure)                                      |
+| Field           | Type              | Required | Description                                                               |
+| --------------- | ----------------- | -------- | ------------------------------------------------------------------------- |
+| type            | `"join.response"` | Yes      | Message discriminator                                                     |
+| messageId       | string            | No       | Correlation ID echoed from join.request for relay routing                 |
+| success         | boolean           | Yes      | Whether the join was successful                                           |
+| joinProtocol    | `2`               | No       | Join protocol version (on success)                                        |
+| serverPublicKey | string            | No       | The existing orchestrator's one-time X25519 public key (DER SPKI, base64) |
+| serverNonce     | string            | No       | 32 random bytes, base64                                                   |
+| serverProof     | string            | No       | HMAC-SHA256 over the response transcript, lowercase hex                   |
+| encryptedBundle | string            | No       | Base64 AES-256-GCM sealed config bundle (on success)                      |
+| error           | string            | No       | Error message (on failure)                                                |
+| errorCode       | string            | No       | Why the join was refused (see below). Absent on an internal failure       |
+
+#### Join error codes
+
+| errorCode                   | Produced by                   | Meaning                                                                     |
+| --------------------------- | ----------------------------- | --------------------------------------------------------------------------- |
+| `join_protocol_v1_removed`  | Platform, orchestrator, route | The request carries the join token (join protocol v1). Upgrade `kici-admin` |
+| `join_protocol_unsupported` | Platform                      | No orchestrator in the target pool supports join protocol v2. Upgrade them  |
+| `invalid_request`           | Platform, orchestrator, route | The request is malformed                                                    |
+| `invalid_token`             | Orchestrator, route           | No live join token matches the request's routing part and proof             |
+| `token_expired`             | Orchestrator, route           | The matching join token has expired                                         |
+| `token_already_used`        | Orchestrator, route           | Another joiner consumed the join token                                      |
+| `org_mismatch`              | Platform                      | The routing part names an org other than the relaying connection's own org  |
+| `no_target`                 | Platform                      | The target pool holds no orchestrator                                       |
+| `relay_timeout`             | Platform                      | The target orchestrator did not answer within 30 seconds                    |
+
+"Route" is `POST /api/v1/cluster/join` on the existing orchestrator, the direct transport of `kici-admin join --peer`. It answers `200` on success, `400` for `invalid_request`, `401` for `invalid_token`, `token_expired` and `token_already_used`, `426` with `Upgrade: kici-join-v2` for `join_protocol_v1_removed`, and `500` for an internal failure.
 
 The Browser ↔ Platform protocol (browser-side WebSocket auth, log subscriptions, status fan-out) is documented in the internal docs.
 
@@ -154,59 +179,61 @@ This layer carries cluster coordination messages between orchestrator instances 
 
 ### Authentication
 
-Peer authentication uses a 4-message ECDH handshake. The initiator (connecting orchestrator) sends `peer.hello`, the responder (receiving orchestrator) replies with `peer.hello.response`, then the initiator sends an encrypted `peer.auth.request`, and the responder replies with an encrypted `peer.auth.response`. All auth material is transmitted over the ECDH-encrypted channel.
+Peer authentication uses a 4-message ECDH handshake with mutual authentication (`mutual-v2`). The receiving orchestrator (the server, on `/ws/peer`) sends `peer.hello`, the connecting orchestrator (the client) replies with `peer.hello.response`, then the client sends an encrypted `peer.auth.request`, and the server replies with an encrypted `peer.auth.response`. Both messages after the hello exchange use the handshake key `K_hs`. No credential or join token crosses the wire: each side sends a proof bound to the handshake transcript. The client accepts nothing until the server's proof verifies. After an acceptance both sides switch to the application key `K_app`, which needs the shared credential or token as well as `K_hs`.
 
 #### peer.hello
 
-Sent by the initiator (connecting orchestrator) to start the ECDH handshake. Provides the initiator's ephemeral ECDH public key and a nonce.
+Sent by the server when a client connects. Provides the server's ephemeral ECDH public key, a nonce and the authentication schemes it accepts.
 
-| Field              | Type           | Required | Description                                                |
-| ------------------ | -------------- | -------- | ---------------------------------------------------------- |
-| type               | `"peer.hello"` | Yes      | Message discriminator                                      |
-| ephemeralPublicKey | string         | Yes      | Initiator's ephemeral X25519 public key (base64, DER SPKI) |
-| nonce              | string         | Yes      | Base64-encoded 32-byte random nonce (HKDF salt)            |
+| Field              | Type           | Required | Description                                                                                                                       |
+| ------------------ | -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| type               | `"peer.hello"` | Yes      | Message discriminator                                                                                                             |
+| ephemeralPublicKey | string         | Yes      | Server's ephemeral X25519 public key (base64, DER SPKI)                                                                           |
+| nonce              | string         | Yes      | Base64-encoded 32-byte random nonce (HKDF salt)                                                                                   |
+| authSchemes        | string[]       | No       | Schemes the server accepts (`mutual-v2`). A client refuses a hello without `mutual-v2` and sends nothing that depends on a secret |
 
 #### peer.hello.response
 
-Sent by the responder (receiving orchestrator) in response to `peer.hello`. Provides the responder's ephemeral ECDH public key. After this exchange, both sides derive a shared session key.
+Sent by the client in response to `peer.hello`. Provides the client's ephemeral ECDH public key. After this exchange, both sides derive `K_hs` and the transcript hash.
 
-| Field              | Type                    | Required | Description                                                |
-| ------------------ | ----------------------- | -------- | ---------------------------------------------------------- |
-| type               | `"peer.hello.response"` | Yes      | Message discriminator                                      |
-| ephemeralPublicKey | string                  | Yes      | Responder's ephemeral X25519 public key (base64, DER SPKI) |
+| Field              | Type                    | Required | Description                                             |
+| ------------------ | ----------------------- | -------- | ------------------------------------------------------- |
+| type               | `"peer.hello.response"` | Yes      | Message discriminator                                   |
+| ephemeralPublicKey | string                  | Yes      | Client's ephemeral X25519 public key (base64, DER SPKI) |
 
 #### peer.auth.request
 
-Sent by the connecting orchestrator after the ECDH handshake. **Encrypted** with the shared session key. Contains either a join token (first connection) or an HMAC credential proof (subsequent connections). The receiving orchestrator must respond within 15 seconds or the connection is closed.
+Sent by the client after the ECDH handshake. **Encrypted** with `K_hs`. The client proves that it holds its credential (`credential` mode) or its join token (`token` mode, first join). The server closes a connection that has not authenticated within 15 seconds. A request that carries `proof` or `token`, or no `scheme`, is refused with the reason `Mutual peer authentication required`.
 
-| Field           | Type                  | Required    | Description                                                        |
-| --------------- | --------------------- | ----------- | ------------------------------------------------------------------ |
-| type            | `"peer.auth.request"` | Yes         | Message discriminator                                              |
-| instanceId      | string                | Yes         | Sender's cluster instance ID                                       |
-| protocolVersion | number                | Yes         | Protocol version                                                   |
-| token           | string                | Conditional | Join token (first connection only)                                 |
-| proof           | string                | Conditional | HMAC proof of credential ownership (subsequent connections)        |
-| softwareVersion | string                | No          | Software version of the connecting peer (for version compat check) |
-| role            | enum                  | No          | Role of the connecting peer: `coordinator` or `worker`             |
-
-One of `token` or `proof` must be present.
+| Field           | Type                  | Required    | Description                                                                |
+| --------------- | --------------------- | ----------- | -------------------------------------------------------------------------- |
+| type            | `"peer.auth.request"` | Yes         | Message discriminator                                                      |
+| instanceId      | string                | Yes         | Client's cluster instance ID                                               |
+| protocolVersion | number                | Yes         | Protocol version                                                           |
+| scheme          | enum                  | Yes         | `mutual-v2`                                                                |
+| mode            | enum                  | Yes         | `credential` or `token`                                                    |
+| clientProof     | string                | Yes         | Hex HMAC-SHA256 proof over the handshake transcript                        |
+| tokenRouting    | string                | Conditional | The join token's base64url routing part (token mode only; never the token) |
+| softwareVersion | string                | No          | Software version of the client (logged)                                    |
+| role            | enum                  | No          | Role the client declares: `coordinator` or `worker`; the proof covers it   |
 
 #### peer.auth.response
 
-Response to a peer authentication request. **Encrypted** with the shared session key.
+Response to a peer authentication request. **Encrypted** with `K_hs`.
 
-| Field             | Type                    | Required | Description                                                        |
-| ----------------- | ----------------------- | -------- | ------------------------------------------------------------------ |
-| type              | `"peer.auth.response"`  | Yes      | Message discriminator                                              |
-| accepted          | boolean                 | Yes      | Whether authentication succeeded                                   |
-| instanceId        | string                  | No       | Responder's cluster instance ID                                    |
-| sessionCredential | string                  | No       | Issued credential for future connections (first join)              |
-| role              | string                  | No       | Confirmed role of the peer                                         |
-| reason            | string                  | No       | Rejection reason (if not accepted)                                 |
-| softwareVersion   | string                  | No       | Software version of the coordinator (for version compat check)     |
-| agents            | PeerAgentSummary[]      | No       | Responder's connected agent inventory (present when accepted=true) |
-| scalerCapacity    | ScalerCapacitySummary[] | No       | Responder's scaler capacity (present when accepted=true)           |
-| capabilities      | PeerCapabilities        | No       | Responder's feature capabilities (present when accepted=true)      |
+| Field             | Type                    | Required | Description                                                                                   |
+| ----------------- | ----------------------- | -------- | --------------------------------------------------------------------------------------------- |
+| type              | `"peer.auth.response"`  | Yes      | Message discriminator                                                                         |
+| accepted          | boolean                 | Yes      | Whether authentication succeeded                                                              |
+| instanceId        | string                  | No       | Server's cluster instance ID (present on every acceptance)                                    |
+| serverProof       | string                  | No       | Hex proof that the server holds the same credential or token (present on every acceptance)    |
+| sessionCredential | string                  | No       | Issued credential for future connections (token mode); the server proof covers it             |
+| role              | string                  | No       | Role the server grants, from the credential row or the join-token row (present on acceptance) |
+| reason            | string                  | No       | Rejection reason (if not accepted)                                                            |
+| softwareVersion   | string                  | No       | Software version of the server (logged)                                                       |
+| agents            | PeerAgentSummary[]      | No       | Server's connected agent inventory (present when accepted=true)                               |
+| scalerCapacity    | ScalerCapacitySummary[] | No       | Server's scaler capacity (present when accepted=true)                                         |
+| capabilities      | PeerCapabilities        | No       | Server's feature capabilities (present when accepted=true)                                    |
 
 ### Inventory & consensus
 

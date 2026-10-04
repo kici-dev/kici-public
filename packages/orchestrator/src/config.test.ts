@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from './config.js';
 import { resolveLocalConfig } from './config/resolver.js';
+import { PeerDiscoveryMode } from './config/schema.js';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX, clusterSentinelKey } from './cluster/cluster-identity.js';
 
 /**
@@ -373,6 +374,23 @@ describe('orchestrator loadConfig', () => {
     it('defaults cluster.singleNode to false', () => {
       const config = loadConfig();
       expect(config.cluster.singleNode).toBe(false);
+    });
+
+    it('defaults cluster.peerDiscovery to platform', () => {
+      const config = loadConfig();
+      expect(config.cluster.peerDiscovery).toBe(PeerDiscoveryMode.enum.platform);
+    });
+
+    it('parses KICI_CLUSTER_PEER_DISCOVERY=static', () => {
+      process.env.KICI_CLUSTER_PEER_DISCOVERY = 'static';
+      const config = loadConfig();
+      expect(config.cluster.peerDiscovery).toBe(PeerDiscoveryMode.enum.static);
+    });
+
+    it('refuses an unknown KICI_CLUSTER_PEER_DISCOVERY value', () => {
+      // fails-when: the value is a free string
+      process.env.KICI_CLUSTER_PEER_DISCOVERY = 'bogus';
+      expect(() => loadConfig()).toThrow();
     });
   });
 

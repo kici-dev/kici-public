@@ -130,6 +130,7 @@ RUN rm -f .npmrc \
 #   a `.tar.gz` / `.tar.xz` toolchain (mise's installer extracts a gzip tarball)
 #   fails with `gzip: Cannot exec: No such file or directory` before any step.
 # - iptables: MMDS metadata block when running as root
+# - tini: PID 1 of the agent container (see the ENTRYPOINT below)
 # - node: runtime + child process spawning (base image)
 # - npm: .kici/ dependency installation for npm projects (ships with node)
 # - pnpm: .kici/ dependency installation for pnpm-workspace repos (activated
@@ -209,7 +210,7 @@ RUN apt-get update \
   && CURL_VER="$(apt-cache policy curl | awk '/Candidate:/{print $2}')" \
   && { [ -n "$CURL_VER" ] && [ "$CURL_VER" != '(none)' ]; } \
   && apt-get install -y --no-install-recommends --allow-downgrades \
-       git bash "curl=$CURL_VER" "libcurl4t64=$CURL_VER" gzip xz-utils iptables \
+       git bash "curl=$CURL_VER" "libcurl4t64=$CURL_VER" gzip xz-utils iptables tini \
   && rm -f /var/lib/dpkg/status.d/libcurl4t64 \
   && dpkg --remove --force-depends perl perl-modules-5.40 libperl5.40 liberror-perl \
   && dpkg --purge --force-depends --force-remove-essential perl-base \
@@ -294,6 +295,18 @@ RUN set -eu; \
   chown -R node:node /opt/kici/node; \
   /opt/kici/node/bin/node --version
 
+# tini, PID 1 of the agent: Node never reaps a process it did not spawn, so an
+# agent running as PID 1 keeps every orphan a step leaves as a zombie, and a
+# killed step's process group reads as alive. The entrypoint runs the agent
+# under the package's tini. The static build is copied into the runtime tree,
+# because the scalers start an agent inside a job's own image from that tree,
+# and the image is not required to ship an init or a matching libc. The label
+# tells the scalers this tree carries it.
+RUN install -d -o root -g root -m 0755 /opt/kici/bin \
+  && install -o root -g root -m 0755 /usr/bin/tini-static /opt/kici/bin/tini \
+  && /usr/bin/tini --version && /opt/kici/bin/tini --version
+LABEL kici.runtime.init="tini"
+
 # Copy the pruned workspace (prod node_modules + pre-rebuilt oxc-transform
 # native binding + dist artifacts) from the builder, straight into the runtime
 # tree so /opt/kici is SELF-CONTAINED.
@@ -320,5 +333,7 @@ USER node
 # Expose health endpoint port (default 8080)
 EXPOSE 8080
 
-# Use node directly (not npm) for proper SIGTERM handling
+# tini forwards SIGTERM and SIGUSR1 to the agent. `-s` keeps it a reaper when
+# something else is PID 1, such as `docker run --init`.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["node", "packages/agent/dist/server.js"]

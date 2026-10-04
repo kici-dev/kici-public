@@ -90,6 +90,18 @@ describe('runGithubManifestSetup', () => {
     expect(deps.convert).not.toHaveBeenCalled();
   });
 
+  // fails-when: the abort still blames the Platform connection whatever the cause.
+  it('names the missing piece and offers --webhook-url', async () => {
+    const get = vi
+      .fn()
+      .mockResolvedValue({ webhookUrl: null, webhookNote: 'platform-url-unknown' });
+    const deps = makeDeps();
+    await expect(
+      runGithubManifestSetup({ name: 'acme' }, makeClient({ get }) as never, deps),
+    ).rejects.toThrow(/did not send its GitHub webhook URL[\s\S]*--webhook-url/);
+    expect(deps.startLoopback).not.toHaveBeenCalled();
+  });
+
   it('uses the paste-code path in --no-browser mode', async () => {
     const client = makeClient();
     const deps = makeDeps();
@@ -133,7 +145,7 @@ describe('runGithubManifestSetup', () => {
     );
   });
 
-  it('uses --webhook-url verbatim and skips platform-mode URL resolution', async () => {
+  it('uses --webhook-url verbatim instead of the URL the orchestrator resolves for its mode', async () => {
     const get = vi.fn(); // pre-flight resolver must NOT be called
     const startLoopback = vi.fn().mockResolvedValue({
       formUrl: 'http://127.0.0.1:1/',
@@ -150,7 +162,7 @@ describe('runGithubManifestSetup', () => {
       deps,
     );
 
-    // The platform-mode pre-flight GET was bypassed entirely.
+    // The pre-flight GET (the URL the orchestrator resolves for its mode) was bypassed entirely.
     expect(get).not.toHaveBeenCalled();
     // The override URL is baked into the served manifest verbatim.
     const secondCall = startLoopback.mock.calls[1]?.[0] as { manifestJson: string };

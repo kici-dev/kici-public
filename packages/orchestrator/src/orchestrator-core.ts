@@ -263,7 +263,7 @@ import { runMigrations, withMigrationPool } from './db/migrator.js';
 import { buildDeferredIndexes } from './db/deferred-indexes.js';
 import { SourceStore, SourceManager } from './sources/index.js';
 import { GithubAppNameRefresher } from './github-app-name-refresher/github-app-name-refresher.js';
-import { fetchGithubAppIdentity } from './providers/github/manifest.js';
+import { fetchGithubAppIdentity, listGithubAppInstallations } from './providers/github/manifest.js';
 import { loadProvenanceContext } from './provenance/dispatch-context.js';
 import {
   resolveMasterKeys,
@@ -3368,7 +3368,6 @@ export async function bootstrapOrchestrator(
   const sourceManager = new SourceManager({
     pool,
     sourceStore,
-    mode: config.mode,
     onSourcesChanged: () => {
       // Wired by mode-specific hook in onSubsystemsReady
     },
@@ -4000,6 +3999,7 @@ export async function bootstrapOrchestrator(
     sharedConfigStore,
     clusterIdentity,
     databaseUrl: config.databaseUrl,
+    secretKey: masterKeys?.material,
   });
 
   // Wire JoinTokenManager + SharedConfigStore into admin routes
@@ -4984,11 +4984,14 @@ export async function bootstrapOrchestrator(
   // each GitHub source's display name + slug from GitHub on a daily cadence and
   // persists a drift; the `sources_change` DB trigger fans the change out to the
   // Platform + dashboard via the existing SourceManager → updateSources path.
+  // The same pass logs a warning for each App that lacks an event or permission
+  // KiCI needs, or has an installation that has not accepted one.
   let githubAppNameRefresher: GithubAppNameRefresher | null = null;
   if (sourceStore) {
     githubAppNameRefresher = new GithubAppNameRefresher({
       sourceStore,
       fetchIdentity: (creds) => fetchGithubAppIdentity(creds),
+      fetchInstallations: (creds) => listGithubAppInstallations(creds),
       scanIntervalMs: config.githubAppNameRefreshIntervalMs,
     });
     await githubAppNameRefresher.start();

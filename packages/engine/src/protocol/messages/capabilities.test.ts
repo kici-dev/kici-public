@@ -4,6 +4,7 @@ import {
   OrchRole,
   ORCH_CAPABILITIES,
   hasOrchCapability,
+  OrchCapabilityFlag,
   platformCapabilitiesSchema,
   PLATFORM_CAPABILITIES,
   hasPlatformCapability,
@@ -97,6 +98,22 @@ describe('hasOrchCapability', () => {
   it('returns false for flag set to false', () => {
     const caps = orchCapabilitiesSchema.parse({ futureFlag: false });
     expect(hasOrchCapability(caps, 'futureFlag')).toBe(false);
+  });
+
+  // fails-when: clusterJoinV2 is missing from OrchCapabilityFlag, or an absent
+  //   capability set reads as capable.
+  it('declares clusterJoinV2 and lists it in OrchCapabilityFlag', () => {
+    expect(orchCapabilitiesSchema.parse({ clusterJoinV2: true }).clusterJoinV2).toBe(true);
+    expect(OrchCapabilityFlag.options).toContain('clusterJoinV2');
+    expect(hasOrchCapability({ clusterJoinV2: true }, OrchCapabilityFlag.enum.clusterJoinV2)).toBe(
+      true,
+    );
+    expect(hasOrchCapability({}, OrchCapabilityFlag.enum.clusterJoinV2)).toBe(false);
+    expect(hasOrchCapability(undefined, OrchCapabilityFlag.enum.clusterJoinV2)).toBe(false);
+  });
+
+  it('rejects a non-boolean clusterJoinV2', () => {
+    expect(orchCapabilitiesSchema.safeParse({ clusterJoinV2: 'yes' }).success).toBe(false);
   });
 });
 

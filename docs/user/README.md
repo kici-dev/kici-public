@@ -1,15 +1,15 @@
 ---
 title: User guide
-description: Writing and testing CI/CD workflows in TypeScript, running on infrastructure you control
+description: Writing, testing and debugging CI/CD workflows -- by you or your coding agent -- on infrastructure you control
 ---
 
-KiCI runs your CI/CD on infrastructure you control -- your own orchestrator and agents clone the code and run every job, while the hosted platform relays webhooks and renders the dashboard without ever seeing your source or secrets. You author workflows in real, typed TypeScript and run them locally before you push, so the pipeline you test on your laptop is the pipeline that runs in production. This section is for the people writing those workflows.
+KiCI runs your CI/CD on infrastructure you control. Your own orchestrator and agents clone the code and run every job, while the hosted platform relays webhooks and renders the dashboard without ever seeing your source or secrets. You author workflows in typed TypeScript and run them on your own agents before you push, and your coding agent can drive the same loop. This section is for the people writing those workflows.
 
 ## Start here
 
 1. **[Green run in ~5 minutes](quickstart.md)** -- stand up an orchestrator and agent (Docker / Podman or bare metal) and watch your first workflow go green.
 2. **[Getting started](getting-started.md)** -- install the SDK and compiler, write your first workflow, compile it to a lock file, and test it locally with simulated events.
-3. **[Why KiCI](why-kici.md)** -- the case for running CI on your own infrastructure with typed TypeScript workflows.
+3. **[Why KiCI](why-kici.md)** -- the case for a complete CI/CD system on your own infrastructure, with a dev loop your coding agent can own.
 4. **[GitHub App provider](providers/github.md)** -- connect your first source and route real pull-request and push events.
 
 ## What's in the user guide

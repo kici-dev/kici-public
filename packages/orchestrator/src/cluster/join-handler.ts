@@ -1,22 +1,44 @@
 /**
- * Join handler for processing join requests from new orchestrators.
+ * Join handler: answers join protocol v2 requests from new orchestrators, whether they
+ * arrive through the Platform relay or on POST /api/v1/cluster/join.
  *
- * Supports both Platform relay and direct peer transport. When a new orchestrator
- * sends a join.request with a kici_join_v1 token, this handler:
- * 1. Validates the token (exists in DB, not expired, not consumed)
- * 2. Builds a config bundle (DB URL, S3 config, secrets key, cluster ID)
- * 3. Encrypts the bundle with the token-derived AES-256-GCM key
- * 4. Consumes the token (one-time use)
- * 5. Returns the encrypted bundle to the joiner
- *
- * The Platform relay sees only routing metadata and ciphertext -- zero-knowledge.
+ * It finds the join token row by the request's routing fields, verifies the joiner's
+ * proof against each candidate row, claims the row by hash, and seals the configuration
+ * bundle (database URL, object storage, secrets key, cluster ID) to the joiner's
+ * one-time key. A version-1 frame (one that carries the token) is refused before any
+ * lookup.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import type { JoinRequest, JoinResponse } from '@kici-dev/engine';
+import {
+  INVALID_JOIN_REQUEST_MESSAGE,
+  JOIN_PROTOCOL_V1_REMOVED_MESSAGE,
+  JoinErrorCode,
+  JoinRequestKind,
+  buildJoinRefusal,
+  classifyJoinRequest,
+  type JoinRequest,
+  type JoinResponse,
+} from '@kici-dev/engine';
 import type { Kysely } from 'kysely';
 
-import { JoinTokenManager, encryptBundle, parseToken } from './join-token.js';
+import {
+  INVALID_JOIN_TOKEN_MESSAGE,
+  JoinTokenManager,
+  ResolvedJoinTokenStatus,
+  TOKEN_ALREADY_USED_MESSAGE,
+  TOKEN_EXPIRED_MESSAGE,
+  decodeJoinRouting,
+  tokenFingerprint,
+  type JoinRoutingClaim,
+} from './join-token.js';
+import {
+  deriveJoinKeys,
+  loadX25519PublicKey,
+  requestTranscript,
+  sealJoinResponse,
+  verifyJoinerProof,
+} from './join-protocol-v2.js';
 import type { ClusterIdentity } from './cluster-identity.js';
 import type { SharedConfigStore } from '../config/shared-store.js';
 
@@ -27,6 +49,11 @@ interface JoinHandlerDeps {
   sharedConfigStore: SharedConfigStore;
   clusterIdentity: ClusterIdentity;
   databaseUrl: string;
+  /**
+   * This orchestrator's own secrets key (`KICI_SECRET_KEY` or its key file). The
+   * bundle carries it when the shared configuration holds no `secrets.key`.
+   */
+  secretKey?: string;
 }
 
 /**
@@ -49,6 +76,22 @@ export interface ConfigBundle {
   clusterId: string;
 }
 
+/** The answer to a failure the joiner cannot act on; the detail goes to the log. */
+export const JOIN_INTERNAL_ERROR_MESSAGE = 'Internal error';
+
+/** Claim failures the joiner can act on, by the message `claimByHash` throws. */
+const CLAIM_ERROR_CODES: ReadonlyMap<string, JoinErrorCode> = new Map([
+  [TOKEN_ALREADY_USED_MESSAGE, JoinErrorCode.enum.token_already_used],
+  [TOKEN_EXPIRED_MESSAGE, JoinErrorCode.enum.token_expired],
+  [INVALID_JOIN_TOKEN_MESSAGE, JoinErrorCode.enum.invalid_token],
+]);
+
+interface DecodedJoinRequest {
+  claim: JoinRoutingClaim;
+  joinerPublicKey: Buffer;
+  requestT: Buffer;
+}
+
 export class JoinHandler {
   private readonly tokenManager: JoinTokenManager;
 
@@ -57,64 +100,103 @@ export class JoinHandler {
   }
 
   /**
-   * Handle a join request from a new orchestrator.
-   * Validates token, builds config bundle, encrypts with token-derived key, consumes token.
-   * Echoes messageId from request for Platform relay correlation.
+   * Answer one join.request frame. Every frame gets exactly one answer, a refused
+   * version-1 or malformed one included. Echoes the request's messageId for Platform
+   * relay correlation. A failure the joiner cannot act on (a database outage) carries
+   * no errorCode and a generic message.
    */
-  async handleJoinRequest(request: JoinRequest): Promise<JoinResponse> {
-    try {
-      // 1. Atomically validate and consume the token (single round-trip,
-      //    only one caller can win the claim across a shared-DB mesh).
-      //    parseToken first so the consumedBy label carries the routing key
-      //    even before the DB claim succeeds.
-      const previewRouting = parseToken(request.token).routing;
-      // The config-bundle bootstrap join.request carries no peer instanceId on
-      // the wire — it is a one-shot fetch of the encrypted config bundle keyed
-      // by the join token, not the ongoing per-peer mesh auth. Use the joiner
-      // routing-key label as both the consumedBy and the consuming instanceId so
-      // a joiner that retries the same bootstrap token (same routing key) is
-      // allowed the same self-healing reuse, while a different routing key is
-      // rejected as already-used.
-      const joinerLabel = `joiner:${previewRouting.routingKey}`;
-      const { routing, keys } = await this.tokenManager.validateAndConsumeToken(
-        request.token,
-        joinerLabel,
-        joinerLabel,
+  async handleJoinRequest(raw: unknown): Promise<JoinResponse> {
+    const classified = classifyJoinRequest(raw);
+    if (classified.kind === JoinRequestKind.enum.v1_removed) {
+      logger.warn('Refused a version-1 join.request', { messageId: classified.messageId });
+      return buildJoinRefusal(
+        classified.messageId,
+        JoinErrorCode.enum.join_protocol_v1_removed,
+        JOIN_PROTOCOL_V1_REMOVED_MESSAGE,
       );
-
-      // 2. Build config bundle
-      const bundle = await this.buildConfigBundle();
-
-      // 3. Encrypt bundle with token-derived key
-      const encrypted = encryptBundle(bundle, keys.encryptionKey);
-      const encryptedB64 = encrypted.toString('base64');
-
-      logger.info('Join request accepted', {
-        orgId: routing.orgId,
-        routingKey: routing.routingKey,
-        clusterId: bundle.clusterId,
-      });
-
-      return {
-        type: 'join.response',
-        messageId: request.messageId,
-        success: true,
-        encryptedBundle: encryptedB64,
-      };
+    }
+    if (classified.kind === JoinRequestKind.enum.invalid) {
+      return buildJoinRefusal(
+        classified.messageId,
+        JoinErrorCode.enum.invalid_request,
+        INVALID_JOIN_REQUEST_MESSAGE,
+      );
+    }
+    const request = classified.request;
+    const decoded = decodeRequest(request);
+    if (!decoded) {
+      return buildJoinRefusal(
+        request.messageId,
+        JoinErrorCode.enum.invalid_request,
+        INVALID_JOIN_REQUEST_MESSAGE,
+      );
+    }
+    try {
+      return await this.answer(request, decoded);
     } catch (err) {
-      const errorMsg = toErrorMessage(err);
-      logger.warn('Join request rejected', { error: errorMsg });
-      return {
-        type: 'join.response',
-        messageId: request.messageId,
-        success: false,
-        error: errorMsg,
-      };
+      const error = toErrorMessage(err);
+      logger.warn('Join request rejected', { error });
+      const code = CLAIM_ERROR_CODES.get(error);
+      // The requester is unauthenticated until its proof is checked, so an
+      // unmapped failure (a database error naming a host or user) stays in the log.
+      return code
+        ? buildJoinRefusal(request.messageId, code, error)
+        : {
+            type: 'join.response',
+            messageId: request.messageId,
+            success: false,
+            error: JOIN_INTERNAL_ERROR_MESSAGE,
+          };
     }
   }
 
+  private async answer(request: JoinRequest, decoded: DecodedJoinRequest): Promise<JoinResponse> {
+    const { claim, joinerPublicKey, requestT } = decoded;
+    const resolved = await this.tokenManager.resolveLiveTokenByRouting(claim, (tokenHash) =>
+      verifyJoinerProof(
+        deriveJoinKeys(Buffer.from(tokenHash, 'hex')),
+        requestT,
+        request.joinerProof,
+      ),
+    );
+    if (resolved.status === ResolvedJoinTokenStatus.enum.unknown) {
+      return buildJoinRefusal(
+        request.messageId,
+        JoinErrorCode.enum.invalid_token,
+        INVALID_JOIN_TOKEN_MESSAGE,
+      );
+    }
+    if (resolved.status === ResolvedJoinTokenStatus.enum.expired) {
+      return buildJoinRefusal(
+        request.messageId,
+        JoinErrorCode.enum.token_expired,
+        TOKEN_EXPIRED_MESSAGE,
+      );
+    }
+    // The bootstrap join carries no peer instance id; the joiner routing-key label is
+    // both consumer and instance, so a joiner retrying its own token is allowed again.
+    const label = `joiner:${claim.routingKey}`;
+    const claimed = await this.tokenManager.claimByHash(resolved.tokenHash, label, label);
+    const bundle = await this.buildConfigBundle();
+    const sealed = sealJoinResponse({
+      keys: deriveJoinKeys(Buffer.from(claimed.tokenHash, 'hex')),
+      requestT,
+      joinerPublicKey,
+      bundle,
+    });
+    logger.info('Join request accepted', {
+      orgId: claimed.routing.orgId,
+      routingKey: claimed.routing.routingKey,
+      clusterId: bundle.clusterId,
+      tokenFingerprint: tokenFingerprint(claimed.tokenHash),
+    });
+    return { type: 'join.response', messageId: request.messageId, success: true, ...sealed };
+  }
+
   /**
-   * Build the config bundle from SharedConfig + local config.
+   * Build the config bundle from SharedConfig + local config. The secrets key is
+   * the shared configuration's `secrets.key`, else this orchestrator's own key, so
+   * a joined orchestrator decrypts what the cluster encrypted.
    */
   async buildConfigBundle(): Promise<ConfigBundle> {
     const sharedResult = await this.deps.sharedConfigStore.getLatest();
@@ -125,8 +207,25 @@ export class JoinHandler {
     return {
       databaseUrl: this.deps.databaseUrl,
       storage: shared.storage,
-      secretKey: shared.secrets?.key,
+      secretKey: shared.secrets?.key ?? this.deps.secretKey,
       clusterId,
     };
+  }
+}
+
+/** Decode the routing part and the joiner key, and build the request transcript; null when malformed. */
+function decodeRequest(request: JoinRequest): DecodedJoinRequest | null {
+  try {
+    const claim = decodeJoinRouting(request.routing);
+    const joinerPublicKey = Buffer.from(request.joinerPublicKey, 'base64');
+    loadX25519PublicKey(joinerPublicKey);
+    const requestT = requestTranscript(
+      request.routing,
+      joinerPublicKey,
+      Buffer.from(request.joinerNonce, 'base64'),
+    );
+    return { claim, joinerPublicKey, requestT };
+  } catch {
+    return null;
   }
 }

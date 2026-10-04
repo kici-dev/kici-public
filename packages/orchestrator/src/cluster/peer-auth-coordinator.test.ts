@@ -2,9 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PeerAuthCoordinator } from './peer-auth-coordinator.js';
+import { PeerAuthCoordinator, RejectionAction } from './peer-auth-coordinator.js';
 import type { CredentialFileData } from './peer-credentials.js';
-import { CoordinatorCredentialOutcome as Outcome } from './coordinator-credential.js';
+import {
+  CoordinatorCredentialOutcome as Outcome,
+  RejectionCorroboration,
+} from './coordinator-credential.js';
 
 let dir: string;
 let credFile: string;
@@ -146,7 +149,7 @@ describe('PeerAuthCoordinator.reportRejection', () => {
     });
     // This peer-client proved with an OLDER credential than what's on disk now.
     const action = await c.reportRejection('stale-old', 'Invalid proof');
-    expect(action).toBe('retry-credential');
+    expect(action).toBe(RejectionAction.RetryCredential);
     await expect(stat(credFile)).resolves.toBeDefined(); // file still present
   });
 
@@ -158,7 +161,7 @@ describe('PeerAuthCoordinator.reportRejection', () => {
       joinToken: 'tok',
     });
     const action = await c.reportRejection('still-current', 'Credential revoked');
-    expect(action).toBe('rejoin');
+    expect(action).toBe(RejectionAction.Rejoin);
     await expect(stat(credFile)).rejects.toThrow(); // file deleted
   });
 
@@ -169,7 +172,68 @@ describe('PeerAuthCoordinator.reportRejection', () => {
       joinToken: 'tok',
     });
     const action = await c.reportRejection('whatever', 'Unknown credential');
-    expect(action).toBe('rejoin');
+    expect(action).toBe(RejectionAction.Rejoin);
+  });
+});
+
+describe('reportRejection corroboration', () => {
+  const fileExists = async () =>
+    stat(credFile).then(
+      () => true,
+      () => false,
+    );
+
+  it('keeps the file when this cluster database holds the credential as valid', async () => {
+    await writeFile(credFile, JSON.stringify(cred('coord-a', 'secret-1')));
+    const corroborateRejection = vi.fn().mockResolvedValue(RejectionCorroboration.HeldValid);
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      corroborateRejection,
+    });
+    // fails-when: no corroboration, so any endpoint's "Credential revoked" deletes the file
+    expect(await c.reportRejection('secret-1', 'Credential revoked')).toBe(
+      RejectionAction.KeepCredential,
+    );
+    expect(corroborateRejection).toHaveBeenCalledWith('secret-1');
+    expect(await fileExists()).toBe(true);
+  });
+
+  it('keeps the file when the database read fails', async () => {
+    await writeFile(credFile, JSON.stringify(cred('coord-a', 'secret-1')));
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      corroborateRejection: vi.fn().mockResolvedValue(RejectionCorroboration.Unreadable),
+    });
+    expect(await c.reportRejection('secret-1', 'Invalid proof')).toBe(
+      RejectionAction.KeepCredential,
+    );
+    expect(await fileExists()).toBe(true);
+  });
+
+  it('deletes the file when the database does not hold it (revoked, expired or missing)', async () => {
+    // breaks-if-wrong: an operator revoke must still delete the file so self-issue reconciles
+    await writeFile(credFile, JSON.stringify(cred('coord-a', 'secret-1')));
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      corroborateRejection: vi.fn().mockResolvedValue(RejectionCorroboration.NotHeld),
+    });
+    expect(await c.reportRejection('secret-1', 'Credential revoked')).toBe(RejectionAction.Rejoin);
+    expect(await fileExists()).toBe(false);
+  });
+
+  it('still prefers a sibling-refreshed file over corroboration', async () => {
+    await writeFile(credFile, JSON.stringify(cred('coord-a', 'fresh')));
+    const corroborateRejection = vi.fn();
+    const c = new PeerAuthCoordinator({
+      credentialFile: credFile,
+      instanceId: 'coord-a',
+      corroborateRejection,
+    });
+    expect(await c.reportRejection('stale', 'Invalid proof')).toBe(RejectionAction.RetryCredential);
+    expect(corroborateRejection).not.toHaveBeenCalled();
   });
 });
 

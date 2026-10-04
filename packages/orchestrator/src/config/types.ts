@@ -8,6 +8,7 @@
  */
 
 import type { OrchestratorMode } from '@kici-dev/engine';
+import type { PeerDiscoveryMode } from './schema.js';
 
 /**
  * Per-orchestrator settings loaded from YAML file.
@@ -88,6 +89,7 @@ export interface SharedConfig {
     raftHeartbeatMs?: number;
     peerHeartbeatIntervalMs?: number;
     peerMaxReconnectDelayMs?: number;
+    peerDiscovery?: PeerDiscoveryMode;
   };
   webhookPayloadDir?: string;
   cacheTtlDays?: number;
@@ -197,6 +199,8 @@ export interface AppConfig {
     coordinatorUrl?: string;
     /** Stale peer timeout in ms. */
     peerStaleTimeoutMs: number;
+    /** Whether this coordinator dials Platform-announced peers. */
+    peerDiscovery: PeerDiscoveryMode;
   };
   /** Webhook payload storage directory */
   webhookPayloadDir?: string;

@@ -82,6 +82,15 @@ vi.mock('../../service/index.js', async () => {
   };
 });
 
+// The real resolveInstanceTarget above imports detectPlatform from
+// platform-detect.js itself, so the barrel's detectPlatform mock never reaches
+// discovery. Pin the host here as well (as service/instance/resolve.test.ts
+// does), so "a systemd host" holds on a host without systemd.
+vi.mock('../../service/platform-detect.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../service/platform-detect.js')>();
+  return { ...actual, detectPlatform: vi.fn((): ServicePlatform => 'systemd') };
+});
+
 // Import after mocks so the action picks up the mocked module.
 import { registerOrchestratorUninstall } from './uninstall.js';
 import {
@@ -91,6 +100,7 @@ import {
   writeManifest,
 } from '../../service/index.js';
 import type { InstanceManifest } from '../../service/index.js';
+import { detectPlatform } from '../../service/platform-detect.js';
 
 function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -270,6 +280,9 @@ describe('orchestrator uninstall — folder-anchored', () => {
     const cfg = mockUninstall.mock.calls[0]![0] as ServiceConfig;
     expect(cfg.name).toBe('kici-foo');
     expect(readIndex(tmpConfigRoot)).toEqual([]);
+    // fails-when: the mock above is inert (a wrong module id), so discovery
+    // reads the real host; `toHaveBeenCalled` throws on a non-spy.
+    expect(vi.mocked(detectPlatform)).toHaveBeenCalled();
   });
 
   it('resolves via CWD manifest, then performs uninstall + index removal', async () => {

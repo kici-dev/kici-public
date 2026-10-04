@@ -4,9 +4,12 @@
  *   host list      List all roster hosts with derived status
  *   host get       Show one roster host
  *   host declare   Pre-declare a static host before its agent connects
+ *   host remove    Remove a host from the roster
  *
  * Reads/writes the orchestrator DB directly (via withDb), so this lives in
  * kici-admin — never in the public `kici` or the Platform `kici-platform-admin`.
+ * Writes run as the operator: they may set reserved `kici:` labels and
+ * properties, change any host, and confirm a host the dashboard created.
  */
 
 import type { Command } from 'commander';
@@ -16,7 +19,7 @@ import { parseHostPropertyAssignments } from '@kici-dev/engine';
 
 import { withDb } from './shared/db.js';
 import { recordAdminCliAccessOnDb } from './shared/admin-cli-access-log.js';
-import { deriveHostStatus, HostRosterStore } from '../../agent/host-roster.js';
+import { deriveHostStatus, HostRosterStore, HostWriteAuthority } from '../../agent/host-roster.js';
 import type { Database, HostRosterRow } from '../../db/types.js';
 
 /** Collect a repeatable `--prop key=value` flag into an array. */
@@ -36,7 +39,8 @@ function rosterGraceMs(): number {
 
 function formatHostTable(rows: HostRosterRow[]): string {
   if (rows.length === 0) return 'No hosts in the roster.';
-  const header = 'Agent ID | Class | Status | Instance | Last Seen | Labels';
+  // Source is the last column so scripts reading the earlier columns by position keep working.
+  const header = 'Agent ID | Class | Status | Instance | Last Seen | Labels | Source';
   const sep = '-'.repeat(header.length);
   const now = Date.now();
   const grace = rosterGraceMs();
@@ -44,7 +48,7 @@ function formatHostTable(rows: HostRosterRow[]): string {
     // SAME deriveHostStatus the store uses — no divergent inline logic.
     const status = deriveHostStatus(r, now, grace);
     const labels = (JSON.parse(r.labels) as string[]).join(',');
-    return `${r.agent_id} | ${r.lifecycle_class} | ${status} | ${r.connected_instance_id ?? '-'} | ${new Date(r.last_seen).toISOString()} | ${labels}`;
+    return `${r.agent_id} | ${r.lifecycle_class} | ${status} | ${r.connected_instance_id ?? '-'} | ${new Date(r.last_seen).toISOString()} | ${labels} | ${r.identity_source}`;
   });
   return [header, sep, ...body].join('\n');
 }
@@ -97,7 +101,7 @@ export function registerHostCommands(program: Command): void {
     .command('declare')
     .description('Pre-declare a static host before it connects')
     .requiredOption('--agent-id <id>', 'Agent id the host will register as')
-    .option('--labels <labels>', 'Comma-separated labels', '')
+    .option('--labels <labels>', 'Comma-separated labels')
     .option('--hostname <name>', 'Hostname')
     .option(
       '--prop <key=value>',
@@ -119,7 +123,7 @@ export function registerHostCommands(program: Command): void {
     .action(
       async (opts: {
         agentId: string;
-        labels: string;
+        labels?: string;
         hostname?: string;
         prop: string[];
         address?: string;
@@ -129,12 +133,14 @@ export function registerHostCommands(program: Command): void {
         s3Reachable?: boolean;
       }) => {
         try {
-          const labels = opts.labels
-            ? String(opts.labels)
-                .split(',')
-                .map((s) => s.trim())
-                .filter(Boolean)
-            : [];
+          // Omitted --labels keeps a stored host's labels (a new host gets none).
+          const labels =
+            opts.labels === undefined
+              ? undefined
+              : opts.labels
+                  .split(',')
+                  .map((s) => s.trim())
+                  .filter(Boolean);
           const properties = parseHostPropertyAssignments(opts.prop);
           let sshPort: number | undefined;
           if (opts.sshPort !== undefined) {
@@ -147,6 +153,7 @@ export function registerHostCommands(program: Command): void {
             const kdb = db as unknown as Kysely<Database>;
             try {
               await new HostRosterStore(kdb).declareStatic({
+                authority: HostWriteAuthority.operator,
                 agentId: opts.agentId,
                 labels,
                 hostname: opts.hostname,
@@ -189,7 +196,9 @@ export function registerHostCommands(program: Command): void {
         const deleted = await withDb(async (db) => {
           const kdb = db as unknown as Kysely<Database>;
           try {
-            const n = await new HostRosterStore(kdb).removeStatic(opts.agentId);
+            const n = await new HostRosterStore(kdb).removeStatic(opts.agentId, {
+              authority: HostWriteAuthority.operator,
+            });
             await recordAdminCliAccessOnDb(kdb, {
               action: 'fleet.host.remove',
               target: { type: 'fleet', id: opts.agentId },

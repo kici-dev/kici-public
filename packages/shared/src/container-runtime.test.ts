@@ -1,5 +1,8 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import {
+  agentImageLabels,
   pullImageIfMissing,
   runtimeInjectBind,
   injectedAgentCommand,
@@ -8,6 +11,10 @@ import {
   RUNTIME_MOUNT,
   RUNTIME_NODE_MOUNT,
   RuntimeSubtree,
+  RUNTIME_INIT_LABEL,
+  RUNTIME_TINI_PATH,
+  RuntimeInit,
+  runtimeInitCommand,
 } from './container-runtime.js';
 
 function mockDocker(opts: { present?: boolean } = {}) {
@@ -104,10 +111,81 @@ describe('runtimeInjectBind', () => {
 
 describe('injectedAgentCommand', () => {
   it('names both halves absolutely, since the image ships neither', () => {
+    // breaks-if-wrong: an agent image with no init label starts as before.
     expect(injectedAgentCommand()).toEqual([
       `${RUNTIME_MOUNT}/node/bin/node`,
       `${RUNTIME_MOUNT}/app/packages/agent/dist/server.js`,
     ]);
+  });
+
+  it('starts the agent under the init it is given', () => {
+    expect(injectedAgentCommand(['/opt/kici/bin/tini', '-s', '--'])).toEqual([
+      '/opt/kici/bin/tini',
+      '-s',
+      '--',
+      '/opt/kici/node/bin/node',
+      '/opt/kici/app/packages/agent/dist/server.js',
+    ]);
+  });
+});
+
+describe('runtimeInitCommand', () => {
+  it('starts an injected agent under the runtime tini when the image names it', () => {
+    // fails-when: the label is ignored, so an agent started inside a job's
+    // own image is PID 1 and never reaps a step's orphans.
+    expect(runtimeInitCommand({ [RUNTIME_INIT_LABEL]: 'tini' })).toEqual([
+      '/opt/kici/bin/tini',
+      '-s',
+      '--',
+    ]);
+  });
+
+  it('adds no init for an agent image that names none', () => {
+    // breaks-if-wrong: an agent image built before the label must start
+    // exactly as it did; its runtime tree has no /opt/kici/bin/tini.
+    expect(runtimeInitCommand(undefined)).toEqual([]);
+    expect(runtimeInitCommand(null)).toEqual([]);
+    expect(runtimeInitCommand({ 'org.opencontainers.image.version': '0.14.2' })).toEqual([]);
+  });
+
+  it('adds no init for a value this release does not know', () => {
+    expect(runtimeInitCommand({ [RUNTIME_INIT_LABEL]: 'catatonit' })).toEqual([]);
+  });
+
+  it('agrees with what the agent image ships', () => {
+    // fails-when: the Dockerfile's label, install path or entrypoint drifts
+    // from what the scalers start: the injected command would name a file
+    // the runtime tree does not carry.
+    const dockerfile = readFileSync(
+      path.resolve(import.meta.dirname, '../../agent/Dockerfile'),
+      'utf8',
+    );
+    expect(dockerfile).toContain(`LABEL ${RUNTIME_INIT_LABEL}="${RuntimeInit.enum.tini}"`);
+    expect(dockerfile).toMatch(
+      new RegExp(`install -o root -g root -m 0755 /usr/bin/tini-static ${RUNTIME_TINI_PATH}\\b`),
+    );
+    expect(dockerfile).toContain('ENTRYPOINT ["/usr/bin/tini", "-s", "--"]');
+    expect(dockerfile).toContain('CMD ["node", "packages/agent/dist/server.js"]');
+  });
+});
+
+describe('agentImageLabels', () => {
+  it('reads the labels of the agent image', async () => {
+    const inspect = vi
+      .fn()
+      .mockResolvedValue({ Config: { Labels: { [RUNTIME_INIT_LABEL]: 'tini' } } });
+    const getImage = vi.fn().mockReturnValue({ inspect });
+    expect(await agentImageLabels({ getImage } as never, 'kici-agent:x')).toEqual({
+      [RUNTIME_INIT_LABEL]: 'tini',
+    });
+    expect(getImage).toHaveBeenCalledWith('kici-agent:x');
+  });
+
+  it('reads an image with no labels as none', async () => {
+    // Docker reports an unlabelled image's Labels as null.
+    const inspect = vi.fn().mockResolvedValue({ Config: { Labels: null } });
+    const getImage = vi.fn().mockReturnValue({ inspect });
+    expect(await agentImageLabels({ getImage } as never, 'kici-agent:x')).toBeUndefined();
   });
 });
 

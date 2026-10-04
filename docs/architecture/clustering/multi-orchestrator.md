@@ -63,7 +63,7 @@ The KiCI Platform is primarily a **webhook router and peer matchmaker**, not a g
 
 Peers discover each other through two mechanisms:
 
-1. **Platform matchmaker (every Platform-connected mode -- `platform`, `hybrid`, `observed`):** When an orchestrator sends `source.register`, the Platform responds with `source.register.ack` that includes a `peers` array listing all other orchestrators registered with overlapping routing keys. When an orchestrator registers, the Platform also sends `peer.update` with the full peer list to every orchestrator already in the pool. Peer matchmaking is independent of relay eligibility -- an `observed` orchestrator never receives a relayed webhook, but it still discovers and is discovered by its peers.
+1. **Platform matchmaker (every Platform-connected mode -- `platform`, `hybrid`, `observed`):** When an orchestrator sends `source.register`, the Platform responds with `source.register.ack` that includes a `peers` array listing all other orchestrators registered with overlapping routing keys. When an orchestrator registers, the Platform also sends `peer.update` with the full peer list to every orchestrator already in the pool. Peer matchmaking is independent of relay eligibility -- an `observed` orchestrator never receives a relayed webhook, but it still discovers and is discovered by its peers. An announced address is a hint: a coordinator dials it with the announced instance ID, and the address becomes a peer only after mutual authentication succeeds and the server reports that instance ID. An address that fails mutual authentication is dropped, and dialled again only when the Platform announces it again. A new address announced for a connected peer is dialled as a candidate and replaces the working link only after it authenticates. `KICI_CLUSTER_PEER_DISCOVERY=static` turns off dialling of announced addresses.
 
 2. **Static configuration (independent mode):** Operators configure `KICI_CLUSTER_PEERS` with comma-separated peer addresses. Each orchestrator creates `PeerClient` instances for all configured peers at startup.
 
@@ -75,22 +75,27 @@ sequenceDiagram
     participant B as Orchestrator B
 
     A->>B: WebSocket connect to /ws/peer
-    B->>A: peer.hello (ephemeralPublicKey, nonce)
+    B->>A: peer.hello (ephemeralPublicKey, nonce, authSchemes)
     A->>B: peer.hello.response (ephemeralPublicKey)
-    A->>B: peer.auth.request (encrypted: instanceId, token or proof, protocolVersion)
-    B->>A: peer.auth.response (encrypted: accepted, instanceId, sessionCredential)
+    A->>B: peer.auth.request (K_hs: instanceId, scheme, mode, clientProof, tokenRouting, protocolVersion)
+    B->>A: peer.auth.response (K_hs: accepted, instanceId, role, serverProof, sessionCredential)
+    Note over A: A checks serverProof before it processes anything else
 
-    Note over A,B: Authenticated -- bidirectional messaging (encrypted)
+    Note over A,B: Authenticated -- bidirectional messaging under K_app
 
     A->>B: peer.heartbeat (agents, capabilities, term, leaderId)
     B->>A: peer.heartbeat (agents, capabilities, term, leaderId)
 ```
 
 - **Direct WS preferred** -- orchestrators proactively connect to all known peers
-- **ECDH encrypted channel** -- X25519 key exchange establishes an encrypted channel before any auth material is sent
-- **Join token or credential auth** -- a worker authenticates its first connection with a one-time join token; a coordinator without a token issues its own credential on its first peer connection; every later connection uses an HMAC credential proof
+- **ECDH encrypted channel** -- X25519 key exchange derives the handshake key (`K_hs`), which protects the authentication exchange
+- **Mutual authentication (`mutual-v2`)** -- both sides hash the handshake transcript (both ephemeral keys, the nonce, the advertised schemes). The dialling side proves the shared key with an HMAC over that hash; the accepting side answers with its own HMAC over the hash and the client proof. The shared key is the stored hash of the peer credential (credential mode) or of the join token (token mode). A relay that runs its own key exchange with each side gets two different transcripts, so neither proof verifies across them
+- **No secret on the wire** -- in token mode the peer sends the token's routing part, never the token. The accepting side finds the token row by its routing fields, picks the row the proof matches, and takes the peer's role and routing key from that row
+- **Join token or credential** -- a worker authenticates its first connection with a one-time join token; a coordinator without a token issues its own credential on its first peer connection; every later connection proves the credential
+- **Application key** -- after the acceptance both sides switch to `K_app`, derived from `K_hs` and the shared key, so a side that skipped the proof check can neither read nor write application frames
+- **Scheme refusal** -- a dialling side that does not see `mutual-v2` in `peer.hello` sends nothing secret and closes; an accepting side refuses a request in the earlier scheme with `Mutual peer authentication required`, which does not count against the rate limit
 - **Protocol version check** -- a `protocolVersion` below `MIN_PROTOCOL_VERSION` is refused with `peer.auth.response { accepted: false }` and close code `WS_CLOSE_PROTOCOL_ERROR`; a newer version is accepted (forward compatibility)
-- **Auth timeout** -- incoming connections must authenticate within 15 seconds or get disconnected
+- **Auth timeout** -- both sides close a connection that has not authenticated within 15 seconds
 - **Rate limiting** -- 5 failed auth attempts per IP within 60 seconds triggers temporary block
 - **Auto-reconnect** -- exponential backoff with jitter (1s base, 1.5x multiplier, 60s max)
 
@@ -395,7 +400,7 @@ This allows different connection strings for the same logical resource (e.g., VP
 KiCI's design assumes **one cluster per org** for a given routing key. The Platform-side routing pool is keyed by `(orgId, routingKey)` only -- there is no notion of `cluster_id` on the Platform tier. If two distinct clusters in the same org register the same source (e.g., the same GitHub App installation), every orchestrator from both clusters lands in the same Platform pool. The resulting behavior is incoherent and is **not a supported deployment topology**:
 
 - **Webhook routing splits unpredictably.** Least-loaded routing picks one orchestrator from the merged pool per delivery. A given delivery may land on cluster A or cluster B, depending on momentary job counts and round-robin tie-breaking. The receiving orchestrator becomes the run coordinator and creates the run row in **its own** orchestrator DB; the other cluster never sees that delivery.
-- **Peer discovery cross-fires.** Peer discovery matches on routing-key prefix only, so when a cluster B orchestrator registers, cluster A orchestrators are told about it and attempt P2P connections. The ECDH handshake completes, but join-token / HMAC-credential authentication then fails because cluster B's peer-credential table has no entry for cluster A's instance ID (and vice versa). The result is permanent peer-discovery noise that never produces healthy peer links. A coordinator that issues its own credential also deletes it and issues a replacement after each proof the other cluster rejects.
+- **Peer discovery cross-fires.** Peer discovery matches on routing-key prefix only, so when a cluster B orchestrator registers, cluster A orchestrators are told about it and attempt P2P connections. The ECDH handshake completes, but mutual authentication then fails because cluster B's peer-credential table has no entry for cluster A's instance ID (and vice versa). The result is peer-discovery noise that never produces healthy peer links. A coordinator keeps its credential file through such a rejection, because its own database still holds the credential as valid.
 - **Webhook secrets must be duplicated.** Each orchestrator verifies signatures locally against its own scoped-secret store. Whichever cluster gets routed must already hold the source's signing material; otherwise signature verification fails inside the chosen coordinator and the delivery is rejected.
 - **Dashboard becomes split-view.** The dashboard run list mirrors lifecycle events from every connected orchestrator, so runs from both clusters appear mixed together. Run-detail and log proxy queries route via least-loaded selection, so a request for a run that lives in cluster A's DB can land on a cluster B orchestrator and return "not found".
 - **Cron / orphan recovery double-fires.** Each cluster's Raft leader independently evaluates schedules and orphan recovery on its own DB, so any cron registration loaded into both clusters fires twice per tick, and orphan-run finalization decisions diverge between the two clusters.
@@ -406,16 +411,20 @@ If you genuinely need two independent orchestrator deployments listening to the 
 
 ## Join token bootstrap
 
-### Zero-knowledge join flow
+### Join flow
 
-New orchestrators can join an existing cluster using a one-time join token without manual config copying. The join token serves triple duty: authentication, routing, and encryption key derivation.
+New orchestrators can join an existing cluster with a join token, without manual config copying. `kici-admin join` uses join protocol v2: the join secret stays on the joining host, and the existing orchestrator seals the configuration bundle to a one-time key of that host.
 
 **Token format:** `kici_join_v1.<base64url_routing>.<hex_secret>`
 
-- **Routing part** (cleartext): `{ orgId, routingKey, expiry }` -- the Platform reads this for relay routing
-- **Secret part**: HKDF-SHA256 derives an AES-256 encryption key + SHA-256 hash stored in the orchestrator DB for validation
+- **Routing part** (cleartext): `{ orgId, routingKey, expiry, role }`. The Platform reads it to check the org and choose the target pool. The existing orchestrator uses it to find candidate token rows. It is a lookup key only: the role and routing key a join gets come from the stored row.
+- **Secret part**: never sent. Its SHA-256 is the value the `join_tokens` table stores, and it is the root of every join key.
 
-The config bundle (DB URL, S3 config, cluster ID) is encrypted with AES-256-GCM using the token-derived key. The Platform relay sees only the routing metadata and opaque ciphertext -- zero knowledge of customer configuration data.
+**Key schedule.** Both sides derive three keys from the SHA-256 of the secret with HKDF-SHA256: a joiner proof key, a server proof key, and a binding key. The joiner sends the routing part, a one-time X25519 public key, a random nonce, and an HMAC over a transcript of those three values. The existing orchestrator checks that proof against each candidate row and claims the matching row. It answers with its own one-time X25519 public key, its own nonce, an HMAC over the extended transcript, and the sealed bundle. The bundle key is HKDF over the X25519 agreement, salted with the binding key. The bundle is AES-256-GCM with the transcript as associated data. The joiner checks the server proof before it opens the bundle, and writes nothing when the proof fails.
+
+A relay sees the routing part, both public keys, both nonces, both proofs and the ciphertext. None of these lets it read the bundle, forge one the joiner accepts, or join with the token.
+
+The bundle carries the cluster database URL, the object storage configuration, the cluster's secrets key (`secrets.key` from the shared configuration, else the answering orchestrator's own `KICI_SECRET_KEY`), and the cluster ID.
 
 ### Transport modes
 
@@ -426,29 +435,29 @@ New orch --[join.request]--> Platform --[relay]--> Existing orch
 New orch <--[join.response]-- Platform <--[relay]-- Existing orch
 ```
 
-The Platform uses the token's cleartext routing part to find an orchestrator in the target pool, then relays the encrypted `join.request` to it. The existing orchestrator validates the token hash, builds an encrypted config bundle, and sends `join.response` back through the relay. The Platform uses `messageId` correlation to route the response to the correct joiner when multiple join requests are in flight.
+The joining host authenticates to the Platform with an API key of the org, as an orchestrator connection does. The Platform checks that the routing part names that org, then relays the `join.request` to an orchestrator in the target pool that advertises the `clusterJoinV2` capability. When the pool holds only orchestrators without it, the Platform answers `join_protocol_unsupported`. The existing orchestrator answers through the relay. The Platform uses `messageId` correlation to route the response to the correct joiner when multiple join requests are in flight. The Platform refuses a `join.request` that carries the join token itself (`join_protocol_v1_removed`) and never forwards it.
 
 **Direct peer mode:**
 
 ```
 New orch --[POST /api/v1/cluster/join]--> Existing orch
-New orch <--[encrypted config bundle]---- Existing orch
+New orch <--[sealed config bundle]------- Existing orch
 ```
 
-Same crypto protocol, but the new orchestrator connects directly to an existing orchestrator's REST API instead of going through the Platform relay. Useful for self-hosted/independent setups without Platform connectivity.
+Same protocol, but the new orchestrator posts the `join.request` to an existing orchestrator's REST API instead of going through the Platform relay. Useful for independent setups without Platform connectivity. The endpoint answers a request body that carries the join token with `426` and `Upgrade: kici-join-v2`.
 
 ### Token lifecycle
 
 1. Operator creates a join token via `POST /api/v1/admin/join-tokens` or `kici-admin peer create-token`
-2. Token hash is stored in the `join_tokens` DB table with expiry
+2. The SHA-256 of the token secret is stored in the `join_tokens` DB table with expiry
 3. New orchestrator runs `kici-admin join --token TOKEN --platform URL` or `--peer URL`
-4. Existing orchestrator validates the token hash, builds and encrypts the config bundle
-5. Token is consumed (marked as used) after successful join -- one-time use only
-6. New orchestrator decrypts the bundle and writes `./kici-orchestrator.env`, the env file `kici-admin orchestrator install --env-file` consumes
+4. Existing orchestrator finds the row by the routing part, checks the proof, and claims the row
+5. The claim marks the token consumed. The bootstrap join can repeat with the same token until it expires; a token consumed by a peer in token mode is refused to every other instance
+6. New orchestrator checks the server proof, opens the bundle, and writes `./kici-orchestrator.env`, the env file `kici-admin orchestrator install --env-file` consumes
 
 ### Peer credential issuance
 
-After successful join token validation, the coordinator issues a persistent session credential to the new peer. The credential is stored in the `peer_credentials` database table and saved to the peer's local credential file (`~/.kici/peer-credential`). Subsequent connections use the credential (via HMAC proof over the ECDH-encrypted channel) instead of a join token. Credentials can be revoked via `kici-admin peer revoke`.
+After successful join token validation, the coordinator issues a persistent session credential to the new peer. The credential is stored in the `peer_credentials` database table and saved to the peer's local credential file (`~/.kici/peer-credential`). Subsequent connections prove the credential (a `mutual-v2` proof over the handshake transcript) instead of the join token. Credentials can be revoked via `kici-admin peer revoke`.
 
 A coordinator without a join token issues its own credential instead, the first time it connects to a peer. It writes the credential hash to `peer_credentials` (marked as self-issued) and the credential to its local file. Then it proves possession like any joined peer. It retires the self-issued credential its previous run left in the same file, unless that instance still has a live heartbeat. It does not re-issue a credential that an operator revoked for its instance ID; a coordinator that restarts under a new instance ID issues a credential for the new ID. Every coordinator shares the cluster database, so issuing its own credential needs no access beyond what `kici-admin peer create-token` needs.
 

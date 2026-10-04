@@ -7,12 +7,16 @@
  * - Periodic heartbeat (30s default)
  * - Intentional disconnect flag to prevent reconnection
  *
- * Authentication uses ECDH key exchange followed by join token (first connect)
- * or HMAC credential proof (reconnection).
+ * Authentication is mutual-v2: after the ECDH key exchange the client proves
+ * its credential (or, on first join, its join token) with an HMAC over the
+ * handshake transcript, and accepts nothing until the server proves it holds
+ * the same credential or token. The join token never leaves this host. Every
+ * frame after acceptance uses an application key that needs the shared secret.
+ * A server that does not offer mutual-v2 gets no proof at all.
  */
 
 import WebSocket from 'ws';
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import {
   createLogger,
   getReconnectDelay,
@@ -21,9 +25,14 @@ import {
   ChunkRequestWaiter,
 } from '@kici-dev/shared';
 import {
+  PeerAuthMode,
+  PeerAuthScheme,
   peerHelloSchema,
   peerFromPeerMessageSchema,
+  WS_CLOSE_PROTOCOL_ERROR,
+  WS_CLOSE_UNAUTHORIZED,
   WS_MAX_PAYLOAD_BYTES,
+  type PeerAuthResponse,
   type PeerHeartbeat,
   type PeerToPeerMessage,
   type JobReroute,
@@ -49,7 +58,7 @@ import {
   type RaftAppendEntries,
   PROTOCOL_VERSION,
 } from '@kici-dev/engine';
-import type { PeerRegistry } from './peer-registry.js';
+import { PeerLinkDirection, type PeerRegistry } from './peer-registry.js';
 import {
   PeerForgetWaiters,
   replyToPeerForgetRequest,
@@ -63,11 +72,19 @@ import {
   type ScalerOrphansRequestHandler,
 } from './scaler-orphans-peer.js';
 import {
+  HANDSHAKE_NONCE_BYTES,
+  computeClientProof,
+  computeServerProof,
+  decodeProof,
+  deriveAppKey,
   generateEcdhKeyPair,
   deriveSessionKey,
   encryptMessage,
   decryptMessage,
+  peerTranscriptHash,
+  proofMatches,
 } from './peer-crypto.js';
+import { parseToken, tokenHashOf } from './join-token.js';
 import type { CredentialFileData } from './peer-credentials.js';
 import type { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 import { runDetached } from '../helpers/run-detached.js';
@@ -80,6 +97,42 @@ export const NO_AUTH_METHOD_MESSAGE =
 
 const NO_AUTH_METHOD_REMEDY =
   'A coordinator issues its own credential unless an operator revoked it; a worker needs KICI_CLUSTER_JOIN_TOKEN';
+
+/** Logged when a dialled server does not offer mutual authentication. */
+export const PEER_MUTUAL_AUTH_UNSUPPORTED_MESSAGE =
+  'Peer does not support mutual authentication; upgrade every orchestrator in the cluster';
+
+/** The default for `handshakeTimeoutMs`, matching the server's own authentication timeout. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** Where the address this client dials came from. */
+export enum PeerDialOrigin {
+  /** KICI_CLUSTER_PEERS or a worker's coordinator URLs: reconnects with backoff. */
+  Static = 'static',
+  /** A Platform announcement: a hint, dropped for good when mutual authentication fails. */
+  Discovered = 'discovered',
+}
+
+/** Why a server failed mutual authentication. */
+export enum PeerMutualAuthFailure {
+  SchemeMissing = 'scheme-missing',
+  ServerProofInvalid = 'server-proof-invalid',
+  InstanceIdMissing = 'instance-id-missing',
+  InstanceIdMismatch = 'instance-id-mismatch',
+}
+
+/** K_hs and TH of the handshake in flight. */
+interface HandshakeState {
+  handshakeKey: Buffer;
+  transcriptHash: Buffer;
+}
+
+/** What this connection proved with, kept until the server's proof is checked. */
+interface PendingProof {
+  psk: Buffer;
+  clientProof: Buffer;
+  mode: PeerAuthMode;
+}
 
 // Software version injected at build time by scripts/build-service.mjs.
 declare const KICI_PKG_VERSION: string;
@@ -101,6 +154,21 @@ export interface PeerClientOptions {
   instanceId: string;
   /** Peer registry to update on heartbeats from remote peer. */
   peerRegistry: PeerRegistry;
+  /**
+   * Where the dialled address came from. A static target reconnects with
+   * backoff after any failure; a discovered target that fails mutual
+   * authentication is dropped. Default: static.
+   */
+  origin?: PeerDialOrigin;
+  /** The instance id a discovered target was announced with; the server must report it. */
+  expectedInstanceId?: string;
+  /**
+   * Closes a connection that has not completed authentication within this
+   * many ms, after which the normal reconnect policy applies. Default: 15000.
+   */
+  handshakeTimeoutMs?: number;
+  /** Called when a discovered target fails mutual authentication; the client then stays down. */
+  onMutualAuthFailed?: (failure: PeerMutualAuthFailure) => void;
   /** Callback to get this orchestrator's local agent inventory for heartbeats. */
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   /** Heartbeat interval in ms. Default: 30000 (30s). */
@@ -235,7 +303,13 @@ export class PeerClient {
   private noAuthWarned = false;
   private intentionalDisconnect = false;
   private _targetInstanceId: string | null = null;
+  /** The key the current frames use: K_hs while authenticating, K_app once connected. */
   private sessionKey: Buffer | null = null;
+  /** The handshake in flight; cleared on acceptance or close. */
+  private handshake: HandshakeState | null = null;
+  /** The proof this connection sent, until the server's proof is checked. */
+  private pendingProof: PendingProof | null = null;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly ackWaiters = new Map<string, AckWaiter>();
   private readonly cacheWaiters = new Map<string, CacheWaiter>();
   private readonly configReloadWaiters = new Map<string, ConfigReloadWaiter>();
@@ -251,11 +325,15 @@ export class PeerClient {
   private isJoiner = false;
   /** complete() callback for the in-flight token-join, if this client is joiner. */
   private joinComplete: ((issued: CredentialFileData | null) => void) | null = null;
-  /** The credential string this client last built an HMAC proof with. */
+  /** The credential string this client last built a proof with. */
   private lastProvedCredential: string | null = null;
   private readonly instanceId: string;
   private readonly role: 'coordinator' | 'worker';
   private readonly peerRegistry: PeerRegistry;
+  private readonly origin: PeerDialOrigin;
+  private readonly expectedInstanceId?: string;
+  private readonly handshakeTimeoutMs: number;
+  private readonly onMutualAuthFailed?: (failure: PeerMutualAuthFailure) => void;
   private readonly getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   private readonly heartbeatIntervalMs: number;
   private readonly maxReconnectDelayMs: number;
@@ -295,6 +373,10 @@ export class PeerClient {
     this.instanceId = options.instanceId;
     this.role = options.role ?? 'coordinator';
     this.peerRegistry = options.peerRegistry;
+    this.origin = options.origin ?? PeerDialOrigin.Static;
+    this.expectedInstanceId = options.expectedInstanceId;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    this.onMutualAuthFailed = options.onMutualAuthFailed;
     this.getLocalInventory = options.getLocalInventory;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30_000;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60_000;
@@ -354,6 +436,7 @@ export class PeerClient {
     this.scalerOrphansWaiters.rejectAll('Disconnected before the scaler orphan response arrived');
     this.peerForgetWaiters.rejectAll('Disconnected before the peer forget response arrived');
     this.logsCollectWaiters.rejectAll('peer disconnected');
+    this.resetHandshake();
 
     if (this.ws) {
       this.ws.close(1000, 'Client disconnect');
@@ -361,6 +444,7 @@ export class PeerClient {
     }
 
     if (this._targetInstanceId) {
+      this.peerRegistry.setAuthScheme(this._targetInstanceId, PeerLinkDirection.Outbound, null);
       this.peerRegistry.markDisconnected(this._targetInstanceId);
     }
 
@@ -564,6 +648,9 @@ export class PeerClient {
       return;
     }
 
+    const ws = this.ws;
+    this.armHandshakeTimer(ws);
+
     this.ws.on('open', () => {
       this._state = 'handshaking';
       logger.info('Connected to peer, waiting for ECDH handshake', { url: this.url });
@@ -580,13 +667,20 @@ export class PeerClient {
         targetInstanceId: this._targetInstanceId,
       });
 
+      // A socket that disconnect() already released (or that a newer socket
+      // replaced) closes late: disconnect() did the cleanup, and the peer may
+      // be registered again by the client that replaced this one.
+      if (this.ws !== ws) return;
+
       this._state = 'disconnected';
       this.stopHeartbeat();
       this.sessionKey = null;
+      this.resetHandshake();
       // Fail any in-flight fleet collect — the chunked reply can't complete now.
       this.logsCollectWaiters.rejectAll('peer disconnected');
 
       if (this._targetInstanceId) {
+        this.peerRegistry.setAuthScheme(this._targetInstanceId, PeerLinkDirection.Outbound, null);
         this.peerRegistry.markDisconnected(this._targetInstanceId);
       }
 
@@ -608,166 +702,16 @@ export class PeerClient {
     const raw = data.toString();
 
     if (this._state === 'handshaking') {
-      // --- Waiting for peer.hello from server ---
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        logger.warn('Malformed JSON during handshake');
-        return;
-      }
-
-      const hello = peerHelloSchema.safeParse(parsed);
-      if (!hello.success) {
-        logger.warn('Expected peer.hello, got invalid message');
-        return;
-      }
-
-      // Generate our ECDH key pair
-      const ecdh = generateEcdhKeyPair();
-
-      // Derive session key using server's public key and nonce
-      const serverPubKey = Buffer.from(hello.data.ephemeralPublicKey, 'base64');
-      const nonce = Buffer.from(hello.data.nonce, 'base64');
-
-      try {
-        this.sessionKey = deriveSessionKey(ecdh.privateKey, serverPubKey, nonce);
-      } catch (err) {
-        logger.error('ECDH key derivation failed', { error: toErrorMessage(err) });
-        if (this.ws) this.ws.close(1000, 'Key derivation failed');
-        return;
-      }
-
-      // Send peer.hello.response
-      this.ws!.send(
-        JSON.stringify({
-          type: 'peer.hello.response',
-          ephemeralPublicKey: ecdh.publicKey.toString('base64'),
-        }),
-      );
-
-      // Now send auth request (encrypted)
-      this._state = 'authenticating';
-      this.sendAuthRequest(nonce).catch((err) => {
-        logger.error('Failed to send auth request', { error: toErrorMessage(err) });
-        if (this.ws) this.ws.close(1000, 'Auth request failed');
-      });
-
+      this.handleHello(raw);
       return;
     }
 
     if (this._state === 'authenticating') {
-      // --- Waiting for peer.auth.response (encrypted) ---
-      if (!this.sessionKey) {
-        logger.warn('No session key for auth response decryption');
-        return;
-      }
-
-      let decrypted: string;
-      try {
-        decrypted = decryptMessage(raw, this.sessionKey);
-      } catch {
-        logger.warn('Failed to decrypt auth response');
-        return;
-      }
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(decrypted);
-      } catch {
-        logger.warn('Malformed JSON in decrypted auth response');
-        return;
-      }
-
-      const msgResult = peerFromPeerMessageSchema.safeParse(parsed);
-      if (!msgResult.success) {
-        logger.warn('Invalid auth response', { errors: msgResult.error.issues });
-        return;
-      }
-
-      if (msgResult.data.type !== 'peer.auth.response') {
-        logger.warn('Expected peer.auth.response, got', { type: msgResult.data.type });
-        return;
-      }
-
-      const msg = msgResult.data;
-
-      if (msg.accepted) {
-        if (msg.softwareVersion) {
-          logger.info('Coordinator software version', {
-            localVersion: SOFTWARE_VERSION,
-            coordinatorVersion: msg.softwareVersion,
-          });
-        }
-
-        this._targetInstanceId = msg.instanceId ?? null;
-        if (msg.instanceId) {
-          this.onAuthenticated?.(msg.instanceId);
-        }
-        logger.info('Peer auth accepted', {
-          targetInstanceId: msg.instanceId,
-          agentCount: msg.agents?.length ?? 0,
-          scalerBackends: msg.scalerCapacity?.length ?? 0,
-        });
-
-        this._state = 'connected';
-        this.reconnectAttempts = 0;
-        this.noAuthWarned = false;
-
-        // Persist credential if issued (first join). The coordinator owns the
-        // shared file; if this client is the joiner it writes via complete().
-        if (msg.sessionCredential && this.isJoiner && this.joinComplete) {
-          this.joinComplete({
-            instanceId: this.instanceId,
-            credential: msg.sessionCredential,
-            role: msg.role ?? 'coordinator',
-            issuedAt: new Date().toISOString(),
-          });
-        }
-        this.isJoiner = false;
-        this.joinComplete = null;
-
-        // Register peer in registry
-        this.peerRegistry.addPeer({
-          instanceId: msg.instanceId!,
-          connectionId: randomUUID(),
-          address: this.url,
-          routingKeys: [],
-        });
-
-        // Populate registry with auth response capabilities
-        if (msg.agents || msg.scalerCapacity) {
-          this.peerRegistry.updateHeartbeat(msg.instanceId!, {
-            type: 'peer.heartbeat',
-            instanceId: msg.instanceId!,
-            timestamp: Date.now(),
-            term: 0,
-            leaderId: null,
-            draining: false,
-            agents: msg.agents ?? [],
-            capabilities: msg.capabilities ?? { s3LogAccess: false },
-            scalerCapacity: msg.scalerCapacity,
-          });
-        }
-
-        // Send immediate heartbeat
-        if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionKey) {
-          const inventory = this.getLocalInventory();
-          this.ws.send(
-            encryptMessage(
-              JSON.stringify({ type: 'peer.heartbeat', ...inventory }),
-              this.sessionKey,
-            ),
-          );
-        }
-
-        this.startHeartbeat();
-        this.onConnected?.(this.url);
-      } else {
-        this.handleAuthRejected(msg.reason);
-      }
+      this.handleAuthResponse(raw);
       return;
     }
+
+    if (this._state !== 'connected') return;
 
     // --- Connected: decrypt and route ---
     if (!this.sessionKey) return;
@@ -795,6 +739,289 @@ export class PeerClient {
     }
 
     this.routeMessage(msgResult.data);
+  }
+
+  private armHandshakeTimer(ws: WebSocket): void {
+    this.clearHandshakeTimer();
+    this.handshakeTimer = setTimeout(() => {
+      this.handshakeTimer = null;
+      if (this.ws !== ws || this._state === 'connected') return;
+      logger.warn('Peer handshake timed out', {
+        url: this.url,
+        state: this._state,
+        timeoutMs: this.handshakeTimeoutMs,
+      });
+      this.releaseJoin();
+      ws.terminate();
+    }, this.handshakeTimeoutMs);
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+  }
+
+  /** A token join in flight must be released so sibling clients stop waiting on it. */
+  private releaseJoin(): void {
+    const complete = this.joinComplete;
+    this.isJoiner = false;
+    this.joinComplete = null;
+    complete?.(null);
+  }
+
+  /** Forget the handshake of a connection that closed or is being torn down. */
+  private resetHandshake(): void {
+    this.clearHandshakeTimer();
+    this.handshake = null;
+    this.pendingProof = null;
+    this.releaseJoin();
+  }
+
+  /** Close a connection whose handshake broke the protocol. */
+  private abortHandshake(reason: string): void {
+    logger.warn('Closing peer connection during the handshake', { url: this.url, reason });
+    this.handshake = null;
+    this.pendingProof = null;
+    this.releaseJoin();
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.close(WS_CLOSE_PROTOCOL_ERROR, reason);
+    }
+  }
+
+  /** Close a connection whose server failed mutual authentication. */
+  private failMutualAuth(failure: PeerMutualAuthFailure, closeCode: number): void {
+    logger.error('Peer failed mutual authentication', {
+      url: this.url,
+      failure,
+      origin: this.origin,
+    });
+    this.handshake = null;
+    this.pendingProof = null;
+    this.releaseJoin();
+    if (this.origin === PeerDialOrigin.Discovered) {
+      // An announced address is a hint: it is dropped, and dialled again only
+      // if the Platform announces it again.
+      this.intentionalDisconnect = true;
+      this.onMutualAuthFailed?.(failure);
+    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.close(closeCode, failure);
+  }
+
+  /** The server's plaintext peer.hello: refuse it unless it offers mutual-v2. */
+  private handleHello(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.abortHandshake('Malformed JSON during handshake');
+      return;
+    }
+    const hello = peerHelloSchema.safeParse(parsed);
+    if (!hello.success) {
+      this.abortHandshake('Expected peer.hello');
+      return;
+    }
+    const authSchemes = hello.data.authSchemes ?? [];
+    if (!authSchemes.includes(PeerAuthScheme.enum['mutual-v2'])) {
+      logger.error(PEER_MUTUAL_AUTH_UNSUPPORTED_MESSAGE, {
+        url: this.url,
+        advertised: authSchemes,
+      });
+      this.failMutualAuth(PeerMutualAuthFailure.SchemeMissing, WS_CLOSE_PROTOCOL_ERROR);
+      return;
+    }
+    const serverPub = Buffer.from(hello.data.ephemeralPublicKey, 'base64');
+    const nonce = Buffer.from(hello.data.nonce, 'base64');
+    if (nonce.length !== HANDSHAKE_NONCE_BYTES) {
+      this.abortHandshake('Invalid hello nonce');
+      return;
+    }
+    const ecdh = generateEcdhKeyPair();
+    let handshakeKey: Buffer;
+    try {
+      handshakeKey = deriveSessionKey(ecdh.privateKey, serverPub, nonce);
+    } catch (err) {
+      logger.error('ECDH key derivation failed', { error: toErrorMessage(err) });
+      this.abortHandshake('Key derivation failed');
+      return;
+    }
+    this.handshake = {
+      handshakeKey,
+      transcriptHash: peerTranscriptHash({
+        serverEphemeralPublicKey: serverPub,
+        serverNonce: nonce,
+        authSchemes,
+        clientEphemeralPublicKey: ecdh.publicKey,
+      }),
+    };
+    this.sessionKey = handshakeKey;
+    this.ws!.send(
+      JSON.stringify({
+        type: 'peer.hello.response',
+        ephemeralPublicKey: ecdh.publicKey.toString('base64'),
+      }),
+    );
+    this._state = 'authenticating';
+    this.sendAuthRequest().catch((err) => {
+      logger.error('Failed to send auth request', { error: toErrorMessage(err) });
+      this.abortHandshake('Auth request failed');
+    });
+  }
+
+  /**
+   * The encrypted peer.auth.response. Any frame that is not one closes the
+   * socket. An acceptance is checked synchronously, before any state change,
+   * registry write or callback, so a frame pipelined behind an unproven
+   * acceptance meets a client that is not connected.
+   */
+  private handleAuthResponse(raw: string): void {
+    const hs = this.handshake;
+    const proof = this.pendingProof;
+    if (!hs || !proof) {
+      this.abortHandshake('Frame before the auth request');
+      return;
+    }
+    let msg: PeerAuthResponse;
+    try {
+      const parsed = peerFromPeerMessageSchema.safeParse(
+        JSON.parse(decryptMessage(raw, hs.handshakeKey)),
+      );
+      if (!parsed.success || parsed.data.type !== 'peer.auth.response') {
+        this.abortHandshake('Expected peer.auth.response');
+        return;
+      }
+      msg = parsed.data;
+    } catch {
+      this.abortHandshake('Undecryptable frame during authentication');
+      return;
+    }
+
+    if (!msg.accepted) {
+      this.handshake = null;
+      this.pendingProof = null;
+      this.handleAuthRejected(msg.reason);
+      return;
+    }
+    const failure = this.checkAcceptance(msg, hs, proof);
+    if (failure) {
+      this.failMutualAuth(failure, WS_CLOSE_UNAUTHORIZED);
+      return;
+    }
+    this.sessionKey = deriveAppKey({
+      handshakeKey: hs.handshakeKey,
+      psk: proof.psk,
+      transcriptHash: hs.transcriptHash,
+      clientProof: proof.clientProof,
+      serverProof: decodeProof(msg.serverProof!)!,
+    });
+    this.handshake = null;
+    this.pendingProof = null;
+    this.completeAcceptance(msg as PeerAuthResponse & { instanceId: string; role: string });
+  }
+
+  /** Returns why the acceptance fails mutual authentication, or null when it passes. */
+  private checkAcceptance(
+    msg: PeerAuthResponse,
+    hs: HandshakeState,
+    proof: PendingProof,
+  ): PeerMutualAuthFailure | null {
+    if (!msg.instanceId) return PeerMutualAuthFailure.InstanceIdMissing;
+    const presented = msg.serverProof ? decodeProof(msg.serverProof) : null;
+    if (!presented || !msg.role) return PeerMutualAuthFailure.ServerProofInvalid;
+    if (proof.mode === PeerAuthMode.enum.token && !msg.sessionCredential) {
+      return PeerMutualAuthFailure.ServerProofInvalid;
+    }
+    const expected = computeServerProof({
+      psk: proof.psk,
+      transcriptHash: hs.transcriptHash,
+      clientProof: proof.clientProof,
+      serverInstanceId: msg.instanceId,
+      grantedRole: msg.role,
+      sessionCredential: msg.sessionCredential ?? null,
+    });
+    if (!proofMatches(expected, presented)) return PeerMutualAuthFailure.ServerProofInvalid;
+    if (this.expectedInstanceId && msg.instanceId !== this.expectedInstanceId) {
+      return PeerMutualAuthFailure.InstanceIdMismatch;
+    }
+    return null;
+  }
+
+  /** The server proved itself: register the peer and start the connected session. */
+  private completeAcceptance(msg: PeerAuthResponse & { instanceId: string; role: string }): void {
+    this.clearHandshakeTimer();
+    if (msg.softwareVersion) {
+      logger.info('Coordinator software version', {
+        localVersion: SOFTWARE_VERSION,
+        coordinatorVersion: msg.softwareVersion,
+      });
+    }
+
+    this._targetInstanceId = msg.instanceId;
+    // Before addPeer: a caller that re-keys or promotes this client on
+    // authentication disconnects the client it replaces here.
+    this.onAuthenticated?.(msg.instanceId);
+    logger.info('Peer auth accepted', {
+      targetInstanceId: msg.instanceId,
+      agentCount: msg.agents?.length ?? 0,
+      scalerBackends: msg.scalerCapacity?.length ?? 0,
+    });
+
+    this._state = 'connected';
+    this.reconnectAttempts = 0;
+    this.noAuthWarned = false;
+
+    // Persist the credential the server issued (first join), which its proof
+    // covers. The coordinator owns the shared file; the joiner writes via complete().
+    if (msg.sessionCredential && this.isJoiner && this.joinComplete) {
+      this.joinComplete({
+        instanceId: this.instanceId,
+        credential: msg.sessionCredential,
+        role: msg.role,
+        issuedAt: new Date().toISOString(),
+      });
+    }
+    this.isJoiner = false;
+    this.joinComplete = null;
+
+    this.peerRegistry.addPeer({
+      instanceId: msg.instanceId,
+      connectionId: randomUUID(),
+      address: this.url,
+      routingKeys: [],
+    });
+    this.peerRegistry.setAuthScheme(
+      msg.instanceId,
+      PeerLinkDirection.Outbound,
+      PeerAuthScheme.enum['mutual-v2'],
+    );
+
+    // Populate registry with auth response capabilities
+    if (msg.agents || msg.scalerCapacity) {
+      this.peerRegistry.updateHeartbeat(msg.instanceId, {
+        type: 'peer.heartbeat',
+        instanceId: msg.instanceId,
+        timestamp: Date.now(),
+        term: 0,
+        leaderId: null,
+        draining: false,
+        agents: msg.agents ?? [],
+        capabilities: msg.capabilities ?? { s3LogAccess: false },
+        scalerCapacity: msg.scalerCapacity,
+      });
+    }
+
+    // Send immediate heartbeat
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionKey) {
+      const inventory = this.getLocalInventory();
+      this.ws.send(
+        encryptMessage(JSON.stringify({ type: 'peer.heartbeat', ...inventory }), this.sessionKey),
+      );
+    }
+
+    this.startHeartbeat();
+    this.onConnected?.(this.url);
   }
 
   /**
@@ -875,62 +1102,43 @@ export class PeerClient {
    * reconnect storm (the rest reuse the freshly-written credential). This
    * client never reads or writes the credential file directly.
    */
-  private async sendAuthRequest(nonce: Buffer): Promise<void> {
-    if (!this.sessionKey || !this.ws) return;
+  private async sendAuthRequest(): Promise<void> {
+    const hs = this.handshake;
+    if (!hs || !this.ws) return;
 
     const decision = await this.authCoordinator.decideAuth();
+    if (this.handshake !== hs || this._state !== 'authenticating' || !this.ws) {
+      // The socket moved on while the decision was pending.
+      if (decision.mode === 'token-join') decision.complete(null);
+      return;
+    }
 
+    let psk: Buffer;
+    let mode: PeerAuthMode;
+    let tokenRouting = '';
     if (decision.mode === 'credential') {
-      const cred = decision.credential;
-      const credentialHash = sha256(cred.credential);
-      const nonceB64 = nonce.toString('base64');
-      const proof = createHmac('sha256', Buffer.from(credentialHash, 'hex'))
-        .update(nonceB64 + ':' + this.instanceId)
-        .digest('hex');
-      this.lastProvedCredential = cred.credential;
+      psk = Buffer.from(sha256(decision.credential.credential), 'hex');
+      mode = PeerAuthMode.enum.credential;
+      this.lastProvedCredential = decision.credential.credential;
       this.isJoiner = false;
       this.joinComplete = null;
-
-      logger.info('Sending credential-based auth request', {
-        targetUrl: this.url,
-        credentialInstanceId: cred.instanceId,
-      });
-      this.ws.send(
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.request',
-            instanceId: this.instanceId,
-            protocolVersion: PROTOCOL_VERSION,
-            proof,
-            softwareVersion: SOFTWARE_VERSION,
-            role: this.role,
-          }),
-          this.sessionKey,
-        ),
-      );
     } else if (decision.mode === 'token-join') {
+      try {
+        const parsed = parseToken(decision.token);
+        tokenRouting = parsed.routingB64;
+        psk = Buffer.from(tokenHashOf(parsed.secretHex), 'hex');
+      } catch (err) {
+        logger.error('KICI_CLUSTER_JOIN_TOKEN is not a valid join token', {
+          error: toErrorMessage(err),
+        });
+        decision.complete(null);
+        this.abortHandshake('Invalid join token');
+        return;
+      }
+      mode = PeerAuthMode.enum.token;
       this.isJoiner = true;
       this.joinComplete = decision.complete;
       this.lastProvedCredential = null;
-
-      logger.info('Sending token-based auth request', {
-        targetUrl: this.url,
-        instanceId: this.instanceId,
-        reason: 'no-credential-file',
-      });
-      this.ws.send(
-        encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.request',
-            instanceId: this.instanceId,
-            protocolVersion: PROTOCOL_VERSION,
-            token: decision.token,
-            softwareVersion: SOFTWARE_VERSION,
-            role: this.role,
-          }),
-          this.sessionKey,
-        ),
-      );
     } else {
       const meta = {
         instanceId: this.instanceId,
@@ -946,7 +1154,40 @@ export class PeerClient {
       if (this.ws.readyState === WebSocket.OPEN) {
         this.ws.close(1000, 'No auth method');
       }
+      return;
     }
+
+    const clientProof = computeClientProof({
+      psk,
+      transcriptHash: hs.transcriptHash,
+      mode,
+      clientInstanceId: this.instanceId,
+      role: this.role,
+      protocolVersion: PROTOCOL_VERSION,
+      tokenRouting,
+    });
+    this.pendingProof = { psk, clientProof, mode };
+    logger.info('Sending mutual-v2 auth request', {
+      targetUrl: this.url,
+      mode,
+      ...(mode === PeerAuthMode.enum.token && { reason: 'no-credential-file' }),
+    });
+    this.ws.send(
+      encryptMessage(
+        JSON.stringify({
+          type: 'peer.auth.request',
+          instanceId: this.instanceId,
+          protocolVersion: PROTOCOL_VERSION,
+          softwareVersion: SOFTWARE_VERSION,
+          role: this.role,
+          scheme: PeerAuthScheme.enum['mutual-v2'],
+          mode,
+          clientProof: clientProof.toString('hex'),
+          ...(mode === PeerAuthMode.enum.token && { tokenRouting }),
+        }),
+        hs.handshakeKey,
+      ),
+    );
   }
 
   private routeMessage(msg: PeerToPeerMessage): void {

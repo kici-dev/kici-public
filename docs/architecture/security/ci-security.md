@@ -150,7 +150,7 @@ Because a `--job` selector cannot separate two holds on one job, `kici approve` 
 ### Approval channels
 
 1. **Dashboard** — the **Approval queue** page (`/orgs/:customerId/approval-queue`), which lists security and context holds together and draws the controls each one's permission allows.
-2. **Comment-based** — `/kici approve` and `/kici reject` in pull-request comments (case-insensitive). The commenter's identity is resolved through their identity link, and their `ci_trust` level is checked before the command acts. A command acts **only on the held runs for the pull request (and repo) the comment was posted on** — a bare `/kici approve` releases every pending security hold for that pull request, and never touches holds from other pull requests or repositories. An explicit `/kici approve <runId>` is narrowed within that pull request's holds, so a run id belonging to a different pull request or repository matches nothing.
+2. **Comment-based** — `/kici approve` and `/kici reject` in pull-request comments (case-insensitive). The commenter's identity is resolved through their identity link, and their `ci_trust` level is checked before the command acts. A command acts **only on the held runs for the pull request (and repo) the comment was posted on** — a bare `/kici approve` releases every pending security hold for that pull request, and never touches holds from other pull requests or repositories. An explicit `/kici approve <runId>` is narrowed within that pull request's holds, so a run id belonging to a different pull request or repository matches nothing. On GitHub, the App needs the Issues read permission and the Issue comment event subscription, or the comment never arrives (see [Pull-request comment commands](../../user/providers/github.md#pull-request-comment-commands)).
 
 An approve posts the terminal provider status before it resumes the run, so the replayed dispatch's own pending status lands last. That ordering costs one provider round-trip per hold.
 
@@ -256,7 +256,10 @@ Indexes:
 GitHub webhook
     |
     v
-Platform relay (verify signature, route over the WebSocket)
+Platform relay (route over the WebSocket)
+    |
+    v
+Orchestrator verifies the signature
     |
     v
 Orchestrator pipeline

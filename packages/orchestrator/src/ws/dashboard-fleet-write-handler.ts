@@ -10,6 +10,12 @@
  * short-circuits a disabled op with a structured `operation_disabled` envelope
  * plus a `denied` access-log row, and a `recordAccess` helper that attributes
  * every outcome to the calling actor.
+ *
+ * The handler never passes a write authority, so the roster store applies the
+ * Platform's: a declare only creates a new, unconfirmed host, a remove only
+ * deletes such a host, and reserved `kici:` labels and properties are refused.
+ * A refusal records a `denied` access-log row and answers with a
+ * `FleetHostWriteRefusal` code.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type {
@@ -23,7 +29,11 @@ import type {
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
-import type { HostRosterStore } from '../agent/host-roster.js';
+import {
+  type HostRosterStore,
+  HostWriteRefusedError,
+  ReservedHostKeyError,
+} from '../agent/host-roster.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import {
   assertDashboardWriteAllowed,
@@ -148,6 +158,33 @@ export class DashboardFleetWriteHandler {
   }
 
   /**
+   * Answer a write the roster store refused for the Platform's authority: a
+   * `denied` access-log row with `<code>:<detail>`, and the refusal code in the
+   * response `error` field (plus the reserved keys for `reserved_property`).
+   */
+  private refuse(
+    msg: { actor: ActorPrincipal; requestId: string; agentId: string },
+    action: AccessLogAction,
+    responseType: string,
+    err: HostWriteRefusedError,
+  ): void {
+    this.recordAccess(
+      msg.actor,
+      action,
+      { type: 'fleet', id: msg.agentId },
+      msg.requestId,
+      'denied',
+      `${err.code}:${err.detail}`,
+    );
+    this.deps.send({
+      type: responseType,
+      requestId: msg.requestId,
+      error: err.code,
+      ...(err instanceof ReservedHostKeyError && { reservedKeys: err.keys }),
+    });
+  }
+
+  /**
    * Route a fleet host-write message to the appropriate handler. Returns true
    * if the message was handled, false otherwise.
    */
@@ -177,6 +214,8 @@ export class DashboardFleetWriteHandler {
       return;
     }
     try {
+      // Never pass an authority: the store's default is the Platform's, which
+      // only creates new, unconfirmed hosts and refuses reserved kici: keys.
       const { created } = await this.deps.rosterStore.declareStatic({
         agentId: msg.agentId,
         labels: msg.labels,
@@ -197,6 +236,10 @@ export class DashboardFleetWriteHandler {
         created,
       });
     } catch (err) {
+      if (err instanceof HostWriteRefusedError) {
+        this.refuse(msg, 'fleet.host.declare', 'dashboard.fleet.host.declare.response', err);
+        return;
+      }
       logger.error('Failed to declare host', { agentId: msg.agentId, error: toErrorMessage(err) });
       this.recordAccess(
         msg.actor,
@@ -227,6 +270,7 @@ export class DashboardFleetWriteHandler {
       return;
     }
     try {
+      // No authority: the store's Platform default removes only unconfirmed hosts.
       const deleted = await this.deps.rosterStore.removeStatic(msg.agentId);
       this.recordAccess(
         msg.actor,
@@ -243,6 +287,10 @@ export class DashboardFleetWriteHandler {
         removed: deleted > 0,
       });
     } catch (err) {
+      if (err instanceof HostWriteRefusedError) {
+        this.refuse(msg, 'fleet.host.remove', 'dashboard.fleet.host.remove.response', err);
+        return;
+      }
       logger.error('Failed to remove host', { agentId: msg.agentId, error: toErrorMessage(err) });
       this.recordAccess(
         msg.actor,

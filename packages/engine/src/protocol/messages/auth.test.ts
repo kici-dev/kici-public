@@ -92,6 +92,26 @@ describe('authSuccessSchema', () => {
       true,
     );
   });
+
+  // fails-when: the schema strips githubWebhookUrl, so a newer orchestrator
+  //   never learns the Platform's webhook URL and platform-mode manifests abort.
+  // breaks-if-wrong: an auth.success without the field (an older Platform) still parses.
+  it('carries githubWebhookUrl as a string, as null, and absent', () => {
+    const url = 'https://api.kici.dev/webhook/org_abc123def456/github';
+    expect(
+      authSuccessSchema.parse({ ...validSuccess, githubWebhookUrl: url }).githubWebhookUrl,
+    ).toBe(url);
+    expect(
+      authSuccessSchema.parse({ ...validSuccess, githubWebhookUrl: null }).githubWebhookUrl,
+    ).toBeNull();
+    expect(authSuccessSchema.parse(validSuccess)).not.toHaveProperty('githubWebhookUrl');
+  });
+
+  it('rejects a non-string githubWebhookUrl', () => {
+    expect(authSuccessSchema.safeParse({ ...validSuccess, githubWebhookUrl: 42 }).success).toBe(
+      false,
+    );
+  });
 });
 
 describe('authFailureSchema', () => {

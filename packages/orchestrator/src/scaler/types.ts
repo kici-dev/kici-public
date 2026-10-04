@@ -522,7 +522,8 @@ export interface ScalerEntry {
   orchestratorUrl?: string;
   /**
    * Extra host:IP mappings for spawned agents (e.g. ["registry.local:host-gateway"]): the
-   * container runtime's ExtraHosts, or each Firecracker guest's /etc/hosts.
+   * container runtime's ExtraHosts (container scaler, bare-metal job-image agents), or
+   * each Firecracker guest's /etc/hosts.
    */
   extraHosts?: string[];
   /** Disable nftables-based network isolation for container backend (default: true). Set to false when nft is unavailable. */
@@ -596,10 +597,11 @@ export interface ScalerEntry {
   /** Default memory in MiB for VMs @default 512 */
   memSizeMib?: number;
   /**
-   * Wrap privileged commands (`ip`, `chown`) with `sudo -n` when the
-   * orchestrator runs as a non-root user (e.g. user-mode systemd on edge
-   * worker nodes). Operators must have NOPASSWD sudoers entries for those
-   * binaries. Default false.
+   * Wrap privileged commands with `sudo -n` when the orchestrator runs as a
+   * non-root user (e.g. user-mode systemd on edge worker nodes): the Firecracker
+   * backend's `ip`, `chown`, `chmod`, `kill` and `nft`, and the `nft` of a
+   * bare-metal scaler's job-image label sets. Operators must have NOPASSWD
+   * sudoers entries for those binaries. Default false.
    */
   requireSudo?: boolean;
 

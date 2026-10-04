@@ -348,8 +348,8 @@ export function createPresignAgentPackageHandler(
 /**
  * Reserved `host_properties` keys carrying a permanent fleet agent's re-stage
  * hints: how to drain + restart it after an install swap, and where it lives.
- * Declared with `kici-admin host declare --property`; the `kici:` namespace is
- * orchestrator-reserved so an agent never reports them.
+ * Only a local `kici-admin host declare --prop` sets them: a registering agent's
+ * reserved keys are stripped and a dashboard declare that names one is refused.
  */
 const RESTART_STOP_KEY = 'kici:agent-restart-stop';
 const RESTART_START_KEY = 'kici:agent-restart-start';
@@ -400,7 +400,7 @@ export function resolveRestartSpec(properties: Record<string, unknown>): AgentRe
   if (typeof service === 'string' && service.length > 0) {
     // Defensively single-quote the service name so it cannot break out of the
     // systemctl argv (belt-and-suspenders on top of the reserved-namespace
-    // strip that keeps these keys operator-declared, not agent-forgeable).
+    // guard that keeps these keys operator-declared, not agent-forgeable).
     const svc = `'${service.replace(/'/g, `'\\''`)}'`;
     return {
       stop: `systemctl --user stop ${svc} || true`,
@@ -509,7 +509,7 @@ export function createRestageAgentHandler(
     if (!restart) {
       recordBringup(deps, 'fleet.init_runner.bringup', callingAgentId, targetAgentId, 'denied');
       throw new Error(
-        `host ${targetAgentId} declares no restart method (set ${AGENT_SERVICE_KEY} or ${RESTART_STOP_KEY}/${RESTART_START_KEY} via \`kici-admin host declare --property\`)`,
+        `host ${targetAgentId} declares no restart method (set ${AGENT_SERVICE_KEY} or ${RESTART_STOP_KEY}/${RESTART_START_KEY} via \`kici-admin host declare --prop\`)`,
       );
     }
 

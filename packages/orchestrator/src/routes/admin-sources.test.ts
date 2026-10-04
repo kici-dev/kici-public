@@ -154,8 +154,17 @@ describe('admin source routes', () => {
         }),
         updateSource: vi.fn().mockResolvedValue(undefined),
       });
-      const fetchAppIdentity = vi.fn().mockResolvedValue({ name: 'unchanged', slug: 'unchanged' });
-      const app = createSourceRoutes({ sourceStore, fetchAppIdentity });
+      const fetchAppIdentity = vi.fn().mockResolvedValue({
+        name: 'unchanged',
+        slug: 'unchanged',
+        events: [],
+        permissions: {},
+      });
+      const app = createSourceRoutes({
+        sourceStore,
+        fetchAppIdentity,
+        fetchAppInstallations: vi.fn().mockResolvedValue([]),
+      });
 
       const res = await app.request('/sources/refresh-all', { method: 'POST' });
 
@@ -297,5 +306,49 @@ describe('admin source routes', () => {
       expect(body.error).toContain('a%20b');
       expect(body.error).not.toContain('Source not found');
     });
+  });
+});
+
+describe('GET /sources ingressUrl', () => {
+  const githubRow = {
+    id: 'src-1',
+    provider: 'github',
+    name: 'a',
+    routing_key: 'github:42',
+    customer_id: 'org_a',
+    config: {},
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  };
+
+  // fails-when: the field is absent, or the resolver gets the wrong id or org.
+  // breaks-if-wrong: rows still list when no resolver is wired (second test).
+  it('carries the URL the resolver builds from each row id and org', async () => {
+    const listSources = vi.fn().mockResolvedValue([githubRow]);
+    const resolveSourceIngressUrl = vi.fn(
+      () => 'https://ci.example.com/webhook/org_a/github/src-1',
+    );
+    const app = createSourceRoutes({
+      sourceStore: createMockSourceStore({ listSources }),
+      resolveSourceIngressUrl,
+    });
+    const body = (await (await app.request('/sources')).json()) as {
+      sources: Array<{ ingressUrl: string | null }>;
+    };
+    expect(resolveSourceIngressUrl).toHaveBeenCalledWith({ id: 'src-1', customerId: 'org_a' });
+    expect(body.sources[0].ingressUrl).toBe('https://ci.example.com/webhook/org_a/github/src-1');
+  });
+
+  it('is null without a resolver, and the rows still list', async () => {
+    const listSources = vi.fn().mockResolvedValue([githubRow]);
+    const app = createSourceRoutes({ sourceStore: createMockSourceStore({ listSources }) });
+    const res = await app.request('/sources');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sources: Array<{ routingKey: string; ingressUrl: string | null }>;
+    };
+    expect(body.sources).toHaveLength(1);
+    expect(body.sources[0].routingKey).toBe('github:42');
+    expect(body.sources[0].ingressUrl).toBeNull();
   });
 });

@@ -60,6 +60,7 @@ import type { Kysely } from 'kysely';
 import type pg from 'pg';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
+import type { WebhookUrlResolution } from '../sources/webhook-url-resolvers.js';
 
 const logger = createLogger({ prefix: 'admin-api' });
 
@@ -75,10 +76,8 @@ export interface AdminRouteDeps {
    */
   databaseUrl?: string;
   /**
-   * Orchestrator operating mode. Gates mode-specific admin behavior — today the
-   * `observed`-mode refusal of GitHub-App source creation (those sources are
-   * Platform-relayed by nature, and an observed orchestrator never accepts a
-   * relay). Optional so WS-only / test admins can omit it.
+   * Orchestrator operating mode. Gates mode-specific admin behavior. Optional so
+   * WS-only / test admins can omit it.
    */
   mode?: OrchestratorMode;
   /**
@@ -137,20 +136,21 @@ export interface AdminRouteDeps {
   sourceStore?: SourceStore;
   /**
    * Optional -- resolves the public webhook URL for a newly added source so
-   * `kici-admin source add` can print it. Wired in platform/hybrid mode to
-   * register-and-await the Platform ack; independent mode returns a null URL
-   * with a note.
+   * `kici-admin source add` can print it. The rules per mode live in
+   * `sources/webhook-url-resolvers.ts`.
    */
   resolveSourceWebhookUrl?: (params: {
     routingKey: string;
     provider: string;
     sourceId: string;
-  }) => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
+  }) => Promise<WebhookUrlResolution>;
   /**
    * Optional -- resolves the org-scoped GitHub webhook URL for the manifest
-   * setup pre-flight (before any App exists). Wired in platform/hybrid mode.
+   * setup pre-flight (before any App exists), by mode.
    */
-  resolveGithubWebhookUrl?: () => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
+  resolveGithubWebhookUrl?: () => Promise<WebhookUrlResolution>;
+  /** Optional — builds the direct-ingress URL `source list` prints per GitHub source. */
+  resolveSourceIngressUrl?: (row: { id: string; customerId: string | null }) => string | null;
   /** Optional -- for DB migration endpoints. */
   db?: Kysely<any>;
   /** Optional -- for DB migration endpoints. */
@@ -896,7 +896,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         sourceStore: deps.sourceStore,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
-        mode: deps.mode,
+        resolveSourceIngressUrl: deps.resolveSourceIngressUrl,
       }),
     );
   }

@@ -59,7 +59,7 @@ sequenceDiagram
 1. **Agent disconnect detection:** The orchestrator detects the WebSocket `close` event for a registered agent.
 
 2. **Disconnect triage by agent kind:** `Dispatcher.onAgentDisconnect()` first checks whether the agent was spawned by a scaler backend.
-   - **Static agents** (a static agent can reconnect after a network blip) get per-job recovery timers — for each in-flight job the dispatcher transitions `dispatch_queue.status` from `dispatched` to `recovering`, creates a `setTimeout` timer with the grace period (2x `maxReconnectDelayMs`), and stores recovery metadata (`agentId`, `runId`, `timer`, `disconnectedAt`). The remaining steps describe this path.
+   - **Static agents** (a static agent can reconnect after a network blip) get per-job recovery timers — for each in-flight job the dispatcher transitions `dispatch_queue.status` from `dispatched` to `recovering`, creates a `setTimeout` timer with the grace period (2x `maxReconnectDelayMs`), and stores recovery metadata (`agentId`, `runId`, `timer`, `disconnectedAt`). The deadline and the agent are also written to `dispatch_queue.recovery_deadline` and `dispatch_queue.recovery_agent_id`, so the recovery survives the loss of the in-memory timer. The remaining steps describe this path.
    - **Scaler-managed agents** are single-use — the scaler destroys them on disconnect, so reconnection is impossible and a recovery window cannot succeed. Their in-flight jobs are triaged instead: a job that never reached `running` is immediately requeued for another agent (bumping `dispatch_queue.dispatch_attempts`), while a job that had already started executing is failed fast (steps may have external side effects, so silently re-running it is not safe). See [Scaler-managed agent disconnect](#scaler-managed-agent-disconnect) under failure modes.
 
 3. **Agent reconnection:** The agent detects the WS close and starts exponential backoff reconnection (1s base, 1.5x multiplier, jitter, 60s max). When the new orchestrator is ready, the agent connects.
@@ -132,7 +132,7 @@ If buffer overflow occurred during the outage:
 
 ### Buffer limits
 
-| Buffer       | Max Size | Purpose                                           |
+| Buffer       | Max size | Purpose                                           |
 | ------------ | -------- | ------------------------------------------------- |
 | Event buffer | 5,000    | Protocol messages (heartbeats, etc.) via `send()` |
 | Log buffer   | 10,000   | Log lines from step execution via `streamLog()`   |
@@ -156,17 +156,19 @@ When the orchestrator starts (or restarts), it must handle jobs from the previou
 
 ### Recovery flow on startup
 
-1. **Orphaned `recovering` jobs:** `StaleRunDetector.cleanupOrphanedRecoveryJobs()` finds any jobs left in `recovering` state from a previous orchestrator instance. These are permanently failed with the message: "Job failed: orchestrator restarted during recovery (recovery state lost)". This runs **before** the first stale detection scan.
+1. **Orphaned `recovering` jobs:** `StaleRunDetector.cleanupOrphanedRecoveryJobs()` finds every job left in `recovering` state, in both `execution_jobs` and `dispatch_queue`. These are permanently failed with the message: "Job failed: orchestrator restarted during recovery (recovery state lost)". This runs **before** the first stale detection scan.
 
-2. **Dispatched jobs from previous instance:** After cleanup, the startup scan queries `dispatch_queue WHERE status = 'dispatched'`. For each:
+2. **Dispatched jobs from previous instance:** After cleanup, the startup scan queries the `dispatch_queue` rows in `dispatched` state that this instance owns or whose owning coordinator is no longer alive. Rows that a live sibling coordinator owns, or whose owner is unknown, are left alone and counted in a warning log. For each recovered row:
    - The job is transitioned to `recovering`
-   - A new recovery timer is created with `agentId = 'unknown'` (the previous orchestrator's in-memory agent mapping is lost)
+   - A new recovery timer is created for the agent recorded at dispatch. A row with no recorded agent gets `agentId = 'unknown'`, and no agent can reclaim it
    - If the agent reconnects and claims the job, it is restored normally
    - If the timer expires, the job is permanently failed
 
-3. **Interaction with stale detection:** The stale run detector queries for `status = 'running'` jobs. Since recovering jobs are in `recovering` state (not `running`), they are naturally excluded from stale detection scans.
+3. **Persisted deadlines:** `Dispatcher.recoverState()` re-arms a timer for each `recovering` row whose `recovery_deadline` is still in the future. On the Raft leader, a sweep runs every 10 seconds and fails each `recovering` row whose deadline has passed. This sweep is the backstop when the coordinator that held a recovery timer crashes.
 
-> See `packages/orchestrator/src/stale-detector/stale-run-detector.ts` for `cleanupOrphanedRecoveryJobs()`, and `packages/orchestrator/src/orchestrator-core.ts` for the startup recovery scan.
+4. **Interaction with stale detection:** The stale run detector queries for `status = 'running'` jobs. Since recovering jobs are in `recovering` state (not `running`), they are naturally excluded from stale detection scans.
+
+> See `packages/orchestrator/src/stale-detector/stale-run-detector.ts` for `cleanupOrphanedRecoveryJobs()`, `packages/orchestrator/src/agent/dispatcher.ts` for `recoverState()` and `sweepExpiredRecoveries()`, and `packages/orchestrator/src/orchestrator-core.ts` for the startup recovery scan.
 
 ## Failure modes
 
@@ -224,7 +226,7 @@ Scaler-managed agents are single-use and destroyed on disconnect, so they never 
 
 ### Structured log fields
 
-Recovery events are logged with the following structured fields for ELK dashboards and alerting:
+Recovery events are logged with the following structured fields for log dashboards and alerting:
 
 | Field                     | Type   | Description                                   |
 | ------------------------- | ------ | --------------------------------------------- |
@@ -242,32 +244,32 @@ Operators can query the `dispatch_queue` table to monitor recovery state:
 -- Count jobs currently in recovery
 SELECT count(*) FROM dispatch_queue WHERE status = 'recovering';
 
--- Find recovering jobs with their age
-SELECT id, run_id, created_at, now() - created_at AS age
+-- Find recovering jobs with the time left before their recovery deadline
+SELECT id, run_id, recovery_agent_id, recovery_deadline - now() AS time_left
 FROM dispatch_queue
 WHERE status = 'recovering'
-ORDER BY created_at;
+ORDER BY recovery_deadline;
 
 -- Check recent recovery timeouts
-SELECT id, run_id, error_message, updated_at
-FROM dispatch_queue
+SELECT run_id, job_id, error_message, completed_at
+FROM execution_jobs
 WHERE status = 'failed'
-  AND error_message LIKE '%recovery timeout%'
-ORDER BY updated_at DESC
+  AND error_message LIKE '%recovery window%'
+ORDER BY completed_at DESC
 LIMIT 10;
 ```
 
-### ELK dashboard suggestions
+### Log dashboard suggestions
 
 - **Recovery rate:** Count log events with message "Job recovered from agent reconnection" per time window
 - **Average recovery duration:** Aggregate `recovery_duration` field from recovery log events
-- **Recovery timeouts:** Count events with message containing "recovery timeout exceeded"
+- **Recovery timeouts:** Count events with the message "Job recovery timed out"
 - **Buffer overflow frequency:** Count gap markers that include "dropped due to buffer overflow"
 
 ## See also
 
-- [Reconnection and Event Buffering](reconnection.md) -- WebSocket reconnection behavior and message buffering
+- [Reconnection and event buffering](reconnection.md) -- WebSocket reconnection behavior and message buffering
 - [Execution status vocabulary](../execution/state-machine.md) -- run, job, and step status vocabularies and terminal-state rules
-- [Job Execution Lifecycle](../execution/job-execution.md) -- Agent job lifecycle from dispatch to cleanup
-- [Stale Detection](../execution/stale-detection.md) -- Stale run detector behavior
-- [Orchestrator Configuration](../configuration.md) -- Orchestrator settings
+- [Job execution lifecycle](../execution/job-execution.md) -- Agent job lifecycle from dispatch to cleanup
+- [Stale detection](../execution/stale-detection.md) -- Stale run detector behavior
+- [Orchestrator configuration](../configuration.md) -- Orchestrator settings

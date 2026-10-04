@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SourceManager, ObservedGithubAppSourcesError } from './source-manager.js';
-import { OrchestratorMode } from '@kici-dev/engine';
+import { SourceManager } from './source-manager.js';
 import type { SourceStore, SourceWithSecrets } from './source-store.js';
 import type { Source } from '../db/types.js';
 
@@ -462,41 +461,23 @@ describe('SourceManager', () => {
   });
 });
 
-describe('observed-mode GitHub-App source assertion', () => {
-  it('refuses to start when any GitHub-App source exists', async () => {
+describe('GitHub-App sources in observed mode', () => {
+  // fails-when: the observed startup assertion exists — start() rejects.
+  // breaks-if-wrong: the hybrid / no-mode starts elsewhere in this file still pass.
+  it('starts over a GitHub-App row and registers it as github_app', async () => {
     const client = createMockPoolClient();
     const mgr = new SourceManager({
       pool: createMockPool(client) as never,
-      sourceStore: createMockSourceStore([makeSource()]),
+      sourceStore: createMockSourceStore(
+        [makeSource()],
+        new Map([['github:42', makeSourceWithSecrets()]]),
+      ),
       onSourcesChanged: () => {},
-      mode: OrchestratorMode.enum.observed,
-    });
-    await expect(mgr.start()).rejects.toBeInstanceOf(ObservedGithubAppSourcesError);
-    // The LISTEN client is never checked out when the assertion trips.
-    expect(client.on).not.toHaveBeenCalled();
-  });
-
-  it('starts when no GitHub-App source exists', async () => {
-    const client = createMockPoolClient();
-    const mgr = new SourceManager({
-      pool: createMockPool(client) as never,
-      sourceStore: createMockSourceStore([]),
-      onSourcesChanged: () => {},
-      mode: OrchestratorMode.enum.observed,
     });
     await expect(mgr.start()).resolves.toBeDefined();
-    await mgr.stop();
-  });
-
-  it('allows GitHub-App sources in hybrid mode', async () => {
-    const client = createMockPoolClient();
-    const mgr = new SourceManager({
-      pool: createMockPool(client) as never,
-      sourceStore: createMockSourceStore([makeSource()]),
-      onSourcesChanged: () => {},
-      mode: OrchestratorMode.enum.hybrid,
-    });
-    await expect(mgr.start()).resolves.toBeDefined();
+    expect(mgr.getSources()).toEqual([
+      { provider: 'github', routingKey: 'github:42', name: 'Test App', subtype: 'github_app' },
+    ]);
     await mgr.stop();
   });
 });

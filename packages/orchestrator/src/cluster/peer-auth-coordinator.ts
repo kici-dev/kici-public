@@ -12,6 +12,11 @@
  * A coordinator without a join token also wires a `selfIssue` callback. When a
  * decision finds no credential and no token, the callback issues the
  * coordinator its own credential, once per storm, under the same mutex.
+ *
+ * A coordinator also wires `corroborateRejection`. Any dialled endpoint can
+ * send a rejection, so before it deletes the file the coordinator asks its own
+ * cluster database: a credential the database holds as valid, or a database it
+ * cannot read, keeps the file.
  */
 import { unlink } from 'node:fs/promises';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -21,7 +26,7 @@ import {
   type CredentialFileData,
 } from './peer-credentials.js';
 import { runDetached } from '../helpers/run-detached.js';
-import { CoordinatorCredentialOutcome } from './coordinator-credential.js';
+import { CoordinatorCredentialOutcome, RejectionCorroboration } from './coordinator-credential.js';
 
 const logger = createLogger({ prefix: 'peer-auth-coordinator' });
 
@@ -35,7 +40,15 @@ export type AuthDecision =
   | { mode: 'token-join'; token: string; complete: (issued: CredentialFileData | null) => void }
   | { mode: 'no-auth' };
 
-export type RejectionAction = 'retry-credential' | 'rejoin';
+/** What `reportRejection` did with the credential file. */
+export enum RejectionAction {
+  /** A sibling refreshed the file: retry with the fresh credential. */
+  RetryCredential = 'retry-credential',
+  /** The file was deleted: the next decision token-joins or self-issues. */
+  Rejoin = 'rejoin',
+  /** This cluster's database holds the credential as valid (or is unreadable): the file stays. */
+  KeepCredential = 'keep-credential',
+}
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -55,6 +68,7 @@ export class PeerAuthCoordinator {
   private readonly joinToken?: string;
   private readonly joinWaitTimeoutMs: number;
   private readonly selfIssue?: () => Promise<CoordinatorCredentialOutcome>;
+  private readonly corroborateRejection?: (credential: string) => Promise<RejectionCorroboration>;
   /** The issuance in progress; concurrent sibling clients share it. */
   private selfIssueInFlight: Promise<CoordinatorCredentialOutcome> | null = null;
   /** An operator revoked this coordinator's credential: never issue again in this process. */
@@ -75,12 +89,18 @@ export class PeerAuthCoordinator {
      * credential and no join token. Only a coordinator wires it.
      */
     selfIssue?: () => Promise<CoordinatorCredentialOutcome>;
+    /**
+     * Asks this coordinator's own cluster database whether it holds a rejected
+     * credential as valid. Only a coordinator with a database wires it.
+     */
+    corroborateRejection?: (credential: string) => Promise<RejectionCorroboration>;
   }) {
     this.credentialFile = opts.credentialFile;
     this.instanceId = opts.instanceId;
     this.joinToken = opts.joinToken;
     this.joinWaitTimeoutMs = opts.joinWaitTimeoutMs ?? DEFAULT_JOIN_WAIT_TIMEOUT_MS;
     this.selfIssue = opts.selfIssue;
+    this.corroborateRejection = opts.corroborateRejection;
   }
 
   /** Run `fn` exclusively against the credential file. */
@@ -208,7 +228,17 @@ export class PeerAuthCoordinator {
           instanceId: this.instanceId,
           reason,
         });
-        return 'retry-credential';
+        return RejectionAction.RetryCredential;
+      }
+      if (cred && this.corroborateRejection) {
+        const verdict = await this.corroborateRejection(cred.credential);
+        if (verdict !== RejectionCorroboration.NotHeld) {
+          logger.warn(
+            'A peer rejected a credential this cluster holds as valid; keeping the credential file',
+            { instanceId: this.instanceId, reason, verdict },
+          );
+          return RejectionAction.KeepCredential;
+        }
       }
       // Genuinely stale (or absent): delete so the next decideAuth token-joins.
       try {
@@ -226,7 +256,7 @@ export class PeerAuthCoordinator {
           });
         }
       }
-      return 'rejoin';
+      return RejectionAction.Rejoin;
     });
   }
 }

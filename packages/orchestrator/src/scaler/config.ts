@@ -228,10 +228,10 @@ const scalerEntrySchema = z
     runtime: z.enum(['docker', 'podman', 'auto']).default('auto'),
     orchestratorUrl: z.string().optional(),
     /**
-     * Extra `host:address` name mappings for spawned agents. A container scaler
-     * passes them to the runtime; a Firecracker scaler writes them into each
-     * guest's `/etc/hosts`, with `host-gateway` resolved to the bridge gateway.
-     * None by default.
+     * Extra `host:address` name mappings for spawned agents. A container scaler,
+     * and a bare-metal scaler's job-image agent containers, pass them to the
+     * runtime; a Firecracker scaler writes them into each guest's `/etc/hosts`,
+     * with `host-gateway` resolved to the bridge gateway. None by default.
      */
     extraHosts: z.array(z.string()).optional(),
     networkIsolation: z.boolean().default(true),
@@ -298,10 +298,11 @@ const scalerEntrySchema = z
     memSizeMib: z.number().int().positive().default(512),
     /**
      * When the orchestrator runs as a non-root user (e.g. user-mode systemd on
-     * an edge worker), set this to true so privileged commands (`ip`, `chown`)
-     * are wrapped with `sudo -n`. Operators must have a NOPASSWD sudoers entry
-     * for those binaries. On hosts where the orchestrator is already root,
-     * leave unset.
+     * an edge worker), set this to true so privileged commands are wrapped with
+     * `sudo -n`: `ip`, `chown`, `chmod`, `kill` and `nft` for a Firecracker
+     * scaler, `nft` for a bare-metal scaler's job-image label sets. Operators
+     * must have a NOPASSWD sudoers entry for those binaries. On hosts where the
+     * orchestrator is already root, leave unset.
      */
     requireSudo: z.boolean().default(false),
 

@@ -405,13 +405,13 @@ Key differences from a plain generic source:
 When using the Platform relay, generic webhooks follow the same path as GitHub webhooks:
 
 1. External service POSTs to `https://<platform>/webhook/<orgId>/generic/<sourceId>`
-2. Platform verifies the signature (for HMAC sources) or passes through (for `skip_verification` sources)
-3. Platform relays via WebSocket to the orchestrator using routing key `generic:<orgId>:<sourceId>`
+2. Platform relays the raw body and headers via WebSocket to the orchestrator using routing key `generic:<orgId>:<sourceId>`
+3. Orchestrator verifies the request with the source's verification method (HMAC, bearer token, IP allowlist, or none)
 4. Orchestrator processes the webhook through the normal pipeline
 
 The Platform resolves the source by both the routing key and the URL's `orgId`, and it refuses to register a `generic:` routing key whose organization segment is not the organization the orchestrator authenticated as. So the three values above stay one value end to end, and a source another organization registered under your key can never receive your deliveries.
 
-Sources using bearer token, IP allowlist, or no verification are automatically flagged as `skip_verification` in the Platform -- the orchestrator handles verification instead.
+The Platform stores no verification secrets for any method. With a bearer token, the Platform forwards the `Authorization` header, so it does see the token in transit. With an IP allowlist, the orchestrator checks the client IP that the Platform reports. Use HMAC when the relay must not be able to produce a valid request.
 
 The Platform also deduplicates before it relays, on two keys: the delivery id (`X-Delivery-ID` or `X-Request-ID`), and the raw body bytes against deliveries it accepted for the same source within the last minute. A second POST with the same body inside that minute is answered 200 `{ "status": "duplicate" }` and not relayed, whatever delivery id it carries. This is what collapses a provider that emits one event twice. A sender that means to fire the same event twice within a minute must vary the body -- a timestamp or nonce field is enough. The orchestrator's own `dedupWindowSeconds` / idempotency-key window applies after the relay and is unaffected.
 

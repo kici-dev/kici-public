@@ -69,7 +69,7 @@ kici-admin peer reset-raft-state --database-url <url> [--json]
 
 Manages peer credentials for multi-orchestrator clusters. These commands access the database directly (not via the admin API), except `forget`. `forget` goes through the admin API of the running coordinators. It removes a peer that left the cluster from each coordinator's live peer list and leaves its credential as it is (see [Managing peers](../clustering.md#managing-peers)). `create-token`, `list`, `revoke` and `revoke-all` read the database URL from `KICI_DATABASE_URL` only; `prune-credentials` and `reset-raft-state` also accept `--database-url`.
 
-- `create-token` generates a single-use join token (defaults: coordinator role, 1-hour expiry, org-id `default`, routing-key `default`, attribution `cli`).
+- `create-token` generates a join token (defaults: coordinator role, 1-hour expiry, org-id `default`, routing-key `default`, attribution `cli`).
   - `--created-by <actor>` sets the `join_tokens.created_by` audit attribution. Defaults to `cli`; a deploy script can pass its own name, e.g. `deploy-script`, so its join tokens are distinguishable from ad-hoc operator ones.
   - `--json` prints a single JSON object (`{ token, role, orgId, routingKey, expiresAt }`) on stdout instead of the human-readable multi-line output, so callers can pipe it through `JSON.parse` without stripping prose. This is what lets a deploy script mint a token and hand it straight to a joining peer when bootstrapping an HA cluster unattended.
 - `revoke` refuses the peer's next connection attempt. It does not close the peer's open connections.
@@ -86,7 +86,19 @@ kici-admin join --token <join-token> --platform <wss://...> --api-key <key>
 kici-admin join --token <join-token> --peer <https://orch-1:8080>
 ```
 
-Bootstraps a new orchestrator into an existing cluster. Connects via Platform relay or direct peer, receives an encrypted config bundle, and writes an env file the orchestrator boots from.
+Bootstraps a new orchestrator into an existing cluster. Connects via Platform relay or direct peer, receives the configuration bundle sealed to this host, and writes an env file the orchestrator boots from. The join secret never leaves this host: `join` sends a proof that it holds the token, and checks the cluster's proof before it writes anything.
+
+`join` needs the cluster's orchestrators on a release with join protocol v2. Upgrade the cluster's orchestrators first, then `kici-admin`.
+
+| Error                                                                       | Meaning                                                                              |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `The cluster's orchestrators predate join protocol v2…`                     | No orchestrator in the target pool supports join protocol v2. Upgrade them.          |
+| `The orchestrator at <url> predates join protocol v2…`                      | The `--peer` orchestrator is older. Upgrade it.                                      |
+| `Join rejected: … (invalid_token)`                                          | No live token matches. Check the token, or create a new one.                         |
+| `Join rejected: … (token_already_used)`                                     | A peer consumed the token. Create a new token.                                       |
+| `Join rejected: … (token_expired)`                                          | The token has expired. Create a new token.                                           |
+| `The join response did not come from an orchestrator that holds this token` | The response failed its proof. Nothing was written.                                  |
+| `Platform auth failed: …` / `WebSocket closed before auth (code …)`         | The Platform refused the connection. The reason names why, for example a plan limit. |
 
 - `--env-file <path>` sets the output path for that env file (default: `./kici-orchestrator.env`). It carries the cluster database URL, the object-storage settings and the secrets encryption key. On a POSIX host the file is written at mode 0600, readable by its owner only. On Windows the same call leaves the ACL unchanged, so restrict the file yourself. `kici-admin orchestrator install --env-file` copies it into the config folder of the instance, which only LocalSystem and Administrators can read. Delete the file after the copy. Hand it straight to the installer:
 
@@ -109,8 +121,8 @@ kici-admin host declare --agent-id <id> [--labels <labels>] [--hostname <name>] 
 kici-admin host remove --agent-id <id>
 ```
 
-- `list` / `get` read the durable host roster and report each host's derived status (`ready` / `unreachable` / `stale`) from the shared last-seen + connected-instance columns.
-- `declare` pre-declares a `static` host before its agent connects — until the agent dials in, the host reads `unreachable`, making "expected but not yet here" a visible state. `--prop` (repeatable) seeds typed host properties. The reach fields (`--address`, `--ssh-user`, `--ssh-port`, `--ssh-key-secret`, `--s3-reachable`) let a fresh box be bootstrapped before it runs an agent. Every attempt writes a `fleet.host.declare` `access_log` entry.
+- `list` / `get` read the durable host roster and report each host's derived status (`ready` / `unreachable` / `stale`) from the shared last-seen + connected-instance columns, and the host's identity source (`agent`, `operator`, or `platform` for an unconfirmed dashboard declare).
+- `declare` pre-declares a `static` host before its agent connects — until the agent dials in, the host reads `unreachable`, making "expected but not yet here" a visible state. `--prop` (repeatable) seeds typed host properties. The reach fields (`--address`, `--ssh-user`, `--ssh-port`, `--ssh-key-secret`, `--s3-reachable`) let a fresh box be bootstrapped before it runs an agent. It may set reserved `kici:` labels and properties, and it confirms a host declared from the dashboard, replacing that host's labels, hostname and properties. Every attempt writes a `fleet.host.declare` `access_log` entry.
 - `remove` deletes the host's roster row — the retirement path for a box that is gone for good, so it stops reading `unreachable` forever. It exits non-zero when no row matches, and every attempt writes a `fleet.host.remove` `access_log` entry.
 
 These commands read and write the orchestrator database directly (set `KICI_DATABASE_URL`). See [Host roster (declared inventory)](../host-roster.md) for the full model, derived-status table, and the `KICI_ROSTER_GRACE_MS` / `KICI_ROSTER_TTL_MS` timing knobs.

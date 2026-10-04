@@ -12,7 +12,7 @@
  */
 
 import { createRequire } from 'node:module';
-import { resolveNpm } from './npm-resolver.js';
+import { hostNpmLookupEnv, lookupHostNpm, type HostNpmLookupEnv } from './npm-resolver.js';
 
 /** The subset of npm's `ini` module this module uses. */
 export interface IniCodec {
@@ -35,21 +35,26 @@ const DISALLOWED_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/;
 /** Any control character at all: a kept value may carry none. */
 const ANY_CONTROL = /[\u0000-\u001f\u007f]/;
 
+/** npm's `.npmrc` parser from the npm the host install trusts, or why there is none. */
+export type HostNpmIni = { ini: IniCodec } | { ini: null; detail: string };
+
 /**
- * npm's own `.npmrc` parser, from the npm bundled with the Node running the
- * agent. `null` when that npm is not found or ships no usable `ini`.
+ * npm's own `.npmrc` parser, from the npm {@link lookupHostNpm} finds: the npm
+ * installed with the Node running the agent, else a distribution or PATH npm
+ * at the minimum version.
  */
-export function loadNpmIni(): IniCodec | null {
-  const { npmCliPath } = resolveNpm();
-  if (!npmCliPath) return null;
+export function loadHostNpmIni(env: HostNpmLookupEnv = hostNpmLookupEnv()): HostNpmIni {
+  const npm = lookupHostNpm(env);
+  if (!npm.found) return { ini: null, detail: npm.detail };
   try {
-    const ini = createRequire(npmCliPath)('ini') as Partial<IniCodec>;
-    return typeof ini.decode === 'function' && typeof ini.encode === 'function'
-      ? (ini as IniCodec)
-      : null;
+    const ini = createRequire(npm.npmCliPath)('ini') as Partial<IniCodec>;
+    if (typeof ini.decode === 'function' && typeof ini.encode === 'function') {
+      return { ini: ini as IniCodec };
+    }
   } catch {
-    return null;
+    // Reported below.
   }
+  return { ini: null, detail: `${npm.npmCliPath} ships no usable ini parser` };
 }
 
 export type ParsedNpmrc =

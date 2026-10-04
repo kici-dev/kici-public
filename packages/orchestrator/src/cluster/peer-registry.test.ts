@@ -1,6 +1,44 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { PeerRegistry } from './peer-registry.js';
-import type { PeerHeartbeat } from '@kici-dev/engine';
+import { PeerLinkDirection, PeerRegistry } from './peer-registry.js';
+import { PeerAuthScheme, type PeerHeartbeat } from '@kici-dev/engine';
+
+describe('authScheme per link direction', () => {
+  const add = (r: PeerRegistry) =>
+    r.addPeer({ instanceId: 'p', connectionId: 'c', address: null, routingKeys: [] });
+
+  it('starts with neither direction authenticated', () => {
+    const r = new PeerRegistry();
+    add(r);
+    expect(r.getPeer('p')!.authScheme).toEqual({ inbound: null, outbound: null });
+  });
+
+  it('records each direction independently and resets only the closed one', () => {
+    const r = new PeerRegistry();
+    add(r);
+    r.setAuthScheme('p', PeerLinkDirection.Inbound, PeerAuthScheme.enum['mutual-v2']);
+    r.setAuthScheme('p', PeerLinkDirection.Outbound, PeerAuthScheme.enum['mutual-v2']);
+    expect(r.getPeer('p')!.authScheme).toEqual({ inbound: 'mutual-v2', outbound: 'mutual-v2' });
+    // fails-when: both directions share one flag
+    r.setAuthScheme('p', PeerLinkDirection.Outbound, null);
+    expect(r.getPeer('p')!.authScheme).toEqual({ inbound: 'mutual-v2', outbound: null });
+  });
+
+  it('keeps the other direction when a disconnected peer is added again', () => {
+    const r = new PeerRegistry();
+    add(r);
+    r.setAuthScheme('p', PeerLinkDirection.Inbound, PeerAuthScheme.enum['mutual-v2']);
+    r.markDisconnected('p');
+    add(r);
+    expect(r.getPeer('p')!.authScheme.inbound).toBe('mutual-v2');
+  });
+
+  it('ignores an unknown peer', () => {
+    const r = new PeerRegistry();
+    expect(() =>
+      r.setAuthScheme('nope', PeerLinkDirection.Inbound, PeerAuthScheme.enum['mutual-v2']),
+    ).not.toThrow();
+  });
+});
 
 describe('PeerRegistry', () => {
   let registry: PeerRegistry;

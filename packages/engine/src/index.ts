@@ -165,7 +165,7 @@ export {
   type SourceDeregisterAck,
 } from './protocol/messages/source-registration.js';
 
-// --- Protocol: Cluster join (zero-knowledge bootstrap) ---
+// --- Protocol: Cluster join (join protocol v2) ---
 export * from './protocol/messages/join.js';
 
 // --- Protocol: Peer-to-peer messages (orchestrator cluster) ---

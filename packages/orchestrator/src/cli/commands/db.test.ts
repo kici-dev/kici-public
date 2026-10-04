@@ -113,6 +113,15 @@ vi.mock('../service/index.js', async () => {
   };
 });
 
+// The real resolveInstanceTarget above imports detectPlatform from
+// platform-detect.js itself, so the barrel's detectPlatform mock never reaches
+// discovery. Pin the host here as well (as service/instance/resolve.test.ts
+// does), so "a systemd host" holds on a host without systemd.
+vi.mock('../service/platform-detect.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../service/platform-detect.js')>();
+  return { ...actual, detectPlatform: vi.fn((): ServicePlatform => 'systemd') };
+});
+
 vi.mock('../service/backup-timer.js', async () => {
   const actual = await vi.importActual<typeof import('../service/backup-timer.js')>(
     '../service/backup-timer.js',
@@ -148,6 +157,7 @@ vi.mock('../service/backup-timer.js', async () => {
 import { registerDbCommands } from './db.js';
 import { writeManifest } from '../service/index.js';
 import type { InstanceManifest } from '../service/index.js';
+import { detectPlatform } from '../service/platform-detect.js';
 
 function buildDbCommand(): Command {
   const program = new Command();
@@ -533,6 +543,9 @@ describe('db backup --install-timer — the timer follows the install, not the h
       // It resolved (it reached the timer installer) and then refused for the
       // right reason — not for "instance not found".
       expect(scannedPlatforms).toEqual(['systemd', 'compose']);
+      // fails-when: the mock above is inert (a wrong module id), so discovery
+      // reads the real host; `toHaveBeenCalled` throws on a non-spy.
+      expect(vi.mocked(detectPlatform)).toHaveBeenCalled();
       expect(timerPlatforms).toEqual(['compose']);
       expect(errorOutput()).toContain('host scheduler KiCI does');
     } finally {

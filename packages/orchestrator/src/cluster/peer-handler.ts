@@ -1,15 +1,23 @@
 /**
  * WebSocket handler for incoming peer connections from other orchestrators.
  *
- * Accepts WS upgrade, performs ECDH key exchange for encrypted channel,
- * validates authentication via join token (first connect) or HMAC credential
- * proof (reconnection), registers the peer in PeerRegistry, and routes
- * messages bidirectionally. Sends periodic heartbeats to the connecting peer.
+ * Accepts WS upgrade, performs ECDH key exchange, and authenticates the peer
+ * with mutual-v2: `peer.hello` advertises the scheme, the peer proves its
+ * credential (or, on first join, its join token) with an HMAC over the
+ * handshake transcript, and this server answers with its own proof and
+ * switches to the application key. A join token never arrives here: the peer
+ * sends the token's routing segment, and the role and routing key come from
+ * the join_tokens row. A request in the scheme earlier releases used is refused
+ * with PEER_MUTUAL_AUTH_REQUIRED_REASON. Registers the peer in PeerRegistry and
+ * routes messages bidirectionally. Sends periodic heartbeats to the peer.
  */
 
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { createLogger, sha256, toErrorMessage, ChunkRequestWaiter } from '@kici-dev/shared';
 import {
+  PEER_MUTUAL_AUTH_REQUIRED_REASON,
+  PeerAuthMode,
+  PeerAuthScheme,
   peerHelloResponseSchema,
   peerAuthRequestSchema,
   peerFromPeerMessageSchema,
@@ -19,6 +27,7 @@ import {
   WS_CLOSE_AUTH_TIMEOUT,
   WS_CLOSE_INVALID_MESSAGE,
   WS_CLOSE_PLAN_LIMIT,
+  type PeerAuthRequest,
   type PeerHeartbeat,
   type PeerToPeerMessage,
   type JobReroute,
@@ -45,7 +54,7 @@ import {
   type RaftVoteResponse,
   type RaftAppendEntries,
 } from '@kici-dev/engine';
-import type { PeerRegistry } from './peer-registry.js';
+import { PeerLinkDirection, type PeerRegistry } from './peer-registry.js';
 import {
   PeerForgetWaiters,
   PEER_FORGET_COORDINATORS_ONLY,
@@ -61,16 +70,25 @@ import {
   type ScalerOrphansRequestHandler,
 } from './scaler-orphans-peer.js';
 import {
+  HANDSHAKE_NONCE_BYTES,
+  computeClientProof,
+  computeServerProof,
+  decodeProof,
+  deriveAppKey,
   generateEcdhKeyPair,
   deriveSessionKey,
   encryptMessage,
   decryptMessage,
+  peerTranscriptHash,
+  proofMatches,
 } from './peer-crypto.js';
 import type { PeerCredentialStore } from './peer-credentials.js';
 import {
-  deriveKeys,
+  decodeJoinRouting,
   isTokenAlreadyUsedError,
-  parseToken,
+  ResolvedJoinTokenStatus,
+  tokenFingerprint,
+  type JoinRoutingClaim,
   type JoinTokenManager,
 } from './join-token.js';
 import { runDetached } from '../helpers/run-detached.js';
@@ -206,6 +224,44 @@ interface PeerConnection {
    * the role the peer declares, which a worker could set to `coordinator`.
    */
   authenticatedRole: string;
+}
+
+/** The schemes this server lists in peer.hello, in order. */
+export const ADVERTISED_PEER_AUTH_SCHEMES: readonly string[] = [PeerAuthScheme.enum['mutual-v2']];
+
+/** Proof checks one token-mode request may cost: rows minted for one routing key in one millisecond. */
+const MAX_TOKEN_CANDIDATES = 8;
+
+/**
+ * A peer.auth.request from a release before mutual authentication: it carries
+ * a proof or a token, or names no scheme.
+ */
+export function isLegacyPeerAuthRequest(raw: unknown): boolean {
+  if (typeof raw !== 'object' || raw === null) return false;
+  const r = raw as Record<string, unknown>;
+  if (r.type !== 'peer.auth.request') return false;
+  return 'proof' in r || 'token' in r || !('scheme' in r);
+}
+
+/** K_hs and TH of one connection's handshake. */
+interface HandshakeState {
+  handshakeKey: Buffer;
+  transcriptHash: Buffer;
+}
+
+/** An accepted authentication. */
+interface AcceptedAuth {
+  /** The role the credential row or join-token row carries. */
+  role: string;
+  /** K_app: every frame after the acceptance. */
+  appKey: Buffer;
+}
+
+/** A join-token row a token-mode peer proved, claimed for this peer. */
+interface TokenGrant {
+  role: 'coordinator' | 'worker';
+  routingKey: string;
+  trigger: 'token-join' | 'idempotent-token-retry';
 }
 
 /** Rate limit tracking per IP. */
@@ -439,6 +495,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       clearInterval(conn.heartbeatTimer);
       conn.heartbeatTimer = null;
     }
+    peerRegistry.setAuthScheme(conn.peerInstanceId, PeerLinkDirection.Inbound, null);
     peerRegistry.markDisconnected(conn.peerInstanceId);
     connections.delete(conn.peerInstanceId);
   }
@@ -753,9 +810,13 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
 
     let authenticated = false;
+    let closed = false;
+    let authInFlight = false;
     let peerInstanceId: string | null = null;
     let sessionKey: Buffer | null = null;
-    let handshakeNonce: Buffer | null = null;
+    let hs: HandshakeState | null = null;
+    /** This socket's connection once authenticated; a reconnect replaces it in `connections`. */
+    let ownConn: PeerConnection | null = null;
 
     // Auth timeout: close if not authenticated within threshold
     const authTimer = setTimeout(() => {
@@ -765,148 +826,67 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
     }, authTimeoutMs);
 
-    // --- Step 1: ECDH handshake (Layer 1) ---
-    // Generate ephemeral key pair and send peer.hello
+    const fail = (code: number, reason: string): void => {
+      closed = true;
+      ws.close(code, reason);
+      clearTimeout(authTimer);
+    };
+
+    // --- Step 1: ECDH handshake, advertising the schemes this server accepts ---
     const ecdh = generateEcdhKeyPair();
-    const nonce = randomBytes(32);
-    handshakeNonce = nonce;
+    const nonce = randomBytes(HANDSHAKE_NONCE_BYTES);
 
     sendPlainMessage(ws, {
       type: 'peer.hello',
       ephemeralPublicKey: ecdh.publicKey.toString('base64'),
       nonce: nonce.toString('base64'),
+      authSchemes: ADVERTISED_PEER_AUTH_SCHEMES,
     });
-
-    // State: waiting for peer.hello.response, then peer.auth.request (encrypted)
-    let ecdhComplete = false;
 
     ws.on('message', (data: unknown) => {
       const raw = typeof data === 'string' ? data : String(data);
 
-      if (!ecdhComplete) {
+      if (!hs) {
         // --- Waiting for peer.hello.response (plaintext) ---
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          logger.warn('Malformed JSON during ECDH handshake');
-          return;
-        }
-
-        const helloResp = peerHelloResponseSchema.safeParse(parsed);
-        if (!helloResp.success) {
-          logger.warn('Expected peer.hello.response, got invalid message');
-          ws.close(WS_CLOSE_INVALID_MESSAGE, 'Expected hello response');
-          clearTimeout(authTimer);
-          return;
-        }
-
-        // Derive session key
-        try {
-          sessionKey = deriveSessionKey(
-            ecdh.privateKey,
-            Buffer.from(helloResp.data.ephemeralPublicKey, 'base64'),
-            nonce,
-          );
-        } catch (err) {
-          logger.warn('ECDH key derivation failed', { error: toErrorMessage(err) });
-          ws.close(WS_CLOSE_INVALID_MESSAGE, 'Key derivation failed');
-          clearTimeout(authTimer);
-          return;
-        }
-
-        ecdhComplete = true;
+        hs = readHelloResponse(raw, ecdh, nonce, fail);
         return;
       }
 
       if (!authenticated) {
-        // --- Waiting for peer.auth.request (encrypted) ---
-        if (!sessionKey) {
-          logger.warn('No session key for auth decryption');
-          ws.close(WS_CLOSE_INVALID_MESSAGE, 'No session key');
-          clearTimeout(authTimer);
+        // --- Waiting for peer.auth.request (under K_hs) ---
+        if (authInFlight) {
+          logger.warn('Peer sent a frame while its authentication was in flight', { ip });
+          fail(WS_CLOSE_INVALID_MESSAGE, 'Frame during authentication');
           return;
         }
+        const handshake = hs;
+        const authMsg = readAuthRequest(ws, handshake, raw, ip, fail);
+        if (!authMsg) return;
 
-        let decrypted: string;
-        try {
-          decrypted = decryptMessage(raw, sessionKey);
-        } catch (err) {
-          logger.warn('Failed to decrypt auth request', { error: toErrorMessage(err) });
-          recordFailedAuth(ip);
-          ws.close(WS_CLOSE_UNAUTHORIZED, 'Decryption failed');
-          clearTimeout(authTimer);
-          return;
-        }
-
-        let authParsed: unknown;
-        try {
-          authParsed = JSON.parse(decrypted);
-        } catch {
-          logger.warn('Malformed JSON in decrypted auth request');
-          ws.close(WS_CLOSE_INVALID_MESSAGE, 'Invalid auth format');
-          clearTimeout(authTimer);
-          return;
-        }
-
-        const authMsg = peerAuthRequestSchema.safeParse(authParsed);
-        if (!authMsg.success) {
-          logger.warn('Invalid peer.auth.request format', { errors: authMsg.error.issues });
-          ws.close(WS_CLOSE_INVALID_MESSAGE, 'Invalid auth request');
-          clearTimeout(authTimer);
-          return;
-        }
-
-        // Handle auth asynchronously
-        handleAuth(ws, sessionKey, handshakeNonce!, authMsg.data, ip)
-          .then((authenticatedRole) => {
-            if (authenticatedRole === null) return;
+        authInFlight = true;
+        handleAuth(ws, handshake, authMsg, ip)
+          .then((accepted) => {
+            authInFlight = false;
+            if (accepted === null || closed) return;
 
             authenticated = true;
-            peerInstanceId = authMsg.data.instanceId;
+            peerInstanceId = authMsg.instanceId;
+            sessionKey = accepted.appKey;
             clearTimeout(authTimer);
-
-            logger.info('Peer authenticated', { peerInstanceId });
-
-            // Register in peer registry
-            peerRegistry.addPeer({
-              instanceId: peerInstanceId,
-              connectionId: randomUUID(),
-              address: null, // incoming connections don't have a known address
-              routingKeys: [],
-              role: authMsg.data.role,
-            });
-
-            // Send immediate heartbeat so peer has our full state
-            const inventory = getLocalInventory();
-            sendEncryptedMessage(ws, sessionKey!, {
-              type: 'peer.heartbeat',
-              ...inventory,
-            });
-
-            // Start periodic heartbeats
-            const conn: PeerConnection = {
-              peerInstanceId,
-              ws,
-              sessionKey: sessionKey!,
-              heartbeatTimer: null,
-              authenticatedRole,
-            };
-            connections.set(peerInstanceId, conn);
-            startHeartbeat(conn);
+            ownConn = registerInboundPeer(ws, authMsg, accepted);
           })
           .catch((err) => {
+            authInFlight = false;
             logger.error('Unexpected error during auth handling', {
               error: toErrorMessage(err),
             });
-            ws.close(WS_CLOSE_UNAUTHORIZED, 'Auth error');
-            clearTimeout(authTimer);
+            fail(WS_CLOSE_UNAUTHORIZED, 'Auth error');
           });
 
         return;
       }
 
-      // --- Authenticated: decrypt and route ---
+      // --- Authenticated: decrypt under K_app and route ---
       if (!sessionKey) return;
 
       let decrypted: string;
@@ -938,14 +918,20 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     });
 
     ws.on('close', () => {
+      closed = true;
       clearTimeout(authTimer);
 
-      if (peerInstanceId) {
+      if (peerInstanceId && ownConn) {
         logger.info('Peer disconnected', { peerInstanceId });
-        rejectLogsCollectForPeer(peerInstanceId);
-        const conn = connections.get(peerInstanceId);
-        if (conn) {
-          cleanupConnection(conn);
+        if (ownConn.heartbeatTimer) {
+          clearInterval(ownConn.heartbeatTimer);
+          ownConn.heartbeatTimer = null;
+        }
+        // A peer that reconnected while this socket was still open owns the
+        // entry now: only this socket's own connection is cleaned up.
+        if (connections.get(peerInstanceId) === ownConn) {
+          rejectLogsCollectForPeer(peerInstanceId);
+          cleanupConnection(ownConn);
         }
       }
     });
@@ -957,26 +943,219 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     });
   }
 
+  /** The peer's plaintext hello.response: derive K_hs and the transcript hash, or close. */
+  function readHelloResponse(
+    raw: string,
+    ecdh: ReturnType<typeof generateEcdhKeyPair>,
+    nonce: Buffer,
+    fail: (code: number, reason: string) => void,
+  ): HandshakeState | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.warn('Malformed JSON during ECDH handshake');
+      return null;
+    }
+
+    const helloResp = peerHelloResponseSchema.safeParse(parsed);
+    if (!helloResp.success) {
+      logger.warn('Expected peer.hello.response, got invalid message');
+      fail(WS_CLOSE_INVALID_MESSAGE, 'Expected hello response');
+      return null;
+    }
+
+    const clientPub = Buffer.from(helloResp.data.ephemeralPublicKey, 'base64');
+    try {
+      return {
+        handshakeKey: deriveSessionKey(ecdh.privateKey, clientPub, nonce),
+        transcriptHash: peerTranscriptHash({
+          serverEphemeralPublicKey: ecdh.publicKey,
+          serverNonce: nonce,
+          authSchemes: ADVERTISED_PEER_AUTH_SCHEMES,
+          clientEphemeralPublicKey: clientPub,
+        }),
+      };
+    } catch (err) {
+      logger.warn('ECDH key derivation failed', { error: toErrorMessage(err) });
+      fail(WS_CLOSE_INVALID_MESSAGE, 'Key derivation failed');
+      return null;
+    }
+  }
+
   /**
-   * Validate auth request (token or credential proof).
-   * Returns the role the accepted credential or join token carries, or null
-   * when the request is rejected. The role the peer declares in its request is
-   * not authenticated; this one is.
+   * The encrypted peer.auth.request, or null after closing the connection. A
+   * request in the scheme earlier releases used is refused with
+   * PEER_MUTUAL_AUTH_REQUIRED_REASON, which is not a failed authentication: an
+   * old peer connects as soon as it is upgraded.
+   */
+  function readAuthRequest(
+    ws: PeerWsLike,
+    hs: HandshakeState,
+    raw: string,
+    ip: string,
+    fail: (code: number, reason: string) => void,
+  ): PeerAuthRequest | null {
+    let decrypted: string;
+    try {
+      decrypted = decryptMessage(raw, hs.handshakeKey);
+    } catch (err) {
+      logger.warn('Failed to decrypt auth request', { error: toErrorMessage(err) });
+      recordFailedAuth(ip);
+      fail(WS_CLOSE_UNAUTHORIZED, 'Decryption failed');
+      return null;
+    }
+
+    let authParsed: unknown;
+    try {
+      authParsed = JSON.parse(decrypted);
+    } catch {
+      logger.warn('Malformed JSON in decrypted auth request');
+      fail(WS_CLOSE_INVALID_MESSAGE, 'Invalid auth format');
+      return null;
+    }
+
+    if (isLegacyPeerAuthRequest(authParsed)) {
+      const legacyId = (authParsed as { instanceId?: unknown }).instanceId;
+      logger.warn(
+        'Peer used an authentication scheme this release no longer accepts; upgrade every orchestrator in the cluster',
+        { peerInstanceId: typeof legacyId === 'string' ? legacyId : null, ip },
+      );
+      sendEncryptedMessage(ws, hs.handshakeKey, {
+        type: 'peer.auth.response',
+        accepted: false,
+        instanceId,
+        reason: PEER_MUTUAL_AUTH_REQUIRED_REASON,
+      });
+      fail(WS_CLOSE_PROTOCOL_ERROR, PEER_MUTUAL_AUTH_REQUIRED_REASON);
+      return null;
+    }
+
+    const authMsg = peerAuthRequestSchema.safeParse(authParsed);
+    if (!authMsg.success) {
+      logger.warn('Invalid peer.auth.request format', { errors: authMsg.error.issues });
+      fail(WS_CLOSE_INVALID_MESSAGE, 'Invalid auth request');
+      return null;
+    }
+    return authMsg.data;
+  }
+
+  /** Register an authenticated inbound peer and start its heartbeats under K_app. */
+  function registerInboundPeer(
+    ws: PeerWsLike,
+    authMsg: PeerAuthRequest,
+    accepted: AcceptedAuth,
+  ): PeerConnection {
+    const peerInstanceId = authMsg.instanceId;
+    logger.info('Peer authenticated', { peerInstanceId });
+
+    peerRegistry.addPeer({
+      instanceId: peerInstanceId,
+      connectionId: randomUUID(),
+      address: null, // incoming connections don't have a known address
+      routingKeys: [],
+      role: authMsg.role,
+    });
+    peerRegistry.setAuthScheme(
+      peerInstanceId,
+      PeerLinkDirection.Inbound,
+      PeerAuthScheme.enum['mutual-v2'],
+    );
+
+    // Send immediate heartbeat so peer has our full state
+    const inventory = getLocalInventory();
+    sendEncryptedMessage(ws, accepted.appKey, {
+      type: 'peer.heartbeat',
+      ...inventory,
+    });
+
+    const conn: PeerConnection = {
+      peerInstanceId,
+      ws,
+      sessionKey: accepted.appKey,
+      heartbeatTimer: null,
+      authenticatedRole: accepted.role,
+    };
+    connections.set(peerInstanceId, conn);
+    startHeartbeat(conn);
+    return conn;
+  }
+
+  /** Refuse an authentication attempt; it counts against the rate limits. */
+  function rejectAuth(
+    ws: PeerWsLike,
+    hs: HandshakeState,
+    reason: string,
+    ip: string,
+    peerInstanceId: string,
+  ): null {
+    sendEncryptedMessage(ws, hs.handshakeKey, {
+      type: 'peer.auth.response',
+      accepted: false,
+      instanceId,
+      reason,
+    });
+    recordFailedAuth(ip, peerInstanceId);
+    ws.close(WS_CLOSE_UNAUTHORIZED, reason);
+    return null;
+  }
+
+  /** Answer an accepted peer with the server proof, and derive K_app. */
+  function acceptAuth(
+    ws: PeerWsLike,
+    hs: HandshakeState,
+    args: {
+      psk: Buffer;
+      clientProof: Buffer;
+      grantedRole: string;
+      sessionCredential: string | null;
+    },
+  ): AcceptedAuth {
+    const serverProof = computeServerProof({
+      psk: args.psk,
+      transcriptHash: hs.transcriptHash,
+      clientProof: args.clientProof,
+      serverInstanceId: instanceId,
+      grantedRole: args.grantedRole,
+      sessionCredential: args.sessionCredential,
+    });
+    const inventory = getLocalInventory();
+    sendEncryptedMessage(ws, hs.handshakeKey, {
+      type: 'peer.auth.response',
+      accepted: true,
+      instanceId,
+      role: args.grantedRole,
+      serverProof: serverProof.toString('hex'),
+      ...(args.sessionCredential !== null && { sessionCredential: args.sessionCredential }),
+      softwareVersion: SOFTWARE_VERSION,
+      agents: inventory.agents,
+      scalerCapacity: inventory.scalerCapacity,
+      capabilities: inventory.capabilities,
+    });
+    return {
+      role: args.grantedRole,
+      appKey: deriveAppKey({
+        handshakeKey: hs.handshakeKey,
+        psk: args.psk,
+        transcriptHash: hs.transcriptHash,
+        clientProof: args.clientProof,
+        serverProof,
+      }),
+    };
+  }
+
+  /**
+   * Validate a mutual-v2 auth request. Returns the accepted role and K_app, or
+   * null when the request is rejected. The role the peer declares is bound
+   * into its proof but not trusted; the accepted role comes from the
+   * credential row or the join-token row.
    */
   async function handleAuth(
     ws: PeerWsLike,
-    sessionKey: Buffer,
-    nonce: Buffer,
-    authMsg: {
-      instanceId: string;
-      protocolVersion: number;
-      token?: string;
-      proof?: string;
-      softwareVersion?: string;
-      role?: 'coordinator' | 'worker';
-    },
+    hs: HandshakeState,
+    authMsg: PeerAuthRequest,
     ip: string,
-  ): Promise<string | null> {
+  ): Promise<AcceptedAuth | null> {
     // Protocol version check (minimum-version semantics: future versions accepted)
     if (authMsg.protocolVersion < MIN_PROTOCOL_VERSION) {
       logger.warn('Peer protocol version below minimum', {
@@ -984,7 +1163,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         received: authMsg.protocolVersion,
         minimum: MIN_PROTOCOL_VERSION,
       });
-      sendEncryptedMessage(ws, sessionKey, {
+      sendEncryptedMessage(ws, hs.handshakeKey, {
         type: 'peer.auth.response',
         accepted: false,
         instanceId,
@@ -1004,298 +1183,222 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       });
     }
 
-    if (authMsg.token) {
-      // --- Token-based auth (first join) ---
-      try {
-        // Atomic validate+consume: one UPDATE..WHERE consumed_at IS NULL
-        // wins the claim across the shared-DB mesh; every other concurrent
-        // caller throws TOKEN_ALREADY_USED and is handled by the recovery
-        // branch below. The atomicity is what keeps multiple coordinators
-        // from each issuing their own credential for the same instanceId
-        // off a single join token.
-        //
-        // The joining peer's instanceId (authMsg.instanceId) is recorded as
-        // consumed_by_instance so the SAME peer can re-present its still-valid
-        // join token after losing its credential (transient outage / deleted
-        // credential file) and self-heal without a redeploy. `instanceId` here
-        // is the local coordinator's own id (the consumedBy / consumer).
-        const result = await tokenManager.validateAndConsumeToken(
-          authMsg.token,
-          instanceId,
-          authMsg.instanceId,
-        );
+    const clientProof = decodeProof(authMsg.clientProof);
+    if (!clientProof) return rejectAuth(ws, hs, 'Invalid proof', ip, authMsg.instanceId);
+    return authMsg.mode === PeerAuthMode.enum.token
+      ? authenticateToken(ws, hs, authMsg, clientProof, ip)
+      : authenticateCredential(ws, hs, authMsg, clientProof, ip);
+  }
 
-        // Enforce role
-        if (!acceptedRoles.includes(result.routing.role)) {
-          logger.warn('Peer role mismatch', {
-            peerInstanceId: authMsg.instanceId,
-            accepted: acceptedRoles,
-            actual: result.routing.role,
-          });
-          sendEncryptedMessage(ws, sessionKey, {
-            type: 'peer.auth.response',
-            accepted: false,
-            instanceId,
-            reason: 'Role mismatch',
-          });
-          recordFailedAuth(ip, authMsg.instanceId);
-          ws.close(WS_CLOSE_UNAUTHORIZED, 'Role mismatch');
-          return null;
-        }
+  /** The client proof this request must carry for a given PSK. */
+  function expectedClientProof(
+    hs: HandshakeState,
+    authMsg: PeerAuthRequest,
+    psk: Buffer,
+    tokenRouting: string,
+  ): Buffer {
+    return computeClientProof({
+      psk,
+      transcriptHash: hs.transcriptHash,
+      mode: authMsg.mode,
+      clientInstanceId: authMsg.instanceId,
+      role: authMsg.role ?? '',
+      protocolVersion: authMsg.protocolVersion,
+      tokenRouting,
+    });
+  }
 
-        // Generate session credential
-        const credential = randomBytes(32).toString('hex');
-        const credentialHash = sha256(credential);
-
-        // Save credential to DB
-        const saveResult = await credentialStore.save({
-          instanceId: authMsg.instanceId,
-          credentialHash,
-          role: result.routing.role,
-          routingKeys: [result.routing.routingKey],
-          sourceTokenHash: result.keys.validationHash,
-        });
-
-        // A token-join issues a fresh credential and revokes the prior active
-        // one for this instanceId. Because that credential is shared across the
-        // joining orchestrator's sibling peer-clients, a revokedCount > 0 here
-        // invalidates those siblings' in-flight proofs — log it so a
-        // revoke-driven sibling cascade is visible.
-        logger.info('Peer credential issued via token join', {
-          peerInstanceId: authMsg.instanceId,
-          trigger: 'token-join',
-          revokedPriorCredentials: saveResult.revokedCount,
-        });
-
-        // Gate a worker join against the plan ceiling before accepting.
-        if (!(await admitWorkerOrReject(result.routing.role, ws, sessionKey, authMsg.instanceId)))
-          return null;
-
-        // Get local inventory for auth response
-        const inventory = getLocalInventory();
-
-        // Send auth response with credential, capabilities, and software version
-        sendEncryptedMessage(ws, sessionKey, {
-          type: 'peer.auth.response',
-          accepted: true,
-          sessionCredential: credential,
-          role: result.routing.role,
-          instanceId,
-          softwareVersion: SOFTWARE_VERSION,
-          agents: inventory.agents,
-          scalerCapacity: inventory.scalerCapacity,
-          capabilities: inventory.capabilities,
-        });
-
-        return result.routing.role;
-      } catch (err) {
-        // Idempotent mesh-join recovery: when sibling peer-clients on the
-        // same peer identity race on a single join token across a shared-DB
-        // multi-coordinator mesh, only one wins the atomic claim in
-        // validateAndConsumeToken and the rest hit "already been used".
-        // The losers are not attackers — they are the same peer trying to
-        // establish its other mesh WS connections. Verify that the peer
-        // already owns a non-revoked credential whose source_token_hash
-        // matches the presented token, and if so issue a fresh per-coord
-        // credential without re-consuming the token. Anything else
-        // (expired, unknown, parse errors, unknown instance,
-        // sourceTokenHash mismatch) falls through to the original
-        // rejection path so real replays still log the warning.
-        if (isTokenAlreadyUsedError(err)) {
-          try {
-            const parsed = parseToken(authMsg.token);
-            const presentedHash = deriveKeys(Buffer.from(parsed.secretHex, 'hex')).validationHash;
-            const existing = await credentialStore.findByInstanceId(authMsg.instanceId);
-            if (existing && !existing.revokedAt && existing.sourceTokenHash === presentedHash) {
-              // Enforce role on the recovery path too
-              if (!acceptedRoles.includes(parsed.routing.role)) {
-                logger.warn('Peer role mismatch on token retry', {
-                  peerInstanceId: authMsg.instanceId,
-                  accepted: acceptedRoles,
-                  actual: parsed.routing.role,
-                });
-                sendEncryptedMessage(ws, sessionKey, {
-                  type: 'peer.auth.response',
-                  accepted: false,
-                  instanceId,
-                  reason: 'Role mismatch',
-                });
-                recordFailedAuth(ip, authMsg.instanceId);
-                ws.close(WS_CLOSE_UNAUTHORIZED, 'Role mismatch');
-                return null;
-              }
-
-              const credential = randomBytes(32).toString('hex');
-              const credentialHash = sha256(credential);
-              const retrySave = await credentialStore.save({
-                instanceId: authMsg.instanceId,
-                credentialHash,
-                role: parsed.routing.role,
-                routingKeys: [parsed.routing.routingKey],
-                sourceTokenHash: presentedHash,
-              });
-
-              logger.info('Peer idempotent token retry accepted', {
-                peerInstanceId: authMsg.instanceId,
-                sourceTokenHash: presentedHash,
-                trigger: 'idempotent-token-retry',
-                revokedPriorCredentials: retrySave.revokedCount,
-              });
-
-              if (
-                !(await admitWorkerOrReject(
-                  parsed.routing.role,
-                  ws,
-                  sessionKey,
-                  authMsg.instanceId,
-                ))
-              )
-                return null;
-
-              const inventory = getLocalInventory();
-              sendEncryptedMessage(ws, sessionKey, {
-                type: 'peer.auth.response',
-                accepted: true,
-                sessionCredential: credential,
-                role: parsed.routing.role,
-                instanceId,
-                softwareVersion: SOFTWARE_VERSION,
-                agents: inventory.agents,
-                scalerCapacity: inventory.scalerCapacity,
-                capabilities: inventory.capabilities,
-              });
-              return parsed.routing.role;
-            }
-          } catch (recoveryErr) {
-            logger.warn('Peer token idempotent recovery failed', {
-              peerInstanceId: authMsg.instanceId,
-              error: toErrorMessage(recoveryErr),
-            });
-            // Fall through to rejection
-          }
-        }
-        logger.warn('Peer token validation failed', {
-          peerInstanceId: authMsg.instanceId,
-          error: toErrorMessage(err),
-        });
-        sendEncryptedMessage(ws, sessionKey, {
-          type: 'peer.auth.response',
-          accepted: false,
-          instanceId,
-          reason: 'Invalid token',
-        });
-        recordFailedAuth(ip, authMsg.instanceId);
-        ws.close(WS_CLOSE_UNAUTHORIZED, 'Invalid token');
-        return null;
-      }
-    } else if (authMsg.proof) {
-      // --- Credential-based auth (reconnection) ---
-      const stored = await credentialStore.findByInstanceId(authMsg.instanceId);
-
-      if (!stored) {
-        // A peer presented an HMAC proof but no active credential row exists
-        // for its instanceId: a sibling/self token-join revoked the shared
-        // credential, the credential expired, or the peer's row lives in
-        // another cluster's database. The peer deletes its credential file and
-        // falls back to its join token, or, for a coordinator without one,
-        // issues itself a new credential unless an operator revoked it.
-        logger.warn('Peer credential not found', {
-          peerInstanceId: authMsg.instanceId,
-          authPath: 'credential-proof',
-        });
-        sendEncryptedMessage(ws, sessionKey, {
-          type: 'peer.auth.response',
-          accepted: false,
-          instanceId,
-          reason: 'Unknown credential',
-        });
-        recordFailedAuth(ip, authMsg.instanceId);
-        ws.close(WS_CLOSE_UNAUTHORIZED, 'Unknown credential');
-        return null;
-      }
-
-      if (stored.revokedAt) {
-        logger.warn('Peer credential revoked', {
-          peerInstanceId: authMsg.instanceId,
-          authPath: 'credential-proof',
-          revokedAt: stored.revokedAt.toISOString(),
-        });
-        sendEncryptedMessage(ws, sessionKey, {
-          type: 'peer.auth.response',
-          accepted: false,
-          instanceId,
-          reason: 'Credential revoked',
-        });
-        recordFailedAuth(ip, authMsg.instanceId);
-        ws.close(WS_CLOSE_UNAUTHORIZED, 'Credential revoked');
-        return null;
-      }
-
-      // HMAC proof verification:
-      // proof = HMAC-SHA256(key=credentialHash_bytes, data=nonce_b64 + ':' + instanceId)
-      const nonceB64 = nonce.toString('base64');
-      const expectedProof = createHmac('sha256', Buffer.from(stored.credentialHash, 'hex'))
-        .update(nonceB64 + ':' + authMsg.instanceId)
-        .digest();
-
-      const proofBuffer = Buffer.from(authMsg.proof, 'hex');
-
-      if (
-        proofBuffer.length !== expectedProof.length ||
-        !timingSafeEqual(proofBuffer, expectedProof)
-      ) {
-        logger.warn('Peer HMAC proof invalid', {
-          peerInstanceId: authMsg.instanceId,
-          authPath: 'credential-proof',
-        });
-        sendEncryptedMessage(ws, sessionKey, {
-          type: 'peer.auth.response',
-          accepted: false,
-          instanceId,
-          reason: 'Invalid proof',
-        });
-        recordFailedAuth(ip, authMsg.instanceId);
-        ws.close(WS_CLOSE_UNAUTHORIZED, 'Invalid proof');
-        return null;
-      }
-
-      // Update last seen (track which coordinator validated)
-      await credentialStore.updateLastSeen(stored.credentialHash, instanceId);
-
-      // Gate a worker join against the plan ceiling before accepting.
-      if (!(await admitWorkerOrReject(stored.role, ws, sessionKey, authMsg.instanceId)))
-        return null;
-
-      // Get local inventory for auth response
-      const inventory = getLocalInventory();
-
-      // Send auth response with capabilities and software version
-      sendEncryptedMessage(ws, sessionKey, {
-        type: 'peer.auth.response',
-        accepted: true,
-        instanceId,
-        softwareVersion: SOFTWARE_VERSION,
-        agents: inventory.agents,
-        scalerCapacity: inventory.scalerCapacity,
-        capabilities: inventory.capabilities,
-      });
-
-      return stored.role;
-    } else {
-      // Neither token nor proof provided
-      logger.warn('Peer auth request missing token and proof', {
+  /** Credential mode: the PSK is the stored credential hash for the peer's instance id. */
+  async function authenticateCredential(
+    ws: PeerWsLike,
+    hs: HandshakeState,
+    authMsg: PeerAuthRequest,
+    clientProof: Buffer,
+    ip: string,
+  ): Promise<AcceptedAuth | null> {
+    const stored = await credentialStore.findByInstanceId(authMsg.instanceId);
+    if (!stored) {
+      // No active credential row exists for this instanceId: a sibling/self
+      // token-join revoked the shared credential, the credential expired, or
+      // the peer's row lives in another cluster's database. The peer deletes
+      // its credential file and falls back to its join token, or, for a
+      // coordinator without one, issues itself a new credential unless an
+      // operator revoked it.
+      logger.warn('Peer credential not found', {
         peerInstanceId: authMsg.instanceId,
+        authPath: 'credential-proof',
       });
-      sendEncryptedMessage(ws, sessionKey, {
-        type: 'peer.auth.response',
-        accepted: false,
-        instanceId,
-        reason: 'Missing auth method',
+      return rejectAuth(ws, hs, 'Unknown credential', ip, authMsg.instanceId);
+    }
+
+    if (stored.revokedAt) {
+      logger.warn('Peer credential revoked', {
+        peerInstanceId: authMsg.instanceId,
+        authPath: 'credential-proof',
+        revokedAt: stored.revokedAt.toISOString(),
       });
-      recordFailedAuth(ip, authMsg.instanceId);
-      ws.close(WS_CLOSE_UNAUTHORIZED, 'Missing auth method');
+      return rejectAuth(ws, hs, 'Credential revoked', ip, authMsg.instanceId);
+    }
+
+    const psk = Buffer.from(stored.credentialHash, 'hex');
+    if (!proofMatches(expectedClientProof(hs, authMsg, psk, ''), clientProof)) {
+      logger.warn('Peer credential proof invalid', {
+        peerInstanceId: authMsg.instanceId,
+        authPath: 'credential-proof',
+      });
+      return rejectAuth(ws, hs, 'Invalid proof', ip, authMsg.instanceId);
+    }
+
+    // Update last seen (track which coordinator validated)
+    await credentialStore.updateLastSeen(stored.credentialHash, instanceId);
+
+    // Gate a worker join against the plan ceiling before accepting.
+    if (!(await admitWorkerOrReject(stored.role, ws, hs.handshakeKey, authMsg.instanceId))) {
       return null;
     }
+    return acceptAuth(ws, hs, {
+      psk,
+      clientProof,
+      grantedRole: stored.role,
+      sessionCredential: null,
+    });
+  }
+
+  /**
+   * Token mode: the peer sends its token's routing segment, never the token.
+   * The routing fields select candidate rows, the proof selects the row (its
+   * token hash is the PSK), and the role and routing key come from that row.
+   */
+  async function authenticateToken(
+    ws: PeerWsLike,
+    hs: HandshakeState,
+    authMsg: PeerAuthRequest,
+    clientProof: Buffer,
+    ip: string,
+  ): Promise<AcceptedAuth | null> {
+    const routingB64 = authMsg.tokenRouting;
+    if (!routingB64) return rejectAuth(ws, hs, 'Invalid token', ip, authMsg.instanceId);
+    let claimedRouting: JoinRoutingClaim;
+    try {
+      claimedRouting = decodeJoinRouting(routingB64);
+    } catch {
+      return rejectAuth(ws, hs, 'Invalid token', ip, authMsg.instanceId);
+    }
+
+    let checked = 0;
+    const resolved = await tokenManager.resolveLiveTokenByRouting(claimedRouting, (tokenHash) => {
+      checked += 1;
+      if (checked > MAX_TOKEN_CANDIDATES) return false;
+      return proofMatches(
+        expectedClientProof(hs, authMsg, Buffer.from(tokenHash, 'hex'), routingB64),
+        clientProof,
+      );
+    });
+    if (resolved.status !== ResolvedJoinTokenStatus.enum.live) {
+      logger.warn('Peer token proof matched no live join token', {
+        peerInstanceId: authMsg.instanceId,
+        status: resolved.status,
+      });
+      return rejectAuth(ws, hs, 'Invalid token', ip, authMsg.instanceId);
+    }
+
+    const grant = await claimTokenGrant(resolved.tokenHash, authMsg.instanceId);
+    if (!grant) return rejectAuth(ws, hs, 'Invalid token', ip, authMsg.instanceId);
+    if (!acceptedRoles.includes(grant.role)) {
+      logger.warn('Peer role mismatch', {
+        peerInstanceId: authMsg.instanceId,
+        accepted: acceptedRoles,
+        actual: grant.role,
+        trigger: grant.trigger,
+      });
+      return rejectAuth(ws, hs, 'Role mismatch', ip, authMsg.instanceId);
+    }
+
+    const credential = randomBytes(32).toString('hex');
+    const saveResult = await credentialStore.save({
+      instanceId: authMsg.instanceId,
+      credentialHash: sha256(credential),
+      role: grant.role,
+      routingKeys: [grant.routingKey],
+      sourceTokenHash: resolved.tokenHash,
+    });
+
+    // A token-join issues a fresh credential and revokes the prior active one
+    // for this instanceId. Because that credential is shared across the
+    // joining orchestrator's sibling peer-clients, a revokedCount > 0 here
+    // invalidates those siblings' in-flight proofs — log it so a
+    // revoke-driven sibling cascade is visible.
+    logger.info(
+      grant.trigger === 'token-join'
+        ? 'Peer credential issued via token join'
+        : 'Peer idempotent token retry accepted',
+      {
+        peerInstanceId: authMsg.instanceId,
+        trigger: grant.trigger,
+        tokenFingerprint: tokenFingerprint(resolved.tokenHash),
+        revokedPriorCredentials: saveResult.revokedCount,
+      },
+    );
+
+    // Gate a worker join against the plan ceiling before accepting.
+    if (!(await admitWorkerOrReject(grant.role, ws, hs.handshakeKey, authMsg.instanceId))) {
+      return null;
+    }
+    return acceptAuth(ws, hs, {
+      psk: Buffer.from(resolved.tokenHash, 'hex'),
+      clientProof,
+      grantedRole: grant.role,
+      sessionCredential: credential,
+    });
+  }
+
+  /**
+   * Claim the token row, or recover a sibling client's retry on a token this
+   * peer already consumed. Role and routing key always come from the row.
+   */
+  async function claimTokenGrant(
+    tokenHash: string,
+    peerInstanceId: string,
+  ): Promise<TokenGrant | null> {
+    try {
+      // Atomic claim: one UPDATE..WHERE consumed_at IS NULL wins across the
+      // shared-DB mesh, so multiple coordinators never each issue a credential
+      // for the same instanceId off one join token. The joining peer's
+      // instanceId is recorded as consumed_by_instance, so the same peer can
+      // prove its still-valid token again after losing its credential and
+      // self-heal without a redeploy. `instanceId` is this coordinator's id.
+      const row = await tokenManager.claimByHash(tokenHash, instanceId, peerInstanceId);
+      return { role: row.role, routingKey: row.routing.routingKey, trigger: 'token-join' };
+    } catch (err) {
+      if (!isTokenAlreadyUsedError(err)) {
+        logger.warn('Peer token validation failed', {
+          peerInstanceId,
+          tokenFingerprint: tokenFingerprint(tokenHash),
+          error: toErrorMessage(err),
+        });
+        return null;
+      }
+    }
+    // Idempotent mesh-join recovery: sibling peer-clients of one joining peer
+    // race on its token, and only one wins the claim. The losers are the same
+    // peer establishing its other mesh connections, so they get a fresh
+    // credential when the peer already owns an unrevoked one issued from this
+    // token. Anything else falls through to the rejection.
+    const existing = await credentialStore.findByInstanceId(peerInstanceId);
+    if (!existing || existing.revokedAt || existing.sourceTokenHash !== tokenHash) {
+      logger.warn('Peer token was already used by another instance', {
+        peerInstanceId,
+        tokenFingerprint: tokenFingerprint(tokenHash),
+      });
+      return null;
+    }
+    const row = await tokenManager.readByHash(tokenHash);
+    if (!row) return null;
+    return {
+      role: row.role,
+      routingKey: row.routing.routingKey,
+      trigger: 'idempotent-token-retry',
+    };
   }
 
   /**

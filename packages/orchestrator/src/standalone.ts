@@ -51,8 +51,13 @@ const otelSdk = initTelemetry({
 });
 
 const { loadConfig } = await import('./config.js');
-const { PeerClient, PeerAuthCoordinator, coordinatorSelfIssuer } =
-  await import('./cluster/index.js');
+const {
+  PeerClient,
+  PeerDialOrigin,
+  PeerAuthCoordinator,
+  coordinatorSelfIssuer,
+  coordinatorRejectionCorroborator,
+} = await import('./cluster/index.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
 const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
 const { ContextStore } = await import('./contexts/context-store.js');
@@ -60,7 +65,14 @@ const { VariableStore } = await import('./contexts/variable-store.js');
 const { createIndependentApprovalExtras } = await import('./approvals/independent-wiring.js');
 
 import type { OrchestratorHooks } from './orchestrator-core.js';
+import { OrchestratorMode } from '@kici-dev/engine';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
+import {
+  DEFAULT_ORG_SEGMENT,
+  WebhookUrlNote,
+  resolveListedGithubIngressUrl,
+  resolveManifestGithubWebhookUrl,
+} from './sources/webhook-url-resolvers.js';
 import { runDetached } from './helpers/run-detached.js';
 import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
 import { answerScalerOrphansRequest } from './scaler/orphan-requests.js';
@@ -146,6 +158,11 @@ await guardStartup(logger, async () => {
               agentMaxReconnectDelayMs: config.agentMaxReconnectDelayMs,
               clusterInstanceHeartbeatMs: config.clusterInstanceHeartbeatMs,
             }),
+        // Any dialled endpoint can send a rejection; the coordinator's own database
+        // decides whether the credential file goes.
+        corroborateRejection: config.cluster.singleNode
+          ? undefined
+          : coordinatorRejectionCorroborator({ db: sub.db, instanceId: config.instanceId }),
       });
 
       // Create PeerClient instances for statically configured peers
@@ -153,6 +170,7 @@ await guardStartup(logger, async () => {
         const peerUrl = peerAddr.replace(/^https?:\/\//, 'ws://') + '/ws/peer';
         const client = new PeerClient({
           url: peerUrl,
+          origin: PeerDialOrigin.Static,
           joinToken: config.cluster.joinToken,
           credentialFile: peerCredentialFile,
           authCoordinator: peerAuthCoordinator,
@@ -267,24 +285,32 @@ await guardStartup(logger, async () => {
             sourceId: string;
           }) => {
             if (params.provider !== 'github') {
-              return { webhookUrl: null, webhookNote: 'unsupported-provider' };
+              return { webhookUrl: null, webhookNote: WebhookUrlNote.enum['unsupported-provider'] };
             }
             const source = await sub.sourceStore?.getSourceById(params.sourceId);
-            const orgId = source?.customer_id ?? '__default__';
+            const orgId = source?.customer_id ?? DEFAULT_ORG_SEGMENT;
             const url = buildLocalGithubIngressUrl(config.webhookPublicUrl, orgId, params.sourceId);
-            return url ? { webhookUrl: url } : { webhookUrl: null, webhookNote: 'no-public-url' };
+            return url
+              ? { webhookUrl: url }
+              : { webhookUrl: null, webhookNote: WebhookUrlNote.enum['no-public-url'] };
           },
-          // Manifest setup pre-flight: the org-scoped GitHub webhook URL is
-          // resolvable locally once a public base is configured. Independent
-          // mode has no central org, so an App-level manifest is org-scoped by
-          // the operator-provided org id when one is known; absent that we
-          // return an honest note rather than a fabricated URL.
-          resolveGithubWebhookUrl: async () => {
-            if (!config.webhookPublicUrl) {
-              return { webhookUrl: null, webhookNote: 'no-public-url' };
-            }
-            return { webhookUrl: null, webhookNote: 'org-not-identified' };
-          },
+          // Manifest pre-flight: the org-scoped direct route URL under the
+          // `__default__` org segment the per-source URL already uses.
+          resolveGithubWebhookUrl: async () =>
+            resolveManifestGithubWebhookUrl({
+              mode: OrchestratorMode.enum.independent,
+              webhookPublicUrl: config.webhookPublicUrl,
+              orgId: undefined,
+              platformGithubWebhookUrl: undefined,
+            }),
+          // `source list` ingress URL: the org segment is the source's own org.
+          resolveSourceIngressUrl: (row: { id: string; customerId: string | null }) =>
+            resolveListedGithubIngressUrl({
+              mode: OrchestratorMode.enum.independent,
+              webhookPublicUrl: config.webhookPublicUrl,
+              orgId: row.customerId || DEFAULT_ORG_SEGMENT,
+              sourceId: row.id,
+            }),
 
           // Dispatch-time context resolution (variables + scoped secrets) for
           // independent mode is opt-in via KICI_INDEPENDENT_SECRETS. When on

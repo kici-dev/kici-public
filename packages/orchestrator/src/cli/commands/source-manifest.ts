@@ -28,6 +28,7 @@ import {
 import { manifestCreateUrl } from '../../providers/github/manifest-form.js';
 import { startManifestLoopback, type ManifestLoopback } from '../loopback-callback.js';
 import { openBrowserBestEffort } from '../open-browser.js';
+import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
 
 /** Static marketing-site page the CLI points at in headless paste-code mode. */
 const STATIC_CALLBACK_URL = 'https://kici.dev/gh-manifest-callback';
@@ -44,9 +45,9 @@ export interface ManifestSetupOptions {
   githubOrg?: string;
   /**
    * Self-hosted webhook URL override. When set, it is baked verbatim into the
-   * App manifest's `hook_attributes.url` and the platform-mode webhook-URL
-   * resolution is skipped — so the flow works even where the auto-resolved KiCI
-   * platform URL is unavailable. KiCI adds no ingress at this URL; the operator
+   * App manifest's `hook_attributes.url` instead of the URL the orchestrator
+   * resolves for its mode — so the flow works even where that URL is
+   * unavailable. KiCI adds no ingress at this URL; the operator
    * owns delivery. Advanced/self-hosted only.
    */
   webhookUrl?: string;
@@ -98,9 +99,8 @@ async function resolveWebhookUrl(client: AdminApiClient): Promise<string> {
   );
   if (!pre.webhookUrl) {
     throw new Error(
-      `Cannot resolve the GitHub webhook URL${pre.webhookNote ? ` (${pre.webhookNote})` : ''}. ` +
-        'The manifest flow needs it to configure the App. Ensure the orchestrator is connected ' +
-        'to the Platform and has identified its org, then retry.',
+      `Cannot resolve the webhook URL for the new GitHub App: ${webhookNoteReason(pre.webhookNote)}. ` +
+        webhookNoteHint(pre.webhookNote),
     );
   }
   return pre.webhookUrl;
@@ -179,8 +179,8 @@ export async function runGithubManifestSetup(
 ): Promise<void> {
   // 1. Resolve the webhook URL BEFORE creating anything on GitHub. An explicit
   //    --webhook-url is the operator asserting "I own delivery": it is used
-  //    verbatim and decouples the flow from platform-mode URL resolution (so it
-  //    works even where the auto-resolved platform URL is unavailable).
+  //    verbatim instead of the URL the orchestrator resolves for its mode (so it
+  //    works even where that URL is unavailable).
   const webhookUrl = opts.webhookUrl
     ? validateWebhookUrl(opts.webhookUrl)
     : await resolveWebhookUrl(client);

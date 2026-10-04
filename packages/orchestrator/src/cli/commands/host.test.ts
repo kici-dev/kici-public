@@ -29,6 +29,7 @@ vi.mock('../../agent/host-roster.js', async (importActual) => {
 });
 
 const { registerHostCommands } = await import('./host.js');
+const { HostWriteAuthority } = await import('../../agent/host-roster.js');
 
 async function runCommand(
   args: string[],
@@ -106,6 +107,58 @@ describe('kici-admin host', () => {
     ]);
     const { stdout } = await runCommand(['host', 'list']);
     expect(stdout).toContain('unreachable');
+  });
+
+  it('host declare passes operator authority and reserved --prop keys', async () => {
+    // fails-when: the CLI omits the authority, so the store refuses kici: keys and existing hosts.
+    mockDeclareStatic.mockResolvedValue({ created: true });
+    await runCommand([
+      'host',
+      'declare',
+      '--agent-id',
+      'db-01',
+      '--prop',
+      'kici:agent-restart-start=systemctl --user start kici-agent',
+    ]);
+    expect(mockDeclareStatic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authority: HostWriteAuthority.operator,
+        properties: { 'kici:agent-restart-start': 'systemctl --user start kici-agent' },
+      }),
+    );
+  });
+
+  it('host declare without --labels keeps the stored labels (passes none to the store)', async () => {
+    // fails-when: --labels defaults to '' and reaches the store as [], wiping the
+    // labels of an existing host an operator only adds --prop keys to.
+    mockDeclareStatic.mockResolvedValue({ created: false });
+    await runCommand(['host', 'declare', '--agent-id', 'db-01', '--prop', 'region=eu']);
+    expect(mockDeclareStatic.mock.calls[0]![0]).toMatchObject({ labels: undefined });
+  });
+
+  it('host declare with --labels passes the parsed list', async () => {
+    // breaks-if-wrong: an explicit label list must still reach the store.
+    mockDeclareStatic.mockResolvedValue({ created: true });
+    await runCommand(['host', 'declare', '--agent-id', 'db-01', '--labels', 'role:db, region:eu']);
+    expect(mockDeclareStatic.mock.calls[0]![0]).toMatchObject({ labels: ['role:db', 'region:eu'] });
+  });
+
+  it('host list shows the identity source column', async () => {
+    mockListAll.mockResolvedValue([
+      {
+        agent_id: 'p-01',
+        lifecycle_class: 'static',
+        connected_instance_id: null,
+        last_seen: new Date(),
+        labels: '[]',
+        hostname: null,
+        identity_source: 'platform',
+      },
+    ]);
+    const { stdout } = await runCommand(['host', 'list']);
+    expect(stdout).toContain('Source');
+    expect(stdout).toMatch(/Labels \| Source/);
+    expect(stdout).toMatch(/^p-01 \| static \| unreachable \| .* \| platform$/m);
   });
 
   it('host list --json emits JSON', async () => {
@@ -264,6 +317,10 @@ describe('host declare/remove access-log', () => {
 
   it('records fleet.host.remove on remove', async () => {
     await runCommand(['host', 'remove', '--agent-id', 'agent-1']);
+    // fails-when: the CLI removes under the store's Platform default.
+    expect(mockRemoveStatic).toHaveBeenCalledWith('agent-1', {
+      authority: HostWriteAuthority.operator,
+    });
     expect(mockRecordOnDb).toHaveBeenCalledTimes(1);
     const entry = mockRecordOnDb.mock.calls[0][1];
     expect(entry.action).toBe('fleet.host.remove');

@@ -1,5 +1,5 @@
 #!/bin/sh
-# /init -- PID 1 inside Firecracker VM
+# /init -- PID 1 inside the Firecracker VM until it execs tini
 # Networking is configured by the kernel via boot_args (ip=...).
 #
 # build-agent-rootfs.sh installs this file as /init on every agent injection,
@@ -215,5 +215,16 @@ log "========================="
   done
 ) &
 
-log "Starting KiCI agent..."
-exec /usr/local/bin/node /opt/kici/agent.js
+# tini is PID 1 from here on, and runs the agent as its child. Node never
+# reaps a process it did not spawn, so an agent running as PID 1 would keep
+# every orphan a step leaves as a zombie, and a killed step's process group
+# would read as alive. tini reaps them, and forwards SIGTERM, SIGINT (a
+# SendCtrlAltDel reaches PID 1 as SIGINT) and SIGUSR1 (drain) to the agent.
+# The agent injection installs tini together with this /init.
+TINI=/usr/local/bin/tini
+if [ ! -x "$TINI" ]; then
+  log "FATAL: $TINI is missing; refresh the image with build-agent-rootfs.sh --agent-only"
+  exit 1
+fi
+log "Starting KiCI agent under tini..."
+exec "$TINI" -- /usr/local/bin/node /opt/kici/agent.js

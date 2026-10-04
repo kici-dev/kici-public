@@ -55,6 +55,7 @@ import { gcStaleAgentTmpDirs } from './execution/tmp-gc.js';
 import { issueReboot } from './execution/reboot.js';
 import { decideIdleShutdown } from './idle-shutdown.js';
 import { agentToolRequirements } from './required-tools.js';
+import { pidOneWarning } from './pid-one.js';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // Workspace dep fingerprints power the SDK drift diagnostic: compare the agent's
@@ -583,6 +584,11 @@ await guardStartup(logger, async () => {
   if (Object.keys(envProbes).length > 0) {
     logger.info('Agent startup env probes (diagnostic)', envProbes);
   }
+
+  // Emitted after the WS transport is attached, like the env probes, so the
+  // warning reaches the orchestrator log.
+  const pidOne = pidOneWarning(process.pid);
+  if (pidOne) logger.warn(pidOne);
 
   // 7. Connect to orchestrator
   client.connect();

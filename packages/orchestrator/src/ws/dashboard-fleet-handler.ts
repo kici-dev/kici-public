@@ -2,8 +2,9 @@
  * Orchestrator-side handlers for the fleet-management read path (P2).
  *
  * Each handler answers one Platform->orchestrator read-relay request from
- * `HostRosterStore`, returning the canonical `HostInventoryEntry` shape on the
- * wire. The handlers are pure (they take their dependencies as arguments) so
+ * `HostRosterStore`. The roster reads return `FleetHostEntry` (the canonical
+ * `HostInventoryEntry` plus `confirmed`) so the dashboard can show hosts
+ * declared from the dashboard that no agent or operator confirmed yet. The handlers are pure (they take their dependencies as arguments) so
  * the WS wiring in `server.ts` stays a thin adapter and the logic is unit
  * testable without a live DB / Platform connection.
  */
@@ -42,12 +43,12 @@ export interface FleetHandlerDeps {
   registrationStore: RegistrationStore;
 }
 
-/** Roster: every declared/live host as a `HostInventoryEntry`. */
+/** Roster: every host, unconfirmed placeholders included, flagged `confirmed`. */
 export async function handleFleetHostsRequest(
   deps: FleetHandlerDeps,
   requestId: string,
 ): Promise<DashboardFleetHostsResponse> {
-  const hosts = await deps.rosterStore.queryInventory(undefined, deps.rosterGraceMs);
+  const hosts = await deps.rosterStore.listFleetHosts(deps.rosterGraceMs);
   return { type: 'dashboard.fleet.hosts.response', requestId, hosts };
 }
 
@@ -57,7 +58,7 @@ export async function handleFleetHostRequest(
   requestId: string,
   agentId: string,
 ): Promise<DashboardFleetHostResponse> {
-  const host = await deps.rosterStore.getInventory(agentId, deps.rosterGraceMs);
+  const host = await deps.rosterStore.getFleetHost(agentId, deps.rosterGraceMs);
   const runRows = await deps.db
     .selectFrom('execution_jobs')
     .innerJoin('execution_runs', 'execution_runs.run_id', 'execution_jobs.run_id')
@@ -151,8 +152,10 @@ export async function handleFleetWorkflowsForHostRequest(
   requestId: string,
   agentId: string,
 ): Promise<DashboardFleetWorkflowsForHostResponse> {
-  const entry = await deps.rosterStore.getInventory(agentId, deps.rosterGraceMs);
-  if (!entry) {
+  const entry = await deps.rosterStore.getFleetHost(agentId, deps.rosterGraceMs);
+  // An unconfirmed host is never a fan-out target (findFanoutTargets skips it),
+  // so it lists no fan-outs.
+  if (!entry || !entry.confirmed) {
     return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
   }
   // Mirrors `findFanoutTargets`, the resolver the dispatcher and the preview
@@ -160,7 +163,7 @@ export async function handleFleetWorkflowsForHostRequest(
   // target, so no workflow fans out to it however well its labels match.
   // Without this the host page would name fan-outs no run ever produces.
   // The flag is read off the roster row rather than `entry` because
-  // `HostInventoryEntry` is the SDK-facing `ctx.kici.inventory` shape.
+  // `FleetHostEntry` extends the SDK-facing `ctx.kici.inventory` shape.
   const row = await deps.rosterStore.get(agentId);
   if (row?.scaler_managed) {
     return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
