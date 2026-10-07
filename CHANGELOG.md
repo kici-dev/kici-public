@@ -2,6 +2,57 @@
 
 Release notes for the public KiCI packages.
 
+## v0.16.0 — 2026-10-07
+
+### Features
+
+- Breaking: the orchestrator accepts only lock files compiled at schema v42 or newer, and every lock must carry `minReaderVersion` — recompile with `kici compile` and push. `kici login` no longer takes `--token`: log in with the browser or `--device` flow, or write a personal access token to the CLI config. The CLI ignores a `token` key in its config and no longer reads `endpoint` as the Platform URL. A local dev plane created by an earlier release is recreated once. `@kici-dev/compiler` no longer exports `CapabilityGapError`, `formatCapabilityGapError` or `CapabilityGapInfo`. When no runs match, `kici runs list` now fails with an error if it cannot read the recent webhook activity, instead of printing `No runs found.`
+- Breaking: the wire protocol is version 4. The Platform, orchestrators, agents and cluster peers refuse a connection from any release before it (protocol 3), so upgrade the orchestrator, its agents and its cluster peers in the same window. The orchestrator no longer refuses an organization-wide workflow with a `needs` generator up front when its init-runner agents lack a capability. The evaluation waits for an agent with the `kici:agent-feature:global-eval-skips-result-aware` label, and fails at the wait ceiling if none arrives. The `kici_orch_ws_platform_capability_gap_total` metric is removed.
+- Breaking: the orchestrator refuses KICI_CLUSTER_COORDINATOR_URL (set the comma-separated KICI_CLUSTER_COORDINATOR_URLS instead) and the unused KICI_STORAGE_PATH at boot, and a KICI_PROVIDERS_GITHUB_* variable no longer maps to a config path on reload.
+- Breaking: a scaler pool declares its platform with the structured platform field. A plain platform label (windows, macos, arm64, …) without it is refused when the scaler config loads, and resources takes only the { requests, limits } form.
+- Breaking: every kici-admin command selects the org with --org. The --customer-id and --org-id spellings are removed, and dashboard-writes set --op takes only permissive, encrypted or disabled (the true/false sugar is removed).
+- Breaking: kici-admin cache purge-legacy and kici-admin secret fix-prefixed-scopes are removed. Remove objects under the retired cache layouts with a bucket lifecycle rule.
+- Breaking: a <context>:<key> secret reference resolves only through a scope bound to the context; the scope named after the context is no longer read. /health on the orchestrator and the agent, and kici-admin orchestrator/agent status --json, no longer report buildCommit.
+- Breaking: a database upgrade rewrites stored legacy run statuses and hold types, and the trust-policy approval window is set in seconds. kici-admin trust-policy set takes --approval-expiry <duration> (for example 72h or 30m) in place of --approval-expiry-hours and --approval-expiry-seconds, and the dashboard takes the same duration. The Platform trust-policy API (GET and PUT /api/v1/orgs/:customerId/trust-policy) and the orchestrator admin trust-policy API no longer accept or return approvalExpiryHours: send approvalExpirySeconds.
+- Breaking: the dashboard API serves context edits, secrets, secret backends, the event DLQ and global-workflow settings only under /orgs/:customerId/orchestrators/:clusterName/. The organization-level copies of those routes are removed. The organization-level context list and delete, the workflow registration routes and the held-run routes stay.
+- Breaking: the hosted Platform no longer publishes a provenance issuer, so attestation bundles it signed no longer verify. Verify against your configured orchestrator, or the issuer you pass with --trust-root. The auth.success message no longer carries provenanceIssuer.
+- Breaking: kici verify-attestation with no --trust-root and no configured orchestrator now exits 1 and names both remedies, instead of falling back to the hosted Platform's issuer.
+- kici-admin db schema-diff compares an orchestrator database with the schema the installed release expects, and exits 2 on any difference.
+- kici-admin org list prints every org id the orchestrator holds data for, and the data that names each one (--json; --database-url reads the database directly). kici-admin orchestrator status prints the Platform org of an attached orchestrator when an admin token is set. The org-id help of the secret, context, variable and remote-source commands points at kici-admin org list.
+- Breaking: kici-admin's default --url is now http://localhost:4000, the orchestrator's default port; pass --url to reach another address.
+- Breaking: db check-schema exits 1 instead of 2 when it cannot read the database, and its --json output carries a kind field. kici-admin db migrate gains --database-url, which migrates a database directly without a running orchestrator.
+- kici-admin scaler reload applies a scalers.yaml edit on the orchestrator it points at and every orchestrator connected to it, or on that one only with --single, and prints what changed or why the file was refused.
+
+### Fixes
+
+- A job that a cluster worker dispatches now waits for a concurrency slot as long as the cluster's concurrency_wait_timeout_ms setting allows. Before, the agent used its own KICI_CONCURRENCY_WAIT_TIMEOUT_MS value for such a job.
+- A routing key with no registered source no longer borrows another GitHub App's bundle; only a provider-wide default bundle stands in for it.
+- A re-run that reaches the Platform only through the orchestrator's reconnect replay now records its original run, so it shows in the re-run list of the run it re-runs.
+- The orchestrator admin trust-policy API now refuses an approval window longer than one year, the bound kici-admin and the Platform already applied.
+- The MCP approve_run and reject_run tools now find a remote run's held approval. The relay carried no organization, so the orchestrator looked the hold up under its own connection organization and missed a hold recorded under the run's organization.
+- The dashboard attestation detail page now verifies a bundle against the issuer of the orchestrator that signed it, the same issuer the attestation lists use.
+- The scaler no longer provisions a second agent for a job whose first agent is still being provisioned or has not yet taken the job. The pending-job re-offer skips such a job on every coordinator, so an event scaler without maxAgents no longer requests two cloud runners for one job.
+- When kici-admin cannot reach its built-in default address, the error now says to set KICI_ADMIN_URL or pass --url to reach another orchestrator.
+- kici-admin db check-schema no longer reports a content hash mismatch for a database the orchestrator migrated itself: the migration content hash ignores the identifier renames that differ between the CLI and the orchestrator bundle.
+- A coordinator whose previous credential and its replacement were revoked in the same millisecond now reads the newer one when it decides whether its credential was retired or revoked.
+- kici-admin cold-store list-chunks, verify-chunk, peek-chunk, replay-chunk and reconcile now find chunks archived under a cold-retention bucket (access_log, secret_audit_log), which they previously skipped or could not address.
+- kici-admin cold-store reconcile now rebuilds the run-id index of a manifest it recreates, so rerunning an archived run finds a chunk whose manifest reconcile rebuilt.
+- kici-admin cold-store reconcile orders numeric row ids the way the archiver does, so it no longer rejects a chunk with numeric ids as possibly tampered.
+- kici-admin org-settings show prints (cluster default) for an override the orchestrator does not report, and (not reported) for any other setting it does not report, instead of 'undefined'. It no longer fails when the sandbox capability list is absent.
+- A `kici run remote` run of a workflow with only dynamic jobs is now marked as a local working-tree run, and its row records the secret context, trust context and test-run stamp like any other run.
+- kici-admin config reload reports the scaler config's own reload outcome in a scaler field, so a refused scalers.yaml no longer looks like a plain success.
+- A worker-role orchestrator reloads its scaler config on SIGHUP instead of exiting.
+- The orchestrator readiness check (`/ready`) no longer reports the database as down for a moment after a PostgreSQL failover.
+
+### Documentation
+
+- The activity and audit-log docs no longer claim that the old organization audit-log URL redirects to the activity page; that URL is gone.
+- The upgrade and rollback guide no longer says migrations are forward-only: it names kici-admin db migrate --to for a schema rollback.
+
+### Other
+
+- Deprecated: kici-admin cold-store reconcile --confirm-cleanup never had an effect. It is still accepted, now prints a deprecation notice, and is removed in v1.0.0.
+
 ## v0.15.0 — 2026-10-04
 
 ### Features

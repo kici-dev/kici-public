@@ -1284,8 +1284,7 @@ export interface HeldRunsTable {
   /**
    * Hold type — an engine `HoldType` member ('reviewer' | 'timer' |
    * 'concurrency' | 'security'). Stays `string` so a row written by a
-   * different orchestrator version is never rejected; read it through
-   * `normalizePersistedHoldType`.
+   * different orchestrator version is never rejected.
    */
   hold_type: string;
   /** Hold status: 'pending' | 'approved' | 'rejected' | 'expired' | 'released' */
@@ -1316,7 +1315,8 @@ export interface HeldRunsTable {
   trigger_source: Generated<string>;
   /**
    * Normalized `ApprovalRequirement` (clauses + expiresAt + reason) the hold
-   * must satisfy. Null for legacy rows that predate the approval model.
+   * must satisfy. Null for a hold with no requirement: security, wait and queue
+   * holds, which `security-hold-check.ts` tells apart on this column.
    */
   approval_requirement: ColumnType<
     ApprovalRequirement | null,
@@ -2250,25 +2250,8 @@ export interface OrgTrustPolicyTable {
   customer_id: string;
   /** How to treat a pull request opened from a fork: ignore | hold | allow */
   fork_policy: string;
-  /**
-   * The coarse, hours-granularity view of the security-hold window.
-   *
-   * Retained and always written, because it is the only window an older peer or
-   * CLI can read. This build derives it from `approval_expiry_seconds` on every
-   * write (rounded up, never below 1), so the two columns cannot disagree.
-   */
-  approval_expiry_hours: number;
-  /**
-   * How long a security hold stays approvable before it expires, in seconds —
-   * the authoritative window, and the only granularity that can express a
-   * sub-hour hold.
-   *
-   * Nullable: NULL means no seconds value was ever written (a row predating the
-   * column, or one written by an older build), and every reader falls back to
-   * `approval_expiry_hours * 3600`. Same convention as
-   * `contexts.hold_expiry_seconds`.
-   */
-  approval_expiry_seconds: ColumnType<number | null, number | null | undefined, number | null>;
+  /** How long a security hold stays approvable before it expires, in seconds. */
+  approval_expiry_seconds: number;
   /** Which side last wrote this row: platform | local */
   source: string;
   /** When this policy was last written */

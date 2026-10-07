@@ -18,16 +18,13 @@ import type { JobDispatch, LogStream, ChangedFilesStatus } from '@kici-dev/engin
 import type { DynamicJobNeed, RepoInfo, EventPayload } from '@kici-dev/sdk';
 import { buildNeedsContext } from '@kici-dev/sdk/internal';
 import type { $ as Shell } from 'zx';
-import { gitClone, type GitAuth } from '../checkout/git-clone.js';
+import { gitClone } from '../checkout/git-clone.js';
 import { computeChangedFiles, type ChangedFilesResult } from '../checkout/changed-files.js';
 import { repoIdentifierFromUrl } from './global-workflow-env.js';
 import { makeStreamingZxLog } from './streaming-zx-log.js';
 import type { FilterEvalInput } from './init-runner.js';
 import type { GlobalEvalRoundJobConfig } from './global-eval-types.js';
 import { globalWorkspaceLayout } from './job-workspace-layout.js';
-
-export const DEFAULT_GLOBAL_EVAL_ROUND_TIMEOUT_MS = 120_000;
-export const DEFAULT_GLOBAL_EVAL_CANDIDATE_TIMEOUT_MS = 20_000;
 
 /** The workflow-repository fields a global workflow's evaluation job carries in its config. */
 export type GlobalWorkflowRepoFields = Pick<
@@ -89,12 +86,7 @@ export async function resolveEvalChangedFiles(
   }
   // Same auth chain the source clone used (its own credentials were ephemeral).
   const sourceAuth = dispatch.sourceAuth ?? dispatch.workflowAuth;
-  const auth: GitAuth | undefined =
-    sourceAuth ??
-    (dispatch.token
-      ? { kind: 'basic', user: 'x-access-token', secret: dispatch.token }
-      : undefined);
-  return computeChangedFiles(sourceDir, event as EventPayload, auth);
+  return computeChangedFiles(sourceDir, event as EventPayload, sourceAuth);
 }
 
 /**
@@ -143,7 +135,6 @@ export async function ensureFilterSourceDir(
     sha: dispatch.sha,
     workDir: sourceDir,
     gitAuth: sourceAuth,
-    token: sourceAuth ? undefined : dispatch.token,
   });
   return sourceDir;
 }

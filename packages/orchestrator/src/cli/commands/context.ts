@@ -37,10 +37,14 @@ import type { ContextRow, ShowContextResult, SeedContextResult } from '@kici-dev
 import { MinimumTrustSchema, type MinimumTrust } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
 import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  parseIntOption,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+} from './shared/cli-action.js';
+import { ORG_ID_HELP, ORG_LIST_HINT } from './shared/org-id.js';
 
 function parseJsonOption(raw: string | undefined, label: string): unknown | undefined {
   if (raw === undefined) return undefined;
@@ -96,15 +100,6 @@ function parseMinimumTrustOption(raw: string | undefined): MinimumTrust | undefi
 export function parseEnabledOption(raw: string | undefined): boolean | undefined {
   if (raw === undefined) return undefined;
   return raw !== 'false';
-}
-
-function parseIntOption(raw: string | undefined, label: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || Math.floor(n) !== n) {
-    throw new Error(`${label}: must be an integer (got "${raw}")`);
-  }
-  return n;
 }
 
 /**
@@ -204,7 +199,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
   env
     .command('create')
     .description('Upsert a context (idempotent by org+name)')
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--name <name>', 'Context name')
     .option('--type <t>', 'Context type (fixed|glob|template)', 'fixed')
     .option(
@@ -224,10 +219,10 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--wait-timer <seconds>', 'Wait timer before release (seconds)')
     .option('--hold-expiry <seconds>', 'Hold expiry TTL (seconds)')
     .option('--minimum-trust <level>', 'Minimum trust (trusted)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         if (opts.type === 'glob' && !opts.globPattern) {
           throw new Error('--type glob requires --glob-pattern <pattern>');
         }
@@ -273,17 +268,14 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           dbUrl,
           client: dbUrl ? undefined : getClient(),
         });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context bind ────────────────────────────────────────────────────
   env
     .command('bind')
     .description('Upsert a context_bindings row (scope_pattern → context)')
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--env <name>', 'Context name')
     .requiredOption('--scope <pattern>', 'Scope pattern (e.g. "staging" or "aws/prod/**")')
     .option(
@@ -291,10 +283,10 @@ export function registerContextCommands(program: Command, getClient: () => Admin
       'Host selector (exact/glob/regex over agentId/host/labels); "**" = all hosts',
       '**',
     )
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const payload = {
           orgId: opts.org,
@@ -313,17 +305,14 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         } else {
           console.log(`context bind: created=${result.created}${dbUrl ? ' (direct)' : ''}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context set-policy ──────────────────────────────────────────────
   env
     .command('set-policy')
     .description('Update policy fields on a context (only provided fields change)')
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--env <name>', 'Context name')
     .option('--branch-restrictions <json>', 'JSON array of allowed branches')
     .option(
@@ -339,10 +328,10 @@ export function registerContextCommands(program: Command, getClient: () => Admin
       '--allow-local-execution <bool>',
       'Allow CLI/test runs to resolve this env (true|false)',
     )
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const payload: Record<string, unknown> = {
           orgId: opts.org,
           contextName: opts.env,
@@ -388,21 +377,18 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         } else {
           console.log(`context set-policy: updated (env=${opts.env})${dbUrl ? ' (direct)' : ''}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context list ────────────────────────────────────────────────────
   env
     .command('list')
     .description('List contexts for an org')
-    .requiredOption('--org <id>', 'Org ID')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .requiredOption('--org <id>', ORG_ID_HELP)
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result = dbUrl
           ? await listContextsDirect(dbUrl, { orgId: opts.org })
@@ -414,22 +400,19 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         } else {
           printContextTable(result.contexts);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context show ────────────────────────────────────────────────────
   env
     .command('show')
     .description('Show a single context with variables + bindings')
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--name <name>', 'Context name')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result = dbUrl
           ? await showContextDirect(dbUrl, { orgId: opts.org, name: opts.name })
@@ -441,11 +424,8 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         } else {
           printShowContext(result);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context delete ──────────────────────────────────────────────────
   env
@@ -453,12 +433,12 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .description(
       'Delete a context (cascades bindings, variables, overrides; held-run history survives; pending held runs block with a clear error, resolved holds do not)',
     )
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--name <name>', 'Context name')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         let deleted: boolean;
         if (dbUrl) {
@@ -478,11 +458,8 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         } else {
           console.log(`context delete: deleted=true${dbUrl ? ' (direct)' : ''}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context purge ───────────────────────────────────────────────────
   env
@@ -491,10 +468,13 @@ export function registerContextCommands(program: Command, getClient: () => Admin
       'Delete all contexts (and held runs) for an org — direct-DB break-glass / warm-start reset',
     )
     .option('--database-url <url>', 'Use direct DB access (or KICI_DATABASE_URL)')
-    .option('--org <id>', 'Restrict purge to a single org (omit to purge all orgs)')
+    .option(
+      '--org <id>',
+      `Restrict purge to a single org (omit to purge all orgs; ${ORG_LIST_HINT})`,
+    )
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (!dbUrl) {
           console.error('Error: --database-url or KICI_DATABASE_URL is required (direct-DB only)');
@@ -509,17 +489,14 @@ export function registerContextCommands(program: Command, getClient: () => Admin
               (opts.org ? ` (org ${opts.org})` : ' (all orgs)'),
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── context create-template ─────────────────────────────────────────
   env
     .command('create-template')
     .description('Create or update a context template + its seed variables')
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--template <name>', 'Template name')
     .option('--type <t>', 'Context type (defaults to "template")', 'template')
     .option('--branch-restrictions <json>', 'JSON array of allowed branches')
@@ -528,10 +505,10 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--hold-expiry <seconds>', 'Hold expiry TTL (seconds)')
     .option('--minimum-trust <level>', 'Minimum trust (trusted)')
     .option('--variables <json>', 'JSON object of env variables to seed (e.g. \'{"K":"V"}\')')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const branchRestrictions = parseJsonOption(
           opts.branchRestrictions,
           '--branch-restrictions',
@@ -572,11 +549,8 @@ export function registerContextCommands(program: Command, getClient: () => Admin
             `context create-template: envId=${result.envId} created=${result.created} variablesSet=${result.variablesSet}${dbUrl ? ' (direct)' : ''}`,
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   registerSourceOverrideCommands(env, getClient);
 }
@@ -630,12 +604,12 @@ function registerSourceOverrideCommands(context: Command, getClient: () => Admin
 
   so.command('list')
     .description('List the source overrides in a context, for every source unless --routing-key')
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--env <name>', 'Context name')
     .option('--routing-key <key>', 'Only list the overrides for this source routing key')
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const params = new URLSearchParams({ orgId: opts.org });
         if (opts.routingKey) params.set('routingKey', opts.routingKey);
         const result = await getClient().get<{ overrides: SourceOverrideRow[] }>(
@@ -646,25 +620,22 @@ function registerSourceOverrideCommands(context: Command, getClient: () => Admin
         } else {
           printSourceOverrides(result.overrides);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   so.command('set')
     .description(
       'Set the value one source sees for a context variable key. A locked context ' +
         'variable keeps its own value.',
     )
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--env <name>', 'Context name')
     .requiredOption('--routing-key <key>', 'Routing key of the source the override applies to')
     .requiredOption('--key <key>', 'Variable key')
     .requiredOption('--value <value>', 'Override value')
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const result = await getClient().put<{ set: boolean }>(sourceOverridePath(opts), {
           value: opts.value,
         });
@@ -675,23 +646,20 @@ function registerSourceOverrideCommands(context: Command, getClient: () => Admin
             `context source-override set: key=${opts.key} routing-key=${opts.routingKey} (env=${opts.env})`,
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   so.command('delete')
     .description(
       'Delete one source override, so the source resolves the key from the context variables',
     )
-    .requiredOption('--org <id>', 'Org ID')
+    .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--env <name>', 'Context name')
     .requiredOption('--routing-key <key>', 'Routing key of the source the override applies to')
     .requiredOption('--key <key>', 'Variable key')
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const result = await getClient().delete<{ deleted: boolean }>(sourceOverridePath(opts));
         if (opts.json) {
           console.log(JSON.stringify(result));
@@ -700,9 +668,6 @@ function registerSourceOverrideCommands(context: Command, getClient: () => Admin
             `context source-override delete: key=${opts.key} routing-key=${opts.routingKey} (env=${opts.env})`,
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

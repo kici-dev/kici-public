@@ -295,3 +295,32 @@ describe('loadAccessLogRange cold page early stop', () => {
     expect(result.nextCursor).toBeNull();
   });
 });
+
+describe('loadAccessLogRange cursor source', () => {
+  function cursorOf(payload: Record<string, unknown>): string {
+    return Buffer.from(JSON.stringify(payload)).toString('base64url');
+  }
+
+  async function whereCallsFor(cursor: string): Promise<number> {
+    const { db } = makeHotMockDb([]);
+    await loadAccessLogRange({
+      db,
+      coldStore: undefined,
+      filter: { orgId: 'org-1' },
+      limit: 10,
+      cursor,
+    });
+    const builder = (db.selectFrom as unknown as ReturnType<typeof vi.fn>).mock.results[0]!
+      .value as { where: ReturnType<typeof vi.fn> };
+    return builder.where.mock.calls.length;
+  }
+
+  it('ignores a cursor without a source instead of resuming it as hot', async () => {
+    const at = { createdAt: new Date().toISOString(), id: '00000000-0000-4000-8000-000000000001' };
+    // breaks-if-wrong: a hot cursor still adds the keyset predicate.
+    const hot = await whereCallsFor(cursorOf({ source: 'hot', ...at }));
+    // fails-when: a source-less cursor is still read as hot (one more predicate).
+    const sourceless = await whereCallsFor(cursorOf(at));
+    expect(hot).toBe(sourceless + 1);
+  });
+});

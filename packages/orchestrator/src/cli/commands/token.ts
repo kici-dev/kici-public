@@ -7,7 +7,7 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 /**
  * Parse a `--expires` value into an absolute expiry Date.
@@ -91,11 +91,11 @@ export function registerTokenCommands(program: Command, getClient: () => AdminAp
       'Record the intended holder of this token -- an OIDC subject or an email address. Advisory metadata: the orchestrator cannot verify it and never reads it when authorizing a request. It is what lets the dashboard RBAC drift report say whose token this is; a token created without it is reported as unlinked.',
     )
     .action(
-      async (
-        label: string,
-        opts: { role: string; routingKey?: string; expires?: string; subject?: string },
-      ) => {
-        try {
+      cliAction(
+        async (
+          label: string,
+          opts: { role: string; routingKey?: string; expires?: string; subject?: string },
+        ) => {
           const expiresAt = opts.expires ? parseExpiresAt(opts.expires).toISOString() : undefined;
           const result = await getClient().createToken({
             label,
@@ -107,36 +107,27 @@ export function registerTokenCommands(program: Command, getClient: () => AdminAp
           console.log(`Token created: ${result.token}`);
           console.log(`Token ID: ${result.id}`);
           console.log('Save this token -- it will not be shown again.');
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   tok
     .command('list')
     .description('List all admin API tokens')
-    .action(async () => {
-      try {
+    .action(
+      cliAction(async () => {
         const tokens = await getClient().listTokens();
         console.log(formatTokenTable(tokens));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   tok
     .command('revoke <id>')
     .description('Revoke an admin API token')
-    .action(async (id: string) => {
-      try {
+    .action(
+      cliAction(async (id: string) => {
         await getClient().revokeToken(id);
         console.log(`Token ${id} revoked.`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

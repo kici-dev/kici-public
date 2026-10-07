@@ -15,56 +15,40 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { createLogger } from '@kici-dev/shared';
 import type { DrainController } from '../drain/drain-controller.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
-import { handleAdminError } from './admin-errors.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
+import { type AdminEnv, createAdminApp } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-orchestrator-drain' });
 
 export const DrainActionSchema = z.enum(['drain', 'resume']);
 export type DrainAction = z.infer<typeof DrainActionSchema>;
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
 export function createOrchestratorDrainRoutes(deps: {
   drainController: DrainController;
   rbac: RbacEnforcer;
 }): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
   // GET — report drain status, no state change.
   app.get('/orchestrator/drain', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'orchestrator.drain');
-      return c.json(await deps.drainController.snapshot(), 200);
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    deps.rbac.requirePermission(c.get('role'), 'orchestrator.drain');
+    return c.json(await deps.drainController.snapshot(), 200);
   });
 
   // POST — flip the drain flag on ('drain') or off ('resume').
   app.post('/orchestrator/drain', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'orchestrator.drain');
-      const body = await c.req.json().catch(() => ({}));
-      const parsed = DrainActionSchema.safeParse((body as { action?: unknown }).action);
-      if (!parsed.success) {
-        return c.json({ error: "action must be 'drain' or 'resume'" }, 400);
-      }
-      if (parsed.data === DrainActionSchema.enum.drain) {
-        deps.drainController.startDrain();
-      } else {
-        deps.drainController.stopDrain();
-      }
-      return c.json(await deps.drainController.snapshot(), 200);
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+    deps.rbac.requirePermission(c.get('role'), 'orchestrator.drain');
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = DrainActionSchema.safeParse((body as { action?: unknown }).action);
+    if (!parsed.success) {
+      return c.json({ error: "action must be 'drain' or 'resume'" }, 400);
     }
+    if (parsed.data === DrainActionSchema.enum.drain) {
+      deps.drainController.startDrain();
+    } else {
+      deps.drainController.stopDrain();
+    }
+    return c.json(await deps.drainController.snapshot(), 200);
   });
 
   return app;

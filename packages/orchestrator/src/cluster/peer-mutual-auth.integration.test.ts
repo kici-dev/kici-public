@@ -55,6 +55,7 @@ function inventory(instanceId: string): Omit<PeerHeartbeat, 'type'> {
 function jobReroute() {
   return jobRerouteSchema.parse({
     type: 'job.reroute',
+    spawnRetry: { maxAttempts: 3, backoffMs: 0 },
     messageId: `msg-${randomBytes(4).toString('hex')}`,
     jobId: 'job-1',
     runId: 'run-1',

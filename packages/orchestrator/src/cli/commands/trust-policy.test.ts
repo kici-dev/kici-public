@@ -6,7 +6,6 @@ import {
   formatDirectory,
   formatPolicy,
   formatExpiry,
-  policyExpiryWarnings,
   registerTrustPolicyCommands,
   type TrustDirectoryView,
   type TrustPolicyView,
@@ -16,7 +15,7 @@ import type { AdminApiClient } from '../api-client.js';
 const VIEW: TrustPolicyView = {
   customerId: 'org-1',
   forkPolicy: 'hold',
-  approvalExpiryHours: 72,
+  approvalExpirySeconds: 72 * 3600,
   source: 'platform',
   updatedAt: '2026-07-29T06:00:00.000Z',
   platformManaged: true,
@@ -53,7 +52,7 @@ describe('formatPolicy', () => {
     const out = formatPolicy(VIEW, 'table');
     expect(out).toContain('Fork PR policy:');
     expect(out).toContain('hold');
-    expect(out).toContain('72 h');
+    expect(out).toContain('72h');
     expect(out).toContain('managed by the KiCI Platform');
     expect(out).toContain('2026-07-29T06:00:00.000Z');
   });
@@ -147,16 +146,16 @@ describe('formatPolicy', () => {
   it('emits JSON when asked', () => {
     expect(JSON.parse(formatPolicy(VIEW, 'json'))).toMatchObject({
       forkPolicy: 'hold',
-      approvalExpiryHours: 72,
+      approvalExpirySeconds: 72 * 3600,
     });
   });
 });
 
 describe('buildPolicyPatch', () => {
   it('maps kebab flags onto the wire field names', () => {
-    expect(buildPolicyPatch({ forkPolicy: 'hold', approvalExpiryHours: '12' })).toEqual({
+    expect(buildPolicyPatch({ forkPolicy: 'hold', approvalExpiry: '12h' })).toEqual({
       forkPolicy: 'hold',
-      approvalExpiryHours: 12,
+      approvalExpirySeconds: 12 * 3600,
     });
   });
 
@@ -197,67 +196,29 @@ describe('buildPolicyPatch', () => {
     ).toEqual({});
   });
 
-  it.each(['0', '-1', '1.5', 'abc'])('rejects approval expiry %s', (value) => {
-    expectExit(() => buildPolicyPatch({ approvalExpiryHours: value }));
+  it.each(['0s', '-1h', '1.5h', '72', 'abc', '8761h'])('rejects approval expiry %s', (value) => {
+    // fails-when: a malformed or out-of-range duration reaches the PATCH body.
+    const msg = expectExit(() => buildPolicyPatch({ approvalExpiry: value }));
+    expect(msg).toContain('--approval-expiry:');
   });
 
-  it('accepts a seconds window', () => {
-    expect(buildPolicyPatch({ approvalExpirySeconds: '30' })).toEqual({
-      approvalExpirySeconds: 30,
-    });
-  });
-
-  it.each(['0', '-1', '1.5', 'abc'])('rejects approval expiry seconds %s', (value) => {
-    // Same floor and the same two reasons as the hours flag: the column is
-    // INTEGER, and a non-positive window mints an already-expired hold.
-    const msg = expectExit(() => buildPolicyPatch({ approvalExpirySeconds: value }));
-    expect(msg).toContain('--approval-expiry-seconds must be an integer >= 1');
-  });
-
-  it('carries both spellings through when both are given', () => {
-    // The route, not the CLI, decides which wins; the CLI warns (below).
-    expect(buildPolicyPatch({ approvalExpiryHours: '72', approvalExpirySeconds: '30' })).toEqual({
-      approvalExpiryHours: 72,
-      approvalExpirySeconds: 30,
-    });
+  it('sends --approval-expiry 90m as approvalExpirySeconds 5400', () => {
+    // breaks-if-wrong: a sub-hour window must still reach the route exactly.
+    expect(buildPolicyPatch({ approvalExpiry: '90m' })).toEqual({ approvalExpirySeconds: 5400 });
+    expect(buildPolicyPatch({ approvalExpiry: '30s' })).toEqual({ approvalExpirySeconds: 30 });
   });
 });
 
 describe('formatExpiry', () => {
-  it('renders a whole-hour window in hours, exactly as it always did', () => {
-    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: 72 * 3600 })).toBe('72 h');
-  });
-
-  it('renders a sub-hour window in seconds rather than rounding it', () => {
-    // Rounding would print a window the orchestrator is not applying.
-    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: 30 })).toBe('30 s');
-    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: 5400 })).toBe('5400 s');
-  });
-
-  it('falls back to the hours field for an orchestrator that sends no seconds', () => {
-    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: undefined })).toBe('72 h');
+  it('renders the window in the duration spelling the flag takes', () => {
+    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: 72 * 3600 })).toBe('72h');
+    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: 5400 })).toBe('1h30m');
+    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: 30 })).toBe('30s');
   });
 
   it('says unknown when the policy carries no window at all', () => {
     // A v0.5.0 independent orchestrator, which resolved no policy.
-    expect(
-      formatExpiry({ ...VIEW, approvalExpiryHours: undefined, approvalExpirySeconds: undefined }),
-    ).toBe('unknown');
-  });
-});
-
-describe('policyExpiryWarnings', () => {
-  it('names the ignored spelling when both are given', () => {
-    expect(policyExpiryWarnings({ approvalExpiryHours: 72, approvalExpirySeconds: 30 })).toEqual([
-      'Warning: --approval-expiry-hours 72 is ignored because --approval-expiry-seconds 30 ' +
-        'was also given; the more specific value wins.',
-    ]);
-  });
-
-  it('is silent when only one spelling is given', () => {
-    expect(policyExpiryWarnings({ approvalExpiryHours: 72 })).toEqual([]);
-    expect(policyExpiryWarnings({ approvalExpirySeconds: 30 })).toEqual([]);
-    expect(policyExpiryWarnings({ forkPolicy: 'hold' })).toEqual([]);
+    expect(formatExpiry({ ...VIEW, approvalExpirySeconds: undefined })).toBe('unknown');
   });
 });
 
@@ -481,7 +442,7 @@ describe('registerTrustPolicyCommands', () => {
     'kici-admin',
     'trust-policy',
     'directory-set',
-    '--customer-id',
+    '--org',
     'org-1',
     '--user-id',
     'user-7',
@@ -492,6 +453,38 @@ describe('registerTrustPolicyCommands', () => {
     '--ci-trust',
     'write',
   ];
+
+  it('set sends --approval-expiry as seconds and refuses the retired hours flag', async () => {
+    const { program, patch } = harness({ policy: { ...VIEW, approvalExpirySeconds: 5400 } });
+    await program.parseAsync([
+      'node',
+      'kici-admin',
+      'trust-policy',
+      'set',
+      '--org',
+      'org-1',
+      '--approval-expiry',
+      '90m',
+    ]);
+    expect(patch).toHaveBeenCalledWith('/api/v1/admin/trust-policy', {
+      customerId: 'org-1',
+      approvalExpirySeconds: 5400,
+    });
+    // fails-when: --approval-expiry-hours is still a registered option.
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await expect(
+      harness().program.parseAsync([
+        'node',
+        'kici-admin',
+        'trust-policy',
+        'set',
+        '--org',
+        'org-1',
+        '--approval-expiry-hours',
+        '72',
+      ]),
+    ).rejects.toMatchObject({ code: 'commander.unknownOption' });
+  });
 
   it('registers every leaf, including the two directory writers', () => {
     const { program } = harness();
@@ -554,7 +547,7 @@ describe('registerTrustPolicyCommands', () => {
       'kici-admin',
       'trust-policy',
       'directory-remove',
-      '--customer-id',
+      '--org',
       'org/1',
       '--user-id',
       'user 7',
@@ -571,7 +564,7 @@ describe('registerTrustPolicyCommands', () => {
       'kici-admin',
       'trust-policy',
       'directory-remove',
-      '--customer-id',
+      '--org',
       'org-1',
       '--user-id',
       'ghost',

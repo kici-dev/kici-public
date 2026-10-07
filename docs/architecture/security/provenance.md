@@ -113,9 +113,8 @@ only build-supplied input.
   rather than following the issuer named in the token. `kici verify-attestation`
   defaults its trust root to the configured orchestrator; it can also verify
   offline against an exported `{ issuer, jwks }` file (air-gap) or against the
-  orchestrator's native `POST /v1/verify-attestation` endpoint. Bundles signed by
-  the hosted platform before the orchestrator owned signing keep verifying against
-  the platform's still-published JWKS.
+  orchestrator's native `POST /v1/verify-attestation` endpoint. The hosted
+  platform publishes no provenance issuer or JWKS.
 - **The bundle format is forward-compatible.** Verification dispatches on the
   bundle's media type, so additional bundle formats can be added without
   changing the verifier's existing path.
@@ -150,9 +149,8 @@ signing keys, and operators backfill or refresh stored verdicts with
 **Trust root at ingest.** When orchestrator-owned signing is configured, the
 orchestrator verifies at ingest against its **own** key set — read directly from
 its signing-keys store, so fresh rotations and revocations are reflected
-immediately. Bundles signed by the hosted platform before the orchestrator owned
-signing are verified against the platform's provenance issuer instead. When no
-provenance trust root is configured, every verdict is recorded as `unverifiable`
+immediately. Without orchestrator-owned signing, it verifies against the issuer
+set in `KICI_PROVENANCE_ISSUER`. When no provenance trust root is configured, every verdict is recorded as `unverifiable`
 rather than silently `verified`. Verification consumes only the public issuer +
 key set; the private signing key never takes part in checking a bundle.
 

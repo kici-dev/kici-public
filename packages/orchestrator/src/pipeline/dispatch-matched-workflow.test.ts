@@ -679,12 +679,11 @@ function rejectDecision(reason: SecurityHoldReason) {
 }
 
 /** A TrustPolicyStore stand-in returning a fixed approval-expiry window. */
-function storeReturningExpiry(approvalExpiryHours: number) {
+function storeReturningExpiry(hours: number) {
   return {
     get: vi.fn().mockResolvedValue({
       forkPolicy: 'hold',
-      approvalExpiryHours,
-      approvalExpirySeconds: approvalExpiryHours * SECONDS_PER_HOUR,
+      approvalExpirySeconds: hours * SECONDS_PER_HOUR,
       source: 'platform',
       updatedAt: new Date(),
     }),
@@ -1615,6 +1614,28 @@ describe('dispatchMatchedWorkflow — the run exists before the first job reache
       'add-jobs:build',
       'release',
     ]);
+  });
+
+  it('registers the run with the context-derived positional arguments', async () => {
+    // fails-when: a registration site drifts from the shared argument list
+    // (wrong position, a dropped localWorkingTree, or a lost routing key)
+    const tracker = makeOrderRecordingTracker([]);
+    const { ctx } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      localWorkingTree: true,
+      executionTracker: tracker,
+    });
+
+    await dispatchMatchedWorkflow(ctx);
+
+    expect(tracker.onExecutionStarted).toHaveBeenCalledTimes(1);
+    const call = tracker.onExecutionStarted.mock.calls[0] as unknown[];
+    expect(call.slice(0, 6)).toEqual(['run-1', 'ci', 'local', 'repo', 'main', 'main']);
+    expect(call[6]).toBe('test:delivery');
+    expect(call[9]).toEqual([]);
+    expect(call[10]).toBe('local:repo');
+    expect(call[20]).toBe(true);
   });
 
   it('does not register the run a second time once it is started early', async () => {
@@ -2953,6 +2974,53 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
     const pending = await consumePendingJobContext(undefined, ctx.runId, 'build');
     expect(pending).toBeDefined();
     expect(pending?.jobInput.jobConfig.jobEnv).toEqual({ RESOLVED: 'yes' });
+  });
+
+  it('marks a dynamic-only local working-tree run as local when it bootstraps the row', async () => {
+    // A workflow with no static job registers its run through the deferred
+    // bootstrap, the one registration site with no job to start early.
+    // fails-when: that bootstrap drops localWorkingTree, so no status frame
+    // marks a `kici run remote` upload of a dynamic-only workflow
+    // breaks-if-wrong: a webhook run (localWorkingTree false) must stay unmarked
+    for (const localWorkingTree of [true, false]) {
+      const tracker = makeTracker(vi.fn());
+      const columnWrites: Record<string, unknown>[] = [];
+      const update = {
+        set: (cols: Record<string, unknown>) => {
+          columnWrites.push(cols);
+          return update;
+        },
+        where: () => update,
+        execute: async () => [],
+      };
+      const { ctx } = makeSingleJobContext({
+        bundle: {
+          normalizer: { provider: 'local' },
+        } as unknown as WorkflowDispatchContext['bundle'],
+        fullRepo: true,
+        withDynamicEntry: true,
+        db: { ...makeDb(), updateTable: () => update },
+        localWorkingTree,
+        // The same pending-registry shape, tracking a dynamic eval that yields no jobs.
+        pendingDynamics: { ...makePendingInits({}), track: vi.fn(async () => []) },
+        executionTracker: tracker,
+      });
+      ctx.workflow = {
+        ...ctx.workflow,
+        jobs: ctx.workflow.jobs.filter((j) => j._type !== 'static'),
+      };
+
+      await dispatchMatchedWorkflow(ctx);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(tracker.onExecutionStarted).toHaveBeenCalledTimes(1);
+      const call = tracker.onExecutionStarted.mock.calls[0] as unknown[];
+      expect(call[9]).toEqual([]);
+      expect(call[20]).toBe(localWorkingTree);
+      // The row is marked too: `recordRunStart` returned before the row existed,
+      // so the bootstrap is the only writer left.
+      expect(columnWrites.some((c) => c.local_working_tree === true)).toBe(localWorkingTree);
+    }
   });
 
   it('holds every child of a dynamic matrix, not one placeholder', async () => {

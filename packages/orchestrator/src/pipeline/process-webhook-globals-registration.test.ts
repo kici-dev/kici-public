@@ -280,8 +280,7 @@ describe('a global workflow refused registration says which workflows and which 
     // remedy — only the operator knows whether the missing mapping is the real
     // problem. The master switch is fleet-wide now, so the anchor has no
     // per-org opt-in of its own.
-    expect(remedy).toContain(`--customer-id`);
-    expect(remedy).toContain(ROUTING_KEY);
+    expect(remedy).toContain(`source update ${ROUTING_KEY} --org <org>`);
     expect(remedy).toContain(`cluster-settings set --global-workflows-enabled true`);
   });
 
@@ -299,7 +298,7 @@ describe('a global workflow refused registration says which workflows and which 
     const line = lines.find();
     expect(line.orgId).toBe(REAL_ORG);
     expect(line.remedy).toContain(`--org ${REAL_ORG}`);
-    expect(line.remedy).not.toContain('--customer-id');
+    expect(line.remedy).not.toContain('source update');
   });
 
   it('emits no line, and registers the global, when the policy admits', async () => {

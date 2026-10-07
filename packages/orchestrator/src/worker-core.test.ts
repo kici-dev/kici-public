@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, beforeAll, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach, type Mock } from 'vitest';
 
 // Mock external dependencies to avoid starting real servers/connections
 vi.mock('@hono/node-server', () => ({
@@ -67,6 +67,7 @@ vi.mock('@kici-dev/shared', async () => {
 });
 
 import type { AppConfig } from './config.js';
+import { ScalerReloadOutcome } from '@kici-dev/engine';
 import { createAgentWsHandler } from './ws/agent-handler.js';
 
 function createWorkerConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -98,7 +99,7 @@ function createWorkerConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     cluster: {
       instanceId: 'test-worker-1',
       role: 'worker',
-      coordinatorUrl: 'http://coordinator:4000',
+      coordinatorUrls: ['http://coordinator:4000'],
       joinToken: 'test-join-token',
       credentialFile: '/tmp/test-credential',
       autoRotateCredentials: false,
@@ -127,7 +128,38 @@ describe('bootstrapWorker', () => {
     vi.clearAllMocks();
   });
 
-  it('creates PeerClient with coordinatorUrl from config', async () => {
+  /** Run one named step of the graceful shutdown each bootstrap registered. */
+  async function runShutdownStep(name: string): Promise<void> {
+    const { setupGracefulShutdown } = await import('@kici-dev/shared');
+    for (const [opts] of (setupGracefulShutdown as unknown as Mock).mock.calls) {
+      const steps = (opts as { steps: Array<{ name: string; fn: () => unknown }> }).steps;
+      await steps.find((step) => step.name === name)?.fn();
+    }
+  }
+
+  // Each bootstrap installs a real SIGHUP listener; its own shutdown step removes it.
+  afterEach(() => runShutdownStep('Removing the SIGHUP listener'));
+
+  // fails-when: the worker installs no SIGHUP listener (Node.js then exits on the
+  // signal), or wires no answer to a coordinator's scaler reload request
+  // breaks-if-wrong: the worker's shutdown still removes the listener
+  it('reloads its scaler config on SIGHUP instead of exiting, and answers a reload request', async () => {
+    const before = process.listenerCount('SIGHUP');
+    const { bootstrapWorker } = await import('./worker-core.js');
+
+    const subsystems = await bootstrapWorker(createWorkerConfig());
+
+    expect(process.listenerCount('SIGHUP')).toBe(before + 1);
+    const peerClient = subsystems.peerClient as unknown as MockPeerClient;
+    expect(await peerClient.options.onScalerReloadRequest()).toEqual({
+      outcome: ScalerReloadOutcome.enum['not-configured'],
+    });
+
+    await runShutdownStep('Removing the SIGHUP listener');
+    expect(process.listenerCount('SIGHUP')).toBe(before);
+  });
+
+  it('creates PeerClient with coordinatorUrls from config', async () => {
     const config = createWorkerConfig();
     const { bootstrapWorker } = await import('./worker-core.js');
 
@@ -325,16 +357,16 @@ describe('bootstrapWorker', () => {
     await expect(bootstrapWorker(config)).rejects.toThrow('expected "worker"');
   });
 
-  it('throws when coordinatorUrl is missing', async () => {
+  it('throws when coordinatorUrls is empty', async () => {
     const config = createWorkerConfig({
       cluster: {
         ...createWorkerConfig().cluster,
-        coordinatorUrl: undefined,
+        coordinatorUrls: [],
       },
     });
     const { bootstrapWorker } = await import('./worker-core.js');
 
-    await expect(bootstrapWorker(config)).rejects.toThrow('cluster.coordinatorUrl');
+    await expect(bootstrapWorker(config)).rejects.toThrow('cluster.coordinatorUrls');
   });
 
   it('connects PeerClient as the final step', async () => {
@@ -351,9 +383,18 @@ describe('bootstrapWorker', () => {
 describe('resolveWorkerAgentTokenTtlMs', () => {
   it('returns the pulled agent_token_ttl_ms once a snapshot has landed', async () => {
     const { resolveWorkerAgentTokenTtlMs } = await import('./worker-core.js');
-    expect(resolveWorkerAgentTokenTtlMs({ settings: { agentTokenTtlMs: 33_000 } }, 3_600_000)).toBe(
-      33_000,
-    );
+    expect(
+      resolveWorkerAgentTokenTtlMs(
+        {
+          settings: {
+            agentTokenTtlMs: 33_000,
+            firecrackerApiSocketWaitMs: 1,
+            concurrencyWaitTimeoutMs: 1,
+          },
+        },
+        3_600_000,
+      ),
+    ).toBe(33_000);
   });
 
   it('falls back to the config default until the first pull lands (null snapshot)', async () => {
@@ -367,7 +408,13 @@ describe('resolveWorkerFirecrackerApiSocketWaitMs', () => {
     const { resolveWorkerFirecrackerApiSocketWaitMs } = await import('./worker-core.js');
     expect(
       resolveWorkerFirecrackerApiSocketWaitMs(
-        { settings: { agentTokenTtlMs: 1, firecrackerApiSocketWaitMs: 45_000 } },
+        {
+          settings: {
+            agentTokenTtlMs: 1,
+            firecrackerApiSocketWaitMs: 45_000,
+            concurrencyWaitTimeoutMs: 1,
+          },
+        },
         30_000,
       ),
     ).toBe(45_000);
@@ -377,14 +424,30 @@ describe('resolveWorkerFirecrackerApiSocketWaitMs', () => {
     const { resolveWorkerFirecrackerApiSocketWaitMs } = await import('./worker-core.js');
     expect(resolveWorkerFirecrackerApiSocketWaitMs(null, 30_000)).toBe(30_000);
   });
+});
 
-  it('falls back to the config default for a snapshot from a leader without the knob', async () => {
-    // breaks-if-wrong: an older leader omits the field; the worker must keep
-    // its own default rather than wait for 0 ms.
-    const { resolveWorkerFirecrackerApiSocketWaitMs } = await import('./worker-core.js');
+describe('resolveWorkerConcurrencyWaitTimeoutMs', () => {
+  it('returns the pulled concurrency_wait_timeout_ms', async () => {
+    // fails-when: a worker ignores the pulled fleet-wide wait.
+    const { resolveWorkerConcurrencyWaitTimeoutMs } = await import('./worker-core.js');
     expect(
-      resolveWorkerFirecrackerApiSocketWaitMs({ settings: { agentTokenTtlMs: 1 } }, 30_000),
-    ).toBe(30_000);
+      resolveWorkerConcurrencyWaitTimeoutMs(
+        {
+          settings: {
+            agentTokenTtlMs: 1,
+            firecrackerApiSocketWaitMs: 1,
+            concurrencyWaitTimeoutMs: 900_000,
+          },
+        },
+        3_600_000,
+      ),
+    ).toBe(900_000);
+  });
+
+  it('falls back to the config default until the first pull lands', async () => {
+    // breaks-if-wrong: a worker with no snapshot yet still sends a wait.
+    const { resolveWorkerConcurrencyWaitTimeoutMs } = await import('./worker-core.js');
+    expect(resolveWorkerConcurrencyWaitTimeoutMs(null, 3_600_000)).toBe(3_600_000);
   });
 });
 

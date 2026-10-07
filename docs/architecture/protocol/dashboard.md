@@ -155,17 +155,17 @@ Response from an existing orchestrator with the sealed config bundle, or a refus
 
 #### Join error codes
 
-| errorCode                   | Produced by                   | Meaning                                                                     |
-| --------------------------- | ----------------------------- | --------------------------------------------------------------------------- |
-| `join_protocol_v1_removed`  | Platform, orchestrator, route | The request carries the join token (join protocol v1). Upgrade `kici-admin` |
-| `join_protocol_unsupported` | Platform                      | No orchestrator in the target pool supports join protocol v2. Upgrade them  |
-| `invalid_request`           | Platform, orchestrator, route | The request is malformed                                                    |
-| `invalid_token`             | Orchestrator, route           | No live join token matches the request's routing part and proof             |
-| `token_expired`             | Orchestrator, route           | The matching join token has expired                                         |
-| `token_already_used`        | Orchestrator, route           | Another joiner consumed the join token                                      |
-| `org_mismatch`              | Platform                      | The routing part names an org other than the relaying connection's own org  |
-| `no_target`                 | Platform                      | The target pool holds no orchestrator                                       |
-| `relay_timeout`             | Platform                      | The target orchestrator did not answer within 30 seconds                    |
+| errorCode                   | Produced by                   | Meaning                                                                                                                                |
+| --------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `join_protocol_v1_removed`  | Platform, orchestrator, route | The request carries the join token (join protocol v1). Upgrade `kici-admin`                                                            |
+| `join_protocol_unsupported` | None                          | Not sent at protocol 4: every orchestrator answers join protocol v2. `kici-admin join` still names the upgrade when it reads this code |
+| `invalid_request`           | Platform, orchestrator, route | The request is malformed                                                                                                               |
+| `invalid_token`             | Orchestrator, route           | No live join token matches the request's routing part and proof                                                                        |
+| `token_expired`             | Orchestrator, route           | The matching join token has expired                                                                                                    |
+| `token_already_used`        | Orchestrator, route           | Another joiner consumed the join token                                                                                                 |
+| `org_mismatch`              | Platform                      | The routing part names an org other than the relaying connection's own org                                                             |
+| `no_target`                 | Platform                      | The target pool holds no orchestrator                                                                                                  |
+| `relay_timeout`             | Platform                      | The target orchestrator did not answer within 30 seconds                                                                               |
 
 "Route" is `POST /api/v1/cluster/join` on the existing orchestrator, the direct transport of `kici-admin join --peer`. It answers `200` on success, `400` for `invalid_request`, `401` for `invalid_token`, `token_expired` and `token_already_used`, `426` with `Upgrade: kici-join-v2` for `join_protocol_v1_removed`, and `500` for an internal failure.
 
@@ -340,41 +340,42 @@ Raft leader heartbeat (no log entries — KiCI uses Raft for leader election onl
 
 Sent by the coordinator to a peer when no local agent can handle a job. Contains the full resolved job configuration so the peer can dispatch without re-resolving.
 
-| Field                      | Type                                         | Required | Description                                                                                                                                                                                                   |
-| -------------------------- | -------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type                       | `"job.reroute"`                              | Yes      | Message discriminator                                                                                                                                                                                         |
-| messageId                  | string                                       | Yes      | Unique message ID for ACK correlation                                                                                                                                                                         |
-| jobId                      | string                                       | Yes      | Pre-allocated job ID. The sending coordinator allocates it before reroute so its `execution_runs` / `execution_jobs` rows reference the same id the receiving peer will dispatch under.                       |
-| runId                      | string                                       | Yes      | Execution run identifier                                                                                                                                                                                      |
-| deliveryId                 | string                                       | Yes      | Original webhook delivery ID                                                                                                                                                                                  |
-| routingKey                 | string                                       | Yes      | Provider routing key                                                                                                                                                                                          |
-| event, action              | string, string or null                       | Yes      | Webhook event type and action                                                                                                                                                                                 |
-| payload                    | Record<string, unknown>                      | Yes      | Full webhook payload                                                                                                                                                                                          |
-| jobName                    | string                                       | Yes      | Job to execute                                                                                                                                                                                                |
-| workflowName               | string                                       | Yes      | Workflow containing the job                                                                                                                                                                                   |
-| runsOnLabels               | string[][]                                   | Yes      | Label sets the job requires                                                                                                                                                                                   |
-| excludeLabels              | string[]                                     | No       | Labels that the dispatched agent must NOT have                                                                                                                                                                |
-| runsOnPatterns             | LabelMatcher[]                               | No       | Glob/regex include matchers the receiving peer's agent labels must satisfy, applied on top of the exact `runsOnLabels` prefilter. Absent reads as `[]`; a pure-pattern job carries its whole selector here    |
-| excludePatterns            | LabelMatcher[]                               | No       | Glob/regex matchers that disqualify a candidate agent. Absent reads as `[]`                                                                                                                                   |
-| triedConnections           | string[]                                     | Yes      | Instance IDs already tried (loop prevention)                                                                                                                                                                  |
-| maxHops                    | number                                       | Yes      | Maximum allowed hops (default: 3)                                                                                                                                                                             |
-| spawnRetry                 | `{ maxAttempts: number, backoffMs: number }` | No       | Spawn-retry budget the receiving worker applies to the job: agent spawns it attempts (>= 1) and the wait after a failed one (ms, >= 0). Absent from an older coordinator: the worker applies its own defaults |
-| coordinatorId              | string                                       | Yes      | Instance ID of the run coordinator                                                                                                                                                                            |
-| jobConfig                  | Record<string, unknown>                      | No       | Resolved job config (steps, rules, matrix, etc.)                                                                                                                                                              |
-| repoUrl                    | string                                       | No       | Repository clone URL                                                                                                                                                                                          |
-| ref                        | string                                       | No       | Git ref (branch name)                                                                                                                                                                                         |
-| sha                        | string                                       | No       | Commit SHA                                                                                                                                                                                                    |
-| provider                   | string                                       | No       | Provider type (e.g., `github`)                                                                                                                                                                                |
-| providerContext            | Record<string, unknown>                      | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                                            |
-| sourceTarUrl               | string                                       | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                                                   |
-| sourceTarDigest            | string                                       | No       | SHA-256 of the source tarball's own bytes, for integrity verification                                                                                                                                         |
-| depsUrl                    | string                                       | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                                                 |
-| depsHash                   | string                                       | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                                       |
-| cloneToken                 | string                                       | No       | Pre-resolved clone token for workers without provider credentials                                                                                                                                             |
-| encryptedSecrets           | string                                       | No       | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                                                     |
-| encryptedNamespacedSecrets | string                                       | No       | Encrypted namespaced secrets envelope                                                                                                                                                                         |
-| requestId                  | string                                       | No       | Trace ID for distributed tracing                                                                                                                                                                              |
-| traceId                    | string                                       | No       | Additional trace context                                                                                                                                                                                      |
+| Field                      | Type                                         | Required | Description                                                                                                                                                                                                |
+| -------------------------- | -------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type                       | `"job.reroute"`                              | Yes      | Message discriminator                                                                                                                                                                                      |
+| messageId                  | string                                       | Yes      | Unique message ID for ACK correlation                                                                                                                                                                      |
+| jobId                      | string                                       | Yes      | Pre-allocated job ID. The sending coordinator allocates it before reroute so its `execution_runs` / `execution_jobs` rows reference the same id the receiving peer will dispatch under.                    |
+| runId                      | string                                       | Yes      | Execution run identifier                                                                                                                                                                                   |
+| deliveryId                 | string                                       | Yes      | Original webhook delivery ID                                                                                                                                                                               |
+| routingKey                 | string                                       | Yes      | Provider routing key                                                                                                                                                                                       |
+| event, action              | string, string or null                       | Yes      | Webhook event type and action                                                                                                                                                                              |
+| payload                    | Record<string, unknown>                      | Yes      | Full webhook payload                                                                                                                                                                                       |
+| jobName                    | string                                       | Yes      | Job to execute                                                                                                                                                                                             |
+| workflowName               | string                                       | Yes      | Workflow containing the job                                                                                                                                                                                |
+| runsOnLabels               | string[][]                                   | Yes      | Label sets the job requires                                                                                                                                                                                |
+| excludeLabels              | string[]                                     | No       | Labels that the dispatched agent must NOT have                                                                                                                                                             |
+| runsOnPatterns             | LabelMatcher[]                               | No       | Glob/regex include matchers the receiving peer's agent labels must satisfy, applied on top of the exact `runsOnLabels` prefilter. Absent reads as `[]`; a pure-pattern job carries its whole selector here |
+| excludePatterns            | LabelMatcher[]                               | No       | Glob/regex matchers that disqualify a candidate agent. Absent reads as `[]`                                                                                                                                |
+| triedConnections           | string[]                                     | Yes      | Instance IDs already tried (loop prevention)                                                                                                                                                               |
+| maxHops                    | number                                       | Yes      | Maximum allowed hops (default: 3)                                                                                                                                                                          |
+| spawnRetry                 | `{ maxAttempts: number, backoffMs: number }` | Yes      | Spawn-retry budget the receiving worker applies to the job: agent spawns it attempts (>= 1) and the wait after a failed one (ms, >= 0)                                                                     |
+| coordinatorId              | string                                       | Yes      | Instance ID of the run coordinator                                                                                                                                                                         |
+| jobConfig                  | Record<string, unknown>                      | No       | Resolved job config (steps, rules, matrix, etc.)                                                                                                                                                           |
+| repoUrl                    | string                                       | No       | Repository clone URL                                                                                                                                                                                       |
+| ref                        | string                                       | No       | Git ref (branch name)                                                                                                                                                                                      |
+| sha                        | string                                       | No       | Commit SHA                                                                                                                                                                                                 |
+| provider                   | string                                       | No       | Provider type (e.g., `github`)                                                                                                                                                                             |
+| providerContext            | Record<string, unknown>                      | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                                         |
+| sourceTarUrl               | string                                       | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                                                |
+| sourceTarDigest            | string                                       | No       | SHA-256 of the source tarball's own bytes, for integrity verification                                                                                                                                      |
+| depsUrl                    | string                                       | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                                              |
+| depsHash                   | string                                       | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                                    |
+| cloneToken                 | string                                       | No       | Pre-resolved clone token for workers without provider credentials                                                                                                                                          |
+| workflowCloneToken         | string                                       | No       | Pre-resolved clone token for the workflow repository of an organization-wide (global) job                                                                                                                  |
+| encryptedSecrets           | string                                       | No       | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                                                  |
+| encryptedNamespacedSecrets | string                                       | No       | Encrypted namespaced secrets envelope                                                                                                                                                                      |
+| requestId                  | string                                       | No       | Trace ID for distributed tracing                                                                                                                                                                           |
+| traceId                    | string                                       | No       | Additional trace context                                                                                                                                                                                   |
 
 LabelMatcher: `{ kind: "exact", value: string }` or `{ kind: "regex", source: string, flags: string }`. Globs are converted to regex at compile time, so the wire only ever carries these two forms.
 
@@ -464,11 +465,11 @@ Log chunk relay from worker to coordinator. Batched log lines from agent executi
 
 Each LogLineEntry:
 
-| Field     | Type   | Required | Description                                     |
-| --------- | ------ | -------- | ----------------------------------------------- |
-| text      | string | Yes      | Log line text                                   |
-| timestamp | number | Yes      | Unix timestamp (milliseconds)                   |
-| stream    | enum   | No       | One of: `stdout`, `stderr` (defaults to stdout) |
+| Field     | Type   | Required | Description                   |
+| --------- | ------ | -------- | ----------------------------- |
+| text      | string | Yes      | Log line text                 |
+| timestamp | number | Yes      | Unix timestamp (milliseconds) |
+| stream    | enum   | Yes      | One of: `stdout`, `stderr`    |
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerLogChunkSchema`
 
@@ -572,17 +573,18 @@ Config reload request forwarded from one orchestrator to a specific peer when an
 
 Response from the target peer carrying the reload result fields.
 
-| Field           | Type                            | Required | Description                                         |
-| --------------- | ------------------------------- | -------- | --------------------------------------------------- |
-| type            | `"peer.config.reload.response"` | Yes      | Message discriminator                               |
-| messageId       | string                          | Yes      | Unique message ID                                   |
-| success         | boolean                         | Yes      | Whether the reload succeeded                        |
-| version         | number                          | No       | New config version after reload                     |
-| errors          | string[]                        | No       | Error messages if reload failed                     |
-| restartRequired | string[]                        | No       | Config fields that require a restart to take effect |
-| fieldsChanged   | string[]                        | No       | Config fields that were changed                     |
+| Field           | Type                            | Required | Description                                                                                              |
+| --------------- | ------------------------------- | -------- | -------------------------------------------------------------------------------------------------------- |
+| type            | `"peer.config.reload.response"` | Yes      | Message discriminator                                                                                    |
+| messageId       | string                          | Yes      | Unique message ID                                                                                        |
+| success         | boolean                         | Yes      | Whether the reload succeeded                                                                             |
+| version         | number                          | No       | New config version after reload                                                                          |
+| errors          | string[]                        | No       | Error messages if reload failed                                                                          |
+| restartRequired | string[]                        | No       | Config fields that require a restart to take effect                                                      |
+| fieldsChanged   | string[]                        | No       | Config fields that were changed                                                                          |
+| scaler          | object                          | No       | The target's scaler config reload: `outcome`, and `plan` or `errors` (see `peer.scaler.reload.response`) |
 
-> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerConfigReloadResponseSchema`
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerConfigReloadResponseSchema`, `scalerReloadAnswerSchema`
 
 #### peer.clusterSettings.request
 
@@ -641,6 +643,34 @@ A VM `status` is `orphaned`, `unverified` or `tracked`. A stop `outcome` is `sto
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerOrphansResponseSchema`
 
+### Scaler reload fan-out
+
+#### peer.scaler.reload.request
+
+The orchestrator that received `kici-admin scaler reload` (without `--single`) sends this message to each connected peer, coordinators and workers alike, so each one re-reads its own scaler config. A peer accepts it from coordinators only: the incoming peer connection checks that the sender's credential is a coordinator's.
+
+| Field     | Type                           | Required | Description           |
+| --------- | ------------------------------ | -------- | --------------------- |
+| type      | `"peer.scaler.reload.request"` | Yes      | Message discriminator |
+| messageId | string                         | Yes      | Unique message ID     |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerReloadRequestSchema`
+
+#### peer.scaler.reload.response
+
+What the peer's reload did. `outcome` is `applied`, `rejected`, `not-configured` or `unreachable`. A `rejected` reload applied nothing.
+
+| Field     | Type                            | Required | Description                                                                                                                     |
+| --------- | ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| type      | `"peer.scaler.reload.response"` | Yes      | Message discriminator                                                                                                           |
+| messageId | string                          | Yes      | Matches the request                                                                                                             |
+| outcome   | string                          | Yes      | What the reload did on this peer                                                                                                |
+| plan      | object                          | No       | `applied` only: scaler names per bucket (`added`, `updated`, `unchanged`, `retired`, `resurrected`) and changed `global` limits |
+| errors    | string[]                        | No       | `rejected` only: why the file was refused                                                                                       |
+| detail    | string                          | No       | Why the peer could not reload (for example, a request from a peer that is not a coordinator)                                    |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerReloadResponseSchema`, `scalerReloadPlanSchema`
+
 ### Peer forget fan-out
 
 #### peer.forget.request
@@ -689,16 +719,16 @@ Broadcast to every peer when an agent token is revoked so each peer can close it
 
 Forwarded by a worker to the coordinator that owns the run when the worker's scaler emits a provisioning event correlated to a queued job (e.g. a failed agent spawn). Workers have no database, so they cannot persist provisioning failures themselves — the coordinator's `ExecutionTracker` writes the event to the provisioning log and the dispatch queue's last-error column.
 
-| Field       | Type             | Required | Description                                                                                                                                                                                                                                |
-| ----------- | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| type        | `"scaler.event"` | Yes      | Message discriminator                                                                                                                                                                                                                      |
-| runId       | string           | Yes      | Execution run ID                                                                                                                                                                                                                           |
-| jobId       | string           | Yes      | Job ID within the run                                                                                                                                                                                                                      |
-| agentId     | string           | Yes      | The scaler-managed agent ID the event is about                                                                                                                                                                                             |
-| eventType   | enum             | Yes      | Scaler event type (a `ScalerEventType` enum member)                                                                                                                                                                                        |
-| detail      | string           | Yes      | Human-readable detail, including any captured spawn stderr tail                                                                                                                                                                            |
-| timestampMs | number           | Yes      | Event timestamp in epoch milliseconds                                                                                                                                                                                                      |
-| final       | boolean          | No       | Retry verdict on a `scaler.failed` for a job under the worker's spawn-retry budget: `false` while attempts remain, `true` on the last one. Absent on a repeated report of one failed spawn, on every other relay, and from an older worker |
+| Field       | Type             | Required | Description                                                                                                                                                                                                         |
+| ----------- | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type        | `"scaler.event"` | Yes      | Message discriminator                                                                                                                                                                                               |
+| runId       | string           | Yes      | Execution run ID                                                                                                                                                                                                    |
+| jobId       | string           | Yes      | Job ID within the run                                                                                                                                                                                               |
+| agentId     | string           | Yes      | The scaler-managed agent ID the event is about                                                                                                                                                                      |
+| eventType   | enum             | Yes      | Scaler event type (a `ScalerEventType` enum member)                                                                                                                                                                 |
+| detail      | string           | Yes      | Human-readable detail, including any captured spawn stderr tail                                                                                                                                                     |
+| timestampMs | number           | Yes      | Event timestamp in epoch milliseconds                                                                                                                                                                               |
+| final       | boolean          | No       | Retry verdict on a `scaler.failed` for a job under the worker's spawn-retry budget: `false` while attempts remain, `true` on the last one. Absent on a repeated report of one failed spawn and on every other relay |
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerScalerEventSchema`
 
@@ -892,7 +922,7 @@ All protocol messages are validated at runtime using Zod discriminated unions. E
 
 **Peer-to-peer layer:**
 
-- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.scaler.orphans.request`, `peer.scaler.orphans.response`, `peer.forget.request`, `peer.forget.response`, `peer.clusterSettings.request`, `peer.clusterSettings.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
+- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.scaler.orphans.request`, `peer.scaler.orphans.response`, `peer.scaler.reload.request`, `peer.scaler.reload.response`, `peer.forget.request`, `peer.forget.response`, `peer.clusterSettings.request`, `peer.clusterSettings.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
 
 The upstream layers (orchestrator↔KiCI and browser↔KiCI) have their own discriminated unions.
 
@@ -932,18 +962,8 @@ KiCI propagates a `requestId` (UUIDv4) through the entire webhook processing pip
 
 The `app.service` field identifies which KiCI tier produced a log line (values: `platform`, `orchestrator`, `agent`). Set process-wide at startup via `setServiceName()` from `@kici-dev/shared`. This field is independent of container naming and works in all deployment models (containerized, bare-metal, Firecracker). For forwarded agent logs flowing through orchestrator stdout, the `service` field is preserved from the agent's original JSON output.
 
-## Capability negotiation
+## Unsupported request types
 
-The set of `dashboard.*` request types is the de-facto feature contract between the dashboard, the relay, and the orchestrator. Each tier can be on a different version: the dashboard and relay are centrally deployed and always current, and a customer's orchestrator upgrades on the customer's own schedule. Without the manifest below, a dashboard request for a feature a particular orchestrator predates would come back as a confusing "invalid payload" — indistinguishable from a genuinely malformed body.
-
-To make version mismatches explicit, the orchestrator advertises a **capability manifest** in its connection handshake: `supportedDashboardRequests`, the list of every dashboard request type that build understands: the `dashboard.*` family plus the proxied `run.*` and `test.relay.*` requests. The list is derived directly from the orchestrator's own protocol schema, so it can never drift from what the build actually handles.
-
-The manifest drives three behaviors:
-
-- **Pre-flight gating (relay).** Before forwarding a `dashboard.*` request to an orchestrator, the relay checks the request type against that connection's advertised manifest. If the type is absent, the relay short-circuits with a structured `501` carrying the connected orchestrator version and the unsupported request type — the request never reaches the orchestrator. A connection that advertises **no** manifest (an orchestrator predating this mechanism) is treated as "unknown": the request is forwarded and the reactive path below applies.
-- **Reactive classification (orchestrator).** When a request does reach the orchestrator and fails schema validation, the orchestrator distinguishes a request type it has never heard of (version mismatch → `unsupported_request_type`, "upgrade the orchestrator") from a known type with a malformed body (`invalid_payload`, a genuine client error). The error response frame carries the structured `code` and the orchestrator version.
-- **Proactive UI signalling (dashboard).** The dashboard reads each orchestrator's manifest from the org-scoped orchestrators listing and greys out — with an "upgrade required" banner naming the connected version — any orchestrator-backed write action whose request types the connected orchestrator does not advertise. When the manifest is unknown, the action stays enabled and the reactive `501` handles a real mismatch. Only orchestrator-backed surfaces are gated; tenant-plane actions handled entirely by the relay are never gated on orchestrator capability.
-
-The net effect: a feature the connected orchestrator is too old to handle produces a clear "upgrade your orchestrator (connected vX)" signal instead of a misleading malformed-payload error. The system self-heals once the operator upgrades the orchestrator.
+A dashboard request reaches the orchestrator without a pre-flight check: every orchestrator at protocol 4 understands every `dashboard.*` request type the Platform sends. When a request fails schema validation, the orchestrator still distinguishes a request type it has never heard of (`unsupported_request_type`, "upgrade the orchestrator") from a known type with a malformed body (`invalid_payload`, a genuine client error). The error response frame carries the structured `code` and the orchestrator version.
 
 ## See also

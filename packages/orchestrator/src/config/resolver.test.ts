@@ -90,11 +90,23 @@ describe('envKeyToConfigPath', () => {
     expect(envKeyToConfigPath('KICI_CLUSTER_ROLE')).toEqual(['cluster', 'role']);
   });
 
-  it('maps KICI_CLUSTER_COORDINATOR_URL to cluster.coordinatorUrl path', () => {
-    expect(envKeyToConfigPath('KICI_CLUSTER_COORDINATOR_URL')).toEqual([
+  it('maps KICI_CLUSTER_COORDINATOR_URLS to cluster.coordinatorUrls path', () => {
+    expect(envKeyToConfigPath('KICI_CLUSTER_COORDINATOR_URLS')).toEqual([
       'cluster',
-      'coordinatorUrl',
+      'coordinatorUrls',
     ]);
+  });
+
+  it('does not map the removed singular KICI_CLUSTER_COORDINATOR_URL', () => {
+    // fails-when: the singular name still has an overlay mapping.
+    expect(envKeyToConfigPath('KICI_CLUSTER_COORDINATOR_URL')).toBeNull();
+  });
+
+  it('ignores KICI_PROVIDERS_GITHUB_* keys', () => {
+    // fails-when: the provider overlay branch still writes providers.github.
+    expect(envKeyToConfigPath('KICI_PROVIDERS_GITHUB_MAIN_APP_ID')).toBeNull();
+    const out = applyEnvOverrides({}, { KICI_PROVIDERS_GITHUB_MAIN_APP_ID: '1' });
+    expect(out).not.toHaveProperty('providers');
   });
 
   it('maps KICI_CLUSTER_PEER_STALE_TIMEOUT_MS to cluster.peerStaleTimeoutMs path', () => {
@@ -234,8 +246,7 @@ describe('applyEnvOverrides', () => {
 
   it('ignores non-KICI_ env vars', () => {
     const config = { database: { url: 'pg://yaml' } };
-    // DATABASE_URL was removed from LEGACY_MAPPINGS in P5 — it is no
-    // longer recognized; only KICI_DATABASE_URL applies.
+    // DATABASE_URL is not read unprefixed; only KICI_DATABASE_URL applies.
     const env = { DATABASE_URL: 'pg://legacy', KICI_DATABASE_URL: 'pg://env' };
     const result = applyEnvOverrides(config, env);
     expect((result.database as Record<string, unknown>).url).toBe('pg://env');
@@ -523,8 +534,7 @@ describe('resolveFullConfig', () => {
   it('KICI_DATABASE_URL is the only accepted form', () => {
     const localConfig = makeMinimalLocal();
     const dbConfig = makeMinimalShared();
-    // Even with both set, only KICI_DATABASE_URL applies — the legacy form
-    // was removed from LEGACY_MAPPINGS in P5.
+    // Even with both set, only KICI_DATABASE_URL applies.
     const env = {
       DATABASE_URL: 'pg://legacy',
       KICI_DATABASE_URL: 'pg://kici',
@@ -569,12 +579,12 @@ describe('resolveFullConfig', () => {
 
   it('forwards cluster.role from merged config', () => {
     const localConfig = makeMinimalLocal({
-      cluster: { role: 'worker', coordinatorUrl: 'http://coordinator:4000' },
+      cluster: { role: 'worker', coordinatorUrls: ['http://coordinator:4000'] },
     });
     const env = { KICI_DATABASE_URL: 'pg://env' };
     const result = resolveFullConfig(localConfig, null, env);
     expect(result.cluster.role).toBe('worker');
-    expect(result.cluster.coordinatorUrl).toBe('http://coordinator:4000');
+    expect(result.cluster.coordinatorUrls).toEqual(['http://coordinator:4000']);
   });
 
   it('forwards cluster.peerStaleTimeoutMs from DB config', () => {
@@ -592,11 +602,12 @@ describe('resolveFullConfig', () => {
     });
     const env = {
       KICI_CLUSTER_ROLE: 'worker',
-      KICI_CLUSTER_COORDINATOR_URL: 'http://coord:4000',
+      KICI_CLUSTER_COORDINATOR_URLS: 'http://coord:4000, http://coord:4100',
     };
     const result = resolveFullConfig(localConfig, null, env);
     expect(result.cluster.role).toBe('worker');
-    expect(result.cluster.coordinatorUrl).toBe('http://coord:4000');
+    // breaks-if-wrong: the comma-separated env form must split like the startup loader.
+    expect(result.cluster.coordinatorUrls).toEqual(['http://coord:4000', 'http://coord:4100']);
   });
 
   it('flows KICI_SERVER_TLS_CERT_PATH through to appConfig.tlsCertPath', () => {

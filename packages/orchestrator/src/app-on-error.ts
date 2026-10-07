@@ -3,7 +3,7 @@
  *
  * Without one, Hono answers an unhandled throw with a bare, unstructured 500:
  * no JSON body, no route context, and nothing written to our own logs. Every
- * admin router already catches inside its handlers (routes/admin-errors.ts),
+ * admin sub-app answers its own errors through its own onError (routes/admin-env.ts),
  * and the auth path catches inside its middleware (routes/admin-auth.ts) -- this
  * covers whatever neither does.
  *

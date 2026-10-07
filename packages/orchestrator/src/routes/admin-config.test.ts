@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { ScalerReloadOutcome } from '@kici-dev/engine';
 import { Hono } from 'hono';
 import { createConfigAdminRoutes, type ConfigRouteDeps } from './admin-config.js';
 import { AUTH_ERROR } from './admin-auth.js';
@@ -364,6 +365,24 @@ describe('admin-config routes', () => {
         source: 'http',
         drain: undefined,
       });
+    });
+
+    // fails-when: the route drops the scaler outcome from the reload result
+    it('returns the scaler outcome beside the config result', async () => {
+      const { app, deps } = createTestApp();
+      const scaler = { outcome: ScalerReloadOutcome.enum.rejected, errors: ['overlap'] };
+      (deps.configReloader as any).executeReload.mockResolvedValueOnce({
+        success: true,
+        version: 4,
+        scaler,
+      });
+      const res = await app.request('/admin/config/reload', {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json()).scaler).toEqual(scaler);
     });
 
     it('passes drain option', async () => {

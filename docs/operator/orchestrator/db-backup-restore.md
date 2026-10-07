@@ -121,8 +121,8 @@ Tune the WARN threshold cluster-wide with the `KICI_BACKUP_STALENESS_WARN_HOURS`
 environment variable, or per org at runtime:
 
 ```bash
-kici-admin org-settings backup-freshness set --hours 12 --customer-id <org>
-kici-admin org-settings backup-freshness reset --customer-id <org>   # back to the cluster default
+kici-admin org-settings backup-freshness set --hours 12 --org <org>
+kici-admin org-settings backup-freshness reset --org <org>   # back to the cluster default
 ```
 
 The global check warns against the **strictest** per-org threshold, since a

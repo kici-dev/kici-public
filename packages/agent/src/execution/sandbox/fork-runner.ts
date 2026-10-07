@@ -194,7 +194,6 @@ export function buildCloneRequest(
     repoUrl: dispatch.repoUrl,
     ref: dispatch.ref,
     sha: dispatch.sha,
-    token: dispatch.token,
     sourceAuth: dispatch.sourceAuth,
     workflowAuth: dispatch.workflowAuth,
     ...(extra?.credentialHelperPath ? { credentialHelperPath: extra.credentialHelperPath } : {}),

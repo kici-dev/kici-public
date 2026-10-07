@@ -1,33 +1,50 @@
 ---
 title: 'kici-admin: org settings'
-description: 'Org-level security policy: npm, cache, dispatch, approval, CI trust, and dashboard-write policy'
+description: 'Org ids, and org-level security policy: npm, cache, dispatch, approval, CI trust, and dashboard-write policy'
 ---
 
 ## Guide
 
+### org -- the org ids this orchestrator holds
+
+```bash
+kici-admin org list [--json] [--database-url <url>]
+```
+
+Lists every org id this orchestrator holds data for. The commands that take an org id (`secret`, `context`, `variable`, `remote-source`, `org-settings`, `trust-policy`) accept these values. Each row names the data that holds the org id:
+
+- `platform` — the org the Platform attached this orchestrator to. Only the admin API reports it.
+- `remote-source` — the anchor for `kici run remote`, created when the orchestrator authenticates with the Platform.
+- `source`, `generic-source` — webhook sources. A source added without an org is filed under `__default__`.
+- `context`, `secret`, `org-settings`, `trust-policy`, `registration` — the data of those commands.
+
+The command reads the orchestrator admin API (`GET /api/v1/admin/org-ids`). It needs an unscoped admin token with the `secret.read` permission (owner or admin). `--database-url` (or `KICI_DATABASE_URL`) reads the orchestrator database instead. That mode cannot see the Platform connection, so it does not list the `platform` source, and the table output says so. With `--json`, the output is `{ "platformAttachment": "attached" | "pending" | "none", "attachedOrgId": …, "orgs": [{ "orgId": …, "sources": […] }] }`. The database mode leaves out the first two fields. `pending` means that the orchestrator has not authenticated with the Platform yet.
+
+`kici-admin orchestrator status` also shows the Platform org. See [cluster and infrastructure](./cluster-and-infra.md).
+
 ### org-settings -- org-level security policy
 
 ```bash
-kici-admin org-settings global-workflows show --customer-id <id> [--format json|table]
-kici-admin org-settings global-workflows allow-add <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
-kici-admin org-settings global-workflows allow-remove <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
-kici-admin org-settings global-workflows deny-add <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
-kici-admin org-settings global-workflows deny-remove <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
-kici-admin org-settings allow-http-npm true|false --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache show --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache set-quota <bytes> --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache set-ttl <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings dispatch-ack show --customer-id <id> [--format json|table]
-kici-admin org-settings dispatch-ack set <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings dispatch-ack reset --customer-id <id> [--format json|table]
-kici-admin org-settings approval show --customer-id <id> [--format json|table]
-kici-admin org-settings approval set-expiry <seconds> --customer-id <id> [--format json|table]
-kici-admin org-settings approval set-self-approval true|false --customer-id <id> [--format json|table]
+kici-admin org-settings global-workflows show --org <id> [--format json|table]
+kici-admin org-settings global-workflows allow-add <pattern> --org <id> [--source <routingKey>] [--format json|table]
+kici-admin org-settings global-workflows allow-remove <pattern> --org <id> [--source <routingKey>] [--format json|table]
+kici-admin org-settings global-workflows deny-add <pattern> --org <id> [--source <routingKey>] [--format json|table]
+kici-admin org-settings global-workflows deny-remove <pattern> --org <id> [--source <routingKey>] [--format json|table]
+kici-admin org-settings allow-http-npm true|false --org <id> [--format json|table]
+kici-admin org-settings user-cache show --org <id> [--format json|table]
+kici-admin org-settings user-cache set-quota <bytes> --org <id> [--format json|table]
+kici-admin org-settings user-cache set-ttl <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings dispatch-ack show --org <id> [--format json|table]
+kici-admin org-settings dispatch-ack set <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings dispatch-ack reset --org <id> [--format json|table]
+kici-admin org-settings approval show --org <id> [--format json|table]
+kici-admin org-settings approval set-expiry <seconds> --org <id> [--format json|table]
+kici-admin org-settings approval set-self-approval true|false --org <id> [--format json|table]
 ```
 
 Manages per-org global-workflow policy (workflow-author allow-list and source-repo deny-list). Settings are org-scoped — there is one row per `customer_id` regardless of how many webhook sources the org has. Each list entry can optionally pin to a specific source via `--source <routingKey>`. Calls the orchestrator admin API directly (not the Platform dashboard proxy) so it stays operable even when Platform is unavailable.
 
-- `--customer-id <id>` (alias: `--org <id>`) selects the org row.
+- `--org <id>` selects the org row. `kici-admin org list` prints the org ids.
 - `--source <routingKey>` on `*-add` stores the entry pinned to that single webhook source. Omit for "any source in the org".
 - `--source <routingKey>` on `*-remove` matches a source-qualified entry. Omit to remove the unqualified entry.
 - `show` prints the current settings row for the given org. Its `Enabled (cluster-wide)` line is informational — it reports the effective fleet-wide master switch (`cluster_settings.global_workflows_enabled`), which you set with [`kici-admin cluster-settings`](./cluster-and-infra.md), not a per-org value.
@@ -55,8 +72,8 @@ A pattern of one of these shapes that is already stored is not applied as a nega
 #### `allow-http-npm` — permit non-https private npm registries
 
 ```bash
-kici-admin org-settings allow-http-npm true --customer-id <id>
-kici-admin org-settings allow-http-npm false --customer-id <id>
+kici-admin org-settings allow-http-npm true --org <id>
+kici-admin org-settings allow-http-npm false --org <id>
 ```
 
 Toggles `org_settings.allow_http_npm_registries`. When `false` (the default), any workflow `registries:` entry whose URL is `http://<non-loopback-host>` is rejected at dispatch time. Loopback (`localhost` / `127.0.0.0/8` / `::1`) and `*.local` hostnames are **always** allowed regardless of this toggle, so a developer iterating against a local Verdaccio container does not need to flip it.
@@ -70,11 +87,11 @@ See [Private npm registries](../../../user/private-registries.md) for the workfl
 #### `user-cache` — per-org cache quota + entry TTL
 
 ```bash
-kici-admin org-settings user-cache show --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache set-quota <bytes> --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache set-ttl <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache reset-quota --customer-id <id> [--format json|table]
-kici-admin org-settings user-cache reset-ttl --customer-id <id> [--format json|table]
+kici-admin org-settings user-cache show --org <id> [--format json|table]
+kici-admin org-settings user-cache set-quota <bytes> --org <id> [--format json|table]
+kici-admin org-settings user-cache set-ttl <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings user-cache reset-quota --org <id> [--format json|table]
+kici-admin org-settings user-cache reset-ttl --org <id> [--format json|table]
 ```
 
 Reads and writes the per-org byte quota and per-entry TTL for the user-facing cache (`ctx.cache` / the declarative job-step `cache:`). These map to the NULLABLE columns `org_settings.user_cache_quota_bytes` and `org_settings.user_cache_ttl_ms`. When a column is NULL (the default), the orchestrator uses the cluster-wide default from `KICI_USER_CACHE_QUOTA_BYTES` (5 GiB) / `KICI_USER_CACHE_TTL_MS` (7 days); a positive-integer override takes precedence at cache-operation time.
@@ -88,15 +105,15 @@ This is the cluster-configurable knob for "this one tenant needs a bigger cache 
 #### `artifacts` — per-org artifact quota, TTL, and size caps
 
 ```bash
-kici-admin org-settings artifacts show --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts set-quota <bytes> --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts set-ttl <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts set-max-bytes <bytes> --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts set-max-per-run <count> --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts reset-quota --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts reset-ttl --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts reset-max-bytes --customer-id <id> [--format json|table]
-kici-admin org-settings artifacts reset-max-per-run --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts show --org <id> [--format json|table]
+kici-admin org-settings artifacts set-quota <bytes> --org <id> [--format json|table]
+kici-admin org-settings artifacts set-ttl <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings artifacts set-max-bytes <bytes> --org <id> [--format json|table]
+kici-admin org-settings artifacts set-max-per-run <count> --org <id> [--format json|table]
+kici-admin org-settings artifacts reset-quota --org <id> [--format json|table]
+kici-admin org-settings artifacts reset-ttl --org <id> [--format json|table]
+kici-admin org-settings artifacts reset-max-bytes --org <id> [--format json|table]
+kici-admin org-settings artifacts reset-max-per-run --org <id> [--format json|table]
 ```
 
 The four budget knobs for user-facing artifacts (`ctx.artifacts.upload` / `download`). Each maps to a NULLABLE `org_settings` column; NULL means the cluster-wide default applies.
@@ -114,9 +131,9 @@ The four budget knobs for user-facing artifacts (`ctx.artifacts.upload` / `downl
 #### `backup-freshness` — per-org backup staleness WARN threshold
 
 ```bash
-kici-admin org-settings backup-freshness show --customer-id <id> [--format json|table]
-kici-admin org-settings backup-freshness set --hours <n> --customer-id <id> [--format json|table]
-kici-admin org-settings backup-freshness reset --customer-id <id> [--format json|table]
+kici-admin org-settings backup-freshness show --org <id> [--format json|table]
+kici-admin org-settings backup-freshness set --hours <n> --org <id> [--format json|table]
+kici-admin org-settings backup-freshness reset --org <id> [--format json|table]
 ```
 
 How old the newest `backup_runs` row may get before the `diagnose` backup check reports WARN. Maps to `org_settings.backup_staleness_warn_hours`; NULL means the cluster default from `KICI_BACKUP_STALENESS_WARN_HOURS` (24 hours) applies.
@@ -127,9 +144,9 @@ How old the newest `backup_runs` row may get before the `diagnose` backup check 
 #### `ingest-concurrency` — per-org webhook ingest cap
 
 ```bash
-kici-admin org-settings ingest-concurrency show --customer-id <id> [--format json|table]
-kici-admin org-settings ingest-concurrency set <count> --customer-id <id> [--format json|table]
-kici-admin org-settings ingest-concurrency reset --customer-id <id> [--format json|table]
+kici-admin org-settings ingest-concurrency show --org <id> [--format json|table]
+kici-admin org-settings ingest-concurrency set <count> --org <id> [--format json|table]
+kici-admin org-settings ingest-concurrency reset --org <id> [--format json|table]
 ```
 
 The maximum number of concurrent webhook-processing pipelines the admission controller admits for this org before shedding with `429` + `Retry-After`. Maps to a NULLABLE `org_settings` column; NULL means the cluster default from `KICI_INGEST_ORG_MAX_CONCURRENCY` (32) applies.
@@ -139,9 +156,9 @@ Lower it to rein in a noisy tenant that is crowding out the rest of the cluster;
 #### `queue-timeout` — per-org dispatch-queue job timeout
 
 ```bash
-kici-admin org-settings queue-timeout show --customer-id <id> [--format json|table]
-kici-admin org-settings queue-timeout set <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings queue-timeout reset --customer-id <id> [--format json|table]
+kici-admin org-settings queue-timeout show --org <id> [--format json|table]
+kici-admin org-settings queue-timeout set <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings queue-timeout reset --org <id> [--format json|table]
 ```
 
 How long a job may sit queued before it expires. The deadline resolves as `job.timeoutMs` → this org override → the cluster default from `KICI_QUEUE_TIMEOUT_MS` (1 hour), so a workflow that sets its own job timeout always wins.
@@ -152,9 +169,9 @@ How long a job may sit queued before it expires. The deadline resolves as `job.t
 #### `cache-upload-settle` — per-org build cache publish wait
 
 ```bash
-kici-admin org-settings cache-upload-settle show --customer-id <id> [--format json|table]
-kici-admin org-settings cache-upload-settle set <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings cache-upload-settle reset --customer-id <id> [--format json|table]
+kici-admin org-settings cache-upload-settle show --org <id> [--format json|table]
+kici-admin org-settings cache-upload-settle set <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings cache-upload-settle reset --org <id> [--format json|table]
 ```
 
 How long a build job's success waits for the orchestrator to publish the cache that the build uploaded. The jobs that wait on the build read the published cache when the build succeeds. Without the wait, they can start before the publish finishes and install their dependencies themselves. The value resolves as this org override → the cluster default from `KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS` (10 seconds).
@@ -166,9 +183,9 @@ How long a build job's success waits for the orchestrator to publish the cache t
 #### `reroute` — per-org cross-peer reroute tunables
 
 ```bash
-kici-admin org-settings reroute show --customer-id <id> [--format json|table]
-kici-admin org-settings reroute set --customer-id <id> [--window <ms>] [--ack-timeout <ms>] [--max-hops <n>] [--spawn-max-attempts <n>] [--spawn-retry-backoff <ms>] [--format json|table]
-kici-admin org-settings reroute reset --customer-id <id> [--format json|table]
+kici-admin org-settings reroute show --org <id> [--format json|table]
+kici-admin org-settings reroute set --org <id> [--window <ms>] [--ack-timeout <ms>] [--max-hops <n>] [--spawn-max-attempts <n>] [--spawn-retry-backoff <ms>] [--format json|table]
+kici-admin org-settings reroute reset --org <id> [--format json|table]
 ```
 
 The knobs governing how a coordinator hands a job to a sibling peer that can actually run it, and how often a worker retries the agent spawn for a job it received. Each maps to a NULLABLE `org_settings` column; NULL means the cluster default applies.
@@ -190,10 +207,10 @@ See [Multi-orchestrator clustering](../../../architecture/clustering/multi-orche
 #### `sandbox-allowlist` — container-sandbox escape hatches
 
 ```bash
-kici-admin org-settings sandbox-allowlist show --customer-id <id> [--format json|table]
-kici-admin org-settings sandbox-allowlist set-capabilities <capabilities> --customer-id <id> [--format json|table]
-kici-admin org-settings sandbox-allowlist allow-host-network true|false --customer-id <id> [--format json|table]
-kici-admin org-settings sandbox-allowlist reset --customer-id <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist show --org <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist set-capabilities <capabilities> --org <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist allow-host-network true|false --org <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist reset --org <id> [--format json|table]
 ```
 
 Gates the two escape hatches a container job (one with a `container:` image) can request through the SDK `sandbox:` field. **The default is deny-all** — an empty capability list and host networking off — and a non-allow-listed request **fails the run at dispatch**, naming the offending capability or knob, rather than being silently downgraded.
@@ -207,9 +224,9 @@ Every entry here widens the isolation boundary for the whole org, so grant the n
 #### `scaler-spawn-timeout` — per-org scaler spawn deadline
 
 ```bash
-kici-admin org-settings scaler-spawn-timeout show --customer-id <id> [--format json|table]
-kici-admin org-settings scaler-spawn-timeout set <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings scaler-spawn-timeout reset --customer-id <id> [--format json|table]
+kici-admin org-settings scaler-spawn-timeout show --org <id> [--format json|table]
+kici-admin org-settings scaler-spawn-timeout set <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings scaler-spawn-timeout reset --org <id> [--format json|table]
 ```
 
 The deadline for a single scaler spawn — image pull plus container create plus start. A hung runtime or registry that blows the deadline is aborted, so it can no longer pin its per-backend spawn-semaphore slot and head-of-line block every other queued spawn.
@@ -219,9 +236,9 @@ Maps to a NULLABLE `org_settings` column; NULL means the cluster default from `K
 #### `dispatch-ack` — per-org dispatch acknowledgment deadline
 
 ```bash
-kici-admin org-settings dispatch-ack show --customer-id <id> [--format json|table]
-kici-admin org-settings dispatch-ack set <milliseconds> --customer-id <id> [--format json|table]
-kici-admin org-settings dispatch-ack reset --customer-id <id> [--format json|table]
+kici-admin org-settings dispatch-ack show --org <id> [--format json|table]
+kici-admin org-settings dispatch-ack set <milliseconds> --org <id> [--format json|table]
+kici-admin org-settings dispatch-ack reset --org <id> [--format json|table]
 ```
 
 Reads and writes the per-org dispatch-acknowledgment deadline. This is how long the orchestrator waits for the agent to answer a dispatched job before it treats the dispatch as lost. The agent answers with an accept acknowledgment, a refusal, or a `running` status. On expiry the orchestrator requeues the job and disconnects the unresponsive agent, so a dispatch dropped in an agent's socket teardown no longer strands the run until a timeout. The agent's other running jobs get the same handling as when an agent loses its connection.
@@ -237,9 +254,9 @@ Raise it for an org whose agents sit behind a high-latency network where the 10-
 #### `approval` — held-approval expiry and self-approval policy
 
 ```bash
-kici-admin org-settings approval show --customer-id <id> [--format json|table]
-kici-admin org-settings approval set-expiry <seconds> --customer-id <id> [--format json|table]
-kici-admin org-settings approval set-self-approval true|false --customer-id <id> [--format json|table]
+kici-admin org-settings approval show --org <id> [--format json|table]
+kici-admin org-settings approval set-expiry <seconds> --org <id> [--format json|table]
+kici-admin org-settings approval set-self-approval true|false --org <id> [--format json|table]
 ```
 
 Controls how held approval elements (workflow / job / step gates) behave for the org. Both settings have non-null defaults, so there is no "reset to cluster default" — a `set` replaces the current value.
@@ -251,26 +268,26 @@ Controls how held approval elements (workflow / job / step gates) behave for the
 #### `dashboard-writes` — dashboard write policy matrix
 
 ```bash
-kici-admin org-settings dashboard-writes show --customer-id <id> [--category <name>] [--sensitivity <name>] [--format json|table]
-kici-admin org-settings dashboard-writes set --customer-id <id> --op <name>=<true|false> [--op ...] [--category <name>] [--sensitivity <name>] [--enabled true|false] [--format json|table]
-kici-admin org-settings dashboard-writes reset --customer-id <id> [--format json|table]
+kici-admin org-settings dashboard-writes show --org <id> [--category <name>] [--sensitivity <name>] [--format json|table]
+kici-admin org-settings dashboard-writes set --org <id> --op <name>=<true|false> [--op ...] [--category <name>] [--sensitivity <name>] [--enabled true|false] [--format json|table]
+kici-admin org-settings dashboard-writes reset --org <id> [--format json|table]
 ```
 
 Manages the per-orch dashboard write policy — the matrix of `dashboard.*` write operations the orchestrator will accept when proxied through Platform. Empty policy = all operations enabled (permissive default).
 
 - `show` prints the current policy. Filter to one category (`Secrets`, `Variables`, `Environments`, `Bindings`, `Held runs`, `DLQ`, `Registrations`, `Topology`) or one sensitivity bucket (`plaintext`, `authority`, `dispatch`).
-- `set` flips one or more operations. Pass `--op <name>=<bool>` (repeatable) for individual operations, or combine `--category` / `--sensitivity` with `--enabled <bool>` to flip every operation in the matching group at once. The CLI prints the planned change before applying.
+- `set` flips one or more operations. Pass `--op <name>=<permissive|encrypted|disabled>` (repeatable) for individual operations, or combine `--category` / `--sensitivity` with `--enabled <bool>` to flip every operation in the matching group at once. The CLI prints the planned change before applying.
 - `reset` returns every operation to the permissive default.
-- `--customer-id <id>` (alias `--org`) selects the org row.
+- `--org <id>` selects the org row.
 
 ### trust-policy -- CI trust policy for fork pull requests
 
 ```bash
-kici-admin trust-policy show --customer-id <id> [--format json|table]
-kici-admin trust-policy directory --customer-id <id> [--format json|table]
-kici-admin trust-policy set --customer-id <id> [--fork-policy ignore|hold|allow] [--approval-expiry-hours <n>] [--approval-expiry-seconds <n>] [--format json|table]
-kici-admin trust-policy directory-set --customer-id <id> --user-id <id> --provider-username <name> --provider-user-id <id> --ci-trust none|read|write|admin [--provider <name>] [--format json|table]
-kici-admin trust-policy directory-remove --customer-id <id> --user-id <id> [--format json|table]
+kici-admin trust-policy show --org <id> [--format json|table]
+kici-admin trust-policy directory --org <id> [--format json|table]
+kici-admin trust-policy set --org <id> [--fork-policy ignore|hold|allow] [--approval-expiry <duration>] [--format json|table]
+kici-admin trust-policy directory-set --org <id> --user-id <id> --provider-username <name> --provider-user-id <id> --ci-trust none|read|write|admin [--provider <name>] [--format json|table]
+kici-admin trust-policy directory-remove --org <id> --user-id <id> [--format json|table]
 ```
 
 The org-wide switch deciding what happens to a pull request from a fork. `--fork-policy` takes one of three values:
@@ -279,9 +296,9 @@ The org-wide switch deciding what happens to a pull request from a fork. `--fork
 - `hold` — the run parks behind a security approval.
 - `allow` — the pull request runs, with reduced privilege.
 
-`--approval-expiry-hours` and `--approval-expiry-seconds` set how long a security hold waits for an approval before it expires. They are two spellings of one window. Hours is the ergonomic form (integer, at least 1). Seconds is the only form that can express a window shorter than an hour (integer, at least 1, up to one year). Setting either recomputes the other, so they cannot disagree. Pass both and the seconds value wins, because it is the more specific. The CLI then prints a warning naming the value it ignored.
+`--approval-expiry` sets how long a security hold waits for an approval before it expires. It takes a duration made of hours, minutes, and seconds, in that order and with no spaces: `72h`, `30m`, `90s`, or `1h30m`. The window is from 1 second to 1 year. A value outside that range, or one that is not a duration, stops the command with an error.
 
-`show` prints a whole-hour window as hours (`72 h`) and anything finer as seconds (`30 s`).
+`show` prints the window as a duration, for example `72h` or `1h30m`.
 
 `directory` prints the stored approval directory — the identity links, member CI trust levels, and teams that `/kici approve` is resolved against. Use it to tell a stale directory from an absent one when an approval comment is refused.
 
@@ -291,7 +308,7 @@ Where a Platform is attached it owns the directory: it pushes the whole thing on
 
 ```bash
 kici-admin trust-policy directory-set \
-  --customer-id acme \
+  --org acme \
   --user-id alice \
   --provider-username alice \
   --provider-user-id 4242 \
@@ -316,13 +333,13 @@ See [CI security](../../../architecture/security/ci-security.md) for the threat 
 
 ```bash
 # What is this run waiting for, and who may answer it?
-kici-admin held-run list --customer-id org-1 --run-id run-abc
+kici-admin held-run list --org org-1 --run-id run-abc
 
 # Let it run.
-kici-admin held-run approve --customer-id org-1 --run-id run-abc
+kici-admin held-run approve --org org-1 --run-id run-abc
 
 # Or cancel it.
-kici-admin held-run reject --customer-id org-1 --run-id run-abc --reason "wrong branch"
+kici-admin held-run reject --org org-1 --run-id run-abc --reason "wrong branch"
 ```
 
 `list` prints one entry per pending hold: its id, the element it holds, its type and queue, when it expires, and the approvers its requirement names. Read the approver line first — a hold naming a specific user or team is only answerable by a token that requirement accepts.
@@ -365,7 +382,7 @@ Synopsis: `kici-admin held-run approve [options]`
 
 | Option               | Default | Description                                                                                                                                                   |
 | -------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>` |         | Org / customer id                                                                                                                                             |
+| `--org <id>`         |         | Org id                                                                                                                                                        |
 | `--run-id <id>`      |         | Run whose hold to approve                                                                                                                                     |
 | `--job <name>`       |         | Match a hold by its job name                                                                                                                                  |
 | `--step <index>`     |         | Match a step-scoped hold by its step index                                                                                                                    |
@@ -381,11 +398,11 @@ Synopsis: `kici-admin held-run list [options]`
 
 **Options**
 
-| Option               | Default | Description                |
-| -------------------- | ------- | -------------------------- |
-| `--customer-id <id>` |         | Org / customer id          |
-| `--run-id <id>`      |         | Run whose holds to list    |
-| `--format <format>`  | `table` | Output format: json\|table |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--run-id <id>`     |         | Run whose holds to list    |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin held-run reject`
 
@@ -397,7 +414,7 @@ Synopsis: `kici-admin held-run reject [options]`
 
 | Option               | Default | Description                                                                                                                                                   |
 | -------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>` |         | Org / customer id                                                                                                                                             |
+| `--org <id>`         |         | Org id                                                                                                                                                        |
 | `--run-id <id>`      |         | Run whose hold to reject                                                                                                                                      |
 | `--reason <text>`    |         | Why the hold is being rejected                                                                                                                                |
 | `--job <name>`       |         | Match a hold by its job name                                                                                                                                  |
@@ -405,6 +422,25 @@ Synopsis: `kici-admin held-run reject [options]`
 | `--hold <id>`        |         | Match one hold by its own id (ignores every other filter)                                                                                                     |
 | `--hold-type <type>` |         | Narrow to holds of one type (reviewer \| timer \| concurrency \| security)                                                                                    |
 | `--as <user-id>`     |         | Answer as this KiCI user id, so the decision satisfies the hold's {user} / {team} clauses. Register the id first with `kici-admin trust-policy directory-set` |
+
+### `kici-admin org`
+
+Inspect the org ids this orchestrator holds data for
+
+Synopsis: `kici-admin org`
+
+### `kici-admin org list`
+
+List every org id this orchestrator holds data for, and the data that names it (the Platform connection, sources, contexts, secrets, org settings, trust policy, registrations)
+
+Synopsis: `kici-admin org list [options]`
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
 
 ### `kici-admin org-settings`
 
@@ -426,11 +462,10 @@ Synopsis: `kici-admin org-settings allow-http-npm <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings allow-untrusted-dockerfile-builds`
 
@@ -446,11 +481,10 @@ Synopsis: `kici-admin org-settings allow-untrusted-dockerfile-builds <value> [op
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings approval`
 
@@ -472,11 +506,10 @@ Synopsis: `kici-admin org-settings approval set-expiry <seconds> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings approval set-self-approval`
 
@@ -492,11 +525,10 @@ Synopsis: `kici-admin org-settings approval set-self-approval <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings approval show`
 
@@ -506,11 +538,10 @@ Synopsis: `kici-admin org-settings approval show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts`
 
@@ -526,11 +557,10 @@ Synopsis: `kici-admin org-settings artifacts reset-max-bytes [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts reset-max-per-run`
 
@@ -540,11 +570,10 @@ Synopsis: `kici-admin org-settings artifacts reset-max-per-run [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts reset-quota`
 
@@ -554,11 +583,10 @@ Synopsis: `kici-admin org-settings artifacts reset-quota [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts reset-ttl`
 
@@ -568,11 +596,10 @@ Synopsis: `kici-admin org-settings artifacts reset-ttl [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts set-max-bytes`
 
@@ -588,11 +615,10 @@ Synopsis: `kici-admin org-settings artifacts set-max-bytes <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts set-max-per-run`
 
@@ -608,11 +634,10 @@ Synopsis: `kici-admin org-settings artifacts set-max-per-run <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts set-quota`
 
@@ -628,11 +653,10 @@ Synopsis: `kici-admin org-settings artifacts set-quota <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts set-ttl`
 
@@ -648,11 +672,10 @@ Synopsis: `kici-admin org-settings artifacts set-ttl <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings artifacts show`
 
@@ -662,11 +685,10 @@ Synopsis: `kici-admin org-settings artifacts show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings backup-freshness`
 
@@ -682,11 +704,10 @@ Synopsis: `kici-admin org-settings backup-freshness reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings backup-freshness set`
 
@@ -696,12 +717,11 @@ Synopsis: `kici-admin org-settings backup-freshness set [options]`
 
 **Options**
 
-| Option               | Default | Description                       |
-| -------------------- | ------- | --------------------------------- |
-| `--hours <n>`        |         | Threshold in hours (integer >= 1) |
-| `--customer-id <id>` |         | Customer / org id (alias: --org)  |
-| `--org <id>`         |         | Alias for --customer-id           |
-| `--format <format>`  | `table` | Output format: json\|table        |
+| Option              | Default | Description                       |
+| ------------------- | ------- | --------------------------------- |
+| `--hours <n>`       |         | Threshold in hours (integer >= 1) |
+| `--org <id>`        |         | Org id                            |
+| `--format <format>` | `table` | Output format: json\|table        |
 
 ### `kici-admin org-settings backup-freshness show`
 
@@ -711,11 +731,10 @@ Synopsis: `kici-admin org-settings backup-freshness show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings cache-upload-settle`
 
@@ -731,11 +750,10 @@ Synopsis: `kici-admin org-settings cache-upload-settle reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings cache-upload-settle set`
 
@@ -751,11 +769,10 @@ Synopsis: `kici-admin org-settings cache-upload-settle set <ms> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings cache-upload-settle show`
 
@@ -765,11 +782,10 @@ Synopsis: `kici-admin org-settings cache-upload-settle show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings dashboard-writes`
 
@@ -785,15 +801,14 @@ Synopsis: `kici-admin org-settings dashboard-writes reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings dashboard-writes set`
 
-Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation (legacy true|false accepted). "encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.
+Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. "encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.
 
 Synopsis: `kici-admin org-settings dashboard-writes set [options]`
 
@@ -801,8 +816,7 @@ Synopsis: `kici-admin org-settings dashboard-writes set [options]`
 
 | Option                 | Default | Description                                                                                        |
 | ---------------------- | ------- | -------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>`   |         | Customer / org id (alias: --org)                                                                   |
-| `--org <id>`           |         | Alias for --customer-id                                                                            |
+| `--org <id>`           |         | Org id                                                                                             |
 | `--op <op=state>`      |         | Single operation posture; repeatable (e.g. --op secrets.set=encrypted --op variables.set=disabled) |
 | `--category <name>`    |         | Apply --enabled to every operation in this category                                                |
 | `--sensitivity <name>` |         | Apply --enabled to every operation in this sensitivity bucket                                      |
@@ -819,8 +833,7 @@ Synopsis: `kici-admin org-settings dashboard-writes show [options]`
 
 | Option                 | Default | Description                                                                                                    |
 | ---------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>`   |         | Customer / org id (alias: --org)                                                                               |
-| `--org <id>`           |         | Alias for --customer-id                                                                                        |
+| `--org <id>`           |         | Org id                                                                                                         |
 | `--category <name>`    |         | Filter to one category (Secrets\|Variables\|Environments\|Bindings\|"Held runs"\|DLQ\|Registrations\|Topology) |
 | `--sensitivity <name>` |         | Filter to one sensitivity bucket (plaintext\|authority\|dispatch)                                              |
 | `--format <format>`    | `table` | Output format: json\|table                                                                                     |
@@ -839,11 +852,10 @@ Synopsis: `kici-admin org-settings dispatch-ack reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings dispatch-ack set`
 
@@ -859,11 +871,10 @@ Synopsis: `kici-admin org-settings dispatch-ack set <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings dispatch-ack show`
 
@@ -873,11 +884,10 @@ Synopsis: `kici-admin org-settings dispatch-ack show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings global-workflows`
 
@@ -901,8 +911,7 @@ Synopsis: `kici-admin org-settings global-workflows allow-add <pattern> [options
 
 | Option                  | Default | Description                                                                |
 | ----------------------- | ------- | -------------------------------------------------------------------------- |
-| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                           |
-| `--org <id>`            |         | Alias for --customer-id                                                    |
+| `--org <id>`            |         | Org id                                                                     |
 | `--source <routingKey>` |         | Pin the entry to one webhook source (e.g. github:42). Omit for any source. |
 | `--format <format>`     | `table` | Output format: json\|table                                                 |
 
@@ -922,8 +931,7 @@ Synopsis: `kici-admin org-settings global-workflows allow-remove <pattern> [opti
 
 | Option                  | Default | Description                                                                    |
 | ----------------------- | ------- | ------------------------------------------------------------------------------ |
-| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                               |
-| `--org <id>`            |         | Alias for --customer-id                                                        |
+| `--org <id>`            |         | Org id                                                                         |
 | `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
 | `--format <format>`     | `table` | Output format: json\|table                                                     |
 
@@ -943,8 +951,7 @@ Synopsis: `kici-admin org-settings global-workflows deny-add <pattern> [options]
 
 | Option                  | Default | Description                                                                |
 | ----------------------- | ------- | -------------------------------------------------------------------------- |
-| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                           |
-| `--org <id>`            |         | Alias for --customer-id                                                    |
+| `--org <id>`            |         | Org id                                                                     |
 | `--source <routingKey>` |         | Pin the entry to one webhook source (e.g. github:42). Omit for any source. |
 | `--format <format>`     | `table` | Output format: json\|table                                                 |
 
@@ -964,8 +971,7 @@ Synopsis: `kici-admin org-settings global-workflows deny-remove <pattern> [optio
 
 | Option                  | Default | Description                                                                    |
 | ----------------------- | ------- | ------------------------------------------------------------------------------ |
-| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                               |
-| `--org <id>`            |         | Alias for --customer-id                                                        |
+| `--org <id>`            |         | Org id                                                                         |
 | `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
 | `--format <format>`     | `table` | Output format: json\|table                                                     |
 
@@ -977,11 +983,10 @@ Synopsis: `kici-admin org-settings global-workflows show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings ingest-concurrency`
 
@@ -997,11 +1002,10 @@ Synopsis: `kici-admin org-settings ingest-concurrency reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings ingest-concurrency set`
 
@@ -1017,11 +1021,10 @@ Synopsis: `kici-admin org-settings ingest-concurrency set <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings ingest-concurrency show`
 
@@ -1031,11 +1034,10 @@ Synopsis: `kici-admin org-settings ingest-concurrency show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings queue-timeout`
 
@@ -1051,11 +1053,10 @@ Synopsis: `kici-admin org-settings queue-timeout reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings queue-timeout set`
 
@@ -1071,11 +1072,10 @@ Synopsis: `kici-admin org-settings queue-timeout set <ms> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings queue-timeout show`
 
@@ -1085,11 +1085,10 @@ Synopsis: `kici-admin org-settings queue-timeout show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings reroute`
 
@@ -1105,11 +1104,10 @@ Synopsis: `kici-admin org-settings reroute reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings reroute set`
 
@@ -1121,8 +1119,7 @@ Synopsis: `kici-admin org-settings reroute set [options]`
 
 | Option                       | Default | Description                                                                    |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------ |
-| `--customer-id <id>`         |         | Customer / org id (alias: --org)                                               |
-| `--org <id>`                 |         | Alias for --customer-id                                                        |
+| `--org <id>`                 |         | Org id                                                                         |
 | `--window <ms>`              |         | Spawn window (integer milliseconds, >= 1000)                                   |
 | `--ack-timeout <ms>`         |         | Reroute ACK timeout (integer milliseconds, >= 1000)                            |
 | `--max-hops <n>`             |         | Maximum peer hops (integer >= 1)                                               |
@@ -1138,11 +1135,10 @@ Synopsis: `kici-admin org-settings reroute show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings sandbox-allowlist`
 
@@ -1164,11 +1160,10 @@ Synopsis: `kici-admin org-settings sandbox-allowlist allow-host-network <value> 
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings sandbox-allowlist reset`
 
@@ -1178,11 +1173,10 @@ Synopsis: `kici-admin org-settings sandbox-allowlist reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings sandbox-allowlist set-capabilities`
 
@@ -1198,11 +1192,10 @@ Synopsis: `kici-admin org-settings sandbox-allowlist set-capabilities <capabilit
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings sandbox-allowlist show`
 
@@ -1212,11 +1205,10 @@ Synopsis: `kici-admin org-settings sandbox-allowlist show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings scaler-spawn-timeout`
 
@@ -1232,11 +1224,10 @@ Synopsis: `kici-admin org-settings scaler-spawn-timeout reset [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings scaler-spawn-timeout set`
 
@@ -1252,11 +1243,10 @@ Synopsis: `kici-admin org-settings scaler-spawn-timeout set <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings scaler-spawn-timeout show`
 
@@ -1266,11 +1256,10 @@ Synopsis: `kici-admin org-settings scaler-spawn-timeout show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings user-cache`
 
@@ -1286,11 +1275,10 @@ Synopsis: `kici-admin org-settings user-cache reset-quota [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings user-cache reset-ttl`
 
@@ -1300,11 +1288,10 @@ Synopsis: `kici-admin org-settings user-cache reset-ttl [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings user-cache set-quota`
 
@@ -1320,11 +1307,10 @@ Synopsis: `kici-admin org-settings user-cache set-quota <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings user-cache set-ttl`
 
@@ -1340,11 +1326,10 @@ Synopsis: `kici-admin org-settings user-cache set-ttl <value> [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin org-settings user-cache show`
 
@@ -1354,11 +1339,10 @@ Synopsis: `kici-admin org-settings user-cache show [options]`
 
 **Options**
 
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin trust-policy`
 
@@ -1374,10 +1358,10 @@ Synopsis: `kici-admin trust-policy directory [options]`
 
 **Options**
 
-| Option               | Default | Description                |
-| -------------------- | ------- | -------------------------- |
-| `--customer-id <id>` |         | Org / customer id          |
-| `--format <format>`  | `table` | Output format: json\|table |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin trust-policy directory-remove`
 
@@ -1387,11 +1371,11 @@ Synopsis: `kici-admin trust-policy directory-remove [options]`
 
 **Options**
 
-| Option               | Default | Description                |
-| -------------------- | ------- | -------------------------- |
-| `--customer-id <id>` |         | Org / customer id          |
-| `--user-id <id>`     |         | KiCI user id to revoke     |
-| `--format <format>`  | `table` | Output format: json\|table |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--user-id <id>`    |         | KiCI user id to revoke     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 ### `kici-admin trust-policy directory-set`
 
@@ -1403,7 +1387,7 @@ Synopsis: `kici-admin trust-policy directory-set [options]`
 
 | Option                       | Default  | Description                                                                                                                              |
 | ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>`         |          | Org / customer id                                                                                                                        |
+| `--org <id>`                 |          | Org id                                                                                                                                   |
 | `--user-id <id>`             |          | KiCI user id the approval is attributed to                                                                                               |
 | `--provider-username <name>` |          | Provider-side username (display only)                                                                                                    |
 | `--provider-user-id <id>`    |          | Immutable provider-side numeric id (GitHub's `sender.id`). Required: an approval comment is matched on this alone, never on the username |
@@ -1419,13 +1403,12 @@ Synopsis: `kici-admin trust-policy set [options]`
 
 **Options**
 
-| Option                              | Default | Description                                                                                                      |
-| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
-| `--customer-id <id>`                |         | Org / customer id                                                                                                |
-| `--format <format>`                 | `table` | Output format: json\|table                                                                                       |
-| `--fork-policy <value>`             |         | Fork PR policy (ignore \| hold \| allow)                                                                         |
-| `--approval-expiry-hours <value>`   |         | Security-hold approval expiry, in hours (integer >= 1)                                                           |
-| `--approval-expiry-seconds <value>` |         | Security-hold approval expiry, in seconds (integer >= 1). Wins over --approval-expiry-hours when both are given. |
+| Option                         | Default | Description                                           |
+| ------------------------------ | ------- | ----------------------------------------------------- |
+| `--org <id>`                   |         | Org id                                                |
+| `--format <format>`            | `table` | Output format: json\|table                            |
+| `--fork-policy <value>`        |         | Fork PR policy (ignore \| hold \| allow)              |
+| `--approval-expiry <duration>` |         | Security-hold approval expiry, e.g. 72h, 30m or 1h30m |
 
 ### `kici-admin trust-policy show`
 
@@ -1435,9 +1418,9 @@ Synopsis: `kici-admin trust-policy show [options]`
 
 **Options**
 
-| Option               | Default | Description                |
-| -------------------- | ------- | -------------------------- |
-| `--customer-id <id>` |         | Org / customer id          |
-| `--format <format>`  | `table` | Output format: json\|table |
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--org <id>`        |         | Org id                     |
+| `--format <format>` | `table` | Output format: json\|table |
 
 <!-- END GENERATED: kici-admin-org-settings -->

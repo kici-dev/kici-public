@@ -862,7 +862,7 @@ export function createApp(deps: AppDependencies) {
           stepIndex: chunk.stepIndex,
           lines: chunk.lines,
           timestamp: chunk.timestamp,
-          ...(chunk.stream !== undefined && { stream: chunk.stream }),
+          stream: chunk.stream,
         }),
     }),
   });
@@ -955,7 +955,7 @@ export function createApp(deps: AppDependencies) {
             stepIndex: msg.stepIndex,
             lines: msg.lines,
             timestamp: msg.timestamp,
-            ...(msg.stream !== undefined && { stream: msg.stream }),
+            stream: msg.stream,
           }),
         ...(deps.logWriter && {
           trackLogChunk: (runId: string, pending: Promise<unknown>) =>
@@ -1010,8 +1010,7 @@ export function createApp(deps: AppDependencies) {
                 jobName: deps.executionTracker.getJobName(msg.runId, msg.jobId) ?? msg.jobId,
                 stepIndex: msg.stepIndex,
                 stepName: msg.stepName,
-                state: msg.state as
-                  'running' | 'success' | 'failed' | 'skipped' | 'cancelled' | 'error',
+                state: msg.state as 'running' | 'success' | 'failed' | 'skipped' | 'cancelled',
                 durationMs: (msg.data?.durationMs as number) ?? undefined,
                 installationId: execContext.installationId,
                 routingKey: execContext.routingKey,
@@ -1732,12 +1731,13 @@ export function createApp(deps: AppDependencies) {
         retryAttestations: deps.retryAttestations,
         globalWorkflowsEnabledDefault: deps.config.globalWorkflowsEnabled,
         databaseUrl: deps.config.databaseUrl,
-        // Backs the staleness warning on `kici-admin trust-policy directory`.
-        // Read lazily so a reconnect is reflected without re-mounting the
-        // routes, matching `getPlatformOrgId` below; omitted entirely in
-        // independent mode, where there is no connection to report.
+        // Back the staleness warning on `kici-admin trust-policy directory` and
+        // the Platform attachment `GET /orgs` reports. Both are read lazily, so
+        // a reconnect is reflected without re-mounting the routes; both are
+        // omitted in independent mode, where there is no connection to report.
         ...(deps.platformClient && {
           platformConnected: () => deps.platformClient?.state === 'authenticated',
+          getPlatformOrgId: () => deps.platformClient?.getOrgId(),
         }),
         // Backs `kici-admin held-run approve|reject`. Absent when no mode hook
         // supplied a job-release callback, which leaves the decision route
@@ -1980,7 +1980,7 @@ export function createApp(deps: AppDependencies) {
     }),
   );
 
-  // Public capability manifest for CLI capability-gap error messages
+  // Public capability manifest: orchestrator and protocol versions
   app.route('/', createCapabilitiesRoutes());
 
   // Orchestrator-owned provenance: public OIDC discovery + JWKS (public halves

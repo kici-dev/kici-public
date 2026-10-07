@@ -27,11 +27,11 @@ import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { CLUSTER_NAME_REGEX, clusterNameSchema } from '@kici-dev/engine/protocol/cluster-name';
 import type { Database } from '../db/types.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import { readClusterName, setClusterName } from '../config/cluster-name.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-cluster-name' });
 
@@ -49,25 +49,15 @@ interface ClusterNameRouteDeps {
   accessLog?: AccessLogWriter;
 }
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
 const updateSchema = z.object({
   name: clusterNameSchema,
 });
 
 export function createClusterNameRoutes(deps: ClusterNameRouteDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
-  app.get('/cluster-name', async (c) => {
+  app.get('/cluster-name', requireUnscoped, async (c) => {
     try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.read');
       const current = await readClusterName(deps.db);
       if (current === null) {
@@ -88,10 +78,8 @@ export function createClusterNameRoutes(deps: ClusterNameRouteDeps): Hono<AdminE
     }
   });
 
-  app.put('/cluster-name', async (c) => {
+  app.put('/cluster-name', requireUnscoped, async (c) => {
     try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.write');
       const body = updateSchema.parse(await c.req.json());
       const prior = await readClusterName(deps.db);

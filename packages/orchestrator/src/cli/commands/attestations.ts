@@ -9,7 +9,7 @@
  * Belongs to `kici-admin`: it works on the orchestrator's database.
  */
 import type { Command } from 'commander';
-import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
+import { createLogger, createPool } from '@kici-dev/shared';
 import { loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
 import { createCacheStorage } from '../../storage/index.js';
@@ -24,16 +24,9 @@ import {
   readAttestations,
   type AttestationListItem,
 } from './attestations-list.js';
+import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 
 const logger = createLogger({ prefix: 'kici-admin-attestations' });
-
-function resolveDatabaseUrl(explicit?: string): string {
-  const url = explicit ?? process.env.KICI_DATABASE_URL;
-  if (!url) {
-    throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  }
-  return url;
-}
 
 /** Build the provenance object-storage handle from config (s3 / filesystem). */
 function buildStorage(config: ReturnType<typeof loadConfig>): CacheStorage | undefined {
@@ -92,26 +85,29 @@ export function registerAttestationsCommands(
       '--include-rejected',
       'Also re-attempt rows previously marked terminally rejected (re-arm)',
     )
-    .action(async (opts: { runId?: string; allPending?: boolean; includeRejected?: boolean }) => {
-      try {
-        const result = await runAttestationRetry(
-          (body) =>
-            getClient().post<{ minted: number; stillPending: number; rejected: number }>(
-              '/api/v1/admin/attestations/retry',
-              body,
-            ),
-          { runId: opts.runId, allPending: opts.allPending, includeRejected: opts.includeRejected },
-        );
-        logger.info('attestations retry complete', result);
-        process.stderr.write(
-          `Minted ${result.minted} deferred attestation(s); ` +
-            `${result.stillPending} still pending; ${result.rejected} rejected.\n`,
-        );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+    .action(
+      cliAction(
+        async (opts: { runId?: string; allPending?: boolean; includeRejected?: boolean }) => {
+          const result = await runAttestationRetry(
+            (body) =>
+              getClient().post<{ minted: number; stillPending: number; rejected: number }>(
+                '/api/v1/admin/attestations/retry',
+                body,
+              ),
+            {
+              runId: opts.runId,
+              allPending: opts.allPending,
+              includeRejected: opts.includeRejected,
+            },
+          );
+          logger.info('attestations retry complete', result);
+          process.stderr.write(
+            `Minted ${result.minted} deferred attestation(s); ` +
+              `${result.stillPending} still pending; ${result.rejected} rejected.\n`,
+          );
+        },
+      ),
+    );
 
   attestations
     .command('reverify')
@@ -119,8 +115,8 @@ export function registerAttestationsCommands(
     .option('--all', 'Re-evaluate every attestation (default: only pending/unverifiable)')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--yes', 'Skip the --all confirmation prompt')
-    .action(async (opts: { all?: boolean; databaseUrl?: string; yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { all?: boolean; databaseUrl?: string; yes?: boolean }) => {
         const config = loadConfig();
         const url = resolveDatabaseUrl(opts.databaseUrl ?? (config.databaseUrl || undefined));
         if (opts.all && !opts.yes) {
@@ -146,11 +142,8 @@ export function registerAttestationsCommands(
           await db.destroy();
           await pool.end().catch(() => {});
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   attestations
     .command('list')
@@ -161,14 +154,14 @@ export function registerAttestationsCommands(
     .option('--json', 'Emit the raw JSON envelope instead of a table')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .action(
-      async (opts: {
-        runId?: string;
-        jobId?: string;
-        limit: string;
-        json?: boolean;
-        databaseUrl?: string;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          runId?: string;
+          jobId?: string;
+          limit: string;
+          json?: boolean;
+          databaseUrl?: string;
+        }) => {
           // Pure DB read — no storage / trust-root config needed, so resolve the
           // URL directly from --database-url / KICI_DATABASE_URL (matching the
           // sibling `host list` / `environment list` reads) rather than through
@@ -192,10 +185,7 @@ export function registerAttestationsCommands(
             await db.destroy();
             await pool.end().catch(() => {});
           }
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 }

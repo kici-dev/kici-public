@@ -75,7 +75,7 @@ verification) and keeps everything else internal is the typical shape.
 - **Clustering (any mode)** — peers must reach each other's `/ws/peer` over the
   address set in `KICI_CLUSTER_ADDRESS`; in the Platform-connected modes, peers that
   cannot reach each other directly fall back to relaying through the Platform.
-  Workers dial `KICI_CLUSTER_COORDINATOR_URL` outbound only.
+  Workers dial each URL in `KICI_CLUSTER_COORDINATOR_URLS` outbound only.
 
 ## Job egress is filtered by default
 

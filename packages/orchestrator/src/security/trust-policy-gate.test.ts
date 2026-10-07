@@ -21,7 +21,7 @@ import {
 /** A policy whose only meaningful field is the fork switch under test. */
 const policy = (forkPolicy: string): TrustPolicy => ({
   forkPolicy: forkPolicy as TrustPolicy['forkPolicy'],
-  approvalExpiryHours: 72,
+  approvalExpirySeconds: 72 * SECONDS_PER_HOUR,
 });
 
 /**
@@ -75,28 +75,15 @@ describe('evaluateTrustPolicy (fork switch)', () => {
 
   it('carries the approval expiry from the policy that produced the verdict', () => {
     const out = evaluateTrustPolicy(
-      { ...policy(ForkPolicy.enum.hold), approvalExpiryHours: 12 },
+      { ...policy(ForkPolicy.enum.hold), approvalExpirySeconds: 12 * SECONDS_PER_HOUR },
       FORK,
     );
     expect(out).toMatchObject({ action: 'hold', approvalExpirySeconds: 12 * SECONDS_PER_HOUR });
   });
 
-  it('converts an hours-only policy rather than falling back to the default', () => {
-    // The pushed policy from an older Platform carries no seconds field at all.
-    // A verdict that dropped to `DEFAULT_APPROVAL_EXPIRY_SECONDS` here would
-    // silently lengthen every such org's hold to 72 hours.
-    const hoursOnly: TrustPolicy = { ...policy(ForkPolicy.enum.hold), approvalExpiryHours: 3 };
-    expect(hoursOnly.approvalExpirySeconds).toBeUndefined();
-    expect(evaluateTrustPolicy(hoursOnly, FORK)).toMatchObject({
-      approvalExpirySeconds: 3 * SECONDS_PER_HOUR,
-    });
-  });
-
-  it('prefers the seconds window over the hours field beside it', () => {
-    // The whole point of the field: a window an hours-granularity policy cannot
-    // express must survive the verdict intact, not be rounded to its neighbour.
+  it('carries a sub-hour window through the verdict intact', () => {
     const out = evaluateTrustPolicy(
-      { ...policy(ForkPolicy.enum.hold), approvalExpiryHours: 72, approvalExpirySeconds: 30 },
+      { ...policy(ForkPolicy.enum.hold), approvalExpirySeconds: 30 },
       FORK,
     );
     expect(out).toMatchObject({ action: 'hold', approvalExpirySeconds: 30 });
@@ -319,7 +306,7 @@ describe('policy key coverage', () => {
     expect(evaluateTrustPolicy(policy(ForkPolicy.enum.hold), FORK).action).toBe('hold');
     expect(evaluateTrustPolicy(policy(ForkPolicy.enum.ignore), FORK).action).toBe('ignore');
     expect(evaluateTrustPolicy(policy(ForkPolicy.enum.allow), FORK).action).toBe('pass');
-    // `approvalExpiryHours` is consumed by the hold path, asserted above and in
+    // `approvalExpirySeconds` is consumed by the hold path, asserted above and in
     // dispatch-matched-workflow.test.ts.
   });
 });

@@ -124,7 +124,7 @@ export const sharedConfigSchema = z.object({
       peerHeartbeatIntervalMs: z.coerce.number().optional(),
       peerMaxReconnectDelayMs: z.coerce.number().optional(),
       role: z.enum(['coordinator', 'worker']).optional(),
-      coordinatorUrl: z.string().optional(),
+      coordinatorUrls: z.union([z.array(z.string()), z.string()]).optional(),
       peerStaleTimeoutMs: z.coerce.number().optional(),
       peerDiscovery: PeerDiscoveryMode.optional(),
     })
@@ -233,8 +233,20 @@ export const appConfigSchema = z
         peerMaxReconnectDelayMs: z.coerce.number().default(60000),
         /** Cluster role: coordinator (full orchestrator) or worker (delegated execution). */
         role: z.enum(['coordinator', 'worker']).default('coordinator'),
-        /** URL of the coordinator to connect to when role=worker. */
-        coordinatorUrl: z.string().optional(),
+        /** URLs of every coordinator to connect to when role=worker. */
+        coordinatorUrls: z
+          .union([
+            z.array(z.string()),
+            z.string().transform((v) =>
+              v
+                ? v
+                    .split(',')
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                : [],
+            ),
+          ])
+          .default([]),
         /** Stale peer timeout in ms. */
         peerStaleTimeoutMs: z.coerce.number().default(60_000),
         /** Whether this coordinator dials Platform-announced peers (platform) or only `peers` (static). */
@@ -261,12 +273,12 @@ export const appConfigSchema = z
   .superRefine((data, ctx) => {
     const isWorker = data.cluster.role === 'worker';
 
-    // Workers require a coordinator URL
-    if (isWorker && !data.cluster.coordinatorUrl) {
+    // Workers require at least one coordinator URL
+    if (isWorker && data.cluster.coordinatorUrls.length === 0) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'cluster.coordinatorUrl is required when cluster.role=worker',
-        path: ['cluster', 'coordinatorUrl'],
+        message: 'cluster.coordinatorUrls is required when cluster.role=worker',
+        path: ['cluster', 'coordinatorUrls'],
       });
     }
 

@@ -38,22 +38,19 @@ export function rerouteJobConfig(msg: JobReroute): Record<string, unknown> {
 }
 
 /**
- * Clone auth for an organization-wide job whose workflow repository has its own
- * clone token. The agent resolves the source clone as `sourceAuth ?? workflowAuth
- * ?? token`, so `sourceAuth` is set from the source token too: without it the
- * source repository would be cloned with the workflow repository's token.
- * Empty when the coordinator sent no workflow clone token.
+ * Clone auth for a rerouted job, from the clone tokens the coordinator
+ * pre-resolved: the source repository's `cloneToken` becomes `sourceAuth`, and
+ * an organization-wide job's `workflowCloneToken` becomes `workflowAuth`.
  */
-function workflowCloneAuth(cfg: Record<string, unknown>): {
+function rerouteCloneAuth(cfg: Record<string, unknown>): {
   workflowAuth?: ProviderGitAuth;
   sourceAuth?: ProviderGitAuth;
 } {
-  const workflowToken = cfg.workflowCloneToken as string | undefined;
-  if (!workflowToken) return {};
   const sourceToken = cfg.cloneToken as string | undefined;
+  const workflowToken = cfg.workflowCloneToken as string | undefined;
   return {
-    workflowAuth: cloneTokenGitAuth(workflowToken),
     ...(sourceToken && { sourceAuth: cloneTokenGitAuth(sourceToken) }),
+    ...(workflowToken && { workflowAuth: cloneTokenGitAuth(workflowToken) }),
   };
 }
 
@@ -65,10 +62,7 @@ function workflowCloneAuth(cfg: Record<string, unknown>): {
  */
 export function rerouteDispatchRefusal(msg: JobReroute): string | undefined {
   const cfg = rerouteJobConfig(msg);
-  return crossHostAuthRefusal(cfg, msg.repoUrl ?? '', {
-    ...(msg.cloneToken && { token: msg.cloneToken }),
-    ...workflowCloneAuth(cfg),
-  });
+  return crossHostAuthRefusal(cfg, msg.repoUrl ?? '', rerouteCloneAuth(cfg));
 }
 
 /** The fields of a queued job the worker dispatch reads. */
@@ -86,7 +80,7 @@ export interface WorkerQueuedJob {
 /** The `job.dispatch` message the worker sends its agent for a rerouted job. */
 export function buildWorkerDispatchMessage(
   job: WorkerQueuedJob,
-  ids: { messageId: string; timestamp: number },
+  ids: { messageId: string; timestamp: number; concurrencyWaitTimeoutMs: number },
 ): Record<string, unknown> {
   const cfg = job.jobConfig;
   const dispatchSecrets = cfg.secrets as Record<string, string> | undefined;
@@ -97,11 +91,6 @@ export function buildWorkerDispatchMessage(
   const dispatchInstallEnvSecrets = cfg.installEnvSecrets as Record<string, string> | undefined;
   const dispatchContainerRegistryAuth = cfg.containerRegistryAuth as
     { username: string; password: string; serveraddress: string } | undefined;
-  // The coordinator pre-resolves the source repo's clone token and carries it
-  // in jobConfig.cloneToken. Forwarded as the dispatch `token` so the agent's
-  // git clone authenticates against a private repository. A workflow
-  // repository's own token becomes `workflowAuth` (see workflowCloneAuth).
-  const dispatchToken = cfg.cloneToken as string | undefined;
   const cleanJobConfig = Object.fromEntries(
     Object.entries(cfg).filter(([k]) => !WORKER_PRIVATE_KEYS.has(k)),
   );
@@ -119,6 +108,8 @@ export function buildWorkerDispatchMessage(
     sha: job.sha,
     lockFileUrl: cfg.lockFileUrl ?? '',
     jobConfig: cleanJobConfig,
+    // The fleet-wide concurrency-slot wait, from the worker's pulled settings.
+    concurrencyWaitTimeoutMs: ids.concurrencyWaitTimeoutMs,
     // Lift user-cache namespacing from jobConfig to top-level dispatch
     // fields so the worker's agent-WS handler resolves the cache ref from
     // the tracked dispatch (matches the coordinator dispatch path).
@@ -131,8 +122,9 @@ export function buildWorkerDispatchMessage(
     ...(typeof cleanJobConfig.cacheRefScope === 'string' && {
       cacheRefScope: cleanJobConfig.cacheRefScope,
     }),
-    ...(dispatchToken && { token: dispatchToken }),
-    ...workflowCloneAuth(cfg),
+    // The coordinator pre-resolves the clone tokens and carries them in
+    // jobConfig; they reach the agent as structured auth (see rerouteCloneAuth).
+    ...rerouteCloneAuth(cfg),
     ...(dispatchSecrets && { secrets: dispatchSecrets }),
     ...(dispatchNamespacedSecrets && { namespacedSecrets: dispatchNamespacedSecrets }),
     ...(dispatchRunPublicKey && { runPublicKey: dispatchRunPublicKey }),

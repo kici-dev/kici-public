@@ -27,23 +27,17 @@ import { runEventMessageSchema, jobContextMessageSchema } from './run-events.js'
  * from the enclosing message so the orchestrator's evaluator and cache can type
  * against the policy alone.
  */
+/** Seconds in an hour. */
+export const SECONDS_PER_HOUR = 3600;
+
 /**
- * Documented default hours a security hold stays open.
+ * Documented default window a security hold stays open: 72 hours.
  *
  * The single owner of the value: the fail-closed policy, the orchestrator's
  * stored-policy default, and the hold-sizing fallback all read it, so the
  * number cannot drift between the two packages that enforce it.
  */
-export const DEFAULT_APPROVAL_EXPIRY_HOURS = 72;
-
-/** Seconds in an hour — the one conversion between the two expiry spellings. */
-export const SECONDS_PER_HOUR = 3600;
-
-/**
- * The same documented default as {@link DEFAULT_APPROVAL_EXPIRY_HOURS}, in the
- * granularity the policy actually stores.
- */
-export const DEFAULT_APPROVAL_EXPIRY_SECONDS = DEFAULT_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR;
+export const DEFAULT_APPROVAL_EXPIRY_SECONDS = 72 * SECONDS_PER_HOUR;
 
 /**
  * The shortest expressible security-hold window.
@@ -55,43 +49,8 @@ export const DEFAULT_APPROVAL_EXPIRY_SECONDS = DEFAULT_APPROVAL_EXPIRY_HOURS * S
  */
 export const MIN_APPROVAL_EXPIRY_SECONDS = 1;
 
-/** The longest window the Platform accepts: one year, the bound already applied to hours. */
-export const MAX_APPROVAL_EXPIRY_HOURS = 8760;
-
-/** {@link MAX_APPROVAL_EXPIRY_HOURS} in seconds, so neither spelling outranges the other. */
-export const MAX_APPROVAL_EXPIRY_SECONDS = MAX_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR;
-
-/**
- * The window a policy actually means, in seconds.
- *
- * `approvalExpirySeconds` is the authority and `approvalExpiryHours` its coarse
- * spelling, so the more specific field wins whenever both are present — the
- * only rule that never discards what an operator asked for. A policy carrying
- * neither (an older peer that sent no window at all) falls back to the
- * documented default.
- */
-export function approvalExpirySecondsOf(policy: {
-  approvalExpiryHours?: number | null;
-  approvalExpirySeconds?: number | null;
-}): number {
-  if (policy.approvalExpirySeconds != null) return policy.approvalExpirySeconds;
-  if (policy.approvalExpiryHours != null) return policy.approvalExpiryHours * SECONDS_PER_HOUR;
-  return DEFAULT_APPROVAL_EXPIRY_SECONDS;
-}
-
-/**
- * The coarse `approvalExpiryHours` view of a window stored in seconds.
- *
- * Rounds UP, and never below one hour. A sub-hour window has no exact hours
- * spelling, and the peer reading this field is one that cannot express the real
- * value anyway — so the choice is which way to be wrong. Rounding up yields a
- * longer hold than asked for, which stays approvable; rounding down yields zero,
- * which is the already-expired hold `MIN_APPROVAL_EXPIRY_SECONDS` exists to
- * prevent.
- */
-export function approvalExpiryHoursOf(seconds: number): number {
-  return Math.max(1, Math.ceil(seconds / SECONDS_PER_HOUR));
-}
+/** The longest window the Platform accepts: one year. */
+export const MAX_APPROVAL_EXPIRY_SECONDS = 8760 * SECONDS_PER_HOUR;
 
 /**
  * The org-level fork switch: the setting an org's trust policy carries for how
@@ -129,31 +88,14 @@ export const trustPolicySchema = z
   .object({
     forkPolicy: ForkPolicy,
     /**
-     * Hours a security hold stays open — the coarse spelling of
-     * `approvalExpirySeconds`, kept required so an orchestrator or CLI on an
-     * older build still receives a window it can read. Not deprecated: it is read,
-     * enforced whenever no seconds value accompanies it, and remains the
-     * ergonomic way to say "72 hours".
+     * Seconds a security hold stays open.
      *
-     * Integer and positive: the column is INTEGER NOT NULL, so a fractional value
-     * throws inside the fire-and-forget persist and the policy is then silently
-     * never stored, and a zero or negative value mints an already-expired hold.
-     */
-    approvalExpiryHours: z.number().int().min(1),
-    /**
-     * Seconds a security hold stays open — the authoritative window, and the one
-     * granularity that can express a sub-hour hold.
-     *
-     * Optional because an older Platform sends only the hours field; a frame
-     * without it resolves through {@link approvalExpirySecondsOf}, which falls
-     * back to `approvalExpiryHours * SECONDS_PER_HOUR`. When both are present this
-     * one wins, at every layer.
-     *
-     * Integer and at least {@link MIN_APPROVAL_EXPIRY_SECONDS} for the same two
-     * reasons the hours field is: the column is INTEGER, and a non-positive window
+     * Integer and at least {@link MIN_APPROVAL_EXPIRY_SECONDS}: the column is
+     * INTEGER, so a fractional value throws inside the fire-and-forget persist
+     * and the policy is then silently never stored, and a non-positive window
      * mints an already-expired hold.
      */
-    approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
+    approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS),
   })
   .strict();
 export type TrustPolicy = z.infer<typeof trustPolicySchema>;
@@ -392,12 +334,8 @@ export type StaleCheckrunCleanup = z.infer<typeof staleCheckrunCleanupSchema>;
 
 /**
  * Platform capability advertisement, sent once by the Platform after the
- * orchestrator authenticates. The orchestrator caches it per connection and
- * pre-flight-checks its own feature-gated sends against it, so a self-hosted
- * orchestrator running ahead of the hosted Platform surfaces a diagnosable
- * capability gap instead of firing a frame the Platform would silently drop.
- * Payload is `platformCapabilitiesSchema` (`.passthrough()`, absent =
- * unsupported).
+ * orchestrator authenticates. Payload is `platformCapabilitiesSchema`, which
+ * defines no flag at protocol 4.
  */
 export const platformCapabilitiesMessageSchema = z.object({
   type: z.literal('platform.capabilities'),
@@ -500,20 +438,16 @@ export type PlanHeadroom = z.infer<typeof planHeadroomSchema>;
 /**
  * Acknowledgment that a webhook was received and processing started.
  *
- * Under the chunked relay protocol the orchestrator also reports the HMAC
- * verification outcome here via `result`, and may include a non-secret-bearing
- * diagnostic in `reason` when result is a rejection. Both fields are optional
- * for backward compatibility during the rollout: pre-cutover senders omit them.
+ * The orchestrator reports the HMAC verification outcome via `result`, and may
+ * include a non-secret-bearing diagnostic in `reason` when result is a
+ * rejection.
  */
 export const webhookAckSchema = z.object({
   type: z.literal('webhook.ack'),
   messageId: z.string(),
   deliveryId: z.string(),
-  /**
-   * Verification + processing outcome. Required from the chunked relay path
-   * (commit 3 onwards on the orch side); pre-chunked acks omit this.
-   */
-  result: WebhookRelayResult.optional(),
+  /** Verification + processing outcome. */
+  result: WebhookRelayResult,
   /**
    * Optional non-secret-bearing diagnostic for rejection cases. MUST NOT
    * include any secret material (HMAC keys, bearer tokens, computed signatures).
@@ -540,11 +474,8 @@ export const logChunkSchema = z.object({
   stepIndex: z.number(),
   lines: z.array(z.string()),
   timestamp: z.number(),
-  /**
-   * Which stream these lines came from. Optional for backward compatibility
-   * with orchestrators that do not send it; absent is read as `stdout`.
-   */
-  stream: LogStream.optional(),
+  /** Which stream these lines came from. */
+  stream: LogStream,
 });
 
 /**
@@ -596,11 +527,10 @@ export type CacheStats = z.infer<typeof cacheStatsSchema>;
  * Platform receives it, updates its cache, and re-broadcasts the
  * relevant subset to any connected dashboard SPA sessions.
  */
-export const orchCapabilitiesUpdateSchema = z.object({
+const orchCapabilitiesUpdateSchema = z.object({
   type: z.literal('orch.capabilities.update'),
   capabilities: orchCapabilitiesSchema,
 });
-export type OrchCapabilitiesUpdate = z.infer<typeof orchCapabilitiesUpdateSchema>;
 
 // --- Direction-specific discriminated unions ---
 
@@ -720,7 +650,6 @@ export const PLATFORM_TO_ORCH_RECOGNIZED_TYPES: ReadonlySet<string> = new Set(
 
 export type WebhookRelay = z.infer<typeof webhookRelaySchema>;
 export type WebhookAck = z.infer<typeof webhookAckSchema>;
-export type ExecutionEvent = z.infer<typeof executionEventSchema>;
 export type LogChunk = z.infer<typeof logChunkSchema>;
 export type PeerDiscover = z.infer<typeof peerDiscoverSchema>;
 export type PeerUpdate = z.infer<typeof peerUpdateSchema>;

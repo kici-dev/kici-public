@@ -4,7 +4,6 @@ import pc from 'picocolors';
 import {
   loadGlobalConfig,
   saveGlobalConfig,
-  mergeGlobalConfig,
   getConfigPath,
   type GlobalConfig,
 } from '../remote/config.js';
@@ -19,8 +18,6 @@ import { toErrorMessage } from '@kici-dev/core';
 import { planeStatus, attachPlane } from '../local-plane/plane-manager.js';
 
 export interface LoginOptions {
-  /** API key for non-interactive authentication */
-  token?: string;
   /** Platform relay URL */
   platformEndpoint?: string;
   /** OIDC issuer URL override */
@@ -215,60 +212,17 @@ async function maybePromptAttach(
 /**
  * Authenticate with KiCI.
  *
- * - With `--token`, saves the API key directly (legacy flow)
- * - Without `--token`, runs OAuth flow: PKCE (desktop) or device (headless)
+ * - Runs the OAuth flow: PKCE (desktop) or device (headless)
  * - With `--device`, forces device authorization flow
  *
  * Returns true on success, false on error.
  */
 export async function loginCommand(options: LoginOptions): Promise<boolean> {
   try {
-    // If --token is provided, use the legacy API key flow
-    if (options.token !== undefined) {
-      return await legacyTokenLogin(options);
-    }
-
-    // If stdin is a TTY and no --device flag, check if user wants to paste a token
-    // For non-interactive (piped) input, go straight to OAuth
-    // New default: OAuth flow
     return await oauthLogin(options);
   } catch (err: unknown) {
     const message = toErrorMessage(err);
     console.error(pc.red(`\n  Login failed: ${message}`));
     return false;
   }
-}
-
-/**
- * Legacy login flow: saves an API key directly to config.
- */
-async function legacyTokenLogin(options: LoginOptions): Promise<boolean> {
-  let token = options.token;
-
-  // If token is undefined (shouldn't reach here, but guard), prompt
-  if (token === undefined) {
-    token = await promptInput('Enter your KiCI API key: ');
-  }
-
-  // Validate token is non-empty
-  if (!token || token.length === 0) {
-    console.error(pc.red('Error: API key cannot be empty'));
-    return false;
-  }
-
-  // Build config update
-  const update: Record<string, string> = { token };
-  if (options.platformEndpoint) {
-    update.platformEndpoint = options.platformEndpoint;
-  }
-  if (options.routingKey) {
-    update.routingKey = options.routingKey;
-  }
-
-  await mergeGlobalConfig(update);
-
-  const configPath = getConfigPath();
-  console.log(pc.green(`Authenticated successfully. Config saved to ${configPath}`));
-
-  return true;
 }

@@ -14,6 +14,7 @@ import {
 
 const SAMPLE_LOCK: LockFile = {
   schemaVersion: SCHEMA_VERSION,
+  minReaderVersion: SCHEMA_VERSION,
   source: { file: '.kici/workflows/ci.ts', export: '#default' },
   contentHash: 'h',
   workflows: [],
@@ -91,6 +92,7 @@ describe('LockFileCache', () => {
   it('throws LockFileParseError for a stale string-array runsOn at the current schemaVersion', async () => {
     const staleRunsOn = {
       schemaVersion: SCHEMA_VERSION,
+      minReaderVersion: SCHEMA_VERSION,
       source: { file: 't', export: '#default' },
       contentHash: 'h',
       workflows: [
@@ -168,6 +170,7 @@ describe('LockFileCache byte bound', () => {
   const bigLock = (h: string): LockFile =>
     ({
       schemaVersion: SCHEMA_VERSION,
+      minReaderVersion: SCHEMA_VERSION,
       source: { file: '.kici/workflows/ci.ts', export: '#default' },
       contentHash: h.repeat(5000),
       workflows: [],

@@ -1244,15 +1244,14 @@ describe('PeerRegistry', () => {
       expect(qualified[0].instanceId).toBe('orch-win');
     });
 
-    it('gates a structured-field windows pool whose plain label escapes the denylist', () => {
+    it('gates a structured-field windows pool with a non-canonical plain label', () => {
       registry.addPeer({
         instanceId: 'orch-win2022',
         connectionId: 'conn-win2022',
         address: null,
         routingKeys: [],
       });
-      // The pool's plain label is `windows-2022` (NOT in PLATFORM_TAINT_LABELS),
-      // but the orchestrator derived the taint from the structured `platform`
+      // The pool's plain label is `windows-2022`, and the orchestrator derived the taint from the structured `platform`
       // field and advertises `mandatoryLabels: ['windows']` plus the matchable
       // `windows` token injected into the labelSet. The peer registry reads the
       // advertised gate verbatim, so the cross-peer gate is provenance-agnostic.

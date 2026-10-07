@@ -375,8 +375,7 @@ export function buildProgram(): Command {
 
   program
     .command('login')
-    .description('Authenticate with KiCI via browser OAuth (default) or API key (--token)')
-    .option('--token <key>', 'API key for direct authentication (legacy)')
+    .description('Authenticate with KiCI via browser OAuth (default) or device flow (--device)')
     .option('--device', 'Force device authorization flow (for headless/SSH environments)')
     .option('--platform-endpoint <url>', 'Platform relay URL')
     .option(
@@ -399,7 +398,6 @@ Environment variables:
     .action(async (options) => {
       const { loginCommand } = await import('./commands/index.js');
       const success = await loginCommand({
-        token: options.token,
         device: options.device,
         platformEndpoint: options.platformEndpoint,
         oidcIssuer: options.oidcIssuer,
@@ -1075,7 +1073,7 @@ Environment variables:
     .option('--bundle <path>', 'Path or URL to the attestation bundle JSON')
     .option(
       '--trust-root <url-or-file>',
-      'Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator, else the hosted KiCI platform)',
+      'Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator)',
     )
     .option('--audience <aud>', 'Expected token audience')
     .option('--json', 'Output structured JSON result', false)

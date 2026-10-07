@@ -14,9 +14,9 @@
  * the hot tuple comparison `(created_at, id) < (cursor.createdAt, cursor.id)`.
  * The cursor also carries a `source: 'hot' | 'cold'` discriminator so a
  * cursor minted while the page boundary was inside cold can resume in
- * the cold stream on the next request. Cursors without a `source` field
- * default to `'hot'` — backwards-compatible with any tab the user had
- * open across a deploy boundary.
+ * the cold stream on the next request. A cursor without a valid `source` is
+ * invalid, like any other unparsable cursor, and the read starts from the
+ * first page.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
@@ -27,6 +27,7 @@ import {
   type AccessLogSource,
   type AccessLogTargetType,
   type ActorType,
+  toIsoString,
 } from '@kici-dev/engine';
 import type { AccessLogTable, Database } from '../db/types.js';
 
@@ -92,7 +93,7 @@ export async function loadAccessLogRange(
 
   // ── 1. Hot path ────────────────────────────────────────────────
   // Skip when the cursor explicitly resumes in cold; otherwise run
-  // the legacy hot SELECT with limit + 1 to detect "needs more".
+  // the hot SELECT with limit + 1 to detect "needs more".
   const fromTs = parseDate(filter.fromTimestamp);
   const toTs = parseDate(filter.toTimestamp);
 
@@ -305,8 +306,7 @@ export function toAccessLogItem(row: AccessLogColdRow): AccessLogItem {
     outcome: row.outcome as AccessLogOutcome,
     errorMessage: row.error_message,
     agentLabel: row.agent_label ?? null,
-    createdAt:
-      row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+    createdAt: toIsoString(row.created_at),
   };
 }
 
@@ -330,13 +330,12 @@ function parseCursor(cursor: string): ParsedCursor | null {
       typeof parsed !== 'object' ||
       parsed === null ||
       typeof parsed.createdAt !== 'string' ||
-      typeof parsed.id !== 'string'
+      typeof parsed.id !== 'string' ||
+      (parsed.source !== 'hot' && parsed.source !== 'cold')
     ) {
       return null;
     }
-    // Backward compat: older cursors lack `source`; treat as hot.
-    const source = parsed.source === 'cold' ? 'cold' : 'hot';
-    return { source, createdAt: parsed.createdAt, id: parsed.id };
+    return { source: parsed.source, createdAt: parsed.createdAt, id: parsed.id };
   } catch {
     return null;
   }

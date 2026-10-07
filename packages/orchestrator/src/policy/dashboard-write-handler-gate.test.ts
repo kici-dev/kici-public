@@ -47,6 +47,8 @@ function buildDepsWithDisabledPolicy(disabled: DashboardWritePolicyMap): {
     contextStore: {} as never,
     variableStore: {} as never,
     bindingStore: {} as never,
+    // These tests drive no approval; the held-run deps are never read.
+    approvals: {} as never,
     secretStore: {
       listScopes: vi.fn().mockResolvedValue([]),
       listKeys: vi.fn().mockResolvedValue([]),

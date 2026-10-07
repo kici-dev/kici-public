@@ -25,17 +25,10 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
+import { resolveDatabaseUrl } from './shared/cli-action.js';
 
 interface CommonOpts {
   databaseUrl?: string;
-}
-
-function resolveDatabaseUrl(opts: CommonOpts): string {
-  const url = opts.databaseUrl ?? process.env.KICI_DATABASE_URL;
-  if (!url) {
-    throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  }
-  return url;
 }
 
 /**
@@ -57,7 +50,7 @@ export function registerColdStoreCommands(
     .option('--database-url <url>', 'Orchestrator Postgres URL (else KICI_DATABASE_URL)')
     .action(async (table: string, opts: CommonOpts) => {
       try {
-        const databaseUrl = resolveDatabaseUrl(opts);
+        const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
         const { archiveNow } = await import('./cold-store-impl.js');
         await archiveNow({ databaseUrl, table });
       } catch (err) {
@@ -76,7 +69,7 @@ export function registerColdStoreCommands(
     .action(
       async (table: string, opts: CommonOpts & { tenant?: string; from?: string; to?: string }) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { dryRunArchive } = await import('./cold-store-impl.js');
           await dryRunArchive({
             databaseUrl,
@@ -113,7 +106,7 @@ export function registerColdStoreCommands(
         },
       ) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { listChunks } = await import('./cold-store-impl.js');
           await listChunks({
             databaseUrl,
@@ -144,7 +137,7 @@ export function registerColdStoreCommands(
         opts: CommonOpts & { table: string; tenant: string; partitionDate: string },
       ) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { verifyChunk } = await import('./cold-store-impl.js');
           const result = await verifyChunk({
             databaseUrl,
@@ -174,7 +167,7 @@ export function registerColdStoreCommands(
         opts: CommonOpts & { table: string; tenant: string; partitionDate: string },
       ) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { replayChunk } = await import('./cold-store-impl.js');
           await replayChunk({
             databaseUrl,
@@ -205,7 +198,7 @@ export function registerColdStoreCommands(
         opts: CommonOpts & { table: string; tenant: string; partitionDate: string },
       ) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { replayIntoPg } = await import('./cold-store-impl.js');
           await replayIntoPg({
             databaseUrl,
@@ -226,11 +219,11 @@ export function registerColdStoreCommands(
     .description('Walk S3 prefix and rebuild missing manifests from data files')
     .option('--database-url <url>', 'Orchestrator Postgres URL (else KICI_DATABASE_URL)')
     .option('--tenant <rk>', 'Scope to a single routing key')
-    .option('--confirm-cleanup', 'Also delete chunk_counts rows whose S3 objects are gone')
+    .option('--confirm-cleanup', 'Deprecated: has no effect (removed in v1.0.0)')
     .action(
       async (table: string, opts: CommonOpts & { tenant?: string; confirmCleanup?: boolean }) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { reconcile } = await import('./cold-store-impl.js');
           await reconcile({
             databaseUrl,
@@ -254,7 +247,7 @@ export function registerColdStoreCommands(
     .option('--limit <n>', 'Max candidates to inspect', '1000')
     .action(async (opts: CommonOpts & { table?: string; bucket?: string; limit?: string }) => {
       try {
-        const databaseUrl = resolveDatabaseUrl(opts);
+        const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
         const { listPurgeable } = await import('./cold-store-impl.js');
         await listPurgeable({
           databaseUrl,
@@ -288,7 +281,7 @@ export function registerColdStoreCommands(
         },
       ) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { purgeNow } = await import('./cold-store-impl.js');
           await purgeNow({
             databaseUrl,
@@ -323,7 +316,7 @@ export function registerColdStoreCommands(
         },
       ) => {
         try {
-          const databaseUrl = resolveDatabaseUrl(opts);
+          const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const { peekChunk } = await import('./cold-store-impl.js');
           await peekChunk({
             databaseUrl,

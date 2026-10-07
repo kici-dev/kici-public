@@ -207,10 +207,11 @@ describe('policy fields reach the decision sites they claim to', () => {
     // Positive control: if the schema import ever resolves to something without
     // a shape, every per-field case below would vacuously pass over an empty
     // list. Pin the membership so a silently-empty enumeration fails loudly.
-    expect(FIELDS.length).toBeGreaterThanOrEqual(3);
+    expect(FIELDS.length).toBeGreaterThanOrEqual(2);
     expect(FIELDS).toContain('forkPolicy');
-    expect(FIELDS).toContain('approvalExpiryHours');
     expect(FIELDS).toContain('approvalExpirySeconds');
+    // fails-when: the retired hours spelling is declared on the wire again.
+    expect(FIELDS).not.toContain('approvalExpiryHours');
     // fails-when: a non-fork arm the gate never read is declared on the wire again.
     expect(FIELDS).not.toContain('unknownContributorPolicy');
     expect(FIELDS).not.toContain('workflowChangePolicy');
@@ -223,23 +224,17 @@ describe('policy fields reach the decision sites they claim to', () => {
     expect(EVALUATOR).toMatch(/switch \(policy\.forkPolicy\) \{/);
   });
 
-  it('routes both expiry spellings into the hold-expiry calculation', () => {
-    // Neither is an arm — together they name one window, so the pair rides the
-    // hold outcome into the expiry calculation instead.
-    //
-    // The gate resolves the two through `approvalExpirySecondsOf`, which is what
-    // makes an hours-only policy still size a hold; dispatch then reads the one
-    // resolved field. Asserting only the dispatch half would pass on a build
-    // whose gate had dropped the hours fallback, which is the layer the value
-    // actually comes from.
-    expect(HOLD_FOR_FORK).toMatch(/approvalExpirySeconds:\s*approvalExpirySecondsOf\(policy\)/);
+  it('routes the expiry window into the hold-expiry calculation', () => {
+    // Not an arm: the window rides the hold outcome into the expiry
+    // calculation, and dispatch reads the field the gate copied from the policy.
+    expect(HOLD_FOR_FORK).toMatch(/approvalExpirySeconds:\s*policy\.approvalExpirySeconds/);
     expect(DISPATCH).toMatch(/decision\.approvalExpirySeconds\s*\?\?/);
   });
 
   it('accounts for every wire field', () => {
     // A field added to the schema is neither the fork switch nor the expiry —
     // so it fails here until someone routes it to a decision site.
-    const accounted = new Set(['forkPolicy', 'approvalExpiryHours', 'approvalExpirySeconds']);
+    const accounted = new Set(['forkPolicy', 'approvalExpirySeconds']);
     expect(FIELDS.filter((f) => !accounted.has(f))).toEqual([]);
   });
 });

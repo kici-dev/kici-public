@@ -12,19 +12,16 @@ import { createLogger, depCacheKeyOf } from '@kici-dev/shared';
 import type { RegistrationStore } from '../registration/registration-store.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { TokenManager } from '../secrets/token-manager.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import type { ContextStore } from '../contexts/context-store.js';
 import { toContext } from '../contexts/context-store.js';
 import { assertWorkflowsSatisfiable } from '../contexts/protection/satisfiability.js';
-import { handleAdminError } from './admin-errors.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
+import { type AdminEnv, createAdminApp } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-registrations' });
 
-/**
- * Dependencies for admin registration routes.
- */
 export interface AdminRegistrationRoutesDeps {
   registrationStore: RegistrationStore;
   registrationIndex: RegistrationIndex;
@@ -38,15 +35,6 @@ export interface AdminRegistrationRoutesDeps {
    */
   contextStore?: Pick<ContextStore, 'matchContext'>;
 }
-
-/** Hono env type for admin registration routes with context variables. */
-type AdminRegEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
 
 // -- Zod schemas for request validation --
 
@@ -74,10 +62,8 @@ const registerManualSchema = z.object({
  * @param deps - Admin registration route dependencies
  * @returns Hono app with registration routes mounted at /api/v1/admin/registrations
  */
-export function createAdminRegistrationRoutes(
-  deps: AdminRegistrationRoutesDeps,
-): Hono<AdminRegEnv> {
-  const app = new Hono<AdminRegEnv>();
+export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps): Hono<AdminEnv> {
+  const app = createAdminApp(logger);
 
   // -- Bearer token auth middleware --
   const authMiddleware = createBearerAuthMiddleware({
@@ -89,99 +75,87 @@ export function createAdminRegistrationRoutes(
 
   // ---- Registration endpoints ----
 
-  // List all registrations with optional filters
   app.get('/api/v1/admin/registrations', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'context.read');
+    deps.rbac.requirePermission(c.get('role'), 'context.read');
 
-      const customerId = c.req.query('customerId') ?? c.req.query('org');
-      const queryRoutingKey = c.req.query('routingKey');
-      const tokenRoutingKey = c.get('routingKey');
-      // Routing-key-scoped tokens see only their own routing key:
-      // refuse a mismatching explicit filter, or force the filter
-      // when none was provided.
-      if (tokenRoutingKey) {
-        if (queryRoutingKey && queryRoutingKey !== tokenRoutingKey) {
-          const denied = enforceRoutingKeyScope(c, queryRoutingKey);
-          if (denied) return denied;
-        }
+    const customerId = c.req.query('customerId') ?? c.req.query('org');
+    const queryRoutingKey = c.req.query('routingKey');
+    const tokenRoutingKey = c.get('routingKey');
+    // Routing-key-scoped tokens see only their own routing key:
+    // refuse a mismatching explicit filter, or force the filter
+    // when none was provided.
+    if (tokenRoutingKey) {
+      if (queryRoutingKey && queryRoutingKey !== tokenRoutingKey) {
+        const denied = enforceRoutingKeyScope(c, queryRoutingKey);
+        if (denied) return denied;
       }
-      const routingKey = tokenRoutingKey ?? queryRoutingKey;
-      const repoIdentifier = c.req.query('repoIdentifier');
-      const triggerType = c.req.query('triggerType');
-      const eventName = c.req.query('event');
-
-      // When customerId or event filters are present, use getAll() and apply
-      // all filters in-memory (cross-source webhook lookup path). Otherwise,
-      // honor the existing index-backed routingKey/repo fast paths.
-      let registrations;
-      if (customerId || eventName) {
-        registrations = await deps.registrationStore.getAll();
-      } else if (routingKey && repoIdentifier) {
-        registrations = await deps.registrationStore.getByRoutingKeyAndRepo(
-          routingKey,
-          repoIdentifier,
-        );
-      } else if (routingKey) {
-        registrations = await deps.registrationStore.getByRoutingKey(routingKey);
-      } else {
-        registrations = await deps.registrationStore.getAll();
-      }
-
-      if (customerId) {
-        registrations = registrations.filter((r) => r.customerId === customerId);
-      }
-      if (routingKey && (customerId || eventName)) {
-        registrations = registrations.filter((r) => r.routing_key === routingKey);
-      }
-      // Defence-in-depth: a routing-key-scoped token must never observe
-      // rows outside its scope, regardless of the filter shape above.
-      if (tokenRoutingKey) {
-        registrations = registrations.filter((r) => r.routing_key === tokenRoutingKey);
-      }
-      if (repoIdentifier && (customerId || eventName)) {
-        registrations = registrations.filter((r) => r.repo_identifier === repoIdentifier);
-      }
-      if (triggerType) {
-        registrations = registrations.filter((r) => r.trigger_types.includes(triggerType));
-      }
-      if (eventName) {
-        registrations = registrations.filter((r) => {
-          const triggers =
-            (
-              r.lock_entry as {
-                triggers?: ReadonlyArray<{ _type: string; events?: readonly string[] }>;
-              }
-            )?.triggers ?? [];
-          return triggers.some(
-            (t) => t._type === 'webhook' && (t.events ?? []).includes(eventName),
-          );
-        });
-      }
-
-      return c.json({ registrations, total: registrations.length }, 200);
-    } catch (err) {
-      return handleError(c, err);
     }
+    const routingKey = tokenRoutingKey ?? queryRoutingKey;
+    const repoIdentifier = c.req.query('repoIdentifier');
+    const triggerType = c.req.query('triggerType');
+    const eventName = c.req.query('event');
+
+    // When customerId or event filters are present, use getAll() and apply
+    // all filters in-memory (cross-source webhook lookup path). Otherwise,
+    // honor the existing index-backed routingKey/repo fast paths.
+    let registrations;
+    if (customerId || eventName) {
+      registrations = await deps.registrationStore.getAll();
+    } else if (routingKey && repoIdentifier) {
+      registrations = await deps.registrationStore.getByRoutingKeyAndRepo(
+        routingKey,
+        repoIdentifier,
+      );
+    } else if (routingKey) {
+      registrations = await deps.registrationStore.getByRoutingKey(routingKey);
+    } else {
+      registrations = await deps.registrationStore.getAll();
+    }
+
+    if (customerId) {
+      registrations = registrations.filter((r) => r.customerId === customerId);
+    }
+    if (routingKey && (customerId || eventName)) {
+      registrations = registrations.filter((r) => r.routing_key === routingKey);
+    }
+    // Defence-in-depth: a routing-key-scoped token must never observe
+    // rows outside its scope, regardless of the filter shape above.
+    if (tokenRoutingKey) {
+      registrations = registrations.filter((r) => r.routing_key === tokenRoutingKey);
+    }
+    if (repoIdentifier && (customerId || eventName)) {
+      registrations = registrations.filter((r) => r.repo_identifier === repoIdentifier);
+    }
+    if (triggerType) {
+      registrations = registrations.filter((r) => r.trigger_types.includes(triggerType));
+    }
+    if (eventName) {
+      registrations = registrations.filter((r) => {
+        const triggers =
+          (
+            r.lock_entry as {
+              triggers?: ReadonlyArray<{ _type: string; events?: readonly string[] }>;
+            }
+          )?.triggers ?? [];
+        return triggers.some((t) => t._type === 'webhook' && (t.events ?? []).includes(eventName));
+      });
+    }
+
+    return c.json({ registrations, total: registrations.length }, 200);
   });
 
-  // Get single registration by ID
   app.get('/api/v1/admin/registrations/:id', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'context.read');
+    deps.rbac.requirePermission(c.get('role'), 'context.read');
 
-      const registration = await deps.registrationStore.getById(c.req.param('id'));
-      if (!registration) {
-        return c.json({ error: 'Registration not found' }, 404);
-      }
-
-      const denied = enforceRoutingKeyScope(c, registration.routing_key);
-      if (denied) return denied;
-
-      return c.json({ registration }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    const registration = await deps.registrationStore.getById(c.req.param('id'));
+    if (!registration) {
+      return c.json({ error: 'Registration not found' }, 404);
     }
+
+    const denied = enforceRoutingKeyScope(c, registration.routing_key);
+    if (denied) return denied;
+
+    return c.json({ registration }, 200);
   });
 
   // Upsert workflow_registrations from a lock file (break-glass / test seeding).
@@ -189,178 +163,157 @@ export function createAdminRegistrationRoutes(
   // `registration delete`. Transactional via
   // RegistrationStore.replaceAll({ prune: false }) + bumpVersion.
   app.post('/api/v1/admin/registrations/register-manual', async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'context.update');
+
+    const body = await c.req.json();
+    const parsed = registerManualSchema.parse(body);
+
+    const denied = enforceRoutingKeyScope(c, parsed.routingKey);
+    if (denied) return denied;
+
+    let lockFile: { workflows: unknown[]; lockfileHash?: unknown; siblingsDigest?: unknown };
     try {
-      deps.rbac.requirePermission(c.get('role'), 'context.update');
-
-      const body = await c.req.json();
-      const parsed = registerManualSchema.parse(body);
-
-      const denied = enforceRoutingKeyScope(c, parsed.routingKey);
-      if (denied) return denied;
-
-      let lockFile: { workflows: unknown[]; lockfileHash?: unknown; siblingsDigest?: unknown };
-      try {
-        lockFile = JSON.parse(parsed.lockFileContents);
-      } catch (err) {
-        return c.json(
-          {
-            error: `lockFileContents is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
-          },
-          400,
-        );
-      }
-      if (!Array.isArray((lockFile as { workflows?: unknown }).workflows)) {
-        return c.json({ error: 'lock file missing workflows[] array' }, 400);
-      }
-
-      // Proactive satisfiability: reject a manual registration whose job binds a
-      // provably-unsatisfiable environment list before it ever dispatches.
-      if (deps.contextStore) {
-        const envStore = deps.contextStore;
-        try {
-          await assertWorkflowsSatisfiable(
-            lockFile.workflows as Parameters<typeof assertWorkflowsSatisfiable>[0],
-            async (name) => {
-              const row = await envStore.matchContext(parsed.customerId, name);
-              return row ? toContext(row) : null;
-            },
-          );
-        } catch (err) {
-          return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
-        }
-      }
-
-      await deps.registrationStore.replaceAll(
-        parsed.repoIdentifier,
-        (lockFile.workflows ?? []) as Parameters<typeof deps.registrationStore.replaceAll>[1],
-        parsed.routingKey,
-        parsed.providerContext,
-        {
-          customerId: parsed.customerId,
-          commitSha: parsed.commitSha,
-          depCacheKey: depCacheKeyOf(lockFile),
-          prune: false,
-        },
-      );
-      const registryVersion = await deps.registrationStore.bumpVersion();
-      await deps.registrationIndex.refreshIfNeeded(registryVersion);
-
-      const workflowCount = (lockFile.workflows ?? []).length;
-      logger.info('Manual workflow registration', {
-        repoIdentifier: parsed.repoIdentifier,
-        routingKey: parsed.routingKey,
-        customerId: parsed.customerId,
-        workflowCount,
-        registryVersion,
-      });
-
-      return c.json({ workflowCount, registryVersion }, 200);
+      lockFile = JSON.parse(parsed.lockFileContents);
     } catch (err) {
-      return handleError(c, err);
+      return c.json(
+        {
+          error: `lockFileContents is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+        },
+        400,
+      );
     }
+    if (!Array.isArray((lockFile as { workflows?: unknown }).workflows)) {
+      return c.json({ error: 'lock file missing workflows[] array' }, 400);
+    }
+
+    // Proactive satisfiability: reject a manual registration whose job binds a
+    // provably-unsatisfiable environment list before it ever dispatches.
+    if (deps.contextStore) {
+      const envStore = deps.contextStore;
+      try {
+        await assertWorkflowsSatisfiable(
+          lockFile.workflows as Parameters<typeof assertWorkflowsSatisfiable>[0],
+          async (name) => {
+            const row = await envStore.matchContext(parsed.customerId, name);
+            return row ? toContext(row) : null;
+          },
+        );
+      } catch (err) {
+        return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      }
+    }
+
+    await deps.registrationStore.replaceAll(
+      parsed.repoIdentifier,
+      (lockFile.workflows ?? []) as Parameters<typeof deps.registrationStore.replaceAll>[1],
+      parsed.routingKey,
+      parsed.providerContext,
+      {
+        customerId: parsed.customerId,
+        commitSha: parsed.commitSha,
+        depCacheKey: depCacheKeyOf(lockFile),
+        prune: false,
+      },
+    );
+    const registryVersion = await deps.registrationStore.bumpVersion();
+    await deps.registrationIndex.refreshIfNeeded(registryVersion);
+
+    const workflowCount = (lockFile.workflows ?? []).length;
+    logger.info('Manual workflow registration', {
+      repoIdentifier: parsed.repoIdentifier,
+      routingKey: parsed.routingKey,
+      customerId: parsed.customerId,
+      workflowCount,
+      registryVersion,
+    });
+
+    return c.json({ workflowCount, registryVersion }, 200);
   });
 
   // Force re-register from lock file (bumps registry version)
   app.post('/api/v1/admin/registrations/refresh', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'context.update');
+    deps.rbac.requirePermission(c.get('role'), 'context.update');
 
-      const body = await c.req.json();
-      const parsed = refreshSchema.parse(body);
+    const body = await c.req.json();
+    const parsed = refreshSchema.parse(body);
 
-      const denied = enforceRoutingKeyScope(c, parsed.routingKey);
-      if (denied) return denied;
+    const denied = enforceRoutingKeyScope(c, parsed.routingKey);
+    if (denied) return denied;
 
-      // Bump registry version to force all peers to reload
-      const registryVersion = await deps.registrationStore.bumpVersion();
-      await deps.registrationIndex.refreshIfNeeded(registryVersion);
+    // Bump registry version to force all peers to reload
+    const registryVersion = await deps.registrationStore.bumpVersion();
+    await deps.registrationIndex.refreshIfNeeded(registryVersion);
 
-      logger.info('Registration refresh triggered', {
-        routingKey: parsed.routingKey,
-        repoIdentifier: parsed.repoIdentifier,
-        registryVersion,
-      });
+    logger.info('Registration refresh triggered', {
+      routingKey: parsed.routingKey,
+      repoIdentifier: parsed.repoIdentifier,
+      registryVersion,
+    });
 
-      return c.json({ registryVersion }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json({ registryVersion }, 200);
   });
 
   // Disable (or, with `disabled: false`, re-enable) a registration by ID. A
   // disabled registration stays registered, but none of its triggers dispatch.
   app.patch('/api/v1/admin/registrations/:id/disable', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'context.update');
+    deps.rbac.requirePermission(c.get('role'), 'context.update');
 
-      const id = c.req.param('id');
-      const parsed = disableSchema.parse(await c.req.json());
-      // Look up the row's routing key first so a scoped token cannot toggle a
-      // registration outside its scope, as the DELETE route below does.
-      const existing = await deps.registrationStore.getById(id);
-      if (!existing) {
-        return c.json({ error: 'Registration not found' }, 404);
-      }
-      const denied = enforceRoutingKeyScope(c, existing.routing_key);
-      if (denied) return denied;
-
-      const updated = await deps.registrationStore.setDisabled(id, parsed.disabled);
-      if (!updated) {
-        return c.json({ error: 'Registration not found' }, 404);
-      }
-
-      // Bump registry version so every peer reloads the disabled flag.
-      const registryVersion = await deps.registrationStore.bumpVersion();
-      await deps.registrationIndex.refreshIfNeeded(registryVersion);
-
-      logger.info('Registration disabled flag set', {
-        id,
-        disabled: parsed.disabled,
-        registryVersion,
-      });
-
-      return c.json({ disabled: parsed.disabled, registryVersion }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    const id = c.req.param('id');
+    const parsed = disableSchema.parse(await c.req.json());
+    // Look up the row's routing key first so a scoped token cannot toggle a
+    // registration outside its scope, as the DELETE route below does.
+    const existing = await deps.registrationStore.getById(id);
+    if (!existing) {
+      return c.json({ error: 'Registration not found' }, 404);
     }
+    const denied = enforceRoutingKeyScope(c, existing.routing_key);
+    if (denied) return denied;
+
+    const updated = await deps.registrationStore.setDisabled(id, parsed.disabled);
+    if (!updated) {
+      return c.json({ error: 'Registration not found' }, 404);
+    }
+
+    // Bump registry version so every peer reloads the disabled flag.
+    const registryVersion = await deps.registrationStore.bumpVersion();
+    await deps.registrationIndex.refreshIfNeeded(registryVersion);
+
+    logger.info('Registration disabled flag set', {
+      id,
+      disabled: parsed.disabled,
+      registryVersion,
+    });
+
+    return c.json({ disabled: parsed.disabled, registryVersion }, 200);
   });
 
-  // Delete a registration by ID
   app.delete('/api/v1/admin/registrations/:id', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'context.delete');
+    deps.rbac.requirePermission(c.get('role'), 'context.delete');
 
-      const id = c.req.param('id');
-      // Look up the row's routing key first so a scoped token cannot
-      // delete a registration outside its scope. Returning 404 (rather
-      // than 403) for missing rows preserves the prior contract.
-      const existing = await deps.registrationStore.getById(id);
-      if (!existing) {
-        return c.json({ error: 'Registration not found' }, 404);
-      }
-      const denied = enforceRoutingKeyScope(c, existing.routing_key);
-      if (denied) return denied;
-
-      const deleted = await deps.registrationStore.deleteById(id);
-      if (!deleted) {
-        return c.json({ error: 'Registration not found' }, 404);
-      }
-
-      // Bump registry version to notify peers
-      const registryVersion = await deps.registrationStore.bumpVersion();
-      await deps.registrationIndex.refreshIfNeeded(registryVersion);
-
-      logger.info('Registration deleted', { id, registryVersion });
-
-      return c.json({ deleted: true, registryVersion }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    const id = c.req.param('id');
+    // Look up the row's routing key first so a scoped token cannot
+    // delete a registration outside its scope. Returning 404 (rather
+    // than 403) for missing rows preserves the prior contract.
+    const existing = await deps.registrationStore.getById(id);
+    if (!existing) {
+      return c.json({ error: 'Registration not found' }, 404);
     }
+    const denied = enforceRoutingKeyScope(c, existing.routing_key);
+    if (denied) return denied;
+
+    const deleted = await deps.registrationStore.deleteById(id);
+    if (!deleted) {
+      return c.json({ error: 'Registration not found' }, 404);
+    }
+
+    // Bump registry version to notify peers
+    const registryVersion = await deps.registrationStore.bumpVersion();
+    await deps.registrationIndex.refreshIfNeeded(registryVersion);
+
+    logger.info('Registration deleted', { id, registryVersion });
+
+    return c.json({ deleted: true, registryVersion }, 200);
   });
 
   return app;
-}
-
-function handleError(c: any, err: unknown) {
-  return handleAdminError(c, err, logger);
 }

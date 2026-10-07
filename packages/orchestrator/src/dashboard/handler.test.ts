@@ -65,7 +65,7 @@ const noopCallbacks = {
  *   3. SELECT customer_id FROM generic_webhook_sources ... LIMIT 1
  * Returning `{ routing_key: null }` from #1 short-circuits #2 / #3 — the
  * resolver returns null, the handler falls back to its bound (null/null)
- * context, and `recordAccess` is a no-op for tests that don't pass an
+ * context, and the access recorder is a no-op for tests that don't pass an
  * `accessLog`. This keeps these older tests passing without coupling them
  * to the new lookup chain.
  */
@@ -1318,6 +1318,7 @@ describe('DashboardHandler', () => {
         logStorage,
         provenanceStorage,
         send,
+        provenanceSigningIssuer: 'https://orch.example',
         ...noopCallbacks,
       });
 
@@ -1335,6 +1336,8 @@ describe('DashboardHandler', () => {
       expect(provenanceStorage.get).toHaveBeenCalledTimes(1);
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('dashboard.attestation.get.response');
+      // fails-when: the detail response omits the signing issuer the list carries.
+      expect(response.trustedIssuer).toBe('https://orch.example');
       expect(response.attestation.id).toBe('att-1');
       expect(response.attestation.bundle.mediaType).toContain('kici.provenance.bundle');
     });
@@ -1709,6 +1712,10 @@ describe('DashboardHandler', () => {
       expect(selectLimit).toHaveBeenCalledWith(3);
       expect(firstPage.runs.map((r) => r.runId)).toEqual(['run-1', 'run-2']);
       expect(firstPage.nextCursor).toBeTruthy();
+      // fails-when: the cursor's encoding (key order, JSON, base64url) changes
+      expect(firstPage.nextCursor).toBe(
+        'eyJjcmVhdGVkQXQiOiIyMDI2LTAxLTE1VDA5OjAwOjAwLjAwMFoiLCJydW5JZCI6InJ1bi0yIn0',
+      );
 
       // Second page: feed the cursor back; only the remaining row comes out
       // (no "extra" row → no further cursor). Routing-key resolution runs
@@ -2004,6 +2011,7 @@ describe('DashboardHandler', () => {
 
       const msg: RunRerunRequest = {
         type: 'run.rerun.request',
+        routingKey: 'github:1',
         requestId: 'req-r1',
         actor: { type: 'user', sub: 'user@test.com' },
         runId: 'original-run-123',
@@ -2013,13 +2021,13 @@ describe('DashboardHandler', () => {
 
       // Third arg is the agent provenance label (null for a plain user); the
       // fourth is the Platform `requestId` (idempotency key); the fifth is
-      // `routingKey` from the WS payload (absent here → undefined).
+      // `routingKey` from the WS payload.
       expect(onRerun).toHaveBeenCalledWith(
         'original-run-123',
         'user:user@test.com',
         null,
         'req-r1',
-        undefined,
+        'github:1',
       );
       expect(send).toHaveBeenCalledOnce();
       const response = send.mock.calls[0][0];
@@ -2039,6 +2047,7 @@ describe('DashboardHandler', () => {
 
       const msg: RunRerunRequest = {
         type: 'run.rerun.request',
+        routingKey: 'github:1',
         requestId: 'req-r3',
         actor: { type: 'system', component: 'test' },
         runId: 'running-run',
@@ -2079,6 +2088,7 @@ describe('DashboardHandler', () => {
 
       const msg: RunRerunRequest = {
         type: 'run.rerun.request',
+        routingKey: 'github:1',
         requestId: 'req-inj',
         actor: { type: 'user', sub: 'u1' },
         runId: 'run-inj',
@@ -2110,6 +2120,7 @@ describe('DashboardHandler', () => {
 
       const msg: RunRerunRequest = {
         type: 'run.rerun.request',
+        routingKey: 'github:1',
         requestId: 'req-cfg',
         actor: { type: 'user', sub: 'u1' },
         runId: 'run-cfg',
@@ -2577,6 +2588,10 @@ describe('DashboardHandler', () => {
       const response = send.mock.calls[0][0];
       expect(response.items).toHaveLength(2);
       expect(response.nextCursor).toBeTruthy();
+      // fails-when: the cursor's encoding (key order, JSON, base64url) changes
+      expect(response.nextCursor).toBe(
+        'eyJyZWNlaXZlZEF0IjoiMjAyNi0wNC0xN1QwMjowMDowMC4wMDBaIiwiaWQiOiJpZC0yIn0',
+      );
     });
   });
 
@@ -2955,7 +2970,7 @@ describe('DashboardHandler', () => {
   // ── multi-tenant orgId resolution ───────────────────────────────
   //
   // The invariant: when the orchestrator hosts more than one tenant,
-  // `recordAccess` MUST attribute the dashboard read to the **run's** owning
+  // the access recorder MUST attribute the dashboard read to the **run's** owning
   // org / routing key — not the handler-bound (LIMIT-1, no-ORDER-BY,
   // non-deterministic) pair set by `setOrgContext`.
   describe('multi-tenant orgId resolution', () => {

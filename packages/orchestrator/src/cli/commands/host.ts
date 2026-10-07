@@ -21,6 +21,7 @@ import { withDb } from './shared/db.js';
 import { recordAdminCliAccessOnDb } from './shared/admin-cli-access-log.js';
 import { deriveHostStatus, HostRosterStore, HostWriteAuthority } from '../../agent/host-roster.js';
 import type { Database, HostRosterRow } from '../../db/types.js';
+import { cliAction } from './shared/cli-action.js';
 
 /** Collect a repeatable `--prop key=value` flag into an array. */
 function collectProp(value: string, previous: string[]): string[] {
@@ -60,8 +61,8 @@ export function registerHostCommands(program: Command): void {
     .command('list')
     .description('List all roster hosts')
     .option('--json', 'Output JSON')
-    .action(async (opts: { json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { json?: boolean }) => {
         const rows = await withDb((db) =>
           new HostRosterStore(db as unknown as Kysely<Database>).listAll(),
         );
@@ -70,19 +71,16 @@ export function registerHostCommands(program: Command): void {
           return;
         }
         console.log(formatHostTable(rows));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   host
     .command('get')
     .description('Show one roster host')
     .requiredOption('--agent-id <id>', 'Agent id')
     .option('--json', 'Output JSON')
-    .action(async (opts: { agentId: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { agentId: string; json?: boolean }) => {
         const row = await withDb((db) =>
           new HostRosterStore(db as unknown as Kysely<Database>).get(opts.agentId),
         );
@@ -91,11 +89,8 @@ export function registerHostCommands(program: Command): void {
           process.exit(1);
         }
         console.log(opts.json ? JSON.stringify(row, null, 2) : formatHostTable([row]));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   host
     .command('declare')
@@ -121,18 +116,18 @@ export function registerHostCommands(program: Command): void {
       'The box can reach the orchestrator object storage — bring-up delivers the agent payload via a presigned S3 pull (else it falls back to SSH-push)',
     )
     .action(
-      async (opts: {
-        agentId: string;
-        labels?: string;
-        hostname?: string;
-        prop: string[];
-        address?: string;
-        sshUser?: string;
-        sshPort?: string;
-        sshKeySecret?: string;
-        s3Reachable?: boolean;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          agentId: string;
+          labels?: string;
+          hostname?: string;
+          prop: string[];
+          address?: string;
+          sshUser?: string;
+          sshPort?: string;
+          sshKeySecret?: string;
+          s3Reachable?: boolean;
+        }) => {
           // Omitted --labels keeps a stored host's labels (a new host gets none).
           const labels =
             opts.labels === undefined
@@ -180,19 +175,16 @@ export function registerHostCommands(program: Command): void {
             }
           });
           console.log(`Declared static host: ${opts.agentId}`);
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   host
     .command('remove')
     .description('Remove a host from the roster')
     .requiredOption('--agent-id <id>', 'Agent id to remove')
-    .action(async (opts: { agentId: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { agentId: string }) => {
         const deleted = await withDb(async (db) => {
           const kdb = db as unknown as Kysely<Database>;
           try {
@@ -221,9 +213,6 @@ export function registerHostCommands(program: Command): void {
           process.exit(1);
         }
         console.log(`Removed host: ${opts.agentId}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

@@ -52,13 +52,13 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Is a stored token + endpoint present (regardless of expiry)? */
 export function hasCredentials(config: GlobalConfig): boolean {
-  return Boolean((config.pat ?? config.token) && (config.platformEndpoint ?? config.endpoint));
+  return Boolean(config.pat && config.platformEndpoint);
 }
 
 /** Check 1: logged in with an unexpired token. */
 export function checkLogin(config: GlobalConfig, now: number): DoctorCheckBody {
   const name = 'login';
-  const endpoint = config.platformEndpoint ?? config.endpoint;
+  const endpoint = config.platformEndpoint;
   if (!hasCredentials(config)) {
     return {
       name,

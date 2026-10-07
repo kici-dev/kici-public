@@ -56,6 +56,8 @@ import {
   type RaftVoteRequest,
   type RaftVoteResponse,
   type RaftAppendEntries,
+  type PeerScalerReloadRequest,
+  type PeerScalerReloadResponse,
   PROTOCOL_VERSION,
 } from '@kici-dev/engine';
 import { PeerLinkDirection, type PeerRegistry } from './peer-registry.js';
@@ -71,6 +73,9 @@ import {
   type SCALER_ORPHANS_TIMEOUT,
   type ScalerOrphansRequestHandler,
 } from './scaler-orphans-peer.js';
+import { replyToScalerReloadRequest, ScalerReloadWaiters } from './scaler-reload-peer.js';
+import type { PEER_REQUEST_TIMEOUT } from './peer-request-waiters.js';
+import type { ScalerFileReload } from '../scaler/file-reload.js';
 import {
   HANDSHAKE_NONCE_BYTES,
   computeClientProof,
@@ -244,6 +249,12 @@ export interface PeerClientOptions {
    */
   onScalerOrphansRequest?: ScalerOrphansRequestHandler;
   /**
+   * Reloads this node's scaler config for a peer.scaler.reload.request the
+   * connected coordinator sent (`kici-admin scaler reload`). If undefined,
+   * requests are answered `rejected`.
+   */
+  onScalerReloadRequest?: ScalerFileReload;
+  /**
    * Forgets a departed peer the connected coordinator forgot (`kici-admin peer
    * forget`). If undefined, requests are answered with outcome `error`.
    */
@@ -314,6 +325,7 @@ export class PeerClient {
   private readonly cacheWaiters = new Map<string, CacheWaiter>();
   private readonly configReloadWaiters = new Map<string, ConfigReloadWaiter>();
   private readonly scalerOrphansWaiters = new ScalerOrphansWaiters();
+  private readonly scalerReloadWaiters = new ScalerReloadWaiters();
   private readonly peerForgetWaiters = new PeerForgetWaiters();
   private readonly clusterSettingsWaiters = new Map<string, ClusterSettingsWaiter>();
   /** Correlates peer.logs.collect.request with the peer's chunked subtree response. */
@@ -365,6 +377,7 @@ export class PeerClient {
   private readonly onAuthenticated?: (targetInstanceId: string) => void;
   private readonly onLogsCollectRequest?: PeerLogsCollectResponder;
   private readonly onScalerOrphansRequest?: ScalerOrphansRequestHandler;
+  private readonly onScalerReloadRequest?: ScalerFileReload;
   private readonly onPeerForgetRequest?: PeerClientOptions['onPeerForgetRequest'];
 
   constructor(options: PeerClientOptions) {
@@ -396,6 +409,7 @@ export class PeerClient {
     this.onAuthenticated = options.onAuthenticated;
     this.onLogsCollectRequest = options.onLogsCollectRequest;
     this.onScalerOrphansRequest = options.onScalerOrphansRequest;
+    this.onScalerReloadRequest = options.onScalerReloadRequest;
     this.onPeerForgetRequest = options.onPeerForgetRequest;
   }
 
@@ -434,6 +448,7 @@ export class PeerClient {
     this.clearConfigReloadWaiters();
     this.clearClusterSettingsWaiters();
     this.scalerOrphansWaiters.rejectAll('Disconnected before the scaler orphan response arrived');
+    this.scalerReloadWaiters.rejectAll('Disconnected before the scaler reload response arrived');
     this.peerForgetWaiters.rejectAll('Disconnected before the peer forget response arrived');
     this.logsCollectWaiters.rejectAll('peer disconnected');
     this.resetHandshake();
@@ -554,6 +569,21 @@ export class PeerClient {
   ): Promise<PeerScalerOrphansResponse | null | typeof SCALER_ORPHANS_TIMEOUT> {
     if (!this.send(msg as PeerToPeerMessage)) return null;
     return this.scalerOrphansWaiters.wait(msg.messageId, timeoutMs);
+  }
+
+  /**
+   * Send a peer.scaler.reload.request to the connected peer and wait for the
+   * matching response.
+   *
+   * @returns the response; null when not connected; `'timeout'` when no
+   *   response arrived within `timeoutMs`.
+   */
+  async sendScalerReloadAndWait(
+    msg: PeerScalerReloadRequest,
+    timeoutMs: number,
+  ): Promise<PeerScalerReloadResponse | null | typeof PEER_REQUEST_TIMEOUT> {
+    if (!this.send(msg as PeerToPeerMessage)) return null;
+    return this.scalerReloadWaiters.wait(msg.messageId, timeoutMs);
   }
 
   /**
@@ -1190,7 +1220,70 @@ export class PeerClient {
     );
   }
 
+  /**
+   * Route the operator-relay pairs (`scaler orphans --target`, `peer forget`,
+   * `scaler reload`): answer a request from the coordinator this client
+   * dialled, or hand a response to the request waiting for it.
+   *
+   * @returns whether `msg` was one of them.
+   */
+  private routeOperatorRelay(msg: PeerToPeerMessage): boolean {
+    switch (msg.type) {
+      case 'peer.scaler.orphans.request': {
+        replyToScalerOrphansRequest(
+          msg,
+          this.onScalerOrphansRequest,
+          (response) => {
+            this.send(response);
+          },
+          { peerId: this._targetInstanceId },
+        );
+        return true;
+      }
+
+      case 'peer.forget.request': {
+        // This client dialled the peer, and only coordinators dial coordinators.
+        replyToPeerForgetRequest(
+          msg,
+          this.onPeerForgetRequest,
+          (response) => {
+            this.send(response);
+          },
+          { peerId: this._targetInstanceId },
+        );
+        return true;
+      }
+
+      case 'peer.forget.response': {
+        this.peerForgetWaiters.resolve(msg);
+        return true;
+      }
+
+      case 'peer.scaler.orphans.response': {
+        this.scalerOrphansWaiters.resolve(msg);
+        return true;
+      }
+
+      case 'peer.scaler.reload.request': {
+        // The sender is the coordinator this client dialled: only coordinators
+        // serve the peer endpoint, so no role check is needed here.
+        replyToScalerReloadRequest(msg, this.onScalerReloadRequest, (r) => this.send(r), {
+          peerId: this._targetInstanceId,
+        });
+        return true;
+      }
+
+      case 'peer.scaler.reload.response': {
+        this.scalerReloadWaiters.resolve(msg);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
   private routeMessage(msg: PeerToPeerMessage): void {
+    if (this.routeOperatorRelay(msg)) return;
     switch (msg.type) {
       case 'peer.heartbeat': {
         this.peerRegistry.updateHeartbeat(msg.instanceId, msg);
@@ -1352,41 +1445,6 @@ export class PeerClient {
           this.configReloadWaiters.delete(msg.messageId);
           waiter.resolve(msg);
         }
-        break;
-      }
-
-      case 'peer.scaler.orphans.request': {
-        replyToScalerOrphansRequest(
-          msg,
-          this.onScalerOrphansRequest,
-          (response) => {
-            this.send(response);
-          },
-          { peerId: this._targetInstanceId },
-        );
-        break;
-      }
-
-      case 'peer.forget.request': {
-        // This client dialled the peer, and only coordinators dial coordinators.
-        replyToPeerForgetRequest(
-          msg,
-          this.onPeerForgetRequest,
-          (response) => {
-            this.send(response);
-          },
-          { peerId: this._targetInstanceId },
-        );
-        break;
-      }
-
-      case 'peer.forget.response': {
-        this.peerForgetWaiters.resolve(msg);
-        break;
-      }
-
-      case 'peer.scaler.orphans.response': {
-        this.scalerOrphansWaiters.resolve(msg);
         break;
       }
 

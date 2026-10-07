@@ -203,6 +203,14 @@ export const AccessLogAction = z.enum([
    */
   'scaler.orphan.stop',
   /**
+   * The scaler config re-read via the orch admin `POST /admin/scaler/reload`
+   * route (driven by `kici-admin scaler reload`), on the receiving orchestrator
+   * and, unless `single`, on every peer it is connected to. `target_id` is the
+   * receiving instance id; `actor_meta` carries `single` and the per-instance
+   * `results`.
+   */
+  'scaler.reload',
+  /**
    * A departed peer dropped from the coordinators' live peer registries via
    * the orch admin `POST /admin/peers/forget` route (driven by `kici-admin peer
    * forget`). `target_id` is the forgotten instance id; `actor_meta` carries the
@@ -226,6 +234,7 @@ export const AccessLogAction = z.enum([
    * outcome 'error' on failure).
    */
   'db.fresh',
+  'db.migrate',
   'db.ensure',
   'db.create_role',
   'db.create_readonly_user',

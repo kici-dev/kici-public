@@ -65,7 +65,7 @@ below use LogQL; adapt the label selectors to your own log shipper.
 The webhook response includes the `requestId`. Query your log store for every
 line carrying it across all tiers:
 
-```logql
+```text
 {job="kici"} | json | requestId="<requestId>"
 ```
 
@@ -77,7 +77,7 @@ illustrative — the label set depends on how you ship logs.)
 
 Add the `service` label to scope to one tier:
 
-```logql
+```text
 {service="orchestrator"} | json | requestId="<requestId>"
 ```
 
@@ -87,13 +87,13 @@ Labels are filtered before the `| json` parser runs, so this is materially faste
 
 Use the parsed `runId` field to see all jobs in a single workflow run:
 
-```logql
+```text
 {service="orchestrator"} | json | runId="<runId>"
 ```
 
 ### Finding errors by tier
 
-```logql
+```text
 {service="agent"} |~ "\"level\":\"error\""
 ```
 
@@ -108,13 +108,13 @@ Agent logs reach your log store through two paths:
 
 To find every forwarded agent log line regardless of which path it took:
 
-```logql
+```text
 {service="agent"} | json
 ```
 
 ### Finding jobs by routing key
 
-```logql
+```text
 {service="orchestrator"} | json | routingKey="github:<app-id>" | jobId!=""
 ```
 
@@ -158,6 +158,8 @@ All three tiers expose health endpoints for monitoring:
 | `/cluster/health` | Cluster health: status, role, term, leader, peers, agents                                       |
 | `/cluster/peers`  | Per-peer details: instance ID, connection state, agents, and each link direction's `authScheme` |
 | `/cluster/runs`   | Active execution runs with job routing summary                                                  |
+
+The orchestrator `/ready` check stays `200` through a database failover. A failover closes the idle pooled connections, and the check asks again on another connection before it reports the database as down.
 
 ### Agent
 

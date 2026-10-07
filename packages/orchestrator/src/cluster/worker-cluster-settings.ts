@@ -14,6 +14,7 @@ import type { ClusterSettingsReader } from './cluster-settings-reader.js';
 export interface WorkerClusterSettingDefaults {
   agentTokenTtlMs: number;
   firecrackerApiSocketWaitMs: number;
+  concurrencyWaitTimeoutMs: number;
 }
 
 /** A worker snapshot and the `cluster_settings.version` its values belong to. */
@@ -45,6 +46,10 @@ export async function resolveWorkerClusterSettingsSnapshot(
       firecrackerApiSocketWaitMs: numberOr(
         row?.firecracker_api_socket_wait_ms,
         defaults.firecrackerApiSocketWaitMs,
+      ),
+      concurrencyWaitTimeoutMs: numberOr(
+        row?.concurrency_wait_timeout_ms,
+        defaults.concurrencyWaitTimeoutMs,
       ),
     },
   };

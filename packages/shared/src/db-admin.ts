@@ -217,6 +217,13 @@ export async function createReadOnlyDbUser(
   }
 }
 
+/** An identifier followed by the bundler's `$<n>` rename suffix. */
+const BUNDLER_RENAME_SUFFIX = /\b([A-Za-z_][A-Za-z0-9_]*)\$\d+\b/g;
+
+function bundleStableSource(fn: (...args: never[]) => unknown): string {
+  return fn.toString().replace(BUNDLER_RENAME_SUFFIX, '$1');
+}
+
 /**
  * Compute a stable content hash over all migrations the provider exposes.
  * Uses migration name + the string representation of `up`/`down` (via
@@ -224,7 +231,11 @@ export async function createReadOnlyDbUser(
  * the hash even when the filename stays the same.
  *
  * Works with any `MigrationProvider` — file-based or the orchestrator /
- * Platform bundled ones.
+ * Platform bundled ones. The bundler renames clashing identifiers with a
+ * `$<n>` suffix whose number depends on everything else in the bundle, so the
+ * CLI and the server bundle give one migration different source text. The
+ * suffixes are removed before hashing: a database the orchestrator migrated
+ * reads current to `db check-schema`, and the reverse.
  */
 export async function computeMigrationsHash(provider: MigrationProvider): Promise<string> {
   const migrations = await provider.getMigrations();
@@ -234,10 +245,10 @@ export async function computeMigrationsHash(provider: MigrationProvider): Promis
     const migration = migrations[name];
     hash.update(name);
     hash.update('\0');
-    hash.update(migration.up.toString());
+    hash.update(bundleStableSource(migration.up));
     hash.update('\0');
     if (migration.down) {
-      hash.update(migration.down.toString());
+      hash.update(bundleStableSource(migration.down));
     }
     hash.update('\0');
   }
@@ -253,7 +264,7 @@ export async function computeMigrationsHash(provider: MigrationProvider): Promis
  * `kici-admin db check-schema` / `kici-platform-admin db check-schema` read
  * this row; a caller of the file-based hash reads the other.
  */
-export const PROVIDER_HASH_KEY = 'kysely_migration_provider';
+const PROVIDER_HASH_KEY = 'kysely_migration_provider';
 
 /**
  * Ensure the content-hash marker table exists, then upsert `hash` keyed by
@@ -1792,49 +1803,85 @@ export async function emitKiciEventDirect(
   }
 }
 
+export const SchemaStatusKind = {
+  Current: 'current',
+  Missing: 'missing',
+  Pending: 'pending',
+  UnknownApplied: 'unknown-applied',
+  HashMissing: 'hash-missing',
+  HashMismatch: 'hash-mismatch',
+} as const;
+export type SchemaStatusKind = (typeof SchemaStatusKind)[keyof typeof SchemaStatusKind];
+
+export interface SchemaStatus {
+  current: boolean;
+  kind: SchemaStatusKind;
+  reason?: string;
+  /** Migrations the provider carries that the database has not applied. */
+  pending?: string[];
+}
+
+/** PostgreSQL's `undefined_table` SQLSTATE. */
+const UNDEFINED_TABLE = '42P01';
+
 /**
- * Return `{ current: true }` if the applied migration count matches the
- * provider's migration count AND the content hash in `_migration_content_hash`
- * matches the provider's current hash. Otherwise return `{ current: false,
- * reason }` with a human-readable reason.
+ * Compare the applied ledger and the stored content hash against `provider`.
  *
- * Callers use this as a warm-start freshness gate — if not current, do a cold
- * start (`db fresh`).
+ * `kind` is the structured verdict callers branch on. A count difference keeps
+ * the `migration count mismatch (applied=N, expected=M)` reason: deploy-prod's
+ * rollback preflight parses it from every image, old ones included. A
+ * connection failure throws instead of reporting a missing table.
+ *
+ * Callers use this as a warm-start freshness gate.
  */
 export async function isSchemaCurrent(
   pool: pg.Pool,
   provider: MigrationProvider,
-): Promise<{ current: boolean; reason?: string }> {
-  const migrations = await provider.getMigrations();
-  const expectedCount = Object.keys(migrations).length;
+): Promise<SchemaStatus> {
+  const expected = Object.keys(await provider.getMigrations()).sort();
 
-  let appliedCount: number;
+  let applied: string[];
   try {
-    const result = await pool.query<{ count: number }>(
-      'SELECT COUNT(*)::int AS count FROM "kysely_migration"',
+    const result = await pool.query<{ name: string }>(
+      'SELECT name FROM "kysely_migration" ORDER BY name',
     );
-    appliedCount = result.rows[0]?.count ?? 0;
-  } catch {
-    return { current: false, reason: 'kysely_migration table missing' };
-  }
-
-  if (appliedCount !== expectedCount) {
+    applied = result.rows.map((r) => r.name);
+  } catch (err) {
+    if ((err as { code?: string }).code !== UNDEFINED_TABLE) throw err;
     return {
       current: false,
-      reason: `migration count mismatch (applied=${appliedCount}, expected=${expectedCount})`,
+      kind: SchemaStatusKind.Missing,
+      reason: 'kysely_migration table missing',
     };
   }
 
-  const expectedHash = await computeMigrationsHash(provider);
+  const expectedSet = new Set(expected);
+  const appliedSet = new Set(applied);
+  const unknown = applied.filter((n) => !expectedSet.has(n));
+  const pending = expected.filter((n) => !appliedSet.has(n));
+  const countReason = `migration count mismatch (applied=${applied.length}, expected=${expected.length})`;
+  if (unknown.length > 0) {
+    return {
+      current: false,
+      kind: SchemaStatusKind.UnknownApplied,
+      reason:
+        applied.length !== expected.length
+          ? countReason
+          : `migration names mismatch (unknown applied: ${unknown.join(', ')})`,
+    };
+  }
+  if (pending.length > 0) {
+    return { current: false, kind: SchemaStatusKind.Pending, reason: countReason, pending };
+  }
+
   const storedHash = await readStoredMigrationContentHash(pool);
-  if (storedHash !== expectedHash) {
-    return {
-      current: false,
-      reason: storedHash === null ? 'content hash missing' : 'content hash mismatch',
-    };
+  if (storedHash === null) {
+    return { current: false, kind: SchemaStatusKind.HashMissing, reason: 'content hash missing' };
   }
-
-  return { current: true };
+  if (storedHash !== (await computeMigrationsHash(provider))) {
+    return { current: false, kind: SchemaStatusKind.HashMismatch, reason: 'content hash mismatch' };
+  }
+  return { current: true, kind: SchemaStatusKind.Current };
 }
 
 // ── Orchestrator DB direct helpers ──────────────────────────────────

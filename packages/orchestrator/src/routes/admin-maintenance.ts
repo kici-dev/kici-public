@@ -17,22 +17,14 @@ import { z } from 'zod';
 import { sql } from 'kysely';
 import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import type { Role } from '../secrets/rbac.js';
+import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-maintenance' });
 
 interface MaintenanceRouteDeps {
   db: Kysely<any>;
 }
-
-type AdminMaintenanceEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
 
 const purgeStaleSourcesSchema = z.object({
   routingKey: z.string().min(1),
@@ -47,13 +39,11 @@ const purgeSecretsSchema = z.object({
   orgId: z.string().min(1).optional(),
 });
 
-export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminMaintenanceEnv> {
-  const app = new Hono<AdminMaintenanceEnv>();
+export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminEnv> {
+  const app = createAdminApp(logger);
 
   // POST /api/v1/admin/queue/clear — TRUNCATE dispatch_queue.
-  app.post('/queue/clear', async (c) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
+  app.post('/queue/clear', requireUnscoped, async (c) => {
     try {
       await sql`TRUNCATE dispatch_queue`.execute(deps.db);
       logger.info('dispatch_queue cleared');
@@ -192,9 +182,7 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminM
   // for ops recovery after encryption-key rotation leaves undecryptable rows,
   // or for resetting per-source secrets in test setups. Scope is org-wide by
   // default; pass orgId to constrain.
-  app.post('/secrets/purge', async (c) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
+  app.post('/secrets/purge', requireUnscoped, async (c) => {
     try {
       const body = purgeSecretsSchema.parse(await c.req.json());
       const query = body.orgId

@@ -17,6 +17,8 @@ import {
   setContextSecretDirect,
   listCheckRunTrackingDirect,
   registerWorkflowManualDirect,
+  isSchemaCurrent,
+  SchemaStatusKind,
 } from './db-admin.js';
 
 describe('parseDatabaseUrl', () => {
@@ -100,6 +102,31 @@ describe('computeMigrationsHash', () => {
     const h1 = await computeMigrationsHash(makeProvider({ '001_initial': m1 }));
     const h2 = await computeMigrationsHash(makeProvider({ '001_initial': m1, '002_extra': m2 }));
     expect(h1).not.toBe(h2);
+  });
+
+  // fails-when: the hash reads the bundler's `$<n>` rename suffixes, so the CLI bundle
+  // and the server bundle disagree about the same migration (check-schema: hash-mismatch)
+  it('ignores the bundler rename suffix on identifiers', async () => {
+    const sql = (s: string) => s;
+    const sql$2 = sql;
+    async function up(): Promise<void> {
+      sql('SELECT 1');
+    }
+    async function up$157(): Promise<void> {
+      sql$2('SELECT 1');
+    }
+    const plain = await computeMigrationsHash(makeProvider({ '001_initial': { up } }));
+    const renamed = await computeMigrationsHash(makeProvider({ '001_initial': { up: up$157 } }));
+    expect(renamed).toBe(plain);
+    // breaks-if-wrong: an edited body must still change the hash
+    const upEdited = (() => {
+      async function up(): Promise<void> {
+        sql('SELECT 2');
+      }
+      return up;
+    })();
+    const edited = await computeMigrationsHash(makeProvider({ '001_initial': { up: upEdited } }));
+    expect(edited).not.toBe(plain);
   });
 
   it('is order-independent over object key insertion order', async () => {
@@ -1102,3 +1129,95 @@ describe('registerWorkflowManualDirect', () => {
 // symmetric with other test files in the monorepo).
 void beforeEach;
 void vi;
+
+describe('isSchemaCurrent kinds', () => {
+  function fakePool(applied: string[] | null | Error, storedHash: string | null) {
+    return {
+      query: async (text: string) => {
+        if (text.includes('FROM "kysely_migration"')) {
+          if (applied instanceof Error) throw applied;
+          if (applied === null) {
+            throw Object.assign(new Error('relation "kysely_migration" does not exist'), {
+              code: '42P01',
+            });
+          }
+          return { rows: applied.map((name) => ({ name })) };
+        }
+        if (text.includes('_migration_content_hash')) {
+          return { rows: storedHash ? [{ hash: storedHash }] : [] };
+        }
+        throw new Error(`unexpected query ${text}`);
+      },
+    } as unknown as pg.Pool;
+  }
+  const migration: Migration = { up: async () => undefined };
+  const provider = (names: string[]): MigrationProvider => ({
+    getMigrations: async () => Object.fromEntries(names.map((n) => [n, migration])),
+  });
+
+  it('is current when names and hash agree', async () => {
+    const p = provider(['010_baseline']);
+    const s = await isSchemaCurrent(fakePool(['010_baseline'], await computeMigrationsHash(p)), p);
+    expect(s).toEqual({ current: true, kind: SchemaStatusKind.Current });
+  });
+  // fails-when: the count-reason shape changes — deploy-prod parses it from older images too
+  it('reports pending migrations with the count reason deploy-prod parses', async () => {
+    const s = await isSchemaCurrent(
+      fakePool(['010_baseline'], null),
+      provider(['010_baseline', '011_x']),
+    );
+    expect(s.kind).toBe(SchemaStatusKind.Pending);
+    expect(s.pending).toEqual(['011_x']);
+    expect(s.reason).toBe('migration count mismatch (applied=1, expected=2)');
+  });
+  // fails-when: a database ahead of the binary stops reporting the count reason, so
+  // deploy-prod can no longer read it as "db-ahead"
+  it('keeps the count reason when the database carries more migrations', async () => {
+    const s = await isSchemaCurrent(
+      fakePool(['010_baseline', '011_x', '012_y'], null),
+      provider(['010_baseline', '011_x']),
+    );
+    expect(s.kind).toBe(SchemaStatusKind.UnknownApplied);
+    expect(s.reason).toBe('migration count mismatch (applied=3, expected=2)');
+  });
+  // fails-when: a same-count rename is reported as current
+  it('reports same-count name drift as unknown-applied', async () => {
+    const s = await isSchemaCurrent(
+      fakePool(['010_baseline', '011_other'], null),
+      provider(['010_baseline', '011_x']),
+    );
+    expect(s.kind).toBe(SchemaStatusKind.UnknownApplied);
+    expect(s.reason).toBe('migration names mismatch (unknown applied: 011_other)');
+  });
+  // fails-when: a ledger row this build does not carry (a baseline row a development
+  // build wrote) reads as anything but unknown-applied
+  it('reports a baseline row as an unknown applied migration', async () => {
+    const p = provider(['001_a', '002_b', '003_c']);
+    const s = await isSchemaCurrent(fakePool(['002_baseline', '003_c'], null), p);
+    expect(s.kind).toBe(SchemaStatusKind.UnknownApplied);
+    expect(Object.values(SchemaStatusKind)).not.toContain('baseline-ledger');
+  });
+  it('reports a missing ledger table and a hash mismatch', async () => {
+    expect((await isSchemaCurrent(fakePool(null, null), provider(['010_baseline']))).kind).toBe(
+      SchemaStatusKind.Missing,
+    );
+    const s = await isSchemaCurrent(
+      fakePool(['010_baseline'], 'stale'),
+      provider(['010_baseline']),
+    );
+    expect(s).toEqual({
+      current: false,
+      kind: SchemaStatusKind.HashMismatch,
+      reason: 'content hash mismatch',
+    });
+  });
+  // fails-when: an unreachable database is reported as a missing ledger table
+  it('throws a connection failure instead of reporting a missing table', async () => {
+    const refused = Object.assign(new Error('getaddrinfo ENOTFOUND postgres-platform'), {
+      code: 'ENOTFOUND',
+    });
+    await expect(
+      isSchemaCurrent(fakePool(refused, null), provider(['010_baseline'])),
+    ).rejects.toThrow(/ENOTFOUND/);
+  });
+});

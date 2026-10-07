@@ -9,11 +9,9 @@ import { type Kysely, sql } from 'kysely';
  * unknown-type badge — and two semantically identical wait holds render
  * differently depending on which gate produced them.
  *
- * Writers emit the gate vocabulary; this backfills the history. The read path
- * also normalizes (`normalizePersistedHoldType`) and the wait-hold release
- * sweep matches both spellings, so a row written by an un-upgraded
- * orchestrator behaves correctly whether or not this has run — the two sides
- * deploy independently.
+ * Writers emit the gate vocabulary; this backfills the history. Migration 158
+ * re-applies the same rewrite, after which the readers match the gate
+ * vocabulary only.
  *
  * Idempotent: a second run matches no rows.
  */

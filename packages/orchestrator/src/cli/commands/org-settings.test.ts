@@ -13,6 +13,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Command } from 'commander';
 import { registerOrgSettingsCommands } from './org-settings.js';
 import type { AdminApiClient } from '../api-client.js';
+import { DASHBOARD_WRITE_OPERATIONS } from '@kici-dev/engine/protocol/dashboard-write-operations';
 
 interface CommandResult {
   stdout: string;
@@ -32,6 +33,11 @@ const SAMPLE_SETTINGS = {
   userCacheTtlMs: null,
   artifactMaxBytes: null,
   artifactMaxPerRun: null,
+  rerouteSpawnMaxAttempts: null,
+  rerouteSpawnRetryBackoffMs: null,
+  cacheUploadSettleTimeoutMs: null,
+  sandboxAllowedCapabilities: [],
+  sandboxAllowHostNetwork: false,
   createdAt: '2026-04-17T10:00:00Z',
   updatedAt: '2026-04-17T10:00:00Z',
 };
@@ -62,7 +68,8 @@ async function runCommand(args: string[], client: Partial<AdminApiClient>): Prom
   } catch (err: any) {
     if (!err.message?.startsWith('EXIT:')) {
       if (err.code?.startsWith('commander.')) {
-        // commander exit
+        exitCode = err.exitCode ?? 1;
+        errors.push(err.message);
       } else {
         console.log = origLog;
         console.error = origError;
@@ -93,7 +100,7 @@ describe('kici-admin org-settings global-workflows', () => {
 
   it('show --format json emits the raw settings object', async () => {
     const { stdout } = await runCommand(
-      ['org-settings', 'global-workflows', 'show', '--customer-id', ORG, '--format', 'json'],
+      ['org-settings', 'global-workflows', 'show', '--org', ORG, '--format', 'json'],
       client,
     );
     expect(mockGet).toHaveBeenCalledWith(
@@ -104,7 +111,7 @@ describe('kici-admin org-settings global-workflows', () => {
 
   it('show defaults to a human-readable table', async () => {
     const { stdout } = await runCommand(
-      ['org-settings', 'global-workflows', 'show', '--customer-id', ORG],
+      ['org-settings', 'global-workflows', 'show', '--org', ORG],
       client,
     );
     expect(stdout).toContain('Customer/org id:');
@@ -116,14 +123,22 @@ describe('kici-admin org-settings global-workflows', () => {
     expect(stdout).not.toContain('Elevated');
   });
 
-  it('show accepts --org as an alias for --customer-id', async () => {
-    await runCommand(
-      ['org-settings', 'global-workflows', 'show', '--org', ORG, '--format', 'json'],
+  it('rejects --customer-id as an unknown option', async () => {
+    // fails-when: the --customer-id spelling is still registered.
+    const result = await runCommand(
+      ['org-settings', 'global-workflows', 'show', '--org', ORG, '--customer-id', ORG],
       client,
     );
-    expect(mockGet).toHaveBeenCalledWith(
-      `/api/v1/admin/org-settings/global-workflows?customerId=${encodeURIComponent(ORG)}`,
-    );
+    expect(result.exitCode).not.toBeNull();
+    expect(result.stderr).toMatch(/unknown option '--customer-id'/);
+    expect(mockGet).not.toHaveBeenCalled();
+  });
+
+  it('requires --org', async () => {
+    // breaks-if-wrong: dropping the alias must not leave the org optional.
+    const result = await runCommand(['org-settings', 'global-workflows', 'show'], client);
+    expect(result.stderr).toMatch(/required option '--org <id>' not specified/);
+    expect(mockGet).not.toHaveBeenCalled();
   });
 
   it('set-enabled is gone — the master switch is cluster-wide', async () => {
@@ -131,7 +146,7 @@ describe('kici-admin org-settings global-workflows', () => {
     // that nothing patches the org row any more; commander reports the removed
     // subcommand as an unknown command (exit non-zero, never 0).
     const { exitCode } = await runCommand(
-      ['org-settings', 'global-workflows', 'set-enabled', 'true', '--customer-id', ORG],
+      ['org-settings', 'global-workflows', 'set-enabled', 'true', '--org', ORG],
       client,
     );
     expect(mockPatch).not.toHaveBeenCalled();
@@ -149,7 +164,7 @@ describe('kici-admin org-settings global-workflows', () => {
       },
     });
     await runCommand(
-      ['org-settings', 'global-workflows', 'allow-add', 'myorg/deploy', '--customer-id', ORG],
+      ['org-settings', 'global-workflows', 'allow-add', 'myorg/deploy', '--org', ORG],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -174,7 +189,7 @@ describe('kici-admin org-settings global-workflows', () => {
         'global-workflows',
         'allow-add',
         'myorg/deploy',
-        '--customer-id',
+        '--org',
         ORG,
         '--source',
         'github:42',
@@ -190,7 +205,7 @@ describe('kici-admin org-settings global-workflows', () => {
   it('allow-add is a no-op when an exact-match entry is already present', async () => {
     mockGet.mockResolvedValueOnce({ settings: SAMPLE_SETTINGS });
     const { stdout } = await runCommand(
-      ['org-settings', 'global-workflows', 'allow-add', 'myorg/ci-*', '--customer-id', ORG],
+      ['org-settings', 'global-workflows', 'allow-add', 'myorg/ci-*', '--org', ORG],
       client,
     );
     expect(mockPatch).not.toHaveBeenCalled();
@@ -218,7 +233,7 @@ describe('kici-admin org-settings global-workflows', () => {
         'global-workflows',
         'allow-add',
         'myorg/ci-*',
-        '--customer-id',
+        '--org',
         ORG,
         '--source',
         'github:42',
@@ -242,7 +257,7 @@ describe('kici-admin org-settings global-workflows', () => {
       settings: { ...SAMPLE_SETTINGS, deniedRepos: [{ pattern: 'a' }] },
     });
     await runCommand(
-      ['org-settings', 'global-workflows', 'deny-remove', 'b', '--customer-id', ORG],
+      ['org-settings', 'global-workflows', 'deny-remove', 'b', '--org', ORG],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -270,7 +285,7 @@ describe('kici-admin org-settings global-workflows', () => {
         'global-workflows',
         'deny-remove',
         'myorg/x',
-        '--customer-id',
+        '--org',
         ORG,
         '--source',
         'github:42',
@@ -304,7 +319,7 @@ describe('kici-admin org-settings global-workflows', () => {
         'global-workflows',
         'allow-add',
         'forgejo.example.com/team/**',
-        '--customer-id',
+        '--org',
         ORG,
         '--source',
         genericKey,
@@ -326,10 +341,9 @@ describe('kici-admin org-settings global-workflows', () => {
     program.configureOutput({ writeErr: () => {} });
     registerOrgSettingsCommands(program, () => client as AdminApiClient);
     await expect(
-      program.parseAsync(
-        ['org-settings', 'global-workflows', sub, 'myorg/release', '--customer-id', ORG],
-        { from: 'user' },
-      ),
+      program.parseAsync(['org-settings', 'global-workflows', sub, 'myorg/release', '--org', ORG], {
+        from: 'user',
+      }),
     ).rejects.toThrow(/unknown command 'elevate-(add|remove)'/);
     expect(mockPatch).not.toHaveBeenCalled();
   });
@@ -349,7 +363,7 @@ describe('kici-admin org-settings user-cache', () => {
 
   it('show prints the per-org quota + TTL (cluster default when null)', async () => {
     const { stdout } = await runCommand(
-      ['org-settings', 'user-cache', 'show', '--customer-id', ORG],
+      ['org-settings', 'user-cache', 'show', '--org', ORG],
       client,
     );
     expect(mockGet).toHaveBeenCalledWith(
@@ -361,7 +375,7 @@ describe('kici-admin org-settings user-cache', () => {
 
   it('set-quota patches userCacheQuotaBytes with a positive integer', async () => {
     await runCommand(
-      ['org-settings', 'user-cache', 'set-quota', '1073741824', '--customer-id', ORG],
+      ['org-settings', 'user-cache', 'set-quota', '1073741824', '--org', ORG],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -371,10 +385,7 @@ describe('kici-admin org-settings user-cache', () => {
   });
 
   it('set-ttl patches userCacheTtlMs with a positive integer', async () => {
-    await runCommand(
-      ['org-settings', 'user-cache', 'set-ttl', '3600000', '--customer-id', ORG],
-      client,
-    );
+    await runCommand(['org-settings', 'user-cache', 'set-ttl', '3600000', '--org', ORG], client);
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
       customerId: ORG,
       userCacheTtlMs: 3600000,
@@ -399,7 +410,7 @@ describe('kici-admin org-settings user-cache', () => {
 
   it('set-quota rejects a non-positive / non-integer value with exit 1', async () => {
     const { exitCode, stderr } = await runCommand(
-      ['org-settings', 'user-cache', 'set-quota', '0', '--customer-id', ORG],
+      ['org-settings', 'user-cache', 'set-quota', '0', '--org', ORG],
       client,
     );
     expect(exitCode).toBe(1);
@@ -422,7 +433,7 @@ describe('kici-admin org-settings artifacts', () => {
 
   it('show prints the per-org size cap + per-run cap (cluster default when null)', async () => {
     const { stdout } = await runCommand(
-      ['org-settings', 'artifacts', 'show', '--customer-id', ORG],
+      ['org-settings', 'artifacts', 'show', '--org', ORG],
       client,
     );
     expect(stdout).toContain('Artifact max bytes:');
@@ -432,7 +443,7 @@ describe('kici-admin org-settings artifacts', () => {
 
   it('set-max-bytes patches artifactMaxBytes with a positive integer', async () => {
     await runCommand(
-      ['org-settings', 'artifacts', 'set-max-bytes', '2147483648', '--customer-id', ORG],
+      ['org-settings', 'artifacts', 'set-max-bytes', '2147483648', '--org', ORG],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -442,10 +453,7 @@ describe('kici-admin org-settings artifacts', () => {
   });
 
   it('set-max-per-run patches artifactMaxPerRun with a positive integer', async () => {
-    await runCommand(
-      ['org-settings', 'artifacts', 'set-max-per-run', '3', '--customer-id', ORG],
-      client,
-    );
+    await runCommand(['org-settings', 'artifacts', 'set-max-per-run', '3', '--org', ORG], client);
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
       customerId: ORG,
       artifactMaxPerRun: 3,
@@ -470,7 +478,7 @@ describe('kici-admin org-settings artifacts', () => {
 
   it('set-max-per-run rejects a non-positive / non-integer value with exit 1', async () => {
     const { exitCode, stderr } = await runCommand(
-      ['org-settings', 'artifacts', 'set-max-per-run', '0', '--customer-id', ORG],
+      ['org-settings', 'artifacts', 'set-max-per-run', '0', '--org', ORG],
       client,
     );
     expect(exitCode).toBe(1);
@@ -492,7 +500,7 @@ describe('kici-admin org-settings reroute', () => {
   });
 
   it('show fetches the settings', async () => {
-    await runCommand(['org-settings', 'reroute', 'show', '--customer-id', ORG], client);
+    await runCommand(['org-settings', 'reroute', 'show', '--org', ORG], client);
     expect(mockGet).toHaveBeenCalledWith(
       `/api/v1/admin/org-settings/global-workflows?customerId=${encodeURIComponent(ORG)}`,
     );
@@ -500,17 +508,7 @@ describe('kici-admin org-settings reroute', () => {
 
   it('set patches only the flags provided', async () => {
     await runCommand(
-      [
-        'org-settings',
-        'reroute',
-        'set',
-        '--customer-id',
-        ORG,
-        '--window',
-        '120000',
-        '--max-hops',
-        '5',
-      ],
+      ['org-settings', 'reroute', 'set', '--org', ORG, '--window', '120000', '--max-hops', '5'],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -522,7 +520,7 @@ describe('kici-admin org-settings reroute', () => {
 
   it('set with no flags exits 1', async () => {
     const { exitCode, stderr } = await runCommand(
-      ['org-settings', 'reroute', 'set', '--customer-id', ORG],
+      ['org-settings', 'reroute', 'set', '--org', ORG],
       client,
     );
     expect(exitCode).toBe(1);
@@ -532,26 +530,14 @@ describe('kici-admin org-settings reroute', () => {
 
   it('set rejects a window below the 1000ms floor', async () => {
     const { exitCode } = await runCommand(
-      ['org-settings', 'reroute', 'set', '--customer-id', ORG, '--window', '500'],
+      ['org-settings', 'reroute', 'set', '--org', ORG, '--window', '500'],
       client,
     );
     expect(exitCode).toBe(1);
     expect(mockPatch).not.toHaveBeenCalled();
   });
 
-  it('reset clears only the three overrides an older orchestrator reports', async () => {
-    // breaks-if-wrong: reset against an older orchestrator must still succeed — its
-    // strict PATCH schema rejects the spawn-retry fields it does not project.
-    await runCommand(['org-settings', 'reroute', 'reset', '--org', ORG], client);
-    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
-      customerId: ORG,
-      rerouteSpawnWindowMs: null,
-      rerouteAckTimeoutMs: null,
-      rerouteMaxHops: null,
-    });
-  });
-
-  it('reset also clears the spawn-retry budget when the orchestrator reports it', async () => {
+  it('reset clears every reroute override, the spawn-retry budget included', async () => {
     // fails-when: reset leaves the spawn-retry overrides in place on a current orchestrator
     mockGet.mockResolvedValue({
       settings: {
@@ -577,7 +563,7 @@ describe('kici-admin org-settings reroute', () => {
         'org-settings',
         'reroute',
         'set',
-        '--customer-id',
+        '--org',
         ORG,
         '--spawn-max-attempts',
         '2',
@@ -600,7 +586,7 @@ describe('kici-admin org-settings reroute', () => {
     ]) {
       // fails-when: a floor is dropped, so a worker could be told to never spawn
       const { exitCode } = await runCommand(
-        ['org-settings', 'reroute', 'set', '--customer-id', ORG, ...flags],
+        ['org-settings', 'reroute', 'set', '--org', ORG, ...flags],
         client,
       );
       expect(exitCode).toBe(1);
@@ -616,19 +602,13 @@ describe('kici-admin org-settings reroute', () => {
         rerouteSpawnRetryBackoffMs: 2500,
       },
     });
-    const { stdout } = await runCommand(
-      ['org-settings', 'reroute', 'show', '--customer-id', ORG],
-      client,
-    );
+    const { stdout } = await runCommand(['org-settings', 'reroute', 'show', '--org', ORG], client);
     expect(stdout).toContain('Reroute spawn attempts: 4');
     expect(stdout).toContain('Reroute spawn backoff: 2500 ms');
   });
 
-  it('show prints the cluster default when an older orchestrator omits the budget', async () => {
-    const { stdout } = await runCommand(
-      ['org-settings', 'reroute', 'show', '--customer-id', ORG],
-      client,
-    );
+  it('show prints the cluster default when the budget is unset', async () => {
+    const { stdout } = await runCommand(['org-settings', 'reroute', 'show', '--org', ORG], client);
     expect(stdout).toContain('Reroute spawn attempts: (cluster default)');
     expect(stdout).toContain('Reroute spawn backoff: (cluster default)');
   });
@@ -667,12 +647,18 @@ describe('kici-admin org-settings dashboard-writes', () => {
       'backends.sync_one': true,
       'backends.test': true,
     },
+    platformManaged: false,
+  };
+  const DW_RESPONSE = {
+    ...DW_RESPONSE_EMPTY,
+    // The server reports a state for every operation it knows.
+    states: Object.fromEntries(DASHBOARD_WRITE_OPERATIONS.map((d) => [d.name, 'permissive'])),
   };
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockGet = vi.fn().mockResolvedValue(DW_RESPONSE_EMPTY);
-    mockPatch = vi.fn().mockResolvedValue(DW_RESPONSE_EMPTY);
+    mockGet = vi.fn().mockResolvedValue(DW_RESPONSE);
+    mockPatch = vi.fn().mockResolvedValue(DW_RESPONSE);
     client = { get: mockGet as any, patch: mockPatch as any };
   });
 
@@ -685,7 +671,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
       `/api/v1/admin/org-settings/dashboard-writes?customerId=${ORG}`,
     );
     expect(result.exitCode).toBeNull();
-    expect(JSON.parse(result.stdout)).toEqual(DW_RESPONSE_EMPTY);
+    expect(JSON.parse(result.stdout)).toEqual(DW_RESPONSE);
   });
 
   it('show table mode groups operations by category', async () => {
@@ -720,13 +706,24 @@ describe('kici-admin org-settings dashboard-writes', () => {
 
   it('set --op flips a single operation', async () => {
     await runCommand(
-      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'secrets.set=false'],
+      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'secrets.set=disabled'],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/dashboard-writes', {
       customerId: ORG,
       updates: { 'secrets.set': 'disabled' },
     });
+  });
+
+  it('rejects the boolean sugar --op name=true', async () => {
+    // fails-when: true/false still maps to permissive/disabled.
+    const result = await runCommand(
+      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'secrets.set=true'],
+      client,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(/--op value must be one of permissive\|encrypted\|disabled/);
+    expect(mockPatch).not.toHaveBeenCalled();
   });
 
   it('set --op secrets.set=encrypted sends the encrypted posture', async () => {
@@ -749,9 +746,9 @@ describe('kici-admin org-settings dashboard-writes', () => {
         '--org',
         ORG,
         '--op',
-        'secrets.set=false',
+        'secrets.set=disabled',
         '--op',
-        'variables.set=false',
+        'variables.set=disabled',
       ],
       client,
     );
@@ -809,7 +806,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
 
   it('set rejects unknown --op operations', async () => {
     const result = await runCommand(
-      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'bogus.op=false'],
+      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'bogus.op=disabled'],
       client,
     );
     expect(result.exitCode).toBe(1);
@@ -847,9 +844,10 @@ describe('kici-admin org-settings dashboard-writes', () => {
   // an ordinary disable, and the answering surface it removed is elsewhere.
   describe('already-disabled held-run lockout', () => {
     const lockedOut = (platformManaged: boolean) => ({
-      ...DW_RESPONSE_EMPTY,
+      ...DW_RESPONSE,
       stored: { 'held_runs.approve': 'disabled' },
       effective: { ...DW_RESPONSE_EMPTY.effective, 'held_runs.approve': false },
+      states: { ...DW_RESPONSE.states, 'held_runs.approve': 'disabled' },
       platformManaged,
     });
 
@@ -876,7 +874,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
     });
 
     it('stays quiet when no held-run write is disabled', async () => {
-      mockGet.mockResolvedValue({ ...DW_RESPONSE_EMPTY, platformManaged: true });
+      mockGet.mockResolvedValue({ ...DW_RESPONSE, platformManaged: true });
       const result = await runCommand(
         ['org-settings', 'dashboard-writes', 'show', '--org', ORG],
         client,
@@ -906,7 +904,7 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
 
   it('show prints the capability list + host-network flag', async () => {
     const { stdout } = await runCommand(
-      ['org-settings', 'sandbox-allowlist', 'show', '--customer-id', ORG],
+      ['org-settings', 'sandbox-allowlist', 'show', '--org', ORG],
       client,
     );
     expect(stdout).toContain('Sandbox capabilities:');
@@ -921,7 +919,7 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
         'sandbox-allowlist',
         'set-capabilities',
         'NET_ADMIN, SYS_PTRACE',
-        '--customer-id',
+        '--org',
         ORG,
       ],
       client,
@@ -934,7 +932,7 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
 
   it('set-capabilities with an empty string clears the list', async () => {
     await runCommand(
-      ['org-settings', 'sandbox-allowlist', 'set-capabilities', '', '--customer-id', ORG],
+      ['org-settings', 'sandbox-allowlist', 'set-capabilities', '', '--org', ORG],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -945,7 +943,7 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
 
   it('allow-host-network true patches the flag', async () => {
     await runCommand(
-      ['org-settings', 'sandbox-allowlist', 'allow-host-network', 'true', '--customer-id', ORG],
+      ['org-settings', 'sandbox-allowlist', 'allow-host-network', 'true', '--org', ORG],
       client,
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
@@ -956,7 +954,7 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
 
   it('allow-host-network rejects a non-boolean with exit 1', async () => {
     const { exitCode, stderr } = await runCommand(
-      ['org-settings', 'sandbox-allowlist', 'allow-host-network', 'maybe', '--customer-id', ORG],
+      ['org-settings', 'sandbox-allowlist', 'allow-host-network', 'maybe', '--org', ORG],
       client,
     );
     expect(exitCode).toBe(1);
@@ -965,7 +963,7 @@ describe('kici-admin org-settings sandbox-allowlist', () => {
   });
 
   it('reset clears both the capability list and host-network flag', async () => {
-    await runCommand(['org-settings', 'sandbox-allowlist', 'reset', '--customer-id', ORG], client);
+    await runCommand(['org-settings', 'sandbox-allowlist', 'reset', '--org', ORG], client);
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
       customerId: ORG,
       sandboxAllowedCapabilities: null,
@@ -1030,5 +1028,185 @@ describe('kici-admin org-settings cache-upload-settle', () => {
       customerId: ORG,
       cacheUploadSettleTimeoutMs: null,
     });
+  });
+});
+
+/**
+ * Every per-org integer knob: `set` patches its field, a value below the floor
+ * exits 1 with the knob's own message and sends nothing, a failed PATCH prints
+ * the server error, and `reset` patches the field to null.
+ */
+describe('kici-admin org-settings integer knobs', () => {
+  interface KnobCase {
+    name: string;
+    set: (value: string) => string[];
+    reset: string[];
+    field: string;
+    min: number;
+    invalid: string;
+  }
+  const valueArg =
+    (...cmd: string[]) =>
+    (value: string) => ['org-settings', ...cmd, value];
+  const cases: KnobCase[] = [
+    {
+      name: 'backup-freshness',
+      set: (v) => ['org-settings', 'backup-freshness', 'set', '--hours', v],
+      reset: ['org-settings', 'backup-freshness', 'reset'],
+      field: 'backupStalenessWarnHours',
+      min: 1,
+      invalid: 'Error: --hours must be an integer >= 1',
+    },
+    {
+      name: 'queue-timeout',
+      set: valueArg('queue-timeout', 'set'),
+      reset: ['org-settings', 'queue-timeout', 'reset'],
+      field: 'queueTimeoutMs',
+      min: 0,
+      invalid: 'Error: --ms must be an integer >= 0',
+    },
+    {
+      name: 'cache-upload-settle',
+      set: valueArg('cache-upload-settle', 'set'),
+      reset: ['org-settings', 'cache-upload-settle', 'reset'],
+      field: 'cacheUploadSettleTimeoutMs',
+      min: 0,
+      invalid: 'Error: --ms must be an integer >= 0',
+    },
+    {
+      name: 'dispatch-ack',
+      set: valueArg('dispatch-ack', 'set'),
+      reset: ['org-settings', 'dispatch-ack', 'reset'],
+      field: 'dispatchAckTimeoutMs',
+      min: 1000,
+      invalid: 'Error: value must be an integer >= 1000 (milliseconds)',
+    },
+    {
+      name: 'scaler-spawn-timeout',
+      set: valueArg('scaler-spawn-timeout', 'set'),
+      reset: ['org-settings', 'scaler-spawn-timeout', 'reset'],
+      field: 'scalerSpawnTimeoutMs',
+      min: 1000,
+      invalid: 'Error: value must be an integer >= 1000 (milliseconds)',
+    },
+    {
+      name: 'ingest-concurrency',
+      set: valueArg('ingest-concurrency', 'set'),
+      reset: ['org-settings', 'ingest-concurrency', 'reset'],
+      field: 'ingestMaxConcurrency',
+      min: 1,
+      invalid: 'Error: value must be an integer >= 1',
+    },
+    ...(
+      [
+        ['user-cache', 'quota', 'userCacheQuotaBytes', 'bytes'],
+        ['user-cache', 'ttl', 'userCacheTtlMs', 'milliseconds'],
+        ['artifacts', 'quota', 'artifactQuotaBytes', 'bytes'],
+        ['artifacts', 'ttl', 'artifactTtlMs', 'milliseconds'],
+        ['artifacts', 'max-bytes', 'artifactMaxBytes', 'bytes'],
+        ['artifacts', 'max-per-run', 'artifactMaxPerRun', 'artifacts'],
+      ] as const
+    ).map(([group, knob, field, unit]) => ({
+      name: `${group} ${knob}`,
+      set: valueArg(group, `set-${knob}`),
+      reset: ['org-settings', group, `reset-${knob}`],
+      field,
+      min: 1,
+      invalid: `Error: value must be a positive integer (${unit})`,
+    })),
+  ];
+
+  let mockPatch: ReturnType<typeof vi.fn>;
+  let client: Partial<AdminApiClient>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPatch = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    client = { get: vi.fn() as any, patch: mockPatch as any };
+  });
+
+  describe.each(cases)('$name', (c) => {
+    it('set at the floor patches the field and prints the settings', async () => {
+      const result = await runCommand([...c.set(String(c.min)), '--org', ORG], client);
+      expect(result.exitCode).toBeNull();
+      expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+        customerId: ORG,
+        [c.field]: c.min,
+      });
+      expect(result.stdout).toContain(`Customer/org id:       ${ORG}`);
+    });
+
+    // fails-when: the knob accepts a value below its floor, or its message changes.
+    it('set below the floor exits 1 with the knob message and sends nothing', async () => {
+      const result = await runCommand([...c.set(String(c.min - 1)), '--org', ORG], client);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(c.invalid);
+      expect(mockPatch).not.toHaveBeenCalled();
+    });
+
+    it('set prints the server error and exits 1 when the PATCH fails', async () => {
+      mockPatch.mockRejectedValueOnce(new Error('boom'));
+      const result = await runCommand([...c.set(String(c.min)), '--org', ORG], client);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe('Error: boom');
+    });
+
+    it('reset patches the field to null', async () => {
+      const result = await runCommand([...c.reset, '--org', ORG], client);
+      expect(result.exitCode).toBeNull();
+      expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+        customerId: ORG,
+        [c.field]: null,
+      });
+    });
+  });
+});
+
+describe('kici-admin org-settings show against an orchestrator that omits newer fields', () => {
+  // fails-when: the table renders an absent nullable field as `undefined`, or an
+  // absent capability list crashes the command.
+  it('renders every absent override as the cluster default', async () => {
+    const { customerId, enabled, allowedRepos, deniedRepos } = SAMPLE_SETTINGS;
+    const client: Partial<AdminApiClient> = {
+      get: vi.fn().mockResolvedValue({
+        settings: { customerId, enabled, allowedRepos, deniedRepos },
+      }) as any,
+    };
+    const result = await runCommand(
+      ['org-settings', 'global-workflows', 'show', '--org', ORG],
+      client,
+    );
+    expect(result.exitCode).toBeNull();
+    expect(result.stdout).not.toContain('undefined');
+    expect(result.stdout).toMatch(/Approval expiry:\s+\(not reported\)/);
+    expect(result.stdout).toMatch(/Allow self-approval:\s+\(not reported\)/);
+    expect(result.stdout).toMatch(/Artifact max\/run:\s+\(cluster default\)/);
+    expect(result.stdout).toMatch(/Reroute max hops:\s+\(cluster default\)/);
+    expect(result.stdout).toMatch(/Dispatch ack timeout:\s+\(cluster default\)/);
+    expect(result.stdout).toMatch(/Ingest max concurrency: \(cluster default\)/);
+    expect(result.stdout).toMatch(/Queue timeout:\s+\(cluster default\)/);
+    expect(result.stdout).toMatch(/Sandbox capabilities:\s+\(none — deny all\)/);
+  });
+
+  // breaks-if-wrong: a set override must still render its value and unit.
+  it('still renders a set override and a reported value with its unit', async () => {
+    const client: Partial<AdminApiClient> = {
+      get: vi.fn().mockResolvedValue({
+        settings: {
+          ...SAMPLE_SETTINGS,
+          dispatchAckTimeoutMs: 0,
+          ingestMaxConcurrency: 4,
+          approvalExpirySeconds: 86400,
+        },
+      }) as any,
+    };
+    const result = await runCommand(
+      ['org-settings', 'global-workflows', 'show', '--org', ORG],
+      client,
+    );
+    expect(result.stdout).toMatch(/Dispatch ack timeout:\s+0 ms/);
+    expect(result.stdout).toContain('Ingest max concurrency: 4');
+    expect(result.stdout).toMatch(/Approval expiry:\s+\d+ s/);
+    expect(result.stdout).toContain('Allow http registries: false');
   });
 });

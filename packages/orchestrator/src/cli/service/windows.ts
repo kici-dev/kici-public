@@ -33,6 +33,7 @@ import {
   batchFileCommand,
   isBatchFile,
 } from '../../helpers/windows-batch.js';
+import { sleep } from '@kici-dev/engine';
 
 /**
  * How long a discovery-path probe of the service registry may run.
@@ -109,11 +110,6 @@ const ERROR_SERVICE_NOT_ACTIVE = 1062;
 
 /** ERROR_SERVICE_CANNOT_ACCEPT_CTRL: `sc.exe stop` on a service that is starting or stopping. */
 const ERROR_SERVICE_CANNOT_ACCEPT_CTRL = 1061;
-
-/** Async sleep used to pace the `sc.exe query` polls. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /** What a service command runs as, and what to change, in a cmd.exe refusal. */
 const SERVICE_USE = 'as a Windows service';

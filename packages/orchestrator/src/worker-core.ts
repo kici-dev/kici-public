@@ -95,6 +95,7 @@ import {
 import { StaticAgentTokenStore } from './worker/static-agent-token-store.js';
 import { reapOrphansAtStartup } from './scaler/startup-orphan-sweep.js';
 import { answerScalerOrphansRequest } from './scaler/orphan-requests.js';
+import { createScalerFileReload, installScalerReloadSignal } from './scaler/file-reload.js';
 import { StepLogBuffer } from './reporting/step-log-buffer.js';
 import { ObserverRegistry } from './ws/observer-registry.js';
 import { configureSecureWsServer } from './ws/server-options.js';
@@ -182,14 +183,25 @@ export function resolveWorkerAgentTokenTtlMs(
 /**
  * Resolve the Firecracker API-socket wait a worker-spawned VM should use: the
  * fleet-wide `firecracker_api_socket_wait_ms` pulled from a coordinator,
- * otherwise the boot-time config default. A snapshot from a coordinator that
- * predates the knob carries no value, and the default applies.
+ * otherwise the boot-time config default.
  */
 export function resolveWorkerFirecrackerApiSocketWaitMs(
   pushed: { settings: WorkerClusterSettings } | null,
   fallback: number,
 ): number {
   return pushed?.settings.firecrackerApiSocketWaitMs ?? fallback;
+}
+
+/**
+ * Resolve the concurrency-slot wait timeout a worker sends on `job.dispatch`:
+ * the fleet-wide `concurrency_wait_timeout_ms` pulled from a coordinator,
+ * otherwise the boot-time config default.
+ */
+export function resolveWorkerConcurrencyWaitTimeoutMs(
+  pushed: { settings: WorkerClusterSettings } | null,
+  fallback: number,
+): number {
+  return pushed?.settings.concurrencyWaitTimeoutMs ?? fallback;
 }
 
 /**
@@ -363,7 +375,11 @@ async function failRefusedReroute(args: {
  * providerContext are already included in the job.reroute message and
  * embedded in the job's jobConfig.
  */
-function buildWorkerOnDispatch(agentRegistry: AgentRegistry, onDelivered: (jobId: string) => void) {
+function buildWorkerOnDispatch(
+  agentRegistry: AgentRegistry,
+  onDelivered: (jobId: string) => void,
+  concurrencyWaitTimeoutMs: () => number,
+) {
   return async (agentId: string, job: any) => {
     const entry = agentRegistry.get(agentId);
     if (!entry) return;
@@ -373,7 +389,11 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry, onDelivered: (jobId
     // No DB lookup needed -- just forward to the agent.
     entry.ws.send(
       JSON.stringify(
-        buildWorkerDispatchMessage(job, { messageId: randomUUID(), timestamp: Date.now() }),
+        buildWorkerDispatchMessage(job, {
+          messageId: randomUUID(),
+          timestamp: Date.now(),
+          concurrencyWaitTimeoutMs: concurrencyWaitTimeoutMs(),
+        }),
       ),
     );
     onDelivered(job.id);
@@ -401,18 +421,9 @@ export async function bootstrapWorker(
   if (config.cluster.role !== 'worker') {
     throw new Error(`bootstrapWorker called with role="${config.cluster.role}", expected "worker"`);
   }
-  // Resolve list of coord URLs to dial. Plural form takes precedence; singular
-  // is treated as a one-element list (back-compat with single-coord workers).
-  const coordUrls =
-    config.cluster.coordinatorUrls && config.cluster.coordinatorUrls.length > 0
-      ? [...config.cluster.coordinatorUrls]
-      : config.cluster.coordinatorUrl
-        ? [config.cluster.coordinatorUrl]
-        : [];
+  const coordUrls = [...config.cluster.coordinatorUrls];
   if (coordUrls.length === 0) {
-    throw new Error(
-      'Worker mode requires cluster.coordinatorUrl or cluster.coordinatorUrls to be set',
-    );
+    throw new Error('Worker mode requires cluster.coordinatorUrls to be set');
   }
 
   // Set structured identity fields on all log lines
@@ -652,10 +663,6 @@ export async function bootstrapWorker(
     executionTracker,
     jobOwnership,
     sendToOwningCoord,
-    defaults: {
-      maxAttempts: config.rerouteSpawnMaxAttempts,
-      backoffMs: config.rerouteSpawnRetryBackoffMs,
-    },
     logger,
   });
   spawnControlRef.current = spawnControl;
@@ -679,11 +686,25 @@ export async function bootstrapWorker(
     agentRegistry,
   );
   const scalerManager = scalerResult?.manager ?? null;
+  // The one scaler file reload, behind SIGHUP and a coordinator's
+  // peer.scaler.reload.request (`kici-admin scaler reload`). Without a scaler
+  // config it answers `not-configured`.
+  const scalerFileReload = createScalerFileReload({
+    manager: scalerManager,
+    load: () => loadScalerConfig(config.scalerConfigPath!, config.scalerConfigDir),
+    logger,
+  });
   const scalerConfig = scalerResult?.config ?? null;
 
   // 5. Create dispatcher with worker onDispatch
-  const onDispatch = buildWorkerOnDispatch(agentRegistry, (jobId) =>
-    spawnControl.onDelivered(jobId),
+  const onDispatch = buildWorkerOnDispatch(
+    agentRegistry,
+    (jobId) => spawnControl.onDelivered(jobId),
+    () =>
+      resolveWorkerConcurrencyWaitTimeoutMs(
+        pushedClusterSettings.current,
+        config.concurrencyWaitTimeoutMs,
+      ),
   );
   const noopMetrics = {
     incJobsDispatched: () => {},
@@ -841,6 +862,8 @@ export async function bootstrapWorker(
       // `kici-admin scaler orphans --target <this worker>`, forwarded by the
       // coordinator: answered from this host and this worker's own tracking.
       onScalerOrphansRequest: (msg) => answerScalerOrphansRequest(scalerManager, msg),
+      // `kici-admin scaler reload`, fanned out by the coordinator.
+      onScalerReloadRequest: scalerFileReload,
       joinToken: config.cluster.joinToken,
       credentialFile: workerCredentialFile,
       authCoordinator: peerAuthCoordinator,
@@ -1053,8 +1076,6 @@ export async function bootstrapWorker(
     livenessInfo: () => ({
       role: 'worker',
       version: ORCHESTRATOR_VERSION,
-      // Deprecated: carries the version (BuildFingerprint.buildCommit).
-      buildCommit: ORCHESTRATOR_VERSION,
       sdkVersion: WORKER_SDK_VERSION,
       sdkBundleHash: WORKER_SDK_BUNDLE_HASH,
       sharedVersion: WORKER_SHARED_VERSION,
@@ -1184,7 +1205,7 @@ export async function bootstrapWorker(
         lines: msg.lines.map((text) => ({
           text,
           timestamp: msg.timestamp,
-          ...(msg.stream !== undefined && { stream: msg.stream }),
+          stream: msg.stream,
         })),
       };
       sendToOwningCoord(msg.jobId, forwarded);
@@ -1272,6 +1293,11 @@ export async function bootstrapWorker(
   }, 30_000);
   outboxResendInterval.unref();
 
+  // A worker runs no ConfigReloader, and Node.js exits on a SIGHUP nothing
+  // listens for: this listener is what makes the documented signal reload the
+  // worker's scalers instead of stopping it.
+  const disposeScalerReloadSignal = installScalerReloadSignal(scalerFileReload, logger);
+
   // 9. Register graceful shutdown with drain support
   setupGracefulShutdown({
     logger,
@@ -1300,6 +1326,10 @@ export async function bootstrapWorker(
       {
         name: 'Stopping heartbeat monitor',
         fn: () => heartbeatMonitor.stop(),
+      },
+      {
+        name: 'Removing the SIGHUP listener',
+        fn: () => disposeScalerReloadSignal(),
       },
       {
         name: 'Stopping outbox re-send interval',

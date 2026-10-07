@@ -22,25 +22,13 @@
  * `cluster` and `cold-store` do.
  */
 import type { Command } from 'commander';
-import {
-  listCheckRunTrackingDirect,
-  toErrorMessage,
-  type CheckRunTrackingDirectRow,
-} from '@kici-dev/shared';
+import { listCheckRunTrackingDirect, type CheckRunTrackingDirectRow } from '@kici-dev/shared';
+import { cliAction, parseIntOption, printJsonOr } from './shared/cli-action.js';
 
 function requireDbUrl(explicit?: string): string {
   const url = explicit ?? process.env.KICI_DATABASE_URL;
   if (!url) throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
   return url;
-}
-
-function parseIntOption(raw: string | undefined, label: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || Math.floor(n) !== n) {
-    throw new Error(`${label}: must be an integer (got "${raw}")`);
-  }
-  return n;
 }
 
 function printTrackingTable(rows: CheckRunTrackingDirectRow[]): void {
@@ -86,8 +74,8 @@ export function registerCheckRunCommands(program: Command): void {
     .option('--limit <n>', 'Max rows to return (default 50, max 1000)')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const limit = parseIntOption(opts.limit, '--limit');
         const dbUrl = requireDbUrl(opts.databaseUrl);
         const result = await listCheckRunTrackingDirect(dbUrl, {
@@ -95,11 +83,7 @@ export function registerCheckRunCommands(program: Command): void {
           checkName: opts.checkName,
           limit,
         });
-        if (opts.json) console.log(JSON.stringify(result));
-        else printTrackingTable(result.rows);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+        printJsonOr(opts.json, result, (r) => printTrackingTable(r.rows));
+      }),
+    );
 }

@@ -9,7 +9,7 @@ Deep-dive documentation for KiCI internals. These docs explain how the three-tie
 
 ### [Architecture overview](overview.md)
 
-The three-tier relay model (Platform, orchestrator, agent) with a Mermaid flowchart showing all tier connections and a package dependency graph showing how the 11 packages (9 scoped `@kici-dev/*` plus the unscoped `kici` wrapper and `kici-admin` admin CLI) relate to each other. Start here for the big picture of how KiCI is structured and why each tier exists.
+The three-tier relay model (Platform, orchestrator, agent) with a Mermaid flowchart showing all tier connections. A package dependency graph shows how the scoped `@kici-dev/*` packages, the unscoped `kici` wrapper and the `kici-admin` admin CLI relate to each other. Start here for the big picture of how KiCI is structured and why each tier exists.
 
 ### [Execution status vocabulary](./execution/state-machine.md)
 

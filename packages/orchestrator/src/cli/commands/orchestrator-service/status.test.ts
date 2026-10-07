@@ -76,6 +76,9 @@ import type { InstanceManifest } from '../../service/index.js';
 import { Hono } from 'hono';
 import { createHealthRoutes, type HealthRoutesDeps } from '../../../routes/health.js';
 import { DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS } from '../../../config.js';
+import { RbacEnforcer } from '../../../secrets/rbac.js';
+import { createAdminOrgRoutes } from '../../../routes/admin-orgs.js';
+import { ORG_LIST_PATH, OrgIdSource } from '../../../db/repos/org-ids-repo.js';
 
 function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -369,26 +372,55 @@ describe('orchestrator status — health section', () => {
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
   let requestedUrls: string[];
+  const ADMIN_TOKEN = 'status-admin-token';
 
   /**
    * Answer the command's HTTP requests with the orchestrator's real health
    * routes, so the renderer is fed the body the running service returns.
    * `basePath` mounts them the way `KICI_BASE_PATH` does. `readyDelayMs` holds
    * the `/ready` answer back (`'never'` never sends one); a held request still
-   * rejects when the caller aborts it.
+   * rejects when the caller aborts it. The org listing is the real admin route
+   * behind a bearer check (`org.missing` leaves it unmounted, like an
+   * orchestrator that predates it).
    */
   function serveRealHealthRoutes(opts: {
     dbHealthy: boolean;
     basePath?: string;
     readyDelayMs?: number | 'never';
+    org?: { getPlatformOrgId?: () => string | undefined; missing?: boolean };
   }): void {
     const routes = createHealthRoutes({ db: fakeDb(opts.dbHealthy), isWarm: () => true });
     const app = opts.basePath ? new Hono().basePath(opts.basePath).route('/', routes) : routes;
+    const admin = new Hono();
+    admin.use('/api/v1/admin/*', async (c, next) => {
+      if (c.req.header('Authorization') !== `Bearer ${ADMIN_TOKEN}`) {
+        return c.json({ error: 'Invalid or revoked token' }, 401);
+      }
+      c.set('role' as never, 'admin' as never);
+      c.set('userId' as never, 'tester' as never);
+      c.set('routingKey' as never, null as never);
+      await next();
+    });
+    if (!opts.org?.missing) {
+      admin.route(
+        '/api/v1/admin',
+        createAdminOrgRoutes({
+          listOrgs: async () => [
+            { orgId: 'org_status', sources: [OrgIdSource.enum['remote-source']] },
+          ],
+          rbac: new RbacEnforcer(),
+          ...(opts.org?.getPlatformOrgId && { getPlatformOrgId: opts.org.getPlatformOrgId }),
+        }),
+      );
+    }
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: string | URL, init?: RequestInit) => {
         const url = new URL(String(input));
         requestedUrls.push(url.href);
+        if (url.pathname.endsWith(ORG_LIST_PATH)) {
+          return admin.request(ORG_LIST_PATH, { headers: init?.headers });
+        }
         const answer = () => app.request(url.pathname);
         const delay = opts.readyDelayMs;
         if (!url.pathname.endsWith('/ready') || delay === undefined) return answer();
@@ -406,10 +438,11 @@ describe('orchestrator status — health section', () => {
     writeManifest(tmpInstanceDir, makeManifest({ name: 'kici-test', envFilePath }));
   }
 
-  async function runStatus(extraArgs: string[] = []): Promise<string> {
+  async function runStatus(extraArgs: string[] = [], rootArgs: string[] = []): Promise<string> {
     await program.parseAsync([
       'node',
       'orchestrator',
+      ...rootArgs,
       'status',
       '--instance-dir',
       tmpInstanceDir,
@@ -444,6 +477,8 @@ describe('orchestrator status — health section', () => {
 
     program = new Command();
     program.name('orchestrator');
+    // The kici-admin root option `status` reads through optsWithGlobals().
+    program.option('-t, --token <token>', 'Admin API token');
     registerStatusCommand(program);
 
     consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -570,8 +605,7 @@ describe('orchestrator status — health section', () => {
     };
 
     expect(json.health.version).toBe(BUILD_GLOBALS.KICI_PKG_VERSION);
-    // The deprecated key stays, carrying the version.
-    expect(json.health.buildCommit).toBe(BUILD_GLOBALS.KICI_PKG_VERSION);
+    expect(json.health).not.toHaveProperty('buildCommit');
     expect(text).not.toContain(BUILD_GLOBALS.KICI_BUILD_COMMIT);
     expect(json.readiness).toEqual({
       status: 'not ready',
@@ -593,6 +627,59 @@ describe('orchestrator status — health section', () => {
 
     expect(text).toContain('(Could not reach health API)');
     expect(text).not.toContain('--- KiCI orchestrator ---');
+  });
+
+  const ORG_ROW = (value: string) => `${'Org:'.padEnd(12)}${value}`;
+
+  // fails-when: status does not send the root token, asks the global --url instead of the
+  // instance endpoint, or drops the line
+  it('prints the attached Platform org, read from the instance admin API with the root token', async () => {
+    serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => 'org_status' } });
+    const lines = (await runStatus([], ['-t', ADMIN_TOKEN])).split('\n');
+    expect(requestedUrls).toContain(`http://localhost:4567${ORG_LIST_PATH}`);
+    expect(lines).toContain(ORG_ROW('org_status (attached to the Platform)'));
+  });
+
+  it('says an independent orchestrator has no Platform org', async () => {
+    serveRealHealthRoutes({ dbHealthy: true });
+    expect((await runStatus([], ['-t', ADMIN_TOKEN])).split('\n')).toContain(
+      ORG_ROW('none (independent orchestrator; kici-admin org list shows its org ids)'),
+    );
+  });
+
+  // fails-when: a Platform client that has not authenticated reads as `none` (Review Focus 4)
+  it('says the org is unknown before the first Platform authentication', async () => {
+    serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => undefined } });
+    expect((await runStatus([], ['-t', ADMIN_TOKEN])).split('\n')).toContain(
+      ORG_ROW('unknown (not yet authenticated with the Platform)'),
+    );
+  });
+
+  // breaks-if-wrong: without a token the section still renders, and no admin request is made
+  it('asks for a token instead of calling the admin API without one', async () => {
+    serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => 'org_status' } });
+    const lines = (await runStatus()).split('\n');
+    expect(lines).toContain('Health:     ok');
+    expect(lines).toContain(ORG_ROW('unknown (pass --token or set KICI_ADMIN_TOKEN to read it)'));
+    expect(requestedUrls.some((u) => u.endsWith(ORG_LIST_PATH))).toBe(false);
+  });
+
+  it('names a refused token and an orchestrator that predates the route', async () => {
+    serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => 'org_status' } });
+    expect((await runStatus([], ['-t', 'wrong-token'])).split('\n')).toContain(
+      ORG_ROW('unknown (the admin API answered HTTP 401)'),
+    );
+    consoleLogSpy.mockClear();
+    serveRealHealthRoutes({ dbHealthy: true, org: { missing: true } });
+    expect((await runStatus([], ['-t', ADMIN_TOKEN])).split('\n')).toContain(
+      ORG_ROW('unknown (this orchestrator predates the org listing)'),
+    );
+  });
+
+  it('returns the org in --json', async () => {
+    serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => 'org_status' } });
+    const json = JSON.parse(await runStatus(['--json'], ['-t', ADMIN_TOKEN])) as { org: unknown };
+    expect(json.org).toEqual({ platformAttachment: 'attached', attachedOrgId: 'org_status' });
   });
 });
 

@@ -15,6 +15,17 @@ describe('DashboardClient.fromConfig', () => {
     expect(() => DashboardClient.fromConfig({ platformEndpoint: 'x' })).toThrowError(/kici login/);
   });
 
+  it('does not send the PAT to a direct-mode orchestrator endpoint', () => {
+    // fails-when: fromConfig falls back to `endpoint` — the Platform PAT would go to the orchestrator URL.
+    expect(() =>
+      DashboardClient.fromConfig({
+        endpoint: 'http://localhost:10143',
+        pat: 'kici_pat_abc',
+        activeOrgId: 'org-1',
+      }),
+    ).toThrowError(/No endpoint configured/);
+  });
+
   it('throws no-active-org when activeOrgId missing', () => {
     expect(() =>
       DashboardClient.fromConfig({ platformEndpoint: 'x', pat: 'kici_pat_abc' }),

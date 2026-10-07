@@ -58,7 +58,7 @@ Produces a self-contained agent + Node payload so a fresh host can be brought up
 ### peer -- cluster peer management
 
 ```bash
-kici-admin peer create-token [--role coordinator|worker] [--expiry-hours <n>] [--org-id <id>] [--routing-key <key>] [--created-by <actor>] [--json]
+kici-admin peer create-token [--role coordinator|worker] [--expiry-hours <n>] [--org <id>] [--routing-key <key>] [--created-by <actor>] [--json]
 kici-admin peer list [--json]
 kici-admin peer revoke --instance-id <id>
 kici-admin peer revoke-all --confirm
@@ -92,7 +92,6 @@ Bootstraps a new orchestrator into an existing cluster. Connects via Platform re
 
 | Error                                                                       | Meaning                                                                              |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `The cluster's orchestrators predate join protocol v2…`                     | No orchestrator in the target pool supports join protocol v2. Upgrade them.          |
 | `The orchestrator at <url> predates join protocol v2…`                      | The `--peer` orchestrator is older. Upgrade it.                                      |
 | `Join rejected: … (invalid_token)`                                          | No live token matches. Check the token, or create a new one.                         |
 | `Join rejected: … (token_already_used)`                                     | A peer consumed the token. Create a new token.                                       |
@@ -440,7 +439,7 @@ Synopsis: `kici-admin peer create-token [options]`
 | ------------------------ | ------------- | ----------------------------------------------------------------- |
 | `--role <role>`          | `coordinator` | Peer role (worker or coordinator)                                 |
 | `--expiry-hours <hours>` | `1`           | Token expiry in hours                                             |
-| `--org-id <id>`          | `default`     | Organization ID                                                   |
+| `--org <id>`             | `default`     | Org id                                                            |
 | `--routing-key <key>`    | `default`     | Routing key                                                       |
 | `--created-by <actor>`   | `cli`         | Attribution written to join_tokens.created_by                     |
 | `--json`                 | `false`       | Emit JSON { token, role, expiresAt, orgId, routingKey } on stdout |

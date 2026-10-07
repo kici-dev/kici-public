@@ -24,7 +24,7 @@ import type { StepLogBuffer } from './step-log-buffer.js';
 /** Step result data as sent by the agent in job.status data.stepResults. */
 export interface StepResultData {
   name: string;
-  status: 'success' | 'failed' | 'error' | 'skipped' | 'cancelled';
+  status: 'success' | 'failed' | 'skipped' | 'cancelled';
   durationMs?: number;
   error?: string;
   exitCode?: number;
@@ -53,7 +53,7 @@ export interface CheckAnnotation {
 /** Step progress entry for live updates. */
 export interface StepProgressEntry {
   name: string;
-  status: 'pending' | 'running' | 'success' | 'failed' | 'error' | 'skipped' | 'cancelled';
+  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'cancelled';
   durationMs?: number;
 }
 
@@ -145,7 +145,6 @@ function statusEmoji(status: string): string {
     case 'success':
       return '\u2714'; // heavy check mark
     case 'failed':
-    case 'error':
       return '\u2716'; // heavy multiplication X
     case 'skipped':
       return '\u23ED'; // next track
@@ -161,7 +160,6 @@ function progressEmoji(status: string): string {
     case 'success':
       return '\u2714';
     case 'failed':
-    case 'error':
       return '\u2716';
     case 'skipped':
       return '\u23ED';
@@ -263,12 +261,12 @@ function buildSummaryWithLogLimit(
   }
 
   // Failed step details
-  const failedSteps = stepResults.filter((s) => s.status === 'failed' || s.status === 'error');
+  const failedSteps = stepResults.filter((s) => s.status === 'failed');
 
   if (failedSteps.length > 0 && maxLogLines >= 0) {
     for (let i = 0; i < stepResults.length; i++) {
       const step = stepResults[i];
-      if (step.status !== 'failed' && step.status !== 'error') continue;
+      if (step.status !== 'failed') continue;
 
       parts.push('');
       parts.push(`### ${statusEmoji(step.status)} ${step.name}`);
@@ -343,8 +341,8 @@ export function buildAnnotations(opts: BuildAnnotationsOptions): {
   for (let i = 0; i < stepResults.length; i++) {
     const step = stepResults[i];
 
-    // Only annotate failed/error steps
-    if (step.status !== 'failed' && step.status !== 'error') continue;
+    // Only annotate failed steps
+    if (step.status !== 'failed') continue;
 
     // Skip steps without source location
     const loc = sourceLocations.get(i);

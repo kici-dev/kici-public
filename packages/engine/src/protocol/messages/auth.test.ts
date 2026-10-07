@@ -6,6 +6,7 @@ describe('authRequestSchema', () => {
     type: 'auth.request',
     token: 'kici_sk_abc123def456',
     protocolVersion: 1,
+    capabilities: { orchRole: 'coordinator' },
   };
 
   it('validates a well-formed auth request', () => {
@@ -40,6 +41,9 @@ describe('authSuccessSchema', () => {
   const validSuccess = {
     type: 'auth.success',
     connectionId: 'conn-abc-123',
+    orgPublicAlias: 'oal_x',
+    orgId: 'org_abc123def456',
+    githubWebhookUrl: null,
   };
 
   it('validates a well-formed success response', () => {
@@ -63,40 +67,21 @@ describe('authSuccessSchema', () => {
     expect(authSuccessSchema.parse(roundTripped)).toEqual(validSuccess);
   });
 
-  it('carries the canonical orgId and orgPublicAlias when supplied', () => {
-    const msg = authSuccessSchema.parse({
-      ...validSuccess,
-      orgPublicAlias: 'oal_x',
-      orgId: 'org_abc123def456',
-    });
+  it('carries the canonical orgId and orgPublicAlias', () => {
+    const msg = authSuccessSchema.parse(validSuccess);
     expect(msg.orgId).toBe('org_abc123def456');
     expect(msg.orgPublicAlias).toBe('oal_x');
   });
 
-  it('accepts an optional provenanceIssuer on auth.success', () => {
-    expect(
-      authSuccessSchema.safeParse({
-        type: 'auth.success',
-        connectionId: 'c1',
-        provenanceIssuer: 'https://issuer.example',
-      }).success,
-    ).toBe(true);
-    expect(
-      authSuccessSchema.safeParse({
-        type: 'auth.success',
-        connectionId: 'c1',
-        provenanceIssuer: null,
-      }).success,
-    ).toBe(true);
-    expect(authSuccessSchema.safeParse({ type: 'auth.success', connectionId: 'c1' }).success).toBe(
-      true,
-    );
+  it('carries no provenance issuer: the Platform publishes none', () => {
+    // fails-when: the schema still declares the removed provenanceIssuer field.
+    const parsed = authSuccessSchema.parse({ ...validSuccess, provenanceIssuer: 'https://x' });
+    expect(parsed).not.toHaveProperty('provenanceIssuer');
   });
 
   // fails-when: the schema strips githubWebhookUrl, so a newer orchestrator
   //   never learns the Platform's webhook URL and platform-mode manifests abort.
-  // breaks-if-wrong: an auth.success without the field (an older Platform) still parses.
-  it('carries githubWebhookUrl as a string, as null, and absent', () => {
+  it('carries githubWebhookUrl as a string and as null', () => {
     const url = 'https://api.kici.dev/webhook/org_abc123def456/github';
     expect(
       authSuccessSchema.parse({ ...validSuccess, githubWebhookUrl: url }).githubWebhookUrl,
@@ -104,7 +89,6 @@ describe('authSuccessSchema', () => {
     expect(
       authSuccessSchema.parse({ ...validSuccess, githubWebhookUrl: null }).githubWebhookUrl,
     ).toBeNull();
-    expect(authSuccessSchema.parse(validSuccess)).not.toHaveProperty('githubWebhookUrl');
   });
 
   it('rejects a non-string githubWebhookUrl', () => {

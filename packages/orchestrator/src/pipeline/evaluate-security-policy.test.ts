@@ -31,10 +31,7 @@ function depsWith(store: unknown): ProcessingDeps {
 function storedRow(forkPolicy: string) {
   return {
     forkPolicy,
-    // Deliberately hours-only: a stored row that predates the seconds column
-    // reads NULL there, so the gate must still resolve a 72-hour window from
-    // the hours field rather than inventing the default.
-    approvalExpiryHours: 72,
+    approvalExpirySeconds: 72 * 3600,
     source: 'platform',
     updatedAt: new Date(),
   };

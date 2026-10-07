@@ -45,11 +45,11 @@ The orchestrator authorizes every `kici-admin` bearer token. The check runs on e
 
 Three fixed roles:
 
-| Role      | Permissions                                                                                                                                                                           | Use case                              |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| `owner`   | Every operation, including key rotation and admin-token management                                                                                                                    | Bootstrap token, break-glass operator |
-| `admin`   | Every operation except `token.manage` and `key.rotate`                                                                                                                                | Day-to-day operations, CI scripts     |
-| `auditor` | Read-only: `context.read`, `audit.read`, `run.read`, `event_log.read`, `access_log.read`, `event_dlq.read`, `scaler.read` (metadata, no payload bodies, no secret values, no VM stop) | Compliance review, log inspection     |
+| Role      | Permissions                                                                                                                                                                                            | Use case                              |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------- |
+| `owner`   | Every operation, including key rotation and admin-token management                                                                                                                                     | Bootstrap token, break-glass operator |
+| `admin`   | Every operation except `token.manage` and `key.rotate`                                                                                                                                                 | Day-to-day operations, CI scripts     |
+| `auditor` | Read-only: `context.read`, `audit.read`, `run.read`, `event_log.read`, `access_log.read`, `event_dlq.read`, `scaler.read` (metadata, no payload bodies, no secret values, no VM stop or scaler reload) | Compliance review, log inspection     |
 
 The full list of fine-grained permissions lives in the orchestrator's `secrets/rbac.ts`, and the per-role matrix is in the [`kici-admin` CLI reference](../orchestrator/kici-admin-cli.md#rbac-roles).
 
@@ -99,7 +99,7 @@ The cache is deliberately never expired. An expiring directory would refuse ever
 
 Two ways to see how far behind your orchestrator is:
 
-- `kici-admin trust-policy directory --customer-id <org-id>` prints when the directory was stored and how long ago. It warns when the Platform connection is down and no push can arrive.
+- `kici-admin trust-policy directory --org <org-id>` prints when the directory was stored and how long ago. It warns when the Platform connection is down and no push can arrive.
 - The `kici_orch_trust_directory_age_seconds` metric reports that age in seconds. Alert on it climbing past the longest outage you accept approvals through. It reports nothing until the first push arrives.
 
 To cut a person off from every surface at once, revoke their orchestrator token as well. A token revocation is decided by the orchestrator itself, so it needs no push.

@@ -419,7 +419,7 @@ A running service that does not answer on its port prints `(Could not reach heal
 
 The **Config files** block comes from the install manifest and the env file on disk, so it prints for a stopped service too. A compose install also lists the generated compose file. The scaler line appears only when the env file names a scaler config.
 
-Use `--json` for machine-readable output. The `health` and `readiness` objects carry the `/health` and `/ready` responses, and the config paths come back as a `configPaths` object. The `buildCommit` field of `health` is deprecated and carries the version (see [Deprecations](../../user/deprecations.md)).
+Use `--json` for machine-readable output. The `health` and `readiness` objects carry the `/health` and `/ready` responses, and the config paths come back as a `configPaths` object.
 
 `kici-admin agent status` reports an agent the same way. It reads the agent's `/health` endpoint on the port the agent's env file sets in `KICI_PORT` (default `8080`):
 
@@ -433,7 +433,7 @@ SDK:          0.11.0 (bundle b012bd8bace3)
 Uptime:       42m 7s
 ```
 
-**Orchestrator** is `connected` while the agent's connection to its orchestrator is open. With `--json`, the `health` object carries the agent's `/health` response, with the version in the deprecated `buildCommit` field.
+**Orchestrator** is `connected` while the agent's connection to its orchestrator is open. With `--json`, the `health` object carries the agent's `/health` response.
 
 ### Logs
 
@@ -572,7 +572,7 @@ The upgrade checks for this. At every version change it records the migration he
 - **The database is ahead** — the switch **refuses**, naming every migration applied since, and prints the two ways forward.
 - **No head recorded for the target** — this instance was installed before the check existed, or the upgrade away from the target ran without admin access. So the head cannot be verified. The switch prints a prominent warning and falls through to the usual confirmation. A version change with admin access records the head, so the check is armed for the next one.
 
-The upgrade reads the migration ledger through the admin API, as the drain does. Set `KICI_ADMIN_TOKEN` to an admin token, and `KICI_ADMIN_URL` to the address of the orchestrator. Without `KICI_ADMIN_URL`, `kici-admin` uses `http://localhost:8080`, and the orchestrator listens on port 4000 by default. Without an admin token, the upgrade records no head, and a rollback prints that the schema was not checked, then falls through to the usual confirmation.
+The upgrade reads the migration ledger through the admin API, as the drain does. Set `KICI_ADMIN_TOKEN` to an admin token, and `KICI_ADMIN_URL` to the address of the orchestrator. Without `KICI_ADMIN_URL`, `kici-admin` uses `http://localhost:4000`, the default port of an orchestrator on the same host. Without an admin token, the upgrade records no head, and a rollback prints that the schema was not checked, then falls through to the usual confirmation.
 
 To roll back across a schema change, revert the schema first, while the newer version is still running:
 
@@ -649,17 +649,17 @@ The orchestrator auto-migrates its PostgreSQL database on startup (enabled by de
 If you've disabled auto-migration (`KICI_AUTO_MIGRATE=false`), run migrations manually **before** you start the new binary:
 
 ```bash
-kici-admin db migrate --status   # Check pending migrations
-kici-admin db migrate            # Apply them
+kici-admin db migrate --database-url <url>   # Apply them directly; the orchestrator need not run
+kici-admin db migrate                        # Or ask a running orchestrator to apply them
 ```
 
-The order matters. A new orchestrator writes the columns its own release added, so starting it against an un-migrated database fails those writes at runtime rather than at boot. This release is a concrete case. Every security-hold insert names `held_runs.posted_pending_check`, which migration 126 adds. On an un-migrated database each insert fails, so a fork pull request the policy should hold gets no hold row and the delivery errors. Nothing warns you at startup — the failure appears per delivery.
+The order matters. A new orchestrator writes the columns its own release added, so starting it against an un-migrated database fails those writes at runtime rather than at boot. Nothing warns you at startup — the failure appears per request.
 
 See [Orchestrator setup — database](../orchestrator/orchestrator-setup.md#database) for details on migration management.
 
 ### Cluster upgrade order
 
-In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. 0.9.0 raises it to 3, so a 0.8.x node (protocol 2) is refused by an upgraded peer until it is upgraded too. See [Coordinator-worker — upgrade procedure](../orchestrator/coordinator-worker.md#upgrade-procedure) for the full sequence.
+In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. Protocol 4 raises it from 3, so a node from 0.15.x or earlier (protocol 3) is refused by an upgraded peer until it is upgraded too. See [Coordinator-worker — upgrade procedure](../orchestrator/coordinator-worker.md#upgrade-procedure) for the full sequence.
 
 ### Job recovery during upgrade
 

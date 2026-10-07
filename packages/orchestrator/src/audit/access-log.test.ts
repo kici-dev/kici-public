@@ -391,8 +391,8 @@ describe('AccessLogWriter (mocked — sampler integration)', () => {
 
 describe('AccessLogWriter.getById (cold-store fallback)', () => {
   // The lookup matrix: hot hit, hot miss
-  // (with and without a cold-store wired), cold hit with `--org-id`, cold
-  // hit without `--org-id` (synthetic tenant), cold miss, and cold-store
+  // (with and without a cold-store wired), cold hit with `--org`, cold
+  // hit without `--org` (synthetic tenant), cold miss, and cold-store
   // throws. The fallback exists because `query()` already merges hot+cold
   // via `loadAccessLogRange`, so paginated lists surface archived rows but
   // the legacy `getById` would 404 on the same ids.

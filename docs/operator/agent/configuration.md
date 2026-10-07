@@ -68,11 +68,11 @@ and the rotated-file logger live in the [environment variable reference](../env-
 
 The agent exposes three HTTP endpoints on the configured `KICI_PORT`:
 
-| Endpoint   | Purpose            | Response                                                                                                                                                                                                                                                                                   |
-| ---------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/health`  | Liveness probe     | Always `200`. Body includes `agentId`, `activeJobs`, `connected` status, and the build identity (`version`, plus the SDK / shared / engine versions and bundle hashes) so operators can correlate deployed builds across services. The deprecated `buildCommit` field carries the version. |
-| `/ready`   | Readiness probe    | `200` when connected to orchestrator, `503` when disconnected.                                                                                                                                                                                                                             |
-| `/metrics` | Prometheus metrics | Prometheus text format with `kici_agent_` prefixed metrics.                                                                                                                                                                                                                                |
+| Endpoint   | Purpose            | Response                                                                                                                                                                                                                           |
+| ---------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/health`  | Liveness probe     | Always `200`. Body includes `agentId`, `activeJobs`, `connected` status, and the build identity (`version`, plus the SDK / shared / engine versions and bundle hashes) so operators can correlate deployed builds across services. |
+| `/ready`   | Readiness probe    | `200` when connected to orchestrator, `503` when disconnected.                                                                                                                                                                     |
+| `/metrics` | Prometheus metrics | Prometheus text format with `kici_agent_` prefixed metrics.                                                                                                                                                                        |
 
 ## Label-based routing
 

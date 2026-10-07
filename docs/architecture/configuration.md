@@ -138,11 +138,7 @@ Atomic swap into ConfigReloader.currentConfig
 
 ### Env var processing
 
-Environment variables are processed in two stages:
-
-1. **Direct mappings:** `KICI_DATABASE_URL` -> `database.url`, etc. A lookup table in `env-overlay.ts` maps known env var suffixes to config path arrays.
-
-2. **Multi-app GitHub provider:** `KICI_PROVIDERS_GITHUB_<APP_NAME>_<FIELD>` is parsed by stripping the `PROVIDERS_GITHUB_` prefix, finding the field suffix (`APP_ID`, `PRIVATE_KEY`, `WEBHOOK_SECRET`), and deriving the app name from the middle segment. App names are lowercased with underscores converted to hyphens (`MAIN_ORG` -> `main-org`).
+Environment variables map to config paths through lookup tables in `env-overlay.ts`: `KICI_DATABASE_URL` -> `database.url`, the startup names whose overlay spelling differs (`KICI_PORT` -> `server.port`), and the one unprefixed name, `NODE_ENV`. Any other variable reaches no config path.
 
 Type coercion is applied based on known field types: numeric fields are parsed as numbers, boolean fields are compared against `"true"`, all others remain strings.
 
@@ -259,6 +255,8 @@ flowchart TD
     swap --> onPlatform["onPlatformReconnect (if changed)"]
 ```
 
+`onScalerReload` runs the scaler file reload that `POST /admin/scaler/reload` (`kici-admin scaler reload`) and a peer's `peer.scaler.reload.request` also run. That route reloads the scaler config without the `ConfigReloader`, so it never bumps the config version the peers follow: a `--single` reload stays on one orchestrator.
+
 ### Safety guarantees
 
 - **Mutex:** Boolean flag prevents concurrent reloads. Second reload returns `{ success: false, errors: ["Reload already in progress"] }`.
@@ -274,7 +272,7 @@ The `ConfigReloader` uses a dependency injection pattern with callbacks for subs
 | Callback              | When Called                   | Purpose                                                                                                                        |
 | --------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `onProviderChange`    | Provider config changed       | Reserved callback. Providers are DB-managed via the sources table, so the change detector always reports no change             |
-| `onScalerReload`      | Always on successful reload   | Reload scaler YAML config, from the path the process started with                                                              |
+| `onScalerReload`      | Always on successful reload   | Reload scaler YAML config, from the path the process started with. Its outcome is returned as `ReloadResult.scaler`            |
 | `onPlatformReconnect` | Platform URL or token changed | Logs that the Platform connection settings changed. The connection is not re-established; `standalone.ts` registers no handler |
 | `onConfigApplied`     | Always on successful reload   | Atomic config reference swap, increment local config version                                                                   |
 

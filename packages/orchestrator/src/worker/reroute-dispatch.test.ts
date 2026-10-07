@@ -6,7 +6,7 @@ import {
   rerouteJobConfig,
 } from './reroute-dispatch.js';
 
-const IDS = { messageId: 'msg-1', timestamp: 1_700_000_000_000 };
+const IDS = { messageId: 'msg-1', timestamp: 1_700_000_000_000, concurrencyWaitTimeoutMs: 900_000 };
 
 function reroute(over: Partial<JobReroute> = {}): JobReroute {
   return {
@@ -60,14 +60,15 @@ describe('worker dispatch of a rerouted job', () => {
       user: 'x-access-token',
       secret: 'src-tok',
     });
-    expect(dispatch.token).toBe('src-tok');
+    // fails-when: the worker still forwards the removed bare `token` field
+    expect(dispatch).not.toHaveProperty('token');
     // fails-when: a clone token is forwarded inside the agent-visible job config
     expect(dispatch.jobConfig).not.toHaveProperty('workflowCloneToken');
     expect(dispatch.jobConfig).not.toHaveProperty('cloneToken');
   });
 
-  it('dispatches a reroute from a coordinator that sends no workflow clone token exactly as before', () => {
-    // breaks-if-wrong: an older coordinator's reroute must reach the agent with the source token alone
+  it('dispatches a reroute that carries no workflow clone token with source auth alone', () => {
+    // breaks-if-wrong: a non-global reroute must reach the agent with its source token as sourceAuth
     const msg = reroute({ cloneToken: 'src-tok' });
     expect(buildWorkerDispatchMessage(queuedJob(msg), IDS)).toEqual({
       type: 'job.dispatch',
@@ -82,8 +83,11 @@ describe('worker dispatch of a rerouted job', () => {
       sha: 'b1',
       lockFileUrl: '',
       jobConfig: { isGlobalWorkflow: true, cacheOrgId: 'org-1' },
+      // fails-when: a worker dispatch drops the fleet-wide concurrency-slot wait,
+      // so the agent applies its own default instead of the cluster setting.
+      concurrencyWaitTimeoutMs: 900_000,
       orgId: 'org-1',
-      token: 'src-tok',
+      sourceAuth: { kind: 'basic', user: 'x-access-token', secret: 'src-tok' },
       secrets: { S: 'v' },
     });
   });

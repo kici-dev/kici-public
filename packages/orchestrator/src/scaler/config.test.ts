@@ -80,7 +80,7 @@ describe('scalerFileSchema', () => {
     const config = {
       version: 1,
       globalMaxAgents: 30,
-      defaults: { resources: { memory: '2g', cpus: 2 } },
+      defaults: { resources: { limits: { memory: '2g', cpus: 2 } } },
       scalers: [
         {
           name: 'container-linux',
@@ -90,7 +90,7 @@ describe('scalerFileSchema', () => {
             {
               labels: ['linux', 'docker'],
               image: 'ghcr.io/my/agent:latest',
-              resources: { memory: '4g', cpus: 4 },
+              resources: { limits: { memory: '4g', cpus: 4 } },
               containerSocket: true,
             },
           ],
@@ -103,7 +103,7 @@ describe('scalerFileSchema', () => {
             {
               labels: ['linux', 'gpu'],
               binaryPath: '/opt/kici/kici-agent',
-              resources: { memory: '16g', cpus: 8 },
+              resources: { limits: { memory: '16g', cpus: 8 } },
             },
           ],
         },
@@ -459,6 +459,7 @@ describe('scalerFileSchema', () => {
           name: 'windows-bare-metal',
           type: 'bare-metal',
           maxAgents: 2,
+          platform: { os: 'windows', arch: 'x64' },
           labelSets: [{ labels: ['windows', 'bare-metal'], binaryPath }],
         },
       ],
@@ -648,7 +649,7 @@ describe('scalerFileSchema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/unrecognized_keys/);
   });
 
-  it('validates dual-arch Firecracker config (two label sets with different rootfs/kernel)', () => {
+  it('validates a Firecracker config with two label sets (different rootfs/kernel)', () => {
     const config = {
       version: 1,
       scalers: [
@@ -669,7 +670,7 @@ describe('scalerFileSchema', () => {
               rootfsPath: '/opt/kici/rootfs-amd64.ext4',
             },
             {
-              labels: ['linux', 'arm64'],
+              labels: ['linux', 'large'],
               rootfsPath: '/opt/kici/rootfs-arm64.ext4',
               kernelPath: '/opt/kici/Image-arm64',
               vcpuCount: 2,
@@ -1006,25 +1007,31 @@ describe('mandatoryLabels validation', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/gate label.*gpu.*missing from labelSets/);
   });
 
-  it('accepts a scaler whose label sets declare different platforms', () => {
-    const config = {
+  it('refuses a plain platform label without the structured platform field', () => {
+    // fails-when: the label is silently derived into a taint, or silently ignored.
+    const config = (platform?: { os: string; arch: string }) => ({
       version: 1,
       scalers: [
         {
-          name: 'mixed',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [
-            // Each set's legacy taint derives from its own labels, so each
-            // gate is reachable from the set it gates. The scaler-wide union
-            // (`macos`) is not required of the linux set.
-            { labels: ['linux', 'gpu'], image: 'gpu:latest' },
-            { labels: ['macos', 'xcode'], image: 'mac:latest' },
-          ],
+          name: 'mac-pool',
+          type: 'bare-metal',
+          maxAgents: 2,
+          ...(platform ? { platform } : {}),
+          labelSets: [{ labels: ['macos', 'xcode'], binaryPath: '/opt/kici/kici-agent' }],
         },
       ],
-    };
-    expect(() => scalerFileSchema.parse(config)).not.toThrow();
+    });
+    const refused = scalerFileSchema.safeParse(config());
+    expect(refused.error?.issues).toEqual([
+      expect.objectContaining({
+        path: ['scalers', 0, 'labelSets', 0, 'labels'],
+        message:
+          'Scaler "mac-pool" labelSets[0]: label "macos" names a platform; declare platform: { os, arch } instead',
+      }),
+    ]);
+    // breaks-if-wrong: the same label set with the structured field must load.
+    const parsed = scalerFileSchema.parse(config({ os: 'macos', arch: 'arm64' }));
+    expect(parsed.scalers[0].platform).toEqual({ os: 'macos', arch: 'arm64' });
   });
 
   it('accepts a configured gate label supplied only by the structured platform taint', () => {
@@ -1280,6 +1287,9 @@ scalers:
   - name: container-arm
     type: container
     maxAgents: 5
+    platform:
+      os: linux
+      arch: arm64
     labelSets:
       - labels: [linux, arm64]
         image: "ghcr.io/my/agent-arm:latest"
@@ -1396,7 +1406,8 @@ describe('resource caps schema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/Duplicate machinePool/);
   });
 
-  it('normalizes flat resources shorthand to nested limits at label-set level', () => {
+  it('refuses the flat resources shorthand at label-set level', () => {
+    // fails-when: { cpus, memory } directly under resources is still normalized.
     const config = {
       version: 1,
       scalers: [
@@ -1414,11 +1425,9 @@ describe('resource caps schema', () => {
         },
       ],
     };
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].labelSets[0].resources).toEqual({
-      requests: { cpus: 2, memory: '4g' },
-      limits: { cpus: 2, memory: '4g' },
-    });
+    expect(() => scalerFileSchema.parse(config)).toThrow(
+      /resources takes \{ requests, limits \}: nest cpus and memory under limits/,
+    );
   });
 
   it('accepts nested resources at label-set level', () => {

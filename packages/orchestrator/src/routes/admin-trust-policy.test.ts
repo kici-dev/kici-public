@@ -39,7 +39,7 @@ import type { AccessLogRecord, AccessLogWriter } from '../audit/access-log.js';
 
 const STORED: StoredTrustPolicy = {
   forkPolicy: 'hold',
-  approvalExpiryHours: 12,
+  approvalExpirySeconds: 12 * 3600,
   source: 'platform',
   updatedAt: new Date('2026-07-29T00:00:00Z'),
 };
@@ -136,7 +136,7 @@ function makeApp(opts: {
         patch: Record<string, unknown>,
         onWrite?: (trx: unknown, merged: Record<string, unknown>) => Promise<void>,
       ) => {
-        const merged = { forkPolicy: 'hold', approvalExpiryHours: 72, ...patch };
+        const merged = { forkPolicy: 'hold', approvalExpirySeconds: 72 * 3600, ...patch };
         const staged: AuditRow[] = [];
         await onWrite?.({ staged }, merged);
         auditRows.push(...staged);
@@ -253,7 +253,7 @@ describe('GET /trust-policy', () => {
     expect(body.policy).toMatchObject({
       customerId: 'org-1',
       forkPolicy: 'hold',
-      approvalExpiryHours: 12,
+      approvalExpirySeconds: 12 * 3600,
       source: 'platform',
       effectiveDefault: false,
       platformManaged: true,
@@ -509,8 +509,34 @@ describe('PATCH /trust-policy', () => {
 
   it('rejects a non-positive approval expiry', async () => {
     const { app, upsertLocal } = makeApp({ mode: 'independent' });
-    const { status } = await patchPolicy(app, { customerId: 'org-1', approvalExpiryHours: 0 });
+    const { status } = await patchPolicy(app, { customerId: 'org-1', approvalExpirySeconds: 0 });
     expect(status).not.toBe(200);
+    expect(upsertLocal).not.toHaveBeenCalled();
+  });
+
+  it('caps the window at one year, the bound the CLI and the Platform state', async () => {
+    // fails-when: the route has no upper bound.
+    const refused = makeApp({ mode: 'independent' });
+    const over = await patchPolicy(refused.app, {
+      customerId: 'org-1',
+      approvalExpirySeconds: 8761 * 3600,
+    });
+    expect(over.status).toBe(400);
+    expect(refused.upsertLocal).not.toHaveBeenCalled();
+    // breaks-if-wrong: exactly one year is still a legal window.
+    const accepted = makeApp({ mode: 'independent' });
+    const max = await patchPolicy(accepted.app, {
+      customerId: 'org-1',
+      approvalExpirySeconds: 8760 * 3600,
+    });
+    expect(max.status).toBe(200);
+  });
+
+  it('refuses the retired approvalExpiryHours field', async () => {
+    // fails-when: the strict body schema still declares the hours spelling.
+    const { app, upsertLocal } = makeApp({ mode: 'independent' });
+    const { status } = await patchPolicy(app, { customerId: 'org-1', approvalExpiryHours: 12 });
+    expect(status).toBe(400);
     expect(upsertLocal).not.toHaveBeenCalled();
   });
 

@@ -7,6 +7,7 @@
  *   db create-role                CREATE ROLE LOGIN [CREATEDB] (direct DB)
  *   db create-readonly-user       Read-only role + GRANT SELECT (direct DB)
  *   db check-schema               Compare bundled migrations vs live schema (direct DB)
+ *   db schema-diff                Compare the live schema with the release snapshot (direct DB)
  *   db collation-check            Check pg_database.datcollversion vs running libc (direct DB)
  *   db reindex                    REINDEX DATABASE CONCURRENTLY (direct DB)
  *   db refresh-collation-version  ALTER DATABASE REFRESH COLLATION VERSION (direct DB)
@@ -27,8 +28,12 @@ import {
   createDbRole,
   createPool,
   createReadOnlyDbUser,
+  diffFingerprints,
   dropAndCreateDatabase,
   ensureDatabase,
+  fingerprintSchema,
+  formatDiffEntry,
+  type FingerprintDiffEntry,
   isSchemaCurrent,
   maskDatabaseUrl,
   parseDatabaseUrl,
@@ -41,7 +46,9 @@ import {
 } from '@kici-dev/shared/db-collation';
 import { createDb } from '../../db/client.js';
 import { createMigrationProvider } from '../../db/migration-provider.js';
-import { runMigrations } from '../../db/migrator.js';
+import { DEFERRED_INDEXES } from '../../db/deferred-indexes.js';
+import { SCHEMA_SNAPSHOT } from '../../db/schema-snapshot.generated.js';
+import { runMigrations, withMigrationPool } from '../../db/migrator.js';
 import { recordAdminCliAccess, recordAdminCliAccessOnDb } from './shared/admin-cli-access-log.js';
 import {
   assertToolVersionCompatible,
@@ -63,14 +70,7 @@ import {
 } from '../service/backup-timer.js';
 import { kiciConfigRoot, resolveInstanceTarget, resolveUserLevel } from '../service/index.js';
 import type { ServicePlatform } from '../service/index.js';
-
-function resolveDatabaseUrl(explicit?: string): string {
-  const url = explicit ?? process.env.KICI_DATABASE_URL;
-  if (!url) {
-    throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  }
-  return url;
-}
+import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 
 async function confirmInteractive(prompt: string, expected: string): Promise<boolean> {
   if (!process.stdin.isTTY) return false;
@@ -199,20 +199,53 @@ async function runBackupTimerCommand(opts: BackupOptions): Promise<void> {
   for (const file of installed.files) console.log(`  Unit:      ${file}`);
 }
 
+/** `db migrate --database-url`: run the migrator in-process, without the HTTP API. */
+async function migrateDirect(url: string): Promise<void> {
+  const { dbName } = parseDatabaseUrl(url);
+  logInvocation('migrate', url);
+  await withMigrationPool(url, async ({ db: kdb, pool }) => {
+    const results = await runMigrations({ db: kdb, pool });
+    const applied = results.filter((r) => r.status === 'Success').map((r) => r.migrationName);
+    await recordAdminCliAccessOnDb(kdb, {
+      action: 'db.migrate',
+      target: { type: 'database', id: dbName },
+      outcome: 'allowed',
+      meta: { applied: applied.length },
+    });
+    if (applied.length === 0) {
+      console.log('Database schema is up to date.');
+      return;
+    }
+    console.log(`Applied ${applied.length} migration(s).`);
+    for (const name of applied) console.log(`  OK  ${name}`);
+  });
+}
+
 export function registerDbCommands(program: Command, getClient: () => AdminApiClient): void {
   const db = program.command('db').description('Database management');
 
   db.command('migrate')
-    .description('Run pending database migrations (via orchestrator HTTP admin API)')
+    .description(
+      'Run pending database migrations (via the orchestrator HTTP admin API, or directly with --database-url)',
+    )
     .option('--status', 'Show migration status without applying')
+    .option(
+      '--database-url <url>',
+      'Migrate this database directly instead of through the orchestrator HTTP API',
+    )
     .option(
       '--to <migration>',
       'Migrate to a named migration, reverting newer ones. Run this BEFORE a rollback, ' +
         'while the newer binary is still serving — it is the only one carrying their down() functions.',
     )
-    .action(async (opts: { status?: boolean; to?: string }) => {
-      try {
-        if (opts.to) {
+    .action(
+      cliAction(async (opts: { status?: boolean; to?: string; databaseUrl?: string }) => {
+        if (opts.databaseUrl) {
+          if (opts.to || opts.status) {
+            throw new Error('--database-url cannot be combined with --to or --status');
+          }
+          await migrateDirect(opts.databaseUrl);
+        } else if (opts.to) {
           const result = await getClient().post<{
             target: string;
             applied: string[];
@@ -248,19 +281,16 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
             }
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('fresh')
     .description('DROP + CREATE the orchestrator DB, run migrations, record content hash')
     .option('--database-url <url>', 'Target database URL (else KICI_DATABASE_URL / DATABASE_URL)')
     .requiredOption('--confirm', 'Explicit confirmation (destructive)')
     .option('--yes', 'Skip interactive confirmation (for scripted use)')
-    .action(async (opts: { databaseUrl?: string; yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; yes?: boolean }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const { dbName } = parseDatabaseUrl(url);
         if (!opts.yes) {
@@ -297,11 +327,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           await kdb.destroy();
           await pool.end().catch(() => undefined);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('backup')
     .description('Dump the orchestrator DB to a local file (pg_dump custom format)')
@@ -331,26 +358,23 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .option('--name <name>', 'Orchestrator service name to schedule (no default)')
     .option('--system', 'Operate against the system-level timer (requires root)')
     .option('--user-level', 'Operate against the user-level timer')
-    .action(async (opts: BackupOptions) => {
-      try {
+    .action(
+      cliAction(async (opts: BackupOptions) => {
         if (opts.installTimer || opts.uninstallTimer) {
           await runBackupTimerCommand(opts);
           return;
         }
         await runBackupCommand(opts);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('restore')
     .description('Restore the orchestrator DB from a pg_dump file (DESTRUCTIVE)')
     .requiredOption('--input <path>', 'Path to a .dump file produced by `db backup`')
     .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
     .option('--yes', 'Skip interactive confirmation (for scripted use)')
-    .action(async (opts: { input: string; databaseUrl?: string; yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { input: string; databaseUrl?: string; yes?: boolean }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const { dbName } = parseDatabaseUrl(url);
         if (!opts.yes) {
@@ -411,11 +435,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           '\n  Next: run "kici-admin cluster reconcile-identity" to reconcile the ' +
             'cluster_id with the S3 sentinel, then restart the orchestrator.\n',
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('ensure <name>')
     .description('CREATE DATABASE IF NOT EXISTS (idempotent)')
@@ -435,16 +456,16 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
       [] as string[],
     )
     .action(
-      async (
-        name: string,
-        opts: {
-          databaseUrl?: string;
-          owner?: string;
-          revokeConnectPublic?: boolean;
-          grantConnectRole: string[];
-        },
-      ) => {
-        try {
+      cliAction(
+        async (
+          name: string,
+          opts: {
+            databaseUrl?: string;
+            owner?: string;
+            revokeConnectPublic?: boolean;
+            grantConnectRole: string[];
+          },
+        ) => {
           const baseUrl = resolveDatabaseUrl(opts.databaseUrl);
           const url = new URL(baseUrl);
           url.pathname = `/${name}`;
@@ -468,11 +489,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
               ? ` [granted CONNECT to: ${opts.grantConnectRole.join(', ')}]`
               : '');
           console.log(`db ensure: ${name} — ${outcome}${suffix}`);
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   db.command('create-role')
@@ -482,13 +500,13 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .requiredOption('--password <password>', 'Role password (raw — quote as needed)')
     .option('--createdb', 'Grant CREATEDB to the new role', false)
     .action(
-      async (opts: {
-        databaseUrl?: string;
-        user: string;
-        password: string;
-        createdb?: boolean;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          databaseUrl?: string;
+          user: string;
+          password: string;
+          createdb?: boolean;
+        }) => {
           const url = resolveDatabaseUrl(opts.databaseUrl);
           const { adminUrl } = parseDatabaseUrl(url);
           logInvocation(`create-role ${opts.user}`, adminUrl);
@@ -504,11 +522,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
             meta: { result: outcome, createdb: !!opts.createdb },
           });
           console.log(`db create-role: ${opts.user} — ${outcome}`);
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   db.command('create-readonly-user')
@@ -516,8 +531,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .option('--database-url <url>', 'Target DB URL (must connect as owner)')
     .requiredOption('--user <name>', 'Read-only role name')
     .requiredOption('--password <password>', 'Role password')
-    .action(async (opts: { databaseUrl?: string; user: string; password: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; user: string; password: string }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const { dbName } = parseDatabaseUrl(url);
         logInvocation(`create-readonly-user ${opts.user}`, url);
@@ -538,18 +553,15 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           url,
         );
         console.log(`db create-readonly-user: ${opts.user} — ${outcome} (db=${dbName})`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('check-schema')
     .description('Compare bundled migrations vs live schema. Exit 2 on drift.')
     .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
     .option('--json', 'Emit JSON instead of a human-readable line', false)
-    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const pool = createPool(url);
         try {
@@ -565,10 +577,35 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         } finally {
           await pool.end().catch(() => undefined);
         }
+      }),
+    );
+
+  db.command('schema-diff')
+    .description(
+      'Compare the live schema with the schema this release expects. Exit 2 on any difference.',
+    )
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
+    .option('--json', 'Emit JSON instead of one line per difference', false)
+    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
+      let differences: FingerprintDiffEntry[];
+      try {
+        const pool = createPool(resolveDatabaseUrl(opts.databaseUrl));
+        try {
+          const live = await fingerprintSchema(pool, {
+            excludeIndexes: DEFERRED_INDEXES.map((i) => i.name),
+          });
+          differences = diffFingerprints(SCHEMA_SNAPSHOT, live);
+        } finally {
+          await pool.end().catch(() => undefined);
+        }
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
       }
+      if (opts.json) process.stdout.write(JSON.stringify({ differences }) + '\n');
+      else if (differences.length === 0) console.log('schema matches');
+      else for (const entry of differences) console.log(formatDiffEntry(entry));
+      if (differences.length > 0) process.exit(2);
     });
 
   db.command('collation-check')
@@ -577,8 +614,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     )
     .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
     .option('--json', 'Emit JSON instead of a human-readable line', false)
-    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const { dbName } = parseDatabaseUrl(url);
         const pool = createPool(url);
@@ -609,11 +646,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         } finally {
           await pool.end().catch(() => undefined);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('reindex')
     .description(
@@ -622,8 +656,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
     .requiredOption('--confirm', 'Explicit confirmation (destructive — long-running)')
     .requiredOption('--reason <text>', 'Reason (recorded in stderr banner)')
-    .action(async (opts: { databaseUrl?: string; reason: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; reason: string }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const { dbName } = parseDatabaseUrl(url);
         logInvocation(`reindex ${dbName} (${opts.reason})`, url);
@@ -643,11 +677,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         } finally {
           await pool.end().catch(() => undefined);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   db.command('refresh-collation-version')
     .description(
@@ -655,8 +686,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     )
     .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
     .requiredOption('--reason <text>', 'Reason (recorded in stderr banner)')
-    .action(async (opts: { databaseUrl?: string; reason: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; reason: string }) => {
         const url = resolveDatabaseUrl(opts.databaseUrl);
         const { dbName } = parseDatabaseUrl(url);
         logInvocation(`refresh-collation-version ${dbName} (${opts.reason})`, url);
@@ -678,9 +709,6 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         } finally {
           await pool.end().catch(() => undefined);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

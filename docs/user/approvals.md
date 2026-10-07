@@ -145,7 +145,7 @@ Because a step-level hold keeps an agent and its workspace occupied for the whol
 
 An `approval` gate works the same way in an [organization-wide workflow](global-workflows.md#holds-approvals-and-pull-requests-from-forks) as in a per-repository one. The held run belongs to the repository whose event started it, so a member scoped to that repository releases it.
 
-A lock whose organization-wide workflow declares `approval` requires orchestrator schema v42 or newer. An older orchestrator rejects that lock and asks you to upgrade it, because it would run the workflow without holding it. See [schema compatibility window](lock-file-and-drift.md#schema-compatibility-window).
+Every lock requires orchestrator schema v42 or newer. An older orchestrator rejects the lock and asks you to upgrade it, so it never runs an organization-wide workflow without holding it. See [schema compatibility window](lock-file-and-drift.md#schema-compatibility-window).
 
 ## Drift gates (`when: 'drift'`)
 

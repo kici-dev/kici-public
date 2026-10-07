@@ -1,23 +1,12 @@
 /**
  * `execution_jobs` cold-store adapter (Orchestrator side).
  *
+ * Tenant column `routing_key`, partition column `created_at`, warm TTL 30
+ * days. Eligible: a terminal job with no live step rows for its (run, job).
  *
- * Contract:
- *   - tenant column: `routing_key` (denormalized in migration 006)
- *   - partition column: `created_at`
- *   - warm TTL: 30 days
- *   - eligibility: terminal job status AND no live steps remain for this
- *     (run, job)
- *
- * Order: registered AFTER `ExecutionStepsAdapter`, BEFORE
- * `ExecutionRunsAdapter` (within one cycle: steps → jobs → runs). The
- * "no live steps" predicate makes the ordering self-correcting across
- * cycle interruptions.
- *
- * FK ordering on the orchestrator side: `execution_jobs.run_id` is a
- * FK to `execution_runs(run_id)`. Deleting a job is safe from the FK's
- * perspective (the FK only constrains job → run direction). The runs
- * adapter's eligibility predicate handles the dependent-rows check.
+ * Registered between the steps and runs adapters (steps → jobs → runs).
+ * Deleting a job never trips the `execution_jobs.run_id → execution_runs`
+ * FK; the runs adapter skips runs that still have jobs.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import {
@@ -25,6 +14,7 @@ import {
   type ColdStoreTableConfig,
   type EligiblePartition,
   type TableAdapter,
+  PgTableAdapterBase,
 } from '@kici-dev/shared';
 import { TERMINAL_JOB_STATES } from '@kici-dev/engine';
 import type { Database, ExecutionJobTable } from '../../db/types.js';
@@ -36,7 +26,6 @@ const APPROX_ROW_BYTES = 1500;
 
 const TERMINAL_STATUS_LIST: readonly string[] = Array.from(TERMINAL_JOB_STATES);
 
-/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,
@@ -50,19 +39,21 @@ export interface ExecutionJobsAdapterOptions {
   overrides?: Partial<ColdStoreTableConfig>;
 }
 
-export class ExecutionJobsAdapter implements TableAdapter<ExecutionJobRow> {
+export class ExecutionJobsAdapter
+  extends PgTableAdapterBase<Database>
+  implements TableAdapter<ExecutionJobRow>
+{
   readonly db = 'orchestrator' as const;
   readonly table = 'execution_jobs';
   readonly tenantColumn = 'routing_key';
   readonly partitionColumn = 'created_at';
-  readonly config: ColdStoreTableConfig;
 
   constructor(
-    private readonly kdb: Kysely<Database>,
+    kdb: Kysely<Database>,
     private readonly instanceId: string,
     opts: ExecutionJobsAdapterOptions = {},
   ) {
-    this.config = { ...DEFAULT_CONFIG, ...(opts.overrides ?? {}) };
+    super(kdb, ADVISORY_LOCK_NAMESPACE, DEFAULT_CONFIG, opts.overrides);
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
@@ -93,25 +84,6 @@ export class ExecutionJobsAdapter implements TableAdapter<ExecutionJobRow> {
     return Number.isFinite(n) ? n * APPROX_ROW_BYTES : 0;
   }
 
-  async withPartitionLock<T>(
-    args: { tenantId: string; partitionDate: string },
-    fn: () => Promise<T>,
-  ): Promise<T | null> {
-    const key = `${ADVISORY_LOCK_NAMESPACE}|${args.tenantId}|${args.partitionDate}`;
-    return await this.kdb.connection().execute(async (conn) => {
-      const lockRes = await sql<{ locked: boolean }>`
-        SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
-      `.execute(conn);
-      const locked = lockRes.rows[0]?.locked === true;
-      if (!locked) return null;
-      try {
-        return await fn();
-      } finally {
-        await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn).catch(() => undefined);
-      }
-    });
-  }
-
   async *selectEligible(args: {
     tenantId: string;
     partitionDate: string;
@@ -119,11 +91,8 @@ export class ExecutionJobsAdapter implements TableAdapter<ExecutionJobRow> {
   }): AsyncIterable<ExecutionJobRow> {
     const dayStart = new Date(`${args.partitionDate}T00:00:00.000Z`);
     const dayEnd = new Date(dayStart.getTime() + 86_400_000);
-    // Defensive predicate: skip jobs that still have live step rows in PG.
-    // Within a single cycle the steps adapter runs first and clears them;
-    // across interrupted cycles, this skip ensures we don't archive a job
-    // that has surviving steps (which would orphan the steps from their
-    // parent metadata).
+    // Skip jobs that still have step rows: after an interrupted cycle,
+    // archiving one would orphan its steps.
     const rows = await sql<ExecutionJobRow>`
       SELECT *
       FROM execution_jobs j
@@ -150,12 +119,12 @@ export class ExecutionJobsAdapter implements TableAdapter<ExecutionJobRow> {
 
   decodeRow(line: string): ExecutionJobRow {
     const parsed = JSON.parse(line) as ExecutionJobRow;
-    coerceDate(parsed, 'created_at');
-    coerceDate(parsed, 'started_at');
-    coerceDate(parsed, 'completed_at');
-    coerceDate(parsed, 'last_heartbeat_at');
-    coerceDate(parsed, 'ready_at');
-    coerceDate(parsed, 'archived_at');
+    PgTableAdapterBase.coerceDate(parsed, 'created_at');
+    PgTableAdapterBase.coerceDate(parsed, 'started_at');
+    PgTableAdapterBase.coerceDate(parsed, 'completed_at');
+    PgTableAdapterBase.coerceDate(parsed, 'last_heartbeat_at');
+    PgTableAdapterBase.coerceDate(parsed, 'ready_at');
+    PgTableAdapterBase.coerceDate(parsed, 'archived_at');
     return parsed;
   }
 
@@ -217,12 +186,5 @@ export class ExecutionJobsAdapter implements TableAdapter<ExecutionJobRow> {
           last_archived_at = now()
       `.execute(trx);
     });
-  }
-}
-
-function coerceDate<T>(parsed: T, field: keyof T): void {
-  const v = (parsed as unknown as Record<string, unknown>)[field as string];
-  if (typeof v === 'string') {
-    (parsed as unknown as Record<string, unknown>)[field as string] = new Date(v);
   }
 }

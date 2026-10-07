@@ -45,6 +45,44 @@ describe('orchestrator health routes — /ready warm gate', () => {
   });
 });
 
+/** A Kysely stub whose readiness query runs the given results in order, then succeeds. */
+function stubDbSequence(failures: Error[]): { db: Kysely<Database>; calls: () => number } {
+  let calls = 0;
+  const chain = {
+    select: () => chain,
+    limit: () => chain,
+    execute: async () => {
+      const failure = failures[calls++];
+      if (failure) throw failure;
+      return [];
+    },
+  };
+  return { db: { selectFrom: () => chain } as unknown as Kysely<Database>, calls: () => calls };
+}
+
+describe('orchestrator health routes — /ready after a switchover', () => {
+  it('stays 200 when the first pooled connection was killed by the switchover', async () => {
+    // fails-when: the readiness query is not retried — the dead connection reads as an outage (503).
+    const { db, calls } = stubDbSequence([new Error('Connection terminated unexpectedly')]);
+    const res = await createHealthRoutes({ db }).request('/ready');
+    expect(res.status).toBe(200);
+    expect(calls()).toBe(2);
+  });
+
+  it('still reports 503 on a real outage, without asking again', async () => {
+    // breaks-if-wrong: an unreachable database must still fail readiness.
+    const outage = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), {
+      code: 'ECONNREFUSED',
+    });
+    const { db, calls } = stubDbSequence([outage, outage, outage]);
+    const res = await createHealthRoutes({ db }).request('/ready');
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { checks: Record<string, boolean> };
+    expect(body.checks.database).toBe(false);
+    expect(calls()).toBe(1);
+  });
+});
+
 describe('orchestrator health routes — /health build identity', () => {
   const GLOBALS = { KICI_PKG_VERSION: '9.8.7', KICI_BUILD_COMMIT: 'c0ffee123' } as const;
 
@@ -58,17 +96,15 @@ describe('orchestrator health routes — /health build identity', () => {
     for (const key of Object.keys(GLOBALS)) delete (globalThis as Record<string, unknown>)[key];
   });
 
-  it('reports the release version in the deprecated buildCommit field, never a build commit', async () => {
-    // fails-when: the route reads a baked build commit — the private repository's
-    // commit ID then reaches every customer who reads /health.
-    // breaks-if-wrong: the deprecated key stays present, as a string, for a
-    // reader that still expects it.
+  it('carries version and no buildCommit', async () => {
+    // fails-when: buildCommit is still emitted, or a baked build commit leaks into the body.
+    // breaks-if-wrong: version must still be reported.
     const res = await createHealthRoutes({ db: stubDbOk() }).request('/health');
     const text = await res.text();
     const body = JSON.parse(text) as Record<string, unknown>;
 
     expect(body.version).toBe(GLOBALS.KICI_PKG_VERSION);
-    expect(body.buildCommit).toBe(GLOBALS.KICI_PKG_VERSION);
+    expect(body).not.toHaveProperty('buildCommit');
     expect(text).not.toContain(GLOBALS.KICI_BUILD_COMMIT);
   });
 });

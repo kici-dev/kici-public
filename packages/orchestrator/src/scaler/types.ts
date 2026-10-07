@@ -156,11 +156,8 @@ export interface LabelSetConfig {
   /** Path to agent binary (bare-metal backend) */
   binaryPath?: string;
   /**
-   * Per-label-set resource request and limit (override scaler defaults).
-   * After config-load normalization the internal representation is always nested:
+   * Per-label-set resource request and limit (override scaler defaults):
    * `{ requests?: { cpus, memory }, limits?: { cpus, memory } }`.
-   * The legacy flat shorthand (`{ cpus, memory }`) is accepted at config-load
-   * and treated as `limits` (with `requests` auto-mirrored).
    */
   resources?: ResourceRequest;
   /**

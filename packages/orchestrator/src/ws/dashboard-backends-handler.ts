@@ -7,7 +7,6 @@
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type {
   AccessLogAction,
-  AccessLogOutcome,
   AccessLogTargetType,
   ActorPrincipal,
   BackendSyncManager,
@@ -31,7 +30,7 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
-import { runDetached } from '../helpers/run-detached.js';
+import { DashboardAccessRecorder } from './dashboard-access.js';
 
 const logger = createLogger({ prefix: 'dashboard-backends-handler' });
 
@@ -81,13 +80,17 @@ export class DashboardBackendsHandler {
   private readonly deps: DashboardBackendsHandlerDeps;
   private orgId: string | null;
   private routingKey: string | null;
-  private readonly accessLog: AccessLogWriter | undefined;
+  private readonly access: DashboardAccessRecorder;
 
   constructor(deps: DashboardBackendsHandlerDeps) {
     this.deps = deps;
     this.orgId = deps.orgId ?? null;
     this.routingKey = deps.routingKey ?? null;
-    this.accessLog = deps.accessLog;
+    this.access = new DashboardAccessRecorder(
+      deps.accessLog,
+      () => ({ orgId: this.orgId, routingKey: this.routingKey }),
+      logger,
+    );
   }
 
   /**
@@ -121,7 +124,7 @@ export class DashboardBackendsHandler {
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           action,
           target,
@@ -134,39 +137,6 @@ export class DashboardBackendsHandler {
       }
       throw err;
     }
-  }
-
-  /**
-   * Write an access_log row for a handler invocation. Best-effort; the writer
-   * swallows failures.
-   */
-  private recordAccess(
-    actor: ActorPrincipal,
-    action: AccessLogAction,
-    target: { type: AccessLogTargetType; id: string } | null,
-    requestId: string | null,
-    outcome: AccessLogOutcome,
-    errorMessage?: string | null,
-  ): void {
-    const accessLog = this.accessLog;
-    if (!accessLog) return;
-    runDetached(
-      logger,
-      'Access log write',
-      () =>
-        accessLog.record({
-          orgId: this.orgId,
-          routingKey: this.routingKey,
-          actor,
-          action,
-          target,
-          requestId,
-          source: 'platform_proxy',
-          outcome,
-          errorMessage: errorMessage ?? null,
-        }),
-      { requestId },
-    );
   }
 
   /**
@@ -198,7 +168,7 @@ export class DashboardBackendsHandler {
   private async handleList(msg: BackendsListRequest): Promise<void> {
     try {
       const backends = await this.deps.registry.listBackends();
-      this.recordAccess(msg.actor, 'backend.list.read', null, msg.requestId, 'allowed');
+      this.access.record(msg.actor, 'backend.list.read', null, msg.requestId, 'allowed');
       this.deps.send({
         type: 'dashboard.backends.list.response',
         requestId: msg.requestId,
@@ -206,7 +176,7 @@ export class DashboardBackendsHandler {
       });
     } catch (err) {
       logger.error('Failed to list backends', { error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.list.read',
         null,
@@ -226,7 +196,7 @@ export class DashboardBackendsHandler {
     try {
       const backend = await this.deps.registry.getBackend(msg.name);
       if (!backend) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'backend.get.read',
           { type: 'backend', id: msg.name },
@@ -242,7 +212,7 @@ export class DashboardBackendsHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.get.read',
         { type: 'backend', id: msg.name },
@@ -256,7 +226,7 @@ export class DashboardBackendsHandler {
       });
     } catch (err) {
       logger.error('Failed to get backend', { name: msg.name, error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.get.read',
         { type: 'backend', id: msg.name },
@@ -286,7 +256,7 @@ export class DashboardBackendsHandler {
     }
     try {
       if (!this.deps.syncManager) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'backend.sync',
           null,
@@ -302,7 +272,7 @@ export class DashboardBackendsHandler {
         return;
       }
       const results = await this.deps.syncManager.syncAllBackends();
-      this.recordAccess(msg.actor, 'backend.sync', null, msg.requestId, 'allowed');
+      this.access.record(msg.actor, 'backend.sync', null, msg.requestId, 'allowed');
       this.deps.send({
         type: 'dashboard.backends.sync.response',
         requestId: msg.requestId,
@@ -310,7 +280,7 @@ export class DashboardBackendsHandler {
       });
     } catch (err) {
       logger.error('Failed to sync all backends', { error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.sync',
         null,
@@ -340,7 +310,7 @@ export class DashboardBackendsHandler {
     }
     try {
       if (!this.deps.syncManager) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'backend.sync.one',
           { type: 'backend', id: msg.name },
@@ -357,7 +327,7 @@ export class DashboardBackendsHandler {
       }
       const backend = await this.deps.registry.getBackend(msg.name);
       if (!backend) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'backend.sync.one',
           { type: 'backend', id: msg.name },
@@ -376,7 +346,7 @@ export class DashboardBackendsHandler {
         return;
       }
       const result = await this.deps.syncManager.syncBackend(msg.name);
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.sync.one',
         { type: 'backend', id: msg.name },
@@ -391,7 +361,7 @@ export class DashboardBackendsHandler {
       });
     } catch (err) {
       logger.error('Failed to sync backend', { name: msg.name, error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.sync.one',
         { type: 'backend', id: msg.name },
@@ -422,7 +392,7 @@ export class DashboardBackendsHandler {
     try {
       const backend = await this.deps.registry.getBackend(msg.name);
       if (!backend) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'backend.test',
           { type: 'backend', id: msg.name },
@@ -439,7 +409,7 @@ export class DashboardBackendsHandler {
       }
       const config = await this.deps.registry.getBackendConfig(msg.name);
       if (!config) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'backend.test',
           { type: 'backend', id: msg.name },
@@ -462,7 +432,7 @@ export class DashboardBackendsHandler {
         syncIntervalMs: backend.syncIntervalMs,
       };
       const result = await this.deps.healthChecker.testConnection(params);
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.test',
         { type: 'backend', id: msg.name },
@@ -479,7 +449,7 @@ export class DashboardBackendsHandler {
       });
     } catch (err) {
       logger.error('Failed to test backend', { name: msg.name, error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'backend.test',
         { type: 'backend', id: msg.name },

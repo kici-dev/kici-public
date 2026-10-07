@@ -117,10 +117,12 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'cluster_name.update': 180,
   'attestation.retry': 180,
   'scaler.orphan.stop': 180,
+  'scaler.reload': 180,
   'peer.forget': 180,
 
   // 180 days — direct-DB kici-admin mutations (source 'admin_cli')
   'db.fresh': 180,
+  'db.migrate': 180,
   'db.ensure': 180,
   'db.create_role': 180,
   'db.create_readonly_user': 180,
@@ -320,7 +322,7 @@ export function accessLogWarmSqlCase(): string {
  * Postgres CASE for Platform `audit_log`. Mirrors `auditLogWarmDays()`.
  *
  * The Platform `audit_log` table has neither an `outcome` nor an `actor_type`
- * column (per migration `001_initial`). Actor type only exists in the JS
+ * column. Actor type only exists in the JS
  * application layer — when an actor is written, the JS code derives `actor_id`
  * from `actor.sub` (or a fixed string like `'platform-admin-cli'`). Because of
  * that, the SQL CASE here cannot apply the `actor.type='platform_operator'`
@@ -466,10 +468,12 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'cluster_name.update': 730,
   'attestation.retry': 730,
   'scaler.orphan.stop': 730,
+  'scaler.reload': 730,
   'peer.forget': 730,
 
   // 730 days — direct-DB kici-admin mutations (source 'admin_cli')
   'db.fresh': 730,
+  'db.migrate': 730,
   'db.ensure': 730,
   'db.create_role': 730,
   'db.create_readonly_user': 730,

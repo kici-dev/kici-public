@@ -13,7 +13,7 @@ description: 'Webhook source and remote-run anchor management'
 kici-admin source add github --name <name> --manifest [--github-org <slug>] [--webhook-url <url>] [--no-browser] [--json]
 # Manual: store credentials for a GitHub App you already created
 kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin]
-kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--customer-id <orgId>]
+kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--org <orgId>]
 # Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth);
 # also reports missing events, permissions and installations pending approval
 kici-admin source refresh <routingKey> [--json]
@@ -83,7 +83,7 @@ forge to sign the payload, so only register repos you trust. Drive runs with
 `source trigger-local <id>` (reads the repo HEAD and POSTs a synthetic push) or
 install a `post-receive` hook with `source install-hook <id>` so every push
 triggers a run. `trigger-local` and the installed hook send to the orchestrator
-at `--base-url` (default: `KICI_ADMIN_URL`, else `http://localhost:8080`). The orchestrator accepts a local source on any scaler backend
+at `--base-url` (default: `KICI_ADMIN_URL`, else `http://localhost:4000`). The orchestrator accepts a local source on any scaler backend
 and logs a reachability warning (not a rejection) on container / Firecracker
 scalers, where the repo must be baked into the image / rootfs or bind-mounted at
 the registered path.
@@ -103,7 +103,7 @@ Counts (`--dry-run`) or deletes (`--confirm`) orphan `sources` rows, their scope
 kici-admin remote-source show <orgId>
 ```
 
-Inspects the orchestrator's auto-provisioned **remote source** for an organization — the system-managed row (routing key `remote:<orgId>`) that anchors the org so `kici run remote` can dispatch to it without any manual webhook source. The orchestrator provisions one automatically for its bound org, so there is nothing to create or remove; this command is read-only.
+Inspects the orchestrator's auto-provisioned **remote source** for an organization — the system-managed row (routing key `remote:<orgId>`) that anchors the org so `kici run remote` can dispatch to it without any manual webhook source. Find the org id with `kici-admin org list`. The orchestrator provisions one automatically for its bound org, so there is nothing to create or remove; this command is read-only.
 
 Use it to debug org-anchor issues on an orchestrator that sits behind a private network: confirm the remote source exists and maps the expected routing key to the org. If a developer's `kici run remote` reports that the org is not routable, `remote-source show <orgId>` is the first check.
 
@@ -125,9 +125,9 @@ Synopsis: `kici-admin remote-source show <orgId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | yes      | no       | Org id (kici-admin org list prints the org ids) |
 
 **Options**
 
@@ -300,7 +300,7 @@ Synopsis: `kici-admin source install-hook <id> [options]`
 | Option             | Default                 | Description                                  |
 | ------------------ | ----------------------- | -------------------------------------------- |
 | `--repo <path>`    |                         | Repo path (default: the source repoBasePath) |
-| `--base-url <url>` | `http://localhost:8080` | Orchestrator base URL                        |
+| `--base-url <url>` | `http://localhost:4000` | Orchestrator base URL                        |
 
 ### `kici-admin source list`
 
@@ -427,7 +427,7 @@ Synopsis: `kici-admin source trigger-local <id> [options]`
 | `--sha <sha>`             |                         | Commit SHA (default: repo HEAD)                                                      |
 | `--before <sha>`          |                         | Commit before the push; the changed files are before..sha (default: parent of --sha) |
 | `--repo-full-name <name>` | `local/repo`            | owner/name identifier used in the payload                                            |
-| `--base-url <url>`        | `http://localhost:8080` | Orchestrator base URL                                                                |
+| `--base-url <url>`        | `http://localhost:4000` | Orchestrator base URL                                                                |
 
 ### `kici-admin source update`
 
@@ -443,15 +443,15 @@ Synopsis: `kici-admin source update <routingKey> [options]`
 
 **Options**
 
-| Option                        | Default | Description                                                        |
-| ----------------------------- | ------- | ------------------------------------------------------------------ |
-| `--name <name>`               |         | New name                                                           |
-| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                           |
-| `--webhook-secret <secret>`   |         | New webhook secret                                                 |
-| `--from-env <varName>`        |         | Read new private key from environment variable                     |
-| `--stdin`                     |         | Read new private key from stdin                                    |
-| `--customer-id <orgId>`       |         | Update the customer/org ID used for secret and environment scoping |
-| `--database-url <url>`        |         | Use direct DB access instead of HTTP (offline mode)                |
+| Option                        | Default | Description                                               |
+| ----------------------------- | ------- | --------------------------------------------------------- |
+| `--name <name>`               |         | New name                                                  |
+| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                  |
+| `--webhook-secret <secret>`   |         | New webhook secret                                        |
+| `--from-env <varName>`        |         | Read new private key from environment variable            |
+| `--stdin`                     |         | Read new private key from stdin                           |
+| `--org <orgId>`               |         | Update the org ID used for secret and environment scoping |
+| `--database-url <url>`        |         | Use direct DB access instead of HTTP (offline mode)       |
 
 ### `kici-admin source update-generic`
 

@@ -55,7 +55,16 @@ function connected(overrides: Partial<PlatformClientOptions>) {
   client.connect();
   const ws = mockInstances[mockInstances.length - 1]!;
   ws.emit('open');
-  ws.emit('message', JSON.stringify({ type: 'auth.success', connectionId: 'conn-1' }));
+  ws.emit(
+    'message',
+    JSON.stringify({
+      type: 'auth.success',
+      connectionId: 'conn-1',
+      orgPublicAlias: 'oal_test',
+      orgId: 'org_test',
+      githubWebhookUrl: null,
+    }),
+  );
   return { client, ws };
 }
 
@@ -84,7 +93,9 @@ describe('Platform frame handler failures', () => {
         .fn()
         .mockRejectedValueOnce(new Error('Connection terminated unexpectedly'))
         .mockResolvedValueOnce(undefined);
-      const { ws } = connected({ onDashboardRunDetail });
+      const { ws } = connected({
+        dashboardHandlers: { 'dashboard.run.detail': onDashboardRunDetail },
+      });
 
       ws.emit('message', runDetail('req-1'));
       await settle();
@@ -113,7 +124,9 @@ describe('Platform frame handler failures', () => {
     const onDashboardRunDetail = vi.fn(() => {
       throw new TypeError('boom');
     });
-    const { ws } = connected({ onDashboardRunDetail });
+    const { ws } = connected({
+      dashboardHandlers: { 'dashboard.run.detail': onDashboardRunDetail },
+    });
 
     expect(() => ws.emit('message', runDetail('req-3'))).not.toThrow();
     expect(mockLogError).toHaveBeenCalledWith(

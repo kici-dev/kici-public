@@ -6,7 +6,7 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 /**
  * Format audit entries as a table.
@@ -42,17 +42,17 @@ export function registerAuditCommands(program: Command, getClient: () => AdminAp
     .option('--offset <n>', 'Offset for pagination')
     .option('--include-archived', 'Include rows from cold storage', false)
     .action(
-      async (opts: {
-        context?: string;
-        routingKey?: string;
-        action?: string;
-        from?: string;
-        to?: string;
-        limit: string;
-        offset?: string;
-        includeArchived?: boolean;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          context?: string;
+          routingKey?: string;
+          action?: string;
+          from?: string;
+          to?: string;
+          limit: string;
+          offset?: string;
+          includeArchived?: boolean;
+        }) => {
           const entries = await getClient().queryAudit({
             contextName: opts.context,
             routingKey: opts.routingKey,
@@ -64,10 +64,7 @@ export function registerAuditCommands(program: Command, getClient: () => AdminAp
             includeArchived: opts.includeArchived === true,
           });
           console.log(formatAuditTable(entries));
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 }

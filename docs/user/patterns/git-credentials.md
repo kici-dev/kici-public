@@ -36,9 +36,8 @@ job('release', {
 Store the secrets first with `kici-admin secret set`, in a scope bound to the
 context the reference names (`kici-admin context bind`). A `ci:` reference is
 read through the bindings of the `ci` context, the same way a job's context
-secrets are. If no scope bound to a context named exactly `ci` carries the
-secret, the reference still reads the scope named `ci`, but that fallback is
-[deprecated](../deprecations.md) and logs a warning. Pasting a private key straight into the workflow is rejected when the
+secrets are. If no scope bound to the `ci` context carries the secret, the
+reference is refused: a scope that only shares the context's name is not read. Pasting a private key straight into the workflow is rejected when the
 workflow is defined, naming the field — a key written into `.kici/` would be
 committed to your repository.
 

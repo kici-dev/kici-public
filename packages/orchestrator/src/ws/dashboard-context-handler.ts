@@ -10,9 +10,8 @@
  * 2. Calls the appropriate store method
  * 3. Returns a response message with requestId and data (or error)
  */
-import { sql, type Kysely } from 'kysely';
+import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { HeldRunStatus } from '../contexts/held-runs.js';
 import type { HeldRunStore, ReleaseSignal } from '../contexts/held-runs.js';
 import type { TeamMembershipLookup } from '../approvals/approval-resolver.js';
 import { applyDecision, type ApplyDecisionDeps } from '../approvals/apply-decision.js';
@@ -56,7 +55,7 @@ import {
   HoldScope,
   assertValidScopeName,
   assertValidSecretKey,
-  normalizePersistedHoldType,
+  toIsoString,
 } from '@kici-dev/engine';
 import { ContextDeleteBlockedError, toContext } from '../contexts/context-store.js';
 import type { ContextStore } from '../contexts/context-store.js';
@@ -79,6 +78,8 @@ import {
   type DashboardSealedEnvelope,
 } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 import { runDetached } from '../helpers/run-detached.js';
+import { DashboardAccessRecorder, audited, type AuditedRequest } from './dashboard-access.js';
+import { safeJsonParse } from '../helpers/json.js';
 
 const logger = createLogger({ prefix: 'dashboard-context-handler' });
 
@@ -98,14 +99,6 @@ function normalizeHeldRunPayload(raw: unknown): { summaryMarkdown: string; drift
     }
   }
   return null;
-}
-
-function safeJsonParse(s: string): unknown {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -134,13 +127,12 @@ export interface DashboardContextHandlerDeps {
   /** Routing key for access_log rows (null when not run-scoped). */
   routingKey?: string | null;
   /**
-   * Held-run store + resume hook for the approve/reject flow. When present, the
-   * approve/reject handlers route through the shared `applyDecision` applier
-   * (eligibility check, real attribution, multi-clause accumulation, and the
-   * resume-after-approval re-dispatch). When absent (legacy / tests), the
-   * handlers fall back to the direct status flip.
+   * Held-run store + resume hook for the approve/reject flow. The approve/reject
+   * handlers route through the shared `applyDecision` applier (eligibility
+   * check, real attribution, multi-clause accumulation, and the
+   * resume-after-approval re-dispatch).
    */
-  approvals?: ApprovalHandlerDeps;
+  approvals: ApprovalHandlerDeps;
   /**
    * Dashboard-encryption key resolver. Present when KICI_SECRET_KEY is
    * configured. Under the `encrypted` posture the secret/variable set handlers
@@ -189,12 +181,16 @@ export interface ApprovalHandlerDeps {
 export class DashboardContextHandler {
   private readonly deps: DashboardContextHandlerDeps;
   private routingKey: string | null;
-  private readonly accessLog: AccessLogWriter | undefined;
+  private readonly access: DashboardAccessRecorder;
 
   constructor(deps: DashboardContextHandlerDeps) {
     this.deps = deps;
     this.routingKey = deps.routingKey ?? null;
-    this.accessLog = deps.accessLog;
+    this.access = new DashboardAccessRecorder(
+      deps.accessLog,
+      () => ({ orgId: this.deps.orgId, routingKey: this.routingKey }),
+      logger,
+    );
   }
 
   /** Update the orgId used for all operations (called when resolved from DB). */
@@ -226,7 +222,7 @@ export class DashboardContextHandler {
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           action,
           target,
@@ -239,6 +235,22 @@ export class DashboardContextHandler {
       }
       throw err;
     }
+  }
+
+  /** Run a single-call request through `audited` with this handler's recorder and response channel. */
+  private audited(
+    req: AuditedRequest,
+    body: () => Promise<Record<string, unknown> | void>,
+  ): Promise<void> {
+    return audited(
+      {
+        recorder: this.access,
+        send: (m) => this.deps.send(m),
+        sendError: (type, requestId, err) => this.sendError(type, requestId, err),
+        ...req,
+      },
+      body,
+    );
   }
 
   /**
@@ -278,40 +290,6 @@ export class DashboardContextHandler {
       return { error: DashboardSealedWriteError.enum.missing_value };
     }
     return { plaintext: msg.value };
-  }
-
-  /**
-   * Write an access_log row for a handler invocation. Uses the handler's
-   * bound orgId + routingKey, the msg.actor principal, and the handler-
-   * specified action + target. Best-effort; the writer swallows failures.
-   */
-  private recordAccess(
-    actor: ActorPrincipal,
-    action: AccessLogAction,
-    target: { type: AccessLogTargetType; id: string } | null,
-    requestId: string | null,
-    outcome: AccessLogOutcome,
-    errorMessage?: string | null,
-  ): void {
-    const accessLog = this.accessLog;
-    if (!accessLog) return;
-    runDetached(
-      logger,
-      'Access log write',
-      () =>
-        accessLog.record({
-          orgId: this.deps.orgId,
-          routingKey: this.routingKey,
-          actor,
-          action,
-          target,
-          requestId,
-          source: 'platform_proxy',
-          outcome,
-          errorMessage: errorMessage ?? null,
-        }),
-      { requestId },
-    );
   }
 
   /**
@@ -416,55 +394,41 @@ export class DashboardContextHandler {
   // ── Context CRUD ──────────────────────────────────────────────
 
   private async handleEnvList(msg: ContextListRequest): Promise<void> {
-    // Scope to the request's target org when the Platform carries one
-    // (Platform-first dev path), falling back to the connection-level org for
-    // the legacy customer-dashboard path. The orchestrator's DB only holds its
-    // own tenant's rows, so honoring the requested org returns that org's data
-    // or an empty list — never another tenant's secrets.
+    // Scope to the request's target org when the Platform carries one, else to
+    // the connection-level org. The orchestrator's DB only holds its own
+    // tenant's rows, so honoring the requested org returns that org's data or
+    // an empty list — never another tenant's secrets.
     const orgId = msg.orgId ?? this.deps.orgId;
-    try {
-      const envs = await this.deps.contextStore.list(orgId);
-      const secretKeysByEnv = msg.includeSecrets
-        ? await this.loadSecretKeysByEnv(
-            orgId,
-            envs.map((e) => e.id),
-          )
-        : undefined;
-      this.recordAccess(
-        msg.actor,
-        'context.list.read',
-        { type: 'context', id: orgId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.list.response',
-        requestId: msg.requestId,
-        contexts: envs.map((e) => ({
-          id: e.id,
-          name: e.name,
-          type: e.type,
-          globPattern: e.glob_pattern,
-          enabled: e.enabled,
-          allowLocalExecution: e.allow_local_execution,
-          createdAt:
-            e.created_at instanceof Date ? e.created_at.toISOString() : String(e.created_at),
-          updatedAt:
-            e.updated_at instanceof Date ? e.updated_at.toISOString() : String(e.updated_at),
-          ...(secretKeysByEnv && { secretKeys: secretKeysByEnv.get(e.id) ?? [] }),
-        })),
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'context.list.read',
-        { type: 'context', id: orgId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.list.response', msg.requestId, err);
-    }
+    await this.audited(
+      {
+        msg,
+        action: 'context.list.read',
+        target: { type: 'context', id: orgId },
+        responseType: 'dashboard.contexts.list.response',
+      },
+      async () => {
+        const envs = await this.deps.contextStore.list(orgId);
+        const secretKeysByEnv = msg.includeSecrets
+          ? await this.loadSecretKeysByEnv(
+              orgId,
+              envs.map((e) => e.id),
+            )
+          : undefined;
+        return {
+          contexts: envs.map((e) => ({
+            id: e.id,
+            name: e.name,
+            type: e.type,
+            globPattern: e.glob_pattern,
+            enabled: e.enabled,
+            allowLocalExecution: e.allow_local_execution,
+            createdAt: toIsoString(e.created_at),
+            updatedAt: toIsoString(e.updated_at),
+            ...(secretKeysByEnv && { secretKeys: secretKeysByEnv.get(e.id) ?? [] }),
+          })),
+        };
+      },
+    );
   }
 
   /**
@@ -472,7 +436,7 @@ export class DashboardContextHandler {
    * its scope bindings. Joins `context_bindings` → `scoped_secrets` on the
    * scope pattern, excluding the `__empty__` sentinel. Returns key names only —
    * never values. Scoped to the caller-resolved org (the request's target org,
-   * or the connection-level org on the legacy path).
+   * else the connection-level org).
    */
   private async loadSecretKeysByEnv(
     orgId: string,
@@ -510,7 +474,7 @@ export class DashboardContextHandler {
     try {
       const env = await this.deps.contextStore.get(this.deps.orgId, msg.contextId);
       if (!env) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'context.get.read',
           { type: 'context', id: msg.contextId },
@@ -525,7 +489,7 @@ export class DashboardContextHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.get.read',
         { type: 'context', id: msg.contextId },
@@ -550,14 +514,12 @@ export class DashboardContextHandler {
           holdExpirySeconds: env.hold_expiry_seconds ?? null,
           enabled: env.enabled,
           allowLocalExecution: env.allow_local_execution,
-          createdAt:
-            env.created_at instanceof Date ? env.created_at.toISOString() : String(env.created_at),
-          updatedAt:
-            env.updated_at instanceof Date ? env.updated_at.toISOString() : String(env.updated_at),
+          createdAt: toIsoString(env.created_at),
+          updatedAt: toIsoString(env.updated_at),
         },
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.get.read',
         { type: 'context', id: msg.contextId },
@@ -596,7 +558,7 @@ export class DashboardContextHandler {
         holdExpirySeconds: msg.holdExpirySeconds,
         enabled: msg.enabled,
       });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.create',
         { type: 'context', id: env.id },
@@ -609,7 +571,7 @@ export class DashboardContextHandler {
         contextId: env.id,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.create',
         { type: 'context', id: msg.name },
@@ -660,7 +622,7 @@ export class DashboardContextHandler {
         enabled: u.enabled,
       });
       if (!env) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'context.update',
           { type: 'context', id: msg.contextId },
@@ -675,7 +637,7 @@ export class DashboardContextHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.update',
         { type: 'context', id: msg.contextId },
@@ -687,7 +649,7 @@ export class DashboardContextHandler {
         requestId: msg.requestId,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.update',
         { type: 'context', id: msg.contextId },
@@ -716,7 +678,7 @@ export class DashboardContextHandler {
         allowLocalExecution: msg.allowLocalExecution,
       });
       if (!env) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'context.update',
           { type: 'context', id: msg.contextId },
@@ -731,7 +693,7 @@ export class DashboardContextHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.update',
         { type: 'context', id: msg.contextId },
@@ -743,7 +705,7 @@ export class DashboardContextHandler {
         requestId: msg.requestId,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.update',
         { type: 'context', id: msg.contextId },
@@ -770,7 +732,7 @@ export class DashboardContextHandler {
     try {
       const deleted = await this.deps.contextStore.delete(this.deps.orgId, msg.contextId);
       if (!deleted) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'context.delete',
           { type: 'context', id: msg.contextId },
@@ -785,7 +747,7 @@ export class DashboardContextHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.delete',
         { type: 'context', id: msg.contextId },
@@ -797,7 +759,7 @@ export class DashboardContextHandler {
         requestId: msg.requestId,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context.delete',
         { type: 'context', id: msg.contextId },
@@ -821,35 +783,24 @@ export class DashboardContextHandler {
   // ── Variables ─────────────────────────────────────────────────────
 
   private async handleVarsList(msg: ContextVarsListRequest): Promise<void> {
-    try {
-      const vars = await this.deps.variableStore.listVars(this.deps.orgId, msg.contextId);
-      this.recordAccess(
-        msg.actor,
-        'context_var.list.read',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.variables.list.response',
-        requestId: msg.requestId,
-        variables: vars.map((v) => ({
-          key: v.key,
-          value: v.value,
-          locked: v.locked,
-        })),
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'context_var.list.read',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.variables.list.response', msg.requestId, err);
-    }
+    await this.audited(
+      {
+        msg,
+        action: 'context_var.list.read',
+        target: { type: 'context', id: msg.contextId },
+        responseType: 'dashboard.contexts.variables.list.response',
+      },
+      async () => {
+        const vars = await this.deps.variableStore.listVars(this.deps.orgId, msg.contextId);
+        return {
+          variables: vars.map((v) => ({
+            key: v.key,
+            value: v.value,
+            locked: v.locked,
+          })),
+        };
+      },
+    );
   }
 
   private async handleVarSet(msg: ContextVarSetRequest): Promise<void> {
@@ -866,7 +817,7 @@ export class DashboardContextHandler {
     }
     const resolved = await this.resolveWriteValue(msg, 'variables.set');
     if ('error' in resolved) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context_var.set',
         { type: 'context', id: `${msg.contextId}:${msg.key}` },
@@ -889,7 +840,7 @@ export class DashboardContextHandler {
         resolved.plaintext,
         msg.locked,
       );
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context_var.set',
         { type: 'context', id: `${msg.contextId}:${msg.key}` },
@@ -901,7 +852,7 @@ export class DashboardContextHandler {
         requestId: msg.requestId,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'context_var.set',
         { type: 'context', id: `${msg.contextId}:${msg.key}` },
@@ -914,240 +865,154 @@ export class DashboardContextHandler {
   }
 
   private async handleVarDelete(msg: ContextVarDeleteRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'variables.delete',
-        'dashboard.contexts.variables.delete.response',
-        'context_var.delete',
-        { type: 'context', id: `${msg.contextId}:${msg.key}` },
-      ))
-    ) {
-      return;
-    }
-    try {
-      await this.deps.variableStore.deleteVar(this.deps.orgId, msg.contextId, msg.key);
-      this.recordAccess(
-        msg.actor,
-        'context_var.delete',
-        { type: 'context', id: `${msg.contextId}:${msg.key}` },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.variables.delete.response',
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'context_var.delete',
-        { type: 'context', id: `${msg.contextId}:${msg.key}` },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.variables.delete.response', msg.requestId, err);
-    }
+        action: 'context_var.delete',
+        target: { type: 'context', id: `${msg.contextId}:${msg.key}` },
+        responseType: 'dashboard.contexts.variables.delete.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'variables.delete',
+            'dashboard.contexts.variables.delete.response',
+            'context_var.delete',
+            { type: 'context', id: `${msg.contextId}:${msg.key}` },
+          ),
+      },
+      async () => {
+        await this.deps.variableStore.deleteVar(this.deps.orgId, msg.contextId, msg.key);
+      },
+    );
   }
 
   // ── Source overrides ──────────────────────────────────────────────
 
   private async handleSourceOverridesList(msg: ContextSourceOverridesListRequest): Promise<void> {
-    try {
-      const overrides = await this.deps.variableStore.listSourceOverrides(
-        this.deps.orgId,
-        msg.contextId,
-        msg.routingKey,
-      );
-      this.recordAccess(
-        msg.actor,
-        'source_override.list.read',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}` },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.source-overrides.list.response',
-        requestId: msg.requestId,
-        overrides: overrides.map((o) => ({
-          key: o.key,
-          value: o.value,
-        })),
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'source_override.list.read',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}` },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.source-overrides.list.response', msg.requestId, err);
-    }
+    await this.audited(
+      {
+        msg,
+        action: 'source_override.list.read',
+        target: { type: 'context', id: `${msg.contextId}:${msg.routingKey}` },
+        responseType: 'dashboard.contexts.source-overrides.list.response',
+      },
+      async () => {
+        const overrides = await this.deps.variableStore.listSourceOverrides(
+          this.deps.orgId,
+          msg.contextId,
+          msg.routingKey,
+        );
+        return {
+          overrides: overrides.map((o) => ({
+            key: o.key,
+            value: o.value,
+          })),
+        };
+      },
+    );
   }
 
   private async handleSourceOverrideSet(msg: ContextSourceOverrideSetRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'contexts.source_overrides.set',
-        'dashboard.contexts.source-overrides.set.response',
-        'source_override.set',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
-      ))
-    ) {
-      return;
-    }
-    try {
-      await this.deps.variableStore.setSourceOverride(
-        this.deps.orgId,
-        msg.contextId,
-        msg.routingKey,
-        msg.key,
-        msg.value,
-      );
-      this.recordAccess(
-        msg.actor,
-        'source_override.set',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.source-overrides.set.response',
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'source_override.set',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.source-overrides.set.response', msg.requestId, err);
-    }
+        action: 'source_override.set',
+        target: { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
+        responseType: 'dashboard.contexts.source-overrides.set.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'contexts.source_overrides.set',
+            'dashboard.contexts.source-overrides.set.response',
+            'source_override.set',
+            { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
+          ),
+      },
+      async () => {
+        await this.deps.variableStore.setSourceOverride(
+          this.deps.orgId,
+          msg.contextId,
+          msg.routingKey,
+          msg.key,
+          msg.value,
+        );
+      },
+    );
   }
 
   private async handleSourceOverrideDelete(msg: ContextSourceOverrideDeleteRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'contexts.source_overrides.delete',
-        'dashboard.contexts.source-overrides.delete.response',
-        'source_override.delete',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
-      ))
-    ) {
-      return;
-    }
-    try {
-      await this.deps.variableStore.deleteSourceOverride(
-        this.deps.orgId,
-        msg.contextId,
-        msg.routingKey,
-        msg.key,
-      );
-      this.recordAccess(
-        msg.actor,
-        'source_override.delete',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.source-overrides.delete.response',
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'source_override.delete',
-        { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.source-overrides.delete.response', msg.requestId, err);
-    }
+        action: 'source_override.delete',
+        target: { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
+        responseType: 'dashboard.contexts.source-overrides.delete.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'contexts.source_overrides.delete',
+            'dashboard.contexts.source-overrides.delete.response',
+            'source_override.delete',
+            { type: 'context', id: `${msg.contextId}:${msg.routingKey}:${msg.key}` },
+          ),
+      },
+      async () => {
+        await this.deps.variableStore.deleteSourceOverride(
+          this.deps.orgId,
+          msg.contextId,
+          msg.routingKey,
+          msg.key,
+        );
+      },
+    );
   }
 
   // ── Bindings ──────────────────────────────────────────────────────
 
   private async handleBindingsList(msg: ContextBindingsListRequest): Promise<void> {
-    try {
-      const bindings = await this.deps.bindingStore.list(this.deps.orgId, msg.contextId);
-      this.recordAccess(
-        msg.actor,
-        'context_binding.list.read',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.bindings.list.response',
-        requestId: msg.requestId,
-        bindings: bindings.map((b) => ({
-          scopePattern: b.scope_pattern,
-          hostPattern: b.host_pattern,
-        })),
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'context_binding.list.read',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.bindings.list.response', msg.requestId, err);
-    }
+    await this.audited(
+      {
+        msg,
+        action: 'context_binding.list.read',
+        target: { type: 'context', id: msg.contextId },
+        responseType: 'dashboard.contexts.bindings.list.response',
+      },
+      async () => {
+        const bindings = await this.deps.bindingStore.list(this.deps.orgId, msg.contextId);
+        return {
+          bindings: bindings.map((b) => ({
+            scopePattern: b.scope_pattern,
+            hostPattern: b.host_pattern,
+          })),
+        };
+      },
+    );
   }
 
   private async handleBindingsSet(msg: ContextBindingsSetRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'contexts.bindings.set',
-        'dashboard.contexts.bindings.set.response',
-        'context_binding.set',
-        { type: 'context', id: msg.contextId },
-      ))
-    ) {
-      return;
-    }
-    try {
-      await this.deps.bindingStore.set(
-        this.deps.orgId,
-        msg.contextId,
-        msg.bindings.map((b) => ({ scopePattern: b.scopePattern, hostPattern: b.hostPattern })),
-      );
-      this.recordAccess(
-        msg.actor,
-        'context_binding.set',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.bindings.set.response',
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'context_binding.set',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.bindings.set.response', msg.requestId, err);
-    }
+        action: 'context_binding.set',
+        target: { type: 'context', id: msg.contextId },
+        responseType: 'dashboard.contexts.bindings.set.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'contexts.bindings.set',
+            'dashboard.contexts.bindings.set.response',
+            'context_binding.set',
+            { type: 'context', id: msg.contextId },
+          ),
+      },
+      async () => {
+        await this.deps.bindingStore.set(
+          this.deps.orgId,
+          msg.contextId,
+          msg.bindings.map((b) => ({ scopePattern: b.scopePattern, hostPattern: b.hostPattern })),
+        );
+      },
+    );
   }
 
   // ── Secrets ───────────────────────────────────────────────────────
@@ -1175,91 +1040,80 @@ export class DashboardContextHandler {
   }
 
   private async handleSecretsList(msg: ContextSecretsListRequest): Promise<void> {
-    try {
-      const orgId = this.deps.orgId;
-      const stores = await this.getBackendStores();
-      const secrets: Array<{
-        scope: string;
-        key: string;
-        createdAt: string;
-        updatedAt: string;
-      }> = [];
+    await this.audited(
+      {
+        msg,
+        action: 'secret.list.read',
+        target: { type: 'secret_scope', id: this.deps.orgId },
+        responseType: 'dashboard.contexts.secrets.list.response',
+      },
+      async () => {
+        const orgId = this.deps.orgId;
+        const stores = await this.getBackendStores();
+        const secrets: Array<{
+          scope: string;
+          key: string;
+          createdAt: string;
+          updatedAt: string;
+        }> = [];
 
-      for (const [backendName, store] of stores) {
-        let scopes: string[];
-        try {
-          scopes = await store.listScopes(orgId);
-        } catch (err) {
-          logger.warn('Failed to list scopes from backend, skipping', {
-            backend: backendName,
-            error: toErrorMessage(err),
-          });
-          continue;
-        }
-
-        for (const scope of scopes) {
-          // Filter internal scopes — strip backend prefix before checking
-          const colonIdx = scope.indexOf(':');
-          const path = colonIdx >= 0 ? scope.slice(colonIdx + 1) : scope;
-          if (path.startsWith('__')) continue;
-
-          // PG scopes are stored unprefixed in the DB.
-          // External backends also return raw scopes.
-          // Always prefix with backend name for the frontend.
-          const prefixedScope = scope.startsWith(`${backendName}:`)
-            ? scope
-            : `${backendName}:${scope}`;
-
-          let keys: string[];
+        for (const [backendName, store] of stores) {
+          let scopes: string[];
           try {
-            keys = await store.listKeys(orgId, scope);
+            scopes = await store.listScopes(orgId);
           } catch (err) {
-            logger.warn('Failed to list keys from backend scope, skipping', {
+            logger.warn('Failed to list scopes from backend, skipping', {
               backend: backendName,
-              scope,
               error: toErrorMessage(err),
             });
             continue;
           }
 
-          if (keys.length === 0) {
-            // Include empty scopes so the frontend shows the scope tree
-            // (e.g., Vault directory scopes that contain sub-scopes but no direct keys)
-            secrets.push({ scope: prefixedScope, key: '', createdAt: '', updatedAt: '' });
-          } else {
-            for (const key of keys) {
-              secrets.push({ scope: prefixedScope, key, createdAt: '', updatedAt: '' });
+          for (const scope of scopes) {
+            // Filter internal scopes — strip backend prefix before checking
+            const colonIdx = scope.indexOf(':');
+            const path = colonIdx >= 0 ? scope.slice(colonIdx + 1) : scope;
+            if (path.startsWith('__')) continue;
+
+            // PG scopes are stored unprefixed in the DB.
+            // External backends also return raw scopes.
+            // Always prefix with backend name for the frontend.
+            const prefixedScope = scope.startsWith(`${backendName}:`)
+              ? scope
+              : `${backendName}:${scope}`;
+
+            let keys: string[];
+            try {
+              keys = await store.listKeys(orgId, scope);
+            } catch (err) {
+              logger.warn('Failed to list keys from backend scope, skipping', {
+                backend: backendName,
+                scope,
+                error: toErrorMessage(err),
+              });
+              continue;
+            }
+
+            if (keys.length === 0) {
+              // Include empty scopes so the frontend shows the scope tree
+              // (e.g., Vault directory scopes that contain sub-scopes but no direct keys)
+              secrets.push({ scope: prefixedScope, key: '', createdAt: '', updatedAt: '' });
+            } else {
+              for (const key of keys) {
+                secrets.push({ scope: prefixedScope, key, createdAt: '', updatedAt: '' });
+              }
             }
           }
         }
-      }
 
-      // Sort by scope then key for consistent ordering
-      secrets.sort((a, b) => a.scope.localeCompare(b.scope) || a.key.localeCompare(b.key));
+        // Sort by scope then key for consistent ordering
+        secrets.sort((a, b) => a.scope.localeCompare(b.scope) || a.key.localeCompare(b.key));
 
-      this.recordAccess(
-        msg.actor,
-        'secret.list.read',
-        { type: 'secret_scope', id: this.deps.orgId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.secrets.list.response',
-        requestId: msg.requestId,
-        secrets,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'secret.list.read',
-        { type: 'secret_scope', id: this.deps.orgId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.secrets.list.response', msg.requestId, err);
-    }
+        return {
+          secrets,
+        };
+      },
+    );
   }
 
   private async handleSecretSet(msg: ContextSecretSetRequest): Promise<void> {
@@ -1276,7 +1130,7 @@ export class DashboardContextHandler {
     }
     const resolved = await this.resolveWriteValue(msg, 'secrets.set');
     if ('error' in resolved) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'secret.set',
         { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
@@ -1300,7 +1154,7 @@ export class DashboardContextHandler {
       // message fails the whole message instead of degrading one field.
       assertValidSecretKey(msg.key);
       await store.setSecret(this.deps.orgId, scope, msg.key, resolved.plaintext);
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'secret.set',
         { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
@@ -1312,7 +1166,7 @@ export class DashboardContextHandler {
         requestId: msg.requestId,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'secret.set',
         { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
@@ -1325,442 +1179,351 @@ export class DashboardContextHandler {
   }
 
   private async handleSecretDelete(msg: ContextSecretDeleteRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'secrets.delete',
-        'dashboard.contexts.secrets.delete.response',
-        'secret.delete',
-        { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
-      ))
-    ) {
-      return;
-    }
-    try {
-      const { store, scope } = await this.resolveStoreForScope(msg.scope);
-      await store.deleteSecret(this.deps.orgId, scope, msg.key);
-      this.recordAccess(
-        msg.actor,
-        'secret.delete',
-        { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.secrets.delete.response',
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'secret.delete',
-        { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.secrets.delete.response', msg.requestId, err);
-    }
+        action: 'secret.delete',
+        target: { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
+        responseType: 'dashboard.contexts.secrets.delete.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'secrets.delete',
+            'dashboard.contexts.secrets.delete.response',
+            'secret.delete',
+            { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
+          ),
+      },
+      async () => {
+        const { store, scope } = await this.resolveStoreForScope(msg.scope);
+        await store.deleteSecret(this.deps.orgId, scope, msg.key);
+      },
+    );
   }
 
   // ── Scope CRUD ──────────────────────────────────────────────────
 
   private async handleScopeCreate(msg: ContextSecretScopeCreateRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'secrets.scope.create',
-        'dashboard.contexts.secrets.scope.create.response',
-        'secret_scope.create',
-        { type: 'secret_scope', id: msg.scope },
-      ))
-    ) {
-      return;
-    }
-    try {
-      const { store, scope } = await this.resolveStoreForScope(msg.scope);
-      assertValidScopeName(scope);
-      if (!store.createScope) {
-        throw new Error('Backend does not support scope creation');
-      }
-      await store.createScope(this.deps.orgId, scope);
-      this.recordAccess(
-        msg.actor,
-        'secret_scope.create',
-        { type: 'secret_scope', id: msg.scope },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.secrets.scope.create.response' as const,
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'secret_scope.create',
-        { type: 'secret_scope', id: msg.scope },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.secrets.scope.create.response', msg.requestId, err);
-    }
+        action: 'secret_scope.create',
+        target: { type: 'secret_scope', id: msg.scope },
+        responseType: 'dashboard.contexts.secrets.scope.create.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'secrets.scope.create',
+            'dashboard.contexts.secrets.scope.create.response',
+            'secret_scope.create',
+            { type: 'secret_scope', id: msg.scope },
+          ),
+      },
+      async () => {
+        const { store, scope } = await this.resolveStoreForScope(msg.scope);
+        assertValidScopeName(scope);
+        if (!store.createScope) {
+          throw new Error('Backend does not support scope creation');
+        }
+        await store.createScope(this.deps.orgId, scope);
+      },
+    );
   }
 
   private async handleScopeRename(msg: ContextSecretScopeRenameRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'secrets.scope.rename',
-        'dashboard.contexts.secrets.scope.rename.response',
-        'secret_scope.rename',
-        { type: 'secret_scope', id: `${msg.oldScope}->${msg.newScope}` },
-      ))
-    ) {
-      return;
-    }
-    try {
-      // Both scopes resolve against ONE snapshot of the backend map. Loading it
-      // twice would let a backend registered or removed between the two loads
-      // decide the comparison below — the same qualifier could resolve to a
-      // backend in one snapshot and fall through to the default in the other,
-      // which is exactly the cross-backend rename this guard must catch.
-      const stores = await this.getBackendStores();
-      const from = resolveScope(msg.oldScope, stores, this.deps.secretStore);
-      const to = resolveScope(msg.newScope, stores, this.deps.secretStore);
-      // A rename is a per-backend operation — the source store re-encrypts each
-      // row under the new scope's AAD. Moving a scope BETWEEN backends is a
-      // copy plus a delete, which this path does not perform, so reject it
-      // outright rather than silently renaming inside the source backend and
-      // reporting success. Mirrors the HTTP admin route's 400.
-      if (from.backendName !== to.backendName) {
-        throw new Error(
-          `Cannot rename a scope across backends ` +
-            `('${from.backendName}' -> '${to.backendName}'). ` +
-            `Recreate the secrets in the destination backend instead.`,
-        );
-      }
-      if (!from.store.renameScope) {
-        throw new Error('Backend does not support scope rename');
-      }
-      // Validate only the destination name — renaming a pre-existing malformed
-      // scope to a conforming one is the built-in cleanup path.
-      assertValidScopeName(to.path);
-      await from.store.renameScope(this.deps.orgId, from.path, to.path);
-      this.recordAccess(
-        msg.actor,
-        'secret_scope.rename',
-        { type: 'secret_scope', id: `${msg.oldScope}->${msg.newScope}` },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.secrets.scope.rename.response' as const,
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'secret_scope.rename',
-        { type: 'secret_scope', id: `${msg.oldScope}->${msg.newScope}` },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.secrets.scope.rename.response', msg.requestId, err);
-    }
+        action: 'secret_scope.rename',
+        target: { type: 'secret_scope', id: `${msg.oldScope}->${msg.newScope}` },
+        responseType: 'dashboard.contexts.secrets.scope.rename.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'secrets.scope.rename',
+            'dashboard.contexts.secrets.scope.rename.response',
+            'secret_scope.rename',
+            { type: 'secret_scope', id: `${msg.oldScope}->${msg.newScope}` },
+          ),
+      },
+      async () => {
+        // Both scopes resolve against ONE snapshot of the backend map. Loading it
+        // twice would let a backend registered or removed between the two loads
+        // decide the comparison below — the same qualifier could resolve to a
+        // backend in one snapshot and fall through to the default in the other,
+        // which is exactly the cross-backend rename this guard must catch.
+        const stores = await this.getBackendStores();
+        const from = resolveScope(msg.oldScope, stores, this.deps.secretStore);
+        const to = resolveScope(msg.newScope, stores, this.deps.secretStore);
+        // A rename is a per-backend operation — the source store re-encrypts each
+        // row under the new scope's AAD. Moving a scope BETWEEN backends is a
+        // copy plus a delete, which this path does not perform, so reject it
+        // outright rather than silently renaming inside the source backend and
+        // reporting success. Mirrors the HTTP admin route's 400.
+        if (from.backendName !== to.backendName) {
+          throw new Error(
+            `Cannot rename a scope across backends ` +
+              `('${from.backendName}' -> '${to.backendName}'). ` +
+              `Recreate the secrets in the destination backend instead.`,
+          );
+        }
+        if (!from.store.renameScope) {
+          throw new Error('Backend does not support scope rename');
+        }
+        // Validate only the destination name — renaming a pre-existing malformed
+        // scope to a conforming one is the built-in cleanup path.
+        assertValidScopeName(to.path);
+        await from.store.renameScope(this.deps.orgId, from.path, to.path);
+      },
+    );
   }
 
   private async handleScopeDelete(msg: ContextSecretScopeDeleteRequest): Promise<void> {
-    if (
-      !(await this.enforcePolicy(
+    await this.audited(
+      {
         msg,
-        'secrets.scope.delete',
-        'dashboard.contexts.secrets.scope.delete.response',
-        'secret_scope.delete',
-        { type: 'secret_scope', id: msg.scope },
-      ))
-    ) {
-      return;
-    }
-    try {
-      const { store, scope } = await this.resolveStoreForScope(msg.scope);
-      if (!store.deleteScope) {
-        throw new Error('Backend does not support scope deletion');
-      }
-      await store.deleteScope(this.deps.orgId, scope);
-      this.recordAccess(
-        msg.actor,
-        'secret_scope.delete',
-        { type: 'secret_scope', id: msg.scope },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.secrets.scope.delete.response' as const,
-        requestId: msg.requestId,
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'secret_scope.delete',
-        { type: 'secret_scope', id: msg.scope },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.secrets.scope.delete.response', msg.requestId, err);
-    }
+        action: 'secret_scope.delete',
+        target: { type: 'secret_scope', id: msg.scope },
+        responseType: 'dashboard.contexts.secrets.scope.delete.response',
+        enforce: () =>
+          this.enforcePolicy(
+            msg,
+            'secrets.scope.delete',
+            'dashboard.contexts.secrets.scope.delete.response',
+            'secret_scope.delete',
+            { type: 'secret_scope', id: msg.scope },
+          ),
+      },
+      async () => {
+        const { store, scope } = await this.resolveStoreForScope(msg.scope);
+        if (!store.deleteScope) {
+          throw new Error('Backend does not support scope deletion');
+        }
+        await store.deleteScope(this.deps.orgId, scope);
+      },
+    );
   }
 
   // ── Context history ──────────────────────────────────────────
 
   private async handleEnvHistory(msg: ContextHistoryRequest): Promise<void> {
-    try {
-      const limit = msg.limit ?? 20;
-      const offset = msg.offset ?? 0;
+    await this.audited(
+      {
+        msg,
+        action: 'context.history.read',
+        target: { type: 'context', id: msg.contextId },
+        responseType: 'dashboard.contexts.history.response',
+      },
+      async () => {
+        const limit = msg.limit ?? 20;
+        const offset = msg.offset ?? 0;
 
-      // Over-fetch by one to detect whether a further page exists without a
-      // separate count query: if the DB returns more than `limit` rows, there
-      // is at least one more page. The probe row is sliced off below and never
-      // reaches the client.
-      const fetched = await this.deps.db
-        .selectFrom('execution_runs')
-        .select([
-          'id',
-          'run_id',
-          'workflow_name',
-          'status',
-          'ref',
-          'sha',
-          'started_at',
-          'completed_at',
-          'context',
-        ])
-        .where('context_id', '=', msg.contextId)
-        .orderBy('started_at', 'desc')
-        .limit(limit + 1)
-        .offset(offset)
-        .execute();
+        // Over-fetch by one to detect whether a further page exists without a
+        // separate count query: if the DB returns more than `limit` rows, there
+        // is at least one more page. The probe row is sliced off below and never
+        // reaches the client.
+        const fetched = await this.deps.db
+          .selectFrom('execution_runs')
+          .select([
+            'id',
+            'run_id',
+            'workflow_name',
+            'status',
+            'ref',
+            'sha',
+            'started_at',
+            'completed_at',
+            'context',
+          ])
+          .where('context_id', '=', msg.contextId)
+          .orderBy('started_at', 'desc')
+          .limit(limit + 1)
+          .offset(offset)
+          .execute();
 
-      const hasMore = fetched.length > limit;
-      const runs = hasMore ? fetched.slice(0, limit) : fetched;
+        const hasMore = fetched.length > limit;
+        const runs = hasMore ? fetched.slice(0, limit) : fetched;
 
-      this.recordAccess(
-        msg.actor,
-        'context.history.read',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.contexts.history.response',
-        requestId: msg.requestId,
-        hasMore,
-        runs: runs.map((r) => ({
-          id: r.id,
-          runId: r.run_id,
-          workflowName: r.workflow_name,
-          status: r.status,
-          branch: r.ref ?? null,
-          commitSha: r.sha ?? null,
-          startedAt:
-            r.started_at instanceof Date
-              ? r.started_at.toISOString()
-              : String(r.started_at ?? null),
-          completedAt: r.completed_at
-            ? r.completed_at instanceof Date
-              ? r.completed_at.toISOString()
-              : String(r.completed_at)
-            : null,
-          context: r.context,
-        })),
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'context.history.read',
-        { type: 'context', id: msg.contextId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.contexts.history.response', msg.requestId, err);
-    }
+        return {
+          hasMore,
+          runs: runs.map((r) => ({
+            id: r.id,
+            runId: r.run_id,
+            workflowName: r.workflow_name,
+            status: r.status,
+            branch: r.ref ?? null,
+            commitSha: r.sha ?? null,
+            startedAt:
+              r.started_at instanceof Date
+                ? r.started_at.toISOString()
+                : String(r.started_at ?? null),
+            completedAt: r.completed_at
+              ? r.completed_at instanceof Date
+                ? r.completed_at.toISOString()
+                : String(r.completed_at)
+              : null,
+            context: r.context,
+          })),
+        };
+      },
+    );
   }
 
   // ── Held runs ─────────────────────────────────────────────────────
 
   private async handleHeldRunsList(msg: HeldRunsListRequest): Promise<void> {
-    // Scope to the request's target org when the Platform carries one
-    // (Platform-first `kici run remote` path), falling back to the
-    // connection-level org for the legacy customer-dashboard path. A remote
-    // run's hold lives under the run's own `remote_sources` org, which differs
-    // from this connection's primary webhook-source org, so honoring the
-    // requested org is what surfaces the hold to `kici approve` / `--approve-all`.
+    // Scope to the request's target org when the Platform carries one, else to
+    // the connection-level org. A remote run's hold lives under the run's own
+    // `remote_sources` org, which differs from this connection's primary
+    // webhook-source org, so honoring the requested org is what surfaces the
+    // hold to `kici approve` / `--approve-all`.
     const orgId = msg.orgId ?? this.deps.orgId;
-    try {
-      let query = this.deps.db
-        .selectFrom('held_runs')
-        .leftJoin('contexts', 'contexts.id', 'held_runs.context_id')
-        .leftJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
-        .select([
-          'held_runs.id',
-          'held_runs.run_id',
-          'held_runs.job_id',
-          'held_runs.context_id',
-          'contexts.name as context_name',
-          'held_runs.hold_type',
-          'held_runs.queue_type',
-          'held_runs.status',
-          'held_runs.reason',
-          'held_runs.approved_by',
-          'held_runs.created_at',
-          'held_runs.resolved_at',
-          'held_runs.expires_at',
-          'held_runs.hold_scope',
-          'held_runs.step_index',
-          'held_runs.approval_requirement',
-          'held_runs.payload',
-          'execution_runs.contributor_username',
-          'execution_runs.trust_tier',
-        ])
-        .where('held_runs.org_id', '=', orgId)
-        .orderBy('held_runs.created_at', 'desc');
+    await this.audited(
+      {
+        msg,
+        action: 'held_run.list.read',
+        target: { type: 'held_run', id: this.deps.orgId },
+        responseType: 'dashboard.held-runs.list.response',
+      },
+      async () => {
+        let query = this.deps.db
+          .selectFrom('held_runs')
+          .leftJoin('contexts', 'contexts.id', 'held_runs.context_id')
+          .leftJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
+          .select([
+            'held_runs.id',
+            'held_runs.run_id',
+            'held_runs.job_id',
+            'held_runs.context_id',
+            'contexts.name as context_name',
+            'held_runs.hold_type',
+            'held_runs.queue_type',
+            'held_runs.status',
+            'held_runs.reason',
+            'held_runs.approved_by',
+            'held_runs.created_at',
+            'held_runs.resolved_at',
+            'held_runs.expires_at',
+            'held_runs.hold_scope',
+            'held_runs.step_index',
+            'held_runs.approval_requirement',
+            'held_runs.payload',
+            'execution_runs.contributor_username',
+            'execution_runs.trust_tier',
+          ])
+          .where('held_runs.org_id', '=', orgId)
+          .orderBy('held_runs.created_at', 'desc');
 
-      if (msg.status) {
-        query = query.where('held_runs.status', '=', msg.status);
-      }
-      if (msg.queueType) {
-        query = query.where('held_runs.queue_type', '=', msg.queueType);
-      }
-      if (msg.runId) {
-        query = query.where('held_runs.run_id', '=', msg.runId);
-      }
-      if (msg.heldRunId) {
-        query = query.where('held_runs.id', '=', msg.heldRunId);
-      }
+        if (msg.status) {
+          query = query.where('held_runs.status', '=', msg.status);
+        }
+        if (msg.queueType) {
+          query = query.where('held_runs.queue_type', '=', msg.queueType);
+        }
+        if (msg.runId) {
+          query = query.where('held_runs.run_id', '=', msg.runId);
+        }
+        if (msg.heldRunId) {
+          query = query.where('held_runs.id', '=', msg.heldRunId);
+        }
 
-      const rows = await query.execute();
+        const rows = await query.execute();
 
-      // Fetch per-hold decisions for multi-clause progress + attribution.
-      const holdIds = rows.map((r) => r.id);
-      const decisionRows =
-        holdIds.length > 0
-          ? await this.deps.db
-              .selectFrom('held_run_approvals')
-              .select([
-                'held_run_id',
-                'approver_user_id',
-                'decision',
-                'clauses_satisfied',
-                'created_at',
-              ])
-              .where('held_run_id', 'in', holdIds)
-              .orderBy('created_at', 'asc')
-              .execute()
-          : [];
-      const decisionsByHold = new Map<string, typeof decisionRows>();
-      for (const d of decisionRows) {
-        const list = decisionsByHold.get(d.held_run_id) ?? [];
-        list.push(d);
-        decisionsByHold.set(d.held_run_id, list);
-      }
+        // Fetch per-hold decisions for multi-clause progress + attribution.
+        const holdIds = rows.map((r) => r.id);
+        const decisionRows =
+          holdIds.length > 0
+            ? await this.deps.db
+                .selectFrom('held_run_approvals')
+                .select([
+                  'held_run_id',
+                  'approver_user_id',
+                  'decision',
+                  'clauses_satisfied',
+                  'created_at',
+                ])
+                .where('held_run_id', 'in', holdIds)
+                .orderBy('created_at', 'asc')
+                .execute()
+            : [];
+        const decisionsByHold = new Map<string, typeof decisionRows>();
+        for (const d of decisionRows) {
+          const list = decisionsByHold.get(d.held_run_id) ?? [];
+          list.push(d);
+          decisionsByHold.set(d.held_run_id, list);
+        }
 
-      this.recordAccess(
-        msg.actor,
-        'held_run.list.read',
-        { type: 'held_run', id: this.deps.orgId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.held-runs.list.response',
-        requestId: msg.requestId,
-        heldRuns: rows.map((r) => ({
-          id: r.id,
-          runId: r.run_id,
-          contextId: r.context_id,
-          contextName: r.context_name,
-          // A row an un-upgraded orchestrator wrote may carry `approval` /
-          // `wait_timer`; the wire and the UI speak one vocabulary. An unknown
-          // type passes through — the field is `z.string()` so a newer
-          // orchestrator's type survives an older reader.
-          holdType: normalizePersistedHoldType(r.hold_type),
-          // Emitted verbatim: both are plain-text columns and the wire fields
-          // are `z.string()`, so a status this build does not know (or one a
-          // newer orchestrator writes) still reaches the reader instead of
-          // failing validation for the whole message. `?? 'context'` is a real
-          // default for the nullable column read, not a cast.
-          queueType: r.queue_type ?? HeldRunQueueType.enum.context,
-          status: r.status,
-          requestedAt:
-            r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
-          resolvedAt: r.resolved_at
-            ? r.resolved_at instanceof Date
-              ? r.resolved_at.toISOString()
-              : String(r.resolved_at)
-            : null,
-          resolvedBy: r.approved_by,
-          reason: r.reason,
-          expiresAt: r.expires_at
-            ? r.expires_at instanceof Date
-              ? r.expires_at.toISOString()
-              : String(r.expires_at)
-            : null,
-          contributorUsername: r.contributor_username ?? null,
-          trustTier: r.trust_tier ?? null,
-          jobId: r.job_id,
-          // Still a cast: the wire field is a strict `HoldScope` enum while the
-          // column is plain text. Safe today because `hold_scope` is only ever
-          // written from `HoldScope` (and defaults to 'job'); widen the wire
-          // field the moment that stops being true.
-          holdScope: (r.hold_scope ?? HoldScope.enum.job) as HoldScope,
-          stepIndex: r.step_index ?? null,
-          requirement:
-            r.approval_requirement &&
-            typeof r.approval_requirement === 'object' &&
-            'clauses' in (r.approval_requirement as Record<string, unknown>)
-              ? {
-                  clauses:
-                    (
-                      r.approval_requirement as {
-                        clauses?: Array<{ team: string } | { user: string }>;
-                      }
-                    ).clauses ?? [],
-                  reason:
-                    (r.approval_requirement as { reason?: string | null }).reason ??
-                    r.reason ??
-                    null,
-                }
+        return {
+          heldRuns: rows.map((r) => ({
+            id: r.id,
+            runId: r.run_id,
+            contextId: r.context_id,
+            contextName: r.context_name,
+            // Verbatim: the wire field is `z.string()`, so a type this build does
+            // not know still reaches the reader.
+            holdType: r.hold_type,
+            // Emitted verbatim: both are plain-text columns and the wire fields
+            // are `z.string()`, so a status this build does not know (or one a
+            // newer orchestrator writes) still reaches the reader instead of
+            // failing validation for the whole message. `?? 'context'` is a real
+            // default for the nullable column read, not a cast.
+            queueType: r.queue_type ?? HeldRunQueueType.enum.context,
+            status: r.status,
+            requestedAt: toIsoString(r.created_at),
+            resolvedAt: r.resolved_at
+              ? r.resolved_at instanceof Date
+                ? r.resolved_at.toISOString()
+                : String(r.resolved_at)
               : null,
-          payload: normalizeHeldRunPayload(r.payload),
-          decisions: (decisionsByHold.get(r.id) ?? []).map((d) => ({
-            approverUserId: d.approver_user_id,
-            // Same shape as `holdScope` above: strict on the wire, plain text
-            // in `held_run_approvals.decision`, only ever written from
-            // `ApprovalDecision`.
-            decision: d.decision as ApprovalDecision,
-            clausesSatisfied: (d.clauses_satisfied ?? null) as Array<
-              { team: string } | { user: string }
-            > | null,
-            createdAt:
-              d.created_at instanceof Date ? d.created_at.toISOString() : String(d.created_at),
+            resolvedBy: r.approved_by,
+            reason: r.reason,
+            expiresAt: r.expires_at
+              ? r.expires_at instanceof Date
+                ? r.expires_at.toISOString()
+                : String(r.expires_at)
+              : null,
+            contributorUsername: r.contributor_username ?? null,
+            trustTier: r.trust_tier ?? null,
+            jobId: r.job_id,
+            // Still a cast: the wire field is a strict `HoldScope` enum while the
+            // column is plain text. Safe today because `hold_scope` is only ever
+            // written from `HoldScope` (and defaults to 'job'); widen the wire
+            // field the moment that stops being true.
+            holdScope: (r.hold_scope ?? HoldScope.enum.job) as HoldScope,
+            stepIndex: r.step_index ?? null,
+            requirement:
+              r.approval_requirement &&
+              typeof r.approval_requirement === 'object' &&
+              'clauses' in (r.approval_requirement as Record<string, unknown>)
+                ? {
+                    clauses:
+                      (
+                        r.approval_requirement as {
+                          clauses?: Array<{ team: string } | { user: string }>;
+                        }
+                      ).clauses ?? [],
+                    reason:
+                      (r.approval_requirement as { reason?: string | null }).reason ??
+                      r.reason ??
+                      null,
+                  }
+                : null,
+            payload: normalizeHeldRunPayload(r.payload),
+            decisions: (decisionsByHold.get(r.id) ?? []).map((d) => ({
+              approverUserId: d.approver_user_id,
+              // Same shape as `holdScope` above: strict on the wire, plain text
+              // in `held_run_approvals.decision`, only ever written from
+              // `ApprovalDecision`.
+              decision: d.decision as ApprovalDecision,
+              clausesSatisfied: (d.clauses_satisfied ?? null) as Array<
+                { team: string } | { user: string }
+              > | null,
+              createdAt: toIsoString(d.created_at),
+            })),
           })),
-        })),
-      });
-    } catch (err) {
-      this.recordAccess(
-        msg.actor,
-        'held_run.list.read',
-        { type: 'held_run', id: this.deps.orgId },
-        msg.requestId,
-        'error',
-        toErrorMessage(err),
-      );
-      this.sendError('dashboard.held-runs.list.response', msg.requestId, err);
-    }
+        };
+      },
+    );
   }
 
   /**
@@ -1809,7 +1572,7 @@ export class DashboardContextHandler {
     decision: 'approve' | 'reject',
     orgId: string = this.deps.orgId,
   ): Promise<void> {
-    const approvals = this.deps.approvals!;
+    const approvals = this.deps.approvals;
     const responseType =
       decision === 'approve'
         ? 'dashboard.held-runs.approve.response'
@@ -1860,7 +1623,7 @@ export class DashboardContextHandler {
     );
 
     if (!result.accepted) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         auditAction,
         { type: 'held_run', id: msg.heldRunId },
@@ -1886,7 +1649,7 @@ export class DashboardContextHandler {
     if (!consequence) {
       // Nothing followed the record — a non-satisfying approve leaves the hold
       // pending, so the audit entry is complete as soon as it is written.
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         auditAction,
         { type: 'held_run', id: msg.heldRunId },
@@ -1912,7 +1675,7 @@ export class DashboardContextHandler {
       'Held-run decision audit',
       () =>
         consequence.then((outcome) => {
-          this.recordAccess(
+          this.access.record(
             msg.actor,
             auditAction,
             { type: 'held_run', id: msg.heldRunId },
@@ -1942,52 +1705,9 @@ export class DashboardContextHandler {
       return;
     }
     try {
-      if (this.deps.approvals) {
-        await this.applyApprovalDecision(msg, 'approve', orgId);
-        return;
-      }
-      const result = await this.deps.db
-        .updateTable('held_runs')
-        .set({
-          status: HeldRunStatus.Approved,
-          resolved_at: sql`now()`,
-          approved_by: 'dashboard-user',
-        })
-        .where('id', '=', msg.heldRunId)
-        .where('org_id', '=', orgId)
-        .where('status', '=', HeldRunStatus.Pending)
-        .executeTakeFirst();
-
-      if (!result || (result.numUpdatedRows ?? 0n) === 0n) {
-        this.recordAccess(
-          msg.actor,
-          'held_run.approve',
-          { type: 'held_run', id: msg.heldRunId },
-          msg.requestId,
-          'allowed',
-          'held run not found or already resolved',
-        );
-        this.deps.send({
-          type: 'dashboard.held-runs.approve.response',
-          requestId: msg.requestId,
-          error: 'Held run not found or already resolved',
-        });
-        return;
-      }
-
-      this.recordAccess(
-        msg.actor,
-        'held_run.approve',
-        { type: 'held_run', id: msg.heldRunId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.held-runs.approve.response',
-        requestId: msg.requestId,
-      });
+      await this.applyApprovalDecision(msg, 'approve', orgId);
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'held_run.approve',
         { type: 'held_run', id: msg.heldRunId },
@@ -2016,52 +1736,9 @@ export class DashboardContextHandler {
       return;
     }
     try {
-      if (this.deps.approvals) {
-        await this.applyApprovalDecision(msg, 'reject', orgId);
-        return;
-      }
-      const result = await this.deps.db
-        .updateTable('held_runs')
-        .set({
-          status: HeldRunStatus.Rejected,
-          resolved_at: sql`now()`,
-          reason: msg.reason ?? 'Rejected via dashboard',
-        })
-        .where('id', '=', msg.heldRunId)
-        .where('org_id', '=', orgId)
-        .where('status', '=', HeldRunStatus.Pending)
-        .executeTakeFirst();
-
-      if (!result || (result.numUpdatedRows ?? 0n) === 0n) {
-        this.recordAccess(
-          msg.actor,
-          'held_run.reject',
-          { type: 'held_run', id: msg.heldRunId },
-          msg.requestId,
-          'allowed',
-          'held run not found or already resolved',
-        );
-        this.deps.send({
-          type: 'dashboard.held-runs.reject.response',
-          requestId: msg.requestId,
-          error: 'Held run not found or already resolved',
-        });
-        return;
-      }
-
-      this.recordAccess(
-        msg.actor,
-        'held_run.reject',
-        { type: 'held_run', id: msg.heldRunId },
-        msg.requestId,
-        'allowed',
-      );
-      this.deps.send({
-        type: 'dashboard.held-runs.reject.response',
-        requestId: msg.requestId,
-      });
+      await this.applyApprovalDecision(msg, 'reject', orgId);
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'held_run.reject',
         { type: 'held_run', id: msg.heldRunId },

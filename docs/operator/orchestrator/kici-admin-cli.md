@@ -64,7 +64,7 @@ These options apply to every command:
 
 | Option                             | Environment variable | Default                 | Description            |
 | ---------------------------------- | -------------------- | ----------------------- | ---------------------- |
-| `--url <url>`, `-u`                | `KICI_ADMIN_URL`     | `http://localhost:8080` | Orchestrator HTTP URL  |
+| `--url <url>`, `-u`                | `KICI_ADMIN_URL`     | `http://localhost:4000` | Orchestrator HTTP URL  |
 | `--token <token>`, `-t`            | `KICI_ADMIN_TOKEN`   | (required)              | Admin API Bearer token |
 | `--version`, `-V`, `--cli-version` |                      |                         | Show CLI version       |
 
@@ -139,7 +139,7 @@ The full command reference is split by area:
 - [Agents, peers & hosts](./kici-admin/agents-peers-hosts.md) — `agent`, `peer`, `join`, `host`
 - [Runs, execution & events](./kici-admin/runs-execution-events.md) — `runs`, `execution`, `check-run`, `queue`, `registration`, `workflow`, `event`, `event-dlq`
 - [Cluster & infrastructure](./kici-admin/cluster-and-infra.md) — `orchestrator`, `cluster`, `cluster-name`, `cluster-settings`, `scaler`, `firecracker`
-- [Org settings](./kici-admin/org-settings.md) — `org-settings`, `trust-policy`, `held-run`
+- [Org settings](./kici-admin/org-settings.md) — `org`, `org-settings`, `trust-policy`, `held-run`
 - [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `cache`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
 
 Each area page carries a `## Guide` section (per-namespace concepts and worked examples) and a `## Reference` section (the always-current generated signature list for that area's commands).
@@ -148,7 +148,7 @@ Each area page carries a `## Guide` section (per-namespace concepts and worked e
 
 | Variable                     | Scope        | Description                                               |
 | ---------------------------- | ------------ | --------------------------------------------------------- |
-| `KICI_ADMIN_URL`             | CLI          | Orchestrator URL (default: `http://localhost:8080`)       |
+| `KICI_ADMIN_URL`             | CLI          | Orchestrator URL (default: `http://localhost:4000`)       |
 | `KICI_ADMIN_TOKEN`           | CLI          | Admin API Bearer token (required)                         |
 | `KICI_DATABASE_URL`          | CLI          | Postgres URL for direct-DB commands (or `--database-url`) |
 | `KICI_BOOTSTRAP_ADMIN_TOKEN` | Orchestrator | Fixed bootstrap token (idempotent)                        |

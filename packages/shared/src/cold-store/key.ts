@@ -74,7 +74,7 @@ const BUCKET_SEGMENT_RE = /^[a-z0-9]+$/;
  *   `<prefix>/<db>/<table>/<tenantId>/<YYYY>/<MM>/<DD>/<bucket>`
  *
  * V1-manifest chunks live at the day-prefix root and are
- * addressed via `tenantDayPrefix` directly — those legacy chunks are
+ * addressed via `tenantDayPrefix` directly — those single-chunk (v1) chunks are
  * treated as the `'forever'` bucket by `parseManifest` but DO NOT carry
  * a `forever` segment in their key (the chunk-purge sweep keys off the
  * manifest's `bucket` / `maxColdDays`, not the path).

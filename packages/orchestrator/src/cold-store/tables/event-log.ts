@@ -7,18 +7,13 @@
  *   - partition column: `received_at`
  *   - warm TTL: 30 days (rows are archived, not hard-deleted)
  *
- * Per-row payload retention: rows on this table carry a `payload_key`
- * pointing at a gzipped webhook body in object storage (LogStorage).
- * Cold-store packages the row metadata — including `payload_key` —
- * but does NOT touch the body the key points to. The body remains in
- * S3 indefinitely so the dashboard delivery-detail page resolves
- * payload reads identically for hot and cold rows. Nothing deletes the
- * row and the payload blob in lock-step.
+ * Each row's `payload_key` points at a gzipped webhook body in object
+ * storage. Archiving moves the row, `payload_key` included, and leaves the
+ * body where it is, so the delivery-detail page reads payloads the same way
+ * for hot and cold rows.
  *
- * Recursive write: archiving event_log rows writes one access_log
- * audit row per chunk (the orchestrator's audit surface). The new
- * access_log rows themselves get archived in a later cycle by the
- * AccessLogAdapter, bounded.
+ * Each archived chunk writes one `access_log` audit row, which the
+ * AccessLogAdapter archives in a later cycle.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import {
@@ -26,6 +21,7 @@ import {
   type ColdStoreTableConfig,
   type EligiblePartition,
   type TableAdapter,
+  PgTableAdapterBase,
 } from '@kici-dev/shared';
 import type { Database, EventLogTable } from '../../db/types.js';
 
@@ -35,7 +31,6 @@ const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|event_log';
 /** Approximate per-row bytes for the minWarmTenantBytes floor check. */
 const APPROX_ROW_BYTES = 800;
 
-/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,
@@ -49,19 +44,21 @@ export interface EventLogAdapterOptions {
   overrides?: Partial<ColdStoreTableConfig>;
 }
 
-export class EventLogAdapter implements TableAdapter<EventLogColdStoreRow> {
+export class EventLogAdapter
+  extends PgTableAdapterBase<Database>
+  implements TableAdapter<EventLogColdStoreRow>
+{
   readonly db = 'orchestrator' as const;
   readonly table = 'event_log';
   readonly tenantColumn = 'routing_key';
   readonly partitionColumn = 'received_at';
-  readonly config: ColdStoreTableConfig;
 
   constructor(
-    private readonly kdb: Kysely<Database>,
+    kdb: Kysely<Database>,
     private readonly instanceId: string,
     opts: EventLogAdapterOptions = {},
   ) {
-    this.config = { ...DEFAULT_CONFIG, ...(opts.overrides ?? {}) };
+    super(kdb, ADVISORY_LOCK_NAMESPACE, DEFAULT_CONFIG, opts.overrides);
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
@@ -88,25 +85,6 @@ export class EventLogAdapter implements TableAdapter<EventLogColdStoreRow> {
     `.execute(this.kdb);
     const n = Number(res.rows[0]?.n ?? '0');
     return Number.isFinite(n) ? n * APPROX_ROW_BYTES : 0;
-  }
-
-  async withPartitionLock<T>(
-    args: { tenantId: string; partitionDate: string },
-    fn: () => Promise<T>,
-  ): Promise<T | null> {
-    const key = `${ADVISORY_LOCK_NAMESPACE}|${args.tenantId}|${args.partitionDate}`;
-    return await this.kdb.connection().execute(async (conn) => {
-      const lockRes = await sql<{ locked: boolean }>`
-        SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
-      `.execute(conn);
-      const locked = lockRes.rows[0]?.locked === true;
-      if (!locked) return null;
-      try {
-        return await fn();
-      } finally {
-        await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn).catch(() => undefined);
-      }
-    });
   }
 
   async *selectEligible(args: {
@@ -137,8 +115,8 @@ export class EventLogAdapter implements TableAdapter<EventLogColdStoreRow> {
 
   decodeRow(line: string): EventLogColdStoreRow {
     const parsed = JSON.parse(line) as EventLogColdStoreRow;
-    coerceDate(parsed, 'received_at');
-    coerceDate(parsed, 'archived_at');
+    PgTableAdapterBase.coerceDate(parsed, 'received_at');
+    PgTableAdapterBase.coerceDate(parsed, 'archived_at');
     return parsed;
   }
 
@@ -168,8 +146,6 @@ export class EventLogAdapter implements TableAdapter<EventLogColdStoreRow> {
 
       await trx.deleteFrom('event_log').where('id', 'in', ids).execute();
 
-      // Orchestrator-side audit goes to access_log (the audit split —
-      // Platform → audit_log, Orchestrator → access_log).
       await trx
         .insertInto('access_log')
         .values({
@@ -202,12 +178,5 @@ export class EventLogAdapter implements TableAdapter<EventLogColdStoreRow> {
           last_archived_at = now()
       `.execute(trx);
     });
-  }
-}
-
-function coerceDate<T>(parsed: T, field: keyof T): void {
-  const v = (parsed as unknown as Record<string, unknown>)[field as string];
-  if (typeof v === 'string') {
-    (parsed as unknown as Record<string, unknown>)[field as string] = new Date(v);
   }
 }

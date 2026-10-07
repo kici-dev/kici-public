@@ -30,10 +30,13 @@ import {
   toErrorMessage,
   type RegisterWorkflowManualResult,
 } from '@kici-dev/shared';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+} from './shared/cli-action.js';
+import { renderTable } from './shared/table.js';
 
 function parseJsonOption(raw: string | undefined, label: string): Record<string, unknown> {
   if (raw === undefined || raw === '') return {};
@@ -118,28 +121,6 @@ function extractWebhookEvents(row: RegistrationRowDTO): string[] {
 }
 
 /**
- * Render an aligned ASCII table.
- *
- * Mirrors the simple `padEnd` style used by commands/source.ts —
- * deliberately no `cli-table` dependency.
- */
-function renderTable(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
-
-  const fmtRow = (cells: string[]) =>
-    cells
-      .map((c, i) => (c ?? '').padEnd(widths[i]!))
-      .join('  ')
-      .trimEnd();
-
-  const lines: string[] = [];
-  lines.push(fmtRow(headers));
-  lines.push(widths.map((w) => '-'.repeat(w)).join('  '));
-  for (const r of rows) lines.push(fmtRow(r));
-  return lines.join('\n');
-}
-
-/**
  * Register the `workflow` command group with kici-admin.
  */
 export function registerWorkflowCommands(program: Command, getClient: () => AdminApiClient): void {
@@ -153,8 +134,8 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
     .option('--trigger-type <type>', 'Filter by trigger type, e.g. webhook, push, schedule')
     .option('--event <eventName>', 'Filter by webhook event name (scans lock_entry.triggers)')
     .option('--json', 'Emit raw JSON instead of a table')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const qs = buildQueryString({
           org: opts.org,
           routingKey: opts.routingKey,
@@ -201,11 +182,8 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
         console.log(renderTable(headers, rows));
         console.log('');
         console.log(`Total: ${response.total}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   wf.command('register-manual')
     .description(
@@ -216,24 +194,24 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
     .requiredOption('--lock-file <path>', 'Path to a kici.lock.json file')
     .requiredOption('--repo <ident>', 'repo_identifier value (e.g. "owner/repo")')
     .requiredOption('--routing-key <key>', 'Routing key for the source (e.g. "github:42")')
-    .requiredOption('--customer <id>', 'customer_id (org) to attribute rows to')
+    .requiredOption('--org <id>', 'Org id to attribute rows to')
     .option(
       '--provider-context <json>',
       'Provider-specific context as a JSON object (default: {})',
       '{}',
     )
     .option('--commit-sha <sha>', 'Optional commit SHA stamped on each row')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const lockFileContents = readFileSync(opts.lockFile, 'utf-8');
         const providerContext = parseJsonOption(opts.providerContext, '--provider-context');
         const payload = {
           lockFileContents,
           repoIdentifier: opts.repo,
           routingKey: opts.routingKey,
-          customerId: opts.customer,
+          customerId: opts.org,
           providerContext,
           commitSha: opts.commitSha,
         };
@@ -251,9 +229,6 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
             `workflow register-manual: workflowCount=${result.workflowCount} registryVersion=${result.registryVersion}${dbUrl ? ' (direct)' : ''}`,
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

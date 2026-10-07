@@ -19,11 +19,11 @@ import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import { CACHE_MAX_ENTRIES_CEILING } from '../cluster/cluster-settings-reader.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import type { PeerRegistry } from '../cluster/peer-registry.js';
 import { buildSettingsPropagationReport } from '../cluster/settings-propagation.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-cluster-settings' });
 
@@ -41,14 +41,6 @@ interface ClusterSettingsRouteDeps {
   /** Mounts `GET /cluster-settings/propagation` when set. */
   propagation?: ClusterSettingsPropagationSource;
 }
-
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
 
 /**
  * camelCase (wire) ↔ snake_case (column) map. Single source of truth for the
@@ -306,66 +298,47 @@ function mountPropagationRoute(
   source: ClusterSettingsPropagationSource,
 ): void {
   // The '/cluster-settings' guard matches that exact path only.
-  app.use('/cluster-settings/propagation', async (c, next) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
-    await next();
-  });
+  app.use('/cluster-settings/propagation', requireUnscoped);
 
-  // GET /api/v1/admin/cluster-settings/propagation
   app.get('/cluster-settings/propagation', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      // Read the row directly, not through a reader cache: this is the version
-      // every coordinator converges on, whichever coordinator answers.
-      const row = (await deps.db
-        .selectFrom('cluster_settings')
-        .selectAll()
-        .where('id', '=', 'default')
-        .executeTakeFirst()) as Record<string, unknown> | undefined;
-      const currentVersion = toNumber(row?.version as string | number | null | undefined) ?? 0;
-      return c.json({
-        propagation: buildSettingsPropagationReport({
-          currentVersion,
-          self: { instanceId: source.instanceId, appliedVersion: source.localVersion() },
-          peers: source.peerRegistry.getAllPeers(),
-          now: Date.now(),
-        }),
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    // Read the row directly, not through a reader cache: this is the version
+    // every coordinator converges on, whichever coordinator answers.
+    const row = (await deps.db
+      .selectFrom('cluster_settings')
+      .selectAll()
+      .where('id', '=', 'default')
+      .executeTakeFirst()) as Record<string, unknown> | undefined;
+    const currentVersion = toNumber(row?.version as string | number | null | undefined) ?? 0;
+    return c.json({
+      propagation: buildSettingsPropagationReport({
+        currentVersion,
+        self: { instanceId: source.instanceId, appliedVersion: source.localVersion() },
+        peers: source.peerRegistry.getAllPeers(),
+        now: Date.now(),
+      }),
+    });
   });
 }
 
 export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
   // Fleet-wide, not per-routing-key; routing-key tokens are refused outright.
-  app.use('/cluster-settings', async (c, next) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
-    await next();
-  });
+  app.use('/cluster-settings', requireUnscoped);
 
-  // GET /api/v1/admin/cluster-settings
   app.get('/cluster-settings', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      const row = await deps.db
-        .selectFrom('cluster_settings')
-        .selectAll()
-        .where('id', '=', 'default')
-        .executeTakeFirst();
-      return c.json({ settings: projectRow(row) });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    const row = await deps.db
+      .selectFrom('cluster_settings')
+      .selectAll()
+      .where('id', '=', 'default')
+      .executeTakeFirst();
+    return c.json({ settings: projectRow(row) });
   });
 
   if (deps.propagation) mountPropagationRoute(app, deps, deps.propagation);
 
-  // PATCH /api/v1/admin/cluster-settings
   app.patch('/cluster-settings', async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'secret.write');

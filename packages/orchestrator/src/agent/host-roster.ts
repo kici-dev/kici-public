@@ -12,6 +12,7 @@ import {
   matcherSatisfiedBy,
 } from '@kici-dev/engine';
 import { type Database, HostIdentitySource, type HostRosterRow } from '../db/types.js';
+import { safeJsonParse } from '../helpers/json.js';
 
 /** Typed host-vars bag carried by roster rows (`string | number | boolean`). */
 export type HostProperties = Record<string, string | number | boolean>;
@@ -267,14 +268,6 @@ export function parseHostProperties(value: unknown): HostProperties {
     return parsed as HostProperties;
   }
   return {};
-}
-
-function safeJsonParse(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
 }
 
 /**

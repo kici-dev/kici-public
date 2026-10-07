@@ -3,7 +3,7 @@ title: Auto-scaler
 description: KiCI orchestrator auto-scaler — dynamic agent provisioning across container, bare-metal, Firecracker, and event backends
 ---
 
-The auto-scaler dynamically provisions agents in response to workload. It is configured via a `scalers.yaml` file (or files in a `scalers.d/` directory) that maps job labels to backend provisioning details. The orchestrator reloads it on `SIGHUP`.
+The auto-scaler dynamically provisions agents in response to workload. It is configured via a `scalers.yaml` file (or files in a `scalers.d/` directory) that maps job labels to backend provisioning details. Apply an edit without a restart with `kici-admin scaler reload`, which reloads it on the orchestrator it points at and every orchestrator connected to it, or with `SIGHUP`.
 
 ## Quick start
 
@@ -62,7 +62,7 @@ An event scaler runs no local compute. It asks a provisioning workflow to boot a
 | Page                                                   | Covers                                                                                                                                                                    |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Common configuration](./auto-scaler/common-config.md) | Fields shared across all backends: top-level schema, label sets, resource caps, warm pool, roles, mandatory/exclude labels, env forwarding, network policy, backpressure. |
-| [Operations](./auto-scaler/operations.md)              | Running and observing: label matching, multi-scaler layout, deployment topology, `SIGHUP` reload, monitoring, troubleshooting, multi-backend examples.                    |
+| [Operations](./auto-scaler/operations.md)              | Running and observing: label matching, multi-scaler layout, deployment topology, config reload, monitoring, troubleshooting, multi-backend examples.                      |
 | [Container backend](./auto-scaler/container.md)        | Container-specific fields, runtime auto-detection, lifecycle, registry auth, the container-socket security warning.                                                       |
 | [Bare-metal backend](./auto-scaler/bare-metal.md)      | Host child processes, cgroup enforcement, network access, remote macOS / Windows orchestrator setup.                                                                      |
 | [Firecracker backend](./auto-scaler/firecracker.md)    | VM networking, jailer fields, rootfs, DB migration, the MMDS credential model, helper scripts.                                                                            |

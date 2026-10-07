@@ -9,8 +9,8 @@ export const authRequestSchema = z.object({
   type: z.literal('auth.request'),
   token: z.string().min(1),
   protocolVersion: z.number().int().positive(),
-  /** Orchestrator capabilities (optional for backward compat with pre-capability orchestrators). */
-  capabilities: orchCapabilitiesSchema.optional(),
+  /** Orchestrator capabilities. */
+  capabilities: orchCapabilitiesSchema,
 });
 
 /** Auth success response sent by Platform to orchestrator after successful authentication. */
@@ -22,38 +22,24 @@ export const authSuccessSchema = z.object({
    * (`oal_<12-char>`). Used by the orchestrator's check-run emitter to
    * build a `details_url` that points at the dashboard's resolver
    * route, so the canonical `org_<12-char>` id never appears in URLs
-   * that reach public surfaces. Optional for back-compat with Platforms
-   * that don't yet supply it; when absent, the orchestrator skips
-   * `details_url` (preserving today's behaviour).
+   * that reach public surfaces.
    */
-  orgPublicAlias: z.string().optional(),
+  orgPublicAlias: z.string(),
   /**
    * Canonical org id (`org_<…>`) of the authenticated orchestrator's owning
    * org. The orchestrator auto-provisions a `remote_sources` anchor
    * (`remote:<orgId>`) from this so `kici run remote` relayed through the
-   * Platform resolves the real tenant. Optional for back-compat with Platforms
-   * that don't yet supply it; when absent, the orchestrator skips
-   * remote-source provisioning.
+   * Platform resolves the real tenant.
    */
-  orgId: z.string().optional(),
-  /**
-   * Provenance trust root (the OIDC issuer) the Platform mints build-provenance
-   * tokens under. The orchestrator uses it to verify provenance bundles at
-   * ingest: it derives the JWKS URI (`<issuer>/.well-known/jwks.json`) and
-   * caches the key set. `null` (or absent) means provenance is not configured —
-   * the orchestrator records each attestation's verdict as `unverifiable`
-   * rather than silently `verified`.
-   */
-  provenanceIssuer: z.string().nullable().optional(),
+  orgId: z.string(),
   /**
    * The Platform's org-scoped GitHub App webhook URL
    * (`<WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`). It is known before any
    * App exists, so the orchestrator's manifest flow bakes it into a new App in
    * platform and hybrid mode. `null` when the Platform has no public webhook
-   * base. Absent from a Platform that does not send it; the orchestrator then
-   * reports the URL as unknown.
+   * base.
    */
-  githubWebhookUrl: z.string().nullable().optional(),
+  githubWebhookUrl: z.string().nullable(),
 });
 
 /** Auth failure response sent by Platform to orchestrator when authentication fails. */

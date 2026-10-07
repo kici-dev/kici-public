@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { DEFERRED_INDEXES } from './deferred-indexes.js';
 import {
-  DEFERRED_INDEXES,
   DEFERRED_INDEX_LOCK_KEY,
   buildDeferredIndexes,
   dropIfInvalid,
-} from './deferred-indexes.js';
+} from './deferred-index-build.js';
 
 const logger = {
   info: vi.fn(),

@@ -1873,18 +1873,6 @@ export const wsNackReceivedTotal = lazyCounter('kici_orch_ws_nack_received_total
   description: 'NACKs received from the Platform for a message it could not process (version skew)',
 });
 
-/**
- * Feature-gated sends the orchestrator SUPPRESSED because the Platform advertised
- * a capability set that lacks the required flag. Labelled by `capability` + `type`.
- */
-export const wsPlatformCapabilityGapTotal = lazyCounter(
-  'kici_orch_ws_platform_capability_gap_total',
-  {
-    description:
-      'Feature-gated sends suppressed because the Platform does not advertise the capability',
-  },
-);
-
 // ── Observable gauge registration ─────────────────────────────────
 
 let _observableGaugesRegistered = false;

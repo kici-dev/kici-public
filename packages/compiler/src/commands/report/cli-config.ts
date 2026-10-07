@@ -54,8 +54,7 @@ function stringField(config: Record<string, unknown>, key: string): string | und
 
 /**
  * Resolve the lookup target the same way `DashboardClient.fromConfig` does:
- * `platformEndpoint`, else the legacy `endpoint`, with one trailing slash
- * stripped, scoped to `activeOrgId`. Undefined when either half is missing —
+ * `platformEndpoint`, with one trailing slash stripped, scoped to `activeOrgId`. Undefined when either half is missing —
  * the fetch then fails with its own "not logged in" or "no active
  * organization" message, which needs no target.
  */
@@ -63,7 +62,7 @@ export function lookupTarget(
   config: Record<string, unknown> | undefined,
 ): LookupTarget | undefined {
   if (!config) return undefined;
-  const endpoint = stringField(config, 'platformEndpoint') ?? stringField(config, 'endpoint');
+  const endpoint = stringField(config, 'platformEndpoint');
   const orgId = stringField(config, 'activeOrgId');
   if (!endpoint || !orgId) return undefined;
   return { endpoint: endpoint.replace(/\/$/, ''), orgId };

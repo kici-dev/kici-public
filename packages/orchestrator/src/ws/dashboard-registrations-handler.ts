@@ -13,11 +13,11 @@ import {
   SourceSubtype,
   TERMINAL_RUN_STATES,
   type AccessLogAction,
-  type AccessLogOutcome,
   type AccessLogTargetType,
   type ActorPrincipal,
   type LockTrigger,
   type LockBranchPattern,
+  toIsoString,
 } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import type { RegistrationStore, RegistrationRow } from '../registration/registration-store.js';
@@ -32,7 +32,7 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
-import { runDetached } from '../helpers/run-detached.js';
+import { DashboardAccessRecorder } from './dashboard-access.js';
 
 interface RegistrationSourceMetadata {
   routingKey: string;
@@ -96,12 +96,16 @@ type RegistrationMessage =
 export class DashboardRegistrationsHandler {
   private readonly deps: DashboardRegistrationsHandlerDeps;
   private routingKey: string | null;
-  private readonly accessLog: AccessLogWriter | undefined;
+  private readonly access: DashboardAccessRecorder;
 
   constructor(deps: DashboardRegistrationsHandlerDeps) {
     this.deps = deps;
     this.routingKey = deps.routingKey ?? null;
-    this.accessLog = deps.accessLog;
+    this.access = new DashboardAccessRecorder(
+      deps.accessLog,
+      () => ({ orgId: this.deps.orgId, routingKey: this.routingKey }),
+      logger,
+    );
   }
 
   /** Update the orgId used for all operations (called when resolved from DB). */
@@ -132,7 +136,7 @@ export class DashboardRegistrationsHandler {
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           action,
           target,
@@ -145,40 +149,6 @@ export class DashboardRegistrationsHandler {
       }
       throw err;
     }
-  }
-
-  /**
-   * Write an access_log row for a handler invocation. Uses the handler's
-   * bound orgId + routingKey, the msg.actor principal, and the handler-
-   * specified action + target. Best-effort; the writer swallows failures.
-   */
-  private recordAccess(
-    actor: ActorPrincipal,
-    action: AccessLogAction,
-    target: { type: AccessLogTargetType; id: string } | null,
-    requestId: string | null,
-    outcome: AccessLogOutcome,
-    errorMessage?: string | null,
-  ): void {
-    const accessLog = this.accessLog;
-    if (!accessLog) return;
-    runDetached(
-      logger,
-      'Access log write',
-      () =>
-        accessLog.record({
-          orgId: this.deps.orgId,
-          routingKey: this.routingKey,
-          actor,
-          action,
-          target,
-          requestId,
-          source: 'platform_proxy',
-          outcome,
-          errorMessage: errorMessage ?? null,
-        }),
-      { requestId },
-    );
   }
 
   async handle(msg: RegistrationMessage): Promise<void> {
@@ -208,7 +178,7 @@ export class DashboardRegistrationsHandler {
       // Look up the registration to get the workflow name for the push event
       const registration = await this.deps.registrationStore.getById(msg.registrationId);
       if (!registration) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'registration.disable',
           { type: 'registration', id: msg.registrationId },
@@ -232,7 +202,7 @@ export class DashboardRegistrationsHandler {
         msg.disabled,
       );
       if (!updated) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'registration.disable',
           { type: 'registration', id: msg.registrationId },
@@ -261,7 +231,7 @@ export class DashboardRegistrationsHandler {
         workflowName: registration.workflow_name,
       });
 
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'registration.disable',
         { type: 'registration', id: msg.registrationId },
@@ -280,7 +250,7 @@ export class DashboardRegistrationsHandler {
         registrationId: msg.registrationId,
         error: message,
       });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'registration.disable',
         { type: 'registration', id: msg.registrationId },
@@ -358,7 +328,7 @@ export class DashboardRegistrationsHandler {
 
       const deleted = await this.deps.registrationStore.deleteById(msg.registrationId);
       if (!deleted) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           'registration.delete',
           { type: 'registration', id: msg.registrationId },
@@ -381,7 +351,7 @@ export class DashboardRegistrationsHandler {
       await this.deps.registrationStore.bumpVersion();
       await this.deps.registrationIndex.loadFromDb();
 
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'registration.delete',
         { type: 'registration', id: msg.registrationId },
@@ -400,7 +370,7 @@ export class DashboardRegistrationsHandler {
         registrationId: msg.registrationId,
         error: message,
       });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'registration.delete',
         { type: 'registration', id: msg.registrationId },
@@ -656,10 +626,8 @@ export class DashboardRegistrationsHandler {
           lastTriggeredAt,
           nextFireAt,
           sourceRepos,
-          createdAt:
-            reg.created_at instanceof Date ? reg.created_at.toISOString() : String(reg.created_at),
-          updatedAt:
-            reg.updated_at instanceof Date ? reg.updated_at.toISOString() : String(reg.updated_at),
+          createdAt: toIsoString(reg.created_at),
+          updatedAt: toIsoString(reg.updated_at),
           disabled: reg.disabled,
           commitSha: reg.commitSha ?? undefined,
           sourceFile: reg.sourceFile ?? undefined,
@@ -668,7 +636,7 @@ export class DashboardRegistrationsHandler {
         };
       });
 
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'registration.list.read',
         { type: 'registration', id: this.deps.orgId },
@@ -688,7 +656,7 @@ export class DashboardRegistrationsHandler {
         requestId: msg.requestId,
         error: message,
       });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'registration.list.read',
         { type: 'registration', id: this.deps.orgId },

@@ -243,18 +243,10 @@ describe('resolveHeldRunId — two holds on one job', () => {
     if (result.ok) expect(result.heldRunId).toBe('hold-reviewer');
   });
 
-  it('normalizes a legacy persisted spelling on both sides', () => {
-    // `approval` is what an un-upgraded orchestrator wrote for a reviewer hold,
-    // so a caller typing either spelling has to reach the same row.
-    const legacy = [{ ...reviewer, holdType: 'approval' }, security];
-    expect(resolveHeldRunId(legacy, { holdType: 'reviewer' })).toMatchObject({
-      ok: true,
-      heldRunId: 'hold-reviewer',
-    });
-    expect(resolveHeldRunId(both, { holdType: 'approval' })).toMatchObject({
-      ok: true,
-      heldRunId: 'hold-reviewer',
-    });
+  it('compares the hold type verbatim: a retired spelling matches nothing', () => {
+    // fails-when: the resolver still maps `approval` onto `reviewer`.
+    const result = resolveHeldRunId(both, { holdType: 'approval' });
+    expect(result.ok).toBe(false);
   });
 
   it('resolves either hold by its own id, ignoring the other filters', () => {

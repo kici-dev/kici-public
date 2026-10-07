@@ -232,19 +232,19 @@ raise one org's budget or retention without touching the cluster default:
 ```bash
 # Give one org a 20 GiB quota and 30-day retention
 kici-admin --url http://localhost:4000 --token $TOKEN \
-  org-settings user-cache set-quota 21474836480 --customer-id <org>
+  org-settings user-cache set-quota 21474836480 --org <org>
 kici-admin --url http://localhost:4000 --token $TOKEN \
-  org-settings user-cache set-ttl 2592000000 --customer-id <org>
+  org-settings user-cache set-ttl 2592000000 --org <org>
 
 # Show the effective per-org values (null = cluster default applies)
 kici-admin --url http://localhost:4000 --token $TOKEN \
-  org-settings user-cache show --customer-id <org>
+  org-settings user-cache show --org <org>
 
 # Drop an override and fall back to the cluster default
 kici-admin --url http://localhost:4000 --token $TOKEN \
-  org-settings user-cache reset-quota --customer-id <org>
+  org-settings user-cache reset-quota --org <org>
 kici-admin --url http://localhost:4000 --token $TOKEN \
-  org-settings user-cache reset-ttl --customer-id <org>
+  org-settings user-cache reset-ttl --org <org>
 ```
 
 See the [kici-admin CLI reference](kici-admin-cli.md) for the full
@@ -286,15 +286,16 @@ This creates version 4 (a copy of version 1). Encrypted fields are preserved as-
 
 ### Reload triggers
 
-The orchestrator supports three reload mechanisms:
+The orchestrator supports these reload mechanisms:
 
-| Trigger | Command                     | Use Case             |
-| ------- | --------------------------- | -------------------- |
-| SIGHUP  | `kill -HUP <pid>`           | Standard Unix signal |
-| HTTP    | `POST /admin/config/reload` | Programmatic/CLI     |
-| CLI     | `kici-admin config reload`  | Operator command     |
+| Trigger       | Command                                                   | Use Case                                            |
+| ------------- | --------------------------------------------------------- | --------------------------------------------------- |
+| SIGHUP        | `systemctl --user kill --kill-whom=main -s HUP <service>` | Standard Unix signal                                |
+| HTTP          | `POST /admin/config/reload`                               | Programmatic/CLI                                    |
+| CLI           | `kici-admin config reload`                                | Operator command                                    |
+| Scaler reload | `kici-admin scaler reload`                                | Scaler config only, on every connected orchestrator |
 
-All triggers reload both the orchestrator config AND the scaler config together.
+The first three reload both the orchestrator config AND the scaler config together. The result of `kici-admin config reload` reports the scaler config's own outcome in its `scaler` field: `applied`, or `rejected` with the errors. `success` describes the orchestrator config only. `kici-admin scaler reload` reloads only the scaler config, and does it on this orchestrator and on every orchestrator it is connected to; see [Config reload](./auto-scaler/operations.md#config-reload).
 
 ### CLI reload
 
@@ -448,7 +449,7 @@ The `POST /admin/config/validate` endpoint accepts a `type` parameter:
 
 - `platformUrl` required but not set when mode is `platform`
 - `storage.bucket` missing when `storage.type` is `s3`
-- A `cluster.role` of `worker` with no `cluster.coordinatorUrl`
+- A `cluster.role` of `worker` with no `cluster.coordinatorUrls`
 
 The orchestrator keeps running with the old config when reload validation fails. No data is lost.
 

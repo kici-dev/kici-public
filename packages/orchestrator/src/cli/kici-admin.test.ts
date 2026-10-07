@@ -342,3 +342,22 @@ describe('kici-admin command options that share a root flag', () => {
     expect(r.command.url).toBeUndefined();
   });
 });
+
+describe('kici-admin command tree', () => {
+  function commandPaths(cmd: Command, prefix: string[] = []): string[] {
+    return cmd.commands.flatMap((sub) => {
+      const path = [...prefix, sub.name()];
+      return [path.join(' '), ...commandPaths(sub, path)];
+    });
+  }
+
+  it('has no cache purge-legacy and no secret fix-prefixed-scopes', () => {
+    const paths = commandPaths(buildProgram());
+    // fails-when: either retired command is still registered.
+    expect(paths).not.toContain('cache purge-legacy');
+    expect(paths).not.toContain('secret fix-prefixed-scopes');
+    // breaks-if-wrong: the secret group and its other verbs must survive.
+    expect(paths).toContain('secret set');
+    expect(paths).toContain('secret scope rename');
+  });
+});

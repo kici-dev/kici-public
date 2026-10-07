@@ -170,8 +170,8 @@ export class DashboardClient {
   ) {}
 
   static fromConfig(config: GlobalConfig): DashboardClient {
-    const token = config.pat ?? config.token;
-    const endpoint = config.platformEndpoint ?? config.endpoint;
+    const token = config.pat;
+    const endpoint = config.platformEndpoint;
     if (!token) {
       throw new DashboardClientError('not_logged_in', 'Not logged in. Run `kici login` first.');
     }
@@ -274,20 +274,11 @@ export class DashboardClient {
     return singleRunSchema.parse(await this.getJson(`/runs/${runId}`)).run;
   }
 
-  /**
-   * Fetch the org's recent webhook-activity counts. Returns null on ANY error
-   * (older Platform without the route, a network blip, an unexpected shape) so
-   * the `kici runs` empty-window hint degrades silently to today's output — the
-   * hint is a nicety, never a hard dependency.
-   */
-  async getWebhookActivity(windowMinutes = 60): Promise<WebhookActivity | null> {
-    try {
-      return webhookActivitySchema.parse(
-        await this.getJson(`/webhook-activity?windowMinutes=${windowMinutes}`),
-      );
-    } catch {
-      return null;
-    }
+  /** Fetch the org's recent webhook-activity counts. */
+  async getWebhookActivity(windowMinutes = 60): Promise<WebhookActivity> {
+    return webhookActivitySchema.parse(
+      await this.getJson(`/webhook-activity?windowMinutes=${windowMinutes}`),
+    );
   }
 
   async getRunDetail(runId: string): Promise<DashboardRunDetailApiResponse> {

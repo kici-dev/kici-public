@@ -1,0 +1,1163 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`org-settings help pin > keeps the full command tree unchanged 1`] = `
+"org-settings :: Manage org-level security settings
+  global-workflows :: Manage per-org global workflow policy
+    show :: Print current global workflow settings for an org
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    allow-add :: Add a glob pattern to the workflow-author allow-list. Use --source to qualify the entry to one webhook source.
+      arg pattern required=true :: 
+      --org <id> mandatory=true :: Org id
+      --source <routingKey> mandatory=false :: Pin the entry to one webhook source (e.g. github:42). Omit for any source.
+      --format <format> mandatory=false default=table :: Output format: json|table
+    allow-remove :: Remove a glob pattern from the workflow-author allow-list. Use --source to target a source-qualified entry.
+      arg pattern required=true :: 
+      --org <id> mandatory=true :: Org id
+      --source <routingKey> mandatory=false :: Match an entry pinned to this routing key. Omit to match an unqualified entry.
+      --format <format> mandatory=false default=table :: Output format: json|table
+    deny-add :: Add a glob pattern to the source-repo deny-list. Use --source to qualify the entry to one webhook source.
+      arg pattern required=true :: 
+      --org <id> mandatory=true :: Org id
+      --source <routingKey> mandatory=false :: Pin the entry to one webhook source (e.g. github:42). Omit for any source.
+      --format <format> mandatory=false default=table :: Output format: json|table
+    deny-remove :: Remove a glob pattern from the source-repo deny-list. Use --source to target a source-qualified entry.
+      arg pattern required=true :: 
+      --org <id> mandatory=true :: Org id
+      --source <routingKey> mandatory=false :: Match an entry pinned to this routing key. Omit to match an unqualified entry.
+      --format <format> mandatory=false default=table :: Output format: json|table
+  dashboard-writes :: Manage per-orch dashboard write policy (which Platform-routed dashboard.* writes the orch accepts)
+    show :: Print current dashboard-write policy. Empty = all enabled.
+      --org <id> mandatory=true :: Org id
+      --category <name> mandatory=false :: Filter to one category (Secrets|Variables|Environments|Bindings|"Held runs"|DLQ|Registrations|Topology)
+      --sensitivity <name> mandatory=false :: Filter to one sensitivity bucket (plaintext|authority|dispatch)
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. "encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.
+      --org <id> mandatory=true :: Org id
+      --op <op=state> mandatory=false default= :: Single operation posture; repeatable (e.g. --op secrets.set=encrypted --op variables.set=disabled)
+      --category <name> mandatory=false :: Apply --enabled to every operation in this category
+      --sensitivity <name> mandatory=false :: Apply --enabled to every operation in this sensitivity bucket
+      --enabled <bool> mandatory=false :: Pair with --category or --sensitivity to flip the whole group
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Reset all operations to enabled (permissive default).
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  allow-http-npm :: Permit plain http:// npm registry URLs in workflow registries:. Default false; loopback / *.local are always allowed regardless.
+    arg value required=true :: 
+    --org <id> mandatory=true :: Org id
+    --format <format> mandatory=false default=table :: Output format: json|table
+  allow-untrusted-dockerfile-builds :: Permit an untrusted ref (fork PR) to build a job's container image from a Dockerfile. Default false. The build is NOT sandboxed — it runs arbitrary RUN commands on the agent host's container daemon.
+    arg value required=true :: 
+    --org <id> mandatory=true :: Org id
+    --format <format> mandatory=false default=table :: Output format: json|table
+  user-cache :: Manage per-org user-facing cache quota + entry TTL (null = cluster default)
+    show :: Print the current per-org user-cache quota + TTL settings
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-quota :: Set the per-org user-cache quota (positive integer bytes)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset-quota :: Clear the per-org user-cache quota override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-ttl :: Set the per-org user-cache ttl (positive integer milliseconds)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset-ttl :: Clear the per-org user-cache ttl override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  artifacts :: Manage per-org artifact quota / TTL / size cap / per-run cap (null = cluster default)
+    show :: Print the current per-org artifact quota + TTL settings
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-quota :: Set the per-org artifact quota (positive integer bytes)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset-quota :: Clear the per-org artifact quota override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-ttl :: Set the per-org artifact ttl (positive integer milliseconds)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset-ttl :: Clear the per-org artifact ttl override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-max-bytes :: Set the per-org artifact max-bytes (positive integer bytes)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset-max-bytes :: Clear the per-org artifact max-bytes override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-max-per-run :: Set the per-org artifact max-per-run (positive integer artifacts)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset-max-per-run :: Clear the per-org artifact max-per-run override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  dispatch-ack :: Manage the per-org dispatch-acknowledgment deadline (null = cluster default)
+    show :: Print the current per-org dispatch-acknowledgment deadline
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set the per-org dispatch-acknowledgment deadline (integer milliseconds, >= 1000)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the per-org dispatch-ack deadline override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  scaler-spawn-timeout :: Manage the per-org scaler spawn deadline (null = cluster default)
+    show :: Print the current per-org scaler spawn deadline
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set the per-org scaler spawn deadline (integer milliseconds, >= 1000)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the per-org scaler spawn deadline override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  ingest-concurrency :: Manage the per-org webhook-ingest concurrency cap (null = cluster default)
+    show :: Print the current per-org webhook-ingest concurrency cap
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set the per-org webhook-ingest concurrency cap (integer, >= 1)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the per-org webhook-ingest concurrency override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  sandbox-allowlist :: Manage the per-org container-sandbox escape-hatch allow-list (empty = deny all)
+    show :: Print the current per-org sandbox capability + host-network allow-list
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-capabilities :: Set the allowed capabilities (comma-separated, e.g. NET_ADMIN,SYS_PTRACE; empty clears)
+      arg capabilities required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    allow-host-network :: Allow (true) or deny (false) workflow-requested host networking
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the allow-list (deny all capabilities and host networking)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  reroute :: Manage the per-org cross-peer reroute tunables (null = cluster default)
+    show :: Print the current per-org reroute tunables
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops / --spawn-max-attempts / --spawn-retry-backoff.
+      --org <id> mandatory=true :: Org id
+      --window <ms> mandatory=false :: Spawn window (integer milliseconds, >= 1000)
+      --ack-timeout <ms> mandatory=false :: Reroute ACK timeout (integer milliseconds, >= 1000)
+      --max-hops <n> mandatory=false :: Maximum peer hops (integer >= 1)
+      --spawn-max-attempts <n> mandatory=false :: Spawn attempts a worker makes for one rerouted job (integer >= 1)
+      --spawn-retry-backoff <ms> mandatory=false :: Wait after a failed spawn before the next attempt (integer milliseconds, >= 0)
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear every per-org reroute override (fall back to the cluster defaults)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  backup-freshness :: Manage the per-org DB-backup freshness WARN threshold (null = cluster default)
+    show :: Print the current per-org backup-freshness threshold
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set the per-org backup-freshness WARN threshold in hours (>= 1)
+      --hours <n> mandatory=true :: Threshold in hours (integer >= 1)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the per-org override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  queue-timeout :: Manage the per-org dispatch-queue job timeout (null = cluster default)
+    show :: Print the current per-org queue timeout
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set the per-org queue timeout in milliseconds (0 = indefinite)
+      arg ms required=true :: Queue timeout in milliseconds (integer >= 0)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the per-org queue-timeout override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  cache-upload-settle :: Manage how long a build success waits for its cache upload to publish (null = cluster default)
+    show :: Print the current per-org cache upload settle timeout
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set :: Set the per-org cache upload settle timeout in milliseconds (0 = no wait)
+      arg ms required=true :: Settle timeout in milliseconds (integer >= 0)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    reset :: Clear the per-org cache upload settle override (fall back to the cluster default)
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+  approval :: Manage the per-org held-approval expiry + self-approval policy
+    show :: Print the current per-org approval policy
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-expiry :: Set the per-org held-approval expiry (integer seconds, >= 1)
+      arg seconds required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table
+    set-self-approval :: Allow or forbid a run triggerer approving its own held elements (true|false)
+      arg value required=true :: 
+      --org <id> mandatory=true :: Org id
+      --format <format> mandatory=false default=table :: Output format: json|table"
+`;
+
+exports[`org-settings help pin > org-settings --help is unchanged 1`] = `
+"Usage: kici-admin org-settings [options] [command]
+
+Manage org-level security settings
+
+Options:
+  -h, --help                                           display help for command
+
+Commands:
+  global-workflows                                     Manage per-org global workflow policy
+  dashboard-writes                                     Manage per-orch dashboard write policy (which
+                                                       Platform-routed dashboard.* writes the orch
+                                                       accepts)
+  allow-http-npm [options] <value>                     Permit plain http:// npm registry URLs in
+                                                       workflow registries:. Default false; loopback
+                                                       / *.local are always allowed regardless.
+  allow-untrusted-dockerfile-builds [options] <value>  Permit an untrusted ref (fork PR) to build a
+                                                       job's container image from a Dockerfile.
+                                                       Default false. The build is NOT sandboxed —
+                                                       it runs arbitrary RUN commands on the agent
+                                                       host's container daemon.
+  user-cache                                           Manage per-org user-facing cache quota +
+                                                       entry TTL (null = cluster default)
+  artifacts                                            Manage per-org artifact quota / TTL / size
+                                                       cap / per-run cap (null = cluster default)
+  dispatch-ack                                         Manage the per-org dispatch-acknowledgment
+                                                       deadline (null = cluster default)
+  scaler-spawn-timeout                                 Manage the per-org scaler spawn deadline
+                                                       (null = cluster default)
+  ingest-concurrency                                   Manage the per-org webhook-ingest concurrency
+                                                       cap (null = cluster default)
+  sandbox-allowlist                                    Manage the per-org container-sandbox
+                                                       escape-hatch allow-list (empty = deny all)
+  reroute                                              Manage the per-org cross-peer reroute
+                                                       tunables (null = cluster default)
+  backup-freshness                                     Manage the per-org DB-backup freshness WARN
+                                                       threshold (null = cluster default)
+  queue-timeout                                        Manage the per-org dispatch-queue job timeout
+                                                       (null = cluster default)
+  cache-upload-settle                                  Manage how long a build success waits for its
+                                                       cache upload to publish (null = cluster
+                                                       default)
+  approval                                             Manage the per-org held-approval expiry +
+                                                       self-approval policy
+  help [command]                                       display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings allow-http-npm --help is unchanged 1`] = `
+"Usage: kici-admin org-settings allow-http-npm [options] <value>
+
+Permit plain http:// npm registry URLs in workflow registries:. Default false; loopback / *.local
+are always allowed regardless.
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings allow-untrusted-dockerfile-builds --help is unchanged 1`] = `
+"Usage: kici-admin org-settings allow-untrusted-dockerfile-builds [options] <value>
+
+Permit an untrusted ref (fork PR) to build a job's container image from a Dockerfile. Default false.
+The build is NOT sandboxed — it runs arbitrary RUN commands on the agent host's container daemon.
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings approval --help is unchanged 1`] = `
+"Usage: kici-admin org-settings approval [options] [command]
+
+Manage the per-org held-approval expiry + self-approval policy
+
+Options:
+  -h, --help                           display help for command
+
+Commands:
+  show [options]                       Print the current per-org approval policy
+  set-expiry [options] <seconds>       Set the per-org held-approval expiry (integer seconds, >= 1)
+  set-self-approval [options] <value>  Allow or forbid a run triggerer approving its own held
+                                       elements (true|false)
+  help [command]                       display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings approval set-expiry --help is unchanged 1`] = `
+"Usage: kici-admin org-settings approval set-expiry [options] <seconds>
+
+Set the per-org held-approval expiry (integer seconds, >= 1)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings approval set-self-approval --help is unchanged 1`] = `
+"Usage: kici-admin org-settings approval set-self-approval [options] <value>
+
+Allow or forbid a run triggerer approving its own held elements (true|false)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings approval show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings approval show [options]
+
+Print the current per-org approval policy
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts [options] [command]
+
+Manage per-org artifact quota / TTL / size cap / per-run cap (null = cluster default)
+
+Options:
+  -h, --help                         display help for command
+
+Commands:
+  show [options]                     Print the current per-org artifact quota + TTL settings
+  set-quota [options] <value>        Set the per-org artifact quota (positive integer bytes)
+  reset-quota [options]              Clear the per-org artifact quota override (fall back to the
+                                     cluster default)
+  set-ttl [options] <value>          Set the per-org artifact ttl (positive integer milliseconds)
+  reset-ttl [options]                Clear the per-org artifact ttl override (fall back to the
+                                     cluster default)
+  set-max-bytes [options] <value>    Set the per-org artifact max-bytes (positive integer bytes)
+  reset-max-bytes [options]          Clear the per-org artifact max-bytes override (fall back to the
+                                     cluster default)
+  set-max-per-run [options] <value>  Set the per-org artifact max-per-run (positive integer
+                                     artifacts)
+  reset-max-per-run [options]        Clear the per-org artifact max-per-run override (fall back to
+                                     the cluster default)
+  help [command]                     display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts reset-max-bytes --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts reset-max-bytes [options]
+
+Clear the per-org artifact max-bytes override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts reset-max-per-run --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts reset-max-per-run [options]
+
+Clear the per-org artifact max-per-run override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts reset-quota --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts reset-quota [options]
+
+Clear the per-org artifact quota override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts reset-ttl --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts reset-ttl [options]
+
+Clear the per-org artifact ttl override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts set-max-bytes --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts set-max-bytes [options] <value>
+
+Set the per-org artifact max-bytes (positive integer bytes)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts set-max-per-run --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts set-max-per-run [options] <value>
+
+Set the per-org artifact max-per-run (positive integer artifacts)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts set-quota --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts set-quota [options] <value>
+
+Set the per-org artifact quota (positive integer bytes)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts set-ttl --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts set-ttl [options] <value>
+
+Set the per-org artifact ttl (positive integer milliseconds)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings artifacts show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings artifacts show [options]
+
+Print the current per-org artifact quota + TTL settings
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings backup-freshness --help is unchanged 1`] = `
+"Usage: kici-admin org-settings backup-freshness [options] [command]
+
+Manage the per-org DB-backup freshness WARN threshold (null = cluster default)
+
+Options:
+  -h, --help       display help for command
+
+Commands:
+  show [options]   Print the current per-org backup-freshness threshold
+  set [options]    Set the per-org backup-freshness WARN threshold in hours (>= 1)
+  reset [options]  Clear the per-org override (fall back to the cluster default)
+  help [command]   display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings backup-freshness reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings backup-freshness reset [options]
+
+Clear the per-org override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings backup-freshness set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings backup-freshness set [options]
+
+Set the per-org backup-freshness WARN threshold in hours (>= 1)
+
+Options:
+  --hours <n>        Threshold in hours (integer >= 1)
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings backup-freshness show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings backup-freshness show [options]
+
+Print the current per-org backup-freshness threshold
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings cache-upload-settle --help is unchanged 1`] = `
+"Usage: kici-admin org-settings cache-upload-settle [options] [command]
+
+Manage how long a build success waits for its cache upload to publish (null = cluster default)
+
+Options:
+  -h, --help          display help for command
+
+Commands:
+  show [options]      Print the current per-org cache upload settle timeout
+  set [options] <ms>  Set the per-org cache upload settle timeout in milliseconds (0 = no wait)
+  reset [options]     Clear the per-org cache upload settle override (fall back to the cluster
+                      default)
+  help [command]      display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings cache-upload-settle reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings cache-upload-settle reset [options]
+
+Clear the per-org cache upload settle override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings cache-upload-settle set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings cache-upload-settle set [options] <ms>
+
+Set the per-org cache upload settle timeout in milliseconds (0 = no wait)
+
+Arguments:
+  ms                 Settle timeout in milliseconds (integer >= 0)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings cache-upload-settle show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings cache-upload-settle show [options]
+
+Print the current per-org cache upload settle timeout
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dashboard-writes --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dashboard-writes [options] [command]
+
+Manage per-orch dashboard write policy (which Platform-routed dashboard.* writes the orch accepts)
+
+Options:
+  -h, --help       display help for command
+
+Commands:
+  show [options]   Print current dashboard-write policy. Empty = all enabled.
+  set [options]    Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per
+                   operation. "encrypted" is valid only for plaintext operations (secrets.set,
+                   variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to
+                   the matching operations.
+  reset [options]  Reset all operations to enabled (permissive default).
+  help [command]   display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dashboard-writes reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dashboard-writes reset [options]
+
+Reset all operations to enabled (permissive default).
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dashboard-writes set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dashboard-writes set [options]
+
+Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation.
+"encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category
+or --sensitivity + --enabled <bool> expands to the matching operations.
+
+Options:
+  --org <id>            Org id
+  --op <op=state>       Single operation posture; repeatable (e.g. --op secrets.set=encrypted --op
+                        variables.set=disabled) (default: [])
+  --category <name>     Apply --enabled to every operation in this category
+  --sensitivity <name>  Apply --enabled to every operation in this sensitivity bucket
+  --enabled <bool>      Pair with --category or --sensitivity to flip the whole group
+  --format <format>     Output format: json|table (default: "table")
+  -h, --help            display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dashboard-writes show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dashboard-writes show [options]
+
+Print current dashboard-write policy. Empty = all enabled.
+
+Options:
+  --org <id>            Org id
+  --category <name>     Filter to one category (Secrets|Variables|Environments|Bindings|"Held
+                        runs"|DLQ|Registrations|Topology)
+  --sensitivity <name>  Filter to one sensitivity bucket (plaintext|authority|dispatch)
+  --format <format>     Output format: json|table (default: "table")
+  -h, --help            display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dispatch-ack --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dispatch-ack [options] [command]
+
+Manage the per-org dispatch-acknowledgment deadline (null = cluster default)
+
+Options:
+  -h, --help             display help for command
+
+Commands:
+  show [options]         Print the current per-org dispatch-acknowledgment deadline
+  set [options] <value>  Set the per-org dispatch-acknowledgment deadline (integer milliseconds, >=
+                         1000)
+  reset [options]        Clear the per-org dispatch-ack deadline override (fall back to the cluster
+                         default)
+  help [command]         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dispatch-ack reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dispatch-ack reset [options]
+
+Clear the per-org dispatch-ack deadline override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dispatch-ack set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dispatch-ack set [options] <value>
+
+Set the per-org dispatch-acknowledgment deadline (integer milliseconds, >= 1000)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings dispatch-ack show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings dispatch-ack show [options]
+
+Print the current per-org dispatch-acknowledgment deadline
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings global-workflows --help is unchanged 1`] = `
+"Usage: kici-admin org-settings global-workflows [options] [command]
+
+Manage per-org global workflow policy
+
+Options:
+  -h, --help                        display help for command
+
+Commands:
+  show [options]                    Print current global workflow settings for an org
+  allow-add [options] <pattern>     Add a glob pattern to the workflow-author allow-list. Use
+                                    --source to qualify the entry to one webhook source.
+  allow-remove [options] <pattern>  Remove a glob pattern from the workflow-author allow-list. Use
+                                    --source to target a source-qualified entry.
+  deny-add [options] <pattern>      Add a glob pattern to the source-repo deny-list. Use --source to
+                                    qualify the entry to one webhook source.
+  deny-remove [options] <pattern>   Remove a glob pattern from the source-repo deny-list. Use
+                                    --source to target a source-qualified entry.
+  help [command]                    display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings global-workflows allow-add --help is unchanged 1`] = `
+"Usage: kici-admin org-settings global-workflows allow-add [options] <pattern>
+
+Add a glob pattern to the workflow-author allow-list. Use --source to qualify the entry to one
+webhook source.
+
+Options:
+  --org <id>             Org id
+  --source <routingKey>  Pin the entry to one webhook source (e.g. github:42). Omit for any source.
+  --format <format>      Output format: json|table (default: "table")
+  -h, --help             display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings global-workflows allow-remove --help is unchanged 1`] = `
+"Usage: kici-admin org-settings global-workflows allow-remove [options] <pattern>
+
+Remove a glob pattern from the workflow-author allow-list. Use --source to target a source-qualified
+entry.
+
+Options:
+  --org <id>             Org id
+  --source <routingKey>  Match an entry pinned to this routing key. Omit to match an unqualified
+                         entry.
+  --format <format>      Output format: json|table (default: "table")
+  -h, --help             display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings global-workflows deny-add --help is unchanged 1`] = `
+"Usage: kici-admin org-settings global-workflows deny-add [options] <pattern>
+
+Add a glob pattern to the source-repo deny-list. Use --source to qualify the entry to one webhook
+source.
+
+Options:
+  --org <id>             Org id
+  --source <routingKey>  Pin the entry to one webhook source (e.g. github:42). Omit for any source.
+  --format <format>      Output format: json|table (default: "table")
+  -h, --help             display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings global-workflows deny-remove --help is unchanged 1`] = `
+"Usage: kici-admin org-settings global-workflows deny-remove [options] <pattern>
+
+Remove a glob pattern from the source-repo deny-list. Use --source to target a source-qualified
+entry.
+
+Options:
+  --org <id>             Org id
+  --source <routingKey>  Match an entry pinned to this routing key. Omit to match an unqualified
+                         entry.
+  --format <format>      Output format: json|table (default: "table")
+  -h, --help             display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings global-workflows show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings global-workflows show [options]
+
+Print current global workflow settings for an org
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings ingest-concurrency --help is unchanged 1`] = `
+"Usage: kici-admin org-settings ingest-concurrency [options] [command]
+
+Manage the per-org webhook-ingest concurrency cap (null = cluster default)
+
+Options:
+  -h, --help             display help for command
+
+Commands:
+  show [options]         Print the current per-org webhook-ingest concurrency cap
+  set [options] <value>  Set the per-org webhook-ingest concurrency cap (integer, >= 1)
+  reset [options]        Clear the per-org webhook-ingest concurrency override (fall back to the
+                         cluster default)
+  help [command]         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings ingest-concurrency reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings ingest-concurrency reset [options]
+
+Clear the per-org webhook-ingest concurrency override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings ingest-concurrency set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings ingest-concurrency set [options] <value>
+
+Set the per-org webhook-ingest concurrency cap (integer, >= 1)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings ingest-concurrency show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings ingest-concurrency show [options]
+
+Print the current per-org webhook-ingest concurrency cap
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings queue-timeout --help is unchanged 1`] = `
+"Usage: kici-admin org-settings queue-timeout [options] [command]
+
+Manage the per-org dispatch-queue job timeout (null = cluster default)
+
+Options:
+  -h, --help          display help for command
+
+Commands:
+  show [options]      Print the current per-org queue timeout
+  set [options] <ms>  Set the per-org queue timeout in milliseconds (0 = indefinite)
+  reset [options]     Clear the per-org queue-timeout override (fall back to the cluster default)
+  help [command]      display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings queue-timeout reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings queue-timeout reset [options]
+
+Clear the per-org queue-timeout override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings queue-timeout set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings queue-timeout set [options] <ms>
+
+Set the per-org queue timeout in milliseconds (0 = indefinite)
+
+Arguments:
+  ms                 Queue timeout in milliseconds (integer >= 0)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings queue-timeout show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings queue-timeout show [options]
+
+Print the current per-org queue timeout
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings reroute --help is unchanged 1`] = `
+"Usage: kici-admin org-settings reroute [options] [command]
+
+Manage the per-org cross-peer reroute tunables (null = cluster default)
+
+Options:
+  -h, --help       display help for command
+
+Commands:
+  show [options]   Print the current per-org reroute tunables
+  set [options]    Set one or more reroute tunables. At least one of --window / --ack-timeout /
+                   --max-hops / --spawn-max-attempts / --spawn-retry-backoff.
+  reset [options]  Clear every per-org reroute override (fall back to the cluster defaults)
+  help [command]   display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings reroute reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings reroute reset [options]
+
+Clear every per-org reroute override (fall back to the cluster defaults)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings reroute set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings reroute set [options]
+
+Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops /
+--spawn-max-attempts / --spawn-retry-backoff.
+
+Options:
+  --org <id>                  Org id
+  --window <ms>               Spawn window (integer milliseconds, >= 1000)
+  --ack-timeout <ms>          Reroute ACK timeout (integer milliseconds, >= 1000)
+  --max-hops <n>              Maximum peer hops (integer >= 1)
+  --spawn-max-attempts <n>    Spawn attempts a worker makes for one rerouted job (integer >= 1)
+  --spawn-retry-backoff <ms>  Wait after a failed spawn before the next attempt (integer
+                              milliseconds, >= 0)
+  --format <format>           Output format: json|table (default: "table")
+  -h, --help                  display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings reroute show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings reroute show [options]
+
+Print the current per-org reroute tunables
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings sandbox-allowlist --help is unchanged 1`] = `
+"Usage: kici-admin org-settings sandbox-allowlist [options] [command]
+
+Manage the per-org container-sandbox escape-hatch allow-list (empty = deny all)
+
+Options:
+  -h, --help                                 display help for command
+
+Commands:
+  show [options]                             Print the current per-org sandbox capability +
+                                             host-network allow-list
+  set-capabilities [options] <capabilities>  Set the allowed capabilities (comma-separated, e.g.
+                                             NET_ADMIN,SYS_PTRACE; empty clears)
+  allow-host-network [options] <value>       Allow (true) or deny (false) workflow-requested host
+                                             networking
+  reset [options]                            Clear the allow-list (deny all capabilities and host
+                                             networking)
+  help [command]                             display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings sandbox-allowlist allow-host-network --help is unchanged 1`] = `
+"Usage: kici-admin org-settings sandbox-allowlist allow-host-network [options] <value>
+
+Allow (true) or deny (false) workflow-requested host networking
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings sandbox-allowlist reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings sandbox-allowlist reset [options]
+
+Clear the allow-list (deny all capabilities and host networking)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings sandbox-allowlist set-capabilities --help is unchanged 1`] = `
+"Usage: kici-admin org-settings sandbox-allowlist set-capabilities [options] <capabilities>
+
+Set the allowed capabilities (comma-separated, e.g. NET_ADMIN,SYS_PTRACE; empty clears)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings sandbox-allowlist show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings sandbox-allowlist show [options]
+
+Print the current per-org sandbox capability + host-network allow-list
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings scaler-spawn-timeout --help is unchanged 1`] = `
+"Usage: kici-admin org-settings scaler-spawn-timeout [options] [command]
+
+Manage the per-org scaler spawn deadline (null = cluster default)
+
+Options:
+  -h, --help             display help for command
+
+Commands:
+  show [options]         Print the current per-org scaler spawn deadline
+  set [options] <value>  Set the per-org scaler spawn deadline (integer milliseconds, >= 1000)
+  reset [options]        Clear the per-org scaler spawn deadline override (fall back to the cluster
+                         default)
+  help [command]         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings scaler-spawn-timeout reset --help is unchanged 1`] = `
+"Usage: kici-admin org-settings scaler-spawn-timeout reset [options]
+
+Clear the per-org scaler spawn deadline override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings scaler-spawn-timeout set --help is unchanged 1`] = `
+"Usage: kici-admin org-settings scaler-spawn-timeout set [options] <value>
+
+Set the per-org scaler spawn deadline (integer milliseconds, >= 1000)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings scaler-spawn-timeout show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings scaler-spawn-timeout show [options]
+
+Print the current per-org scaler spawn deadline
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings user-cache --help is unchanged 1`] = `
+"Usage: kici-admin org-settings user-cache [options] [command]
+
+Manage per-org user-facing cache quota + entry TTL (null = cluster default)
+
+Options:
+  -h, --help                   display help for command
+
+Commands:
+  show [options]               Print the current per-org user-cache quota + TTL settings
+  set-quota [options] <value>  Set the per-org user-cache quota (positive integer bytes)
+  reset-quota [options]        Clear the per-org user-cache quota override (fall back to the cluster
+                               default)
+  set-ttl [options] <value>    Set the per-org user-cache ttl (positive integer milliseconds)
+  reset-ttl [options]          Clear the per-org user-cache ttl override (fall back to the cluster
+                               default)
+  help [command]               display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings user-cache reset-quota --help is unchanged 1`] = `
+"Usage: kici-admin org-settings user-cache reset-quota [options]
+
+Clear the per-org user-cache quota override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings user-cache reset-ttl --help is unchanged 1`] = `
+"Usage: kici-admin org-settings user-cache reset-ttl [options]
+
+Clear the per-org user-cache ttl override (fall back to the cluster default)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings user-cache set-quota --help is unchanged 1`] = `
+"Usage: kici-admin org-settings user-cache set-quota [options] <value>
+
+Set the per-org user-cache quota (positive integer bytes)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings user-cache set-ttl --help is unchanged 1`] = `
+"Usage: kici-admin org-settings user-cache set-ttl [options] <value>
+
+Set the per-org user-cache ttl (positive integer milliseconds)
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;
+
+exports[`org-settings help pin > org-settings user-cache show --help is unchanged 1`] = `
+"Usage: kici-admin org-settings user-cache show [options]
+
+Print the current per-org user-cache quota + TTL settings
+
+Options:
+  --org <id>         Org id
+  --format <format>  Output format: json|table (default: "table")
+  -h, --help         display help for command
+"
+`;

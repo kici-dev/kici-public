@@ -42,11 +42,9 @@
  *   sibling closure the deps tarball carries, which no package-manager lock file moves).
  * Schema version 41 (additive): adds LockDynamicJobFn.gitCredentials (named git credential
  *   refs declared by a dynamicJob generator and inherited by every job it generates).
- * Schema version 42 (additive, conditional reader floor): approval enforced on
- *   organization-wide workflows. The lock shape is unchanged, but a v41 reader dispatches a
- *   global workflow without consulting its `approval`, so a lock whose global workflow (or
- *   one of its static jobs) declares `approval` stamps `minReaderVersion` =
- *   `GLOBAL_APPROVAL_MIN_READER`. Every other lock keeps `minReaderVersion` = `BREAKING_FLOOR`.
+ * Schema version 42 (BREAKING): approval enforced on organization-wide workflows (a v41
+ *   reader dispatches a global workflow without consulting its `approval`), and
+ *   `minReaderVersion` is required. The floor moves to 42.
  */
 
 import { z } from 'zod';
@@ -70,27 +68,13 @@ export const SCHEMA_VERSION = 42 as const;
  *
  * A lock at `schemaVersion >= BREAKING_FLOOR` parses correctly here even if it
  * is newer than `SCHEMA_VERSION` (additive bumps add fields this reader ignores).
- * A lock below the floor was produced by an SDK whose breaking change this
- * reader predates and must be rejected (it would mis-parse silently otherwise).
+ * A lock below the floor must be recompiled with a current SDK and is rejected.
  *
- * Bump rule: move this to the current `SCHEMA_VERSION` ONLY in the commit that
- * lands a `BREAKING` schema change (see the bump-history convention above). It
- * currently sits at 30 because v30 (`environments`→`contexts`) was the most
- * recent breaking bump; v31 through v35 were additive, so a v30 lock still
- * reads correctly.
+ * Bump rule: move this to the current `SCHEMA_VERSION` in the commit that lands
+ * a `BREAKING` schema change (see the bump-history convention above). An
+ * additive bump leaves it in place, so locks compiled at the floor stay readable.
  */
-export const BREAKING_FLOOR = 30 as const;
-
-/**
- * Reader version a lock must require when an organization-wide workflow in it
- * (a workflow with a trigger carrying `repos:`), or one of that workflow's
- * static jobs, declares `approval`. Readers below this version run a global
- * workflow's jobs without holding them for approval, so they must refuse such a
- * lock rather than dispatch it ungated. Not a `BREAKING_FLOOR` move: the lock
- * shape is unchanged, and locks without a gated global workflow stay readable by
- * every orchestrator down to the floor.
- */
-export const GLOBAL_APPROVAL_MIN_READER = 42 as const;
+export const BREAKING_FLOOR = 42 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler
@@ -608,6 +592,42 @@ export interface LockRule {
 }
 
 /**
+ * A declarative cache spec as serialized into the lock file. Mirrors the SDK
+ * `CacheSpec`; the engine cannot import the SDK, so the shape is inlined here.
+ */
+export interface LockCacheSpec {
+  readonly key: string;
+  readonly paths: readonly string[];
+  readonly restoreKeys?: readonly string[];
+}
+
+/** Lock-file form of the SDK `GenericInitConfig`. */
+interface LockGenericInitConfig {
+  readonly run: string;
+  readonly shell?: string;
+  readonly cache?: LockCacheSpec;
+  readonly timeout?: number;
+  readonly env?: Record<string, string>;
+}
+
+/** Lock-file form of the SDK `MiseInitConfig`. */
+interface LockMiseInitConfig {
+  readonly cache?: LockCacheSpec | false;
+  readonly timeout?: number;
+  readonly env?: Record<string, string>;
+  readonly shell?: string;
+}
+
+type LockInitItem = LockGenericInitConfig | 'mise' | { readonly mise: LockMiseInitConfig };
+
+/**
+ * Per-job init config as serialized into the lock file. Mirrors the SDK
+ * `InitConfig` (a generic config, a typed preset, an ordered array, `'auto'`,
+ * or `false`); the engine cannot import the SDK, so the shape is inlined here.
+ */
+export type LockInitConfig = LockInitItem | readonly LockInitItem[] | 'auto' | false;
+
+/**
  * Step in lock file.
  * Minimal representation - agents load full step functions from source.
  */
@@ -627,12 +647,31 @@ export interface LockStep {
     readonly backoff: 'fixed' | 'exponential';
     readonly maxDelayMs: number;
   };
+  /** Declarative cache specs (normalized to an array). Restored before / saved after the step. */
+  readonly cache?: readonly LockCacheSpec[];
   /** Source location of the step() call in the original TypeScript file (for annotations). */
   readonly sourceLocation?: {
     readonly file: string;
     readonly line: number;
     readonly column: number;
   };
+  /** Whether this step has conditional rules (evaluated agent-side). */
+  readonly hasRules?: boolean;
+  /** Step-level rules (same format as job rules). */
+  readonly rules?: readonly LockRule[];
+  /** Whether this step has an onCancel hook. */
+  readonly hasOnCancel?: boolean;
+  /** Whether this step has a cleanup hook. */
+  readonly hasCleanup?: boolean;
+  /**
+   * Whether this step declares an idempotent `check` facet. When true the
+   * orchestrator knows the step is check-capable and a run can be dispatched in
+   * check mode. The check/apply closures themselves are never serialized — the
+   * agent re-evaluates the real workflow TypeScript.
+   */
+  readonly hasCheck?: boolean;
+  /** Whether this step declares a `whenInSync` facet (produces outputs when in sync). */
+  readonly hasWhenInSync?: boolean;
   /** Normalized approval gate; when set the step pauses for a human approval. */
   readonly approval?: LockApproval;
 }
@@ -730,9 +769,21 @@ export const NeedsGroupEntrySchema = z.object({
 export type NeedsGroupEntry = z.infer<typeof NeedsGroupEntrySchema>;
 
 /**
- * Static job in lock file.
- * Contains all orchestrator-readable information for scheduling.
+ * A `needs` entry as the compiler writes it into the lock file. `runOn` is the
+ * resolved status-set; it is a plain array because a raw status-set an author
+ * passes is copied through as is, so a reader must not assume it is non-empty.
  */
+export interface LockNeedsEntry {
+  readonly name: string;
+  readonly runOn: ExecutionJobStatus[];
+}
+
+/** A dynamic-group `needs` entry as the compiler writes it into the lock file. */
+export interface LockNeedsGroupEntry {
+  readonly group: string;
+  readonly runOn: ExecutionJobStatus[];
+}
+
 /** Normalized runsOnAll predicate: OR of AND-groups (include), minus exclude matchers. */
 export interface RunsOnAllPredicate {
   /** OR across groups; AND within a group. */
@@ -823,6 +874,14 @@ export interface LockInvoke {
   readonly optional?: boolean;
 }
 
+/**
+ * Static job in lock file.
+ * Contains all orchestrator-readable information for scheduling.
+ *
+ * `runsOn` contains user-supplied labels only. The `kici:role:*` labels
+ * (e.g., `kici:role:builder`, `kici:role:init-runner`) are injected by the
+ * orchestrator for internal job types (build/init) and are not user-settable.
+ */
 export interface LockJob {
   readonly _type: 'static';
   readonly name: string;
@@ -880,7 +939,7 @@ export interface LockJob {
   readonly maxParallel?: number;
   /** Halt the fan-out on first child failure, skipping the held remainder. Default `false`. */
   readonly failFast?: boolean;
-  readonly needs: readonly (string | NeedsEntry | NeedsGroupEntry)[];
+  readonly needs: readonly (string | LockNeedsEntry | LockNeedsGroupEntry)[];
   /** Group names this job depends on (populated by compiler from dynamicGroup refs). */
   readonly dependsOnGroups?: readonly string[];
   readonly steps: readonly LockStepEntry[];
@@ -889,6 +948,10 @@ export interface LockJob {
   readonly exclude?: readonly Record<string, string>[];
   readonly rules?: readonly LockRule[];
   readonly description?: string;
+  /** When false, agent skips git clone (default: true). */
+  readonly checkout?: boolean;
+  /** Declarative cache specs (normalized to an array). Restored before steps / saved after the job. */
+  readonly cache?: readonly LockCacheSpec[];
   /**
    * Bound contexts in merge order. Each entry is a static name; `dynamic` is set
    * when it is a function resolved on the eval agent's init-runner. Later entries
@@ -903,6 +966,20 @@ export interface LockJob {
   readonly concurrencyGroup?: string;
   /** When true, concurrencyGroup is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicConcurrencyGroup?: boolean;
+  /** Whether this job has an onCancel hook. */
+  readonly hasOnCancel?: boolean;
+  /** Whether this job has a cleanup hook. */
+  readonly hasCleanup?: boolean;
+  /** Whether this job has an onSuccess hook. */
+  readonly hasOnSuccess?: boolean;
+  /** Whether this job has an onFailure hook. */
+  readonly hasOnFailure?: boolean;
+  /** Whether this job has a beforeStep hook. */
+  readonly hasBeforeStep?: boolean;
+  /** Whether this job has an afterStep hook. */
+  readonly hasAfterStep?: boolean;
+  /** Seconds before SIGKILL after SIGTERM during cancellation. */
+  readonly gracePeriod?: number;
   /** Total job wall-clock timeout in milliseconds (init + all steps + hooks). Threaded to the agent via jobConfig. */
   readonly timeout?: number;
   /**
@@ -911,6 +988,12 @@ export interface LockJob {
    * (`requests`) and kernel-side enforcement (`limits`) on the spawned agent.
    */
   readonly resources?: import('../scaler/resource-types.js').ResourceRequest;
+  /**
+   * Per-job init config(s) run after clone, before steps. Threaded verbatim from
+   * the SDK `Job.init`. The agent reads it from the loaded module; the lock copy
+   * is for orchestrator/dashboard visibility.
+   */
+  readonly init?: LockInitConfig;
   /**
    * Container image selecting the container execution backend on the agent. A
    * bare image string, or an object naming exactly one image source: a
@@ -998,7 +1081,7 @@ export interface LockDynamicJobFn {
    * with their frozen outputs available as ctx.needs. Same normalized shape as
    * a static job's `needs`.
    */
-  readonly needs?: readonly (string | NeedsEntry | NeedsGroupEntry)[];
+  readonly needs?: readonly (string | LockNeedsEntry | LockNeedsGroupEntry)[];
   /** True when this dynamic entry was authored as dynamicJob(group, { needs, generate }). */
   readonly resultAware?: boolean;
   /**
@@ -1068,6 +1151,14 @@ export interface LockWorkflow {
    * env vars on the install subprocess for use with a customer-committed `.kici/.npmrc`.
    */
   readonly installEnv?: readonly string[];
+  /** Whether this workflow has an onCancel hook. */
+  readonly hasOnCancel?: boolean;
+  /** Whether this workflow has a cleanup hook. */
+  readonly hasCleanup?: boolean;
+  /** Whether this workflow has an onSuccess hook. */
+  readonly hasOnSuccess?: boolean;
+  /** Whether this workflow has an onFailure hook. */
+  readonly hasOnFailure?: boolean;
   /** Workflow-level concurrency configuration. */
   readonly concurrency?: {
     readonly hasGroup: boolean;
@@ -1110,18 +1201,21 @@ export interface LockFile {
   readonly schemaVersion: typeof SCHEMA_VERSION;
   /**
    * The oldest reader schema version that handles this lock correctly. The
-   * compiler stamps `BREAKING_FLOOR`, or `GLOBAL_APPROVAL_MIN_READER` when an
-   * organization-wide workflow in the lock declares `approval`. A reader whose
+   * compiler stamps `BREAKING_FLOOR`. A reader whose
    * own `SCHEMA_VERSION` is below this value would mis-handle the lock and must
-   * reject it. Absent on
-   * pre-window locks, in which case the reader falls back to exact-match
-   * strictness (see `assertLockFileSchemaCompatible`).
+   * reject it. Required: a lock without it fails the reader's compatibility check.
    */
-  readonly minReaderVersion?: number;
+  readonly minReaderVersion: number;
   readonly source: LockSource;
   /** SHA-256 hash of the serialized lock file content (excluding this field). Changes only when workflows, triggers, jobs, or bundle hashes change. */
   readonly contentHash: string;
-  /** SHA-256 hash of .kici/ lockfile (pnpm-lock.yaml or package-lock.json). Used for dependency cache keying. */
+  /**
+   * SHA-256 hash of the repo's lockfile, used as the dependency cache key. The
+   * lockfile is the one the detected package manager produces — `.kici/`'s
+   * `package-lock.json` for npm, or the repo-root `pnpm-lock.yaml` /
+   * `yarn.lock` for a pnpm/yarn workspace. The hash input is prefixed with the
+   * manager name so a manager change is a guaranteed cache miss.
+   */
   readonly lockfileHash?: string;
   /**
    * SHA-256 over the git-tracked source of every in-repo `workspace:` /

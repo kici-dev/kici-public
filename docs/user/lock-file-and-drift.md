@@ -16,15 +16,15 @@ If you change a workflow file (`.ts`) but do **not** regenerate and commit the l
 
 The lock file (`kici.lock.json`) is a JSON file with the following top-level fields:
 
-| Field              | Description                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `schemaVersion`    | Lock file schema version, stamped by the compiler that produced the lock. Incremented on every format change. The orchestrator accepts a range of versions — see [schema compatibility window](#schema-compatibility-window) — rather than requiring an exact match.                                                                                                                                                           |
-| `minReaderVersion` | The oldest orchestrator schema version that can read this lock: the newest breaking version at compile time, or schema v42 when an organization-wide workflow in the lock declares `approval`. An orchestrator whose own schema is below this rejects the lock and asks you to upgrade it. Omitted on locks compiled before the compatibility window existed. See [schema compatibility window](#schema-compatibility-window). |
-| `source`           | Reference to the source file and export (e.g., `{ file: '.kici/workflows/ci.ts', export: '#default' }`).                                                                                                                                                                                                                                                                                                                       |
-| `contentHash`      | SHA-256 of the serialized lock file content (excluding itself). Changes when any workflow, trigger, or job changes.                                                                                                                                                                                                                                                                                                            |
-| `lockfileHash`     | SHA-256 of the detected package manager's lockfile, used as the dependency cache key. The lockfile is `.kici/package-lock.json` for npm, or the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm/yarn workspace; the hash input is prefixed with the manager name so a manager change is a guaranteed cache miss. Omitted when no lockfile exists.                                                                          |
-| `siblingsDigest`   | SHA-256 over the git-tracked source of every in-repo `workspace:` / `file:` / `link:` / `portal:` sibling package `.kici` depends on, transitively. Part of the dependency cache key alongside `lockfileHash`, because editing a sibling's source moves no package manager lockfile. Omitted when `.kici` depends on no in-repo package, which is the common case.                                                             |
-| `workflows`        | Array of workflow entries, each with its own `contentHash`, `compileSchemaVersion`, triggers, and jobs.                                                                                                                                                                                                                                                                                                                        |
+| Field              | Description                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `schemaVersion`    | Lock file schema version, stamped by the compiler that produced the lock. Incremented on every format change. The orchestrator accepts a range of versions — see [schema compatibility window](#schema-compatibility-window) — rather than requiring an exact match.                                                                                               |
+| `minReaderVersion` | The oldest orchestrator schema version that can read this lock: the newest breaking version at compile time. An orchestrator whose own schema is below this rejects the lock and asks you to upgrade it. Required: the orchestrator rejects a lock without it. See [schema compatibility window](#schema-compatibility-window).                                    |
+| `source`           | Reference to the source file and export (e.g., `{ file: '.kici/workflows/ci.ts', export: '#default' }`).                                                                                                                                                                                                                                                           |
+| `contentHash`      | SHA-256 of the serialized lock file content (excluding itself). Changes when any workflow, trigger, or job changes.                                                                                                                                                                                                                                                |
+| `lockfileHash`     | SHA-256 of the detected package manager's lockfile, used as the dependency cache key. The lockfile is `.kici/package-lock.json` for npm, or the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm/yarn workspace; the hash input is prefixed with the manager name so a manager change is a guaranteed cache miss. Omitted when no lockfile exists.              |
+| `siblingsDigest`   | SHA-256 over the git-tracked source of every in-repo `workspace:` / `file:` / `link:` / `portal:` sibling package `.kici` depends on, transitively. Part of the dependency cache key alongside `lockfileHash`, because editing a sibling's source moves no package manager lockfile. Omitted when `.kici` depends on no in-repo package, which is the common case. |
+| `workflows`        | Array of workflow entries, each with its own `contentHash`, `compileSchemaVersion`, triggers, and jobs.                                                                                                                                                                                                                                                            |
 
 Each workflow entry includes:
 
@@ -70,16 +70,14 @@ longer forces every orchestrator sharing a fleet to upgrade in lockstep.
 
 A lock is accepted when **both** hold:
 
-- Its `schemaVersion` is at or above the orchestrator's oldest supported version.
-  Most schema bumps are additive — they add fields that older readers ignore —
+- Its `schemaVersion` is at or above the orchestrator's oldest supported version,
+  which is schema v42. Most schema bumps are additive — they add fields that older readers ignore —
   so a lock compiled by a newer SDK still loads on an older orchestrator.
 - The orchestrator's own schema version is at or above the lock's
   `minReaderVersion`. This guards the case a version floor alone cannot
   detect: a lock that relies on a **breaking** change the orchestrator predates.
-  It also guards an approval gate on an organization-wide workflow. Orchestrators
-  before schema v42 run such a workflow without holding it for approval, so a
-  lock where an organization-wide workflow, or one of its jobs, declares
-  `approval` requires schema v42 or newer.
+  For example, orchestrators before schema v42 run an organization-wide workflow
+  without holding it for approval, so every lock requires schema v42 or newer.
 
 Two out-of-window cases are rejected with an actionable error (recorded as a
 `lockfile_corrupt` delivery, never a silent mis-route):
@@ -91,8 +89,7 @@ Two out-of-window cases are rejected with an actionable error (recorded as a
   reading it. Fix: upgrade the orchestrator to the version the error names.
 
 A lock can require the compiler's own schema version. This happens when that
-version is itself breaking, or when it is schema v42 and an
-organization-wide workflow in the lock declares `approval`. For such a lock,
+version is the oldest supported version, as schema v42 is now. For such a lock,
 `kici compile` prints a one-line notice that orchestrators older than that
 version cannot read it. It is informational only — the orchestrator is the
 authoritative check.

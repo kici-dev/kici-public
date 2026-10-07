@@ -218,9 +218,9 @@ describe('S3LogStorage segment-aware read/exists/list', () => {
     expect(rest.complete).toBe(true);
   });
 
-  it('read concatenates a legacy single object before segments (deploy transition)', async () => {
+  it('read concatenates a single object before segments', async () => {
     const { store } = makeStoreWithObjects({
-      'p/step-0.log': 'old\n', // legacy/single object, 4 bytes
+      'p/step-0.log': 'old\n', // single object written by append(), 4 bytes
       'p/step-0.log/seg-000000': 'new\n', // 4 bytes
     });
     const all = await store.read('p/step-0.log');
@@ -252,12 +252,12 @@ describe('S3LogStorage segment-aware read/exists/list', () => {
     expect(await store.exists('p/step-0.log')).toBe(true);
   });
 
-  it('exists is true for a legacy single object', async () => {
+  it('exists is true for a single object', async () => {
     const { store } = makeStoreWithObjects({ 'p/step-0.log': 'x' });
     expect(await store.exists('p/step-0.log')).toBe(true);
   });
 
-  it('exists is false when neither legacy nor segments exist', async () => {
+  it('exists is false when neither a single object nor segments exist', async () => {
     const { store } = makeStoreWithObjects({});
     expect(await store.exists('p/step-0.log')).toBe(false);
   });
@@ -292,7 +292,7 @@ describe('S3LogStorage retention helpers (listWithMetadata + deleteMany)', () =>
     activeFake.seedWithMtime({
       'executions/r1/job-a/step-0.log/seg-000000': { body: 'a\n', mtime: d0 },
       'executions/r1/job-a/step-0.log/seg-000001': { body: 'b\n', mtime: d1 },
-      'executions/r2/job-a/step-0.log': { body: 'c\n', mtime: d0 }, // legacy single object
+      'executions/r2/job-a/step-0.log': { body: 'c\n', mtime: d0 }, // single object
     });
     const out = await store.listWithMetadata('executions/');
     expect(out).toEqual(

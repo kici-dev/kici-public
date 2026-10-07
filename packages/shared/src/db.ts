@@ -140,6 +140,66 @@ export function isPoolAcquireTimeout(err: unknown): boolean {
 }
 
 /**
+ * SQLSTATEs that mean "this connection was killed", not "the database is
+ * unavailable": `57P01` admin_shutdown (`pg_terminate_backend`, a leader
+ * demotion) and `57P02` crash_shutdown. `57P03` cannot_connect_now is left
+ * out on purpose — that one is the database refusing new work.
+ */
+const BROKEN_CONNECTION_SQLSTATES = new Set(['57P01', '57P02']);
+
+/** node-postgres' own messages for a socket that died under a pooled client. */
+const BROKEN_CONNECTION_MESSAGES = [
+  'Connection terminated unexpectedly',
+  'Connection terminated',
+  'Client has encountered a connection error and is not queryable',
+];
+
+/**
+ * True when a query failed because the pooled connection it ran on was already
+ * dead. After a switchover, Postgres terminates every idle backend, but a
+ * pooled client only learns of it when it reads the FATAL message. A query that
+ * acquires the client in that gap fails, while a fresh connection would
+ * succeed. The pool discards the client either way.
+ */
+export function isBrokenConnectionError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string') {
+    if (BROKEN_CONNECTION_SQLSTATES.has(code)) return true;
+    // Class 08: connection exceptions.
+    if (code.startsWith('08')) return true;
+    if (code === 'ECONNRESET' || code === 'EPIPE') return true;
+  }
+  return BROKEN_CONNECTION_MESSAGES.includes(err.message);
+}
+
+/**
+ * How many times {@link retryOnBrokenConnection} runs the probe. A switchover
+ * kills every idle client at once, so more than one dead client can be handed
+ * out before the pool has discarded them all. Each failed attempt fails fast
+ * on a dead socket, so the bound costs almost nothing.
+ */
+export const BROKEN_CONNECTION_ATTEMPTS = 3;
+
+/**
+ * Run a database probe again when it failed only because its pooled
+ * connection was already dead. Any other error (unreachable host, acquire
+ * timeout, a real query error) is rethrown at once, so a real outage is never
+ * hidden and never slowed down. Meant for readiness probes, whose question is
+ * "can this process reach its database now". It is not for writes: a write
+ * that failed mid-flight may have been applied.
+ */
+export async function retryOnBrokenConnection<T>(probe: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await probe();
+    } catch (err) {
+      if (attempt >= BROKEN_CONNECTION_ATTEMPTS || !isBrokenConnectionError(err)) throw err;
+    }
+  }
+}
+
+/**
  * Create Kysely database instance (PostgreSQL only).
  *
  * Generic over the database type so each consumer can provide

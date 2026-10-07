@@ -22,7 +22,7 @@
  *   finalize(path) at run completion.
  *
  * - finalize() seals the remaining tail buffer for a step key.
- * - read() lists sealed segments (plus any legacy/single object written by
+ * - read() lists sealed segments (plus any single object written by
  *   append()) and streams them via the byte-offset cursor.
  * - exists()/list() are segment-aware: `exists` is true when a single object or
  *   any segment is present; `list` collapses segment keys to their logical step
@@ -74,7 +74,7 @@ interface SegmentBuffer {
   seqInit: boolean;
 }
 
-/** A sealed segment (or legacy/single object) that read()/exists() reason over. */
+/** A sealed segment (or single object) that read()/exists() reason over. */
 interface Segment {
   key: string;
   size: number;
@@ -305,13 +305,13 @@ export class S3LogStorage implements LogStorage {
   /**
    * Single-object size (or null) + sealed segments in ascending seq order for a
    * key. The single object is the content written by append() (single-shot
-   * writers) or any legacy step log written before the append-only change.
+   * writers).
    */
-  private async layout(key: string): Promise<{ legacy: number | null; segs: Segment[] }> {
-    let legacy: number | null = null;
+  private async layout(key: string): Promise<{ single: number | null; segs: Segment[] }> {
+    let single: number | null = null;
     try {
       const head = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
-      legacy = head.ContentLength ?? 0;
+      single = head.ContentLength ?? 0;
     } catch (err: unknown) {
       if (!this.isNotFoundError(err)) throw err;
     }
@@ -332,7 +332,7 @@ export class S3LogStorage implements LogStorage {
     } while (token);
     // Zero-padded seq means lexical order == numeric order.
     segs.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-    return { legacy, segs };
+    return { single, segs };
   }
 
   /** Fetch an inclusive byte range from one object. */
@@ -374,10 +374,10 @@ export class S3LogStorage implements LogStorage {
   async read(path: string, options?: LogReadOptions): Promise<LogReadResult> {
     const key = this.objectKey(path);
     const cursor = options?.cursor ?? 0;
-    const { legacy, segs } = await this.layout(key);
+    const { single, segs } = await this.layout(key);
 
     const entries: Segment[] = [];
-    if (legacy !== null) entries.push({ key, size: legacy });
+    if (single !== null) entries.push({ key, size: single });
     entries.push(...segs);
 
     const { reads, total } = this.planReads(entries, cursor, options?.limit);
@@ -459,7 +459,7 @@ export class S3LogStorage implements LogStorage {
 
       for (const obj of response.Contents ?? []) {
         if (!obj.Key || !obj.LastModified) continue;
-        // Physical object keys (segments and legacy single objects) are kept
+        // Physical object keys (segments and single objects) are kept
         // as-is — the sweep deletes each one, so no seg-collapse here.
         const relativePath = obj.Key.startsWith(this.prefix)
           ? obj.Key.slice(this.prefix.length)

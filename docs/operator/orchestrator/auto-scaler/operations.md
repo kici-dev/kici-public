@@ -49,8 +49,9 @@ version: 1
 globalMaxAgents: 50
 defaults:
   resources:
-    memory: '2g'
-    cpus: 2
+    limits:
+      memory: '2g'
+      cpus: 2
 ```
 
 ### Additional scaler files
@@ -137,15 +138,58 @@ At expiry the verdict splits:
 - A label set that **neither** a connected agent **nor** a scaler backend can serve settles the job [`unroutable`](../../../architecture/execution/state-machine.md). Its error message names the unsatisfied `runsOn` selectors, and the run **fails** — a job that could never be routed does not report success. For a `container:` job, a connected agent serves the labels only when it can start the container; when none can, the message names the selectors and says that no matching agent reports a container runtime. An agent started inside one job's image serves no other job; when the only matching agents are such agents, the message says so.
 - Anything else — including a job whose agent spawn was attempted and recorded a provisioning error — settles `timed_out_stale`. A failed spawn proves the labels did route, so the provisioning error is the real cause to investigate.
 
-## Config reload (SIGHUP)
+## Config reload
 
-Send `SIGHUP` to the orchestrator process to reload the scaler configuration without restart:
+Edit `scalers.yaml`, then apply it without a restart:
 
 ```bash
-kill -HUP $(pidof node)
-# or
-kill -HUP $(cat /var/run/kici-orchestrator.pid)
+kici-admin scaler reload
 ```
+
+The command reloads the scaler config on the orchestrator it points at and on every orchestrator that one is connected to: the other coordinators, and the workers connected to it. Each orchestrator reads its own `scalers.yaml` and applies it completely or not at all. The command prints one block per orchestrator: the one it points at first, then its peers by instance id:
+
+```text
+coord-a (coordinator): applied
+  updated: linux-containers
+  unchanged: 2
+coord-c (coordinator): rejected
+  error: Label set [linux] overlaps between scalers "linux-containers" and "linux-extra"
+worker-b (worker): applied
+  unchanged: 1
+```
+
+Each orchestrator reports one outcome:
+
+- `applied` -- the file applied. The block names the scalers added, updated, retired or resurrected, the changed global limits, and a count of the unchanged scalers.
+- `rejected` -- the file did not load or did not validate, or an added scaler did not build. Nothing changed on that orchestrator, and the errors name the problems.
+- `not-configured` -- the orchestrator runs without a scaler config.
+- `unreachable` -- the orchestrator is not connected, or it did not answer in time. A worker that moved to another coordinator shows here too; that coordinator reaches it. A peer that left the cluster for good stays in this list until you remove it with `kici-admin peer forget`.
+
+The command exits `1` when an orchestrator rejected its file or was unreachable, and `0` otherwise.
+
+| Flag                  | Effect                                                       |
+| --------------------- | ------------------------------------------------------------ |
+| `--single`            | Reload only the orchestrator the command points at.          |
+| `--timeout <seconds>` | How long to wait for each peer to answer. The default is 60. |
+| `--json`              | Print the response as JSON.                                  |
+
+A worker that is connected only to another coordinator is not reached. Point the command at that coordinator, or at each coordinator in turn.
+
+The command needs an admin token with the `scaler.manage` permission (owner or admin) that no routing key restricts. Each reload writes a `scaler.reload` row to the [access log](../../security/audit-log.md).
+
+### Reload with a signal
+
+`SIGHUP` runs the same reload on the one orchestrator that receives it. On a coordinator it also reloads the orchestrator config. A worker reloads its scaler config. Send the signal to the orchestrator process only:
+
+```bash
+# A service that kici-admin orchestrator install created (here a user service)
+systemctl --user kill --kill-whom=main -s HUP kici-orchestrator
+
+# Docker Compose
+docker compose kill -s HUP orchestrator
+```
+
+Keep `--kill-whom=main`: without it, `systemctl kill` signals every process in the service, and the agents a bare-metal scaler started there stop on the signal. Use `systemctl kill` without `--user` for a system service, and the service name you gave `--name` at install time. A signal reload reports its result only in the orchestrator log.
 
 ### Reload process
 
@@ -156,7 +200,7 @@ The reload runs in four stages. It applies completely, or not at all:
 3. **Build** -- Constructs a backend for each newly added scaler. If a backend fails to construct, everything built so far is torn down and the reload is rejected.
 4. **Commit** -- Applies the new configuration in one step.
 
-On rejection the current configuration keeps serving, and the error is logged.
+On rejection the current configuration keeps serving. `kici-admin scaler reload` prints the errors, and the orchestrator log names them too.
 
 ### What changes on reload
 
@@ -245,11 +289,11 @@ kici-admin agent list
 
 ### Config reload rejected
 
-**Symptom:** SIGHUP sent but config does not change. Error in logs: `Config reload validation failed, keeping current config` (or `New config has label-set overlaps, keeping current config` for an overlap).
+**Symptom:** `kici-admin scaler reload` reports `rejected` for an orchestrator and exits `1`. After a `SIGHUP`, the config does not change and the log shows `Config reload validation failed, keeping current config` (or `Scaler config reload error` for a file that does not load).
 
 **Cause:** The new config has validation errors (label-set overlap, missing required fields, invalid values).
 
-**Solution:** Check orchestrator logs for the specific validation errors. Fix the config and send SIGHUP again. The current config remains active during failed reloads.
+**Solution:** Read the errors the command prints, or the log line. Fix the config and reload again. The current config remains active during failed reloads.
 
 ### A removed scaler still appears in status
 
@@ -280,8 +324,9 @@ globalMaxAgents: 25
 
 defaults:
   resources:
-    memory: '2g'
-    cpus: 2
+    limits:
+      memory: '2g'
+      cpus: 2
 
 scalers:
   - name: container-standard
@@ -293,8 +338,9 @@ scalers:
       - labels: ['linux', 'container', 'node20']
         image: 'ghcr.io/myorg/kici-agent-node20:latest'
         resources:
-          memory: '4g'
-          cpus: 4
+          limits:
+            memory: '4g'
+            cpus: 4
 
   - name: gpu-machines
     type: bare-metal
@@ -303,8 +349,9 @@ scalers:
       - labels: ['linux', 'gpu', 'cuda']
         binaryPath: '/opt/kici/kici-agent'
         resources:
-          memory: '16g'
-          cpus: 8
+          limits:
+            memory: '16g'
+            cpus: 8
 ```
 
 ### Production: multi-scaler with warm pools
@@ -318,8 +365,9 @@ globalMaxAgents: 100
 
 defaults:
   resources:
-    memory: '2g'
-    cpus: 2
+    limits:
+      memory: '2g'
+      cpus: 2
 ```
 
 ```yaml
@@ -338,8 +386,9 @@ scalers:
       - labels: ['linux', 'container', 'node20']
         image: 'ghcr.io/myorg/kici-agent-node20:latest'
         resources:
-          memory: '4g'
-          cpus: 4
+          limits:
+            memory: '4g'
+            cpus: 4
 ```
 
 ```yaml
@@ -356,8 +405,9 @@ scalers:
       - labels: ['linux', 'heavy']
         image: 'ghcr.io/myorg/kici-agent-heavy:latest'
         resources:
-          memory: '8g'
-          cpus: 8
+          limits:
+            memory: '8g'
+            cpus: 8
         containerSocket: true # WARNING: See security section
 ```
 
@@ -371,6 +421,7 @@ scalers:
       - labels: ['linux', 'gpu', 'cuda']
         binaryPath: '/opt/kici/kici-agent'
         resources:
-          memory: '32g'
-          cpus: 16
+          limits:
+            memory: '32g'
+            cpus: 16
 ```

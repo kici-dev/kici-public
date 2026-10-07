@@ -594,6 +594,7 @@ describe('RunCoordinator', () => {
 
       const result = await coordinator.handleIncomingReroute({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-1',
         jobId: 'job-1',
         runId: 'run-1',
@@ -619,6 +620,7 @@ describe('RunCoordinator', () => {
 
       const result = await coordinator.handleIncomingReroute({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-1',
         jobId: 'job-1',
         runId: 'run-1',
@@ -648,6 +650,7 @@ describe('RunCoordinator', () => {
 
       const result = await coordinator.handleIncomingReroute({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-1',
         jobId: 'job-1',
         runId: 'run-1',
@@ -674,6 +677,7 @@ describe('RunCoordinator', () => {
 
       const result = await coordinator.handleIncomingReroute({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-1',
         jobId: 'job-1',
         runId: 'run-1',
@@ -702,6 +706,7 @@ describe('RunCoordinator', () => {
 
       await coordinator.handleIncomingReroute({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-pat',
         jobId: 'job-pat',
         runId: 'run-pat',

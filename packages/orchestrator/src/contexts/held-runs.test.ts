@@ -572,21 +572,14 @@ describe('HeldRunStore', () => {
       return mocks.updateWhere.mock.calls.map((call) => [call[0], call[1], call[2]]);
     }
 
-    it('matches every persisted spelling of the timer hold type', async () => {
-      // The sweep RESUMES an expired install-gate wait hold; `expireOverdue()`
-      // would instead fail the run. A filter pinned to one spelling stops
-      // matching rows the other writer produced, so the hold silently turns
-      // into a failure.
+    it('matches the timer hold type only', async () => {
+      // fails-when: the sweep still matches the retired `wait_timer` spelling.
       const { db, mocks } = createMockDb({ updatedRows: [] });
       const store = new HeldRunStore(db);
 
       await store.releaseDueWaitHolds();
 
-      expect(whereClauses(mocks)).toContainEqual([
-        'hold_type',
-        'in',
-        [HoldType.enum.timer, 'wait_timer'],
-      ]);
+      expect(whereClauses(mocks)).toContainEqual(['hold_type', '=', HoldType.enum.timer]);
     });
 
     it('does NOT filter on scope, so a job-scoped timer hold is released too', async () => {
@@ -609,7 +602,7 @@ describe('HeldRunStore', () => {
       expect(clauses).not.toContainEqual(['hold_scope', '=', HoldScope.enum.workflow]);
       // The other filters are unchanged — this widened scope, nothing else.
       expect(clauses).toContainEqual(['status', '=', 'pending']);
-      expect(clauses).toContainEqual(['hold_type', 'in', [HoldType.enum.timer, 'wait_timer']]);
+      expect(clauses).toContainEqual(['hold_type', '=', HoldType.enum.timer]);
     });
 
     it("carries a job-scoped row's own scope on the signal", async () => {
@@ -617,7 +610,7 @@ describe('HeldRunStore', () => {
       // re-dispatch an entire workflow for a hold that gated one job.
       const row = makeHeldRunRow({
         id: 'hr-wait-job',
-        hold_type: 'wait_timer',
+        hold_type: HoldType.enum.timer,
         hold_scope: HoldScope.enum.job,
         step_index: null,
         trigger_source: TriggerSource.enum.context,
@@ -634,7 +627,7 @@ describe('HeldRunStore', () => {
     it('returns a release signal per released row', async () => {
       const row = makeHeldRunRow({
         id: 'hr-wait',
-        hold_type: 'wait_timer',
+        hold_type: HoldType.enum.timer,
         hold_scope: HoldScope.enum.workflow,
         step_index: null,
         trigger_source: TriggerSource.enum.context,

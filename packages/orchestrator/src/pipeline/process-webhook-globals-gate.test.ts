@@ -233,7 +233,7 @@ function makeDeps(
 
 const HOLD_ALL: TrustPolicy = {
   forkPolicy: 'hold',
-  approvalExpiryHours: 72,
+  approvalExpirySeconds: 72 * 3600,
 };
 
 describe('global-workflow dispatch honours the event trust decision', () => {

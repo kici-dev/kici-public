@@ -6,7 +6,6 @@ import {
   readEnvContent,
   buildInfoRows,
   formatHealthSection,
-  hideBuildCommit,
   localUrl,
   readLocalEndpoint,
 } from './service-health.js';
@@ -20,37 +19,13 @@ describe('buildInfoRows', () => {
     expect(buildInfoRows({ sdkVersion: '0.9.0' })).toEqual([['SDK', '0.9.0']]);
   });
 
-  it('adds the build date to the version, and never the build commit an older service reports', () => {
-    // fails-when: the renderer prints buildCommit — a service older than this
-    // CLI reports the private repository's commit ID there.
+  it('adds the build date to the version', () => {
     expect(
       buildInfoRows({
         version: '1.2.3',
-        buildCommit: 'abc1234',
         buildDate: '2026-09-26T00:00:00Z',
       }),
     ).toEqual([['Version', '1.2.3 (built 2026-09-26T00:00:00Z)']]);
-  });
-});
-
-describe('hideBuildCommit', () => {
-  it('replaces the build commit an older service reports with its version', () => {
-    // fails-when: --json passes an older service's build commit through.
-    expect(hideBuildCommit({ version: '0.11.0', buildCommit: '3e5f7a9c1', uptime: 5 })).toEqual({
-      version: '0.11.0',
-      buildCommit: '0.11.0',
-      uptime: 5,
-    });
-  });
-
-  it('keeps the key a string when the body reports no version', () => {
-    expect(hideBuildCommit({ buildCommit: '3e5f7a9c1' })).toEqual({ buildCommit: 'unknown' });
-  });
-
-  it('adds no key to a body that reports none', () => {
-    // breaks-if-wrong: every other field passes through unchanged.
-    const body = { status: 'ok', version: '0.12.0', sdkVersion: '0.12.0' };
-    expect(hideBuildCommit(body)).toEqual(body);
   });
 });
 

@@ -10,7 +10,7 @@
  *   access-log show   Show a single entry by id
  *
  * Filter flags for `list`:
- *   --org-id          -> ?orgId=
+ *   --org             -> ?orgId=
  *   --actor-type      -> ?actorType=
  *   --actor-id        -> ?actorId=
  *   --action          -> ?action=
@@ -27,7 +27,8 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
+import { renderTable } from './shared/table.js';
 
 interface AccessLogItem {
   id: string;
@@ -52,20 +53,6 @@ interface ListResponse {
   nextCursor: string | null;
 }
 
-function renderTable(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
-  const fmtRow = (cells: string[]) =>
-    cells
-      .map((c, i) => (c ?? '').padEnd(widths[i]!))
-      .join('  ')
-      .trimEnd();
-  const lines: string[] = [];
-  lines.push(fmtRow(headers));
-  lines.push(widths.map((w) => '-'.repeat(w)).join('  '));
-  for (const r of rows) lines.push(fmtRow(r));
-  return lines.join('\n');
-}
-
 export function registerAccessLogCommands(program: Command, getClient: () => AdminApiClient): void {
   const accessLog = program
     .command('access-log')
@@ -74,7 +61,7 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
   accessLog
     .command('list')
     .description('List access-log rows (admin API: /api/v1/admin/access-log)')
-    .option('--org-id <orgId>', 'Filter by org/tenant ID')
+    .option('--org <orgId>', 'Filter by org/tenant ID')
     .option(
       '--actor-type <t>',
       'Filter by actor type (user|api_key|service_account|platform_operator|system)',
@@ -93,10 +80,10 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
     .option('--limit <n>', 'Max results (default 50, max 200)', '50')
     .option('--cursor <c>', 'Opaque cursor from a previous nextCursor')
     .option('--json', 'Emit raw JSON instead of a table')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const response = (await getClient().listAccessLog({
-          orgId: opts.orgId,
+          orgId: opts.org,
           actorType: opts.actorType,
           actorId: opts.actorId,
           action: opts.action,
@@ -148,27 +135,24 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
         console.log(
           `Showing ${response.items.length} row(s)${response.nextCursor ? `; next cursor: ${response.nextCursor}` : ''}`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   accessLog
     .command('show <id>')
     .description('Show a single access-log entry by id')
     .option(
-      '--org-id <orgId>',
+      '--org <orgId>',
       'Tenant scope for cold-store fallback when the row is archived (>30d old). ' +
         'Without this hint, only the synthetic __orchestrator__ tenant is scanned, ' +
         "so a row whose org_id is set won't be found. Single-tenant cold scans " +
         'typically take seconds-to-minutes for one-shot operator queries.',
     )
     .option('--json', 'Emit raw JSON instead of formatted output')
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const response = (await getClient().getAccessLogEntry(id, {
-          orgId: opts.orgId,
+          orgId: opts.org,
         })) as unknown as AccessLogItem;
         if (opts.json) {
           console.log(JSON.stringify(response, null, 2));
@@ -191,9 +175,6 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
         }
         if (response.requestId) console.log(`  Request ID:    ${response.requestId}`);
         if (response.errorMessage) console.log(`  Error:         ${response.errorMessage}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

@@ -9,7 +9,7 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 export function registerApiKeyCommands(program: Command, getClient: () => AdminApiClient): void {
   const apiKey = program
@@ -24,8 +24,8 @@ export function registerApiKeyCommands(program: Command, getClient: () => AdminA
       '--routing-keys <keys>',
       'Comma-separated routing key patterns (e.g. github:42,github:99)',
     )
-    .action(async (opts: { label: string; routingKeys?: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { label: string; routingKeys?: string }) => {
         const routingKeys = opts.routingKeys
           ? opts.routingKeys.split(',').map((k) => k.trim())
           : undefined;
@@ -41,24 +41,18 @@ export function registerApiKeyCommands(program: Command, getClient: () => AdminA
         }
         console.log('');
         console.log('WARNING: Save this key now -- it cannot be recovered after this point.');
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   apiKey
     .command('add-routing-key <id> <pattern>')
     .description('Add a routing key permission pattern to an API key')
-    .action(async (id: string, pattern: string) => {
-      try {
+    .action(
+      cliAction(async (id: string, pattern: string) => {
         const result = await getClient().addRoutingKeyPermission(id, pattern);
         console.log(`Routing key permission added.`);
         console.log(`Permission ID: ${result.id}`);
         console.log(`Pattern:       ${result.pattern}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

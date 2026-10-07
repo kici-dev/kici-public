@@ -4,10 +4,7 @@ import {
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
   type AgentToOrchestratorMessage,
-  type AgentCapabilities,
-  AgentCapabilityFlag,
   agentRegisterSchema,
-  hasAgentCapability,
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
 } from '@kici-dev/engine';
 import {
@@ -111,7 +108,7 @@ function simulateRegisterAck(
     agentId: string;
     labels: string[];
     scalerManaged: boolean;
-    /** Agent-facing capabilities; omit to model a pre-capability orchestrator. */
+    /** Agent-facing capabilities the orchestrator advertises. */
     capabilities: Record<string, unknown>;
   }> = {},
 ): void {
@@ -223,13 +220,8 @@ describe('OrchestratorClient', () => {
       expect(msg.messageId).toBeDefined();
       // Reports its own package version so the Infrastructure page can show it.
       expect(msg.version).toBe(readAgentVersion());
-      // fails-when: the agent stops advertising that its eval round skips result-aware generators
-      expect(
-        hasAgentCapability(
-          msg.capabilities as AgentCapabilities,
-          AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators,
-        ),
-      ).toBe(true);
+      // No agent capability flag is defined at protocol 4.
+      expect(msg.capabilities).toEqual({});
       // fails-when: the agent stops self-reporting the label a result-aware round is routed by
       expect(msg.labels).toEqual(expect.arrayContaining([GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL]));
       // The advertised message still parses under the shared wire schema.
@@ -422,6 +414,7 @@ describe('OrchestratorClient', () => {
         stepIndex: 0,
         lines: ['output'],
         timestamp: 2000,
+        stream: 'stdout',
       });
 
       expect(client.getBufferedCount()).toBe(2);
@@ -1707,8 +1700,6 @@ describe('OrchestratorClient', () => {
   });
 
   describe('user-facing artifact relay (requestUserArtifact completeUpload)', () => {
-    const ACK_CAPS = { artifactCompleteAck: true };
-
     /** The IPC completeUpload request the sandbox relays. */
     function completeRequest(requestId: string) {
       return {
@@ -1729,7 +1720,7 @@ describe('OrchestratorClient', () => {
 
     it('awaits the ack and resolves on committed', async () => {
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const promise = client.requestUserArtifact('job-1', completeRequest('ipc-1'));
       const sent = sentComplete(mock);
@@ -1749,7 +1740,7 @@ describe('OrchestratorClient', () => {
 
     it('rejects on a failed ack so the workflow step fails', async () => {
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const promise = client.requestUserArtifact('job-1', completeRequest('ipc-2'));
       const sent = sentComplete(mock);
@@ -1773,7 +1764,7 @@ describe('OrchestratorClient', () => {
 
     it('rejects when the ack never arrives, before the sandbox request timeout', async () => {
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       // Capture the rejection before advancing the clock: the timer fires
       // inside advanceTimersByTimeAsync, so a handler attached afterwards
@@ -1793,33 +1784,40 @@ describe('OrchestratorClient', () => {
       });
     });
 
-    it('stays fire-and-forget when the orchestrator does not advertise the capability', async () => {
+    it('waits for artifacts.upload.complete.ack without a capability check', async () => {
+      // breaks-if-wrong: hard-wiring the ack must keep the wait, not drop it.
+      // fails-when: the agent resolves before the ack, as the removed
+      // fire-and-forget path did when register.ack carried no capabilities.
       const client = createClient();
-      const mock = registerClient(client);
+      const mock = registerClient(client, { capabilities: {} });
 
-      // Resolves with no ack at all — the pre-capability orchestrator behavior.
-      await expect(client.requestUserArtifact('job-1', completeRequest('ipc-4'))).resolves.toEqual({
-        type: 'artifacts.response',
-        requestId: 'ipc-4',
+      let resolved = false;
+      const promise = client.requestUserArtifact('job-1', completeRequest('ipc-4')).then((res) => {
+        resolved = true;
+        return res;
       });
-      expect(sentComplete(mock)).toBeDefined();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(resolved).toBe(false);
+
+      simulateMessage(mock, {
+        type: 'artifacts.upload.complete.ack',
+        requestId: sentComplete(mock).messageId,
+        outcome: 'committed',
+      });
+      await expect(promise).resolves.toEqual({ type: 'artifacts.response', requestId: 'ipc-4' });
     });
 
     /**
      * Drop the socket unintentionally, let the backoff fire, and re-register.
      * Returns the mock for the new connection.
      */
-    function reconnect(
-      mock: MockWsInstance,
-      /** `null` models an orchestrator that no longer advertises the capability. */
-      capabilities: Record<string, unknown> | null = ACK_CAPS,
-    ): MockWsInstance {
+    function reconnect(mock: MockWsInstance): MockWsInstance {
       mock.readyState = 3;
       mock.emit('close', 1006, Buffer.from('abnormal'));
       vi.advanceTimersByTime(2_000);
       const next = getLatestMock();
       simulateOpen(next);
-      simulateRegisterAck(next, capabilities ? { capabilities } : {});
+      simulateRegisterAck(next);
       return next;
     }
 
@@ -1827,7 +1825,7 @@ describe('OrchestratorClient', () => {
       // The commit is idempotent, so a dropped ack means "we did not hear the
       // answer" — failing here would fail a step whose artifact exists.
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const settled = vi.fn();
       void client.requestUserArtifact('job-1', completeRequest('ipc-hold')).then(settled, settled);
@@ -1843,7 +1841,7 @@ describe('OrchestratorClient', () => {
     it('still rejects an in-flight beginUpload on disconnect', async () => {
       // beginUpload mints a presigned PUT and is deliberately NOT resendable.
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const promise = client.requestUserArtifact('job-1', {
         type: 'artifacts.request' as const,
@@ -1863,7 +1861,7 @@ describe('OrchestratorClient', () => {
       // No reconnect is scheduled on a deliberate shutdown, so holding would
       // strand the step until the ack timer fired.
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const settled = client
         .requestUserArtifact('job-1', completeRequest('ipc-intent'))
@@ -1884,7 +1882,7 @@ describe('OrchestratorClient', () => {
       // rather than wait out the ack deadline (or die unsettled with the
       // process).
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const settled = client
         .requestUserArtifact('job-1', completeRequest('ipc-park-shutdown'))
@@ -1911,7 +1909,7 @@ describe('OrchestratorClient', () => {
       // A permanent auth failure never reaches another register.ack, so the
       // parked complete would otherwise sit until its deadline.
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const settled = client
         .requestUserArtifact('job-1', completeRequest('ipc-park-auth'))
@@ -1936,7 +1934,7 @@ describe('OrchestratorClient', () => {
 
     it('re-sends a held complete after re-registering and resolves on the ack', async () => {
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const promise = client.requestUserArtifact('job-1', completeRequest('ipc-resend'));
       const first = sentComplete(mock);
@@ -1972,7 +1970,7 @@ describe('OrchestratorClient', () => {
 
     it('gives up after the resend budget and says the artifact may have committed', async () => {
       const client = createClient();
-      let mock = registerClient(client, { capabilities: ACK_CAPS });
+      let mock = registerClient(client);
 
       const settled = client
         .requestUserArtifact('job-1', completeRequest('ipc-budget'))
@@ -1992,30 +1990,11 @@ describe('OrchestratorClient', () => {
       });
     });
 
-    it('fails closed when the reconnected orchestrator can no longer ack', async () => {
-      // Resolving here would report success for a commit whose outcome we never
-      // learned — the fail-open loss the ack exists to prevent.
-      const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
-
-      const settled = client
-        .requestUserArtifact('job-1', completeRequest('ipc-downgrade'))
-        .then(() => null)
-        .catch((err: Error) => err);
-      expect(sentComplete(mock)).toBeDefined();
-
-      reconnect(mock, null);
-
-      expect(await settled).toMatchObject({
-        message: expect.stringContaining('may have been committed'),
-      });
-    });
-
     it('does not restart the ack deadline across a resend', async () => {
       // Load-bearing: a restarted timer would let a flapping connection keep the
       // step alive indefinitely instead of failing on the original schedule.
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const settled = client
         .requestUserArtifact('job-1', completeRequest('ipc-deadline'))
@@ -2127,7 +2106,7 @@ describe('OrchestratorClient', () => {
       // deadline, so a genuinely unreachable orchestrator fails the step on
       // schedule instead of parking it forever.
       const client = createClient();
-      const mock = registerClient(client, { capabilities: ACK_CAPS });
+      const mock = registerClient(client);
 
       const settled = client
         .requestUserArtifact('job-1', completeRequest('ipc-5'))

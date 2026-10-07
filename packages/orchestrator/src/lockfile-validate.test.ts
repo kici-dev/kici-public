@@ -3,7 +3,6 @@ import {
   LockFileParseError,
   SCHEMA_VERSION,
   BREAKING_FLOOR,
-  GLOBAL_APPROVAL_MIN_READER,
   type LockFile,
 } from '@kici-dev/engine';
 import {
@@ -15,6 +14,7 @@ import {
 function baseLock(overrides: Partial<LockFile> = {}): LockFile {
   return {
     schemaVersion: SCHEMA_VERSION,
+    minReaderVersion: BREAKING_FLOOR,
     source: { file: 'test', export: '#default' },
     contentHash: 'hash',
     workflows: [],
@@ -82,7 +82,7 @@ describe('assertLockFileSchemaCompatible (compatibility window)', () => {
     ).not.toThrow();
   });
 
-  it('accepts an older-but-post-floor lock (down to the breaking floor)', () => {
+  it('accepts a lock at the breaking floor', () => {
     expect(() =>
       assertLockFileSchemaCompatible(
         baseLock({ schemaVersion: BREAKING_FLOOR as never }),
@@ -90,6 +90,13 @@ describe('assertLockFileSchemaCompatible (compatibility window)', () => {
         REF,
       ),
     ).not.toThrow();
+  });
+
+  it('refuses a v41 lock', () => {
+    // fails-when: BREAKING_FLOOR drops below 42 — a v41 lock would be accepted.
+    const lock = baseLock({ schemaVersion: 41 as never, minReaderVersion: 41 });
+    expect(() => assertLockFileSchemaCompatible(lock, REPO, REF)).toThrow(LockFileParseError);
+    expect(() => assertLockFileSchemaCompatible(lock, REPO, REF)).toThrow(/kici compile/);
   });
 
   it('rejects a below-floor lock as LockFileParseError with compile-and-push guidance', () => {
@@ -109,36 +116,23 @@ describe('assertLockFileSchemaCompatible (compatibility window)', () => {
     );
   });
 
-  it('a v41 orchestrator refuses a lock whose global workflow declares approval', () => {
-    // The compiler stamps GLOBAL_APPROVAL_MIN_READER on such a lock; a v41
-    // reader would otherwise dispatch the global workflow without its gate.
-    const gatedGlobal = baseLock({ minReaderVersion: GLOBAL_APPROVAL_MIN_READER });
-    const V41 = GLOBAL_APPROVAL_MIN_READER - 1;
+  it('an orchestrator older than the lock floor refuses a current lock', () => {
+    const lock = baseLock();
+    const older = BREAKING_FLOOR - 1;
     // fails-when: the reader compares against a version it does not actually read.
-    expect(() => assertLockFileSchemaCompatible(gatedGlobal, REPO, REF, V41)).toThrow(
+    expect(() => assertLockFileSchemaCompatible(lock, REPO, REF, older)).toThrow(
       /requires orchestrator schema >= v42 .* upgrade the orchestrator/i,
     );
-    // breaks-if-wrong: this orchestrator (at or above the reader floor) must accept it,
-    // and a v41 orchestrator must still accept a lock stamped at the breaking floor.
-    expect(() => assertLockFileSchemaCompatible(gatedGlobal, REPO, REF)).not.toThrow();
-    expect(() =>
-      assertLockFileSchemaCompatible(
-        baseLock({ minReaderVersion: BREAKING_FLOOR }),
-        REPO,
-        REF,
-        V41,
-      ),
-    ).not.toThrow();
+    // breaks-if-wrong: this orchestrator (at the floor) must accept it.
+    expect(() => assertLockFileSchemaCompatible(lock, REPO, REF)).not.toThrow();
   });
 
-  it('missing minReaderVersion falls back to exact-match strictness for newer locks', () => {
-    expect(() =>
-      assertLockFileSchemaCompatible(
-        baseLock({ schemaVersion: (SCHEMA_VERSION + 1) as never }),
-        REPO,
-        REF,
-      ),
-    ).toThrow(/upgrade the orchestrator/i);
+  it('refuses a lock with no minReaderVersion', () => {
+    // fails-when: the reader falls back to schemaVersion when minReaderVersion is absent.
+    const lock = baseLock();
+    delete (lock as { minReaderVersion?: number }).minReaderVersion;
+    expect(() => assertLockFileSchemaCompatible(lock, REPO, REF)).toThrow(/minReaderVersion/);
+    // breaks-if-wrong: a current lock carrying the field must still be accepted.
     expect(() => assertLockFileSchemaCompatible(baseLock(), REPO, REF)).not.toThrow();
   });
 });

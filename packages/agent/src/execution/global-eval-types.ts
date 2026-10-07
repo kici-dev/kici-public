@@ -7,13 +7,7 @@
 
 import type { GlobalEvalCandidate } from './global-eval-runner.js';
 
-/**
- * `jobConfig` shape of a pre-run global eval round job.
- *
- * `roundTimeoutMs` / `candidateTimeoutMs` are optional so an older orchestrator
- * that does not send them still dispatches a runnable round; the agent falls
- * back to the defaults in `eval-context.ts`.
- */
+/** `jobConfig` shape of a pre-run global eval round job. */
 export interface GlobalEvalRoundJobConfig {
   globalEvalRound: true;
   candidates: GlobalEvalCandidate[];
@@ -22,6 +16,6 @@ export interface GlobalEvalRoundJobConfig {
   workflowRef?: string;
   workflowSha?: string;
   workflowRepoIdentifier?: string;
-  roundTimeoutMs?: number;
-  candidateTimeoutMs?: number;
+  roundTimeoutMs: number;
+  candidateTimeoutMs: number;
 }

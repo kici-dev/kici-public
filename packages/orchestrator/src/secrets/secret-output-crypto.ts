@@ -3,11 +3,9 @@
  *
  * The column holds a value the orchestrator re-encrypted under the master key
  * after opening the agent's ECDH envelope, so it is one of the master-key
- * wrapped stores and moves with every key rotation. Three call sites read it —
- * the upstream-output merge, the `needs:` inherited-secret reader, and the
- * dashboard reveal path — and each derived the key and named the AAD by hand.
- * Centralising both here keeps the AAD shape and the rotation grace window in
- * one place instead of three.
+ * wrapped stores and moves with every key rotation. The upstream-output merge
+ * and the dashboard reveal path both read it, and share the key derivation and
+ * the AAD shape from here, so the rotation grace window lives in one place.
  */
 import { decrypt, encrypt } from '@kici-dev/shared';
 

@@ -224,28 +224,29 @@ describe('GitCredentialBroker', () => {
     ).rejects.toThrow(/MISSING_PAT/);
   });
 
-  it("reads an unbound exact context's same-named scope through the gate (deprecated)", async () => {
-    const resolver = secretResolver({}, { FORGE_PAT: 'legacy-pat' });
+  it("refuses a token held only in an unbound exact context's same-named scope", async () => {
+    const resolver = secretResolver({}, { FORGE_PAT: 'same-named-pat' });
     const broker = new GitCredentialBroker({
       secretResolver: resolver,
       contextStore: permissiveContexts(),
       sourceAuth: noSource,
       mint: vi.fn(),
     });
-    const result = await broker.resolve({
-      orgId: 'org-1',
-      gate,
-      repositories: ['a/b'],
-      ref: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
-      runId: 'run-1',
-      jobId: 'job-1',
-    });
-    // breaks-if-wrong: a git credential stored in an unbound same-named scope stops resolving
-    expect(result.secret).toBe('legacy-pat');
+    // fails-when: the gate still reads the scope named after the context
+    await expect(
+      broker.resolve({
+        orgId: 'org-1',
+        gate,
+        repositories: ['a/b'],
+        ref: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+        runId: 'run-1',
+        jobId: 'job-1',
+      }),
+    ).rejects.toThrow(/FORGE_PAT/);
     expect(
       (resolver as unknown as { resolveNamedInternal: ReturnType<typeof vi.fn> })
         .resolveNamedInternal,
-    ).toHaveBeenCalledWith('org-1', 'ci', 'FORGE_PAT', { runId: 'run-1', jobId: 'job-1' });
+    ).not.toHaveBeenCalled();
   });
 
   it('falls back to the source credential when no ref is supplied', async () => {

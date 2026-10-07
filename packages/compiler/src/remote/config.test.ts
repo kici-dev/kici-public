@@ -100,14 +100,14 @@ describe('global config management', () => {
       await fs.writeFile(
         path.join(kiciDir, 'config'),
         JSON.stringify({
-          token: 'test-token-123',
+          pat: 'test-token-123',
           endpoint: 'https://orchestrator.example.com',
           routingKey: 'github:42',
         }),
       );
 
       const config = await loadGlobalConfig();
-      expect(config.token).toBe('test-token-123');
+      expect(config.pat).toBe('test-token-123');
       expect(config.endpoint).toBe('https://orchestrator.example.com');
       expect(config.routingKey).toBe('github:42');
     });
@@ -118,15 +118,30 @@ describe('global config management', () => {
       await fs.writeFile(
         path.join(kiciDir, 'config'),
         JSON.stringify({
-          token: 'valid-token',
+          pat: 'valid-token',
           unknownKey: 'should-be-stripped',
           anotherUnknown: 42,
         }),
       );
 
       const config = await loadGlobalConfig();
-      expect(config).toEqual({ token: 'valid-token' });
+      expect(config).toEqual({ pat: 'valid-token' });
       expect((config as Record<string, unknown>).unknownKey).toBeUndefined();
+    });
+
+    it('drops a token key, so only a PAT authenticates', async () => {
+      const kiciDir = path.join(tempDir, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+      await fs.writeFile(
+        path.join(kiciDir, 'config'),
+        JSON.stringify({ endpoint: 'https://api.kici.dev', token: 'kici_old', pat: 'kici_pat_x' }),
+      );
+
+      const config = await loadGlobalConfig();
+      // fails-when: sanitizeConfig still copies `token` — a stale API key would authenticate.
+      expect((config as Record<string, unknown>).token).toBeUndefined();
+      // breaks-if-wrong: the PAT next to it must still load.
+      expect(config.pat).toBe('kici_pat_x');
     });
 
     it('round-trips defaultClusters and drops non-string values', async () => {
@@ -135,7 +150,7 @@ describe('global config management', () => {
       await fs.writeFile(
         path.join(kiciDir, 'config'),
         JSON.stringify({
-          token: 'tok',
+          pat: 'tok',
           defaultClusters: { org_a: 'cluster-1', org_b: 'cluster-2', org_bad: 42 },
         }),
       );
@@ -149,7 +164,7 @@ describe('global config management', () => {
       await fs.mkdir(kiciDir, { recursive: true });
       await fs.writeFile(
         path.join(kiciDir, 'config'),
-        JSON.stringify({ token: 'tok', defaultClusters: ['not', 'an', 'object'] }),
+        JSON.stringify({ pat: 'tok', defaultClusters: ['not', 'an', 'object'] }),
       );
 
       const config = await loadGlobalConfig();
@@ -193,7 +208,7 @@ describe('global config management', () => {
   describe('saveGlobalConfig', () => {
     it('creates config file with correct content', async () => {
       const config = {
-        token: 'my-api-key',
+        pat: 'my-api-key',
         endpoint: 'https://orch.example.com',
         routingKey: 'github:42',
       };
@@ -204,13 +219,13 @@ describe('global config management', () => {
       const content = await fs.readFile(configPath, 'utf-8');
       const parsed = JSON.parse(content);
 
-      expect(parsed.token).toBe('my-api-key');
+      expect(parsed.pat).toBe('my-api-key');
       expect(parsed.endpoint).toBe('https://orch.example.com');
       expect(parsed.routingKey).toBe('github:42');
     });
 
     it('creates directory if it does not exist', async () => {
-      await saveGlobalConfig({ token: 'test' });
+      await saveGlobalConfig({ pat: 'test' });
 
       const kiciDir = path.join(tempDir, '.kici');
       const stat = await fs.stat(kiciDir);
@@ -218,7 +233,7 @@ describe('global config management', () => {
     });
 
     it('sets file permissions to 0o600', async () => {
-      await saveGlobalConfig({ token: 'secret-token' });
+      await saveGlobalConfig({ pat: 'secret-token' });
 
       const configPath = path.join(tempDir, '.kici', 'config');
       const stat = await fs.stat(configPath);
@@ -228,13 +243,13 @@ describe('global config management', () => {
     });
 
     it('writes valid JSON with 2-space indent', async () => {
-      await saveGlobalConfig({ token: 'test', endpoint: 'https://example.com' });
+      await saveGlobalConfig({ pat: 'test', endpoint: 'https://example.com' });
 
       const configPath = path.join(tempDir, '.kici', 'config');
       const content = await fs.readFile(configPath, 'utf-8');
 
       // Should be formatted with 2-space indent
-      expect(content).toContain('  "token"');
+      expect(content).toContain('  "pat"');
       expect(content).toContain('  "endpoint"');
       // Should end with newline
       expect(content.endsWith('\n')).toBe(true);
@@ -247,7 +262,7 @@ describe('global config management', () => {
     it('preserves existing keys while adding new ones', async () => {
       // Save initial config
       await saveGlobalConfig({
-        token: 'existing-token',
+        pat: 'existing-token',
         endpoint: 'https://existing.example.com',
       });
 
@@ -256,36 +271,36 @@ describe('global config management', () => {
         platformEndpoint: 'https://platform.example.com',
       });
 
-      expect(merged.token).toBe('existing-token');
+      expect(merged.pat).toBe('existing-token');
       expect(merged.endpoint).toBe('https://existing.example.com');
       expect(merged.platformEndpoint).toBe('https://platform.example.com');
     });
 
     it('overwrites existing keys with new values', async () => {
-      await saveGlobalConfig({ token: 'old-token' });
+      await saveGlobalConfig({ pat: 'old-token' });
 
-      const merged = await mergeGlobalConfig({ token: 'new-token' });
+      const merged = await mergeGlobalConfig({ pat: 'new-token' });
 
-      expect(merged.token).toBe('new-token');
+      expect(merged.pat).toBe('new-token');
     });
 
     it('returns merged config and persists it', async () => {
-      await saveGlobalConfig({ token: 'first' });
+      await saveGlobalConfig({ pat: 'first' });
       await mergeGlobalConfig({ endpoint: 'https://orch.example.com' });
 
       // Reload from disk to verify persistence
       const reloaded = await loadGlobalConfig();
-      expect(reloaded.token).toBe('first');
+      expect(reloaded.pat).toBe('first');
       expect(reloaded.endpoint).toBe('https://orch.example.com');
     });
 
     it('creates config from scratch when no file exists', async () => {
       const merged = await mergeGlobalConfig({
-        token: 'brand-new',
+        pat: 'brand-new',
         routingKey: 'github:42',
       });
 
-      expect(merged.token).toBe('brand-new');
+      expect(merged.pat).toBe('brand-new');
       expect(merged.routingKey).toBe('github:42');
     });
 
@@ -302,11 +317,11 @@ describe('global config management', () => {
     });
 
     it('ignores undefined values in partial', async () => {
-      await saveGlobalConfig({ token: 'keep-me', endpoint: 'https://keep.example.com' });
+      await saveGlobalConfig({ pat: 'keep-me', endpoint: 'https://keep.example.com' });
 
-      const merged = await mergeGlobalConfig({ token: undefined });
+      const merged = await mergeGlobalConfig({ pat: undefined });
 
-      expect(merged.token).toBe('keep-me');
+      expect(merged.pat).toBe('keep-me');
       expect(merged.endpoint).toBe('https://keep.example.com');
     });
   });
@@ -325,23 +340,23 @@ describe('global config management', () => {
     });
 
     it('saveGlobalConfig writes to custom config dir', async () => {
-      await saveGlobalConfig({ token: 'custom-dir-token' });
+      await saveGlobalConfig({ pat: 'custom-dir-token' });
 
       const configPath = path.join(customConfigDir, 'config');
       const content = await fs.readFile(configPath, 'utf-8');
       const parsed = JSON.parse(content);
-      expect(parsed.token).toBe('custom-dir-token');
+      expect(parsed.pat).toBe('custom-dir-token');
     });
 
     it('loadGlobalConfig reads from custom config dir', async () => {
       await fs.writeFile(
         path.join(customConfigDir, 'config'),
-        JSON.stringify({ token: 'from-custom-dir' }),
+        JSON.stringify({ pat: 'from-custom-dir' }),
         { mode: 0o600 },
       );
 
       const config = await loadGlobalConfig();
-      expect(config.token).toBe('from-custom-dir');
+      expect(config.pat).toBe('from-custom-dir');
     });
   });
 });

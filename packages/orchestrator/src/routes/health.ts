@@ -1,5 +1,6 @@
 import {
   createHealthRoutes as createBaseHealthRoutes,
+  retryOnBrokenConnection,
   type BuildFingerprint,
 } from '@kici-dev/shared';
 import type { Kysely } from 'kysely';
@@ -59,8 +60,6 @@ export function createHealthRoutes(deps: HealthRoutesDeps = {}) {
       return {
         version,
         buildDate: typeof KICI_BUILD_DATE !== 'undefined' ? KICI_BUILD_DATE : 'unknown',
-        // Deprecated: carries the version (BuildFingerprint.buildCommit).
-        buildCommit: version,
         sdkVersion: typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown',
         sdkBundleHash:
           typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown',
@@ -76,7 +75,11 @@ export function createHealthRoutes(deps: HealthRoutesDeps = {}) {
       ? async () => {
           const checks: Record<string, boolean> = {};
           try {
-            await deps.db!.selectFrom('dedup_cache').select('delivery_id').limit(1).execute();
+            // A pooled connection killed by a switchover is not an outage: the
+            // probe asks again on another connection before it reports one.
+            await retryOnBrokenConnection(() =>
+              deps.db!.selectFrom('dedup_cache').select('delivery_id').limit(1).execute(),
+            );
             checks.database = true;
           } catch {
             checks.database = false;

@@ -22,7 +22,6 @@ export interface CloneJobReposRequest {
   repoUrl: string;
   ref: string;
   sha: string;
-  token?: string | undefined;
   sourceAuth?: GitAuth | undefined;
   workflowAuth?: GitAuth | undefined;
   workflowRepoUrl?: string | undefined;
@@ -89,7 +88,6 @@ export async function cloneJobRepos(
       sha: request.workflowSha ?? '',
       workDir: dirs.workflowDir,
       gitAuth: workflowAuth,
-      token: workflowAuth ? undefined : request.token,
       ...helper,
     });
     // `.kici/` lives in the WORKFLOW repo for a global workflow, so only this
@@ -106,7 +104,6 @@ export async function cloneJobRepos(
       sha: request.sha,
       workDir: dirs.sourceDir,
       gitAuth: sourceAuth,
-      token: sourceAuth ? undefined : request.token,
       ...helper,
     });
     deps.log('Dual-clone complete');
@@ -120,7 +117,6 @@ export async function cloneJobRepos(
     sha: request.sha,
     workDir: dirs.workDir,
     gitAuth: request.sourceAuth,
-    token: request.sourceAuth ? undefined : request.token,
     ...helper,
   });
   await deps.excludeScratchFromGit(dirs.workDir);

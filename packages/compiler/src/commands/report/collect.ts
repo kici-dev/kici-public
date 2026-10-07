@@ -117,7 +117,7 @@ const DEFAULT_DEPS: ReportBundleDeps = {
     const { DashboardClient, DashboardClientError } =
       await import('../../remote/dashboard-client.js');
     const config = await loadGlobalConfig();
-    if (!config.activeOrgId || !(config.pat ?? config.token)) return null;
+    if (!config.activeOrgId || !config.pat) return null;
     try {
       const client = DashboardClient.fromConfig(config);
       return { ok: true, infra: await client.getInfrastructure() };

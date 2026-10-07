@@ -18,7 +18,7 @@ import {
   matcherSatisfiedBy,
   WS_CLOSE_AGENT_AUTH_FAILED,
 } from '@kici-dev/engine';
-import type { AgentCapabilities, WsLike } from '@kici-dev/engine';
+import type { WsLike } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 
 /**
@@ -159,11 +159,6 @@ export interface AgentEntry {
   /** Self-reported agent version (e.g. "0.0.1"). Null if not reported. */
   version: string | null;
   /**
-   * Optional behaviours the agent advertised on `agent.register`. Null for an
-   * agent that advertised none, which is read as supporting none.
-   */
-  capabilities: AgentCapabilities | null;
-  /**
    * The `agent_tokens.id` row used to authenticate this connection, or
    * `null` when auth mode is `none`. Indexed by `tokenIdIndex` so a
    * synchronous revocation kick can enumerate every WS authenticated by
@@ -234,8 +229,6 @@ interface AgentMetadata {
    * any operator-declared properties). Undefined ⇒ the agent reported none.
    */
   properties?: Record<string, string | number | boolean>;
-  /** Optional behaviours the agent advertised on `agent.register`. */
-  capabilities?: AgentCapabilities;
 }
 
 /**
@@ -445,7 +438,6 @@ export class AgentRegistry {
       arch,
       registeredAt: Date.now(),
       version: version ?? null,
-      capabilities: metadata?.capabilities ?? null,
       tokenId,
       // Static metadata
       hostname: metadata?.hostname ?? null,

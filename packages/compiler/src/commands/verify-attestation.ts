@@ -8,12 +8,11 @@
  * wrapper (fs / fetch / artifact digest / output).
  *
  * `--trust-root` is optional: when omitted it defaults to the CONFIGURED
- * ORCHESTRATOR (its own `.well-known`), which now owns provenance signing — the
- * natural root of trust for a self-hosted customer. When no orchestrator is
- * configured it falls back to the hosted KiCI Platform's provenance issuer (for
- * historical Platform-signed bundles, which keep verifying forever). Pass
- * `--trust-root` to verify against a different environment or an offline
- * `{ issuer, jwks }` file (air-gap). The token `iss` is always pinned to the
+ * ORCHESTRATOR (its own `.well-known`), which owns provenance signing — the
+ * natural root of trust for a self-hosted customer. With neither, the command
+ * fails and names both remedies: the hosted KiCI Platform publishes no
+ * provenance issuer. Pass `--trust-root` to verify against a different
+ * environment or an offline `{ issuer, jwks }` file (air-gap). The token `iss` is always pinned to the
  * trust root out-of-band — a bundle can never name its own trusted issuer.
  *
  * Returns a boolean (verified) so `cli.ts` can map it to an exit code (0/1).
@@ -24,17 +23,14 @@ import pc from 'picocolors';
 import { KICI_PROVENANCE_AUDIENCE } from '@kici-dev/engine/provenance/bundle';
 import { verifyKiciBundle } from '@kici-dev/engine/provenance/verify';
 import { resolveTrustRoot, type TrustRoot } from '../provenance-trust-root.js';
-import { PROD_PROVENANCE_ISSUER } from '../remote/prod-defaults.js';
-import { loadGlobalConfig } from '../remote/config.js';
+import { getConfigPath, loadGlobalConfig } from '../remote/config.js';
 
 export interface VerifyAttestationOptions {
   /** Path or `http(s)` URL to the attestation bundle JSON. Required. */
   bundle?: string;
   /**
    * Trusted issuer URL (online discovery) or a self-contained `{ issuer, jwks }`
-   * file. Optional — defaults to the configured orchestrator, falling back to
-   * the hosted KiCI Platform's provenance issuer when no orchestrator is
-   * configured.
+   * file. Optional — defaults to the configured orchestrator.
    */
   trustRoot?: string;
   /** Expected token audience (defaults to the KiCI provenance audience). */
@@ -53,24 +49,26 @@ export async function verifyAttestationCommand(
       return false;
     }
 
-    // Default trust root resolution order:
-    //   1. explicit --trust-root
-    //   2. the configured orchestrator (its own base URL → its .well-known), the
-    //      natural root of trust for a self-hosted customer whose orchestrator now
-    //      owns provenance signing
-    //   3. the hosted KiCI Platform's provenance issuer, as a last-resort fallback
-    //      for a CLI with no configured orchestrator
+    // Trust root: the explicit --trust-root, else the configured orchestrator
+    // (the `endpoint` URL in the CLI config → its .well-known), the natural root
+    // of trust for a self-hosted customer whose orchestrator owns provenance
+    // signing. `kici login` sets only the Platform endpoint, never this one.
     const globalConfig = await loadGlobalConfig().catch(() => null);
-    const configuredOrchestrator = globalConfig?.endpoint;
-    const trustRoot = options.trustRoot ?? configuredOrchestrator ?? PROD_PROVENANCE_ISSUER;
+    const trustRoot = options.trustRoot ?? globalConfig?.endpoint;
+    if (!trustRoot) {
+      logger.error(
+        pc.red(
+          `Error: No trust root: pass --trust-root <url-or-file>, or set "endpoint" in ${getConfigPath()} to your orchestrator's URL`,
+        ),
+      );
+      return false;
+    }
     const usingDefault = !options.trustRoot;
-    const usingConfiguredOrchestrator = usingDefault && !!configuredOrchestrator;
     if (usingDefault) {
-      const which = usingConfiguredOrchestrator
-        ? 'configured orchestrator'
-        : 'hosted KiCI platform';
       logger.info(
-        pc.gray(`Using default trust root ${trustRoot} (${which}; pass --trust-root to override)`),
+        pc.gray(
+          `Using default trust root ${trustRoot} (configured orchestrator; pass --trust-root to override)`,
+        ),
       );
     }
 
@@ -82,9 +80,7 @@ export async function verifyAttestationCommand(
     } catch (error) {
       const msg = toErrorMessage(error);
       if (usingDefault && /\b503\b/.test(msg)) {
-        const where = usingConfiguredOrchestrator
-          ? `your configured orchestrator (${trustRoot})`
-          : `the hosted KiCI platform (${trustRoot})`;
+        const where = `your configured orchestrator (${trustRoot})`;
         logger.error(
           pc.red(
             `Error: build provenance signing is not enabled on ${where} yet ` +

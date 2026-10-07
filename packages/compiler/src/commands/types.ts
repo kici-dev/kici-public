@@ -83,7 +83,7 @@ export async function typesCommand(options: TypesOptions = {}): Promise<boolean>
       keys: e.secretKeys ?? [],
     }));
 
-    const source = config.platformEndpoint ?? config.endpoint ?? 'kici Platform';
+    const source = config.platformEndpoint ?? 'kici Platform';
     const dtsContent = generateSecretsDts({
       contexts: metadata,
       endpoint: source.replace(/\/+$/, ''),

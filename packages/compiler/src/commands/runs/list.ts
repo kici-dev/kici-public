@@ -24,10 +24,9 @@ export async function runsListCommand(options: RunsListOptions = {}): Promise<bo
     if (page.runs.length === 0) {
       // When the runs window is empty, surface recent webhook activity so an
       // "almost there" evaluator sees that webhooks arrived but nothing matched
-      // — with the next step to test triggers locally. Silent-degrades to the
-      // plain "No runs found." when the endpoint is unavailable (older Platform).
-      const activity = await client.getWebhookActivity().catch(() => null);
-      if (activity && activity.received > 0) {
+      // — with the next step to test triggers locally.
+      const activity = await client.getWebhookActivity();
+      if (activity.received > 0) {
         const win =
           activity.windowMinutes === 60
             ? 'the last hour'

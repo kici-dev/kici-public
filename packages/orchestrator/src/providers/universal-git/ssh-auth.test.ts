@@ -1,11 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, statSync, readFileSync } from 'node:fs';
-import {
-  prepareSshAuth,
-  prepareSshAuthSync,
-  composeGitSshCommand,
-  quoteShell,
-} from './ssh-auth.js';
+import { prepareSshAuth, prepareSshAuthSync, composeGitSshCommand } from './ssh-auth.js';
 
 const FAKE_PEM = '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----';
 
@@ -118,15 +113,5 @@ describe('composeGitSshCommand', () => {
     expect(acceptNew).toContain('StrictHostKeyChecking=accept-new');
     expect(pinned).toContain(`UserKnownHostsFile='/tmp/kh'`);
     expect(pinned).toContain('StrictHostKeyChecking=yes');
-  });
-});
-
-describe('quoteShell', () => {
-  it('wraps in single quotes', () => {
-    expect(quoteShell('/a/b')).toBe(`'/a/b'`);
-  });
-
-  it('escapes embedded single quotes', () => {
-    expect(quoteShell(`/a/'b`)).toBe(`'/a/'\\''b'`);
   });
 });

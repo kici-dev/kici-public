@@ -122,7 +122,7 @@ Reads and changes rows in `workflow_registrations`. Distinct from `workflow list
 
 ```bash
 kici-admin workflow list [--org <orgId>] [--routing-key <key>] [--repo <ownerRepo>] [--trigger-type <type>] [--event <eventName>] [--json]
-kici-admin workflow register-manual --lock-file <path> --repo <ident> --routing-key <key> --customer <id> [--provider-context <json>] [--commit-sha <sha>] [--database-url <url>] [--json]
+kici-admin workflow register-manual --lock-file <path> --repo <ident> --routing-key <key> --org <id> [--provider-context <json>] [--commit-sha <sha>] [--database-url <url>] [--json]
 ```
 
 `list` inspects workflow registrations from the `workflow_registrations` table. All filters are optional and combinable.
@@ -691,7 +691,7 @@ Synopsis: `kici-admin workflow register-manual [options]`
 | `--lock-file <path>`        |         | Path to a kici.lock.json file                            |
 | `--repo <ident>`            |         | repo_identifier value (e.g. "owner/repo")                |
 | `--routing-key <key>`       |         | Routing key for the source (e.g. "github:42")            |
-| `--customer <id>`           |         | customer_id (org) to attribute rows to                   |
+| `--org <id>`                |         | Org id to attribute rows to                              |
 | `--provider-context <json>` | `{}`    | Provider-specific context as a JSON object (default: {}) |
 | `--commit-sha <sha>`        |         | Optional commit SHA stamped on each row                  |
 | `--database-url <url>`      |         | Use direct DB access instead of HTTP (offline mode)      |

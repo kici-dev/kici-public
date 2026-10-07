@@ -6,6 +6,7 @@ import {
   LogStream,
   PeerForgetOutcome,
   ScalerOrphansAction,
+  ScalerReloadOutcome,
   ScalerVmStopOutcome,
 } from '@kici-dev/engine';
 import { createLogChunkSink } from '../reporting/log-chunk-sink.js';
@@ -440,6 +441,36 @@ async function authenticateWithToken(
   peerInstanceId = 'remote-peer',
 ): Promise<{ sessionKey: Buffer; handshakeKey: Buffer; response: Record<string, any> }> {
   return authenticateV2(handler, ws, { ...tokenOpts(DEFAULT_TOKEN), peerInstanceId });
+}
+
+/**
+ * Connect a peer that authenticates with a worker join token while declaring
+ * `declaredRole` (omitted: no role). Returns the handler, its registry, the
+ * socket and K_app.
+ */
+async function connectWithWorkerToken(
+  overrides: Partial<PeerHandlerDeps>,
+  declaredRole?: 'worker' | 'coordinator',
+) {
+  const { handler, registry } = createTestHandler({
+    ...overrides,
+    tokenManager: createMockTokenManager({ role: 'worker' }) as any,
+    acceptedRoles: ['coordinator', 'worker'],
+  });
+  const ws = new MockPeerWs();
+  handler.handleConnection(ws);
+  const hs = completeEcdhHandshake(ws);
+  ws.simulateRawMessage(
+    authFrame(hs, {
+      type: 'peer.auth.request',
+      instanceId: 'remote-peer',
+      protocolVersion: PROTOCOL_VERSION,
+      token: DEFAULT_TOKEN.token,
+      ...(declaredRole ? { role: declaredRole } : {}),
+    }),
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  return { handler, registry, ws, sessionKey: appKeyOf(ws, hs) };
 }
 
 // ── Setup / Teardown ────────────────────────────────────────────────
@@ -1426,6 +1457,7 @@ describe('PeerHandler', () => {
 
       const reroute = {
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-1',
         jobId: 'job-1',
         runId: 'run-1',
@@ -1505,9 +1537,10 @@ describe('PeerHandler', () => {
     });
 
     it('serves a peer.clusterSettings.request with the resolved snapshot + version', async () => {
-      const onPeerClusterSettingsRequest = vi
-        .fn()
-        .mockResolvedValue({ version: 9, settings: { agentTokenTtlMs: 45_000 } });
+      const onPeerClusterSettingsRequest = vi.fn().mockResolvedValue({
+        version: 9,
+        settings: { agentTokenTtlMs: 45_000, concurrencyWaitTimeoutMs: 900_000 },
+      });
       const { handler } = createTestHandler({ onPeerClusterSettingsRequest });
       const ws = new MockPeerWs();
 
@@ -1530,7 +1563,7 @@ describe('PeerHandler', () => {
         type: 'peer.clusterSettings.response',
         messageId: 'req-1',
         version: 9,
-        settings: { agentTokenTtlMs: 45_000 },
+        settings: { agentTokenTtlMs: 45_000, concurrencyWaitTimeoutMs: 900_000 },
       });
     });
 
@@ -1700,14 +1733,14 @@ describe('PeerHandler', () => {
       expect(ws.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
     });
 
-    it('rejects protocol version 2, the value every 0.8.x peer sends', async () => {
-      // 0.8.0 already shipped PROTOCOL_VERSION = 2, so a floor of 2 refuses no
-      // published build: a 0.8.x peer let through has its heartbeat refused by
-      // the strict 0.9.0 schema instead of being told at connect.
+    it('rejects protocol version 3, the value every pre-R1 peer sends', async () => {
+      // Every release before R1 shipped PROTOCOL_VERSION = 3, so a floor of 3
+      // refuses no published build: a pre-R1 peer let through omits fields R1's
+      // schemas require instead of being told at connect.
       //
-      // fails-when: the floor drops back to 2 — the relative probe above would
-      // then drive 1 and still pass while a real 0.8.x peer connects.
-      const { ws, registry, authResponse } = await sendPeerAuth(2);
+      // fails-when: the floor stays at 3 — the relative probe above would then
+      // drive 2 and still pass while a real pre-R1 peer connects.
+      const { ws, registry, authResponse } = await sendPeerAuth(3);
 
       expect(authResponse?.accepted).toBe(false);
       expect(ws.closeCode).toBe(WS_CLOSE_PROTOCOL_ERROR);
@@ -1788,7 +1821,7 @@ describe('PeerHandler', () => {
         jobId: 'job-1',
         stepIndex: 0,
         lines: [
-          { text: 'Hello from worker', timestamp: Date.now() },
+          { text: 'Hello from worker', timestamp: Date.now(), stream: 'stdout' },
           { text: 'Step output line 2', timestamp: Date.now(), stream: 'stdout' },
         ],
       };
@@ -2012,25 +2045,10 @@ describe('PeerHandler', () => {
     // fails-when: a peer holding a worker join token can make a coordinator forget a peer
     it('refuses a peer holding a worker join token, whatever role it declares', async () => {
       const onPeerForgetRequest = vi.fn();
-      const { handler } = createTestHandler({
-        onPeerForgetRequest,
-        tokenManager: createMockTokenManager({ role: 'worker' }) as any,
-        acceptedRoles: ['coordinator', 'worker'],
-      });
-      const ws = new MockPeerWs();
-      handler.handleConnection(ws);
-      const hs = completeEcdhHandshake(ws);
-      ws.simulateRawMessage(
-        authFrame(hs, {
-          type: 'peer.auth.request',
-          instanceId: 'remote-peer',
-          protocolVersion: PROTOCOL_VERSION,
-          token: DEFAULT_TOKEN.token,
-          role: 'coordinator',
-        }),
+      const { ws, sessionKey } = await connectWithWorkerToken(
+        { onPeerForgetRequest },
+        'coordinator',
       );
-      await vi.advanceTimersByTimeAsync(0);
-      const sessionKey = appKeyOf(ws, hs);
       const countBefore = ws.sentMessages.length;
 
       ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
@@ -2081,6 +2099,136 @@ describe('PeerHandler', () => {
           500,
         ),
       ).toBeNull();
+    });
+  });
+
+  describe('scaler reload routing', () => {
+    /** The scaler reload response among what the handler sent after `countBefore`. */
+    function reloadResponse(ws: MockPeerWs, sessionKey: Buffer, countBefore: number): any {
+      for (const msg of ws.sentMessages.slice(countBefore)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.scaler.reload.response') return parsed;
+        } catch {
+          // ignore non-encrypted or other messages
+        }
+      }
+      return null;
+    }
+
+    const request = { type: 'peer.scaler.reload.request', messageId: 'reload-1' };
+    const plan = {
+      added: [],
+      updated: ['linux'],
+      unchanged: [],
+      retired: [],
+      resurrected: [],
+      global: [],
+    };
+
+    // breaks-if-wrong: a coordinator-role peer's request is answered
+    it('answers a request from a coordinator through onScalerReloadRequest', async () => {
+      const onScalerReloadRequest = vi
+        .fn()
+        .mockResolvedValue({ outcome: ScalerReloadOutcome.enum.applied, plan });
+      const { handler } = createTestHandler({ onScalerReloadRequest });
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const countBefore = ws.sentMessages.length;
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onScalerReloadRequest).toHaveBeenCalledTimes(1);
+      expect(reloadResponse(ws, sessionKey, countBefore)).toEqual({
+        type: 'peer.scaler.reload.response',
+        messageId: 'reload-1',
+        outcome: ScalerReloadOutcome.enum.applied,
+        plan,
+      });
+    });
+
+    // fails-when: a worker-sent peer.scaler.reload.request reaches the handler,
+    // including one that declares itself a coordinator
+    it.each([['worker'], ['coordinator']] as const)(
+      'refuses a request from a peer holding a worker join token (declared role %s)',
+      async (declaredRole) => {
+        const onScalerReloadRequest = vi.fn();
+        const { ws, sessionKey } = await connectWithWorkerToken(
+          { onScalerReloadRequest },
+          declaredRole,
+        );
+        const countBefore = ws.sentMessages.length;
+
+        ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(onScalerReloadRequest).not.toHaveBeenCalled();
+        expect(reloadResponse(ws, sessionKey, countBefore)).toMatchObject({
+          messageId: 'reload-1',
+          outcome: ScalerReloadOutcome.enum.rejected,
+          detail: 'scaler reload requests are accepted from coordinators only',
+        });
+      },
+    );
+
+    it('answers rejected when no handler is wired, and when the handler throws', async () => {
+      for (const onScalerReloadRequest of [
+        undefined,
+        vi.fn().mockRejectedValue(new Error('boom')),
+      ]) {
+        const { handler } = createTestHandler({ onScalerReloadRequest });
+        const ws = new MockPeerWs();
+        const { sessionKey } = await authenticateWithToken(handler, ws);
+        const countBefore = ws.sentMessages.length;
+
+        ws.simulateRawMessage(encryptMessage(JSON.stringify(request), sessionKey));
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(reloadResponse(ws, sessionKey, countBefore)).toMatchObject({
+          outcome: ScalerReloadOutcome.enum.rejected,
+          ...(onScalerReloadRequest
+            ? { errors: ['boom'] }
+            : { detail: 'scaler reload requests are not handled by this peer' }),
+        });
+      }
+    });
+
+    it('sendScalerReloadAndWait returns null when the target is not connected', async () => {
+      const { handler } = createTestHandler();
+      expect(
+        await handler.sendScalerReloadAndWait('nonexistent-peer', request as any, 1_000),
+      ).toBeNull();
+    });
+
+    it('sendScalerReloadAndWait resolves with the matching response, or timeout', async () => {
+      const { handler } = createTestHandler();
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+
+      const answered = handler.sendScalerReloadAndWait('remote-peer', request as any, 5_000);
+      const unanswered = handler.sendScalerReloadAndWait(
+        'remote-peer',
+        { type: 'peer.scaler.reload.request', messageId: 'reload-2' },
+        5_000,
+      );
+      ws.simulateRawMessage(
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.scaler.reload.response',
+            messageId: 'reload-1',
+            outcome: ScalerReloadOutcome.enum['not-configured'],
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await answered).toMatchObject({
+        messageId: 'reload-1',
+        outcome: ScalerReloadOutcome.enum['not-configured'],
+      });
+      expect(await unanswered).toBe('timeout');
     });
   });
 
@@ -2143,24 +2291,10 @@ describe('PeerHandler', () => {
       'refuses a request from a peer holding a worker join token (declared role %s)',
       async (declaredRole) => {
         const onScalerOrphansRequest = vi.fn();
-        const { handler, registry } = createTestHandler({
-          onScalerOrphansRequest,
-          tokenManager: createMockTokenManager({ role: 'worker' }) as any,
-          acceptedRoles: ['coordinator', 'worker'],
-        });
-        const ws = new MockPeerWs();
-        handler.handleConnection(ws);
-        const hs = completeEcdhHandshake(ws);
-        const authRequest = {
-          type: 'peer.auth.request',
-          instanceId: 'remote-peer',
-          protocolVersion: PROTOCOL_VERSION,
-          token: DEFAULT_TOKEN.token,
-          ...(declaredRole ? { role: declaredRole } : {}),
-        };
-        ws.simulateRawMessage(authFrame(hs, authRequest));
-        await vi.advanceTimersByTimeAsync(0);
-        const sessionKey = appKeyOf(ws, hs);
+        const { registry, ws, sessionKey } = await connectWithWorkerToken(
+          { onScalerOrphansRequest },
+          declaredRole,
+        );
         // The registry keeps the declared role; only the token's role is authenticated.
         expect(registry.getPeer('remote-peer')?.role).toBe(declaredRole ?? 'coordinator');
         const countBefore = ws.sentMessages.length;
@@ -2569,6 +2703,7 @@ describe('shouldAdmitWorker', () => {
     function makeJobReroute(): JobReroute {
       return jobRerouteSchema.parse({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: `msg-${randomBytes(4).toString('hex')}`,
         jobId: 'job-1',
         runId: 'run-1',

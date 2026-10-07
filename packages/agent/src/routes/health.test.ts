@@ -48,11 +48,9 @@ describe('health routes', () => {
       expect(body.connected).toBe(false);
     });
 
-    it('reports the release version in the deprecated buildCommit field, never a build commit', async () => {
-      // fails-when: the route reads a baked build commit — the private
-      // repository's commit ID then reaches every operator who reads /health.
-      // breaks-if-wrong: the deprecated key stays present, as a string, for a
-      // reader that still expects it.
+    it('carries version and no buildCommit', async () => {
+      // fails-when: buildCommit is still emitted, or a baked build commit leaks into the body.
+      // breaks-if-wrong: version must still be reported.
       const globals = { KICI_PKG_VERSION: '9.8.7', KICI_BUILD_COMMIT: 'c0ffee123' };
       Object.assign(globalThis, globals);
       try {
@@ -62,7 +60,7 @@ describe('health routes', () => {
         const body = JSON.parse(text) as Record<string, unknown>;
 
         expect(body.version).toBe(globals.KICI_PKG_VERSION);
-        expect(body.buildCommit).toBe(globals.KICI_PKG_VERSION);
+        expect(body).not.toHaveProperty('buildCommit');
         expect(text).not.toContain(globals.KICI_BUILD_COMMIT);
       } finally {
         for (const key of Object.keys(globals)) delete (globalThis as Record<string, unknown>)[key];

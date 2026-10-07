@@ -22,11 +22,13 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { EventStore } from '../events/event-store.js';
 import { redactEventPayload } from '../events/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { handleAdminError } from './admin-errors.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
+import { clampLimit } from './admin-list-limit.js';
+import { type AdminEnv, createAdminApp } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-event-dlq' });
 
@@ -38,23 +40,6 @@ export interface AdminEventDlqRoutesDeps {
   accessLog?: AccessLogWriter;
 }
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 200;
-
-function clampLimit(raw: string | undefined): number {
-  const parsed = parseInt(raw ?? '', 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_LIMIT;
-  return Math.min(parsed, MAX_LIMIT);
-}
-
 function parseCursor(raw: string | undefined): Date | undefined {
   if (!raw) return undefined;
   const date = new Date(raw);
@@ -63,9 +48,8 @@ function parseCursor(raw: string | undefined): Date | undefined {
 }
 
 export function createAdminEventDlqRoutes(deps: AdminEventDlqRoutesDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
-  // ── Bearer token auth middleware ────────────────────────────────
   const authMiddleware = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
     scope: 'admin-event-dlq',
@@ -73,63 +57,52 @@ export function createAdminEventDlqRoutes(deps: AdminEventDlqRoutesDeps): Hono<A
   app.use('/api/v1/admin/event-dlq', authMiddleware);
   app.use('/api/v1/admin/event-dlq/*', authMiddleware);
 
-  // ── GET /api/v1/admin/event-dlq — list rows ─────────────────────
   app.get('/api/v1/admin/event-dlq', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'event_dlq.read');
+    deps.rbac.requirePermission(c.get('role'), 'event_dlq.read');
 
-      const limit = clampLimit(c.req.query('limit'));
-      const beforeDlqAt = parseCursor(c.req.query('before'));
-      const tokenRoutingKey = c.get('routingKey') ?? undefined;
-      // Payload bodies are `event_log.read_payload`; `event_dlq.read` alone
-      // (the auditor role) reads DLQ metadata only.
-      const canReadPayload = deps.rbac.hasPermission(c.get('role'), 'event_log.read_payload');
+    const limit = clampLimit(c.req.query('limit'));
+    const beforeDlqAt = parseCursor(c.req.query('before'));
+    const tokenRoutingKey = c.get('routingKey') ?? undefined;
+    // Payload bodies are `event_log.read_payload`; `event_dlq.read` alone
+    // (the auditor role) reads DLQ metadata only.
+    const canReadPayload = deps.rbac.hasPermission(c.get('role'), 'event_log.read_payload');
 
-      const events = await deps.eventStore.listDlq(limit, beforeDlqAt, tokenRoutingKey);
+    const events = await deps.eventStore.listDlq(limit, beforeDlqAt, tokenRoutingKey);
 
-      const nextCursor =
-        events.length === limit ? (events[events.length - 1].dlqAt?.toISOString() ?? null) : null;
+    const nextCursor =
+      events.length === limit ? (events[events.length - 1].dlqAt?.toISOString() ?? null) : null;
 
-      return c.json(
-        {
-          events: events.map((e) => ({
-            id: e.id,
-            eventName: e.eventName,
-            payload: canReadPayload ? redactEventPayload(e.payload) : null,
-            sourceRepo: e.sourceRepo ?? null,
-            sourceRoutingKey: e.sourceRoutingKey ?? null,
-            sourceRunId: e.sourceRunId ?? null,
-            sourceJobId: e.sourceJobId ?? null,
-            chainDepth: e.chainDepth,
-            createdAt: e.createdAt.toISOString(),
-            dlqAt: e.dlqAt?.toISOString() ?? null,
-            dlqReason: e.dlqReason,
-            attempts: e.attempts,
-            lastError: e.lastError,
-          })),
-          limit,
-          nextCursor,
-        },
-        200,
-      );
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    return c.json(
+      {
+        events: events.map((e) => ({
+          id: e.id,
+          eventName: e.eventName,
+          payload: canReadPayload ? redactEventPayload(e.payload) : null,
+          sourceRepo: e.sourceRepo ?? null,
+          sourceRoutingKey: e.sourceRoutingKey ?? null,
+          sourceRunId: e.sourceRunId ?? null,
+          sourceJobId: e.sourceJobId ?? null,
+          chainDepth: e.chainDepth,
+          createdAt: e.createdAt.toISOString(),
+          dlqAt: e.dlqAt?.toISOString() ?? null,
+          dlqReason: e.dlqReason,
+          attempts: e.attempts,
+          lastError: e.lastError,
+        })),
+        limit,
+        nextCursor,
+      },
+      200,
+    );
   });
 
-  // ── GET /api/v1/admin/event-dlq/count — total DLQ depth ────────
   app.get('/api/v1/admin/event-dlq/count', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'event_dlq.read');
-      const tokenRoutingKey = c.get('routingKey') ?? undefined;
-      const total = await deps.eventStore.countDlq(tokenRoutingKey);
-      return c.json({ total }, 200);
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    deps.rbac.requirePermission(c.get('role'), 'event_dlq.read');
+    const tokenRoutingKey = c.get('routingKey') ?? undefined;
+    const total = await deps.eventStore.countDlq(tokenRoutingKey);
+    return c.json({ total }, 200);
   });
 
-  // ── POST /api/v1/admin/event-dlq/:id/retry — retry one event ──
   app.post('/api/v1/admin/event-dlq/:id/retry', async (c) => {
     const id = c.req.param('id');
     try {
@@ -195,7 +168,6 @@ export function createAdminEventDlqRoutes(deps: AdminEventDlqRoutesDeps): Hono<A
     }
   });
 
-  // ── DELETE /api/v1/admin/event-dlq/:id — discard ──────────────
   app.delete('/api/v1/admin/event-dlq/:id', async (c) => {
     const id = c.req.param('id');
     try {

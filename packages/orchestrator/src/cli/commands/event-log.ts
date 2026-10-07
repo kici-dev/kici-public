@@ -23,7 +23,8 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
+import { renderTable } from './shared/table.js';
 
 interface DeliverySummary {
   orgId: string;
@@ -46,20 +47,6 @@ interface ListResponse {
   total: number;
   limit: number;
   offset: number;
-}
-
-function renderTable(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
-  const fmtRow = (cells: string[]) =>
-    cells
-      .map((c, i) => (c ?? '').padEnd(widths[i]!))
-      .join('  ')
-      .trimEnd();
-  const lines: string[] = [];
-  lines.push(fmtRow(headers));
-  lines.push(widths.map((w) => '-'.repeat(w)).join('  '));
-  for (const r of rows) lines.push(fmtRow(r));
-  return lines.join('\n');
 }
 
 export function registerEventLogCommands(program: Command, getClient: () => AdminApiClient): void {
@@ -92,8 +79,8 @@ export function registerEventLogCommands(program: Command, getClient: () => Admi
       'Merge cold-store archived rows into the result (requires --routing-key for cold scoping)',
     )
     .option('--json', 'Emit raw JSON instead of a table')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const response = (await getClient().listEventLog({
           orgId: opts.org,
           routingKey: opts.routingKey,
@@ -143,11 +130,8 @@ export function registerEventLogCommands(program: Command, getClient: () => Admi
         console.log(
           `Showing ${response.deliveries.length} of ${response.total} (offset ${response.offset}, limit ${response.limit})`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── event-log show <deliveryId> ────────────────────────────────
   eventLog
@@ -160,8 +144,8 @@ export function registerEventLogCommands(program: Command, getClient: () => Admi
       'Routing key hint for cold-store fallback (scopes the cold scan)',
     )
     .option('--json', 'Emit raw JSON instead of formatted output')
-    .action(async (deliveryId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (deliveryId: string, opts) => {
         const response = (await getClient().getEventLog(deliveryId, {
           orgId: opts.org,
           includePayload: !!opts.includePayload,
@@ -203,11 +187,8 @@ export function registerEventLogCommands(program: Command, getClient: () => Admi
           console.log('');
           console.log(`Payload was omitted at ingress; reason: ${r.payloadOmittedReason}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }
 
 function formatBytes(bytes: number): string {

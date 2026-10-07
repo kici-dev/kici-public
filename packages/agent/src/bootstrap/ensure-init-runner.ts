@@ -23,6 +23,7 @@ import type { HostReach } from './reach.js';
 import { probeTargetPlatform } from './probe-platform.js';
 import { stageAgentPayload, type DeliveryMode } from './stage-agent-payload.js';
 import type { AgentPayloadSource } from './payload-source.js';
+import { shQuote } from '@kici-dev/core';
 
 /** Material the orchestrator returns for a bring-up (mirrors the handler result). */
 interface BringupMaterial {
@@ -112,11 +113,6 @@ function buildLauncher(
     `  ${agentCommand} >/tmp/kici-init-runner.log 2>&1 &`,
     'echo "init-runner started pid=$!"',
   ].join('\n');
-}
-
-/** Single-quote a value for safe embedding in the launcher's env assignment. */
-function shQuote(v: string): string {
-  return `'${v.replace(/'/g, `'\\''`)}'`;
 }
 
 /**

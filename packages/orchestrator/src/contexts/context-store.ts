@@ -12,6 +12,7 @@ import {
   DEFAULT_CONCURRENCY_STRATEGY,
   DEFAULT_HOLD_EXPIRY_SECONDS,
   MinimumTrustSchema,
+  toIsoString,
 } from '@kici-dev/engine';
 import type { ConcurrencyStrategy, Context as EngineContext, MinimumTrust } from '@kici-dev/engine';
 import type { Database, Context, NewContext } from '../db/types.js';
@@ -97,10 +98,8 @@ export function toContext(row: Context): EngineContext {
     minimumTrust: readMinimumTrust(row.minimum_trust),
     allowLocalExecution: row.allow_local_execution,
     enabled: row.enabled,
-    createdAt:
-      row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
-    updatedAt:
-      row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
+    createdAt: toIsoString(row.created_at),
+    updatedAt: toIsoString(row.updated_at),
     createdBy: row.created_by ?? '',
   };
 }

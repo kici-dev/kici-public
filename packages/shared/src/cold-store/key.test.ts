@@ -119,7 +119,7 @@ describe('chunkObjectKey', () => {
     );
   });
 
-  it('legacy v1 keys (no bucket) live at the day-prefix root for backward compatibility', () => {
+  it('single-chunk (v1) keys (no bucket) live at the day-prefix root', () => {
     // V1 chunks omit the bucket segment. The framework still
     // reads them via listRelevantManifests (recursive LIST under the
     // tenant prefix) and treats them as `'forever'` for the GC sweep.

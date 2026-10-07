@@ -195,8 +195,8 @@ export interface AppConfig {
     peerMaxReconnectDelayMs: number;
     /** Cluster role: coordinator (full orchestrator) or worker (delegated execution). */
     role: 'coordinator' | 'worker';
-    /** URL of the coordinator to connect to when role=worker. */
-    coordinatorUrl?: string;
+    /** URLs of every coordinator to connect to when role=worker. */
+    coordinatorUrls: string[];
     /** Stale peer timeout in ms. */
     peerStaleTimeoutMs: number;
     /** Whether this coordinator dials Platform-announced peers. */

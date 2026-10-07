@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { ScalerReloadPlan } from '@kici-dev/engine';
 import {
   ExecutionJobStatus,
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
@@ -31,6 +32,7 @@ import {
   SCALER_SHUTDOWN_GRACE_MS,
   resolveScalerOrchestratorUrl,
   buildScalerUsageRows,
+  PROVISION_IN_FLIGHT,
 } from './manager.js';
 import { agentMayRefuse, canAgentRunJob, JobContainerNeed, type AgentFitJob } from './agent-fit.js';
 import type { BoundJobRef, ProvisionBackoffSettings, ScalerManagerDeps } from './manager.js';
@@ -156,6 +158,22 @@ function createDefaultConfig() {
   };
 }
 
+/** An applied reload result: the named plan buckets, every other bucket empty. */
+function appliedPlan(buckets: Partial<ScalerReloadPlan>) {
+  return {
+    valid: true,
+    plan: {
+      added: [],
+      updated: [],
+      unchanged: [],
+      retired: [],
+      resurrected: [],
+      global: [],
+      ...buckets,
+    },
+  };
+}
+
 /**
  * The bare-metal label set every warm-pool fixture uses, carrying a declared
  * shape. A pool whose label set declares no resources is refused, so both the
@@ -243,7 +261,13 @@ type ClaimedSnapshot = Record<string, unknown> & { agentId: string };
 type FakeCapSlot = {
   clusterActiveCount: number;
   reserve: (snapshot: ClaimedSnapshot) => Promise<void>;
+  hasProvisionForJob: (jobId: string) => Promise<boolean>;
 };
+
+/** A job binding of the spawn rows a double has claimed, for `hasProvisionForJob`. */
+function claimedForJob(calls: unknown[][], jobId: string): boolean {
+  return calls.some((c) => (c[0] as { boundJobId?: string }).boundJobId === jobId);
+}
 
 /**
  * Seed a store double's cluster-wide spawn count with `seedCount` rows a peer
@@ -261,6 +285,8 @@ function seedClusterCount<T extends ReturnType<typeof fakeStateStore>>(
     fn({
       clusterActiveCount: seedCount + store.upsertSpawningAgent.mock.calls.length,
       reserve: (snapshot) => store.upsertSpawningAgent(snapshot),
+      hasProvisionForJob: async (jobId) =>
+        claimedForJob(store.upsertSpawningAgent.mock.calls, jobId),
     }),
   );
   return store;
@@ -302,7 +328,11 @@ function fakeStateStore(overrides: Record<string, unknown> = {}) {
     adoptSpawningAgent: vi.fn().mockResolvedValue(null),
     listReapCandidates: vi.fn().mockResolvedValue([]),
     withScalerCapLock: vi.fn(async (_name: string, fn: (slot: FakeCapSlot) => unknown) =>
-      fn({ clusterActiveCount: 0, reserve: (snapshot) => upsertSpawningAgent(snapshot) }),
+      fn({
+        clusterActiveCount: 0,
+        reserve: (snapshot) => upsertSpawningAgent(snapshot),
+        hasProvisionForJob: async (jobId) => claimedForJob(upsertSpawningAgent.mock.calls, jobId),
+      }),
     ),
     upsertAgentJob: vi.fn().mockResolvedValue(undefined),
     deleteAgentJob: vi.fn().mockResolvedValue(undefined),
@@ -366,6 +396,10 @@ function spawningRowTable() {
             row.scalerName === scalerName && row.backendType === ScalerBackendType.enum.event,
         ).length,
         reserve: (snapshot) => overrides.upsertSpawningAgent(snapshot),
+        hasProvisionForJob: async (jobId) =>
+          [...rows.values()].some(
+            (row) => row.scalerName === scalerName && row.boundJobId === jobId,
+          ),
       }),
     ),
     listSpawningAgents: vi.fn(async () => [...rows.values()]),
@@ -830,6 +864,44 @@ describe('ScalerManager', () => {
       // a worker would then ignore the real spawn's failure as superseded
       const spawnedId = vi.mocked(containerBackend.spawn).mock.calls[0][1];
       expect(result.action === 'spawning' && result.agentId).toBe(spawnedId);
+    });
+
+    // fails-when: no per-job check — the pending re-drive re-offers a job whose agent is
+    // still provisioning and both offers spawn (the pool's maxAgents is 20)
+    it('does not provision a second agent for a job whose provision is still in flight', async () => {
+      const manager = createManager();
+      vi.mocked(containerBackend.spawn).mockReturnValue(new Promise(() => {}));
+
+      const [a, b] = await Promise.all([
+        manager.requestScale(['linux', 'docker'], 'job-1', 'run-1'),
+        manager.requestScale(['linux', 'docker'], 'job-1', 'run-1'),
+      ]);
+      expect([a.action, b.action].sort()).toEqual(['skipped', 'spawning']);
+      expect(await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1')).toEqual({
+        action: 'skipped',
+        reason: PROVISION_IN_FLIGHT,
+      });
+      await vi.waitFor(() => expect(containerBackend.spawn).toHaveBeenCalledTimes(1));
+      // breaks-if-wrong: another job on the same pool still gets its own agent
+      expect((await manager.requestScale(['linux', 'docker'], 'job-2', 'run-1')).action).toBe(
+        'spawning',
+      );
+    });
+
+    // breaks-if-wrong: a provision that failed must not block the job's next offer
+    it('provisions the job again after its spawn failed', async () => {
+      const manager = createManager();
+      vi.mocked(containerBackend.spawn).mockRejectedValueOnce(new Error('boom'));
+
+      expect((await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1')).action).toBe(
+        'spawning',
+      );
+      await vi.waitFor(() => expect(containerBackend.spawn).toHaveBeenCalledTimes(1));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      vi.mocked(containerBackend.spawn).mockReturnValue(new Promise(() => {}));
+      expect((await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1')).action).toBe(
+        'spawning',
+      );
     });
 
     it('is a no-op while draining (no fresh capacity spawned)', async () => {
@@ -2968,9 +3040,12 @@ describe('ScalerManager', () => {
       // entry object is the one the backend holds, so this moves live config on
       // both sides — exactly what the teardown must not read.
       entry.provisioningTargets = ['org/edited-since'];
-      expect(await manager.reload({ version: 1, globalMaxAgents: 100, scalers: [entry] })).toEqual({
-        valid: true,
-      });
+      expect(await manager.reload({ version: 1, globalMaxAgents: 100, scalers: [entry] })).toEqual(
+        appliedPlan({
+          // Edited in place: the plan compares against the applied copy, not the live object.
+          updated: [entry.name],
+        }),
+      );
 
       manager.onAgentDisconnected(agentId);
 
@@ -5017,7 +5092,12 @@ describe('ScalerManager', () => {
 
       const result = await manager.reload(newConfig);
 
-      expect(result).toEqual({ valid: true });
+      expect(result).toEqual(
+        appliedPlan({
+          unchanged: ['container-prod', 'bare-metal-gpu'],
+          global: ['globalMaxAgents'],
+        }),
+      );
       expect(containerBackend.reload).toHaveBeenCalledWith(newConfig.scalers[0].labelSets, {
         maxAgents: newConfig.scalers[0].maxAgents,
         entry: newConfig.scalers[0],
@@ -5083,6 +5163,93 @@ describe('ScalerManager', () => {
       expect(applying.labelSets).toEqual(originalLabelSets);
     });
 
+    // fails-when: a kept scaler whose entry changed is reported unchanged
+    it('reports a kept scaler whose entry changed as updated and an identical one as unchanged', async () => {
+      const manager = createManager();
+      const cfg = createDefaultConfig();
+
+      const result = await manager.reload({
+        ...cfg,
+        scalers: [{ ...cfg.scalers[0], maxAgents: 6 }, cfg.scalers[1]],
+      });
+
+      expect(result).toEqual(
+        appliedPlan({
+          updated: ['container-prod'],
+          unchanged: ['bare-metal-gpu'],
+        }),
+      );
+    });
+
+    // breaks-if-wrong: re-reading the same file must report every scaler unchanged,
+    // whatever order its keys come in
+    it('reports an identical config as unchanged, independent of key order', async () => {
+      const manager = createManager();
+      const cfg = createDefaultConfig();
+      const reordered = cfg.scalers.map(
+        (entry) => Object.fromEntries(Object.entries(entry).reverse()) as typeof entry,
+      );
+
+      const result = await manager.reload({ ...cfg, scalers: reordered });
+
+      expect(result.valid && result.plan.updated).toEqual([]);
+      expect(result.valid && result.plan.unchanged).toEqual(['container-prod', 'bare-metal-gpu']);
+    });
+
+    it('lists a changed global resource cap', async () => {
+      const manager = createManager();
+
+      const result = await manager.reload({
+        ...createDefaultConfig(),
+        globalResourceCap: { maxCpu: 8, maxMemoryBytes: 8 * 1024 ** 3 },
+      });
+
+      expect(result.valid && result.plan.global).toEqual(['globalResourceCap']);
+    });
+
+    // fails-when: a refused reload returns a plan, or leaves a backend holding the new maxAgents
+    it('a refused reload carries no plan and leaves every backend as it was', async () => {
+      // The backend applies inside `reload`, as a real one does. The refusal comes
+      // from an added scaler whose backend does not build, a stage that runs
+      // after the kept backends took the new config, so only the rollback keeps
+      // `maxAgents: 9` from staying behind.
+      containerBackend.reload = vi.fn(
+        (labelSets: LabelSetConfig[], opts?: { maxAgents?: number }): ValidationResult => {
+          (containerBackend as { maxAgents: number }).maxAgents = opts?.maxAgents ?? 5;
+          return { valid: true };
+        },
+      );
+      const createBackend = vi.fn(async () => {
+        throw new Error('no such image');
+      });
+      const manager = createManager(undefined, undefined, undefined, createBackend);
+      const cfg = createDefaultConfig();
+      const before = manager.getStatus().backends.map((b) => [b.name, b.maxAgents]);
+
+      const result = await manager.reload({
+        ...cfg,
+        scalers: [
+          { ...cfg.scalers[0], maxAgents: 9 },
+          cfg.scalers[1],
+          {
+            name: 'container-arm',
+            type: 'container' as const,
+            maxAgents: 4,
+            maxConcurrentSpawns: 2,
+            labelSets: [{ labels: ['linux', 'arm64'], image: 'arm:latest' }],
+          },
+        ],
+      });
+
+      expect(result).toEqual({ valid: false, errors: ['scaler "container-arm": no such image'] });
+      // The apply path ran: without the rollback the 9 would still stand.
+      expect(containerBackend.reload).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ maxAgents: 9 }),
+      );
+      expect(manager.getStatus().backends.map((b) => [b.name, b.maxAgents])).toEqual(before);
+    });
+
     /** The added scaler every add/remove test below reloads with. */
     function armEntry() {
       return {
@@ -5106,7 +5273,12 @@ describe('ScalerManager', () => {
       const cfg = createDefaultConfig();
       const result = await manager.reload({ ...cfg, scalers: [...cfg.scalers, armEntry()] });
 
-      expect(result).toEqual({ valid: true });
+      expect(result).toEqual(
+        appliedPlan({
+          added: ['container-arm'],
+          unchanged: ['container-prod', 'bare-metal-gpu'],
+        }),
+      );
       expect(createBackend).toHaveBeenCalledTimes(1);
       expect(manager.hasBackendForLabels(['linux', 'arm64'])).toBe(true);
       expect(manager.getStatus().backends.map((b) => b.name)).toContain('container-arm');
@@ -5240,7 +5412,12 @@ describe('ScalerManager', () => {
 
       const result = await manager.reload({ ...cfg, scalers: [cfg.scalers[0]] });
 
-      expect(result).toEqual({ valid: true });
+      expect(result).toEqual(
+        appliedPlan({
+          unchanged: ['container-prod'],
+          retired: ['bare-metal-gpu'],
+        }),
+      );
       expect(manager.hasBackendForLabels(['linux', 'gpu'])).toBe(false);
       const gpu = manager.getStatus().backends.find((b) => b.name === 'bare-metal-gpu');
       expect(gpu?.retiring).toBe(true);
@@ -5268,7 +5445,12 @@ describe('ScalerManager', () => {
 
       const result = await manager.reload({ ...cfg, scalers: [cfg.scalers[0]] });
 
-      expect(result).toEqual({ valid: true });
+      expect(result).toEqual(
+        appliedPlan({
+          unchanged: ['container-prod'],
+          retired: ['bare-metal-gpu'],
+        }),
+      );
       // Retired (no new routing) but NOT torn down — the in-flight spawn still
       // needs a backend to own the agent it lands.
       expect(manager.hasBackendForLabels(['linux', 'gpu'])).toBe(false);
@@ -5304,7 +5486,12 @@ describe('ScalerManager', () => {
 
       const result = await manager.reload(cfg);
 
-      expect(result).toEqual({ valid: true });
+      expect(result).toEqual(
+        appliedPlan({
+          unchanged: ['container-prod'],
+          resurrected: ['bare-metal-gpu'],
+        }),
+      );
       expect(manager.hasBackendForLabels(['linux', 'gpu'])).toBe(true);
       expect(createBackend).not.toHaveBeenCalled();
       expect(manager.getStatus().backends.find((b) => b.name === 'bare-metal-gpu')?.retiring).toBe(
@@ -5481,6 +5668,7 @@ describe('ScalerManager', () => {
               name: 'win-pool',
               type: 'bare-metal',
               maxAgents: 2,
+              platform: { os: 'windows', arch: 'x64' },
               labelSets: [{ labels: ['windows', 'bare-metal'], binaryPath: '/kici-agent.exe' }],
             },
             {
@@ -5530,7 +5718,7 @@ describe('ScalerManager', () => {
       const manager = createPlatformManager();
       // Spawn a windows-pool agent for an OS-qualified job.
       await manager.requestScale(['windows', 'bare-metal'], 'job-w', 'run-w');
-      // On registration, the returned gate must include the derived `windows`
+      // On registration, the returned gate must include the structured `windows`
       // taint even though the pool declared no explicit mandatoryLabels — so the
       // local queue-drain and eager-dispatch paths reject an unqualified job that
       // would otherwise land on this wrong-OS agent.
@@ -5541,9 +5729,8 @@ describe('ScalerManager', () => {
       expect(registered?.mandatoryLabels).toContain('windows');
     });
 
-    // A pool that declares a non-canonical OS label (`windows-2022`) that the
-    // denylist would NOT catch, but supplies the structured platform field so
-    // the taint still applies. Proves the synonym-escape gap is closed.
+    // A pool that declares a non-canonical OS label (`windows-2022`) and the
+    // structured platform field: the taint derives from the field alone.
     function createStructuredPlatformManager(): ScalerManager {
       const winBackend = createMockBackend({
         type: 'bare-metal',
@@ -5572,11 +5759,9 @@ describe('ScalerManager', () => {
       });
     }
 
-    it('taints a synonym-labeled pool via the structured platform field (closes the denylist gap)', () => {
+    it('taints a synonym-labeled pool via the structured platform field', () => {
       const status = createStructuredPlatformManager().getStatus();
       const pool = status.backends.find((b) => b.name === 'win2022-pool');
-      // Without the structured field, `windows-2022` escapes PLATFORM_TAINT_LABELS
-      // and the pool would carry no taint. With it, the pool is tainted.
       expect(pool?.labelSetMandatoryLabels.flat()).toContain('windows');
     });
 
@@ -5612,15 +5797,13 @@ describe('ScalerManager', () => {
     });
   });
 
-  describe('mixed-platform label sets', () => {
-    // `container` with no declared `platform` resolves to null on every host,
-    // so the only taints in play are the legacy ones derived from each label
-    // set's own labels — and the assertions stay machine-independent. A
-    // bare-metal fixture would host-derive `arm64` on an arm64 box.
-    function createMixedManager(): ScalerManager {
+  describe('per-label-set gate advertisement', () => {
+    // A container pool with a declared platform: the gate is the structured
+    // taint on every label set, independent of the host the test runs on.
+    function createArmManager(): ScalerManager {
       const labelSets = [
         { labels: ['linux', 'gpu'], image: 'gpu:latest' },
-        { labels: ['macos', 'xcode'], image: 'mac:latest' },
+        { labels: ['linux', 'cpu'], image: 'cpu:latest' },
       ];
       const backend = createMockBackend({ type: 'container', labelSets, maxAgents: 4 });
       return new ScalerManager({
@@ -5631,89 +5814,72 @@ describe('ScalerManager', () => {
           globalMaxAgents: 10,
           scalers: [
             {
-              name: 'mixed-pool',
+              name: 'arm-pool',
               type: 'container' as const,
               maxAgents: 4,
               maxConcurrentSpawns: 8,
+              platform: { os: 'linux', arch: 'arm64' },
               labelSets,
             },
           ],
         },
-        backends: [{ name: 'mixed-pool', backend }],
+        backends: [{ name: 'arm-pool', backend }],
       });
     }
 
-    it('advertises a gate per label set', () => {
-      const status = createMixedManager().getStatus();
-      const mixed = status.backends.find((b) => b.name === 'mixed-pool');
-      expect(mixed?.labelSetMandatoryLabels).toEqual([[], ['macos']]);
-      // fails-when: the scaler-wide union returns — on a mixed-platform scaler
-      // it names a taint no single label set can satisfy.
-      expect(mixed).not.toHaveProperty('mandatoryLabels');
+    it('advertises the structured taint on every label set, and nothing scaler-wide', () => {
+      const pool = createArmManager()
+        .getStatus()
+        .backends.find((b) => b.name === 'arm-pool');
+      expect(pool?.labelSetMandatoryLabels).toEqual([['arm64'], ['arm64']]);
+      expect(pool).not.toHaveProperty('mandatoryLabels');
     });
 
     it('keeps labelSetMandatoryLabels index-aligned with labelSets', () => {
-      const mixed = createMixedManager()
+      const pool = createArmManager()
         .getStatus()
-        .backends.find((b) => b.name === 'mixed-pool');
-      expect(mixed?.labelSetMandatoryLabels).toHaveLength(mixed?.labelSets.length ?? -1);
+        .backends.find((b) => b.name === 'arm-pool');
+      expect(pool?.labelSetMandatoryLabels).toHaveLength(pool?.labelSets.length ?? -1);
     });
 
-    it('routes a linux job to the linux label set despite the macos sibling', async () => {
-      const manager = createMixedManager();
-      // Under the scaler-wide union this asked the job to declare `macos`,
-      // so the linux label set was unroutable.
-      const result = await manager.requestScale(['linux', 'gpu'], 'job-l', 'run-l');
-      expect(result.action).toBe('spawning');
+    it('refuses an unqualified job and routes an arm64-qualified one', async () => {
+      const manager = createArmManager();
+      // fails-when: a plain label set taints nothing and the pool takes unqualified work.
+      expect((await manager.requestScale(['linux', 'gpu'], 'job-u', 'run-u')).action).toBe(
+        'no-backend',
+      );
+      // breaks-if-wrong: a job that requests the platform must still route here.
+      expect((await manager.requestScale(['linux', 'gpu', 'arm64'], 'job-a', 'run-a')).action).toBe(
+        'spawning',
+      );
     });
 
-    it('still refuses an unqualified job on the macos label set', async () => {
-      const manager = createMixedManager();
-      const result = await manager.requestScale(['xcode'], 'job-x', 'run-x');
-      expect(result.action).toBe('no-backend');
-    });
-
-    it('stamps only the spawning label set gate onto the registered agent', async () => {
-      const manager = createMixedManager();
-      await manager.requestScale(['linux', 'gpu'], 'job-l2', 'run-l2');
+    it('stamps the structured gate onto an agent spawned for a label set', async () => {
+      const manager = createArmManager();
+      await manager.requestScale(['linux', 'cpu', 'arm64'], 'job-c', 'run-c');
       const spawnedId = [
         ...(manager as unknown as { spawningAgents: Map<string, unknown> }).spawningAgents.keys(),
       ][0];
-      const registered = await manager.onAgentRegistered(spawnedId, ['linux', 'gpu']);
-      // The sibling set's `macos` taint must not reach a linux agent, or
-      // `AgentRegistry.findAvailable` could never return it.
-      expect(registered?.mandatoryLabels).toEqual([]);
-    });
-
-    it('stamps the macos gate onto an agent spawned for the macos label set', async () => {
-      const manager = createMixedManager();
-      await manager.requestScale(['macos', 'xcode'], 'job-m', 'run-m');
-      const spawnedId = [
-        ...(manager as unknown as { spawningAgents: Map<string, unknown> }).spawningAgents.keys(),
-      ][0];
-      const registered = await manager.onAgentRegistered(spawnedId, ['macos', 'xcode']);
-      expect(registered?.mandatoryLabels).toEqual(['macos']);
+      const registered = await manager.onAgentRegistered(spawnedId, ['linux', 'cpu', 'arm64']);
+      expect(registered?.mandatoryLabels).toEqual(['arm64']);
     });
 
     it('advertises the per-label-set gate to peers, and nothing scaler-wide', () => {
-      const capacity = createMixedManager().getRoutableCapacity();
-      const mixed = capacity.find((c) => c.name === 'mixed-pool');
-      expect(mixed?.labelSetMandatoryLabels).toEqual([[], ['macos']]);
-      // fails-when: the removed scaler-wide union is advertised again — the
-      // strict wire schema on the receiving peer would refuse the whole
-      // heartbeat.
-      expect(mixed).not.toHaveProperty('mandatoryLabels');
+      const capacity = createArmManager().getRoutableCapacity();
+      const pool = capacity.find((c) => c.name === 'arm-pool');
+      expect(pool?.labelSetMandatoryLabels).toEqual([['arm64'], ['arm64']]);
+      // fails-when: a scaler-wide union is advertised — the strict wire schema
+      // on the receiving peer would refuse the whole heartbeat.
+      expect(pool).not.toHaveProperty('mandatoryLabels');
     });
 
     it('keeps the per-set gates while retiring', () => {
-      const manager = createMixedManager();
-      retire(manager, 'mixed-pool');
-      const mixed = manager.getStatus().backends.find((b) => b.name === 'mixed-pool');
-      // A retiring scaler has no enriched entry, so the gate takes its fallback
-      // branch, which must still carry the `macos` taint the second label set
-      // derives from its platform.
-      expect(mixed?.retiring).toBe(true);
-      expect(mixed?.labelSetMandatoryLabels).toEqual([[], ['macos']]);
+      const manager = createArmManager();
+      retire(manager, 'arm-pool');
+      const pool = manager.getStatus().backends.find((b) => b.name === 'arm-pool');
+      // A retiring scaler has no enriched entry, so the gate takes its fallback branch.
+      expect(pool?.retiring).toBe(true);
+      expect(pool?.labelSetMandatoryLabels).toEqual([['arm64'], ['arm64']]);
     });
   });
 
@@ -6409,6 +6575,24 @@ describe('ScalerManager', () => {
       expect(scalerCapLockFailuresTotal.add).not.toHaveBeenCalled();
     });
 
+    // fails-when: a coordinator provisions a job a peer already holds a spawn row for,
+    // because the per-job check only reads this process's own maps
+    it('refuses an event spawn for a job a peer already provisions', async () => {
+      const stateStore = seedClusterCount(fakeStateStore(), 0);
+      stateStore.upsertSpawningAgent({ agentId: 'peer-agent', boundJobId: 'job-1' });
+      const emitter = fakeEmitter();
+      const manager = makeManagerWithEventBackend({ stateStore, emitter });
+
+      const result = await manager.requestScale(EVENT_LABELS, 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(result).toEqual({ action: 'skipped', reason: PROVISION_IN_FLIGHT });
+      expect(emitter.emitScalerScaleUp).not.toHaveBeenCalled();
+      // breaks-if-wrong: a different job on the same scaler is still admitted
+      const other = await manager.requestScale(EVENT_LABELS, 'job-2', 'run-1');
+      expect(other.action).toBe('spawning');
+    });
+
     it('admits an event spawn below the cap and claims the slot in the same lock', async () => {
       // The positive control for the case above: same harness, one fewer peer.
       const stateStore = seedClusterCount(fakeStateStore(), 9);
@@ -6487,6 +6671,8 @@ describe('ScalerManager', () => {
           return fn({
             clusterActiveCount: 9 + stateStore.upsertSpawningAgent.mock.calls.length,
             reserve: (snapshot) => stateStore.upsertSpawningAgent(snapshot),
+            hasProvisionForJob: async (jobId) =>
+              claimedForJob(stateStore.upsertSpawningAgent.mock.calls, jobId),
           });
         },
       );

@@ -771,8 +771,8 @@ export class RunCoordinator {
    *   timer: whichever fires first removes the tracking entry.
    * - `final: false` — the worker is retrying. Re-arm the window for one more
    *   attempt plus the backoff; treat the `maxAttempts`-th such relay as final.
-   * - no verdict — an older worker that retries without a bound. The window
-   *   armed at the reroute keeps running unchanged.
+   * - no verdict — a repeated report of one failed spawn. The window armed at
+   *   the reroute keeps running unchanged.
    *
    * Two guards make the re-dispatch safe. First, source provenance: the failure
    * must come from `fromPeerId === tracked.peerId` (the authenticated connection

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { ScalerReloadOutcome } from '@kici-dev/engine';
 import { ConfigReloader } from './reload.js';
 import type { ConfigReloaderDeps, ReloadResult } from './reload.js';
 import type { AppConfig, SharedConfig } from './types.js';
@@ -427,6 +428,32 @@ describe('ConfigReloader', () => {
       await reloader.executeReload({ source: 'sighup' });
 
       expect(onScalerReload).toHaveBeenCalled();
+    });
+
+    // fails-when: a refused scaler file is dropped from the result, so
+    // `kici-admin config reload` prints a plain success
+    it('reports a refused scaler config in result.scaler while success stays true', async () => {
+      const scaler = { outcome: ScalerReloadOutcome.enum.rejected, errors: ['overlap'] };
+      const deps = makeDeps({
+        resolveFullConfig: vi.fn().mockReturnValue(makeConfig({ logLevel: 'debug' })),
+        onScalerReload: vi.fn().mockResolvedValue(scaler),
+      });
+
+      const result = await new ConfigReloader(makeConfig(), deps).executeReload({ source: 'http' });
+
+      expect(result.success).toBe(true);
+      expect(result.scaler).toEqual(scaler);
+    });
+
+    // breaks-if-wrong: an orchestrator without a scaler config answers without the field
+    it('leaves result.scaler unset without a scaler reload', async () => {
+      const deps = makeDeps({
+        resolveFullConfig: vi.fn().mockReturnValue(makeConfig({ logLevel: 'debug' })),
+      });
+
+      const result = await new ConfigReloader(makeConfig(), deps).executeReload({ source: 'http' });
+
+      expect(result).not.toHaveProperty('scaler');
     });
   });
 

@@ -20,7 +20,7 @@ The needs-aware dispatch scheduler is a DB-backed module that gates job dispatch
 
 ## Schema
 
-The squashed baseline migration `001_initial` provides:
+Migration `001_initial` creates the columns, the edge table and the indexes below; migration `047_needs_run_on` adds the `run_on` column.
 
 ### Columns on `execution_jobs`
 
@@ -149,12 +149,12 @@ In the cluster coordinator path, the coordinator subscribes to peer `onJobStatus
 
 ## Source
 
-| Component                | Source                                                                                                            |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| Scheduler module         | `packages/orchestrator/src/pipeline/needs-scheduler.ts`                                                           |
-| Execution tracker hook   | `packages/orchestrator/src/reporting/execution-tracker.ts`                                                        |
-| Restart recovery         | `packages/orchestrator/src/orchestrator-core.ts` (recomputeNeedsSatisfied over pending jobs of non-terminal runs) |
-| Migration                | Squashed into `packages/orchestrator/src/db/migrations/001_initial.ts`                                            |
-| Edge insertion (static)  | `packages/orchestrator/src/pipeline/dispatch-matched-workflow.ts` (insertEdgesForRun call)                        |
-| Edge insertion (dynamic) | `packages/orchestrator/src/pipeline/dispatch-matched-workflow.ts` (resolveGroupEdges call)                        |
-| Dispatch callback        | `packages/orchestrator/src/pipeline/processor.ts` (dispatchReadyJob)                                              |
+| Component                | Source                                                                                                                  |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| Scheduler module         | `packages/orchestrator/src/pipeline/needs-scheduler.ts`                                                                 |
+| Execution tracker hook   | `packages/orchestrator/src/reporting/execution-tracker.ts`                                                              |
+| Restart recovery         | `packages/orchestrator/src/orchestrator-core.ts` (recomputeNeedsSatisfied over pending jobs of non-terminal runs)       |
+| Migrations               | `packages/orchestrator/src/db/migrations/001_initial.ts`, `packages/orchestrator/src/db/migrations/047_needs_run_on.ts` |
+| Edge insertion (static)  | `packages/orchestrator/src/pipeline/dispatch-matched-workflow.ts` (insertEdgesForRun call)                              |
+| Edge insertion (dynamic) | `packages/orchestrator/src/pipeline/dispatch-matched-workflow.ts` (resolveGroupEdges call)                              |
+| Dispatch callback        | `packages/orchestrator/src/pipeline/processor.ts` (dispatchReadyJob)                                                    |

@@ -14,6 +14,7 @@ const sampleRun = {
   status: 'success' as const,
   jobCount: 1,
   startedAt: 1_700_000_000_000,
+  statusEpoch: 0,
   jobs: [{ jobId: 'j1', jobName: 'build', status: 'success' }],
 };
 

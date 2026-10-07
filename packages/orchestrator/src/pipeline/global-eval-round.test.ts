@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  AgentCapabilityFlag,
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
   type LockJobOrFactory,
   type LockWorkflow,
@@ -12,7 +11,6 @@ import {
   isRoundGenerator,
   partitionCandidates,
   runGlobalEvalRounds,
-  RESULT_AWARE_UNSUPPORTED_REASON,
   truncateReasonText,
   MAX_ROUND_REASON_CHARS,
   MIN_GLOBAL_EVAL_AGENT_VERSION,
@@ -1446,10 +1444,6 @@ function candidateWithJobs(
   return { reg: registration({ id: `reg-${name}`, workflowName: name, lockEntry }), lockEntry };
 }
 
-const SKIPS_RESULT_AWARE = {
-  [AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators]: true,
-};
-
 describe('result-aware generators and the round', () => {
   it('classifies only a needs-free dynamic entry as a round generator', () => {
     expect(isRoundGenerator(DYNAMIC_JOB)).toBe(true);
@@ -1494,7 +1488,6 @@ describe('result-aware generators and the round', () => {
           platform: agent.platform ?? 'linux',
           arch: agent.arch ?? 'x64',
           version: agent.version,
-          capabilities: agent.capable ? SKIPS_RESULT_AWARE : null,
         })),
     };
   }
@@ -1579,10 +1572,10 @@ describe('result-aware generators and the round', () => {
     expect(h.dispatched[0].runsOnLabels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
   });
 
-  it.each([
-    { name: 'every registered init-runner lacks the flag', capable: false, refused: true },
-    { name: 'one registered init-runner has the flag', capable: true, refused: false },
-  ])('refuses a result-aware candidate up front only when $name', async ({ capable, refused }) => {
+  it('runs a result-aware candidate with its group even when no agent carries the label', async () => {
+    // breaks-if-wrong: the removed capability refusal must not come back as a
+    // verdict; the round queues on the label and a scaler or agent serves it.
+    // fails-when: the mixed candidate is refused up front instead of dispatched.
     const mixed = candidateWithJobs('mixed', [DYNAMIC_JOB, RESULT_AWARE_JOB]);
     const plain = candidateWithJobs('plain', [DYNAMIC_JOB]);
     const h = harness((input) => ({
@@ -1594,26 +1587,13 @@ describe('result-aware generators and the round', () => {
     }));
     const { verdicts, failures } = await runGlobalEvalRounds(
       roundArgs([mixed, plain], h, {
-        agentRegistry: fleet([
-          { version: '0.9.0', capable: false },
-          { version: '0.9.1', capable },
-        ]),
+        agentRegistry: fleet([{ version: '0.9.0', capable: false }]),
       }),
     );
-    // fails-when: a fleet of registered agents that all lack the flag is sent the mixed candidate
-    expect(verdicts.get(candidateKey(mixed))?.indeterminate === true).toBe(refused);
-    if (refused) {
-      expect(verdicts.get(candidateKey(mixed))?.reason).toContain(RESULT_AWARE_UNSUPPORTED_REASON);
-      expect(failures).toEqual([
-        expect.objectContaining({ workflowNames: ['mixed'], attempts: 0 }),
-      ]);
-      // The plain candidate in the same group still runs, with no feature label.
-      expect(h.dispatched).toHaveLength(1);
-      expect(h.dispatched[0].runsOnLabels).not.toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
-    } else {
-      expect(failures).toEqual([]);
-      expect(verdicts.get(candidateKey(mixed))?.run).toBe(true);
-    }
+    expect(failures).toEqual([]);
+    expect(h.dispatched).toHaveLength(1);
+    expect(h.dispatched[0].runsOnLabels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+    expect(verdicts.get(candidateKey(mixed))?.run).toBe(true);
     expect(verdicts.get(candidateKey(plain))?.run).toBe(true);
   });
 

@@ -13,6 +13,7 @@ describe('EventBuffer', () => {
       type: 'webhook.ack',
       messageId: 'ack-1',
       deliveryId: 'delivery-1',
+      result: 'accepted',
     };
 
     buffer.add(msg);
@@ -24,7 +25,12 @@ describe('EventBuffer', () => {
   it('inherits default maxSize of 10000 from RingBuffer', () => {
     const buffer = new EventBuffer();
     for (let i = 0; i < 10_001; i++) {
-      buffer.add({ type: 'webhook.ack', messageId: String(i), deliveryId: `d-${i}` });
+      buffer.add({
+        type: 'webhook.ack',
+        messageId: String(i),
+        deliveryId: `d-${i}`,
+        result: 'accepted',
+      });
     }
     expect(buffer.size()).toBe(10_000);
   });

@@ -13,13 +13,7 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-import {
-  AGENT_CAPABILITIES,
-  AgentCapabilityFlag,
-  LogStream,
-  agentLogChunkSchema,
-  hasAgentCapability,
-} from '@kici-dev/engine';
+import { LogStream, agentLogChunkSchema } from '@kici-dev/engine';
 import {
   createAgentWsHandler,
   frameIdentity,
@@ -334,31 +328,6 @@ describe('createAgentWsHandler', () => {
       expect(entry).toBeDefined();
       expect(entry!.runningAsUser).toBe('ci-runner');
       expect(entry!.runningAsUid).toBe(1001);
-    });
-
-    it('stores the capabilities the agent advertised, and none when it advertised none', async () => {
-      const handler = createHandler();
-      const flag = AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators;
-      const wsNew = mockWs();
-      handler.onOpen!(new Event('open'), wsNew as any);
-      await handler.onMessage!(
-        makeMessageEvent({
-          ...registerMsg({ agentId: 'agent-new' }),
-          capabilities: AGENT_CAPABILITIES,
-        }),
-        wsNew as any,
-      );
-      const wsOld = mockWs();
-      handler.onOpen!(new Event('open'), wsOld as any);
-      await handler.onMessage!(
-        makeMessageEvent(registerMsg({ agentId: 'agent-old' })),
-        wsOld as any,
-      );
-
-      // fails-when: the advertised capabilities are dropped between the wire and the registry
-      expect(hasAgentCapability(registry.get('agent-new')!.capabilities, flag)).toBe(true);
-      // breaks-if-wrong: a pre-capability agent must still register, reading as supporting nothing
-      expect(registry.get('agent-old')!.capabilities).toBeNull();
     });
 
     it('stores agentId on WS context for disconnect handling', async () => {
@@ -736,21 +705,20 @@ describe('createAgentWsHandler', () => {
       expect(ts.validate).not.toHaveBeenCalled();
     });
 
-    it('refuses protocol version 2, the value every 0.8.x agent sends', async () => {
-      // The literal matters: 0.8.0 already shipped PROTOCOL_VERSION = 2, so a
-      // floor of 2 refuses no published build. A 0.8.x agent let through the
-      // handshake has every `artifacts.upload.complete` refused by the strict
-      // 0.9.0 schema instead of being told at connect.
+    it('refuses protocol version 3, the value every pre-R1 agent sends', async () => {
+      // The literal matters: every release before R1 shipped PROTOCOL_VERSION = 3.
+      // A pre-R1 agent let through the handshake omits fields R1's schemas
+      // require and has those frames refused instead of being told at connect.
       //
-      // fails-when: the floor drops back to 2 — `PROTOCOL_VERSION - 1` above
-      // would then drive 1 and still pass while a real 0.8.x agent connects.
+      // fails-when: the floor stays at 3 — `PROTOCOL_VERSION - 1` above would
+      // then drive 2 and still pass while a real pre-R1 agent connects.
       const ts = mockTokenStore();
       const handler = createHandler({ agentAuthMode: 'token', tokenStore: ts });
       const ws = mockWs();
 
       handler.onOpen!(new Event('open'), ws as any);
       await handler.onMessage!(
-        makeMessageEvent({ ...authRequestMsg(), protocolVersion: 2 }),
+        makeMessageEvent({ ...authRequestMsg(), protocolVersion: 3 }),
         ws as any,
       );
 
@@ -2161,24 +2129,6 @@ describe('createAgentWsHandler', () => {
       expect(uploads.size).toBe(0);
     });
 
-    it('an upload frame from an older agent (no depsHash) still settles', async () => {
-      const { deps, depCache, cacheStorage, uploads } = setup();
-      const handler = createAgentWsHandler(deps);
-      const ws = await connect(handler);
-
-      const upload = handler.onMessage!(
-        makeMessageEvent(uploadCompleteMsg({ depsHash: undefined })),
-        ws as any,
-      );
-      const status = handler.onMessage!(makeMessageEvent(statusMsg()), ws as any);
-      await Promise.all([upload, status]);
-
-      expect(cacheStorage.initMeta).toHaveBeenCalledTimes(1);
-      expect(depCache.publishPointer).not.toHaveBeenCalled();
-      expect(onJobStatus).toHaveBeenCalledTimes(1);
-      expect(uploads.size).toBe(0);
-    });
-
     it('a refused upload frame settles its registration', async () => {
       // fails-when: the refusal breaks out before settling, leaving the record.
       const tracker = new OwnershipTracker({
@@ -2979,7 +2929,7 @@ describe('createAgentWsHandler', () => {
       });
     });
 
-    it('register.ack advertises the artifactCompleteAck capability', async () => {
+    it('register.ack advertises an empty capability set', async () => {
       const { handler } = setup({});
       const ws = mockWs();
       handler.onOpen!(new Event('open'), ws as any);
@@ -2988,7 +2938,8 @@ describe('createAgentWsHandler', () => {
       const ack = (ws.send as ReturnType<typeof vi.fn>).mock.calls
         .map((c) => JSON.parse(c[0]))
         .find((m) => m.type === 'register.ack');
-      expect(ack?.capabilities?.artifactCompleteAck).toBe(true);
+      // fails-when: the orchestrator advertises a removed flag such as artifactCompleteAck again.
+      expect(ack?.capabilities).toEqual({});
     });
 
     it('artifacts.download.request replies found with the presigned GET', async () => {
@@ -3155,6 +3106,7 @@ describe('createAgentWsHandler', () => {
           jobId: 'job-1',
           cacheType: 'source',
           contentHash: 'abc',
+          sourceTarDigest: 'def',
           platform: 'linux',
           arch: 'x64',
         }),
@@ -3366,6 +3318,7 @@ describe('createAgentWsHandler', () => {
           jobId: 'job-1',
           stepIndex: -1,
           lines: ['[job-setup] Setup failed: boom'],
+          stream: 'stdout',
           timestamp: Date.now(),
         }),
         ws as any,
@@ -4422,8 +4375,9 @@ describe('isValidLogChunk', () => {
     timestamp: 1,
   };
 
-  it('accepts a chunk with no stream (the field is optional)', () => {
-    expect(isValidLogChunk(base)).toBe(true);
+  it('rejects a chunk with no stream', () => {
+    // fails-when: the fast path still treats `stream` as optional.
+    expect(isValidLogChunk(base)).toBe(false);
   });
 
   it('accepts a chunk carrying either known stream', () => {

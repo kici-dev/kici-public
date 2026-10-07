@@ -19,6 +19,7 @@ import type {
   DiscoveredInstance,
   LaunchSpec,
 } from './types.js';
+import { sleep } from '@kici-dev/engine';
 
 /** Reverse-DNS label prefix for KiCI services. */
 const LABEL_PREFIX = 'dev.kici';
@@ -66,11 +67,6 @@ const PRINT_NO_SUCH_DOMAIN = 112;
  * launchd is still finishing.
  */
 const FAILED_BOOTOUT_SETTLE_MS = 5_000;
-
-/** Async sleep used to pace launchd bootout/bootstrap reconciliation. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 export class LaunchdServiceManager implements ServiceManager {
   readonly platform = 'launchd' as const;

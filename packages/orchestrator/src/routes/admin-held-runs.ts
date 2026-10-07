@@ -49,10 +49,7 @@ import {
   HeldRunQueueType,
   HoldScope,
   PLATFORM_CONNECTED_MODES,
-  normalizePersistedHoldType,
 } from '@kici-dev/engine';
-import { handleAdminError } from './admin-errors.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import { HeldRunStore, HeldRunStatus, type ReleaseSignal } from '../contexts/held-runs.js';
 import type {
   StoredTrustDirectory,
@@ -65,10 +62,11 @@ import {
   settleSecurityCheckForOutcome,
   type ResolveCheckStatusPoster,
 } from '../pipeline/security-hold-check.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { Database, HeldRun } from '../db/types.js';
 import { runDetached } from '../helpers/run-detached.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-held-runs' });
 
@@ -172,14 +170,6 @@ export interface HeldRunRouteDeps {
   release: HeldRunReleaseWiring;
 }
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
 const decisionSchema = z.object({
   customerId: z.string().min(1),
   heldRunId: z.string().min(1),
@@ -238,9 +228,7 @@ function toSummary(row: HeldRun): Record<string, unknown> {
     id: row.id,
     runId: row.run_id,
     jobId: row.job_id,
-    // Normalized so a row an un-upgraded orchestrator wrote as `approval` /
-    // `wait_timer` answers to the same `--hold-type` the CLI documents.
-    holdType: normalizePersistedHoldType(row.hold_type),
+    holdType: row.hold_type,
     queueType: row.queue_type ?? HeldRunQueueType.enum.context,
     status: row.status,
     holdScope: row.hold_scope ?? HoldScope.enum.job,
@@ -340,7 +328,7 @@ function buildSettleSecurityCheck(
 }
 
 export function createHeldRunRoutes(deps: HeldRunRouteDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
   const store = deps.store;
   const platformManaged = PLATFORM_CONNECTED_MODES.includes(deps.mode);
 
@@ -348,11 +336,7 @@ export function createHeldRunRoutes(deps: HeldRunRouteDeps): Hono<AdminEnv> {
   // are refused outright. One registration per exact path — a bare Hono path
   // matches only itself.
   for (const path of ['/held-runs', '/held-runs/decision']) {
-    app.use(path, async (c, next) => {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      await next();
-    });
+    app.use(path, requireUnscoped);
   }
 
   // GET /api/v1/admin/held-runs?customerId=...&runId=...
@@ -361,52 +345,43 @@ export function createHeldRunRoutes(deps: HeldRunRouteDeps): Hono<AdminEnv> {
   // The listing exists to feed a local decision, and offering it where no local
   // decision can be taken would read as a surface that half works.
   app.get('/held-runs', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
-      const customerId = c.req.query('customerId');
-      const runId = c.req.query('runId');
-      if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
-      if (!runId) return c.json({ error: 'runId query param required' }, 400);
-      if (platformManaged) {
-        return c.json({ error: PLATFORM_MANAGED_HELD_RUN_MESSAGE }, 409);
-      }
-
-      const rows = (await store.listPending(customerId)).filter((r) => r.run_id === runId);
-      runDetached(
-        logger,
-        'Access log write',
-        () =>
-          deps.accessLog.record({
-            orgId: customerId,
-            routingKey: null,
-            actor: heldRunActor(c),
-            action: 'held_run.list.read',
-            target: { type: 'held_run', id: runId },
-            requestId: null,
-            source: 'admin_http',
-            outcome: 'allowed',
-            meta: { runId, pending: rows.length },
-          }),
-        { runId },
-      );
-      return c.json({ heldRuns: rows.map(toSummary) });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
+    const customerId = c.req.query('customerId');
+    const runId = c.req.query('runId');
+    if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
+    if (!runId) return c.json({ error: 'runId query param required' }, 400);
+    if (platformManaged) {
+      return c.json({ error: PLATFORM_MANAGED_HELD_RUN_MESSAGE }, 409);
     }
+
+    const rows = (await store.listPending(customerId)).filter((r) => r.run_id === runId);
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        deps.accessLog.record({
+          orgId: customerId,
+          routingKey: null,
+          actor: heldRunActor(c),
+          action: 'held_run.list.read',
+          target: { type: 'held_run', id: runId },
+          requestId: null,
+          source: 'admin_http',
+          outcome: 'allowed',
+          meta: { runId, pending: rows.length },
+        }),
+      { runId },
+    );
+    return c.json({ heldRuns: rows.map(toSummary) });
   });
 
-  // POST /api/v1/admin/held-runs/decision
   app.post('/held-runs/decision', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
-      const body = decisionSchema.parse(await c.req.json());
-      if (platformManaged) {
-        return c.json({ error: PLATFORM_MANAGED_HELD_RUN_MESSAGE }, 409);
-      }
-      return await applyAdminDecision(c, deps, store, body);
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
+    const body = decisionSchema.parse(await c.req.json());
+    if (platformManaged) {
+      return c.json({ error: PLATFORM_MANAGED_HELD_RUN_MESSAGE }, 409);
     }
+    return await applyAdminDecision(c, deps, store, body);
   });
 
   return app;

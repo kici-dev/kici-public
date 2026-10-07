@@ -1,14 +1,11 @@
 /**
  * Core types for the cold-storage archival framework.
  *
- *  for
- * the full design. This module defines the shapes that the DB-agnostic
+ * This module defines the shapes that the DB-agnostic
  * cold-store framework exchanges with its two concrete consumers
  * (Platform, Orchestrator).
  */
 import type { DbKind } from './key.js';
-
-export type { DbKind } from './key.js';
 
 /**
  * Sidecar manifest written next to every archived chunk.

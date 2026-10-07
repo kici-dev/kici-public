@@ -19,6 +19,7 @@
  * All three are orchestrator-only. An agent has no database and no drain.
  */
 import { toErrorMessage } from '@kici-dev/shared';
+import { sleep as defaultSleep } from '@kici-dev/engine';
 
 /** The drain snapshot both the CLI verb and this module poll. */
 export interface DrainSnapshot {
@@ -44,7 +45,7 @@ export async function waitForQuiesce(
   opts: WaitOpts,
 ): Promise<{ quiesced: boolean; jobsRunning: number }> {
   const now = opts.now ?? Date.now;
-  const sleep = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const sleep = opts.sleep ?? defaultSleep;
   const deadline = now() + opts.timeoutMs;
   for (;;) {
     const snap = await poll();

@@ -64,37 +64,6 @@ export function deriveOsArchLabels(platform: string, arch: string): string[] {
 }
 
 /**
- * Plain OS/arch labels that gate a bare-metal scaler as a mandatory taint.
- * A pool whose declared labels include one of these only accepts jobs that
- * explicitly request that platform. Linux and x64/amd64 are the defaults and
- * are absent on purpose — an unqualified `runsOn: 'bare-metal'` job must still
- * land on a Linux-x64 scaler.
- */
-export const PLATFORM_TAINT_LABELS = new Set<string>([
-  'windows',
-  'win32',
-  'macos',
-  'darwin',
-  'arm64',
-  'aarch64',
-  'arm',
-]);
-
-/**
- * Intersect a pool's declared labels with {@link PLATFORM_TAINT_LABELS},
- * returning the de-duplicated plain platform-taint labels (lowercased) in
- * input order.
- */
-export function derivePlatformTaints(declaredLabels: string[]): string[] {
-  const seen = new Set<string>();
-  for (const raw of declaredLabels) {
-    const label = raw.toLowerCase();
-    if (PLATFORM_TAINT_LABELS.has(label)) seen.add(label);
-  }
-  return [...seen];
-}
-
-/**
  * Operating systems a scaler pool can declare via the structured `platform`
  * field. `linux` is the default and carries no taint; `macos` / `windows` are
  * non-default and taint the pool.
@@ -144,9 +113,8 @@ export function platformToOsArchLabels(platform: ScalerPlatform): string[] {
  * Derive the plain platform-taint labels for a declared structured platform.
  * Returns the canonical tokens (`macos`, `windows`, `arm64`) that a job's
  * `runsOn` must include to allocate on the pool. The linux/x64 default carries
- * no taint. Unlike {@link derivePlatformTaints} (which intersects declared
- * labels against a denylist), this derives from the structured field, so a pool
- * labeled `windows-2022` still taints correctly.
+ * no taint. It derives from the structured field, so a pool labeled
+ * `windows-2022` still taints correctly.
  */
 export function platformToTaints(platform: ScalerPlatform): string[] {
   const taints: string[] = [];

@@ -7,7 +7,14 @@
  */
 
 import * as fs from 'node:fs';
-import type { PeerForgetOutcome, ScalerLiveVm, ScalerVmStopResult } from '@kici-dev/engine';
+import type {
+  PeerForgetOutcome,
+  ScalerLiveVm,
+  ScalerReloadAnswer,
+  ScalerReloadInstanceResult,
+  ScalerVmStopResult,
+} from '@kici-dev/engine';
+import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 
 /** `POST /api/v1/admin/peers/forget`: one result per coordinator, this one first. */
 export interface PeerForgetResponseBody {
@@ -16,6 +23,12 @@ export interface PeerForgetResponseBody {
   /** Set when the coordinator kept the peer only for want of the backstop acknowledgement. */
   acknowledgementRequired?: boolean;
   error?: string;
+}
+
+/** The answer of `POST /api/v1/admin/scaler/reload`: one result per orchestrator, this one first. */
+export interface ScalerReloadResponseBody {
+  scope: 'cluster' | 'single';
+  results: ScalerReloadInstanceResult[];
 }
 
 /** The node a scaler orphans request answered for. */
@@ -163,6 +176,9 @@ export function isTransportFailure(err: unknown): boolean {
   return err instanceof TypeError && err.message === 'fetch failed';
 }
 
+/** The admin API address kici-admin dials when neither --url nor KICI_ADMIN_URL is set. */
+export const DEFAULT_ADMIN_URL = `http://localhost:${ORCHESTRATOR_DEFAULT_PORT}`;
+
 export async function fetchAdminApi(
   url: string,
   init: RequestInit,
@@ -195,15 +211,36 @@ export async function fetchAdminApi(
     // is — ` ()` in a diagnostic is worse than no parenthetical at all.
     const detail = firstCauseMessage(err);
     const cause = detail ? ` (${detail})` : '';
+    // An operator who set neither --url nor KICI_ADMIN_URL dialled the built-in
+    // default, which only reaches an orchestrator on this host at its default port.
+    const defaultHint =
+      baseUrl === DEFAULT_ADMIN_URL
+        ? ` ${DEFAULT_ADMIN_URL} is kici-admin's built-in default, the orchestrator's default ` +
+          `port on this host; an orchestrator on another host, or one whose KICI_PORT sets ` +
+          `another port, needs KICI_ADMIN_URL or --url.`
+        : '';
     throw new Error(
       `cannot reach the orchestrator admin API at ${baseUrl}${cause}. ` +
         `Set KICI_ADMIN_URL to the orchestrator's HTTP address, or pass --base-url where the ` +
         `subcommand accepts it. Note KICI_ORCHESTRATOR_URL is NOT read by this CLI; if other ` +
         `subcommands appear to work, they are using the --database-url / KICI_DATABASE_URL ` +
-        `direct-DB path rather than HTTP.`,
+        `direct-DB path rather than HTTP.${defaultHint}`,
       { cause: err },
     );
   }
+}
+
+/** Build a `?a=1&b=2` query string, skipping undefined, null and empty-string values. */
+export function toQuery(
+  params: Record<string, string | number | boolean | undefined | null>,
+): string {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue;
+    usp.set(k, String(v));
+  }
+  const qs = usp.toString();
+  return qs ? `?${qs}` : '';
 }
 
 export class AdminApiClient {
@@ -638,20 +675,17 @@ export class AdminApiClient {
     /** Opt-in cold-store read-through. */
     includeArchived?: boolean;
   }): Promise<any[]> {
-    const params = new URLSearchParams();
-    if (opts?.contextName) params.set('contextName', opts.contextName);
-    if (opts?.routingKey) params.set('routingKey', opts.routingKey);
-    if (opts?.action) params.set('action', opts.action);
-    if (opts?.from) params.set('from', opts.from);
-    if (opts?.to) params.set('to', opts.to);
-    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
-    if (opts?.offset !== undefined) params.set('offset', String(opts.offset));
-    if (opts?.includeArchived) params.set('includeArchived', 'true');
-    const qs = params.toString();
-    const res = await this.request<{ entries: any[] }>(
-      'GET',
-      `/api/v1/admin/audit${qs ? `?${qs}` : ''}`,
-    );
+    const qs = toQuery({
+      contextName: opts?.contextName,
+      routingKey: opts?.routingKey,
+      action: opts?.action,
+      from: opts?.from,
+      to: opts?.to,
+      limit: opts?.limit,
+      offset: opts?.offset,
+      includeArchived: opts?.includeArchived || undefined,
+    });
+    const res = await this.request<{ entries: any[] }>('GET', `/api/v1/admin/audit${qs}`);
     return res.entries;
   }
 
@@ -771,15 +805,18 @@ export class AdminApiClient {
     return this.request<{ newVersion: number }>('POST', '/admin/config/rollback', { version });
   }
 
-  async configReload(opts?: {
-    drain?: boolean;
-    target?: string;
-  }): Promise<{ success: boolean; version?: number; errors?: string[] }> {
-    return this.request<{ success: boolean; version?: number; errors?: string[] }>(
-      'POST',
-      '/admin/config/reload',
-      opts,
-    );
+  async configReload(opts?: { drain?: boolean; target?: string }): Promise<{
+    success: boolean;
+    version?: number;
+    errors?: string[];
+    scaler?: ScalerReloadAnswer;
+  }> {
+    return this.request<{
+      success: boolean;
+      version?: number;
+      errors?: string[];
+      scaler?: ScalerReloadAnswer;
+    }>('POST', '/admin/config/reload', opts);
   }
 
   // --- Coordinator drain (pre-upgrade quiescing) ---
@@ -815,8 +852,32 @@ export class AdminApiClient {
     timeoutMs?: number;
     acknowledgeBackstop?: boolean;
   }): Promise<PeerForgetResponseBody> {
+    const { res, json, text } = await this.postForBody<
+      Partial<PeerForgetResponseBody> & { error?: string }
+    >('/api/v1/admin/peers/forget', body);
+    if (res.ok) return json as PeerForgetResponseBody;
+    if (res.status === 409 && json.acknowledgementRequired === true) {
+      return {
+        instanceId: body.instanceId,
+        results: json.results ?? [],
+        acknowledgementRequired: true,
+        ...(json.error ? { error: json.error } : {}),
+      };
+    }
+    throw new Error(`HTTP ${res.status}: ${json.error ?? text}`);
+  }
+
+  /**
+   * POST `body` and parse the answer whatever its status, for a route that
+   * reports per-instance results on a non-2xx status too. An unparseable body
+   * reads as `{}`.
+   */
+  private async postForBody<T>(
+    path: string,
+    body: unknown,
+  ): Promise<{ res: Response; json: T; text: string }> {
     const res = await fetchAdminApi(
-      `${this.baseUrl}/api/v1/admin/peers/forget`,
+      `${this.baseUrl}${path}`,
       {
         method: 'POST',
         headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
@@ -831,15 +892,31 @@ export class AdminApiClient {
     } catch {
       parsed = undefined;
     }
-    const json = (parsed ?? {}) as Partial<PeerForgetResponseBody> & { error?: string };
-    if (res.ok) return json as PeerForgetResponseBody;
-    if (res.status === 409 && json.acknowledgementRequired === true) {
-      return {
-        instanceId: body.instanceId,
-        results: json.results ?? [],
-        acknowledgementRequired: true,
-        ...(json.error ? { error: json.error } : {}),
-      };
+    return { res, json: (parsed ?? {}) as T, text };
+  }
+
+  // --- Scaler reload (`kici-admin scaler reload`) ---
+
+  /**
+   * Reload the scaler config on this orchestrator and, unless `single`, on every
+   * peer it is connected to. A response where an instance refused its file or
+   * was not reached (422) is returned like a success, so the caller can show
+   * every instance; a 404 means the orchestrator predates the route.
+   */
+  async scalerReload(body: {
+    single?: boolean;
+    timeoutMs?: number;
+  }): Promise<ScalerReloadResponseBody> {
+    const { res, json, text } = await this.postForBody<
+      Partial<ScalerReloadResponseBody> & { error?: string }
+    >('/api/v1/admin/scaler/reload', body);
+    if ((res.ok || res.status === 422) && Array.isArray(json.results)) {
+      return { scope: json.scope ?? (body.single ? 'single' : 'cluster'), results: json.results };
+    }
+    if (res.status === 404) {
+      throw new Error(
+        'this orchestrator predates kici-admin scaler reload; send SIGHUP to it or upgrade it',
+      );
     }
     throw new Error(`HTTP ${res.status}: ${json.error ?? text}`);
   }
@@ -986,15 +1063,15 @@ export class AdminApiClient {
     limit: number;
     offset: number;
   }> {
-    const params = new URLSearchParams();
-    if (opts?.status) params.set('status', opts.status);
-    if (opts?.workflowName) params.set('workflowName', opts.workflowName);
-    if (opts?.repo) params.set('repo', opts.repo);
-    if (opts?.since) params.set('since', opts.since);
-    if (opts?.limit) params.set('limit', String(opts.limit));
-    if (opts?.offset) params.set('offset', String(opts.offset));
-    const qs = params.toString();
-    return this.request('GET', `/api/v1/admin/runs${qs ? `?${qs}` : ''}`);
+    const qs = toQuery({
+      status: opts?.status,
+      workflowName: opts?.workflowName,
+      repo: opts?.repo,
+      since: opts?.since,
+      limit: opts?.limit || undefined,
+      offset: opts?.offset || undefined,
+    });
+    return this.request('GET', `/api/v1/admin/runs${qs}`);
   }
 
   /**
@@ -1080,13 +1157,10 @@ export class AdminApiClient {
       revealError?: string;
     }>;
   }> {
-    const params = new URLSearchParams();
-    if (opts?.outputKey) params.set('outputKey', opts.outputKey);
-    if (opts?.reveal) params.set('reveal', 'true');
-    const qs = params.toString();
+    const qs = toQuery({ outputKey: opts?.outputKey, reveal: opts?.reveal || undefined });
     return this.request(
       'GET',
-      `/api/v1/admin/runs/${encodeURIComponent(runId)}/secret-outputs${qs ? `?${qs}` : ''}`,
+      `/api/v1/admin/runs/${encodeURIComponent(runId)}/secret-outputs${qs}`,
     );
   }
 
@@ -1110,20 +1184,20 @@ export class AdminApiClient {
     limit: number;
     offset: number;
   }> {
-    const params = new URLSearchParams();
-    if (opts?.orgId) params.set('orgId', opts.orgId);
-    if (opts?.routingKey) params.set('routingKey', opts.routingKey);
-    if (opts?.event) params.set('event', opts.event);
-    if (opts?.action) params.set('action', opts.action);
-    if (opts?.status) params.set('status', opts.status);
-    if (opts?.from) params.set('from', opts.from);
-    if (opts?.to) params.set('to', opts.to);
-    if (opts?.deliveryId) params.set('deliveryId', opts.deliveryId);
-    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
-    if (opts?.offset !== undefined) params.set('offset', String(opts.offset));
-    if (opts?.includeArchived) params.set('includeArchived', 'true');
-    const qs = params.toString();
-    return this.request('GET', `/api/v1/admin/event-log${qs ? `?${qs}` : ''}`);
+    const qs = toQuery({
+      orgId: opts?.orgId,
+      routingKey: opts?.routingKey,
+      event: opts?.event,
+      action: opts?.action,
+      status: opts?.status,
+      from: opts?.from,
+      to: opts?.to,
+      deliveryId: opts?.deliveryId,
+      limit: opts?.limit,
+      offset: opts?.offset,
+      includeArchived: opts?.includeArchived || undefined,
+    });
+    return this.request('GET', `/api/v1/admin/event-log${qs}`);
   }
 
   async getEventLog(
@@ -1153,14 +1227,14 @@ export class AdminApiClient {
     limit: number;
     nextCursor: string | null;
   }> {
-    const params = new URLSearchParams();
-    if (opts?.name) params.set('name', opts.name);
-    if (opts?.outcome) params.set('outcome', opts.outcome);
-    if (opts?.since) params.set('since', opts.since);
-    if (opts?.before) params.set('before', opts.before);
-    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
-    const qs = params.toString();
-    return this.request('GET', `/api/v1/admin/events${qs ? `?${qs}` : ''}`);
+    const qs = toQuery({
+      name: opts?.name,
+      outcome: opts?.outcome,
+      since: opts?.since,
+      before: opts?.before,
+      limit: opts?.limit,
+    });
+    return this.request('GET', `/api/v1/admin/events${qs}`);
   }
 
   /** One internal event with its redacted payload and dispatched runs. */
@@ -1190,34 +1264,29 @@ export class AdminApiClient {
     items: Array<Record<string, unknown>>;
     nextCursor: string | null;
   }> {
-    const params = new URLSearchParams();
-    if (opts?.orgId) params.set('orgId', opts.orgId);
-    if (opts?.actorType) params.set('actorType', opts.actorType);
-    if (opts?.actorId) params.set('actorId', opts.actorId);
-    if (opts?.action) params.set('action', opts.action);
-    if (opts?.source) params.set('source', opts.source);
-    if (opts?.outcome) params.set('outcome', opts.outcome);
-    if (opts?.targetType) params.set('targetType', opts.targetType);
-    if (opts?.targetId) params.set('targetId', opts.targetId);
-    if (opts?.from) params.set('from', opts.from);
-    if (opts?.to) params.set('to', opts.to);
-    if (opts?.q) params.set('q', opts.q);
-    if (opts?.agentLabel) params.set('agentLabel', opts.agentLabel);
-    if (opts?.agentOnly) params.set('agentOnly', 'true');
-    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
-    if (opts?.cursor) params.set('cursor', opts.cursor);
-    const qs = params.toString();
-    return this.request('GET', `/api/v1/admin/access-log${qs ? `?${qs}` : ''}`);
+    const qs = toQuery({
+      orgId: opts?.orgId,
+      actorType: opts?.actorType,
+      actorId: opts?.actorId,
+      action: opts?.action,
+      source: opts?.source,
+      outcome: opts?.outcome,
+      targetType: opts?.targetType,
+      targetId: opts?.targetId,
+      from: opts?.from,
+      to: opts?.to,
+      q: opts?.q,
+      agentLabel: opts?.agentLabel,
+      agentOnly: opts?.agentOnly || undefined,
+      limit: opts?.limit,
+      cursor: opts?.cursor,
+    });
+    return this.request('GET', `/api/v1/admin/access-log${qs}`);
   }
 
   async getAccessLogEntry(id: string, opts?: { orgId?: string }): Promise<Record<string, unknown>> {
-    const params = new URLSearchParams();
-    if (opts?.orgId) params.set('orgId', opts.orgId);
-    const qs = params.toString();
-    return this.request(
-      'GET',
-      `/api/v1/admin/access-log/${encodeURIComponent(id)}${qs ? `?${qs}` : ''}`,
-    );
+    const qs = toQuery({ orgId: opts?.orgId });
+    return this.request('GET', `/api/v1/admin/access-log/${encodeURIComponent(id)}${qs}`);
   }
 
   // --- Diagnostics ---

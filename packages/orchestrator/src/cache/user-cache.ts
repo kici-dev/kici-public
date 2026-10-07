@@ -62,10 +62,9 @@ const TAR_SUFFIX = '.tar.gz';
 
 /**
  * Stem prefix of an in-flight upload, `.tmp-<uuid>.tar.gz`: the presigned PUT
- * target a save lands on before commit copies it to its final key. Shared with
- * the retired-layout classifier so both agree on what an upload looks like.
+ * target a save lands on before commit copies it to its final key.
  */
-export const TEMP_UPLOAD_STEM = '.tmp-';
+const TEMP_UPLOAD_STEM = '.tmp-';
 
 /** Whether a listed object is an in-flight upload rather than a cache entry. */
 function isTempUpload(key: string): boolean {
@@ -82,7 +81,7 @@ const KEY_DISCRIMINATOR_TAIL = new RegExp(`^(.*)-([0-9a-f]{${KEY_DISCRIMINATOR_L
  * is what keeps two other kinds of object out of a restore: an in-flight
  * `.tmp-<uuid>.tar.gz` upload, which is a partial tarball until commit copies
  * it to its final key, and an object under the retired un-discriminated layout,
- * which nothing writes and which `kici-admin cache purge-legacy` removes.
+ * which nothing writes.
  */
 function isCommittedEntry(key: string): boolean {
   return key.endsWith(TAR_SUFFIX) && KEY_DISCRIMINATOR_TAIL.test(key.slice(0, -TAR_SUFFIX.length));
@@ -109,11 +108,8 @@ function stripKeyDiscriminator(stem: string): string {
  * signature on a pre-signed PUT/GET. Repo identifiers like `.` (the internal
  * provider's repo id) hit exactly this case, so the all-dots guard keeps the
  * object key canonical and the namespace boundary intact.
- *
- * Exported so an operator tool that addresses an org's prefix from a raw org id
- * (`kici-admin cache purge-legacy --org`) lands on the segment the writer used.
  */
-export function sanitizeSegment(s: string): string {
+function sanitizeSegment(s: string): string {
   const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '_');
   return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
@@ -191,12 +187,10 @@ function finalKey(prefix: string, key: string): string {
 
 /**
  * The object key a committed save under `key` lands on for this ref. This is
- * the writer's own path — `beginSave` and `commitSave` address the entry
- * through it — so anything that must recognise a current-layout key (the
- * legacy-layout classifier tests) takes it from here rather than restating
- * the format.
+ * the writer's own path: `beginSave` and `commitSave` address the entry
+ * through it.
  */
-export function userCacheEntryKey(ref: UserCacheRef, key: string): string {
+function userCacheEntryKey(ref: UserCacheRef, key: string): string {
   return finalKey(writePrefix(ref), key);
 }
 

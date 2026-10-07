@@ -10,6 +10,7 @@ import {
   TERMINAL_JOB_STATES,
   ExecutionJobStatus,
   ExecutionRunStatus,
+  sleep,
 } from '@kici-dev/engine';
 import { unwrapStoredLogLine } from '../remote/output/streaming.js';
 
@@ -102,12 +103,9 @@ export interface FollowRunOptions {
    * status change) before the follow gives up. Resets on every progress tick, so
    * a legitimately long run (e.g. a full deploy, tens of minutes of image
    * builds + host mutation) never times out while it is actively advancing —
-   * only a genuinely stalled run does. Default 15 min. `timeoutMs` is a
-   * back-compat alias.
+   * only a genuinely stalled run does. Default 15 min.
    */
   idleTimeoutMs?: number;
-  /** @deprecated Back-compat alias for `idleTimeoutMs`. */
-  timeoutMs?: number;
   /** Absolute cap regardless of progress (safety net against a runaway follow). Default 2 h. */
   maxTotalMs?: number;
   /**
@@ -131,7 +129,7 @@ export async function followRun(
 ): Promise<RunOutcome> {
   const client: RunFollowClient = opts.client ?? new AdminApiClient(planeUrl, adminToken);
   const pollIntervalMs = opts.pollIntervalMs ?? 750;
-  const idleTimeoutMs = opts.idleTimeoutMs ?? opts.timeoutMs ?? 900_000;
+  const idleTimeoutMs = opts.idleTimeoutMs ?? 900_000;
   const maxTotalMs = opts.maxTotalMs ?? 7_200_000;
   const acceptanceTimeoutMs = resolveAcceptanceTimeoutMs(
     opts.acceptanceTimeoutMs,
@@ -285,8 +283,4 @@ async function drainLogs(
     }
   }
   return emitted;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

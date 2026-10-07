@@ -6,6 +6,7 @@ import open from 'open';
 import pc from 'picocolors';
 import { toErrorMessage } from '@kici-dev/core';
 import { discoverOidcEndpoints } from './oidc-discovery.js';
+import { sleep } from '@kici-dev/engine';
 
 /**
  * Wrap a fetch call so that transport errors (DNS failure, connection refused,
@@ -372,11 +373,6 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
       );
     }, timeoutMs);
   });
-}
-
-/** Sleep helper for device flow polling. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

@@ -5,7 +5,7 @@ description: End-to-end data flows through the KiCI three-tier architecture
 
 This document describes the key data flows through the KiCI architecture: webhook delivery, job execution, developer-initiated remote runs, dependency caching, re-run and cancel, trace ID propagation, internal event routing, and generic webhook ingestion.
 
-> **Lock file schema version:** The orchestrator accepts a compatibility window of lock schema versions rather than an exact match. A lock is accepted when its `schemaVersion` is at or above the orchestrator's oldest supported version (additive bumps add fields older readers ignore) and the orchestrator's own schema is at or above the lock's `minReaderVersion` (the newest breaking version at compile time, or schema v42 when an organization-wide workflow declares `approval`). A lock below the floor must be recompiled with `kici compile` and pushed; a lock requiring a newer reader means the orchestrator must be upgraded. Both out-of-window cases are rejected with an actionable error rather than a silent mis-route. See [lock file and drift](../user/lock-file-and-drift.md#schema-compatibility-window).
+> **Lock file schema version:** The orchestrator accepts a compatibility window of lock schema versions rather than an exact match. A lock is accepted when its `schemaVersion` is at or above the orchestrator's oldest supported version (additive bumps add fields older readers ignore) and the orchestrator's own schema is at or above the lock's `minReaderVersion` (the newest breaking version at compile time, which is required in every lock). A lock below the floor must be recompiled with `kici compile` and pushed; a lock requiring a newer reader means the orchestrator must be upgraded. Both out-of-window cases are rejected with an actionable error rather than a silent mis-route. See [lock file and drift](../user/lock-file-and-drift.md#schema-compatibility-window).
 
 ## Webhook delivery flow
 
@@ -731,7 +731,7 @@ The dashboard's event-log detail panel reads webhook bodies through a chunked tr
 
 ### Lineage query
 
-The lineage endpoint (`GET /orgs/:customerId/runs/:runId/reruns`) returns all runs with `parent_run_id` matching the given run ID.
+The lineage endpoint (`GET /orgs/:customerId/runs/:runId/reruns`) returns every re-run whose `original_run_id` (the root of the re-run chain) is the given run ID.
 
 ## Trace ID propagation
 

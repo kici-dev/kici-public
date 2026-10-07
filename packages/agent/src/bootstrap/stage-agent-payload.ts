@@ -19,6 +19,7 @@ import type { AgentPlatform } from '@kici-dev/shared';
 import { sshExec, sshPushFile, type SshDeps } from './ssh-exec.js';
 import type { HostReach } from './reach.js';
 import type { AgentPayloadSource } from './payload-source.js';
+import { shQuote } from '@kici-dev/core';
 
 /**
  * How the payload reaches the box. `s3-direct` carries the box-pullable
@@ -61,11 +62,6 @@ function hashFileSha256(filePath: string): Promise<string> {
       .on('data', (chunk) => hash.update(chunk))
       .on('end', () => resolve(hash.digest('hex')));
   });
-}
-
-/** Single-quote a value for safe embedding in a remote shell command. */
-function shQuote(v: string): string {
-  return `'${v.replace(/'/g, `'\\''`)}'`;
 }
 
 /**

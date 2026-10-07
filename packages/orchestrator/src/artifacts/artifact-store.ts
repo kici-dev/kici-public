@@ -23,7 +23,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
 import { createLogger } from '@kici-dev/shared';
-import { ARTIFACT_NAME_MAX_LENGTH, checkArtifactName } from '@kici-dev/engine';
+import { ARTIFACT_NAME_MAX_LENGTH, checkArtifactName, toIsoString } from '@kici-dev/engine';
 import type { ArtifactRejectReason } from '@kici-dev/engine';
 import type { Database, ArtifactRow } from '../db/types.js';
 import type { CacheStorage } from '../storage/types.js';
@@ -443,11 +443,6 @@ export class ArtifactStore {
     };
   }
 
-  /** ISO string for a row's created_at (Date or already-string). */
-  private createdAtIso(createdAt: Date | string): string {
-    return createdAt instanceof Date ? createdAt.toISOString() : String(createdAt);
-  }
-
   /** Load a run's non-expired artifact rows, newest first, given the org TTL. */
   private async loadRunRows(runId: string, ttlMs: number): Promise<ArtifactRow[]> {
     return this.db
@@ -483,7 +478,7 @@ export class ArtifactStore {
         jobId: r.job_id,
         sizeBytes: Number(r.size_bytes),
         sha256: r.sha256,
-        createdAt: this.createdAtIso(r.created_at),
+        createdAt: toIsoString(r.created_at),
         ...(downloadUrl ? { downloadUrl } : {}),
       });
     }

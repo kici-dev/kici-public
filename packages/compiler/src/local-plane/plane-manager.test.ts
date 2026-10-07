@@ -88,6 +88,25 @@ describe('planeUp / planeStatus / planeDown', () => {
     delete process.env.KICI_CONFIG_DIR;
   });
 
+  /**
+   * Write a plane stamp over the current-layout defaults. A key set to
+   * `undefined` is left out of the file, as an older layout leaves it out.
+   */
+  async function seedStamp(fields: Record<string, unknown>): Promise<void> {
+    const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
+    const { stampFile } = planePaths();
+    fs.mkdirSync(path.dirname(stampFile), { recursive: true });
+    const stamp = {
+      orchestratorPid: 2147480000, // non-existent — SIGTERM throws ESRCH, caught
+      port: 4319,
+      pgKind: 'embedded',
+      stampVersion: PLANE_STAMP_VERSION,
+      mode: 'independent',
+      ...fields,
+    };
+    fs.writeFileSync(stampFile, JSON.stringify(stamp));
+  }
+
   it('planeUp boots when nothing is running and writes a stamp', async () => {
     const { classifyPlane } = await import('./plane-liveness.js');
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'free' });
@@ -110,7 +129,21 @@ describe('planeUp / planeStatus / planeDown', () => {
     expect(spawnOrchestratorProcess).not.toHaveBeenCalled();
   });
 
-  it('planeUp recreates the plane on an incompatible stamp version', async () => {
+  it.each([
+    { label: 'an incompatible stamp version', stamp: { kiciVersion: '0.0.0', stampVersion: 0 } },
+    {
+      // fails-when: PLANE_STAMP_VERSION stays 3 — the mode-less stamp is reused as independent.
+      label: 'a stamp from the previous layout, which has no mode field',
+      stamp: { kiciVersion: '0.14.0', buildDate: '2026-09-01T00:00:00.000Z', stampVersion: 3 },
+    },
+    {
+      // fails-when: PLANE_STAMP_VERSION stays 4 — a plane whose orchestrator database a
+      // development build migrated (its ledger may hold 157_baseline) is reused, and the
+      // orchestrator refuses to boot against it.
+      label: 'a stamp from a build whose orchestrator database this build cannot migrate',
+      stamp: { kiciVersion: '0.16.0-dev', buildDate: '2026-10-05T00:00:00.000Z', stampVersion: 4 },
+    },
+  ])('planeUp recreates the plane on $label', async ({ stamp }) => {
     const { spawnOrchestratorProcess } = await import('./orchestrator-process.js');
     const { classifyPlane } = await import('./plane-liveness.js');
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'free' });
@@ -120,19 +153,11 @@ describe('planeUp / planeStatus / planeDown', () => {
     // Seed a stamp from an incompatible layout plus a marker file in pgData.
     fs.mkdirSync(paths.pgData, { recursive: true });
     fs.writeFileSync(path.join(paths.pgData, 'marker'), 'stale');
-    fs.writeFileSync(
-      paths.stampFile,
-      JSON.stringify({
-        orchestratorPid: 2147480000,
-        port: 4319,
-        pgKind: 'embedded',
-        kiciVersion: '0.0.0',
-        stampVersion: 0,
-      }),
-    );
+    await seedStamp({ mode: undefined, ...stamp });
     const st = await planeUp();
     expect(st.running).toBe(true);
     expect(st.stampVersion).toBe(PLANE_STAMP_VERSION);
+    expect(st.mode).toBe('independent');
     // The stale data dir was wiped as part of the recreate.
     expect(fs.existsSync(path.join(paths.pgData, 'marker'))).toBe(false);
     expect(spawnOrchestratorProcess).toHaveBeenCalled();
@@ -143,25 +168,15 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { classifyPlane } = await import('./plane-liveness.js');
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'ours-ready', pid: 9001 });
     const { planeUp } = await import('./plane-manager.js');
-    const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
+    const { planePaths } = await import('./paths.js');
     const paths = planePaths();
     // Concrete current identity, different from the seeded stamp below.
     (globalThis as Record<string, unknown>).KICI_VERSION = '0.1.28';
     (globalThis as Record<string, unknown>).KICI_BUILD_DATE = '2026-09-27T00:00:00.000Z';
     fs.mkdirSync(paths.pgData, { recursive: true });
     fs.writeFileSync(path.join(paths.pgData, 'marker'), 'keep-me');
-    fs.mkdirSync(path.dirname(paths.stampFile), { recursive: true });
-    fs.writeFileSync(
-      paths.stampFile,
-      JSON.stringify({
-        orchestratorPid: 2147480000, // non-existent — SIGTERM throws ESRCH, caught
-        port: 4319,
-        pgKind: 'embedded',
-        kiciVersion: '0.1.26',
-        buildDate: '2026-09-01T00:00:00.000Z',
-        stampVersion: PLANE_STAMP_VERSION, // current layout: only the identity is stale
-      }),
-    );
+    // Current layout: only the identity is stale.
+    await seedStamp({ kiciVersion: '0.1.26', buildDate: '2026-09-01T00:00:00.000Z' });
     vi.mocked(spawnOrchestratorProcess).mockClear();
     const st = await planeUp();
     expect(st.running).toBe(true);
@@ -177,23 +192,9 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { classifyPlane } = await import('./plane-liveness.js');
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'ours-ready', pid: 9001 });
     const { planeUp } = await import('./plane-manager.js');
-    const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
-    const paths = planePaths();
     (globalThis as Record<string, unknown>).KICI_VERSION = '0.1.28';
     (globalThis as Record<string, unknown>).KICI_BUILD_DATE = '2026-09-15T00:00:00.000Z';
-    fs.mkdirSync(path.dirname(paths.stampFile), { recursive: true });
-    fs.writeFileSync(
-      paths.stampFile,
-      JSON.stringify({
-        orchestratorPid: 2147480000,
-        port: 4319,
-        pgKind: 'embedded',
-        kiciVersion: '0.1.28',
-        buildDate: '2026-09-15T00:00:00.000Z',
-        stampVersion: PLANE_STAMP_VERSION,
-        mode: 'independent',
-      }),
-    );
+    await seedStamp({ kiciVersion: '0.1.28', buildDate: '2026-09-15T00:00:00.000Z' });
     vi.mocked(spawnOrchestratorProcess).mockClear();
     const st = await planeUp();
     expect(st.running).toBe(true);
@@ -207,22 +208,8 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { classifyPlane } = await import('./plane-liveness.js');
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'ours-ready', pid: 9001 });
     const { planeUp } = await import('./plane-manager.js');
-    const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
-    const paths = planePaths();
     // No globals set → current buildDate resolves to 'unknown' → guard holds.
-    fs.mkdirSync(path.dirname(paths.stampFile), { recursive: true });
-    fs.writeFileSync(
-      paths.stampFile,
-      JSON.stringify({
-        orchestratorPid: 2147480000,
-        port: 4319,
-        pgKind: 'embedded',
-        kiciVersion: '0.1.26',
-        buildDate: '2026-09-01T00:00:00.000Z',
-        stampVersion: PLANE_STAMP_VERSION,
-        mode: 'independent',
-      }),
-    );
+    await seedStamp({ kiciVersion: '0.1.26', buildDate: '2026-09-01T00:00:00.000Z' });
     vi.mocked(spawnOrchestratorProcess).mockClear();
     await planeUp();
     expect(spawnOrchestratorProcess).not.toHaveBeenCalled(); // reused, not rebooted
@@ -254,7 +241,8 @@ describe('planeUp / planeStatus / planeDown', () => {
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.26',
         buildDate: '2026-09-15T00:00:00.000Z',
-        stampVersion: 3,
+        stampVersion: 4,
+        mode: 'independent' as const,
       };
       expect(planeBuildIsStale(stamp)).toBe(true);
     });
@@ -268,7 +256,8 @@ describe('planeUp / planeStatus / planeDown', () => {
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.28',
         buildDate: '2026-09-01T00:00:00.000Z',
-        stampVersion: 3,
+        stampVersion: 4,
+        mode: 'independent' as const,
       };
       expect(planeBuildIsStale(stamp)).toBe(true);
     });
@@ -282,7 +271,8 @@ describe('planeUp / planeStatus / planeDown', () => {
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.28',
         buildDate: '2026-09-15T00:00:00.000Z',
-        stampVersion: 3,
+        stampVersion: 4,
+        mode: 'independent' as const,
       };
       expect(planeBuildIsStale(stamp)).toBe(false);
     });
@@ -296,7 +286,8 @@ describe('planeUp / planeStatus / planeDown', () => {
         pgKind: 'embedded' as const,
         kiciVersion: '0.1.26',
         buildDate: '2026-09-01T00:00:00.000Z',
-        stampVersion: 3,
+        stampVersion: 4,
+        mode: 'independent' as const,
       };
       expect(planeBuildIsStale(stamp)).toBe(false);
     });

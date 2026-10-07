@@ -6,7 +6,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { AdminApiClient, fetchAdminApi, firstCauseMessage } from './api-client.js';
+import {
+  AdminApiClient,
+  DEFAULT_ADMIN_URL,
+  fetchAdminApi,
+  firstCauseMessage,
+  toQuery,
+} from './api-client.js';
 
 const BASE_URL = 'http://localhost:8080';
 const TOKEN = 'test-token-123';
@@ -312,6 +318,39 @@ describe('AdminApiClient', () => {
     );
   });
 
+  // --- Scaler reload ---
+
+  it('posts a scaler reload and returns the results', async () => {
+    const results = [{ instanceId: 'coord-a', role: 'coordinator', outcome: 'applied' }];
+    const fetchMock = mockFetch(200, { scope: 'single', results });
+    globalThis.fetch = fetchMock;
+
+    expect(await client.scalerReload({ single: true, timeoutMs: 5_000 })).toEqual({
+      scope: 'single',
+      results,
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(`${BASE_URL}/api/v1/admin/scaler/reload`);
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ single: true, timeoutMs: 5_000 });
+  });
+
+  // fails-when: a partial failure (422) throws, so the CLI cannot show every instance
+  it('returns the results of a 422 instead of throwing', async () => {
+    const results = [
+      { instanceId: 'coord-a', role: 'coordinator', outcome: 'rejected', errors: ['x'] },
+    ];
+    globalThis.fetch = mockFetch(422, { scope: 'cluster', results });
+    expect(await client.scalerReload({})).toEqual({ scope: 'cluster', results });
+  });
+
+  it('names an orchestrator that predates the route, and throws any other refusal', async () => {
+    globalThis.fetch = mockFetch(404, { error: 'Not Found' });
+    await expect(client.scalerReload({})).rejects.toThrow('predates kici-admin scaler reload');
+
+    globalThis.fetch = mockFetch(403, { error: 'Forbidden' });
+    await expect(client.scalerReload({})).rejects.toThrow('HTTP 403: Forbidden');
+  });
+
   // --- Scaler orphans ---
 
   it('lists scaler orphans on a target with the wait in the query', async () => {
@@ -354,6 +393,21 @@ describe('AdminApiClient', () => {
     await client.listScopes('org:special');
 
     expect(fetchMock.mock.calls[0][0]).toContain('orgId=org%3Aspecial');
+  });
+
+  // fails-when: a truthy-gated numeric (listRuns limit) starts sending 0, or a
+  // `!== undefined`-gated one (queryAudit limit) stops sending it
+  it('keeps each method’s skip rule for 0 and false', async () => {
+    const fetchMock = mockFetch(200, {});
+    globalThis.fetch = fetchMock;
+    await client.listRuns({ status: 'failed', limit: 0, offset: 5 });
+    await client.listRuns();
+    await client.queryAudit({ limit: 0, includeArchived: false });
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      `${BASE_URL}/api/v1/admin/runs?status=failed&offset=5`,
+      `${BASE_URL}/api/v1/admin/runs`,
+      `${BASE_URL}/api/v1/admin/audit?limit=0`,
+    ]);
   });
 });
 
@@ -403,6 +457,37 @@ describe('fetchAdminApi — unreachable-host diagnostics', () => {
     const res = new Response('{}', { status: 200 });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(res));
     await expect(fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE)).resolves.toBe(res);
+  });
+
+  /** The message `fetchAdminApi` rejects with when `fetch` cannot connect. */
+  async function transportFailureMessage(baseUrl: string): Promise<string> {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    try {
+      await fetchAdminApi(`${baseUrl}/x`, { method: 'GET' }, baseUrl);
+    } catch (err) {
+      return (err as Error).message;
+    }
+    throw new Error('fetchAdminApi resolved against a failing transport');
+  }
+
+  // fails-when: the built-in default drifts from the orchestrator's default port (4000)
+  it("defaults to the orchestrator's default port on this host", () => {
+    expect(DEFAULT_ADMIN_URL).toBe('http://localhost:4000');
+  });
+
+  // fails-when: the built-in default address fails without naming KICI_ADMIN_URL / --url
+  // as the way to reach an orchestrator elsewhere
+  it('says how to reach another orchestrator when the built-in default was dialled', async () => {
+    const message = await transportFailureMessage(DEFAULT_ADMIN_URL);
+    expect(message).toContain('built-in default');
+    expect(message).toContain('needs KICI_ADMIN_URL or --url');
+  });
+
+  // breaks-if-wrong: an address the operator set keeps the existing message
+  it('adds no default hint for an address the operator set', async () => {
+    const message = await transportFailureMessage(BASE);
+    expect(message).toContain(`cannot reach the orchestrator admin API at ${BASE}`);
+    expect(message).not.toContain('built-in default');
   });
 });
 
@@ -497,5 +582,18 @@ describe('firstCauseMessage', () => {
     expect(firstCauseMessage(e)).toBe('');
     expect(firstCauseMessage(new TypeError('fetch failed'))).toBe('');
     expect(firstCauseMessage('not an error')).toBe('');
+  });
+});
+
+describe('toQuery', () => {
+  // fails-when: an undefined value is serialised as "undefined", or an empty set yields "?"
+  it('skips empty values and prefixes ?', () => {
+    expect(toQuery({ a: 'x', b: undefined, c: null, d: '', e: 3 })).toBe('?a=x&e=3');
+    expect(toQuery({})).toBe('');
+  });
+
+  // breaks-if-wrong: an explicit 0 limit and a false flag are still sent; order is kept
+  it('sends 0 and false, in insertion order', () => {
+    expect(toQuery({ limit: 0, flag: false, z: 'a b' })).toBe('?limit=0&flag=false&z=a+b');
   });
 });

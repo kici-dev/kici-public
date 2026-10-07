@@ -53,14 +53,14 @@ The master switch that turns global workflows on at all is **operator-held and f
 
 1. Navigate to **Settings > CI trust** in the dashboard.
 2. Set the fork PR policy (`allow` for an open-source project that wants fork contributions to build, `hold` to review each one, `ignore` to refuse them).
-3. Set the approval expiry — how long a held run stays approvable. Enter an amount and pick its unit (seconds, minutes, or hours), from one second up to one year. The field shows a stored window in the coarsest unit that expresses it exactly, so a 72-hour policy reads `72 hours` and a 90-second one reads `90 seconds`.
+3. Set the approval expiry — how long a held run stays approvable. Enter a duration made of hours, minutes and seconds, such as `72h`, `30m` or `1h30m`, from one second up to one year. The field shows a stored window as its shortest exact duration, so a 72-hour policy reads `72h` and a 90-second one reads `1m30s`.
 4. Save — the policy is pushed to every connected orchestrator over the WebSocket.
 
 While the stored policy is `ignore`, the page shows a notice saying fork pull requests are being dropped, links to the event log where each drop is recorded, and offers `hold` in one click. The notice reports the **saved** policy, so it stays until you save a different one.
 
-An **independent** orchestrator has no Platform to push the policy, so manage it with the orchestrator admin CLI instead: `kici-admin trust-policy show --customer-id <id>` and `kici-admin trust-policy set --customer-id <id> --fork-policy <ignore|hold|allow> …`. On a Platform-attached orchestrator `set` refuses with a 409, because the next Platform push would overwrite a local write. See [kici-admin: org settings](../orchestrator/kici-admin/org-settings.md).
+An **independent** orchestrator has no Platform to push the policy, so manage it with the orchestrator admin CLI instead: `kici-admin trust-policy show --org <id>` and `kici-admin trust-policy set --org <id> --fork-policy <ignore|hold|allow> …`. On a Platform-attached orchestrator `set` refuses with a 409, because the next Platform push would overwrite a local write. See [kici-admin: org settings](../orchestrator/kici-admin/org-settings.md).
 
-The same applies to the approval directory an independent orchestrator resolves `/kici approve` against: `kici-admin trust-policy directory-set --customer-id <id> --user-id <id> --provider-username <name> --provider-user-id <id> --ci-trust <level>` registers an approver, and `kici-admin trust-policy directory-remove` revokes one. Both refuse with a 409 on a Platform-attached orchestrator, where the dashboard owns membership.
+The same applies to the approval directory an independent orchestrator resolves `/kici approve` against: `kici-admin trust-policy directory-set --org <id> --user-id <id> --provider-username <name> --provider-user-id <id> --ci-trust <level>` registers an approver, and `kici-admin trust-policy directory-remove` revokes one. Both refuse with a 409 on a Platform-attached orchestrator, where the dashboard owns membership.
 
 The admin token behind those commands needs the orchestrator-side `ci_trust.read` permission to `show` and `ci_trust.admin` to `set` — both held by the `owner` and `admin` roles, and by neither `auditor` nor a routing-key-scoped token (the policy is org-wide, not per routing key). Every successful `set` writes a `trust_policy.updated` row to the access log in the same transaction as the policy itself, so a policy change can never land unattributed; read it back with `kici-admin access-log list --action trust_policy.updated`. The two directory verbs write a `trust_directory.updated` row on the same terms, so granting someone `ci_trust:write` — which is all it takes to release a security hold — is equally attributable.
 
@@ -82,16 +82,16 @@ An independent orchestrator has no Platform, so the dashboard approval queue, `k
 
 ```bash
 # What is this run waiting for, and who may answer it?
-kici-admin held-run list --customer-id <org> --run-id <run>
+kici-admin held-run list --org <org> --run-id <run>
 
 # Let it run.
-kici-admin held-run approve --customer-id <org> --run-id <run>
+kici-admin held-run approve --org <org> --run-id <run>
 
 # Or cancel it.
-kici-admin held-run reject --customer-id <org> --run-id <run> --reason "not this one"
+kici-admin held-run reject --org <org> --run-id <run> --reason "not this one"
 
 # Answer as a registered member, for a hold whose clauses name a user or a team.
-kici-admin held-run approve --customer-id <org> --run-id <run> --as <user-id>
+kici-admin held-run approve --org <org> --run-id <run> --as <user-id>
 ```
 
 Four things to know before you use it:
@@ -187,12 +187,13 @@ From the CLI, `--job` alone cannot separate the two. Pass `kici approve <run-id>
 
 A `fork_pr` hold covers a whole pull request and is not attached to a context, so it uses the org's **Approval expiry** setting (default 72 hours). A `context_trust` hold is raised by a context, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour), configurable under **Contexts > [context] > Protection**.
 
-The org's approval expiry is one window, stored in seconds. The dashboard takes an amount in seconds, minutes, or hours and always saves it as seconds. The API and the independent-orchestrator CLI accept either spelling:
+The org's approval expiry is one window, stored in seconds. You set it as a duration made of hours, minutes, and seconds, in that order and with no spaces: `72h`, `30m`, `90s`, or `1h30m`. The window is from 1 second to 1 year.
 
-- On a Platform-attached org, `PUT /api/v1/orgs/:customerId/trust-policy` accepts `approvalExpirySeconds` (integer, 1 second to 1 year). It accepts `approvalExpiryHours` too; when a request carries both, the seconds value wins, because it is the more specific of the two.
-- On an independent orchestrator, `kici-admin trust-policy set --customer-id <id> --approval-expiry-seconds <n>` does the same. `--approval-expiry-hours` still works, and passing both prints a warning naming the value that is ignored.
+- In the dashboard, enter the duration in the **Approval expiry** field.
+- On a Platform-attached org, `PUT /api/v1/orgs/:customerId/trust-policy` takes the window as `approvalExpirySeconds` (integer).
+- On an independent orchestrator, use `kici-admin trust-policy set --org <id> --approval-expiry <duration>`.
 
-Both spellings always move together, so they cannot disagree: setting one recomputes the other. `kici-admin trust-policy show` prints a whole-hour window as hours (`72 h`) and anything finer as seconds (`30 s`).
+`kici-admin trust-policy show` prints the window as a duration, for example `72h` or `1h30m`.
 
 A job held twice carries **two** expiries, one per hold, and whichever comes first ends the hold and fails the run. The security half of such a job is a `context_trust` hold, on the context's one-hour default. The reviewer half defaults to the org's `approval_expiry_seconds`, which is 24 hours. So the run fails after an hour unless you raise the context's hold expiry.
 

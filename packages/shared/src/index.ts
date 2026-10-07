@@ -33,6 +33,8 @@ export {
   closeDatabase,
   DEFAULT_DB_DRAIN_TIMEOUT_MS,
   isPoolAcquireTimeout,
+  isBrokenConnectionError,
+  retryOnBrokenConnection,
   type CloseDatabaseResult,
   type CreatePoolOptions,
   type PgPoolErrorSource,
@@ -51,6 +53,8 @@ export {
   storeMigrationContentHash,
   readStoredMigrationContentHash,
   isSchemaCurrent,
+  SchemaStatusKind,
+  type SchemaStatus,
   clearDispatchQueueDirect,
   purgeStaleExecutionDirect,
   purgeStaleSourcesDirect,
@@ -107,6 +111,17 @@ export {
   type RegisterWorkflowManualOpts,
   type RegisterWorkflowManualResult,
 } from './db-admin.js';
+export {
+  MIGRATION_TOOLING_TABLES,
+  diffFingerprints,
+  fingerprintSchema,
+  formatDiffEntry,
+  renderSnapshotModule,
+  type ColumnFingerprint,
+  type FingerprintDiffEntry,
+  type SchemaFingerprint,
+  type SqlQueryable,
+} from './db-schema-fingerprint.js';
 export { depCacheKeyOf, type DepCacheKey } from './dep-cache-key.js';
 export { createMetricsRoutes, type MetricsRoutesDeps } from './routes/metrics.js';
 export {
@@ -151,6 +166,7 @@ export {
 export { kiciTmpBase, kiciMkdtemp } from './tmp-dir.js';
 export { createS3Client, type CreateS3ClientOptions, type SharedS3Config } from './s3-client.js';
 export {
+  assertColdStoreEnabled,
   BaseColdStore,
   ChunkLru,
   COLD_BUCKET_NAMES,
@@ -172,11 +188,13 @@ export {
   coldStoreReplayRowsTotal,
   coldStoreVerifyFailuresTotal,
   computeChunkId,
+  createColdStoreAdminOps,
   decodeChunk,
   encodeChunk,
   encodeKeySegment,
   isLongerColdRetention,
   parseManifest,
+  PgTableAdapterBase,
   resolveTableConfig,
   serializeManifest,
   tablePrefix,
@@ -184,12 +202,17 @@ export {
   tenantDayPrefix,
   type ArchiveCycleSummary,
   type BaseColdStoreDeps,
+  type BuiltColdStore,
   type ChunkCommitMetadata,
   type ChunkLruOptions,
   type ChunkManifest,
   type ColdBucketName,
   type ColdRetention,
   type ColdStore,
+  type ColdStoreAdminChunkOpts,
+  type ColdStoreAdminPurgeOpts,
+  type ColdStoreAdminSide,
+  type ColdStoreAdminStoreOpts,
   type ColdStoreConfig,
   type ColdStoreFetchRangeArgs,
   type ColdStoreReplayChunkArgs,

@@ -21,11 +21,9 @@ import {
   ScalerVmTracker,
   TERMINAL_JOB_STATES,
   deriveOsArchLabels,
-  derivePlatformTaints,
   platformToOsArchLabels,
   platformToTaints,
   hostToScalerPlatform,
-  PLATFORM_TAINT_LABELS,
   AGENT_FEATURE_LABELS,
   agentTypeLabel,
   scalerLabel,
@@ -37,6 +35,7 @@ import type {
   ScalerCapacitySummary,
   ScalerLiveVm,
   ScalerPlatform,
+  ScalerReloadPlan,
   ScalerVmStopResult,
 } from '@kici-dev/engine';
 import {
@@ -93,7 +92,6 @@ import type {
   ScaleResult,
   ScalerEvent,
   ResourceCap,
-  ValidationResult,
   ManagedAgent,
   ResolvedContainerSpawn,
   EffectiveLimits,
@@ -114,6 +112,17 @@ import {
   type LiveVmBackend,
   type NamedLiveVmBackend,
 } from './live-vms.js';
+
+/** The `skipped` reason for a job whose agent is already provisioning or registered. */
+export const PROVISION_IN_FLIGHT = 'provision-in-flight';
+
+/** Outcome of an event scaler's cluster-wide slot claim. */
+const ClusterSlotClaim = {
+  Claimed: 'claimed',
+  Refused: 'refused',
+  ProvisionInFlight: 'provision-in-flight',
+} as const;
+type ClusterSlotClaim = (typeof ClusterSlotClaim)[keyof typeof ClusterSlotClaim];
 
 const logger = createLogger({ prefix: 'scaler' });
 
@@ -422,6 +431,29 @@ interface AppliedBackendReload {
   maxAgents: number;
   /** The entry the backend held, for a backend that keeps one. */
   entry: ScalerEntry | undefined;
+}
+
+/**
+ * The outcome of `ScalerManager.reload`: the applied plan, or the errors of a
+ * refused reload that changed nothing.
+ */
+export type ScalerReloadResult =
+  { valid: true; plan: ScalerReloadPlan } | { valid: false; errors: string[] };
+
+/**
+ * A key-order-independent JSON rendering, so two scaler entries compare equal
+ * when they hold the same values whatever order the YAML listed them in.
+ */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(
+          Object.entries(v as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : v,
+  );
 }
 
 /** Backends that can reap leftovers from a previous incarnation of the scaler. */
@@ -752,6 +784,12 @@ export class ScalerManager {
   private readonly resolveProvisionBackoff: () => Promise<ProvisionBackoffSettings>;
   private readonly readJobStatuses?: ScalerManagerDeps['readJobStatuses'];
   private globalMaxAgents: number;
+  /**
+   * Each configured scaler's entry as last applied, in `stableJson` form. A
+   * reload compares against it to report which kept scalers it updated; the
+   * backends cannot answer that, since most of them keep no copy of their entry.
+   */
+  private readonly appliedEntries = new Map<string, string>();
 
   /** Per-scaler resource caps (`{ maxCpu, maxMemoryBytes }`), keyed by scaler name. */
   private readonly resourceCaps = new Map<string, ResourceCap>();
@@ -845,6 +883,8 @@ export class ScalerManager {
    * else.
    */
   private readonly boundAgents = new Map<string, AgentBinding>();
+  /** Jobs a `requestScale` call is provisioning right now, before its spawning entry exists. */
+  private readonly jobsBeingProvisioned = new Set<string>();
 
   /**
    * Warm agents whose destroy is issued but has not settled yet.
@@ -982,6 +1022,7 @@ export class ScalerManager {
 
     // Index per-scaler orchestratorUrl overrides and roles
     for (const entry of deps.config.scalers) {
+      this.appliedEntries.set(entry.name, stableJson(entry));
       this.scalerUrls.set(entry.name, entry.orchestratorUrl);
       this.backendRoles.set(entry.name, entry.roles);
       this.scalerProvisioningTargets.set(entry.name, entry.provisioningTargets);
@@ -992,7 +1033,6 @@ export class ScalerManager {
       this.perScalerUsage.set(entry.name, { cpus: 0, memBytes: 0 });
       this.scalerMandatoryLabels.set(entry.name, entry.mandatoryLabels ?? []);
       this.scalerPlatform.set(entry.name, entry.platform);
-      this.warnOnUnstructuredPlatformLabels(entry);
     }
 
     // Index backends by name
@@ -1209,7 +1249,7 @@ export class ScalerManager {
             // gate is the one `persistSpawningAgent` records for this set.
             {
               platformTaints: this.platformTaintsFor(backendName, backend.type),
-              mandatoryLabels: this.labelSetMandatoryLabels(backendName, backend, labelSet),
+              mandatoryLabels: this.mandatoryGate(backendName, backend),
             },
             signal,
           ),
@@ -1243,11 +1283,10 @@ export class ScalerManager {
    * The pool measures readiness with `AgentRegistry.findAvailable(labels)`, and
    * that query applies the agent's `mandatoryLabels` gate: an agent is dropped
    * unless every label in its gate also appears in the query. A scaler-spawned
-   * agent's gate is `labelSetMandatoryLabels()` for the set it was spawned for,
-   * which unions the configured gate with the pool's platform taints.
-   * `warmPoolQueryLabels` puts the structured taints into the query, so that
-   * part of the gate is satisfied by construction, and the legacy shim derives
-   * from this label set's own labels, so it is satisfied by construction too.
+   * agent's gate is `mandatoryGate()`, which unions the configured gate with
+   * the pool's platform taints. `warmPoolQueryLabels` puts the structured
+   * taints into the query, so that part of the gate is satisfied by
+   * construction.
    *
    * That leaves one residual case: a configured `mandatoryLabels` entry absent
    * from the label set, which `scaler/config.ts` validation already rejects.
@@ -1256,10 +1295,8 @@ export class ScalerManager {
    * that share the cap. A refused pool is inert, exactly as it is before it
    * fills at all — never partially filled.
    *
-   * The gate derives from `declaredLabels` and is compared against
-   * `queryLabels`. Deriving it from `queryLabels` would fold a structured taint
-   * back in as a legacy one; comparing it against `declaredLabels` alone would
-   * refuse every structurally-tainted pool.
+   * The gate is compared against `queryLabels`: comparing it against
+   * `declaredLabels` alone would refuse every structurally-tainted pool.
    */
   private warmPoolLabelSetFillable(
     scalerName: string,
@@ -1268,7 +1305,7 @@ export class ScalerManager {
   ): boolean {
     const backend = this.backends.get(scalerName);
     if (!backend) return false;
-    const gate = this.labelSetMandatoryLabels(scalerName, backend, declaredLabels);
+    const gate = this.mandatoryGate(scalerName, backend);
     const reachable = new Set(queryLabels.map((l) => l.toLowerCase()));
     const unreachable = gate.filter((l) => !reachable.has(l.toLowerCase()));
     if (unreachable.length === 0) return true;
@@ -1554,34 +1591,12 @@ export class ScalerManager {
   private readonly scalerPlatform = new Map<string, ScalerPlatform | undefined>();
 
   /**
-   * Warn when a pool declares a plain platform-ish label (matched by the legacy
-   * denylist) but omits the structured `platform` field. The denylist is a
-   * migration shim; declaring `platform` is the canonical way to taint a pool.
-   */
-  private warnOnUnstructuredPlatformLabels(entry: {
-    name: string;
-    platform?: ScalerPlatform;
-    labelSets: { labels: string[] }[];
-  }): void {
-    if (entry.platform) return;
-    const plain = entry.labelSets
-      .flatMap((ls) => ls.labels)
-      .filter((l) => PLATFORM_TAINT_LABELS.has(l.toLowerCase()));
-    if (plain.length > 0) {
-      logger.warn(
-        `Scaler '${entry.name}' declares platform label(s) ${plain.join(', ')} without a structured 'platform' field. ` +
-          `Add 'platform: { os, arch }' to make the taint explicit; the plain-label denylist is a migration shim.`,
-      );
-    }
-  }
-
-  /**
    * Resolve the pool's platform for label + taint derivation. Precedence:
    *   1. A declared `platform` field always wins (even on a linux host).
    *   2. Otherwise a bare-metal pool derives its platform from the host OS/arch.
    *   3. Otherwise (container / firecracker, undeclared) returns null — those
    *      pools run linux agents and are not auto-tainted; only an explicit
-   *      declared platform or a legacy denylist label taints them.
+   *      declared platform taints them.
    * Returns null when a bare-metal host's OS/arch is not a supported enum value
    * (the caller falls back to the raw host-label derivation for labels).
    */
@@ -1594,7 +1609,7 @@ export class ScalerManager {
 
   /**
    * The plain platform-taint tokens (`windows`, `macos`, `arm64`) for a scaler,
-   * derived from the same resolved platform `labelSetMandatoryLabels` gates on.
+   * derived from the same resolved platform `mandatoryGate` gates on.
    *
    * This is the single source for the taint: it feeds the matcher's view of the
    * label sets, the taint gate, the labels the spawned agent registers with, and
@@ -1632,31 +1647,17 @@ export class ScalerManager {
   }
 
   /**
-   * Taint gate for ONE of a scaler's label sets: the configured
-   * `mandatoryLabels` plus the platform taints derived from the pool's resolved
-   * structured platform, unioned with the legacy plain-label denylist shim read
-   * from THIS label set alone.
+   * Taint gate for a scaler's label sets: the configured `mandatoryLabels` plus
+   * the platform taints derived from the pool's resolved structured platform.
    *
-   * This is the gate every routing and stamping decision uses. Deriving the
-   * legacy shim per label set is what keeps a mixed-platform scaler routable: a
-   * pool declaring `[linux, gpu]` alongside `[macos, xcode]` gates only the
-   * second set on `macos`, where the union would gate both and leave the linux
-   * set unreachable by any sensible job.
-   *
-   * `backend` carries only `type` because the label set is passed in — a caller
-   * that holds one label set never has to reach for the whole backend.
+   * This is the gate every routing and stamping decision uses. `backend`
+   * carries only `type`, so a caller that holds one label set never has to
+   * reach for the whole backend.
    */
-  private labelSetMandatoryLabels(
-    name: string,
-    backend: { type: string },
-    labelSetLabels: string[],
-  ): string[] {
+  private mandatoryGate(name: string, backend: { type: string }): string[] {
     const config = this.scalerMandatoryLabels.get(name) ?? [];
     const structuredTaints = this.platformTaintsFor(name, backend.type);
-    // Legacy denylist shim: keep tainting un-migrated pools that still declare a
-    // plain platform label without the structured field.
-    const legacyTaints = derivePlatformTaints(labelSetLabels);
-    return [...new Set([...config, ...structuredTaints, ...legacyTaints])];
+    return [...new Set([...config, ...structuredTaints])];
   }
 
   /**
@@ -1712,14 +1713,8 @@ export class ScalerManager {
             labels: [...new Set([...ls.labels, ...autoLabels])],
           })),
           // Index-aligned with `labelSets` by construction: both are
-          // `backend.labelSets.map(...)` over the same array, in order. The
-          // gate derives from the DECLARED labels, not the auto-labelled set
-          // above — feeding the injected platform tokens back through
-          // `derivePlatformTaints` would re-derive the structured taint as a
-          // legacy one on every pool.
-          labelSetMandatoryLabels: backend.labelSets.map((ls) =>
-            this.labelSetMandatoryLabels(name, backend, ls.labels),
-          ),
+          // `backend.labelSets.map(...)` over the same array, in order.
+          labelSetMandatoryLabels: backend.labelSets.map(() => this.mandatoryGate(name, backend)),
         };
       });
   }
@@ -1899,7 +1894,48 @@ export class ScalerManager {
     if (this.isDraining()) {
       return { action: 'skipped', reason: 'draining' };
     }
+    // One job, one provision. The pending-scale re-drive offers every still-
+    // pending job again, including one whose agent is still provisioning or
+    // has registered but not yet claimed it; a second agent for it would sit
+    // idle (and, on an event scaler, bill). Checked and marked before the
+    // first await, so two concurrent offers of one job cannot both pass.
+    if (this.hasLocalProvisionFor(jobId)) {
+      return { action: 'skipped', reason: PROVISION_IN_FLIGHT };
+    }
+    this.jobsBeingProvisioned.add(jobId);
+    try {
+      return await this.provisionForJob(
+        labels,
+        jobId,
+        runId,
+        excludeLabels,
+        resources,
+        orgId,
+        containerSpawn,
+      );
+    } finally {
+      this.jobsBeingProvisioned.delete(jobId);
+    }
+  }
 
+  /** Whether this coordinator already provisions, or holds an agent bound to, `jobId`. */
+  private hasLocalProvisionFor(jobId: string): boolean {
+    if (this.jobsBeingProvisioned.has(jobId)) return true;
+    for (const entry of this.spawningAgents.values()) if (entry.boundJobId === jobId) return true;
+    for (const binding of this.boundAgents.values()) if (binding.jobId === jobId) return true;
+    return false;
+  }
+
+  /** `requestScale` past its drain and per-job checks: match, reserve, spawn. */
+  private async provisionForJob(
+    labels: string[],
+    jobId: string,
+    runId: string,
+    excludeLabels: string[],
+    resources: ResourceRequest | undefined,
+    orgId: string | undefined,
+    containerSpawn: ResolvedContainerSpawn | undefined,
+  ): Promise<ScaleResult> {
     // 0. Prune stale spawning entries (agents that crashed before WS registration).
     this.pruneStaleSpawningEntries();
 
@@ -1955,7 +1991,9 @@ export class ScalerManager {
       runId,
     );
     if (!reserve.reserved) {
-      return { action: 'at-capacity' };
+      return reserve.provisionInFlight
+        ? { action: 'skipped', reason: PROVISION_IN_FLIGHT }
+        : { action: 'at-capacity' };
     }
 
     this.spawningAgents.set(agentId, {
@@ -1990,7 +2028,7 @@ export class ScalerManager {
       boundJobId: jobId,
       runId,
       platformTaints: this.platformTaintsFor(backendName, backend.type),
-      mandatoryLabels: this.labelSetMandatoryLabels(backendName, backend, spawnLabelSet),
+      mandatoryLabels: this.mandatoryGate(backendName, backend),
       ...(containerSpawn ? { container: containerSpawn } : {}),
     };
     // The spawn outlives this call. It runs in its own request store holding
@@ -2082,7 +2120,9 @@ export class ScalerManager {
     boundJobId: string | undefined,
     /** The bound job's run, or `undefined` for a warm pre-spawn. */
     runId?: string,
-  ): Promise<{ reserved: false } | { reserved: true; slotClaimed: boolean }> {
+  ): Promise<
+    { reserved: false; provisionInFlight?: boolean } | { reserved: true; slotClaimed: boolean }
+  > {
     const clusterCapped = backend.type === ScalerBackendType.enum.event && this.stateStore != null;
     let slotClaimed = false;
     const reserveOutcome = await this.runWithReservationLock(async () => {
@@ -2111,7 +2151,7 @@ export class ScalerManager {
         return 'at-capacity-resource' as const;
       }
       if (clusterCapped) {
-        slotClaimed = await this.claimClusterSlot(
+        const claim = await this.claimClusterSlot(
           agentId,
           spawnLabelSet,
           backendName,
@@ -2119,10 +2159,13 @@ export class ScalerManager {
           boundJobId,
           runId,
         );
-        if (!slotClaimed) {
+        if (claim !== ClusterSlotClaim.Claimed) {
           this.releaseInMemory(backendName, requests);
-          return 'at-capacity-count' as const;
+          return claim === ClusterSlotClaim.ProvisionInFlight
+            ? ('provision-in-flight' as const)
+            : ('at-capacity-count' as const);
         }
+        slotClaimed = true;
       }
       // Record the admission INSIDE the critical section. `this.reservations`
       // is the admitted set the count caps above read, so a write outside the
@@ -2139,6 +2182,8 @@ export class ScalerManager {
       });
       return 'reserved' as const;
     });
+    if (reserveOutcome === 'provision-in-flight')
+      return { reserved: false, provisionInFlight: true };
     if (reserveOutcome !== 'reserved') return { reserved: false };
 
     const poolName = this.scalerMachinePools.get(backendName);
@@ -2759,15 +2804,13 @@ export class ScalerManager {
     // scaler is healthy again whatever it did before.
     this.clearProvisionFailures(spawning.backendName);
 
-    // Use the same gate the local matcher and cross-peer advertisement apply to
-    // THIS label set, so a platform-tainted pool (windows/macos/arm64) stamps
-    // that taint onto the registered agent — the queue-drain and eager-dispatch
-    // paths then reject an unqualified job that would otherwise land on a
-    // wrong-OS scaler agent. The gate is derived from `spawning.labelSet`, the
-    // set this agent was actually spawned for: a scaler-wide union would stamp a
-    // sibling set's platform taint onto an agent that cannot satisfy it.
+    // Use the scaler's `mandatoryGate`, the gate the local matcher and
+    // cross-peer advertisement apply, so a platform-tainted pool
+    // (windows/macos/arm64) stamps that taint onto the registered agent — the
+    // queue-drain and eager-dispatch paths then reject an unqualified job that
+    // would otherwise land on a wrong-OS scaler agent.
     const mandatoryLabels = backend
-      ? this.labelSetMandatoryLabels(spawning.backendName, backend, spawning.labelSet)
+      ? this.mandatoryGate(spawning.backendName, backend)
       : (this.scalerMandatoryLabels.get(spawning.backendName) ?? []);
 
     logger.info(`Spawned agent ${agentId} registered, backend ${spawning.backendName}`, {
@@ -3940,7 +3983,6 @@ export class ScalerManager {
         // Drop the stale semaphore so the next spawn builds one at the new width.
         this.spawnSemaphores.delete(entry.name);
       }
-      this.warnOnUnstructuredPlatformLabels(entry);
       // Preserve existing usage counters; only initialize for new scalers.
       if (!this.perScalerUsage.has(entry.name)) {
         this.perScalerUsage.set(entry.name, { cpus: 0, memBytes: 0 });
@@ -4019,7 +4061,7 @@ export class ScalerManager {
    * dropped: it stops taking work at once, its idle warm agents are destroyed,
    * its job-bound agents finish, and its backend is torn down when it drains.
    */
-  async reload(newConfig: ScalerConfig): Promise<ValidationResult> {
+  async reload(newConfig: ScalerConfig): Promise<ScalerReloadResult> {
     const plan = this.planReload(newConfig);
 
     // Validate against live state. `backend.reload` applies as it validates, so
@@ -4037,6 +4079,8 @@ export class ScalerManager {
       return { valid: false, errors: buildErrors };
     }
 
+    const reloadPlan = this.describeReload(newConfig, plan);
+
     // Commit — synchronous, so no interleaved dispatch sees a half-applied config.
     for (const { name, backend } of built) {
       this.backends.set(name, backend);
@@ -4051,6 +4095,8 @@ export class ScalerManager {
 
     this.globalMaxAgents = newConfig.globalMaxAgents;
     this.globalResourceCap = newConfig.globalResourceCap;
+    this.appliedEntries.clear();
+    for (const entry of newConfig.scalers) this.appliedEntries.set(entry.name, stableJson(entry));
     this.applyScalerMetadata(newConfig);
     this.applyWarmPoolConfig(newConfig);
 
@@ -4068,7 +4114,33 @@ export class ScalerManager {
     // now rather than leaving it visible until the next sweep tick.
     await this.sweepRetiredBackends();
 
-    return { valid: true };
+    return { valid: true, plan: reloadPlan };
+  }
+
+  /**
+   * What a validated reload is about to change, per scaler name. Runs before
+   * the commit, while the previous entries and global limits are still in place.
+   */
+  private describeReload(newConfig: ScalerConfig, plan: ReloadPlan): ScalerReloadPlan {
+    const updated: string[] = [];
+    const unchanged: string[] = [];
+    for (const entry of plan.kept) {
+      if (this.appliedEntries.get(entry.name) === stableJson(entry)) unchanged.push(entry.name);
+      else updated.push(entry.name);
+    }
+    const global: string[] = [];
+    if (newConfig.globalMaxAgents !== this.globalMaxAgents) global.push('globalMaxAgents');
+    if (stableJson(newConfig.globalResourceCap) !== stableJson(this.globalResourceCap)) {
+      global.push('globalResourceCap');
+    }
+    return {
+      added: plan.added.map((e) => e.name),
+      updated,
+      unchanged,
+      retired: [...plan.removed],
+      resurrected: plan.resurrected.map((e) => e.name),
+      global,
+    };
   }
 
   /**
@@ -4105,7 +4177,7 @@ export class ScalerManager {
         // case, and the two must stay in step.
         labelSetMandatoryLabels:
           enriched?.labelSetMandatoryLabels ??
-          backend.labelSets.map((ls) => this.labelSetMandatoryLabels(name, backend, ls.labels)),
+          backend.labelSets.map(() => this.mandatoryGate(name, backend)),
         retiring: this.retiring.has(name),
       });
     }
@@ -4432,10 +4504,9 @@ export class ScalerManager {
       ...(roles && { roles }),
       ...(backend && {
         backendType: backend.type,
-        // The gate for the set this agent is spawned for, not the scaler-wide
-        // union: the adopting coordinator stamps this row's value straight onto
-        // the agent, so a union would carry a sibling set's platform taint.
-        mandatoryLabels: this.labelSetMandatoryLabels(scalerName, backend, labelSet),
+        // The scaler's `mandatoryGate`: the adopting coordinator stamps this
+        // row's value straight onto the agent.
+        mandatoryLabels: this.mandatoryGate(scalerName, backend),
       }),
     };
   }
@@ -4472,10 +4543,16 @@ export class ScalerManager {
     boundJobId: string | undefined,
     /** The bound job's run, persisted alongside it so a failure stays attributable. */
     runId: string | undefined,
-  ): Promise<boolean> {
-    if (!this.stateStore) return false;
+  ): Promise<ClusterSlotClaim> {
+    if (!this.stateStore) return ClusterSlotClaim.Refused;
     try {
       return await this.stateStore.withScalerCapLock(scalerName, async (slot) => {
+        // Another coordinator may already provision this job: the re-drive
+        // runs on any coordinator against the shared queue. Read under the
+        // same lock the claim writes under, so two cannot both admit it.
+        if (boundJobId !== undefined && (await slot.hasProvisionForJob(boundJobId))) {
+          return ClusterSlotClaim.ProvisionInFlight;
+        }
         if (slot.clusterActiveCount >= maxAgents) {
           logger.info('scaler.cap exceeded for scaler agents cluster-wide', {
             scaler: scalerName,
@@ -4483,12 +4560,12 @@ export class ScalerManager {
             max: maxAgents,
           });
           incScalerSpawnRefusals();
-          return false;
+          return ClusterSlotClaim.Refused;
         }
         await slot.reserve(
           this.spawningAgentSnapshot(agentId, labelSet, scalerName, boundJobId, runId),
         );
-        return true;
+        return ClusterSlotClaim.Claimed;
       });
     } catch (err) {
       const reason = capLockFailureReason(err);
@@ -4499,7 +4576,7 @@ export class ScalerManager {
         error: toErrorMessage(err),
       });
       scalerCapLockFailuresTotal.add(1, { reason });
-      return false;
+      return ClusterSlotClaim.Refused;
     }
   }
 

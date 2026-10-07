@@ -15,18 +15,21 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
 import { resolveSecretInput, fingerprintValue } from './shared/secret-input.js';
 import { confirmPrompt } from './shared/confirm.js';
+import { cliAction } from './shared/cli-action.js';
+import { ORG_ID_HELP } from './shared/org-id.js';
 
 export function registerVariableCommands(program: Command, getClient: () => AdminApiClient): void {
   const vr = program.command('variable').description('Manage context variables');
 
-  vr.command('list <orgId> <context>')
+  vr.command('list')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<context>')
     .description('List org-level variables in a context')
     .option('--values', 'Print variable values inline (default: keys + locked flag only)')
-    .action(async (orgId: string, context: string, opts: { values?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (orgId: string, context: string, opts: { values?: boolean }) => {
         const { variables } = await getClient().listVariables(orgId, context);
         if (variables.length === 0) {
           console.log('No variables in this context.');
@@ -40,16 +43,16 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
             console.log(`  - ${v.key}${lockTag}`);
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
-  vr.command('get <orgId> <context> <key>')
+  vr.command('get')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<context>')
+    .argument('<key>')
     .description('Print the value of a single variable')
-    .action(async (orgId: string, context: string, key: string) => {
-      try {
+    .action(
+      cliAction(async (orgId: string, context: string, key: string) => {
         const { variables } = await getClient().listVariables(orgId, context);
         const match = variables.find((v) => v.key === key);
         if (!match) {
@@ -57,13 +60,13 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
           process.exit(1);
         }
         console.log(match.value);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
-  vr.command('set <orgId> <context> <key>')
+  vr.command('set')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<context>')
+    .argument('<key>')
     .description(
       'Set a context variable. Value comes from one of: --prompt (default on TTY), ' +
         '--from-stdin (default on pipe), --from-file <path>, --from-env <VAR>, ' +
@@ -82,23 +85,23 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
     )
     .option('--dry-run', 'Parse + validate the value, print fingerprint + length, do not write')
     .action(
-      async (
-        orgId: string,
-        context: string,
-        key: string,
-        opts: {
-          value?: string;
-          prompt?: boolean;
-          fromStdin?: boolean;
-          fromFile?: string;
-          fromEnv?: string;
-          trim?: boolean;
-          locked?: boolean;
-          confirmFingerprint?: string;
-          dryRun?: boolean;
-        },
-      ) => {
-        try {
+      cliAction(
+        async (
+          orgId: string,
+          context: string,
+          key: string,
+          opts: {
+            value?: string;
+            prompt?: boolean;
+            fromStdin?: boolean;
+            fromFile?: string;
+            fromEnv?: string;
+            trim?: boolean;
+            locked?: boolean;
+            confirmFingerprint?: string;
+            dryRun?: boolean;
+          },
+        ) => {
           const { value, source } = await resolveSecretInput(opts);
 
           if (opts.dryRun) {
@@ -113,18 +116,18 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
           await getClient().setVariable(orgId, context, key, value, opts.locked);
           const lockTag = opts.locked ? ' [locked]' : '';
           console.log(`Variable '${key}' set in context '${context}' for org ${orgId}${lockTag}.`);
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
-  vr.command('delete <orgId> <context> <key>')
+  vr.command('delete')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<context>')
+    .argument('<key>')
     .description('Delete a context variable')
     .option('--yes', 'Skip confirmation prompt')
-    .action(async (orgId: string, context: string, key: string, opts: { yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (orgId: string, context: string, key: string, opts: { yes?: boolean }) => {
         if (!opts.yes) {
           const confirmed = await confirmPrompt(
             `Are you sure you want to delete variable '${key}' from context '${context}'? [y/N] `,
@@ -136,9 +139,6 @@ export function registerVariableCommands(program: Command, getClient: () => Admi
         }
         await getClient().deleteVariable(orgId, context, key);
         console.log(`Variable '${key}' deleted from context '${context}' for org ${orgId}.`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

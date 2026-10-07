@@ -20,7 +20,6 @@
 import { randomUUID } from 'node:crypto';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
 import type {
-  AgentCapabilities,
   GlobalEvalCandidateResult,
   GlobalEvalRoundResult,
   LockJob,
@@ -30,10 +29,8 @@ import type {
   WorkflowDecision,
 } from '@kici-dev/engine';
 import {
-  AgentCapabilityFlag,
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
   INIT_RUNNER_ROLE_LABEL,
-  hasAgentCapability,
   isLockDynamicJobFn,
 } from '@kici-dev/engine';
 import {
@@ -255,17 +252,12 @@ export interface GlobalEvalAgentRegistry {
   findAvailable(
     labels: string[],
   ): Array<{ platform: string; arch: string; version?: string | null }>;
-  /**
-   * Every registered agent, busy or idle. Optional so a test double can omit
-   * it; without it the up-front result-aware refusal never fires.
-   */
+  /** Every registered agent, busy or idle. Optional so a test double can omit it. */
   getAllEntries?(): Iterable<{
     labels: ReadonlySet<string>;
     platform: string;
     arch: string;
     version: string | null;
-    /** What the agent advertised on `agent.register`; `null` = supports nothing optional. */
-    capabilities: AgentCapabilities | null;
   }>;
 }
 
@@ -617,51 +609,6 @@ export function unsupportedFleetReason(agentRegistry?: GlobalEvalAgentRegistry):
     `${MIN_GLOBAL_EVAL_AGENT_VERSION} — an orchestrator upgraded ahead of its agents ` +
     'suppresses every global workflow that declares a filter or a dynamic job'
   );
-}
-
-/**
- * Why a candidate with a result-aware generator is refused before any round.
- *
- * An agent without the capability runs every generator in the round, a
- * result-aware one included; that generator sees no upstream outputs and
- * returns the wrong jobs.
- */
-export const RESULT_AWARE_UNSUPPORTED_REASON =
-  'every registered init-runner agent lacks the ' +
-  `'${AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators}' capability, which a ` +
-  "global workflow's eval round needs when the workflow also declares a result-aware " +
-  "generator (dynamicJob with 'needs'). Upgrade your agents so the round runs only the " +
-  'needs-free generators';
-
-/**
- * Why no agent can run a round holding a result-aware generator, or `null`
- * when one might.
- *
- * The same bar as {@link unsupportedFleetReason}: refused only on proof. That
- * means init-runners ARE registered, every one reports a readable version, and
- * none advertises the capability. An empty fleet, a busy capable agent, or an
- * agent whose version cannot be read is not refused — the round queues on the
- * agent-feature label, and a scaler or a registering agent can still serve it.
- */
-export function resultAwareUnsupportedReason(
-  agentRegistry?: GlobalEvalAgentRegistry,
-): string | null {
-  if (!agentRegistry?.getAllEntries) return null;
-  const runners = [...agentRegistry.getAllEntries()].filter((agent) =>
-    agent.labels.has(INIT_RUNNER_ROLE_LABEL),
-  );
-  // breaks-if-wrong: an empty fleet must queue the round, never refuse it
-  if (runners.length === 0) return null;
-  if (runners.some((agent) => agent.version === null || parseVersionBase(agent.version) === null))
-    return null;
-  // fails-when: a fleet of registered agents that all lack the flag is sent a round they would get wrong
-  const capable = runners.some((agent) =>
-    hasAgentCapability(
-      agent.capabilities,
-      AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators,
-    ),
-  );
-  return capable ? null : RESULT_AWARE_UNSUPPORTED_REASON;
 }
 
 /**
@@ -1324,33 +1271,13 @@ export interface GlobalEvalRoundsOutcome {
 }
 
 /**
- * How one group is routed. A group with a result-aware generator runs only on an
- * agent carrying the agent-feature label; when every registered init-runner
- * provably lacks it, those candidates are refused up front and the rest of the
- * group runs as usual.
+ * Whether a group's round must run on an agent carrying the agent-feature label:
+ * true when any candidate has a result-aware generator.
  */
-interface GroupPlan {
-  run: readonly GlobalEvalCandidate[];
-  requiresResultAwareSkip: boolean;
-  refused: readonly GlobalEvalCandidate[];
-}
-
-function planGroup(
-  group: readonly GlobalEvalCandidate[],
-  agentRegistry: GlobalEvalAgentRegistry | undefined,
-): GroupPlan {
-  const deferred = group.filter((candidate) => hasDeferredGenerator(candidate.lockEntry));
-  // fails-when: a candidate with a result-aware generator runs on an agent that would run it too
+function requiresResultAwareSkip(group: readonly GlobalEvalCandidate[]): boolean {
+  // fails-when: a candidate with a result-aware generator runs on an agent without the label
   // breaks-if-wrong: a group with no result-aware generator must run exactly as it always has
-  if (deferred.length === 0) return { run: group, requiresResultAwareSkip: false, refused: [] };
-  if (!resultAwareUnsupportedReason(agentRegistry)) {
-    return { run: group, requiresResultAwareSkip: true, refused: [] };
-  }
-  return {
-    run: group.filter((candidate) => !hasDeferredGenerator(candidate.lockEntry)),
-    requiresResultAwareSkip: false,
-    refused: deferred,
-  };
+  return group.some((candidate) => hasDeferredGenerator(candidate.lockEntry));
 }
 
 /** Fold one round outcome into the delivery's verdicts and failure records. */
@@ -1441,20 +1368,8 @@ export async function runGlobalEvalRounds(
       );
       continue;
     }
-    const plan = planGroup(group, args.deps.agentRegistry);
-    if (plan.refused.length > 0) {
-      settleGroupOutcome(
-        args,
-        plan.refused,
-        { ok: false, error: RESULT_AWARE_UNSUPPORTED_REASON, attempts: 0, runId: randomUUID() },
-        verdicts,
-        failures,
-      );
-    }
-    if (plan.run.length > 0) {
-      const outcome = await runGroupRound(args, plan.run, budgets, plan.requiresResultAwareSkip);
-      settleGroupOutcome(args, plan.run, outcome, verdicts, failures);
-    }
+    const outcome = await runGroupRound(args, group, budgets, requiresResultAwareSkip(group));
+    settleGroupOutcome(args, group, outcome, verdicts, failures);
   }
 
   recordVerdictOutcomes(verdicts);

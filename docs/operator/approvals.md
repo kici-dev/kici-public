@@ -43,13 +43,13 @@ Two org-scoped settings govern approval behavior. Manage them with the orchestra
 
 ```bash
 # Show the current approval settings for an org
-kici-admin org-settings approval show --customer-id <id>
+kici-admin org-settings approval show --org <id>
 
 # Set the default hold expiry (seconds)
-kici-admin org-settings approval set-expiry <seconds> --customer-id <id>
+kici-admin org-settings approval set-expiry <seconds> --org <id>
 
 # Allow or forbid self-approval
-kici-admin org-settings approval set-self-approval true|false --customer-id <id>
+kici-admin org-settings approval set-self-approval true|false --org <id>
 ```
 
 | Setting                   | Default | Effect                                                                                                      |

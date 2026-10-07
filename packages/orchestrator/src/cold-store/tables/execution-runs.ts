@@ -1,18 +1,10 @@
 /**
  * `execution_runs` cold-store adapter (Orchestrator side).
  *
- *
- * Contract:
- *   - tenant column: `routing_key`
- *   - partition column: `created_at`
- *   - warm TTL: 30 days
- *   - eligibility: terminal run status AND no live jobs reference this run
- *
- * Order: registered LAST in the orchestrator cold-store. Within one
- * cycle the framework iterates adapters steps → jobs → runs; this
- * adapter goes last so the FK `execution_jobs.run_id →
- * execution_runs(run_id)` doesn't fire on DELETE. The "no live jobs"
- * predicate enforces the same invariant across cycle interruptions.
+ * Tenant column `routing_key`, partition column `created_at`, warm TTL 30
+ * days. Eligible: a terminal run that no live job references. Registered
+ * last (steps → jobs → runs) so the `execution_jobs.run_id` FK never fires
+ * on DELETE.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import {
@@ -20,6 +12,7 @@ import {
   type ColdStoreTableConfig,
   type EligiblePartition,
   type TableAdapter,
+  PgTableAdapterBase,
 } from '@kici-dev/shared';
 import { TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { Database, ExecutionRunTable } from '../../db/types.js';
@@ -31,7 +24,6 @@ const APPROX_ROW_BYTES = 1000;
 
 const TERMINAL_STATUS_LIST: readonly string[] = Array.from(TERMINAL_RUN_STATES);
 
-/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,
@@ -45,19 +37,21 @@ export interface ExecutionRunsAdapterOptions {
   overrides?: Partial<ColdStoreTableConfig>;
 }
 
-export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
+export class ExecutionRunsAdapter
+  extends PgTableAdapterBase<Database>
+  implements TableAdapter<ExecutionRunRow>
+{
   readonly db = 'orchestrator' as const;
   readonly table = 'execution_runs';
   readonly tenantColumn = 'routing_key';
   readonly partitionColumn = 'created_at';
-  readonly config: ColdStoreTableConfig;
 
   constructor(
-    private readonly kdb: Kysely<Database>,
+    kdb: Kysely<Database>,
     private readonly instanceId: string,
     opts: ExecutionRunsAdapterOptions = {},
   ) {
-    this.config = { ...DEFAULT_CONFIG, ...(opts.overrides ?? {}) };
+    super(kdb, ADVISORY_LOCK_NAMESPACE, DEFAULT_CONFIG, opts.overrides);
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
@@ -88,25 +82,6 @@ export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
     return Number.isFinite(n) ? n * APPROX_ROW_BYTES : 0;
   }
 
-  async withPartitionLock<T>(
-    args: { tenantId: string; partitionDate: string },
-    fn: () => Promise<T>,
-  ): Promise<T | null> {
-    const key = `${ADVISORY_LOCK_NAMESPACE}|${args.tenantId}|${args.partitionDate}`;
-    return await this.kdb.connection().execute(async (conn) => {
-      const lockRes = await sql<{ locked: boolean }>`
-        SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
-      `.execute(conn);
-      const locked = lockRes.rows[0]?.locked === true;
-      if (!locked) return null;
-      try {
-        return await fn();
-      } finally {
-        await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn).catch(() => undefined);
-      }
-    });
-  }
-
   async *selectEligible(args: {
     tenantId: string;
     partitionDate: string;
@@ -114,10 +89,7 @@ export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
   }): AsyncIterable<ExecutionRunRow> {
     const dayStart = new Date(`${args.partitionDate}T00:00:00.000Z`);
     const dayEnd = new Date(dayStart.getTime() + 86_400_000);
-    // FK guard: skip runs that still have live `execution_jobs` rows.
-    // The FK `execution_jobs.run_id → execution_runs(run_id)` would
-    // abort the DELETE otherwise; this predicate makes the adapter
-    // safe across cycle interruptions.
+    // Skip runs that still have `execution_jobs` rows: the FK would abort the DELETE.
     const rows = await sql<ExecutionRunRow>`
       SELECT *
       FROM execution_runs r
@@ -142,10 +114,10 @@ export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
 
   decodeRow(line: string): ExecutionRunRow {
     const parsed = JSON.parse(line) as ExecutionRunRow;
-    coerceDate(parsed, 'created_at');
-    coerceDate(parsed, 'started_at');
-    coerceDate(parsed, 'completed_at');
-    coerceDate(parsed, 'archived_at');
+    PgTableAdapterBase.coerceDate(parsed, 'created_at');
+    PgTableAdapterBase.coerceDate(parsed, 'started_at');
+    PgTableAdapterBase.coerceDate(parsed, 'completed_at');
+    PgTableAdapterBase.coerceDate(parsed, 'archived_at');
     return parsed;
   }
 
@@ -274,12 +246,5 @@ export class ExecutionRunsAdapter implements TableAdapter<ExecutionRunRow> {
           last_archived_at = now()
       `.execute(trx);
     });
-  }
-}
-
-function coerceDate<T>(parsed: T, field: keyof T): void {
-  const v = (parsed as unknown as Record<string, unknown>)[field as string];
-  if (typeof v === 'string') {
-    (parsed as unknown as Record<string, unknown>)[field as string] = new Date(v);
   }
 }

@@ -1,11 +1,9 @@
 /**
  * Every claim a KiCI provenance ID token carries, in a stable order.
  *
- * Both OIDC discovery documents render `claims_supported` from this list — the
- * orchestrator issuer that mints tokens today and the legacy Platform issuer
- * whose already-issued tokens carried the same shape — so a relying party
- * configuring a trust policy reads the same names under either `iss`. The
- * orchestrator binds the list to its `IdTokenClaims` type at compile time and
+ * The orchestrator's OIDC discovery document renders `claims_supported` from
+ * this list, so a relying party configuring a trust policy reads the names the
+ * tokens carry. The orchestrator binds the list to its `IdTokenClaims` type at compile time and
  * a drift test checks it against the claims its builder actually emits.
  */
 export const ID_TOKEN_CLAIM_NAMES = [

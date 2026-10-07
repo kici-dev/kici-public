@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   WS_MAX_PAYLOAD_BYTES,
   DASHBOARD_REQUEST_TYPE_SET,
-  ORCH_CAPABILITIES,
   PROTOCOL_VERSION,
   JoinErrorCode,
   buildJoinRefusal,
@@ -10,6 +9,8 @@ import {
 } from '@kici-dev/engine';
 import {
   PlatformClient,
+  DASHBOARD_FRAME_TYPES,
+  type DashboardFrameType,
   classifyDashboardRequestError,
   type PlatformClientOptions,
 } from './platform-client.js';
@@ -120,6 +121,9 @@ function authenticateClient(client: PlatformClient): MockWsInstance {
   simulateOpen(mock);
   simulateMessage(mock, {
     type: 'auth.success',
+    githubWebhookUrl: null,
+    orgId: 'org_test',
+    orgPublicAlias: 'oal_test',
     connectionId: 'conn-123',
   });
   return mock;
@@ -146,7 +150,14 @@ describe('PlatformClient', () => {
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'c1', orgId: 'org_a', ...extra });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'c1',
+        orgId: 'org_a',
+        orgPublicAlias: 'oal_test',
+        githubWebhookUrl: null,
+        ...extra,
+      });
       return client;
     }
 
@@ -160,10 +171,6 @@ describe('PlatformClient', () => {
 
     it('returns null when the Platform sends null', () => {
       expect(authWith({ githubWebhookUrl: null }).getGithubWebhookUrl()).toBeNull();
-    });
-
-    it('is undefined when the Platform omits the field', () => {
-      expect(authWith({}).getGithubWebhookUrl()).toBeUndefined();
     });
   });
 
@@ -198,10 +205,8 @@ describe('PlatformClient', () => {
         type: 'auth.request',
         token: 'test-api-key',
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: {
-          orchRole: 'coordinator',
-          supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
-        },
+        // fails-when: the auth.request advertises the removed dashboard-request manifest.
+        capabilities: { orchRole: 'coordinator' },
       });
     });
 
@@ -241,16 +246,13 @@ describe('PlatformClient', () => {
   });
 
   describe('capability exchange', () => {
-    // fails-when: the flag is advertised unconditionally, or not at all.
-    it('advertises clusterJoinV2 only when a join handler is wired', () => {
-      expect(createClient({ onJoinRequest: vi.fn() }).getCapabilities().clusterJoinV2).toBe(true);
-      expect(createClient().getCapabilities().clusterJoinV2).toBeUndefined();
-
+    // fails-when: a wired join handler advertises the removed clusterJoinV2 flag again.
+    it('advertises no join capability flag when a join handler is wired', () => {
       const client = createClient({ onJoinRequest: vi.fn() });
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
-      expect(JSON.parse(mock.sentMessages[0]).capabilities.clusterJoinV2).toBe(true);
+      expect(JSON.parse(mock.sentMessages[0]).capabilities).toEqual({ orchRole: 'coordinator' });
     });
 
     it('sends orchestrator capabilities in auth.request', () => {
@@ -303,7 +305,6 @@ describe('PlatformClient', () => {
         type: 'orch.capabilities.update',
         capabilities: {
           orchRole: 'coordinator',
-          supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
           dashboardWrites: { 'secrets.set': 'disabled' },
         },
       });
@@ -347,43 +348,14 @@ describe('PlatformClient', () => {
       });
       expect(client.getCapabilities()).toEqual({
         orchRole: 'coordinator',
-        supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
         dashboardWrites: { 'secrets.set': 'disabled' },
       });
 
       client.broadcastCapabilities({ dashboardWrites: { 'secrets.delete': 'disabled' } });
       expect(client.getCapabilities()).toEqual({
         orchRole: 'coordinator',
-        supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
         dashboardWrites: { 'secrets.delete': 'disabled' },
       });
-    });
-
-    it('advertises the full manifest when no capabilitiesTransform is injected (shipped default)', () => {
-      // The shipped orchestrator injects no transform, so the identity default
-      // advertises every dashboard request type.
-      const client = createClient();
-      const advertised = client.getCapabilities().supportedDashboardRequests ?? [];
-      expect(advertised).toContain('dashboard.contexts.list');
-      expect(advertised).toContain('dashboard.contexts.get');
-    });
-
-    it('applies an injected capabilitiesTransform to the advertised manifest', () => {
-      // Only the build-time test double injects a transform, reproducing an
-      // older / sourceless orchestrator that predates a given capability.
-      const client = createClient({
-        capabilitiesTransform: (c) => ({
-          ...c,
-          supportedDashboardRequests: (c.supportedDashboardRequests ?? []).filter(
-            (t) => t !== 'dashboard.contexts.list',
-          ),
-        }),
-      });
-      const advertised = client.getCapabilities().supportedDashboardRequests ?? [];
-      // The injected transform dropped `.list`…
-      expect(advertised).not.toContain('dashboard.contexts.list');
-      // …while a sibling type is untouched.
-      expect(advertised).toContain('dashboard.contexts.get');
     });
   });
 
@@ -511,6 +483,9 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, {
         type: 'auth.success',
+        githubWebhookUrl: null,
+        orgId: 'org_test',
+        orgPublicAlias: 'oal_test',
         appId: 42,
         connectionId: 'conn-123',
       });
@@ -600,6 +575,9 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       simulateMessage(mock, {
         type: 'auth.success',
+        githubWebhookUrl: null,
+        orgId: 'org_test',
+        orgPublicAlias: 'oal_test',
         appId: 42,
         connectionId: 'conn-abc',
       });
@@ -733,6 +711,7 @@ describe('PlatformClient', () => {
         status: 'success' as const,
         jobCount: 0,
         startedAt: 0,
+        statusEpoch: 0,
         jobs: [],
       };
     }
@@ -860,6 +839,9 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, {
         type: 'auth.success',
+        githubWebhookUrl: null,
+        orgId: 'org_test',
+        orgPublicAlias: 'oal_test',
         connectionId: 'conn-123',
       });
 
@@ -886,7 +868,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -907,7 +895,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -929,7 +923,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -1033,7 +1033,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -1054,6 +1060,9 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, {
         type: 'auth.success',
+        githubWebhookUrl: null,
+        orgId: 'org_test',
+        orgPublicAlias: 'oal_test',
         connectionId: 'conn-123',
       });
 
@@ -1077,6 +1086,9 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, {
         type: 'auth.success',
+        githubWebhookUrl: null,
+        orgId: 'org_test',
+        orgPublicAlias: 'oal_test',
         connectionId: 'conn-123',
       });
 
@@ -1292,7 +1304,13 @@ describe('PlatformClient', () => {
       client.connect();
       let mock = getLatestMock();
       simulateOpen(mock);
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-1' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-1',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       // Disconnect
       mock.readyState = 3;
@@ -1304,7 +1322,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-2' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-2',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register');
@@ -1324,7 +1348,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -1341,7 +1371,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -1359,7 +1395,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -1376,7 +1418,13 @@ describe('PlatformClient', () => {
       simulateOpen(mock);
       mock.sentMessages = [];
 
-      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'conn-123',
+        orgPublicAlias: 'oal_test',
+        orgId: 'org_test',
+        githubWebhookUrl: null,
+      });
 
       const sent = getSentMessages(mock);
       const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
@@ -2326,7 +2374,7 @@ describe('PlatformClient', () => {
   // driving the Platform→Orchestrator dispatch surface. The Platform
   // pushes `trust_policy.update` carrying `identityLinks` + `memberCiTrustLevels`
   // (consumed by `onTrustPolicyUpdate` in `server.ts` to update orchestrator
-  // in-memory state) and `policy.{forkPolicy,approvalExpiryHours}` (received
+  // in-memory state) and `policy.{forkPolicy,approvalExpirySeconds}` (received
   // but DROPPED).
   //
   // The wire-side invariant pinned here: the message reaches
@@ -2350,7 +2398,7 @@ describe('PlatformClient', () => {
       simulateMessage(mock, {
         type: 'trust_policy.update',
         orgId: 'org-1',
-        policy: { forkPolicy: 'allow', approvalExpiryHours: 1 },
+        policy: { forkPolicy: 'allow', approvalExpirySeconds: 3600 },
         identityLinks: [
           {
             userId: 'forged-user',
@@ -2368,7 +2416,7 @@ describe('PlatformClient', () => {
       expect(arg.orgId).toBe('org-1');
       expect(arg.teamMemberships).toEqual([{ teamName: 'leads', memberUserIds: ['u-1', 'u-2'] }]);
       expect(arg.policy.forkPolicy).toBe('allow');
-      expect(arg.policy.approvalExpiryHours).toBe(1);
+      expect(arg.policy.approvalExpirySeconds).toBe(3600);
       expect(arg.identityLinks).toHaveLength(1);
       expect(arg.identityLinks[0].userId).toBe('forged-user');
       expect(arg.memberCiTrustLevels['forged-user']).toBe('admin');
@@ -2489,56 +2537,18 @@ describe('PlatformClient — version-skew NACK + Platform capabilities', () => {
     expect(sent.find((m) => (m as { type?: string }).type === 'nack')).toBeUndefined();
   });
 
-  it('caches platform.capabilities and gates a feature-gated send on it', () => {
-    const client = createClient();
-    const mock = authenticateClient(client);
-
-    // Platform advertises a set WITHOUT orchMetrics → gated send suppressed.
-    simulateMessage(mock, {
-      type: 'platform.capabilities',
-      capabilities: { futureFlag: true },
-    });
-    mock.sentMessages.length = 0;
-
-    const metricsFrame = {
-      type: 'orch.metrics' as const,
-      messageId: 'm1',
-      metrics: [],
-      timestamp: Date.now(),
-    };
-    client.sendIfPlatformSupports('orchMetrics', metricsFrame as OrchestratorToPlatformMessage);
-    expect(
-      getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
-    ).toBeUndefined();
-
-    // Now advertise a set WITH orchMetrics → the same gated send goes out.
-    simulateMessage(mock, {
-      type: 'platform.capabilities',
-      capabilities: { orchMetrics: true },
-    });
-    mock.sentMessages.length = 0;
-    client.sendIfPlatformSupports('orchMetrics', metricsFrame as OrchestratorToPlatformMessage);
-    expect(
-      getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
-    ).toBeDefined();
-  });
-
-  it('backward-safe: a feature-gated send fires when NO capabilities were advertised', () => {
+  it('consumes a platform.capabilities advertisement without a NACK', () => {
+    // breaks-if-wrong: the Platform still sends this frame after auth; the
+    // orchestrator must recognise it, not answer it as version skew.
     const client = createClient();
     const mock = authenticateClient(client);
     mock.sentMessages.length = 0;
 
-    // No platform.capabilities frame was ever received (pre-capability Platform).
-    const metricsFrame = {
-      type: 'orch.metrics' as const,
-      messageId: 'm2',
-      metrics: [],
-      timestamp: Date.now(),
-    };
-    client.sendIfPlatformSupports('orchMetrics', metricsFrame as OrchestratorToPlatformMessage);
-    expect(
-      getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
-    ).toBeDefined();
+    simulateMessage(mock, { type: 'platform.capabilities', capabilities: {} });
+
+    const sent = getSentMessages(mock);
+    expect(sent.find((m) => (m as { type?: string }).type === 'nack')).toBeUndefined();
+    expect(mock.closeCode).toBeUndefined();
   });
 });
 
@@ -2701,5 +2711,69 @@ describe('plan ceiling and worker membership', () => {
       (m) => (m as { type?: string }).type === 'cluster.membership',
     ) as { workers: Array<{ instanceId: string }> } | undefined;
     expect(membership?.workers.map((w) => w.instanceId)).toEqual(['w-1', 'w-2']);
+  });
+});
+
+describe('dashboard frame registry', () => {
+  const actor = { type: 'user', sub: 'sub-1' };
+  /** One schema-valid frame per registered type. */
+  const frames: Record<DashboardFrameType, Record<string, unknown>> = {
+    'dashboard.run.detail': { runId: 'run-1' },
+    'dashboard.run.structured': { runId: 'run-1' },
+    'dashboard.run.state': { runId: 'run-1' },
+    'dashboard.runs.list': {},
+    'dashboard.runs.filters': {},
+    'dashboard.sources.list': {},
+    'dashboard.admin-tokens.list': {},
+    'dashboard.step.logs': { runId: 'run-1', jobId: 'job-1', stepIndex: 0 },
+    'dashboard.attestations.list': { runId: 'run-1' },
+    'dashboard.attestations.list.all': { page: 1 },
+    'dashboard.attestation.get': { attestationId: 'att-1' },
+    'dashboard.artifacts.list': { runId: 'run-1' },
+    'dashboard.payload': { runId: 'run-1' },
+    'dashboard.orch.logs': { runId: 'run-1', jobId: 'job-1' },
+    'dashboard.diagnostics': {},
+    'dashboard.scaler.capacity': {},
+    'dashboard.scaler.agents': { scalerName: 'pool' },
+    'dashboard.fleet.hosts': {},
+    'dashboard.fleet.host': { agentId: 'host-1' },
+    'dashboard.fleet.preview': { workflowName: 'ci' },
+    'dashboard.fleet.workflows-for-host': { agentId: 'host-1' },
+  };
+
+  // fails-when: a registered dashboard frame type is not dispatched to its own handler
+  it.each(DASHBOARD_FRAME_TYPES)('routes %s to its registered handler only', (type) => {
+    const handler = vi.fn();
+    const other = vi.fn();
+    const otherType = DASHBOARD_FRAME_TYPES.find((t) => t !== type)!;
+    const onDashboardEnvMessage = vi.fn();
+    const client = createClient({
+      dashboardHandlers: { [type]: handler, [otherType]: other },
+      onDashboardEnvMessage,
+    });
+    const mock = authenticateClient(client);
+
+    simulateMessage(mock, { type, requestId: 'req-1', actor, ...frames[type] });
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type, requestId: 'req-1' }));
+    expect(other).not.toHaveBeenCalled();
+    expect(onDashboardEnvMessage).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: a registered type with no handler is dropped, not misrouted or thrown
+  it('drops a registered frame type that has no handler', () => {
+    const onDashboardEnvMessage = vi.fn();
+    const client = createClient({ onDashboardEnvMessage });
+    const mock = authenticateClient(client);
+    expect(() =>
+      simulateMessage(mock, {
+        type: 'dashboard.run.detail',
+        requestId: 'req-1',
+        actor,
+        runId: 'run-1',
+      }),
+    ).not.toThrow();
+    expect(onDashboardEnvMessage).not.toHaveBeenCalled();
   });
 });

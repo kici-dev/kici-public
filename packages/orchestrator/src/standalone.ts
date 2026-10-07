@@ -254,6 +254,7 @@ await guardStartup(logger, async () => {
             return reloader.executeReload({ source: 'cluster', drain: msg.drain });
           },
           onPeerForgetRequest: sub.answerPeerForgetRequest,
+          onScalerReloadRequest: sub.scalerFileReload,
           onScalerOrphansRequest: (msg) =>
             answerScalerOrphansRequest(sub.scalerManager ?? null, msg),
           onAuthenticated: (targetInstanceId) => {

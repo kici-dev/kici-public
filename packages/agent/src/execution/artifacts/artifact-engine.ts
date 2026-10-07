@@ -98,8 +98,7 @@ function rejectionMessage(name: string, reason?: ArtifactRejectReason, error?: s
       return `artifact "${name}" would exceed the organization's artifact storage quota`;
     default:
       // No enforcement reason: surface the orchestrator's safe non-enforcement
-      // detail when it sent one, else the generic fallback (which is also what
-      // an older orchestrator that sends neither produces).
+      // detail when it sent one, else the generic fallback.
       return error ? `artifact "${name}": ${error}` : `artifact "${name}" upload was rejected`;
   }
 }

@@ -33,6 +33,16 @@ export {
   type PurgeExpiredChunksOpts,
   type PurgeExpiredChunksSummary,
 } from './cold-store.js';
+export {
+  assertColdStoreEnabled,
+  createColdStoreAdminOps,
+  type BuiltColdStore,
+  type ColdStoreAdminChunkOpts,
+  type ColdStoreAdminPurgeOpts,
+  type ColdStoreAdminSide,
+  type ColdStoreAdminStoreOpts,
+} from './admin-ops.js';
+export { PgTableAdapterBase } from './pg-table-adapter.js';
 export { ChunkLru, type ChunkLruOptions } from './lru.js';
 export { computeChunkId } from './chunk-id.js';
 export {

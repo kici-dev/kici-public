@@ -10,12 +10,7 @@
 import { Kysely, PostgresDialect, sql, type Transaction } from 'kysely';
 import pg from 'pg';
 import { z } from 'zod';
-import {
-  DEFAULT_APPROVAL_EXPIRY_HOURS,
-  DEFAULT_APPROVAL_EXPIRY_SECONDS,
-  approvalExpiryHoursOf,
-  approvalExpirySecondsOf,
-} from '@kici-dev/engine';
+import { DEFAULT_APPROVAL_EXPIRY_SECONDS } from '@kici-dev/engine';
 import type { TrustPolicy } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { DEFAULT_FORK_POLICY } from './trust-policy-gate.js';
@@ -33,42 +28,8 @@ export type TrustPolicySource = z.infer<typeof TrustPolicySource>;
  */
 export const DEFAULT_TRUST_POLICY: TrustPolicy = {
   forkPolicy: DEFAULT_FORK_POLICY,
-  approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 };
-
-/**
- * Resolve a local patch's approval-expiry window against what is already stored.
- *
- * One value is being set, spelled two ways, so the pair is merged as a unit and
- * always re-derived from the winning seconds value:
- *
- * - a patch naming `approvalExpirySeconds` sets the window, and the hours field
- *   is recomputed from it — a stale hours value left behind would be the coarse
- *   view of a window that is no longer stored;
- * - a patch naming only `approvalExpiryHours` sets the window too, and the
- *   seconds field is recomputed from it — keeping the old seconds value would
- *   let it out-rank the operator's explicit hours and silently discard the
- *   write;
- * - a patch naming both takes the seconds value, because it is the more
- *   specific of the two (`approvalExpirySecondsOf`);
- * - a patch naming neither leaves the stored window untouched.
- */
-function mergedExpiry(
-  patch: Partial<TrustPolicy>,
-  existing: StoredTrustPolicy | null,
-): Pick<TrustPolicy, 'approvalExpiryHours' | 'approvalExpirySeconds'> {
-  const patched =
-    patch.approvalExpirySeconds != null || patch.approvalExpiryHours != null
-      ? approvalExpirySecondsOf(patch)
-      : null;
-  const seconds =
-    patched ??
-    existing?.approvalExpirySeconds ??
-    DEFAULT_TRUST_POLICY.approvalExpirySeconds ??
-    DEFAULT_APPROVAL_EXPIRY_SECONDS;
-  return { approvalExpiryHours: approvalExpiryHoursOf(seconds), approvalExpirySeconds: seconds };
-}
 
 /**
  * Namespace for the per-org advisory lock taken by `upsertLocal`, so the key
@@ -98,15 +59,7 @@ export class TrustPolicyStore {
     if (!row) return null;
     return {
       forkPolicy: row.fork_policy as TrustPolicy['forkPolicy'],
-      // The seconds column is authoritative; a NULL one means the row predates
-      // it (or an older build wrote it), so the hours column supplies the
-      // window instead. Resolved here, once, so no caller has to know the rule.
-      approvalExpiryHours: Number(row.approval_expiry_hours),
-      approvalExpirySeconds: approvalExpirySecondsOf({
-        approvalExpiryHours: Number(row.approval_expiry_hours),
-        approvalExpirySeconds:
-          row.approval_expiry_seconds == null ? null : Number(row.approval_expiry_seconds),
-      }),
+      approvalExpirySeconds: Number(row.approval_expiry_seconds),
       source: row.source as TrustPolicySource,
       updatedAt: row.updated_at,
     };
@@ -156,12 +109,10 @@ export class TrustPolicyStore {
       const existing = await this.get(orgId, trx);
       const merged: TrustPolicy = {
         forkPolicy: patch.forkPolicy ?? existing?.forkPolicy ?? DEFAULT_TRUST_POLICY.forkPolicy,
-        // Resolved from the patch as a WHOLE, not field-by-field: a patch
-        // naming only seconds must not keep a stale hours value beside it, and
-        // a patch naming only hours must not keep a stale seconds value that
-        // would then out-rank it. Merging the two fields independently is
-        // exactly how the coarse and fine spellings come to disagree.
-        ...mergedExpiry(patch, existing),
+        approvalExpirySeconds:
+          patch.approvalExpirySeconds ??
+          existing?.approvalExpirySeconds ??
+          DEFAULT_TRUST_POLICY.approvalExpirySeconds,
       };
       await this.write(orgId, merged, TrustPolicySource.enum.local, trx);
       await onWrite?.(trx, merged);
@@ -175,15 +126,9 @@ export class TrustPolicyStore {
     source: TrustPolicySource,
     executor: Kysely<Database> | Transaction<Database> = this.db,
   ): Promise<void> {
-    // One window, written to both columns from the same resolved value. The
-    // hours column is derived rather than copied through, so a policy that
-    // arrived with only seconds can never leave a stale hours value behind for
-    // an older build to read — and the two columns cannot disagree.
-    const seconds = approvalExpirySecondsOf(policy);
     const columns = {
       fork_policy: policy.forkPolicy,
-      approval_expiry_hours: approvalExpiryHoursOf(seconds),
-      approval_expiry_seconds: seconds,
+      approval_expiry_seconds: policy.approvalExpirySeconds,
       source,
       updated_at: sql<Date>`now()`,
     };

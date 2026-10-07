@@ -18,6 +18,7 @@
 
 import { timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
+import type { BlankEnv } from 'hono/types';
 import { createLogger } from '@kici-dev/shared';
 import { AUTH_ERROR } from './admin-auth.js';
 import type { SharedConfigStore } from '../config/shared-store.js';
@@ -25,7 +26,7 @@ import type { ConfigReloader, ReloadResult } from '../config/reload.js';
 import type { LocalConfig } from '../config/types.js';
 import { sharedConfigSchema, localConfigSchema, appConfigSchema } from '../config/schema.js';
 import { deepSet, deepGetByPath } from '../config/index.js';
-import { handleAdminError } from './admin-errors.js';
+import { createAdminApp } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-config' });
 
@@ -39,9 +40,6 @@ export interface PeerReloadForwardResult {
   result: ReloadResult | null;
 }
 
-/**
- * Dependencies for config admin routes.
- */
 export interface ConfigRouteDeps {
   sharedStore: SharedConfigStore;
   configReloader: ConfigReloader;
@@ -66,9 +64,8 @@ export interface ConfigRouteDeps {
  * Returns a Hono app to be mounted at /admin/config.
  */
 export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
-  const app = new Hono();
+  const app = createAdminApp<BlankEnv>(logger);
 
-  // ── Bearer token auth middleware ──────────────────────────────
   app.use('*', async (c, next) => {
     // Capture into a local so TS narrows it to `string` for constantTimeEqual;
     // a bare `deps.adminToken` property access does not narrow across the guard.
@@ -108,299 +105,247 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
     await next();
   });
 
-  // ── 1. POST /seed -- Bulk import shared config ────────────────
   app.post('/seed', async (c) => {
-    try {
-      const body = await c.req.json();
-      const { config, description } = body as { config: unknown; description?: string };
+    const body = await c.req.json();
+    const { config, description } = body as { config: unknown; description?: string };
 
-      if (!config || typeof config !== 'object') {
-        return c.json({ error: 'config field is required and must be an object' }, 400);
-      }
-
-      const version = await deps.sharedStore.save(
-        config as Record<string, unknown>,
-        'api:seed',
-        description ?? 'Seeded via admin API',
-      );
-
-      logger.info('Config seeded via admin API', { version });
-
-      return c.json({ version }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    if (!config || typeof config !== 'object') {
+      return c.json({ error: 'config field is required and must be an object' }, 400);
     }
+
+    const version = await deps.sharedStore.save(
+      config as Record<string, unknown>,
+      'api:seed',
+      description ?? 'Seeded via admin API',
+    );
+
+    logger.info('Config seeded via admin API', { version });
+
+    return c.json({ version }, 200);
   });
 
-  // ── 2. GET / -- Get current effective config (merged) ─────────
   app.get('/', async (c) => {
-    try {
-      const pathFilter = c.req.query('path');
-      const currentConfig = deps.configReloader.getCurrentConfig();
-      const version = deps.configReloader.getCurrentVersion();
+    const pathFilter = c.req.query('path');
+    const currentConfig = deps.configReloader.getCurrentConfig();
+    const version = deps.configReloader.getCurrentVersion();
 
-      let config: unknown = currentConfig;
+    let config: unknown = currentConfig;
 
-      if (pathFilter) {
-        config = deepGetByPath(
-          currentConfig as unknown as Record<string, unknown>,
-          pathFilter.split('.'),
-        );
-        if (config === undefined) {
-          return c.json({ error: `Path "${pathFilter}" not found in config` }, 404);
-        }
+    if (pathFilter) {
+      config = deepGetByPath(
+        currentConfig as unknown as Record<string, unknown>,
+        pathFilter.split('.'),
+      );
+      if (config === undefined) {
+        return c.json({ error: `Path "${pathFilter}" not found in config` }, 404);
       }
-
-      // Redact sensitive values in the response
-      const redacted = redactSensitiveInResponse(config as Record<string, unknown>, pathFilter);
-
-      return c.json({ config: redacted, version, source: 'merged' }, 200);
-    } catch (err) {
-      return handleError(c, err);
     }
+
+    // Redact sensitive values in the response
+    const redacted = redactSensitiveInResponse(config as Record<string, unknown>, pathFilter);
+
+    return c.json({ config: redacted, version, source: 'merged' }, 200);
   });
 
-  // ── 3. PUT / -- Update single field in shared config ──────────
   app.put('/', async (c) => {
-    try {
-      const body = await c.req.json();
-      const { path, value, description } = body as {
-        path: string;
-        value: unknown;
-        description?: string;
-      };
+    const body = await c.req.json();
+    const { path, value, description } = body as {
+      path: string;
+      value: unknown;
+      description?: string;
+    };
 
-      if (!path || typeof path !== 'string') {
-        return c.json({ error: 'path field is required and must be a string' }, 400);
-      }
-
-      // Get latest shared config, deep-set the value, save as new version
-      const latest = await deps.sharedStore.getLatest();
-      const currentConfig = latest ? (latest.config as Record<string, unknown>) : {};
-
-      const updatedConfig = structuredClone(currentConfig);
-      deepSet(updatedConfig, path, value);
-
-      const version = await deps.sharedStore.save(
-        updatedConfig,
-        'api:set',
-        description ?? `Set ${path}`,
-      );
-
-      logger.info('Config field updated via admin API', { path, version });
-
-      return c.json({ version }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    if (!path || typeof path !== 'string') {
+      return c.json({ error: 'path field is required and must be a string' }, 400);
     }
+
+    // Get latest shared config, deep-set the value, save as new version
+    const latest = await deps.sharedStore.getLatest();
+    const currentConfig = latest ? (latest.config as Record<string, unknown>) : {};
+
+    const updatedConfig = structuredClone(currentConfig);
+    deepSet(updatedConfig, path, value);
+
+    const version = await deps.sharedStore.save(
+      updatedConfig,
+      'api:set',
+      description ?? `Set ${path}`,
+    );
+
+    logger.info('Config field updated via admin API', { path, version });
+
+    return c.json({ version }, 200);
   });
 
-  // ── 4. DELETE / -- Remove field from shared config ────────────
   app.delete('/', async (c) => {
-    try {
-      const body = await c.req.json();
-      const { path, description } = body as { path: string; description?: string };
+    const body = await c.req.json();
+    const { path, description } = body as { path: string; description?: string };
 
-      if (!path || typeof path !== 'string') {
-        return c.json({ error: 'path field is required and must be a string' }, 400);
-      }
-
-      const latest = await deps.sharedStore.getLatest();
-      if (!latest) {
-        return c.json({ error: 'No shared config exists' }, 404);
-      }
-
-      const updatedConfig = structuredClone(latest.config as Record<string, unknown>);
-      deepDeletePath(updatedConfig, path);
-
-      const version = await deps.sharedStore.save(
-        updatedConfig,
-        'api:delete',
-        description ?? `Deleted ${path}`,
-      );
-
-      logger.info('Config field deleted via admin API', { path, version });
-
-      return c.json({ version }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    if (!path || typeof path !== 'string') {
+      return c.json({ error: 'path field is required and must be a string' }, 400);
     }
+
+    const latest = await deps.sharedStore.getLatest();
+    if (!latest) {
+      return c.json({ error: 'No shared config exists' }, 404);
+    }
+
+    const updatedConfig = structuredClone(latest.config as Record<string, unknown>);
+    deepDeletePath(updatedConfig, path);
+
+    const version = await deps.sharedStore.save(
+      updatedConfig,
+      'api:delete',
+      description ?? `Deleted ${path}`,
+    );
+
+    logger.info('Config field deleted via admin API', { path, version });
+
+    return c.json({ version }, 200);
   });
 
-  // ── 5. GET /export -- Dump shared config (redacted) ───────────
   app.get('/export', async (c) => {
-    try {
-      const redacted = await deps.sharedStore.exportRedacted();
-      const version = await deps.sharedStore.getCurrentVersion();
+    const redacted = await deps.sharedStore.exportRedacted();
+    const version = await deps.sharedStore.getCurrentVersion();
 
-      if (!redacted) {
-        return c.json({ config: {}, version: 0 }, 200);
-      }
-
-      return c.json({ config: redacted, version }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    if (!redacted) {
+      return c.json({ config: {}, version: 0 }, 200);
     }
+
+    return c.json({ config: redacted, version }, 200);
   });
 
-  // ── 6. POST /validate -- Validate config against schema ───────
   app.post('/validate', async (c) => {
-    try {
-      const body = await c.req.json();
-      const { config, type } = body as {
-        config: unknown;
-        type?: 'local' | 'shared' | 'full';
-      };
+    const body = await c.req.json();
+    const { config, type } = body as {
+      config: unknown;
+      type?: 'local' | 'shared' | 'full';
+    };
 
-      if (!config || typeof config !== 'object') {
-        return c.json({ error: 'config field is required and must be an object' }, 400);
-      }
-
-      const schemaType = type ?? 'shared';
-      let schema;
-      switch (schemaType) {
-        case 'local':
-          schema = localConfigSchema;
-          break;
-        case 'shared':
-          schema = sharedConfigSchema;
-          break;
-        case 'full':
-          schema = appConfigSchema;
-          break;
-        default:
-          return c.json(
-            { error: `Invalid type "${schemaType}". Must be local, shared, or full` },
-            400,
-          );
-      }
-
-      const result = schema.safeParse(config);
-
-      if (result.success) {
-        return c.json({ valid: true }, 200);
-      }
-
-      return c.json(
-        {
-          valid: false,
-          errors: result.error.issues.map((e) => ({
-            path: e.path.join('.'),
-            message: e.message,
-            code: e.code,
-          })),
-        },
-        200,
-      );
-    } catch (err) {
-      return handleError(c, err);
+    if (!config || typeof config !== 'object') {
+      return c.json({ error: 'config field is required and must be an object' }, 400);
     }
+
+    const schemaType = type ?? 'shared';
+    let schema;
+    switch (schemaType) {
+      case 'local':
+        schema = localConfigSchema;
+        break;
+      case 'shared':
+        schema = sharedConfigSchema;
+        break;
+      case 'full':
+        schema = appConfigSchema;
+        break;
+      default:
+        return c.json(
+          { error: `Invalid type "${schemaType}". Must be local, shared, or full` },
+          400,
+        );
+    }
+
+    const result = schema.safeParse(config);
+
+    if (result.success) {
+      return c.json({ valid: true }, 200);
+    }
+
+    return c.json(
+      {
+        valid: false,
+        errors: result.error.issues.map((e) => ({
+          path: e.path.join('.'),
+          message: e.message,
+          code: e.code,
+        })),
+      },
+      200,
+    );
   });
 
-  // ── 7. GET /diff -- Compare local YAML vs shared DB config ────
   app.get('/diff', async (c) => {
+    let localConfig: Record<string, unknown> = {};
     try {
-      let localConfig: Record<string, unknown> = {};
-      try {
-        const loaded = await deps.loadLocalConfig();
-        localConfig = loaded as unknown as Record<string, unknown>;
-      } catch {
-        // No local config available
-      }
-
-      const sharedResult = await deps.sharedStore.getLatest();
-      const sharedConfig = sharedResult
-        ? (sharedResult.config as unknown as Record<string, unknown>)
-        : {};
-
-      const differences = computeDiff(localConfig, sharedConfig);
-
-      return c.json({ local: localConfig, shared: sharedConfig, differences }, 200);
-    } catch (err) {
-      return handleError(c, err);
+      const loaded = await deps.loadLocalConfig();
+      localConfig = loaded as unknown as Record<string, unknown>;
+    } catch {
+      // No local config available
     }
+
+    const sharedResult = await deps.sharedStore.getLatest();
+    const sharedConfig = sharedResult
+      ? (sharedResult.config as unknown as Record<string, unknown>)
+      : {};
+
+    const differences = computeDiff(localConfig, sharedConfig);
+
+    return c.json({ local: localConfig, shared: sharedConfig, differences }, 200);
   });
 
-  // ── 8. GET /history -- Version history ────────────────────────
   app.get('/history', async (c) => {
-    try {
-      const limitStr = c.req.query('limit');
-      const limit = limitStr ? parseInt(limitStr, 10) : 20;
+    const limitStr = c.req.query('limit');
+    const limit = limitStr ? parseInt(limitStr, 10) : 20;
 
-      const versions = await deps.sharedStore.listHistory(limit);
+    const versions = await deps.sharedStore.listHistory(limit);
 
-      return c.json({ versions }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json({ versions }, 200);
   });
 
-  // ── 9. POST /rollback -- Rollback to specific version ─────────
   app.post('/rollback', async (c) => {
-    try {
-      const body = await c.req.json();
-      const { version } = body as { version: number };
+    const body = await c.req.json();
+    const { version } = body as { version: number };
 
-      if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
-        return c.json({ error: 'version must be a positive integer' }, 400);
-      }
-
-      const newVersion = await deps.sharedStore.rollback(version, 'api:rollback');
-
-      logger.info('Config rolled back via admin API', { targetVersion: version, newVersion });
-
-      return c.json({ newVersion }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
+      return c.json({ error: 'version must be a positive integer' }, 400);
     }
+
+    const newVersion = await deps.sharedStore.rollback(version, 'api:rollback');
+
+    logger.info('Config rolled back via admin API', { targetVersion: version, newVersion });
+
+    return c.json({ newVersion }, 200);
   });
 
-  // ── 10. POST /reload -- Trigger config reload ─────────────────
   app.post('/reload', async (c) => {
-    try {
-      const body = await c.req.json().catch(() => ({}));
-      const { drain, target } = body as { drain?: boolean; target?: string };
+    const body = await c.req.json().catch(() => ({}));
+    const { drain, target } = body as { drain?: boolean; target?: string };
 
-      if (target) {
-        // Forward to a specific peer instance via the cluster peer connection.
-        if (!deps.forwardReloadToPeer) {
-          // Single-orchestrator deployment (no cluster) — targeting unavailable.
-          return c.json(
-            { error: 'Per-instance targeting is unavailable: cluster peer routing not configured' },
-            501,
-          );
-        }
-
-        const result = await deps.forwardReloadToPeer(target, { drain });
-        if (result === null) {
-          return c.json({ error: `Target instance "${target}" not connected` }, 404);
-        }
-
-        logger.info('Config reload forwarded to peer', {
-          target,
-          success: result.success,
-          version: result.version,
-        });
-
-        return c.json(result, result.success ? 200 : 500);
+    if (target) {
+      // Forward to a specific peer instance via the cluster peer connection.
+      if (!deps.forwardReloadToPeer) {
+        // Single-orchestrator deployment (no cluster) — targeting unavailable.
+        return c.json(
+          { error: 'Per-instance targeting is unavailable: cluster peer routing not configured' },
+          501,
+        );
       }
 
-      // Execute reload locally
-      const result = await deps.configReloader.executeReload({
-        source: 'http',
-        drain,
+      const result = await deps.forwardReloadToPeer(target, { drain });
+      if (result === null) {
+        return c.json({ error: `Target instance "${target}" not connected` }, 404);
+      }
+
+      logger.info('Config reload forwarded to peer', {
+        target,
+        success: result.success,
+        version: result.version,
       });
 
       return c.json(result, result.success ? 200 : 500);
-    } catch (err) {
-      return handleError(c, err);
     }
+
+    // Execute reload locally
+    const result = await deps.configReloader.executeReload({
+      source: 'http',
+      drain,
+    });
+
+    return c.json(result, result.success ? 200 : 500);
   });
 
   return app;
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────
 
 /**
  * Compare a presented token against the configured admin token in constant
@@ -519,8 +464,4 @@ function redactSensitiveInResponse(config: unknown, _pathFilter?: string): unkno
     }
   }
   return result;
-}
-
-function handleError(c: any, err: unknown) {
-  return handleAdminError(c, err, logger);
 }

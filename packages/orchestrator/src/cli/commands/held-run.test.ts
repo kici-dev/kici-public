@@ -84,13 +84,13 @@ describe('kici-admin held-run', () => {
 
   it('lists a run’s pending holds through the admin route', async () => {
     const { program, get } = harness([REVIEWER_HOLD]);
-    await program.parseAsync([...BASE, 'list', '--customer-id', ORG, '--run-id', RUN]);
+    await program.parseAsync([...BASE, 'list', '--org', ORG, '--run-id', RUN]);
     expect(get).toHaveBeenCalledWith(`/api/v1/admin/held-runs?customerId=${ORG}&runId=${RUN}`);
   });
 
   it('approves the sole pending hold with no filter', async () => {
     const { program, post } = harness([REVIEWER_HOLD]);
-    await program.parseAsync([...BASE, 'approve', '--customer-id', ORG, '--run-id', RUN]);
+    await program.parseAsync([...BASE, 'approve', '--org', ORG, '--run-id', RUN]);
     expect(post).toHaveBeenCalledWith('/api/v1/admin/held-runs/decision', {
       customerId: ORG,
       heldRunId: 'hold-rev',
@@ -103,7 +103,7 @@ describe('kici-admin held-run', () => {
     // rows, and both must be answered separately.
     const { program, post } = harness([REVIEWER_HOLD, SECURITY_HOLD]);
     await expect(
-      program.parseAsync([...BASE, 'approve', '--customer-id', ORG, '--run-id', RUN]),
+      program.parseAsync([...BASE, 'approve', '--org', ORG, '--run-id', RUN]),
     ).rejects.toThrow('exit:1');
     expect(post).not.toHaveBeenCalled();
     // The shared resolver's own message, listing both candidates with the flags
@@ -118,7 +118,7 @@ describe('kici-admin held-run', () => {
     await program.parseAsync([
       ...BASE,
       'approve',
-      '--customer-id',
+      '--org',
       ORG,
       '--run-id',
       RUN,
@@ -133,7 +133,7 @@ describe('kici-admin held-run', () => {
     await program.parseAsync([
       ...BASE,
       'approve',
-      '--customer-id',
+      '--org',
       ORG,
       '--run-id',
       RUN,
@@ -149,7 +149,7 @@ describe('kici-admin held-run', () => {
     await program.parseAsync([
       ...BASE,
       'reject',
-      '--customer-id',
+      '--org',
       ORG,
       '--run-id',
       RUN,
@@ -167,7 +167,7 @@ describe('kici-admin held-run', () => {
   it('refuses a reject with no reason before any request is made', async () => {
     const { program, get, post } = harness([REVIEWER_HOLD]);
     await expect(
-      program.parseAsync([...BASE, 'reject', '--customer-id', ORG, '--run-id', RUN]),
+      program.parseAsync([...BASE, 'reject', '--org', ORG, '--run-id', RUN]),
     ).rejects.toThrow(/reason/);
     expect(get).not.toHaveBeenCalled();
     expect(post).not.toHaveBeenCalled();
@@ -177,7 +177,7 @@ describe('kici-admin held-run', () => {
     const { program, post } = harness([REVIEWER_HOLD]);
     post.mockRejectedValue(new Error('Held runs are answered through the KiCI Platform'));
     await expect(
-      program.parseAsync([...BASE, 'approve', '--customer-id', ORG, '--run-id', RUN]),
+      program.parseAsync([...BASE, 'approve', '--org', ORG, '--run-id', RUN]),
     ).rejects.toThrow('exit:1');
     expect(errors.join('\n')).toContain('Held runs are answered through the KiCI Platform');
   });
@@ -246,7 +246,7 @@ describe('the four disambiguators reach the shared resolver', () => {
     await program.parseAsync([
       ...BASE,
       'approve',
-      '--customer-id',
+      '--org',
       ORG,
       '--run-id',
       RUN,
@@ -261,7 +261,7 @@ describe('the four disambiguators reach the shared resolver', () => {
     await program.parseAsync([
       ...BASE,
       'approve',
-      '--customer-id',
+      '--org',
       ORG,
       '--run-id',
       RUN,
@@ -279,7 +279,7 @@ describe('the four disambiguators reach the shared resolver', () => {
     await program.parseAsync([
       ...BASE,
       'reject',
-      '--customer-id',
+      '--org',
       ORG,
       '--run-id',
       RUN,

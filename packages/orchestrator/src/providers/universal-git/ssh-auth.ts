@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { makeTempDir } from '@kici-dev/shared/tmp';
 import type { SshHostKeyPolicy } from './config.js';
+import { shQuote } from '@kici-dev/shared';
 
 /** Material the caller has prepared (key file + optional known_hosts file). */
 export interface SshAuthArtefacts {
@@ -149,10 +150,10 @@ export function composeGitSshCommand(
   knownHostsPath: string,
 ): string {
   const flags = [
-    `ssh -i ${quoteShell(privateKeyPath)}`,
+    `ssh -i ${shQuote(privateKeyPath)}`,
     '-o IdentitiesOnly=yes',
     '-o BatchMode=yes',
-    `-o UserKnownHostsFile=${quoteShell(knownHostsPath)}`,
+    `-o UserKnownHostsFile=${shQuote(knownHostsPath)}`,
   ];
   flags.push(
     policy === 'pinned' ? '-o StrictHostKeyChecking=yes' : '-o StrictHostKeyChecking=accept-new',
@@ -177,12 +178,4 @@ function assertPinnedHasKnownHosts(opts: PrepareSshAuthOptions): void {
 function normaliseKey(pem: string): string {
   if (pem.endsWith('\n')) return pem;
   return `${pem}\n`;
-}
-
-/**
- * Shell-quote a path for embedding in `GIT_SSH_COMMAND`. Single-quotes the
- * string and escapes embedded single quotes — matches POSIX shell parsing.
- */
-export function quoteShell(path: string): string {
-  return `'${path.replace(/'/g, `'\\''`)}'`;
 }

@@ -19,7 +19,7 @@ import {
   schemaWindowWarning,
 } from '../lockfile/index.js';
 import { formatError, isCompilerError } from '../errors/index.js';
-import { SCHEMA_VERSION, BREAKING_FLOOR, type LockFile } from '../types.js';
+import { SCHEMA_VERSION, type LockFile } from '../types.js';
 
 /** Options for the compile command */
 export interface CompileOptions {
@@ -138,10 +138,7 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     // (see schemaWindowWarning), warn that older orchestrators cannot read it.
     // Silent otherwise (older orchestrators down to the lock's minReaderVersion
     // still read it).
-    const windowWarning = schemaWindowWarning(
-      lockFile.minReaderVersion ?? BREAKING_FLOOR,
-      SCHEMA_VERSION,
-    );
+    const windowWarning = schemaWindowWarning(lockFile.minReaderVersion, SCHEMA_VERSION);
     if (windowWarning) {
       logger.warn(pc.yellow(windowWarning));
     }
@@ -186,8 +183,8 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
       try {
         const { loadGlobalConfig } = await import('../remote/config.js');
         const config = await loadGlobalConfig();
-        const hasToken = Boolean(config.pat ?? config.token);
-        const hasEndpoint = Boolean(config.platformEndpoint ?? config.endpoint);
+        const hasToken = Boolean(config.pat);
+        const hasEndpoint = Boolean(config.platformEndpoint);
         if (hasToken && hasEndpoint && config.activeOrgId) {
           const { typesCommand } = await import('./types.js');
           // The directory this compile actually read, not the raw option. The

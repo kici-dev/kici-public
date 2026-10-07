@@ -14,21 +14,9 @@ import { createLogger } from '@kici-dev/shared';
 import type { BackendDescriptor, AddBackendParams, BackendSyncManager } from '@kici-dev/engine';
 import type { BackendRegistry } from '../secrets/backend-registry.js';
 import type { BackendHealthChecker } from '../secrets/backend-health.js';
-import { handleAdminError } from './admin-errors.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import type { Role } from '../secrets/rbac.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-backends' });
-
-type AdminBackendsEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
-// ── Zod schemas for request validation ──────────────────────────────
 
 const backendTypeSchema = z.enum(['pg', 'vault']);
 
@@ -52,196 +40,148 @@ interface BackendRouteDeps {
  * @param deps - Backend route dependencies (registry, health checker, sync manager)
  * @returns Hono app with backend routes
  */
-export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminBackendsEnv> {
-  const app = new Hono<AdminBackendsEnv>();
+export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminEnv> {
+  const app = createAdminApp(logger);
 
   // Secret-backend management is orchestrator-wide; routing-key tokens
   // are refused at the router level.
-  app.use('/backends', async (c, next) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
-    await next();
-  });
-  app.use('/backends/*', async (c, next) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
-    await next();
-  });
+  app.use('/backends', requireUnscoped);
+  app.use('/backends/*', requireUnscoped);
 
   // ── Static POST routes (must be before parameterized :name routes) ──
 
-  // POST /backends -- add a new backend
   app.post('/backends', async (c) => {
-    try {
-      const body = await c.req.json();
-      const parsed = addBackendSchema.parse(body);
+    const body = await c.req.json();
+    const parsed = addBackendSchema.parse(body);
 
-      const params: AddBackendParams = {
-        name: parsed.name,
-        backendType: parsed.backendType,
-        config: parsed.config,
-        scopeFilter: parsed.scopeFilter,
-        syncIntervalMs: parsed.syncIntervalMs,
-      };
+    const params: AddBackendParams = {
+      name: parsed.name,
+      backendType: parsed.backendType,
+      config: parsed.config,
+      scopeFilter: parsed.scopeFilter,
+      syncIntervalMs: parsed.syncIntervalMs,
+    };
 
-      const descriptor = await deps.registry.addBackend(params);
-      logger.info('Backend added', { name: descriptor.name, type: descriptor.backendType });
+    const descriptor = await deps.registry.addBackend(params);
+    logger.info('Backend added', { name: descriptor.name, type: descriptor.backendType });
 
-      return c.json(descriptorToJson(descriptor), 201);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json(descriptorToJson(descriptor), 201);
   });
 
-  // POST /backends/test -- test connection without persisting
   app.post('/backends/test', async (c) => {
-    try {
-      const body = await c.req.json();
-      const parsed = addBackendSchema.parse(body);
+    const body = await c.req.json();
+    const parsed = addBackendSchema.parse(body);
 
-      const params: AddBackendParams = {
-        name: parsed.name,
-        backendType: parsed.backendType,
-        config: parsed.config,
-        scopeFilter: parsed.scopeFilter,
-        syncIntervalMs: parsed.syncIntervalMs,
-      };
+    const params: AddBackendParams = {
+      name: parsed.name,
+      backendType: parsed.backendType,
+      config: parsed.config,
+      scopeFilter: parsed.scopeFilter,
+      syncIntervalMs: parsed.syncIntervalMs,
+    };
 
-      const result = await deps.healthChecker.testConnection(params);
-      logger.info('Backend connection test', {
-        name: parsed.name,
-        ok: result.ok,
-        latencyMs: result.latencyMs,
-      });
+    const result = await deps.healthChecker.testConnection(params);
+    logger.info('Backend connection test', {
+      name: parsed.name,
+      ok: result.ok,
+      latencyMs: result.latencyMs,
+    });
 
-      return c.json(result);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json(result);
   });
 
-  // POST /backends/sync -- sync all backends
   app.post('/backends/sync', async (c) => {
-    try {
-      if (!deps.syncManager) {
-        return c.json({ error: 'Sync manager not available' }, 503);
-      }
-
-      const results = await deps.syncManager.syncAllBackends();
-      logger.info('All backends synced', { count: results.length });
-
-      return c.json({ results });
-    } catch (err) {
-      return handleError(c, err);
+    if (!deps.syncManager) {
+      return c.json({ error: 'Sync manager not available' }, 503);
     }
+
+    const results = await deps.syncManager.syncAllBackends();
+    logger.info('All backends synced', { count: results.length });
+
+    return c.json({ results });
   });
 
   // ── Parameterized routes ──────────────────────────────────────────
 
-  // DELETE /backends/:name -- remove a backend
   app.delete('/backends/:name', async (c) => {
-    try {
-      const name = c.req.param('name');
+    const name = c.req.param('name');
 
-      // Get scope count before removal for response
-      const backend = await deps.registry.getBackend(name);
-      if (!backend) {
-        return c.json({ error: 'Backend not found' }, 404);
-      }
-
-      const removed = await deps.registry.removeBackend(name);
-      if (!removed) {
-        return c.json({ error: 'Backend not found' }, 404);
-      }
-
-      logger.info('Backend removed', { name, scopeCount: backend.scopeCount });
-      return c.json({ removed: true, scopeCount: backend.scopeCount });
-    } catch (err) {
-      return handleError(c, err);
+    // Get scope count before removal for response
+    const backend = await deps.registry.getBackend(name);
+    if (!backend) {
+      return c.json({ error: 'Backend not found' }, 404);
     }
+
+    const removed = await deps.registry.removeBackend(name);
+    if (!removed) {
+      return c.json({ error: 'Backend not found' }, 404);
+    }
+
+    logger.info('Backend removed', { name, scopeCount: backend.scopeCount });
+    return c.json({ removed: true, scopeCount: backend.scopeCount });
   });
 
-  // GET /backends -- list all backends
   app.get('/backends', async (c) => {
-    try {
-      const backends = await deps.registry.listBackends();
-      return c.json({ backends: backends.map(descriptorToJson) });
-    } catch (err) {
-      return handleError(c, err);
-    }
+    const backends = await deps.registry.listBackends();
+    return c.json({ backends: backends.map(descriptorToJson) });
   });
 
-  // GET /backends/:name -- get a single backend
   app.get('/backends/:name', async (c) => {
-    try {
-      const name = c.req.param('name');
-      const backend = await deps.registry.getBackend(name);
-      if (!backend) {
-        return c.json({ error: 'Backend not found' }, 404);
-      }
-      return c.json(descriptorToJson(backend));
-    } catch (err) {
-      return handleError(c, err);
+    const name = c.req.param('name');
+    const backend = await deps.registry.getBackend(name);
+    if (!backend) {
+      return c.json({ error: 'Backend not found' }, 404);
     }
+    return c.json(descriptorToJson(backend));
   });
 
-  // POST /backends/:name/test -- test a named registered backend
   app.post('/backends/:name/test', async (c) => {
-    try {
-      const name = c.req.param('name');
+    const name = c.req.param('name');
 
-      const backend = await deps.registry.getBackend(name);
-      if (!backend) {
-        return c.json({ error: 'Backend not found' }, 404);
-      }
-
-      const config = await deps.registry.getBackendConfig(name);
-      if (!config) {
-        return c.json({ error: 'Backend config not found' }, 404);
-      }
-
-      const params: AddBackendParams = {
-        name: backend.name,
-        backendType: backend.backendType,
-        config,
-        scopeFilter: backend.scopeFilter,
-        syncIntervalMs: backend.syncIntervalMs,
-      };
-
-      const result = await deps.healthChecker.testConnection(params);
-      logger.info('Named backend connection test', {
-        name,
-        ok: result.ok,
-        latencyMs: result.latencyMs,
-      });
-
-      return c.json(result);
-    } catch (err) {
-      return handleError(c, err);
+    const backend = await deps.registry.getBackend(name);
+    if (!backend) {
+      return c.json({ error: 'Backend not found' }, 404);
     }
+
+    const config = await deps.registry.getBackendConfig(name);
+    if (!config) {
+      return c.json({ error: 'Backend config not found' }, 404);
+    }
+
+    const params: AddBackendParams = {
+      name: backend.name,
+      backendType: backend.backendType,
+      config,
+      scopeFilter: backend.scopeFilter,
+      syncIntervalMs: backend.syncIntervalMs,
+    };
+
+    const result = await deps.healthChecker.testConnection(params);
+    logger.info('Named backend connection test', {
+      name,
+      ok: result.ok,
+      latencyMs: result.latencyMs,
+    });
+
+    return c.json(result);
   });
 
-  // POST /backends/:name/sync -- sync a single backend
   app.post('/backends/:name/sync', async (c) => {
-    try {
-      if (!deps.syncManager) {
-        return c.json({ error: 'Sync manager not available' }, 503);
-      }
-
-      const name = c.req.param('name');
-
-      const backend = await deps.registry.getBackend(name);
-      if (!backend) {
-        return c.json({ error: 'Backend not found' }, 404);
-      }
-
-      const result = await deps.syncManager.syncBackend(name);
-      logger.info('Backend synced', { name, scopeCount: result.scopeCount });
-
-      return c.json({ synced: true, scopeCount: result.scopeCount });
-    } catch (err) {
-      return handleError(c, err);
+    if (!deps.syncManager) {
+      return c.json({ error: 'Sync manager not available' }, 503);
     }
+
+    const name = c.req.param('name');
+
+    const backend = await deps.registry.getBackend(name);
+    if (!backend) {
+      return c.json({ error: 'Backend not found' }, 404);
+    }
+
+    const result = await deps.syncManager.syncBackend(name);
+    logger.info('Backend synced', { name, scopeCount: result.scopeCount });
+
+    return c.json({ synced: true, scopeCount: result.scopeCount });
   });
 
   return app;
@@ -266,8 +206,4 @@ function descriptorToJson(d: BackendDescriptor): Record<string, unknown> {
     createdAt: d.createdAt.toISOString(),
     updatedAt: d.updatedAt.toISOString(),
   };
-}
-
-function handleError(c: any, err: unknown) {
-  return handleAdminError(c, err, logger);
 }

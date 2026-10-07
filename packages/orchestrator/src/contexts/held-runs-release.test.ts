@@ -104,7 +104,7 @@ describeDb('HeldRunStore release helpers', () => {
 
   it('releaseDueWaitHolds releases only overdue timer workflow holds', async () => {
     const overdueRun = randomUUID();
-    const legacyOverdueRun = randomUUID();
+    const secondOverdueRun = randomUUID();
     const futureRun = randomUUID();
     const reviewerRun = randomUUID();
     // What the install gate writes today.
@@ -114,12 +114,10 @@ describeDb('HeldRunStore release helpers', () => {
       envId: envId1,
       expiresAt: new Date(Date.now() - 60_000),
     });
-    // A row an un-upgraded orchestrator wrote before the backfill. It must
-    // resume too — otherwise it falls through to `expireOverdue()` and the
-    // workflow fails instead of continuing.
-    const legacyOverdueId = await seedHold({
-      runId: legacyOverdueRun,
-      holdType: 'wait_timer',
+    // A second overdue hold: the sweep releases every due row, not just one.
+    const secondOverdueId = await seedHold({
+      runId: secondOverdueRun,
+      holdType: HoldType.enum.timer,
       envId: envId1,
       expiresAt: new Date(Date.now() - 60_000),
     });
@@ -139,11 +137,11 @@ describeDb('HeldRunStore release helpers', () => {
 
     const released = await store.releaseDueWaitHolds();
     expect(released).toHaveLength(2);
-    expect(released.map((r) => r.holdId).sort()).toEqual([overdueId, legacyOverdueId].sort());
+    expect(released.map((r) => r.holdId).sort()).toEqual([overdueId, secondOverdueId].sort());
     for (const signal of released) {
       expect(signal.scope).toBe(HoldScope.enum.workflow);
     }
-    expect(released.map((r) => r.runId).sort()).toEqual([overdueRun, legacyOverdueRun].sort());
+    expect(released.map((r) => r.runId).sort()).toEqual([overdueRun, secondOverdueRun].sort());
 
     const stillPending = await db
       .selectFrom('held_runs')

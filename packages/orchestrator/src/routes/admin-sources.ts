@@ -14,8 +14,7 @@ import type { SourceStore } from '../sources/source-store.js';
 import { validateGitHubSource } from '../sources/source-validator.js';
 import { WebhookUrlNote, type WebhookUrlResolution } from '../sources/webhook-url-resolvers.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import type { Role } from '../secrets/rbac.js';
+import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 import {
   fetchGithubAppIdentity,
   listGithubAppInstallations,
@@ -28,6 +27,7 @@ import {
   type FetchGithubAppInstallations,
   type RefreshResult,
 } from '../github-app-name-refresher/github-app-name-refresher.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-sources' });
 
@@ -95,25 +95,15 @@ const redeliverRequestSchema = z.object({
   dryRun: z.boolean().optional(),
 });
 
-type AdminSourcesEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
-export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv> {
-  const app = new Hono<AdminSourcesEnv>();
+export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
+  const app = createAdminApp(logger);
 
   // POST /api/v1/admin/sources -- add a new source. Creates a fresh
   // routing key on the orchestrator, so it cannot be reached by a
   // routing-key-scoped token (the token has no say in the future routing
   // key the new source will receive).
-  app.post('/sources', async (c) => {
+  app.post('/sources', requireUnscoped, async (c) => {
     try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
       const body = await c.req.json();
       const { provider, name, slug, appId, privateKey, webhookSecret } = body;
 
@@ -238,7 +228,6 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
     }
   });
 
-  // PATCH /api/v1/admin/sources/:routingKey -- update a source
   app.patch('/sources/:routingKey', async (c) => {
     try {
       const routingKey = c.req.param('routingKey');
@@ -282,10 +271,8 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
   // name + slug from GitHub, and report each App's missing events and
   // permissions and its installations pending approval. Registered before the
   // parameterized refresh route so the static `refresh-all` segment wins.
-  app.post('/sources/refresh-all', async (c) => {
+  app.post('/sources/refresh-all', requireUnscoped, async (c) => {
     try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
       const all = await deps.sourceStore.listSources();
       const githubSources = all.filter((s) => s.provider === 'github');
       const results: RefreshResult[] = [];
@@ -399,7 +386,6 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
     }
   });
 
-  // GET /api/v1/admin/sources/:routingKey/webhook-secret -- get webhook secret for a source
   app.get('/sources/:routingKey/webhook-secret', async (c) => {
     try {
       const routingKey = c.req.param('routingKey');
@@ -418,7 +404,6 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
     }
   });
 
-  // DELETE /api/v1/admin/sources/:routingKey -- remove a source
   app.delete('/sources/:routingKey', async (c) => {
     try {
       const routingKey = c.req.param('routingKey');

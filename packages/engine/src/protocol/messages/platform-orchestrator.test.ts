@@ -19,14 +19,10 @@ import {
   trustPolicyUpdateSchema,
   trustPolicySchema,
   ForkPolicy,
-  DEFAULT_APPROVAL_EXPIRY_HOURS,
   DEFAULT_APPROVAL_EXPIRY_SECONDS,
   MIN_APPROVAL_EXPIRY_SECONDS,
-  MAX_APPROVAL_EXPIRY_HOURS,
   MAX_APPROVAL_EXPIRY_SECONDS,
   SECONDS_PER_HOUR,
-  approvalExpirySecondsOf,
-  approvalExpiryHoursOf,
   collectDiscriminatorTypes,
   ORCH_TO_PLATFORM_RECOGNIZED_TYPES,
   PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
@@ -46,7 +42,7 @@ describe('trustPolicyUpdateSchema', () => {
     orgId: 'org-1',
     policy: {
       forkPolicy: 'hold' as const,
-      approvalExpiryHours: 24,
+      approvalExpirySeconds: 24 * 3600,
     },
     identityLinks: [],
     memberCiTrustLevels: {},
@@ -149,15 +145,31 @@ describe('webhookRelaySchema', () => {
 
 describe('webhookAckSchema', () => {
   it('validates a well-formed ack', () => {
-    const msg = { type: 'webhook.ack', messageId: 'msg-101', deliveryId: 'del-abc' };
+    const msg = {
+      type: 'webhook.ack',
+      messageId: 'msg-101',
+      deliveryId: 'del-abc',
+      result: 'accepted' as const,
+    };
     expect(webhookAckSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('refuses an ack without result', () => {
+    // fails-when: result stays optional and the Platform defaults it to accepted.
+    expect(
+      webhookAckSchema.safeParse({
+        type: 'webhook.ack',
+        messageId: 'msg-101',
+        deliveryId: 'del-abc',
+      }).success,
+    ).toBe(false);
   });
 
   it('rejects missing deliveryId', () => {
     expect(() => webhookAckSchema.parse({ type: 'webhook.ack', messageId: 'msg-101' })).toThrow();
   });
 
-  it('accepts optional result enum from chunked relay path', () => {
+  it('accepts the result enum', () => {
     const msg = {
       type: 'webhook.ack',
       messageId: 'msg-101',
@@ -381,6 +393,7 @@ describe('logChunkSchema', () => {
     stepIndex: 0,
     lines: ['Installing dependencies...', 'Done in 3.2s'],
     timestamp: Date.now(),
+    stream: 'stdout',
   };
 
   it('validates a well-formed log chunk', () => {
@@ -867,6 +880,9 @@ describe('platformToOrchestratorMessageSchema', () => {
     const msg = {
       type: 'auth.success',
       connectionId: 'conn-abc',
+      orgPublicAlias: 'oal_abc',
+      orgId: 'org_abc',
+      githubWebhookUrl: null,
     };
     expect(platformToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
   });
@@ -925,7 +941,7 @@ describe('platformToOrchestratorMessageSchema', () => {
   });
 
   it('accepts a platform.capabilities advertisement', () => {
-    const msg = { type: 'platform.capabilities', capabilities: { orchMetrics: true } };
+    const msg = { type: 'platform.capabilities', capabilities: {} };
     expect(platformToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
   });
 
@@ -965,7 +981,12 @@ describe('platformToOrchestratorMessageSchema', () => {
 
 describe('orchestratorToPlatformMessageSchema', () => {
   it('accepts webhook.ack messages', () => {
-    const msg = { type: 'webhook.ack', messageId: 'msg-300', deliveryId: 'del-2' };
+    const msg = {
+      type: 'webhook.ack',
+      messageId: 'msg-300',
+      deliveryId: 'del-2',
+      result: 'accepted',
+    };
     expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
   });
 
@@ -990,6 +1011,7 @@ describe('orchestratorToPlatformMessageSchema', () => {
       stepIndex: 1,
       lines: ['PASS'],
       timestamp: 123,
+      stream: 'stdout',
     };
     expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
   });
@@ -1023,6 +1045,7 @@ describe('orchestratorToPlatformMessageSchema', () => {
       type: 'auth.request',
       token: 'kici_sk_test123',
       protocolVersion: 1,
+      capabilities: { orchRole: 'coordinator' },
     };
     expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
   });
@@ -1278,38 +1301,27 @@ describe('recognized-type sets', () => {
   });
 });
 
-describe('trustPolicySchema approvalExpiryHours validation', () => {
+describe('trustPolicySchema approvalExpirySeconds validation', () => {
   const validPolicy = {
     forkPolicy: 'hold',
-    approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+    approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
   };
 
-  it('accepts the documented default', () => {
+  it('accepts the documented default of 72 hours', () => {
     expect(trustPolicySchema.safeParse(validPolicy).success).toBe(true);
+    expect(DEFAULT_APPROVAL_EXPIRY_SECONDS).toBe(72 * SECONDS_PER_HOUR);
   });
 
-  it('rejects a non-integer approvalExpiryHours', () => {
-    // The column is INTEGER NOT NULL, so a fractional value throws inside the
-    // fire-and-forget persist and the policy is silently never stored.
-    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: 1.5 }).success).toBe(
+  it('refuses a policy carrying no window, or the retired hours field', () => {
+    // fails-when: approvalExpirySeconds is optional again, or the strict schema
+    // accepts approvalExpiryHours.
+    expect(trustPolicySchema.safeParse({ forkPolicy: 'hold' }).success).toBe(false);
+    expect(
+      trustPolicySchema.safeParse({ forkPolicy: 'hold', approvalExpiryHours: 72 }).success,
+    ).toBe(false);
+    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: 72 }).success).toBe(
       false,
     );
-  });
-
-  it('rejects a zero or negative approvalExpiryHours', () => {
-    // Either value mints a hold that is already expired the moment it is
-    // written, so the run fails instead of waiting for an approver.
-    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: 0 }).success).toBe(
-      false,
-    );
-    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: -1 }).success).toBe(
-      false,
-    );
-  });
-
-  it('accepts a policy carrying no approvalExpirySeconds', () => {
-    // An older Platform sends only the hours field; the frame must still parse.
-    expect(trustPolicySchema.safeParse(validPolicy).data?.approvalExpirySeconds).toBeUndefined();
   });
 
   it('accepts a one-second window, the shortest expressible hold', () => {
@@ -1322,58 +1334,17 @@ describe('trustPolicySchema approvalExpiryHours validation', () => {
   });
 
   it('rejects a non-integer, zero, or negative approvalExpirySeconds', () => {
-    // Same two reasons as the hours field: the column is INTEGER, and a
-    // non-positive window mints a hold that is already expired when written.
+    // The column is INTEGER, and a non-positive window mints a hold that is
+    // already expired when written.
     for (const bad of [1.5, 0, -1]) {
       expect(
         trustPolicySchema.safeParse({ ...validPolicy, approvalExpirySeconds: bad }).success,
       ).toBe(false);
     }
   });
-});
 
-describe('approval expiry resolution', () => {
-  it('prefers the seconds field when both are present', () => {
-    // Precedence: the more specific field wins, so an operator's sub-hour
-    // window is never silently replaced by the coarse spelling beside it.
-    expect(approvalExpirySecondsOf({ approvalExpiryHours: 72, approvalExpirySeconds: 30 })).toBe(
-      30,
-    );
-  });
-
-  it('converts the hours field when no seconds accompany it', () => {
-    expect(approvalExpirySecondsOf({ approvalExpiryHours: 5 })).toBe(5 * SECONDS_PER_HOUR);
-    // Explicit null (a stored column that predates the seconds value) reads the
-    // same as absent, not as zero.
-    expect(approvalExpirySecondsOf({ approvalExpiryHours: 5, approvalExpirySeconds: null })).toBe(
-      5 * SECONDS_PER_HOUR,
-    );
-  });
-
-  it('falls back to the documented default when the policy carries no window', () => {
-    expect(approvalExpirySecondsOf({})).toBe(DEFAULT_APPROVAL_EXPIRY_SECONDS);
-    expect(DEFAULT_APPROVAL_EXPIRY_SECONDS).toBe(DEFAULT_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR);
-  });
-
-  it('renders a whole-hour window back to the exact hours it came from', () => {
-    for (const hours of [1, 5, 24, DEFAULT_APPROVAL_EXPIRY_HOURS, MAX_APPROVAL_EXPIRY_HOURS]) {
-      expect(approvalExpiryHoursOf(approvalExpirySecondsOf({ approvalExpiryHours: hours }))).toBe(
-        hours,
-      );
-    }
-  });
-
-  it('rounds a sub-hour window up to one hour rather than down to zero', () => {
-    // Rounding down would hand an older peer a zero-hour window — precisely the
-    // already-expired hold the floor exists to prevent.
-    expect(approvalExpiryHoursOf(1)).toBe(1);
-    expect(approvalExpiryHoursOf(30)).toBe(1);
-    expect(approvalExpiryHoursOf(SECONDS_PER_HOUR)).toBe(1);
-    expect(approvalExpiryHoursOf(SECONDS_PER_HOUR + 1)).toBe(2);
-  });
-
-  it('keeps the two spellings expressing the same range', () => {
-    expect(MAX_APPROVAL_EXPIRY_SECONDS).toBe(MAX_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR);
+  it('caps the window at one year', () => {
+    expect(MAX_APPROVAL_EXPIRY_SECONDS).toBe(8760 * SECONDS_PER_HOUR);
   });
 });
 
@@ -1382,7 +1353,7 @@ describe('trustPolicySchema fork switch', () => {
     for (const forkPolicy of ForkPolicy.options) {
       const parsed = trustPolicySchema.parse({
         forkPolicy,
-        approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+        approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
       });
       expect(parsed.forkPolicy).toBe(forkPolicy);
     }
@@ -1397,7 +1368,7 @@ describe('trustPolicySchema fork switch', () => {
       expect(
         trustPolicySchema.safeParse({
           forkPolicy,
-          approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+          approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
         }).success,
       ).toBe(false);
     }

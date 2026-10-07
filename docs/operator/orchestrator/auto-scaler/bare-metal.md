@@ -163,6 +163,9 @@ scalers:
   - name: macos-bare-metal
     type: bare-metal
     maxAgents: 2
+    platform:
+      os: macos
+      arch: arm64
     labelSets:
       - labels: [macos, darwin, bare-metal]
         binaryPath: /Users/youruser/kici/agent/kici-agent
@@ -177,12 +180,15 @@ scalers:
   - name: windows-bare-metal
     type: bare-metal
     maxAgents: 2
+    platform:
+      os: windows
+      arch: x64
     labelSets:
       - labels: [windows, bare-metal]
         binaryPath: C:\kici\agent\kici-agent.cmd
 ```
 
-For a non-Linux bare-metal pool, prefer declaring the structured `platform: { os, arch }` field. It is the canonical way to taint a Windows / macOS / ARM pool so unqualified Linux jobs are never routed to it, and it works even when the pool's plain labels use a non-canonical name. See [Automatic platform taint](./common-config.md) in the common config reference.
+A non-Linux pool declares the structured `platform: { os, arch }` field. It taints a Windows, macOS or ARM pool so unqualified Linux jobs are never routed to it. A plain platform label such as `macos` or `windows` without `platform` is refused when the config loads. See [the structured platform field](./common-config.md) in the common config reference.
 
 ### Key notes
 
@@ -208,6 +214,7 @@ scalers:
       - labels: ['linux', 'gpu', 'cuda']
         binaryPath: '/opt/kici/kici-agent'
         resources:
-          memory: '16g'
-          cpus: 8
+          limits:
+            memory: '16g'
+            cpus: 8
 ```

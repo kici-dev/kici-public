@@ -152,42 +152,21 @@ describe('kici logout', () => {
     expect(config.platformEndpoint).toBe('https://platform.example.com');
   });
 
-  it('clears legacy token on logout', async () => {
-    await saveGlobalConfig({
-      pat: 'kici_pat_test',
-      patId: 'pat-123',
-      platformEndpoint: 'https://platform.example.com',
-      token: 'legacy-api-key',
-    });
-
-    mockFetch.mockResolvedValue({ ok: true });
-
-    await logoutCommand();
-
-    const config = await loadGlobalConfig();
-    expect(config.pat).toBeUndefined();
-    expect(config.token).toBeUndefined();
-  });
-
-  it('logs out token-only user without PAT revocation', async () => {
-    await saveGlobalConfig({
-      token: 'legacy-api-key',
-      endpoint: 'https://orch.example.com',
-    });
+  it('treats a config holding only a token key as logged out', async () => {
+    const kiciDir = path.join(tempDir, '.kici');
+    await fs.mkdir(kiciDir, { recursive: true });
+    await fs.writeFile(
+      path.join(kiciDir, 'config'),
+      JSON.stringify({ token: 'legacy-api-key', endpoint: 'https://orch.example.com' }),
+    );
 
     const result = await logoutCommand();
 
     expect(result).toBe(true);
-    // Should not attempt server-side PAT revocation
+    // fails-when: the token key still counts as a login — logout would try to revoke it.
     expect(mockFetch).not.toHaveBeenCalled();
-
-    const config = await loadGlobalConfig();
-    expect(config.token).toBeUndefined();
-    // Connection settings preserved
-    expect(config.endpoint).toBe('https://orch.example.com');
-
     const output = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
-    expect(output).toMatch(/logged out/i);
+    expect(output).toMatch(/not logged in/i);
   });
 
   it('detaches an attached local dev plane on logout', async () => {

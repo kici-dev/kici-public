@@ -3915,7 +3915,7 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       repoIdentifier: 'forgejo.example.com/kici-ci/shared-pipelines',
       job: { id: 'job-1', ...call },
     });
-    expect(cloneAuth).toMatchObject({ auth: { token: 'forgejo-pat-secret' } });
+    expect(cloneAuth).toMatchObject({ auth: { sourceAuth: { secret: 'forgejo-pat-secret' } } });
 
     // Clone URL built by the universal-git bundle (forgejo host, not GitHub).
     expect(call.repoUrl).toBe(
@@ -3996,7 +3996,7 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       repoIdentifier: 'orgA/repo-creds',
       job: { id: 'job-1', ...call },
     });
-    expect(cloneAuth).toMatchObject({ auth: { token: 'TOKEN-FROM-REG-BUNDLE' } });
+    expect(cloneAuth).toMatchObject({ auth: { sourceAuth: { secret: 'TOKEN-FROM-REG-BUNDLE' } } });
   });
 
   // ── Cross-source repo mode: path filters and disjoint routing ──
@@ -6061,9 +6061,10 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
    */
   function helloFirecrackerLockFile() {
     return {
-      // A freshly-compiled current lock must carry the engine's SCHEMA_VERSION;
-      // the real LockFileCache now rejects any other version as incompatible.
+      // A freshly-compiled current lock carries the engine's SCHEMA_VERSION and a
+      // minReaderVersion; the real LockFileCache rejects a lock without either.
       schemaVersion: SCHEMA_VERSION,
+      minReaderVersion: SCHEMA_VERSION,
       source: { file: '.kici/workflows/hello-firecracker.ts', export: '#default' },
       contentHash: 'fallback-hash',
       workflows: [

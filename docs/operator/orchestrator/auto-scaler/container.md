@@ -324,11 +324,13 @@ scalers:
       - labels: ['linux', 'container']
         image: 'ghcr.io/myorg/kici-agent:latest'
         resources:
-          memory: '2g'
-          cpus: 2
+          limits:
+            memory: '2g'
+            cpus: 2
       - labels: ['linux', 'node20']
         image: 'ghcr.io/myorg/kici-agent-node20:latest'
         resources:
-          memory: '4g'
-          cpus: 2
+          limits:
+            memory: '4g'
+            cpus: 2
 ```

@@ -34,16 +34,9 @@ interface CloneOptions {
   /** Directory to clone into */
   workDir: string;
   /**
-   * Optional auth token (GitHub installation token or personal token).
-   * Deprecated in favour of `gitAuth`; retained for backward compatibility.
-   * When both are set, `gitAuth` wins.
-   */
-  token?: string;
-  /**
-   * Structured auth material. When `kind === 'basic'`, gitAuth is used
-   * instead of `token` via the same `http.extraHeader` path. When
-   * `kind === 'ssh'`, the clone uses `GIT_SSH_COMMAND` with a temp
-   * private key (and optional pinned known_hosts).
+   * Structured auth material. When `kind === 'basic'`, the credential goes
+   * through `http.extraHeader`. When `kind === 'ssh'`, the clone uses
+   * `GIT_SSH_COMMAND` with a temp private key (and optional pinned known_hosts).
    */
   gitAuth?: GitAuth;
   /** Clone depth (default: 1 for shallow clone) */
@@ -127,23 +120,13 @@ export async function gitClone(options: CloneOptions): Promise<void> {
     ref,
     sha,
     workDir,
-    token,
     gitAuth,
     depth = 1,
     credentialHelperPath,
     sshCleanupRegistry,
   } = options;
 
-  // Normalise the auth inputs:
-  //   - When both `gitAuth` and `token` are set, `gitAuth` wins (`gitAuth` is
-  //     the structured path; `token` is the backward-compatible fallback).
-  //   - When only `token` is set, we synthesize a Basic-auth GitAuth so the
-  //     rest of the function has a single code path.
-  const auth: GitAuth | undefined = gitAuth
-    ? gitAuth
-    : token
-      ? { kind: 'basic', user: 'x-access-token', secret: token }
-      : undefined;
+  const auth: GitAuth | undefined = gitAuth;
 
   // Build git clone args and optional env overrides
   const args: string[] = [];

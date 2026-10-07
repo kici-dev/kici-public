@@ -43,19 +43,12 @@ function httpClient(opts: { type: string; bindings: number } | null) {
 }
 
 describe('unboundContextWarning', () => {
-  it('names the context, the deprecated reference fallback, and the exact bind command', () => {
-    expect(unboundContextWarning('org-1', 'staging', ContextType.enum.fixed)).toBe(
-      "warning: context 'staging' has no binding, so no job that lists it in contexts: receives its secrets. " +
-        "A 'staging:<key>' reference still reads scope 'staging', through a deprecated fallback. " +
+  it('names the context, says a reference resolves nothing, and gives the exact bind command', () => {
+    // fails-when: the warning still promises a same-named-scope fallback for references.
+    expect(unboundContextWarning('org-1', 'staging')).toBe(
+      "warning: context 'staging' has no binding, so no job that lists it in contexts: receives its secrets, " +
+        "and a 'staging:<key>' reference resolves nothing. " +
         'Bind a secret scope to it: kici-admin context bind --org org-1 --env staging --scope staging',
-    );
-  });
-
-  it('names no fallback for a glob context, whose references never read a same-named scope', () => {
-    // fails-when: the glob warning promises the fixed-context fallback
-    expect(unboundContextWarning('org-1', 'preview-*', ContextType.enum.glob)).toBe(
-      "warning: context 'preview-*' has no binding, so no job that lists it in contexts: receives its secrets. " +
-        'Bind a secret scope to it: kici-admin context bind --org org-1 --env preview-* --scope preview-*',
     );
   });
 });
@@ -82,7 +75,7 @@ describe('warnIfContextUnbound', () => {
     await warnIfContextUnbound({ orgId: 'org-1', name: 'staging', dbUrl: DB, warn });
 
     // fails-when: a bindingless fixed context passes silently
-    expect(warnings).toEqual([unboundContextWarning('org-1', 'staging', ContextType.enum.fixed)]);
+    expect(warnings).toEqual([unboundContextWarning('org-1', 'staging')]);
     expect(mockShowContextDirect).toHaveBeenCalledWith(DB, { orgId: 'org-1', name: 'staging' });
   });
 
@@ -91,7 +84,7 @@ describe('warnIfContextUnbound', () => {
 
     await warnIfContextUnbound({ orgId: 'org-1', name: 'staging', dbUrl: null, client, warn });
 
-    expect(warnings).toEqual([unboundContextWarning('org-1', 'staging', ContextType.enum.fixed)]);
+    expect(warnings).toEqual([unboundContextWarning('org-1', 'staging')]);
     expect(get).toHaveBeenCalledWith('/api/v1/admin/contexts?orgId=org-1');
     expect(get).toHaveBeenCalledWith('/api/v1/admin/contexts/staging?orgId=org-1');
   });
@@ -117,7 +110,7 @@ describe('warnIfContextUnbound', () => {
       client: httpClient({ type: ContextType.enum.glob, bindings: 0 }).client,
       warn,
     });
-    expect(warnings).toEqual([unboundContextWarning('org-1', 'staging', ContextType.enum.glob)]);
+    expect(warnings).toEqual([unboundContextWarning('org-1', 'staging')]);
   });
 
   it('stays silent for a template row, which no job resolves through', async () => {

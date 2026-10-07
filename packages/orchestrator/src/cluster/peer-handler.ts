@@ -53,6 +53,9 @@ import {
   type RaftVoteRequest,
   type RaftVoteResponse,
   type RaftAppendEntries,
+  type PeerScalerReloadRequest,
+  type PeerScalerReloadResponse,
+  ScalerReloadOutcome,
 } from '@kici-dev/engine';
 import { PeerLinkDirection, type PeerRegistry } from './peer-registry.js';
 import {
@@ -69,6 +72,13 @@ import {
   type SCALER_ORPHANS_TIMEOUT,
   type ScalerOrphansRequestHandler,
 } from './scaler-orphans-peer.js';
+import {
+  replyToScalerReloadRequest,
+  ScalerReloadWaiters,
+  SCALER_RELOAD_COORDINATORS_ONLY_DETAIL,
+} from './scaler-reload-peer.js';
+import type { PEER_REQUEST_TIMEOUT } from './peer-request-waiters.js';
+import type { ScalerFileReload } from '../scaler/file-reload.js';
 import {
   HANDSHAKE_NONCE_BYTES,
   computeClientProof,
@@ -207,6 +217,13 @@ export interface PeerHandlerDeps {
    */
   onScalerOrphansRequest?: ScalerOrphansRequestHandler;
   /**
+   * Reloads this node's scaler config for a peer.scaler.reload.request
+   * (`kici-admin scaler reload`). A request from a peer that is not a
+   * coordinator is refused before it reaches the handler. If undefined,
+   * requests are answered `rejected`.
+   */
+  onScalerReloadRequest?: ScalerFileReload;
+  /**
    * Forgets a departed peer a sibling coordinator forgot (`kici-admin peer
    * forget`). A request from a peer that is not a coordinator is refused. If
    * undefined, requests are answered with outcome `error`.
@@ -326,6 +343,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     onPeerClusterSettingsRequest,
     onLogsCollectRequest,
     onScalerOrphansRequest,
+    onScalerReloadRequest,
     onPeerForgetRequest,
   } = deps;
 
@@ -352,6 +370,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
   /** Scaler orphan response waiters (server-side connections). */
   const scalerOrphansWaiters = new ScalerOrphansWaiters();
+  /** Scaler reload response waiters (server-side connections). */
+  const scalerReloadWaiters = new ScalerReloadWaiters();
   /** Peer forget response waiters (server-side connections). */
   const peerForgetWaiters = new PeerForgetWaiters();
 
@@ -706,6 +726,37 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
       case 'peer.scaler.orphans.response': {
         scalerOrphansWaiters.resolve(msg);
+        break;
+      }
+
+      case 'peer.scaler.reload.request': {
+        const send = (response: PeerScalerReloadResponse): void => {
+          sendEncryptedMessage(conn.ws, conn.sessionKey, response);
+        };
+        // Only a coordinator relays an operator's reload: a worker never directs
+        // another node's scalers. The role is the one the peer's credential
+        // carries, not the one it declares.
+        if (conn.authenticatedRole !== 'coordinator') {
+          logger.warn('Refused a scaler reload request from a peer that is not a coordinator', {
+            peerId: conn.peerInstanceId,
+            role: conn.authenticatedRole,
+          });
+          send({
+            type: 'peer.scaler.reload.response',
+            messageId: msg.messageId,
+            outcome: ScalerReloadOutcome.enum.rejected,
+            detail: SCALER_RELOAD_COORDINATORS_ONLY_DETAIL,
+          });
+          break;
+        }
+        replyToScalerReloadRequest(msg, onScalerReloadRequest, send, {
+          peerId: conn.peerInstanceId,
+        });
+        break;
+      }
+
+      case 'peer.scaler.reload.response': {
+        scalerReloadWaiters.resolve(msg);
         break;
       }
 
@@ -1543,6 +1594,22 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
+   * Send a peer.scaler.reload.request to a peer connected via this handler
+   * (incoming WS) and wait for the matching response.
+   *
+   * @returns the response; null when the peer is not connected via this
+   *   handler; `'timeout'` when no response arrived within `timeoutMs`.
+   */
+  async function sendScalerReloadAndWait(
+    targetInstanceId: string,
+    msg: PeerScalerReloadRequest,
+    timeoutMs: number,
+  ): Promise<PeerScalerReloadResponse | null | typeof PEER_REQUEST_TIMEOUT> {
+    if (!sendToPeer(targetInstanceId, msg as PeerToPeerMessage)) return null;
+    return scalerReloadWaiters.wait(msg.messageId, timeoutMs);
+  }
+
+  /**
    * Send a peer.logs.collect.request to a peer connected via this handler
    * (incoming WS) and await its reassembled subtree-bundle ZIP. Rejects on
    * timeout, an error frame, or peer disconnect.
@@ -1581,6 +1648,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
     configReloadWaiters.clear();
     scalerOrphansWaiters.rejectAll('peer handler shutting down');
+    scalerReloadWaiters.rejectAll('peer handler shutting down');
     peerForgetWaiters.rejectAll('peer handler shutting down');
     logsCollectWaiters.rejectAll('peer handler shutting down');
   }
@@ -1615,6 +1683,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     sendAndWaitAck,
     sendConfigReloadAndWait,
     sendScalerOrphansAndWait,
+    sendScalerReloadAndWait,
     sendPeerForgetAndWait,
     sendLogsCollectAndWait,
     getConnectionCount,

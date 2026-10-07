@@ -51,7 +51,7 @@ describe('loadLocalSecrets', () => {
     expect(result.flat.API_KEY).toBeDefined();
   });
 
-  it('loads .secrets INI file via loadSecretsFile (backward compat)', async () => {
+  it('loads .secrets INI file via loadSecretsFile, keeping its contexts', async () => {
     mockLoadSecretsFile.mockResolvedValue({
       flat: { OLD_SECRET: 'old-value' },
       contexts: { prod: { CTX_SECRET: 'ctx-value' } },

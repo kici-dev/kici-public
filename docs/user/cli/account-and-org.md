@@ -7,7 +7,7 @@ description: 'Login, org selection, personal access tokens, secrets, and admin'
 
 ### kici login
 
-Authenticate with KiCI via browser-based OAuth (default) or API key (`--token`).
+Authenticate with KiCI via browser-based OAuth (default) or the device flow (`--device`). For a CI/CD pipeline, see [non-interactive environments](../cli-auth.md#non-interactive-environments).
 
 By default, `kici login` opens your browser for OIDC authentication using PKCE. In headless environments (SSH, CI, containers), it automatically switches to the RFC 8628 device authorization flow where you visit a URL and enter a code.
 
@@ -43,9 +43,6 @@ kici login
 # Force device flow (for SSH/headless)
 kici login --device
 
-# Legacy API key login
-kici login --token kici_sk_abc123...
-
 # Log in against another KiCI environment (e.g. a testing instance)
 kici login --platform-endpoint https://platform.example.com \
   --oidc-issuer https://auth.example.com/realms/kici-internal
@@ -74,7 +71,7 @@ The first match wins, so an SSH session into WSL, or a container running on a WS
 
 Revoke your personal access token on the server and clear local credentials.
 
-If the server is unreachable, local credentials are still cleared (the PAT will expire automatically). Non-auth config fields (active org, default clusters, etc.) are preserved.
+If the server is unreachable, local credentials are still cleared (the PAT will expire automatically). The active organization is cleared with the credentials. Connection settings (per-org default clusters, Platform endpoint, OIDC issuer, etc.) are preserved.
 
 ```bash
 kici logout
@@ -353,7 +350,7 @@ Synopsis: `kici init [options]`
 
 ### `kici login`
 
-Authenticate with KiCI via browser OAuth (default) or API key (--token)
+Authenticate with KiCI via browser OAuth (default) or device flow (--device)
 
 Synopsis: `kici login [options]`
 
@@ -361,7 +358,6 @@ Synopsis: `kici login [options]`
 
 | Option                      | Default | Description                                                                         |
 | --------------------------- | ------- | ----------------------------------------------------------------------------------- |
-| `--token <key>`             |         | API key for direct authentication (legacy)                                          |
 | `--device`                  |         | Force device authorization flow (for headless/SSH environments)                     |
 | `--platform-endpoint <url>` |         | Platform relay URL                                                                  |
 | `--oidc-issuer <url>`       |         | OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another) |

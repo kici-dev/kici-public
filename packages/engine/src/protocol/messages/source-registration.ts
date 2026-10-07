@@ -133,30 +133,29 @@ export const sourceRegistrationSchema = z.object({
    * different orchestrator clusters that accidentally share the same
    * `clusterName` in one org: every coord in an HA cluster shares the
    * same orch DB and therefore the same `clusterId`, while two unrelated
-   * clusters carry distinct UUIDs. Optional — older orchestrators that
-   * haven't been redeployed yet won't publish it, in which case Platform
-   * skips the cross-cluster collision warn for that connection.
+   * clusters carry distinct UUIDs. Absent when the orchestrator could not
+   * read its cluster id, in which case Platform skips the cross-cluster
+   * collision warn for that connection.
    */
   clusterId: z.string().uuid().optional(),
   /** Reachable address for peer-to-peer connections (from KICI_CLUSTER_ADDRESS env var). */
   address: z.string().nullable().optional(),
-  /** Orchestrator version (e.g. "0.0.1"). Optional for backward compatibility with older orchestrators. */
+  /** Orchestrator version (e.g. "0.0.1"). Absent when the orchestrator cannot read its own version. */
   version: z.string().optional(),
-  /** Orchestrator config mode. Optional for backward compatibility. */
+  /** Orchestrator config mode. */
   mode: OrchestratorMode.optional(),
   /** Scaler backends configured on this orchestrator (e.g. ["container", "firecracker"]). */
   scalerBackends: z.array(z.string()).optional(),
   /**
    * How the orchestrator process itself was deployed (systemd/launchd/windows/
    * compose/unknown), used by the dashboard to build the correct kici-admin
-   * invocation. Optional: older orchestrators that haven't been redeployed don't
-   * publish it, in which case the dashboard treats the shape as `unknown`.
+   * invocation. Absent when the orchestrator cannot detect it, in which case
+   * the dashboard treats the shape as `unknown`.
    */
   deployment: DeploymentIdentitySchema.optional(),
   /**
    * Where this orchestrator's own config files live on its host, so the
-   * dashboard can point an operator straight at them. Optional: an
-   * orchestrator that predates the field omits it, and each member is omitted
+   * dashboard can point an operator straight at them. Each member is omitted
    * independently when that path is not knowable.
    */
   configPaths: ConfigPathsSchema.optional(),
@@ -174,11 +173,10 @@ export const sourceRegistrationSchema = z.object({
  * URL to paste into a GitHub App. `webhookUrl` is null when the Platform has
  * no public webhook base configured (`config.webhookPublicUrl` unset).
  */
-export const acceptedSourceSchema = z.object({
+const acceptedSourceSchema = z.object({
   routingKey: z.string(),
   webhookUrl: z.string().nullable(),
 });
-export type AcceptedSource = z.infer<typeof acceptedSourceSchema>;
 
 /** Platform acknowledgment of source registration. */
 export const sourceRegistrationAckSchema = z.object({

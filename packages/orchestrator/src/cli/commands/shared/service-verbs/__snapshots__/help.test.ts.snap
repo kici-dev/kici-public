@@ -1,0 +1,169 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`service command groups — help pin > agent > logs --help is unchanged 1`] = `
+"Usage: kici-admin agent logs [options]
+
+Tail and follow agent service logs
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance whose logs to read
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  --since <duration>     Show logs since duration (e.g. 1h, 30m)
+  --level <level>        Filter by log level (error|warn|info)
+  --json                 Output as structured JSON
+  --no-follow            Snapshot mode (do not tail)
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > agent > restart --help is unchanged 1`] = `
+"Usage: kici-admin agent restart [options]
+
+Restart the agent service
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to restart
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > agent > start --help is unchanged 1`] = `
+"Usage: kici-admin agent start [options]
+
+Start the agent service
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to start
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > agent > stop --help is unchanged 1`] = `
+"Usage: kici-admin agent stop [options]
+
+Stop the agent service
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to stop
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > agent > uninstall --help is unchanged 1`] = `
+"Usage: kici-admin agent uninstall [options]
+
+Remove the agent service registration
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to uninstall
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > orchestrator > logs --help is unchanged 1`] = `
+"Usage: kici-admin orchestrator logs [options]
+
+Tail and follow orchestrator service logs
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance whose logs to read
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  --since <duration>     Show logs since duration (e.g. 1h, 30m)
+  --level <level>        Filter by log level (error|warn|info)
+  --json                 Output as structured JSON
+  --no-follow            Snapshot mode (do not tail)
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > orchestrator > restart --help is unchanged 1`] = `
+"Usage: kici-admin orchestrator restart [options]
+
+Restart the orchestrator service
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to restart
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > orchestrator > start --help is unchanged 1`] = `
+"Usage: kici-admin orchestrator start [options]
+
+Start the orchestrator service
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to start
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > orchestrator > stop --help is unchanged 1`] = `
+"Usage: kici-admin orchestrator stop [options]
+
+Stop the orchestrator service
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to stop
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;
+
+exports[`service command groups — help pin > orchestrator > uninstall --help is unchanged 1`] = `
+"Usage: kici-admin orchestrator uninstall [options]
+
+Remove the orchestrator service registration
+
+Options:
+  --platform <type>      Force the service platform (systemd, launchd, windows, compose). Default:
+                         the platform in the install manifest
+  --instance-dir <path>  Deploy folder of the instance to uninstall
+  --name <name>          Service name (no default — must resolve via flag/CWD)
+  --system               Operate against the system-level service (requires root)
+  --user-level           Operate against the user-level service
+  -h, --help             display help for command
+"
+`;

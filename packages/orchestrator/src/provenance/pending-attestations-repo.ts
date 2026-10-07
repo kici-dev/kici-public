@@ -49,7 +49,7 @@ export class PendingAttestationsRepo {
   /**
    * List pending rows oldest-first, optionally scoped to a run. Terminally
    * rejected rows (`rejected_at IS NOT NULL`) are excluded — the retrier never
-   * re-picks a row the Platform definitively cannot mint.
+   * re-picks a row the orchestrator definitively cannot mint.
    */
   async list(opts: { runId?: string; limit?: number } = {}): Promise<PendingAttestationRow[]> {
     let q = this.db

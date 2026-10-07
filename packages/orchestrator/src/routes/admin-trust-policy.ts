@@ -26,16 +26,16 @@ import type { ActorPrincipal, OrchestratorMode } from '@kici-dev/engine';
 import {
   CiTrustLevel,
   ForkPolicy,
+  MAX_APPROVAL_EXPIRY_SECONDS,
   MIN_APPROVAL_EXPIRY_SECONDS,
   PLATFORM_CONNECTED_MODES,
 } from '@kici-dev/engine';
-import { handleAdminError } from './admin-errors.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import { resolveEffectivePolicy } from '../security/trust-policy-gate.js';
 import type { TrustPolicyStore } from '../security/trust-policy-store.js';
 import type { TrustDirectory, TrustDirectoryStore } from '../security/trust-directory-store.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-trust-policy' });
 
@@ -98,14 +98,6 @@ interface TrustPolicyRouteDeps {
   accessLog: AccessLogWriter;
 }
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
 /**
  * Strict, like the Platform route: a body naming a field this build does not
  * know — a removed policy arm from an older `kici-admin` — is refused with a
@@ -118,15 +110,13 @@ const updateSchema = z
     // including `ignore`, which is what an orchestrator with no stored row
     // already applies and therefore has to be expressible.
     forkPolicy: ForkPolicy.optional(),
-    /** The coarse spelling of the hold window; still fully supported on its own. */
-    approvalExpiryHours: z.number().int().min(1).optional(),
-    /**
-     * The authoritative hold window, and the only spelling that can express a
-     * sub-hour hold. When a PATCH carries both, this one wins — it is the more
-     * specific of the two — and the store rewrites the hours column to match, so
-     * the two can never be left disagreeing.
-     */
-    approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
+    /** The hold window, in seconds, up to one year. */
+    approvalExpirySeconds: z
+      .number()
+      .int()
+      .min(MIN_APPROVAL_EXPIRY_SECONDS)
+      .max(MAX_APPROVAL_EXPIRY_SECONDS)
+      .optional(),
   })
   .strict();
 
@@ -182,51 +172,43 @@ async function directoryResponse(
 }
 
 export function createTrustPolicyRoutes(deps: TrustPolicyRouteDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
   // The policy and the directory are per-customer (orgId), not per-routing-key;
   // routing-key tokens are refused outright. One registration per exact path: a
   // bare Hono path matches only itself, so the single `/trust-policy`
   // registration this list replaced did not reach the nested directory path.
   for (const path of ['/trust-policy', '/trust-policy/directory']) {
-    app.use(path, async (c, next) => {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      await next();
-    });
+    app.use(path, requireUnscoped);
   }
 
   // GET /api/v1/admin/trust-policy?customerId=...
   app.get('/trust-policy', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
-      const customerId = c.req.query('customerId');
-      if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
+    const customerId = c.req.query('customerId');
+    if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
 
-      const stored = await deps.store.get(customerId);
-      // Report what the gate would ACTUALLY apply, resolved by the same
-      // function the gate uses — a second copy of that logic here would drift
-      // and misreport the enforced policy, which is the class of bug this
-      // whole feature fixes.
-      const { policy: effective } = resolveEffectivePolicy(stored, deps.mode);
-      return c.json({
-        policy: {
-          customerId,
-          ...effective,
-          source: stored?.source ?? null,
-          updatedAt: stored?.updatedAt?.toISOString() ?? null,
-          /**
-           * True when no row is stored, so the values above are the fail-closed
-           * defaults rather than an operator's or the Platform's own choice.
-           */
-          effectiveDefault: stored === null,
-          /** True when the Platform owns this policy and PATCH will refuse. */
-          platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
-        },
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    const stored = await deps.store.get(customerId);
+    // Report what the gate would ACTUALLY apply, resolved by the same
+    // function the gate uses — a second copy of that logic here would drift
+    // and misreport the enforced policy, which is the class of bug this
+    // whole feature fixes.
+    const { policy: effective } = resolveEffectivePolicy(stored, deps.mode);
+    return c.json({
+      policy: {
+        customerId,
+        ...effective,
+        source: stored?.source ?? null,
+        updatedAt: stored?.updatedAt?.toISOString() ?? null,
+        /**
+         * True when no row is stored, so the values above are the fail-closed
+         * defaults rather than an operator's or the Platform's own choice.
+         */
+        effectiveDefault: stored === null,
+        /** True when the Platform owns this policy and PATCH will refuse. */
+        platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
+      },
+    });
   });
 
   // GET /api/v1/admin/trust-policy/directory?customerId=...
@@ -237,39 +219,35 @@ export function createTrustPolicyRoutes(deps: TrustPolicyRouteDeps): Hono<AdminE
   // refused because nobody is registered at all) — two failures that look
   // identical from the pull request.
   app.get('/trust-policy/directory', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
-      const customerId = c.req.query('customerId');
-      if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
+    const customerId = c.req.query('customerId');
+    if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
 
-      const stored = await deps.directory.load(customerId);
-      return c.json({
-        directory:
-          stored === null
-            ? null
-            : {
-                customerId,
-                identityLinks: stored.identityLinks,
-                memberCiTrustLevels: stored.memberCiTrustLevels,
-                teamMemberships: stored.teamMemberships,
-                updatedAt: stored.updatedAt.toISOString(),
-              },
-        /**
-         * True when the Platform owns this directory and is its only writer,
-         * so the PATCH and DELETE below refuse. False on an independent
-         * orchestrator, where the operator is the only writer there is.
-         */
-        platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
-        /**
-         * True when the push that refreshes the directory above could arrive
-         * right now. Omitted where there is no connection to report, so an
-         * absent field reads as "unknown" rather than as "down".
-         */
-        ...(deps.platformConnected && { platformConnected: deps.platformConnected() }),
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    const stored = await deps.directory.load(customerId);
+    return c.json({
+      directory:
+        stored === null
+          ? null
+          : {
+              customerId,
+              identityLinks: stored.identityLinks,
+              memberCiTrustLevels: stored.memberCiTrustLevels,
+              teamMemberships: stored.teamMemberships,
+              updatedAt: stored.updatedAt.toISOString(),
+            },
+      /**
+       * True when the Platform owns this directory and is its only writer,
+       * so the PATCH and DELETE below refuse. False on an independent
+       * orchestrator, where the operator is the only writer there is.
+       */
+      platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
+      /**
+       * True when the push that refreshes the directory above could arrive
+       * right now. Omitted where there is no connection to report, so an
+       * absent field reads as "unknown" rather than as "down".
+       */
+      ...(deps.platformConnected && { platformConnected: deps.platformConnected() }),
+    });
   });
 
   // PATCH /api/v1/admin/trust-policy/directory
@@ -277,47 +255,43 @@ export function createTrustPolicyRoutes(deps: TrustPolicyRouteDeps): Hono<AdminE
   // Register (or re-register) one member as an approver. Independent
   // orchestrators only — see the module docstring.
   app.patch('/trust-policy/directory', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
-      const body = directoryMemberSchema.parse(await c.req.json());
-      if (PLATFORM_CONNECTED_MODES.includes(deps.mode)) {
-        return c.json({ error: PLATFORM_MANAGED_DIRECTORY_MESSAGE }, 409);
-      }
-
-      const { customerId, ...registration } = body;
-      const merged = await deps.directory.upsertLocalMember(
-        customerId,
-        registration,
-        // Same transaction as the directory row, for the same reason the policy
-        // PATCH audits inside its own: an operator granting themselves `write`
-        // CI trust — which is all it takes to release a security hold — can
-        // never land unattributed.
-        (trx, directory) =>
-          deps.accessLog.recordInTransaction(trx, {
-            orgId: customerId,
-            routingKey: null,
-            actor: directoryActor(c),
-            action: 'trust_directory.updated',
-            target: { type: 'org_settings', id: customerId },
-            requestId: null,
-            source: 'admin_http',
-            outcome: 'allowed',
-            // The registration, not the whole merged document: a directory can
-            // hold every member of the org, and the audit row is about the one
-            // that changed.
-            meta: { operation: 'register', registration, links: directory.identityLinks.length },
-          }),
-      );
-      logger.info('Approval directory member registered locally', {
-        customerId,
-        userId: registration.userId,
-        provider: registration.provider,
-        ciTrust: registration.ciTrust,
-      });
-      return c.json(await directoryResponse(deps, customerId, merged));
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
+    const body = directoryMemberSchema.parse(await c.req.json());
+    if (PLATFORM_CONNECTED_MODES.includes(deps.mode)) {
+      return c.json({ error: PLATFORM_MANAGED_DIRECTORY_MESSAGE }, 409);
     }
+
+    const { customerId, ...registration } = body;
+    const merged = await deps.directory.upsertLocalMember(
+      customerId,
+      registration,
+      // Same transaction as the directory row, for the same reason the policy
+      // PATCH audits inside its own: an operator granting themselves `write`
+      // CI trust — which is all it takes to release a security hold — can
+      // never land unattributed.
+      (trx, directory) =>
+        deps.accessLog.recordInTransaction(trx, {
+          orgId: customerId,
+          routingKey: null,
+          actor: directoryActor(c),
+          action: 'trust_directory.updated',
+          target: { type: 'org_settings', id: customerId },
+          requestId: null,
+          source: 'admin_http',
+          outcome: 'allowed',
+          // The registration, not the whole merged document: a directory can
+          // hold every member of the org, and the audit row is about the one
+          // that changed.
+          meta: { operation: 'register', registration, links: directory.identityLinks.length },
+        }),
+    );
+    logger.info('Approval directory member registered locally', {
+      customerId,
+      userId: registration.userId,
+      provider: registration.provider,
+      ciTrust: registration.ciTrust,
+    });
+    return c.json(await directoryResponse(deps, customerId, merged));
   });
 
   // DELETE /api/v1/admin/trust-policy/directory?customerId=...&userId=...
@@ -325,86 +299,77 @@ export function createTrustPolicyRoutes(deps: TrustPolicyRouteDeps): Hono<AdminE
   // Query params rather than a body: a DELETE body is ignored by enough HTTP
   // stacks that a revocation could silently target the wrong member.
   app.delete('/trust-policy/directory', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
-      const customerId = c.req.query('customerId');
-      const userId = c.req.query('userId');
-      if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
-      if (!userId) return c.json({ error: 'userId query param required' }, 400);
-      if (PLATFORM_CONNECTED_MODES.includes(deps.mode)) {
-        return c.json({ error: PLATFORM_MANAGED_DIRECTORY_MESSAGE }, 409);
-      }
-
-      const { directory, removed } = await deps.directory.removeLocalMember(
-        customerId,
-        userId,
-        // `didRemove` comes from the store rather than the destructured
-        // `removed` above: the audit row is written inside the transaction,
-        // before this call has returned anything to destructure.
-        (trx, _merged, didRemove) =>
-          deps.accessLog.recordInTransaction(trx, {
-            orgId: customerId,
-            routingKey: null,
-            actor: directoryActor(c),
-            action: 'trust_directory.updated',
-            target: { type: 'org_settings', id: customerId },
-            requestId: null,
-            source: 'admin_http',
-            outcome: 'allowed',
-            meta: { operation: 'revoke', userId, removed: didRemove },
-          }),
-      );
-      logger.info('Approval directory member removed locally', { customerId, userId, removed });
-      return c.json({ ...(await directoryResponse(deps, customerId, directory)), removed });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
+    const customerId = c.req.query('customerId');
+    const userId = c.req.query('userId');
+    if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
+    if (!userId) return c.json({ error: 'userId query param required' }, 400);
+    if (PLATFORM_CONNECTED_MODES.includes(deps.mode)) {
+      return c.json({ error: PLATFORM_MANAGED_DIRECTORY_MESSAGE }, 409);
     }
-  });
 
-  // PATCH /api/v1/admin/trust-policy
-  app.patch('/trust-policy', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
-      const body = updateSchema.parse(await c.req.json());
-
-      // Platform-owned policy: the Platform is the authority for a
-      // Platform-attached org, and the next push would clobber a local write.
-      // Refuse rather than accept a change that silently disappears.
-      if (PLATFORM_CONNECTED_MODES.includes(deps.mode)) {
-        return c.json({ error: PLATFORM_MANAGED_MESSAGE }, 409);
-      }
-
-      const { customerId, ...patch } = body;
-      const actor: ActorPrincipal = { type: 'service_account', id: c.get('userId') };
-      // The audit row is written through the SAME transaction as the policy
-      // row, so a policy that loosens `forkPolicy` can never land without an
-      // attributable record of who loosened it.
-      const merged = await deps.store.upsertLocal(customerId, patch, async (trx, policy) => {
-        await deps.accessLog.recordInTransaction(trx, {
+    const { directory, removed } = await deps.directory.removeLocalMember(
+      customerId,
+      userId,
+      // `didRemove` comes from the store rather than the destructured
+      // `removed` above: the audit row is written inside the transaction,
+      // before this call has returned anything to destructure.
+      (trx, _merged, didRemove) =>
+        deps.accessLog.recordInTransaction(trx, {
           orgId: customerId,
           routingKey: null,
-          actor,
-          action: 'trust_policy.updated',
+          actor: directoryActor(c),
+          action: 'trust_directory.updated',
           target: { type: 'org_settings', id: customerId },
           requestId: null,
           source: 'admin_http',
           outcome: 'allowed',
-          meta: { patch, policy },
-        });
-      });
-      const stored = await deps.store.get(customerId);
-      logger.info('Trust policy updated locally', { customerId, ...patch });
-      return c.json({
-        policy: {
-          customerId,
-          ...merged,
-          source: stored?.source ?? null,
-          updatedAt: stored?.updatedAt?.toISOString() ?? null,
-        },
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+          meta: { operation: 'revoke', userId, removed: didRemove },
+        }),
+    );
+    logger.info('Approval directory member removed locally', { customerId, userId, removed });
+    return c.json({ ...(await directoryResponse(deps, customerId, directory)), removed });
+  });
+
+  app.patch('/trust-policy', async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'ci_trust.admin');
+    const body = updateSchema.parse(await c.req.json());
+
+    // Platform-owned policy: the Platform is the authority for a
+    // Platform-attached org, and the next push would clobber a local write.
+    // Refuse rather than accept a change that silently disappears.
+    if (PLATFORM_CONNECTED_MODES.includes(deps.mode)) {
+      return c.json({ error: PLATFORM_MANAGED_MESSAGE }, 409);
     }
+
+    const { customerId, ...patch } = body;
+    const actor: ActorPrincipal = { type: 'service_account', id: c.get('userId') };
+    // The audit row is written through the SAME transaction as the policy
+    // row, so a policy that loosens `forkPolicy` can never land without an
+    // attributable record of who loosened it.
+    const merged = await deps.store.upsertLocal(customerId, patch, async (trx, policy) => {
+      await deps.accessLog.recordInTransaction(trx, {
+        orgId: customerId,
+        routingKey: null,
+        actor,
+        action: 'trust_policy.updated',
+        target: { type: 'org_settings', id: customerId },
+        requestId: null,
+        source: 'admin_http',
+        outcome: 'allowed',
+        meta: { patch, policy },
+      });
+    });
+    const stored = await deps.store.get(customerId);
+    logger.info('Trust policy updated locally', { customerId, ...patch });
+    return c.json({
+      policy: {
+        customerId,
+        ...merged,
+        source: stored?.source ?? null,
+        updatedAt: stored?.updatedAt?.toISOString() ?? null,
+      },
+    });
   });
 
   return app;

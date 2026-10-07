@@ -55,7 +55,7 @@ export function getPrometheusExporter(): PrometheusExporter | undefined {
 }
 
 /** One instrument's identity plus the descriptor facts that decide its wire kind. */
-export interface RuntimeMetricDescriptor {
+interface RuntimeMetricDescriptor {
   name: string;
   dataPointType: number;
   isMonotonic?: boolean;

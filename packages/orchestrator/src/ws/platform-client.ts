@@ -15,33 +15,12 @@ import {
   type WebhookRelayResult,
   type TrustPolicyUpdate,
   type StaleCheckrunCleanup,
-  type DashboardRunDetailRequest,
-  type DashboardRunStructuredRequest,
-  type DashboardRunStateRequest,
-  type DashboardRunsListRequest,
-  type DashboardRunsFiltersRequest,
-  type DashboardSourcesListRequest,
-  type DashboardAdminTokensListRequest,
-  type DashboardStepLogsRequest,
-  type DashboardAttestationsListRequest,
-  type DashboardAttestationsListAllRequest,
-  type DashboardAttestationGetRequest,
   type DashboardAttestationRetryRequest,
-  type DashboardArtifactsListRequest,
-  type DashboardOrchLogsRequest,
   type RunRerunRequest,
   type ManualScheduleRequest,
   type RunCancelRequest,
-  type DashboardPayloadRequest,
   type DashboardPlatformToOrchMessage,
   type TestRelayRequest,
-  type DashboardDiagnosticsRequest,
-  type DashboardScalerCapacityRequest,
-  type DashboardScalerAgentsRequest,
-  type DashboardFleetHostsRequest,
-  type DashboardFleetHostRequest,
-  type DashboardFleetPreviewRequest,
-  type DashboardFleetWorkflowsForHostRequest,
   isJoinRequestFrame,
   type JoinResponse,
   type SourceRegistration,
@@ -55,11 +34,9 @@ import {
   buildUnsupportedMessageNack,
   collectDiscriminatorTypes,
   PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
-  hasPlatformCapability,
   CLUSTER_MEMBERSHIP_MAX_WORKERS,
   type OrchCapabilities,
   type OrchRole,
-  type PlatformCapabilities,
   type OrchestratorMode,
   type PlanHeadroom,
   type ClusterMembership,
@@ -69,18 +46,9 @@ import { runDetached } from '../helpers/run-detached.js';
 import { EventBuffer } from './event-buffer.js';
 import { RelayBufferRegistry, type RelayStartMeta } from '../webhook/relay-buffer.js';
 import type { AdmitResult } from '../webhook/ingest-admission.js';
-import {
-  wsUnsupportedMessageSentTotal,
-  wsNackReceivedTotal,
-  wsPlatformCapabilityGapTotal,
-} from '../metrics/prometheus.js';
+import { wsUnsupportedMessageSentTotal, wsNackReceivedTotal } from '../metrics/prometheus.js';
 
-/**
- * Verification + processing outcome returned by the chunked relay path's
- * `onVerifyInbound` callback. Mirrors the shape exported by
- * `webhook/verify-inbound.ts` so wiring is a single hand-off without an
- * adapter layer.
- */
+/** Outcome of the chunked relay path's `onVerifyInbound`; mirrors `webhook/verify-inbound.ts`. */
 export interface InboundVerifyOutcome {
   result: WebhookRelayResult;
   reason?: string;
@@ -118,32 +86,19 @@ export type ReplaySendResult = {
 };
 
 /**
- * A webhook source that this orchestrator manages.
- * Sent to Platform after auth.success so the Platform knows which
- * routing keys this orchestrator handles.
- *
- * Note: webhookSecret is no longer included. Secrets are pushed separately
- * via source.secrets after loading from PgSecretStore.
- *
- * Single source of truth lives in `../entry-helpers.ts`. Re-exported here
- * so existing imports of `ProviderSource` from `./platform-client.js` keep
- * working without churn.
+ * A webhook source this orchestrator manages, registered with the Platform after
+ * auth.success. Defined in `../entry-helpers.ts`; re-exported for existing importers.
  */
 export type { ProviderSource } from '../entry-helpers.js';
 import type { ProviderSource } from '../entry-helpers.js';
 
 /**
  * Hard ceiling on how long an admitted fire-and-forget relay pipeline may hold
- * its admission slot before it is force-released. A pipeline running longer than
- * this is treated as hung; releasing its slot (idempotently) prevents a
- * permanent slot leak that would otherwise shrink capacity for every future
- * webhook. Well above any legitimate ingest-pipeline duration.
+ * its admission slot. Past it the pipeline counts as hung and its slot is
+ * force-released, so a hang cannot permanently shrink ingest capacity.
  *
- * Exported because it is also the hard bound on anything a webhook waits for
- * inline: the global eval round caps its raised wait ceiling at this value,
- * since a ceiling past the point the relay force-releases the pipeline buys
- * latency and no verdict. Two copies of "5 minutes" with nothing coupling them
- * is exactly the pair that drifts.
+ * Exported because the global eval round caps its inline wait ceiling at this
+ * value: waiting past the force-release buys latency and no verdict.
  */
 export const ADMITTED_PIPELINE_LIFETIME_MS = 5 * 60 * 1000;
 
@@ -157,18 +112,9 @@ const CONNECTION_STABLE_MS = 30_000;
 /** Consecutive replay-attributed disconnects before replay is skipped entirely. */
 const REPLAY_BREAKER_THRESHOLD = 3;
 
-/**
- * Wire-shape for one source inside a `source.register` message — matches the
- * engine's Zod schema element exactly so we can hand it through without a
- * cast. Local alias keeps the call sites readable.
- */
 type SourceRegistrationEntry = SourceRegistration['sources'][number];
 
-/**
- * Convert an internal `ProviderSource` to the wire shape Platform expects.
- * Pulled out so every send path uses one mapping (post-auth bulk register,
- * runtime add via `sendSourceRegister`, diff-driven `updateSources`).
- */
+/** The one `ProviderSource` → wire mapping every `source.register` send path uses. */
 function toSourceRegistrationEntry(source: ProviderSource): SourceRegistrationEntry {
   return {
     provider: source.provider,
@@ -186,6 +132,56 @@ function toSourceRegistrationEntry(source: ProviderSource): SourceRegistrationEn
  */
 export type FrameHandler<M> = (msg: M) => void | Promise<void>;
 
+/**
+ * Platform → orchestrator frame types answered by exactly one dashboard / fleet
+ * read handler, looked up in {@link PlatformClientOptions.dashboardHandlers}.
+ */
+export const DASHBOARD_FRAME_TYPES = [
+  'dashboard.run.detail',
+  'dashboard.run.structured',
+  'dashboard.run.state',
+  'dashboard.runs.list',
+  'dashboard.runs.filters',
+  'dashboard.sources.list',
+  'dashboard.admin-tokens.list',
+  'dashboard.step.logs',
+  'dashboard.attestations.list',
+  'dashboard.attestations.list.all',
+  'dashboard.attestation.get',
+  'dashboard.artifacts.list',
+  'dashboard.payload',
+  'dashboard.orch.logs',
+  'dashboard.diagnostics',
+  'dashboard.scaler.capacity',
+  'dashboard.scaler.agents',
+  'dashboard.fleet.hosts',
+  'dashboard.fleet.host',
+  'dashboard.fleet.preview',
+  'dashboard.fleet.workflows-for-host',
+] as const satisfies readonly PlatformToOrchestratorMessage['type'][];
+export type DashboardFrameType = (typeof DASHBOARD_FRAME_TYPES)[number];
+/** One optional handler per {@link DASHBOARD_FRAME_TYPES} entry, typed by its frame. */
+export type DashboardFrameHandlers = {
+  [K in DashboardFrameType]?: FrameHandler<Extract<PlatformToOrchestratorMessage, { type: K }>>;
+};
+type DashboardFrame = Extract<PlatformToOrchestratorMessage, { type: DashboardFrameType }>;
+const DASHBOARD_FRAME_SET: ReadonlySet<string> = new Set(DASHBOARD_FRAME_TYPES);
+const isDashboardFrame = (msg: PlatformToOrchestratorMessage): msg is DashboardFrame =>
+  DASHBOARD_FRAME_SET.has(msg.type);
+
+/** Frame fields worth a debug line when a dashboard frame arrives. */
+const DASHBOARD_FRAME_LOG_FIELDS = [
+  'requestId',
+  'runId',
+  'jobId',
+  'stepIndex',
+  'attestationId',
+  'agentId',
+  'workflowName',
+  'scalerName',
+  'actor',
+] as const;
+
 export interface PlatformClientOptions {
   /** WebSocket URL of the Platform relay. */
   url: string;
@@ -197,18 +193,11 @@ export interface PlatformClientOptions {
   providerSources?: ProviderSource[];
   /** Orchestrator cluster instance ID (sent in source.register for peer correlation). */
   instanceId?: string;
-  /**
-   * Human-friendly cluster name resolved on orch boot
-   * (`cluster_meta.cluster_name`). Sent in source.register so Platform
-   * can route per-orch dashboard requests by this identifier.
-   */
+  /** `cluster_meta.cluster_name`; the Platform routes per-orch dashboard requests by it. */
   clusterName?: string;
   /**
-   * Orchestrator DB identifier (UUID, seeded by migration 001 in
-   * `cluster_meta` key `'cluster_id'`). Sent in source.register so
-   * Platform can warn when two unrelated clusters in the same org
-   * accidentally share a `clusterName`. HA siblings share the same orch
-   * DB and therefore the same `clusterId`.
+   * `cluster_meta.cluster_id` (UUID). Lets the Platform warn when two unrelated
+   * clusters in one org share a `clusterName`; HA siblings share one DB and so one id.
    */
   clusterId?: string;
   /** Reachable address for peer-to-peer connections (from KICI_CLUSTER_ADDRESS env var). Null if not configured. */
@@ -253,16 +242,11 @@ export interface PlatformClientOptions {
   }) => void;
   /** Optional callback invoked after successful authentication and source registration. */
   onAuthenticated?: () => void | Promise<void>;
-  /**
-   * Returns this coordinator's currently-connected worker peers for the
-   * `cluster.membership` snapshot. Undefined on a non-coordinator (or when
-   * clustering is off) → no membership is reported.
-   */
+  /** Connected worker peers for `cluster.membership`; undefined off-coordinator → none reported. */
   getWorkerPeers?: () => Array<{ instanceId: string }>;
   /**
-   * Persisted cache of the Platform-pushed worker ceiling. Written on every
-   * `plan.headroom`, read by `getWorkerCeiling`. Undefined → the coordinator
-   * receives no ceiling and admits worker joins freely.
+   * Persisted Platform-pushed worker ceiling, written on every `plan.headroom`.
+   * Undefined → no ceiling, worker joins are admitted freely.
    */
   planHeadroomStore?: PlanHeadroomStore;
   /**
@@ -273,126 +257,47 @@ export interface PlatformClientOptions {
    */
   onPlanCeiling?: (ceiling: number, evictExcess: boolean) => void;
   /**
-   * Optional callback invoked when the Platform surfaces the orchestrator's
-   * canonical org id on `auth.success`. Used to auto-provision the
-   * `remote_sources` anchor (`remote:<orgId>`) so Platform-relayed
-   * `kici run remote` resolves the real tenant. Fires on every (re)connect;
-   * provisioning is idempotent.
+   * Fires with the canonical org id from `auth.success` on every (re)connect, to
+   * idempotently provision the `remote:<orgId>` anchor `kici run remote` resolves.
    */
   onOrgIdentified?: (info: { orgId: string; clusterId: string | null }) => void;
-  /**
-   * Optional callback fired with the provenance trust root (OIDC issuer) the
-   * Platform supplies on `auth.success`. The orchestrator uses it to verify
-   * provenance bundles at ingest. `null` means provenance is not configured.
-   */
-  onProvenanceIssuer?: (issuer: string | null) => void;
-  /** Optional callback for dashboard run detail requests from Platform. */
-  onDashboardRunDetail?: FrameHandler<DashboardRunDetailRequest>;
-  /** Optional callback for dashboard structured run-result requests from Platform. */
-  onDashboardRunStructured?: FrameHandler<DashboardRunStructuredRequest>;
-  /** Optional callback for the run-state system reconciliation read from Platform. */
-  onDashboardRunState?: FrameHandler<DashboardRunStateRequest>;
-  /** Optional callback for dashboard runs.list (operator console) requests from Platform. */
-  onDashboardRunsList?: FrameHandler<DashboardRunsListRequest>;
-  /** Optional callback for dashboard runs.filters (operator console) requests from Platform. */
-  onDashboardRunsFilters?: FrameHandler<DashboardRunsFiltersRequest>;
-  /** Optional callback for dashboard sources.list (operator console) requests from Platform. */
-  onDashboardSourcesList?: FrameHandler<DashboardSourcesListRequest>;
-  /** Optional callback for dashboard admin-tokens.list (RBAC drift report) requests from Platform. */
-  onDashboardAdminTokensList?: FrameHandler<DashboardAdminTokensListRequest>;
-  /** Optional callback for dashboard step logs requests from Platform. */
-  onDashboardStepLogs?: FrameHandler<DashboardStepLogsRequest>;
-  /** Optional callback for dashboard attestations-list requests from Platform. */
-  onDashboardAttestationsList?: FrameHandler<DashboardAttestationsListRequest>;
-  /** Optional callback for org-wide attestations list (browser) requests from Platform. */
-  onDashboardAttestationsListAll?: FrameHandler<DashboardAttestationsListAllRequest>;
-  /** Optional callback for single-attestation detail requests from Platform. */
-  onDashboardAttestationGet?: FrameHandler<DashboardAttestationGetRequest>;
   onDashboardAttestationRetry?: FrameHandler<DashboardAttestationRetryRequest>;
-  /** Optional callback for dashboard artifacts-list requests from Platform. */
-  onDashboardArtifactsList?: FrameHandler<DashboardArtifactsListRequest>;
-  /** Optional callback for run re-run requests from Platform (dashboard action). */
   onRunRerun?: FrameHandler<RunRerunRequest>;
-  /** Optional callback for manual schedule trigger requests from Platform (dashboard action). */
   onManualSchedule?: FrameHandler<ManualScheduleRequest>;
-  /** Optional callback for run cancel requests from Platform (dashboard action). */
   onRunCancel?: FrameHandler<RunCancelRequest>;
-  /** Optional callback for dashboard payload requests from Platform. */
-  onDashboardPayload?: FrameHandler<DashboardPayloadRequest>;
-  /** Optional callback for dashboard orchestration logs requests from Platform. */
-  onDashboardOrchLogs?: FrameHandler<DashboardOrchLogsRequest>;
-  /** Optional callback for dashboard environment/held-run messages from Platform. */
+  /** Handlers for the {@link DASHBOARD_FRAME_TYPES} read frames; a type with none is dropped. */
+  dashboardHandlers?: DashboardFrameHandlers;
+  /** Dashboard environment / held-run messages. */
   onDashboardEnvMessage?: FrameHandler<DashboardPlatformToOrchMessage>;
-  /**
-   * Optional callback for Platform-first `kici run remote` control-plane relay
-   * requests (upload-init, trigger, status, logs, cancel). The handler performs
-   * the action and replies over the WS keyed by `requestId`.
-   */
+  /** `kici run remote` control-plane relay requests; the handler replies keyed by `requestId`. */
   onTestRelay?: FrameHandler<TestRelayRequest>;
-  /** Optional callback for dashboard diagnostics requests from Platform. */
-  onDashboardDiagnostics?: FrameHandler<DashboardDiagnosticsRequest>;
-  /** Optional callback for dashboard scaler capacity requests from Platform. */
-  onDashboardScalerCapacity?: FrameHandler<DashboardScalerCapacityRequest>;
-  /** Optional callback for dashboard scaler agents requests from Platform. */
-  onDashboardScalerAgents?: FrameHandler<DashboardScalerAgentsRequest>;
-  /** Optional callback for fleet roster requests from Platform. */
-  onFleetHosts?: FrameHandler<DashboardFleetHostsRequest>;
-  /** Optional callback for fleet host-detail requests from Platform. */
-  onFleetHost?: FrameHandler<DashboardFleetHostRequest>;
-  /** Optional callback for fleet runsOnAll-preview requests from Platform. */
-  onFleetPreview?: FrameHandler<DashboardFleetPreviewRequest>;
-  /** Optional callback for fleet workflows-for-host requests from Platform. */
-  onFleetWorkflowsForHost?: FrameHandler<DashboardFleetWorkflowsForHostRequest>;
-  /** Optional callback for trust policy updates pushed from Platform. */
   onTrustPolicyUpdate?: FrameHandler<TrustPolicyUpdate>;
-  /** Optional callback for stale check run cleanup requests from Platform. */
   onStaleCheckrunCleanup?: FrameHandler<StaleCheckrunCleanup>;
-  /**
-   * Optional handler for join.request frames relayed by the Platform. It answers
-   * every such frame. Wiring it advertises the clusterJoinV2 capability.
-   */
+  /** Optional handler for join.request frames relayed by the Platform. It answers every such frame. */
   onJoinRequest?: (raw: unknown) => Promise<JoinResponse>;
   /** Custom orchestrator capabilities to merge with ORCH_CAPABILITIES in auth.request. */
   orchCapabilities?: Partial<OrchCapabilities>;
   /**
-   * Test-only fault-injection transform over the advertised capability manifest,
-   * supplied only by the build-time test double to reproduce an older /
-   * sourceless orchestrator that predates a given dashboard capability. Undefined
-   * (the shipped default) means identity — the full capability set is advertised.
-   */
-  capabilitiesTransform?: (c: OrchCapabilities) => OrchCapabilities;
-  /**
-   * Verify a reassembled inbound webhook from the chunked relay path.
-   *
-   * Wired to `verifyInboundWebhook(deps, ...)` in production. Required when
-   * Platform sends `webhook.relay.start`/`webhook.relay.chunk` (chunked path);
-   * if absent, the orchestrator ACKs `rejected_misconfigured` because it
-   * cannot perform the trust check the new design requires.
+   * Verify a reassembled chunked-relay webhook. Without it every chunked relay
+   * is ACKed `rejected_misconfigured`, since the trust check cannot run.
    */
   onVerifyInbound?: (
     meta: RelayStartMeta,
     body: Buffer,
   ) => Promise<InboundVerifyOutcome> | InboundVerifyOutcome;
-  /**
-   * Optional injected reassembly registry. Tests pass a registry with a short
-   * TTL; production constructs a default one per PlatformClient.
-   */
+  /** Reassembly registry override (tests use a short TTL). */
   relayBuffer?: RelayBufferRegistry;
   /**
-   * Webhook-ingest admission hook. Called with the relay's routing key BEFORE
-   * signature verification (so an unverified flood is throttled too — a verify
-   * does a DB read). When it sheds, the relay acks `shed_retry_later` (429) and
-   * no pipeline work runs. When it admits, the returned slot is held for the
-   * fire-and-forget pipeline's lifetime and released on completion / error /
-   * timeout. Absent → no admission gate (tests, minimal wirings).
+   * Webhook-ingest admission, called BEFORE signature verification so an
+   * unverified flood is throttled too (verify reads the DB). A shed acks
+   * `shed_retry_later` (429); an admitted slot is held for the pipeline's
+   * lifetime. Absent → no admission gate.
    */
   onAdmit?: (routingKey: string) => Promise<AdmitResult>;
   /**
-   * Optional shed-recording seam. Invoked with the pre-verify relay meta +
-   * assembled body + the admission controller's shed reason, before the
-   * shed_retry_later ack. The wiring records the delivery durably — an
-   * `event_log` breadcrumb, and the overflow-buffer row when that queue is
-   * enabled. Best-effort — the client wraps it so a failure never blocks the ack.
+   * Records a shed delivery durably (an `event_log` breadcrumb, plus an
+   * overflow-buffer row when enabled) before the shed ack. Best-effort: a
+   * failure never blocks the ack.
    */
   onShedCapture?: (meta: RelayStartMeta, body: Buffer, reason: string) => Promise<void>;
 }
@@ -436,14 +341,9 @@ export function classifyDashboardRequestError(
 }
 
 /**
- * WebSocket client that connects the orchestrator to the Platform relay.
- *
- * Handles:
- * - Authentication handshake (auth.request -> auth.success/failure)
- * - Periodic heartbeat messages to keep the connection alive
- * - Auto-reconnect with exponential backoff (1s initial, 1.5x, jitter, 60s max)
- * - Webhook relay reception and ACK responses
- * - Event buffering during disconnection with flush on reconnect
+ * The orchestrator's WebSocket link to the Platform relay: auth handshake,
+ * heartbeat, jittered exponential reconnect, webhook relay + ACK, and event
+ * buffering while disconnected.
  */
 export class PlatformClient {
   private ws: WebSocket | null = null;
@@ -466,11 +366,7 @@ export class PlatformClient {
   private readonly token: string;
   private readonly onWebhookRelay: (relay: WebhookRelay) => Promise<void>;
   private providerSources: ProviderSource[];
-  /**
-   * Pending `registerSourceAndAwait()` callers, keyed by routing key. Resolved
-   * with the Platform-computed webhook URL when the matching
-   * `source.register.ack` arrives, or rejected on timeout / disconnect.
-   */
+  /** `registerSourceAndAwait()` waiters by routing key, settled by ack, timeout or disconnect. */
   private readonly pendingSourceRegistrations = new Map<
     string,
     {
@@ -479,16 +375,6 @@ export class PlatformClient {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  /**
-   * Platform capabilities advertised on this connection (Platform → orchestrator
-   * `platform.capabilities` frame). `undefined` means nothing advertised yet —
-   * either a pre-capability Platform (which never advertises) or the frame has
-   * not arrived. Feature-gated sends treat "undefined" as optimistic (send
-   * anyway, backward-safe); only an advertised-but-absent flag suppresses a send.
-   * Reset to `undefined` on every (re)connect so a stale advertisement can't
-   * leak across connections.
-   */
-  private platformCapabilities: PlatformCapabilities | undefined;
   private readonly instanceId?: string;
   private readonly clusterName?: string;
   private readonly clusterId?: string;
@@ -510,34 +396,13 @@ export class PlatformClient {
   private readonly planHeadroomStore?: PlanHeadroomStore;
   private readonly onPlanCeiling?: PlatformClientOptions['onPlanCeiling'];
   private readonly onOrgIdentified?: PlatformClientOptions['onOrgIdentified'];
-  private readonly onProvenanceIssuer?: PlatformClientOptions['onProvenanceIssuer'];
-  private readonly onDashboardRunDetail?: PlatformClientOptions['onDashboardRunDetail'];
-  private readonly onDashboardRunStructured?: PlatformClientOptions['onDashboardRunStructured'];
-  private readonly onDashboardRunState?: PlatformClientOptions['onDashboardRunState'];
-  private readonly onDashboardRunsList?: PlatformClientOptions['onDashboardRunsList'];
-  private readonly onDashboardRunsFilters?: PlatformClientOptions['onDashboardRunsFilters'];
-  private readonly onDashboardSourcesList?: PlatformClientOptions['onDashboardSourcesList'];
-  private readonly onDashboardAdminTokensList?: PlatformClientOptions['onDashboardAdminTokensList'];
-  private readonly onDashboardStepLogs?: PlatformClientOptions['onDashboardStepLogs'];
-  private readonly onDashboardAttestationsList?: PlatformClientOptions['onDashboardAttestationsList'];
-  private readonly onDashboardAttestationsListAll?: PlatformClientOptions['onDashboardAttestationsListAll'];
-  private readonly onDashboardAttestationGet?: PlatformClientOptions['onDashboardAttestationGet'];
   private readonly onDashboardAttestationRetry?: PlatformClientOptions['onDashboardAttestationRetry'];
-  private readonly onDashboardArtifactsList?: PlatformClientOptions['onDashboardArtifactsList'];
   private readonly onRunRerun?: PlatformClientOptions['onRunRerun'];
   private readonly onManualSchedule?: PlatformClientOptions['onManualSchedule'];
   private readonly onRunCancel?: PlatformClientOptions['onRunCancel'];
-  private readonly onDashboardPayload?: PlatformClientOptions['onDashboardPayload'];
-  private readonly onDashboardOrchLogs?: PlatformClientOptions['onDashboardOrchLogs'];
+  private readonly dashboardHandlers: DashboardFrameHandlers;
   private readonly onDashboardEnvMessage?: PlatformClientOptions['onDashboardEnvMessage'];
   private readonly onTestRelay?: PlatformClientOptions['onTestRelay'];
-  private readonly onDashboardDiagnostics?: PlatformClientOptions['onDashboardDiagnostics'];
-  private readonly onDashboardScalerCapacity?: PlatformClientOptions['onDashboardScalerCapacity'];
-  private readonly onDashboardScalerAgents?: PlatformClientOptions['onDashboardScalerAgents'];
-  private readonly onFleetHosts?: PlatformClientOptions['onFleetHosts'];
-  private readonly onFleetHost?: PlatformClientOptions['onFleetHost'];
-  private readonly onFleetPreview?: PlatformClientOptions['onFleetPreview'];
-  private readonly onFleetWorkflowsForHost?: PlatformClientOptions['onFleetWorkflowsForHost'];
   private readonly onTrustPolicyUpdate?: PlatformClientOptions['onTrustPolicyUpdate'];
   private readonly onStaleCheckrunCleanup?: PlatformClientOptions['onStaleCheckrunCleanup'];
   private readonly onJoinRequest?: PlatformClientOptions['onJoinRequest'];
@@ -547,40 +412,24 @@ export class PlatformClient {
   private readonly onShedCapture?: PlatformClientOptions['onShedCapture'];
   private readonly relayBuffer: RelayBufferRegistry;
   /**
-   * Public alias of the orchestrator's owning org as supplied by
-   * Platform on `auth.success`. Used by the check-run emitter to build
-   * outbound `details_url`s that hide the canonical `org_<12-char>` id.
-   * `undefined` when the orchestrator runs against a Platform that
-   * predates the alias plumbing, or before the first successful auth.
+   * Owning org's public alias from `auth.success`, used for outbound check-run
+   * `details_url`s so they hide the canonical `org_<12-char>` id.
    */
   private _orgPublicAlias?: string;
 
-  /** Canonical Platform org id from `auth.success`; see {@link getOrgId}. */
   private _orgId?: string;
 
-  /** The Platform's org-scoped GitHub webhook URL from the last `auth.success`. */
   private _githubWebhookUrl?: string | null;
 
-  /**
-   * Returns the cached public alias of the orchestrator's owning org,
-   * or `undefined` if Platform has not supplied one yet. Read by
-   * `check-run-reporter.ts` when building `details_url`.
-   */
   getOrgPublicAlias(): string | undefined {
     return this._orgPublicAlias;
   }
 
   /**
-   * The canonical Platform organization id this orchestrator authenticated
-   * as, from `auth.success`. `undefined` before the first successful auth, or
-   * against a Platform that does not supply it.
-   *
-   * A generic source's routing key embeds the organization
-   * (`generic:<orgId>:<id>`), and the Platform now refuses to register a key
-   * naming a different one. So the source-create path reads this to refuse a
-   * mismatched `--org` up front, naming the correct value, instead of letting
-   * the operator create a source that registers, is rejected, and never
-   * delivers.
+   * Canonical org id from `auth.success` (`undefined` before it). The Platform
+   * refuses a generic routing key (`generic:<orgId>:<id>`) naming another org,
+   * so source-create reads this to refuse a mismatched `--org` up front rather
+   * than create a source that never delivers.
    */
   getOrgId(): string | undefined {
     return this._orgId;
@@ -628,46 +477,17 @@ export class PlatformClient {
     this.planHeadroomStore = options.planHeadroomStore;
     this.onPlanCeiling = options.onPlanCeiling;
     this.onOrgIdentified = options.onOrgIdentified;
-    this.onProvenanceIssuer = options.onProvenanceIssuer;
-    this.onDashboardRunDetail = options.onDashboardRunDetail;
-    this.onDashboardRunStructured = options.onDashboardRunStructured;
-    this.onDashboardRunState = options.onDashboardRunState;
-    this.onDashboardRunsList = options.onDashboardRunsList;
-    this.onDashboardRunsFilters = options.onDashboardRunsFilters;
-    this.onDashboardSourcesList = options.onDashboardSourcesList;
-    this.onDashboardAdminTokensList = options.onDashboardAdminTokensList;
-    this.onDashboardStepLogs = options.onDashboardStepLogs;
-    this.onDashboardAttestationsList = options.onDashboardAttestationsList;
-    this.onDashboardAttestationsListAll = options.onDashboardAttestationsListAll;
-    this.onDashboardAttestationGet = options.onDashboardAttestationGet;
     this.onDashboardAttestationRetry = options.onDashboardAttestationRetry;
-    this.onDashboardArtifactsList = options.onDashboardArtifactsList;
     this.onRunRerun = options.onRunRerun;
     this.onManualSchedule = options.onManualSchedule;
     this.onRunCancel = options.onRunCancel;
-    this.onDashboardPayload = options.onDashboardPayload;
-    this.onDashboardOrchLogs = options.onDashboardOrchLogs;
+    this.dashboardHandlers = options.dashboardHandlers ?? {};
     this.onDashboardEnvMessage = options.onDashboardEnvMessage;
     this.onTestRelay = options.onTestRelay;
-    this.onDashboardDiagnostics = options.onDashboardDiagnostics;
-    this.onDashboardScalerCapacity = options.onDashboardScalerCapacity;
-    this.onDashboardScalerAgents = options.onDashboardScalerAgents;
-    this.onFleetHosts = options.onFleetHosts;
-    this.onFleetHost = options.onFleetHost;
-    this.onFleetPreview = options.onFleetPreview;
-    this.onFleetWorkflowsForHost = options.onFleetWorkflowsForHost;
     this.onTrustPolicyUpdate = options.onTrustPolicyUpdate;
     this.onStaleCheckrunCleanup = options.onStaleCheckrunCleanup;
     this.onJoinRequest = options.onJoinRequest;
-    // Only the build-time test double injects a capability transform; the
-    // shipped orchestrator advertises the full set (identity transform).
-    const capabilitiesTransform = options.capabilitiesTransform ?? ((c: OrchCapabilities) => c);
-    this.orchCapabilities = capabilitiesTransform({
-      ...ORCH_CAPABILITIES,
-      // Advertised only when this orchestrator answers join protocol v2 frames.
-      ...(options.onJoinRequest ? { clusterJoinV2: true } : {}),
-      ...options.orchCapabilities,
-    });
+    this.orchCapabilities = { ...ORCH_CAPABILITIES, ...options.orchCapabilities };
     this.onVerifyInbound = options.onVerifyInbound;
     this.onAdmit = options.onAdmit;
     this.onShedCapture = options.onShedCapture;
@@ -675,11 +495,9 @@ export class PlatformClient {
   }
 
   /**
-   * Merge `updates` into the stored orch capabilities and broadcast the
-   * full set to Platform via `orch.capabilities.update`. Buffers via
-   * `send()` when not yet authenticated. The next `auth.request` will
-   * also carry the merged capabilities, so a reconnect-followed-by-
-   * runtime-broadcast still ends Platform in the correct cache state.
+   * Merge `updates` and broadcast the full set (buffered while unauthenticated).
+   * The next `auth.request` carries the merged set too, so a reconnect cannot
+   * leave the Platform's cache stale.
    */
   broadcastCapabilities(updates: Partial<OrchCapabilities>): void {
     this.orchCapabilities = { ...this.orchCapabilities, ...updates };
@@ -689,30 +507,21 @@ export class PlatformClient {
     });
   }
 
-  /**
-   * Current merged orchestrator capabilities. Read-only view used by
-   * tests and diagnostics; mutate via `broadcastCapabilities`.
-   */
   getCapabilities(): OrchCapabilities {
     return this.orchCapabilities;
   }
 
-  /** Current connection state. */
   get state(): ConnectionState {
     return this._state;
   }
 
-  /** Number of messages currently buffered. */
   getBufferedCount(): number {
     return this.eventBuffer.size();
   }
 
   /**
-   * Complete a chunked webhook relay: verify, process if accepted, ACK.
-   *
-   * Called from the `webhook.relay.chunk` handler once `relayBuffer.chunk(...)`
-   * returns `{ status: 'completed' }`. This sequence is intentionally single-pass
-   * and inside `requestContext.run` so trace propagation works end-to-end.
+   * Verify, process if accepted, and ACK a fully reassembled chunked relay.
+   * Runs single-pass inside `requestContext.run` so trace propagation holds.
    */
   private async completeChunkedRelay(
     messageId: string,
@@ -793,12 +602,9 @@ export class PlatformClient {
       return;
     }
 
-    // Accepted: synthesize a WebhookRelay-shaped object so the existing
-    // `onWebhookRelay` pipeline keeps working without a parallel API. The
-    // payload is parsed from the body bytes when the content-type signals
-    // JSON; otherwise we forward the raw body in the same `{rawBody,
-    // contentType}` envelope the legacy single-frame relay used so generic
-    // webhooks with non-JSON payloads still route correctly.
+    // Feed `onWebhookRelay` a WebhookRelay: JSON bodies are parsed, anything
+    // else travels as a `{rawBody, contentType}` envelope so non-JSON generic
+    // webhooks still route.
     const contentType = meta.headers['content-type'] ?? 'application/octet-stream';
     let payload: unknown;
     if (contentType.includes('application/json') || contentType === '') {
@@ -824,9 +630,8 @@ export class PlatformClient {
       payload = { rawBody: body.toString('utf8'), contentType };
     }
 
-    // ACK accepted FIRST so Platform can return 200 to the upstream sender
-    // promptly; downstream processing (lock file fetch, trigger match, dispatch)
-    // is fire-and-forget like the legacy single-frame path.
+    // ACK FIRST so the Platform answers the sender promptly; the pipeline
+    // below is fire-and-forget.
     this.sendDirect({
       type: 'webhook.ack',
       messageId,
@@ -845,11 +650,9 @@ export class PlatformClient {
       ...(meta.requestId && { requestId: meta.requestId }),
     };
 
-    // Fire-and-forget pipeline: hold the admitted slot for its lifetime and
-    // release exactly once on completion / error / a hard lifetime timeout (so a
-    // hung pipeline can never leak its slot). release() is itself idempotent, so
-    // a timeout-release followed by a late real completion is safe. Wrapping the
-    // call in Promise.resolve().then keeps a synchronous throw inside the finally.
+    // Release the slot exactly once: on completion, error, or the lifetime
+    // timeout (a late completion after a timeout-release is safe).
+    // Promise.resolve().then keeps a synchronous throw inside the finally.
     let released = false;
     const releaseOnce = (): void => {
       if (released) return;
@@ -882,10 +685,6 @@ export class PlatformClient {
       });
   }
 
-  /**
-   * Initiate connection to the Platform relay.
-   * Starts the connect -> authenticate -> ready lifecycle.
-   */
   connect(): void {
     if (this._state !== 'disconnected') {
       logger.warn('connect() called while not disconnected', { state: this._state });
@@ -896,9 +695,7 @@ export class PlatformClient {
     this.doConnect();
   }
 
-  /**
-   * Gracefully disconnect from Platform. Does not trigger reconnection.
-   */
+  /** Graceful disconnect; does not reconnect. */
   disconnect(): void {
     this.intentionalDisconnect = true;
     this.stopHeartbeat();
@@ -907,22 +704,17 @@ export class PlatformClient {
     this.cancelReconnect();
 
     if (this.ws) {
-      // 1000 = normal closure
       this.ws.close(1000, 'Client disconnect');
       this.ws = null;
     }
 
-    // Drop any in-flight chunked-relay reassembly buffers so their TTL timers
-    // don't keep the process alive past disconnect.
+    // Reassembly TTL timers would otherwise keep the process alive.
     this.relayBuffer.clear();
 
     this._state = 'disconnected';
   }
 
-  /**
-   * Send a message to Platform. If authenticated, sends immediately.
-   * If not authenticated, buffers the message for later delivery.
-   */
+  /** Send now when authenticated, otherwise buffer for the next connection. */
   send(message: OrchestratorToPlatformMessage): void {
     if (this._state === 'authenticated' && this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
@@ -932,20 +724,13 @@ export class PlatformClient {
   }
 
   /**
-   * Send the reconnect state replay as N paced frames.
+   * Send the reconnect state replay as paced frames, each within the wire
+   * schema's run cap and the Platform limiter's byte budget: a breaching frame
+   * gets a 4003 close and, since reconnecting does not shrink it, is resent forever.
    *
-   * The payload is bounded by BOTH the wire schema's run cap and the Platform
-   * limiter's byte budget, and paced under its refill rate, because a frame
-   * breaching either one is rejected with a 4003 close — and since reconnecting
-   * does not reduce the run count, an oversized frame is resent forever rather
-   * than failing once.
-   *
-   * Uses `this.ws.send` directly rather than `this.send()` on purpose: `send()`
-   * falls back to `this.eventBuffer` when the socket is not open, which for a
-   * multi-frame replay would queue the remaining frames for the NEXT connection
-   * instead of abandoning a replay whose connection has already gone. The
-   * Platform's replay handler upserts per run, so abandoning is safe — the next
-   * reconnect replays from scratch.
+   * Uses `this.ws.send`, not `send()`, so a dropped connection abandons the
+   * replay instead of buffering its tail for the next one. The Platform upserts
+   * per run, so the next reconnect replays from scratch.
    */
   async sendStateReplay(runs: StateReplayRun[]): Promise<ReplaySendResult> {
     if (runs.length === 0) return { sent: 0, chunks: 0, skipped: 'empty' };
@@ -991,11 +776,9 @@ export class PlatformClient {
 
       const payload = JSON.stringify(frame);
       this.ws.send(payload);
-      // Attribution marker. Deliberately NOT cleared when the send completes:
-      // the Platform rejects an unacceptable frame milliseconds AFTER the write
-      // succeeds, so a flag cleared on send-completion would never be set when
-      // the close arrives. A close is replay-attributed when a replay went out
-      // on this connection and the connection died before proving stable.
+      // Deliberately NOT cleared on send completion: the Platform's rejection
+      // close arrives after the write succeeds. A close is replay-attributed when
+      // a replay went out and the connection died before proving stable.
       this.replaySentOnConnection = true;
       sent += chunk.length;
 
@@ -1012,49 +795,14 @@ export class PlatformClient {
     return { sent, chunks: chunks.length };
   }
 
-  /**
-   * Send a feature-gated message only if the Platform is known to support the
-   * named capability — the orchestrator-side pre-flight for a self-hosted
-   * orchestrator running ahead of the hosted Platform.
-   *
-   * Backward-safe: a Platform that never advertised capabilities (a
-   * pre-capability build, or the advertisement hasn't arrived yet) is treated as
-   * "unknown → send optimistically", exactly like the Platform's dashboard
-   * pre-flight treats an absent `supportedDashboardRequests` as "unknown", never
-   * "supports nothing". Only an *advertised* capability set that explicitly lacks
-   * the flag suppresses the send — surfacing a diagnosable capability gap instead
-   * of firing a frame the Platform would silently drop.
-   */
-  sendIfPlatformSupports(capability: string, message: OrchestratorToPlatformMessage): void {
-    if (
-      this.platformCapabilities === undefined ||
-      hasPlatformCapability(this.platformCapabilities, capability)
-    ) {
-      this.send(message);
-      return;
-    }
-    wsPlatformCapabilityGapTotal.add(1, { capability, type: message.type });
-    logger.warn('Suppressed feature-gated send: Platform does not advertise capability', {
-      capability,
-      type: message.type,
-    });
-  }
-
-  /**
-   * Send a raw message directly on the WebSocket, bypassing typed validation.
-   * Used for log pull response messages (log.response) which are
-   * NOT in the OrchestratorToPlatformMessage union (they are in the separate log pull schema).
-   */
+  /** Unbuffered, untyped send for frames outside the union (e.g. `log.response`). */
   sendRaw(data: unknown): void {
     if (this._state === 'authenticated' && this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
   }
 
-  /**
-   * Register a new source at runtime (e.g., after config reload adds a new GitHub app).
-   * Separate from the post-auth registration which sends all sources at once.
-   */
+  /** Register one source at runtime (the post-auth registration sends them all). */
   sendSourceRegister(source: ProviderSource): void {
     this.send({
       type: 'source.register',
@@ -1074,10 +822,6 @@ export class PlatformClient {
     });
   }
 
-  /**
-   * Deregister sources at runtime (e.g., after config reload removes a GitHub app).
-   * Tells Platform to stop routing webhooks for these routing keys to this orchestrator.
-   */
   sendSourceDeregister(source: { routingKey: string }): void {
     this.send({
       type: 'source.deregister',
@@ -1086,15 +830,11 @@ export class PlatformClient {
     });
   }
 
-  /**
-   * Diff current provider sources with new ones and send register/deregister as needed.
-   * Convenience method for config reload that atomically updates routing.
-   */
+  /** Diff against the current sources and send the register / deregister frames. */
   updateSources(newSources: ProviderSource[]): void {
     const oldByKey = new Map(this.providerSources.map((s) => [s.routingKey, s]));
     const newByKey = new Map(newSources.map((s) => [s.routingKey, s]));
 
-    // Deregister removed sources
     const removedKeys = this.providerSources
       .filter((s) => !newByKey.has(s.routingKey))
       .map((s) => s.routingKey);
@@ -1106,12 +846,9 @@ export class PlatformClient {
       });
     }
 
-    // Register added or *changed* sources. The diff key is no longer just
-    // routingKey: a rename (name change), slug change, or subtype change with
-    // the same routing_key still needs to flow to Platform so the dashboard
-    // reflects it. The Platform-side `onConflict.doUpdateSet` covers the upsert
-    // semantics on the receiver, so re-sending an already-registered source
-    // is safe and idempotent.
+    // Register added AND changed sources: a name, slug or subtype change under
+    // the same routing key must reach the dashboard. The Platform upserts, so
+    // re-sending a registered source is idempotent.
     const changedSources = newSources.filter((s) => {
       const prev = oldByKey.get(s.routingKey);
       if (!prev) return true; // added
@@ -1141,10 +878,8 @@ export class PlatformClient {
         ...(this.queueTimeoutMs && { queueTimeoutMs: this.queueTimeoutMs }),
       });
     } else if (newSources.length === 0 && this.providerSources.length > 0) {
-      // Every source was removed. Re-announce with an empty set so the
-      // Platform updates this connection's routing_keys to [] and keeps the
-      // now-sourceless orchestrator recorded as connected (rather than going
-      // silent and leaving stale routing keys behind).
+      // Every source was removed: re-announce an empty set so the Platform
+      // clears the routing keys yet keeps this orchestrator recorded as connected.
       this.send({
         type: 'source.register',
         messageId: randomUUID(),
@@ -1164,24 +899,16 @@ export class PlatformClient {
       });
     }
 
-    // Update internal state
     this.providerSources.length = 0;
     this.providerSources.push(...newSources);
   }
 
   /**
-   * Push the full source list to the Platform and resolve with the webhook URL
-   * the Platform computed for `routingKey` (from the `source.register.ack`), or
-   * `null` if the Platform has no public webhook base configured.
-   *
-   * Used by `kici-admin source add` (platform/hybrid mode) to print the URL
-   * synchronously. Passing the **full** source list keeps this on the single
-   * `updateSources` push path — the routing key being newly added means
-   * `updateSources` emits a `source.register` whose ack carries the URL; the
-   * later NOTIFY-driven republish then diffs to a no-op.
-   *
-   * Rejects on timeout or disconnect; the caller degrades to a "(unavailable)"
-   * note rather than fabricating a URL.
+   * Push the full source list and resolve with the webhook URL the Platform's
+   * `source.register.ack` carries for `routingKey` (`null`: no public webhook
+   * base). `kici-admin source add` prints it. Taking the FULL list keeps this
+   * on the one `updateSources` path, so the later NOTIFY republish diffs to a
+   * no-op. Rejects on timeout or disconnect.
    */
   registerSourceAndAwait(
     fullSources: ProviderSource[],
@@ -1189,8 +916,7 @@ export class PlatformClient {
     timeoutMs = 5000,
   ): Promise<string | null> {
     return new Promise<string | null>((resolve, reject) => {
-      // Reject a previous pending wait for the same key (shouldn't happen, but
-      // never leak a resolver).
+      // Never leak a superseded resolver.
       const existing = this.pendingSourceRegistrations.get(routingKey);
       if (existing) {
         clearTimeout(existing.timer);
@@ -1205,10 +931,7 @@ export class PlatformClient {
     });
   }
 
-  /**
-   * Reject every pending `registerSourceAndAwait()` — called on disconnect so a
-   * `source add` issued while the link drops fails fast instead of hanging.
-   */
+  /** On disconnect, so a `source add` in flight fails fast instead of hanging. */
   private rejectPendingSourceRegistrations(reason: string): void {
     for (const [, pending] of this.pendingSourceRegistrations) {
       clearTimeout(pending.timer);
@@ -1228,10 +951,8 @@ export class PlatformClient {
 
     try {
       this.ws = new WebSocket(this.url, {
-        // Cap the maximum decompressed frame size so a rogue or
-        // compromised Platform peer cannot OOM the orchestrator with a
-        // compression bomb on the Platform→orch direction. Without this,
-        // ws@8.x defaults to 100 MiB.
+        // Cap the decompressed frame size so a rogue Platform cannot OOM the
+        // orchestrator with a compression bomb (ws defaults to 100 MiB).
         maxPayload: WS_MAX_PAYLOAD_BYTES,
         perMessageDeflate: {
           concurrencyLimit: 10,
@@ -1251,7 +972,6 @@ export class PlatformClient {
       this._state = 'authenticating';
       logger.info('Connected to Platform, sending auth request', { url: this.url });
 
-      // Send auth.request with capabilities
       this.ws!.send(
         JSON.stringify({
           type: 'auth.request',
@@ -1274,9 +994,6 @@ export class PlatformClient {
       });
 
       this._state = 'disconnected';
-      // Drop the advertised Platform capabilities: a new connection re-advertises,
-      // so never let a stale advertisement leak across reconnects.
-      this.platformCapabilities = undefined;
       this.stopHeartbeat();
       this.stopClusterMembership();
       this.clearStabilityTimer();
@@ -1335,13 +1052,8 @@ export class PlatformClient {
     this.dispatchPlatformMessage(msg);
   }
 
-  /**
-   * Try the non-mainline frames (log-pull, cluster join.request) when the
-   * primary `platformToOrchestratorMessageSchema` failed to parse. Falls back to
-   * a structured warning if none matches.
-   */
+  /** Recognition chain for frames the primary schema rejected. */
   private handleNonStandardMessage(raw: unknown, primaryIssues: unknown): void {
-    // Try log pull messages (separate schema union)
     const logPullParsed = logPullPlatformToOrchSchema.safeParse(raw);
     if (logPullParsed.success) {
       this.runFrameHandler(logPullParsed.data, this.onLogPullRequest);
@@ -1362,24 +1074,17 @@ export class PlatformClient {
       return;
     }
 
-    // A dashboard request that fails primary schema validation (e.g. a malformed
-    // body that omits a required field) still carries a requestId the Platform is
-    // waiting on over its forward window. Emit a structured error response frame
-    // so the Platform answers a fast 400 instead of timing out (10s 504). This is
-    // the schema-validation-layer counterpart to the dispatch choke point in
-    // guardedDashboardDispatch — both guarantee every forwarded dashboard request
-    // gets exactly one response frame.
+    // An invalid dashboard request still has a requestId the Platform waits on:
+    // answer it with an error frame (fast 400, not a 10s 504). With
+    // guardedDashboardDispatch this guarantees exactly one response per request.
     if (this.respondToInvalidDashboardRequest(raw, primaryIssues)) {
       return;
     }
 
-    // Version-skew diagnosability: a frame that failed every recognition schema
-    // is either a genuinely-unknown message type (the Platform is ahead of this
-    // orchestrator build) or malformed garbage. For a recognizable-but-unknown
-    // type, reply with a NACK naming it so the skew surfaces as a diagnosable
-    // error instead of a silent drop → downstream timeout. `buildUnsupportedMessageNack`
-    // returns null (stay drop-and-warn) for garbage, for a `nack` (loop guard),
-    // and for streaming frame classes (`log.chunk` / `orch-log.chunk`).
+    // An unknown-but-recognizable type means the Platform is ahead of this
+    // build: NACK it so the skew is diagnosable instead of a silent timeout.
+    // The builder returns null (drop-and-warn) for garbage, for a `nack` (loop
+    // guard), and for streaming frames (`log.chunk` / `orch-log.chunk`).
     const nack = buildUnsupportedMessageNack(raw, 'orchestrator', PLATFORM_TO_ORCH_KNOWN_TYPES);
     if (nack) {
       wsUnsupportedMessageSentTotal.add(1, { received_type: nack.receivedType ?? 'unknown' });
@@ -1396,12 +1101,7 @@ export class PlatformClient {
     });
   }
 
-  /**
-   * If `raw` looks like a dashboard request (a `dashboard.*` type with a
-   * requestId) that failed schema validation, send a structured error response
-   * keyed to its requestId and return true. Returns false when the message is
-   * not a recognisable dashboard request (let the caller log a warning).
-   */
+  /** Answer an invalid `dashboard.*` request carrying a requestId; false when `raw` is not one. */
   private respondToInvalidDashboardRequest(raw: unknown, issues: unknown): boolean {
     if (typeof raw !== 'object' || raw === null) return false;
     const { type, requestId } = raw as { type?: unknown; requestId?: unknown };
@@ -1437,13 +1137,11 @@ export class PlatformClient {
     });
   }
 
-  /**
-   * Dispatch a parsed platform message to the appropriate per-area
-   * handler. Each `case` either inlines a tiny dispatch (for one-line
-   * forwards to a callback) or delegates to a private method when the
-   * branch carries non-trivial logic.
-   */
   private dispatchPlatformMessage(msg: PlatformToOrchestratorMessage): void {
+    if (isDashboardFrame(msg)) {
+      this.dispatchDashboardFrame(msg);
+      return;
+    }
     switch (msg.type) {
       case 'auth.success':
         this.handleAuthSuccess(msg);
@@ -1487,101 +1185,12 @@ export class PlatformClient {
         this.handlePeerUpdate(msg);
         break;
 
-      case 'dashboard.run.detail':
-        logger.debug('Dashboard run detail request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-        });
-        this.runFrameHandler(msg, this.onDashboardRunDetail);
-        break;
-
-      case 'dashboard.run.structured':
-        logger.debug('Dashboard structured run-result request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-        });
-        this.runFrameHandler(msg, this.onDashboardRunStructured);
-        break;
-
-      case 'dashboard.runs.list':
-        logger.debug('Dashboard runs list request received', {
-          requestId: msg.requestId,
-          actor: msg.actor,
-        });
-        this.runFrameHandler(msg, this.onDashboardRunsList);
-        break;
-
-      case 'dashboard.runs.filters':
-        logger.debug('Dashboard runs filters request received', {
-          requestId: msg.requestId,
-          actor: msg.actor,
-        });
-        this.runFrameHandler(msg, this.onDashboardRunsFilters);
-        break;
-
-      case 'dashboard.sources.list':
-        logger.debug('Dashboard sources list request received', {
-          requestId: msg.requestId,
-          actor: msg.actor,
-        });
-        this.runFrameHandler(msg, this.onDashboardSourcesList);
-        break;
-
-      case 'dashboard.admin-tokens.list':
-        logger.debug('Dashboard admin-tokens list request received', {
-          requestId: msg.requestId,
-          actor: msg.actor,
-        });
-        this.runFrameHandler(msg, this.onDashboardAdminTokensList);
-        break;
-
-      case 'dashboard.step.logs':
-        logger.debug('Dashboard step logs request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-          jobId: msg.jobId,
-          stepIndex: msg.stepIndex,
-        });
-        this.runFrameHandler(msg, this.onDashboardStepLogs);
-        break;
-
-      case 'dashboard.attestations.list':
-        logger.debug('Dashboard attestations list request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-        });
-        this.runFrameHandler(msg, this.onDashboardAttestationsList);
-        break;
-
-      case 'dashboard.attestations.list.all':
-        logger.debug('Dashboard org-wide attestations list request received', {
-          requestId: msg.requestId,
-        });
-        this.runFrameHandler(msg, this.onDashboardAttestationsListAll);
-        break;
-
-      case 'dashboard.attestation.get':
-        logger.debug('Dashboard attestation get request received', {
-          requestId: msg.requestId,
-          attestationId: msg.attestationId,
-        });
-        this.runFrameHandler(msg, this.onDashboardAttestationGet);
-        break;
-
       case 'dashboard.attestation.retry':
         logger.info('Dashboard attestation retry request received', {
           requestId: msg.requestId,
           runId: msg.runId,
         });
         this.runFrameHandler(msg, this.onDashboardAttestationRetry);
-        break;
-
-      case 'dashboard.artifacts.list':
-        logger.debug('Dashboard artifacts list request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-        });
-        this.runFrameHandler(msg, this.onDashboardArtifactsList);
         break;
 
       case 'run.rerun.request':
@@ -1611,23 +1220,6 @@ export class PlatformClient {
         this.runFrameHandler(msg, this.onRunCancel);
         break;
 
-      case 'dashboard.payload':
-        logger.debug('Dashboard payload request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-        });
-        this.runFrameHandler(msg, this.onDashboardPayload);
-        break;
-
-      case 'dashboard.orch.logs':
-        logger.debug('Dashboard orchestration logs request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-          jobId: msg.jobId,
-        });
-        this.runFrameHandler(msg, this.onDashboardOrchLogs);
-        break;
-
       case 'trust_policy.update':
         logger.info('Trust policy updated', { orgId: msg.orgId });
         this.runFrameHandler(msg, this.onTrustPolicyUpdate);
@@ -1641,21 +1233,15 @@ export class PlatformClient {
         break;
 
       case 'platform.capabilities':
-        // Platform advertises what it supports (Platform → orchestrator). Cache
-        // per connection so feature-gated sends can pre-flight against it. A
-        // self-hosted orchestrator running ahead of the hosted Platform uses
-        // this to avoid firing frames the Platform would drop.
-        this.platformCapabilities = msg.capabilities;
+        // No Platform capability flag is defined at protocol 4; log what was advertised.
         logger.info('Platform capabilities advertised', {
           capabilities: Object.keys(msg.capabilities),
         });
         break;
 
       case 'nack':
-        // The Platform could not process a frame we sent — for version skew it
-        // names the unsupported `receivedType`. Surface it as a structured
-        // warning so the skew is diagnosable in Loki instead of a phantom
-        // timeout. Never NACK a NACK (the loop guard lives at the send site).
+        // Surface skew in Loki instead of a phantom timeout. Never NACK a NACK
+        // (the loop guard lives at the send site).
         wsNackReceivedTotal.add(1, { received_type: msg.receivedType ?? 'unknown' });
         logger.warn('Platform rejected a message (NACK) — likely version skew', {
           receivedType: msg.receivedType,
@@ -1664,68 +1250,6 @@ export class PlatformClient {
         });
         break;
 
-      // Diagnostics
-      case 'dashboard.diagnostics':
-        logger.debug('Dashboard diagnostics request received', {
-          requestId: msg.requestId,
-        });
-        this.runFrameHandler(msg, this.onDashboardDiagnostics);
-        break;
-
-      // Run-state system reconciliation read (Platform RunMirrorReconciler)
-      case 'dashboard.run.state':
-        logger.debug('Dashboard run-state reconciliation request received', {
-          requestId: msg.requestId,
-          runId: msg.runId,
-        });
-        this.runFrameHandler(msg, this.onDashboardRunState);
-        break;
-
-      // Fleet read (roster, host detail, runsOnAll preview)
-      case 'dashboard.fleet.hosts':
-        logger.debug('Dashboard fleet hosts request received', { requestId: msg.requestId });
-        this.runFrameHandler(msg, this.onFleetHosts);
-        break;
-      case 'dashboard.fleet.host':
-        logger.debug('Dashboard fleet host request received', {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-        });
-        this.runFrameHandler(msg, this.onFleetHost);
-        break;
-      case 'dashboard.fleet.preview':
-        logger.debug('Dashboard fleet preview request received', {
-          requestId: msg.requestId,
-          workflowName: msg.workflowName,
-        });
-        this.runFrameHandler(msg, this.onFleetPreview);
-        break;
-      case 'dashboard.fleet.workflows-for-host':
-        logger.debug('Dashboard fleet workflows-for-host request received', {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-        });
-        this.runFrameHandler(msg, this.onFleetWorkflowsForHost);
-        break;
-
-      // Scaler capacity
-      case 'dashboard.scaler.capacity':
-        logger.debug('Dashboard scaler capacity request received', {
-          requestId: msg.requestId,
-        });
-        this.runFrameHandler(msg, this.onDashboardScalerCapacity);
-        break;
-
-      // Scaler agents (on-demand)
-      case 'dashboard.scaler.agents':
-        logger.debug('Dashboard scaler agents request received', {
-          requestId: msg.requestId,
-          scalerName: msg.scalerName,
-        });
-        this.runFrameHandler(msg, this.onDashboardScalerAgents);
-        break;
-
-      // Read + mutation attribution (access_log)
       case 'dashboard.access-log.list':
         logger.debug('Dashboard access-log list request received', {
           requestId: msg.requestId,
@@ -1734,8 +1258,6 @@ export class PlatformClient {
         this.runFrameHandler(msg, this.onDashboardEnvMessage);
         break;
 
-      // Registrations + event-log + environment CRUD all share the same
-      // generic onDashboardEnvMessage forwarding shape.
       case 'dashboard.registrations.list':
       case 'dashboard.registration.disable':
       case 'dashboard.registration.delete':
@@ -1778,9 +1300,7 @@ export class PlatformClient {
       case 'dashboard.backends.test':
       case 'dashboard.global-workflows.get':
       case 'dashboard.global-workflows.update':
-      // Fleet host writes (Model C: declare / remove) ride the same generic
-      // forwarding shape — the policy-gated DashboardFleetWriteHandler answers
-      // them inside guardedDashboardDispatch.
+      // Fleet host writes are answered by the policy-gated DashboardFleetWriteHandler.
       case 'dashboard.fleet.host.declare':
       case 'dashboard.fleet.host.remove':
         logger.debug('Dashboard environment message received', {
@@ -1803,9 +1323,7 @@ export class PlatformClient {
         break;
 
       default: {
-        // Exhaustiveness check: every variant of PlatformToOrchestratorMessage
-        // above must be handled. Adding a new variant to the union without a
-        // matching case here will fail `pnpm typecheck` at this line.
+        // Exhaustiveness: a new union variant without a case fails typecheck here.
         const _exhaustive: never = msg;
         void _exhaustive;
         logger.warn('Unknown platform message type', {
@@ -1814,6 +1332,18 @@ export class PlatformClient {
         break;
       }
     }
+  }
+
+  /** Log a dashboard read frame and hand it to its registered handler. */
+  private dispatchDashboardFrame(msg: DashboardFrame): void {
+    const fields = msg as Record<string, unknown>;
+    const meta: Record<string, unknown> = { type: msg.type };
+    for (const key of DASHBOARD_FRAME_LOG_FIELDS) {
+      if (fields[key] !== undefined) meta[key] = fields[key];
+    }
+    logger.debug('Dashboard frame received', meta);
+    const handler = this.dashboardHandlers[msg.type] as FrameHandler<typeof msg> | undefined;
+    this.runFrameHandler(msg, handler);
   }
 
   private handleAuthSuccess(
@@ -1825,11 +1355,9 @@ export class PlatformClient {
     });
 
     this._state = 'authenticated';
-    // Do NOT reset the attempt counter here. Authenticating does not mean the
-    // connection is viable: the state replay send is still ahead of it, and a
-    // frame the Platform rejects closes the socket immediately after. Resetting
-    // on auth is what let a post-auth failure reconnect at the 1.0-1.5s floor
-    // forever instead of escalating toward the 60s ceiling. Only surviving
+    // Do NOT reset the attempt counter on auth: the state replay is still
+    // ahead, and a rejected frame closes the socket right after. Resetting here
+    // pins a post-auth failure at the backoff floor forever. Only surviving
     // CONNECTION_STABLE_MS proves health.
     this.clearStabilityTimer();
     this.stabilityTimer = setTimeout(() => {
@@ -1840,34 +1368,16 @@ export class PlatformClient {
       this.replayConsecutiveFailures = 0;
     }, CONNECTION_STABLE_MS);
     this.stabilityTimer.unref?.();
-    // Cache the owning org's public alias for outbound URLs. Falls back
-    // to whatever was set on the previous connection (typically the
-    // same value); only overwritten when Platform actually supplies one.
-    if (msg.orgPublicAlias) {
-      this._orgPublicAlias = msg.orgPublicAlias;
-    }
-    // Surface the canonical org id so the server can auto-provision the
-    // `remote_sources` anchor for Platform-relayed `kici run remote`.
-    if (msg.orgId) {
-      this._orgId = msg.orgId;
-      this.onOrgIdentified?.({ orgId: msg.orgId, clusterId: this.clusterId ?? null });
-    }
-    // Each authentication replaces the Platform's GitHub webhook URL.
+    this._orgPublicAlias = msg.orgPublicAlias;
+    this._orgId = msg.orgId;
+    this.onOrgIdentified?.({ orgId: msg.orgId, clusterId: this.clusterId ?? null });
     this._githubWebhookUrl = msg.githubWebhookUrl;
-    // Surface the provenance trust root so the agent-handler can verify
-    // provenance bundles at ingest. Fires on every (re)connect; `null` when
-    // the Platform has no provenance issuer configured.
-    this.onProvenanceIssuer?.(msg.provenanceIssuer ?? null);
     this.startHeartbeat();
     this.startClusterMembership();
 
-    // Announce presence to the Platform. Always send source.register —
-    // even with zero sources — so the Platform records this orchestrator
-    // as connected (writes its platform_connections row and tracks the
-    // connection) regardless of whether any sources are configured. A
-    // sourceless orchestrator is a valid, connected orchestrator and must
-    // be visible in the dashboard. onAuthenticated fires on the matching
-    // source.register.ack (sent by the Platform for empty registrations too).
+    // Always send source.register, even with zero sources: a sourceless
+    // orchestrator is still connected and must show in the dashboard.
+    // onAuthenticated fires on the matching ack, which empty registrations get too.
     this.sendDirect({
       type: 'source.register',
       messageId: randomUUID(),
@@ -1899,19 +1409,17 @@ export class PlatformClient {
   ): void {
     logger.error('Platform auth failed', { reason: msg.reason });
 
-    // Close connection, schedule reconnect
+    // The 'close' handler sets state and schedules the reconnect.
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close(1000, 'Auth failed');
     }
-    // Don't set state here, the 'close' event handler does that
   }
 
   private handleWebhookRelayStart(
     msg: Extract<PlatformToOrchestratorMessage, { type: 'webhook.relay.start' }>,
   ): void {
-    // Allocate a per-messageId reassembly buffer. No ACK is sent until
-    // the stream completes (or errors); Platform's AckWaiterRegistry has
-    // a 5 s budget covering the whole start+chunks+ack sequence.
+    // No ACK until the stream completes or errors; the Platform's 5 s ack
+    // budget covers the whole start+chunks+ack sequence.
     const startRes = this.relayBuffer.start(msg.messageId, {
       routingKey: msg.routingKey,
       deliveryId: msg.deliveryId,
@@ -1954,14 +1462,12 @@ export class PlatformClient {
     const applyRes = this.relayBuffer.chunk(msg.messageId, msg.sequence, msg.data, msg.final);
 
     if (applyRes.status === 'pending') {
-      // More chunks expected; no ACK yet.
       return;
     }
 
     if (applyRes.status === 'error') {
-      // We don't have meta in scope (the buffer was already dropped on
-      // error). The deliveryId is required by webhookAckSchema; use the
-      // messageId as a fallback so Platform can correlate via either id.
+      // The buffer (and its deliveryId) is gone; the required deliveryId
+      // falls back to the messageId so the Platform can still correlate.
       logger.warn('Rejecting webhook.relay.chunk', {
         messageId: msg.messageId,
         sequence: msg.sequence,
@@ -1977,7 +1483,6 @@ export class PlatformClient {
       return;
     }
 
-    // Stream complete: verify, then process (if accepted), then ACK.
     const { meta, body } = applyRes;
     const reqId = meta.requestId ?? randomUUID();
     requestContext.run({ requestId: reqId, routingKey: meta.routingKey }, () => {
@@ -2010,8 +1515,6 @@ export class PlatformClient {
       });
     }
 
-    // Resolve any pending registerSourceAndAwait() callers with the webhook
-    // URL the Platform computed for their routing key.
     for (const entry of accepted) {
       const pending = this.pendingSourceRegistrations.get(entry.routingKey);
       if (pending) {
@@ -2024,11 +1527,8 @@ export class PlatformClient {
       logger.warn('Source registration rejected', {
         rejected: rejected.map((r) => `${r.routingKey}: ${r.reason}`),
       });
-      // Fail a pending registerSourceAndAwait() caller with the Platform's own
-      // reason. Without this the waiter sat until its 5 s timeout and the
-      // caller printed "(unavailable)", swallowing the one message that says
-      // why the key was refused — for example that the source's `--org` does
-      // not match the Platform organization the orchestrator authenticated as.
+      // Fail the waiter with the Platform's own reason (e.g. an `--org`
+      // mismatch) rather than letting it time out into "(unavailable)".
       for (const entry of rejected) {
         const pending = this.pendingSourceRegistrations.get(entry.routingKey);
         if (pending) {
@@ -2039,7 +1539,6 @@ export class PlatformClient {
       }
     }
 
-    // Process peer discovery from ACK
     if (msg.peers && msg.peers.length > 0 && this.onPeerDiscover) {
       for (const peer of msg.peers) {
         logger.info('Peer discovered via source.register.ack', {
@@ -2052,7 +1551,6 @@ export class PlatformClient {
       }
     }
 
-    // Invoke onAuthenticated after source registration is processed
     runDetached(logger, 'Platform authenticated hook', () => this.onAuthenticated?.());
   }
 
@@ -2086,10 +1584,7 @@ export class PlatformClient {
     }
   }
 
-  /**
-   * Send a message directly on the WebSocket without buffering.
-   * Used for ACK responses that must go immediately.
-   */
+  /** Unbuffered send, for ACKs that must go now or not at all. */
   private sendDirect(message: OrchestratorToPlatformMessage): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
@@ -2127,15 +1622,9 @@ export class PlatformClient {
     }
   }
 
-  /** How often a coordinator re-sends its membership snapshot. */
   private static readonly CLUSTER_MEMBERSHIP_INTERVAL_MS = 60_000;
 
-  /**
-   * Send the current worker-peer snapshot to the Platform.
-   *
-   * A snapshot, not a delta: a dropped frame self-heals on the next send. A
-   * no-op when the client is not authenticated or has no worker-peer source.
-   */
+  /** Worker-peer snapshot (not a delta, so a dropped frame self-heals on the next send). */
   sendClusterMembership(): void {
     if (this._state !== 'authenticated' || !this.getWorkerPeers) return;
     const workers = this.getWorkerPeers();
@@ -2152,8 +1641,7 @@ export class PlatformClient {
   private startClusterMembership(): void {
     this.stopClusterMembership();
     if (!this.getWorkerPeers) return;
-    // Report once immediately so the Platform has a count before the first
-    // interval elapses, then every 60 s as the self-healing backstop.
+    // Once now, so the Platform has a count before the first interval.
     this.sendClusterMembership();
     this.membershipTimer = setInterval(
       () => this.sendClusterMembership(),
@@ -2169,10 +1657,8 @@ export class PlatformClient {
   }
 
   /**
-   * Store the Platform's worker ceiling and act on an eviction directive.
-   *
-   * The stored value survives a Platform disconnect and a coordinator restart,
-   * which is what makes the fail-open stance bounded rather than unlimited.
+   * Store the worker ceiling; it survives disconnects and restarts, which keeps
+   * the fail-open stance bounded.
    */
   private async onPlanHeadroom(msg: PlanHeadroom): Promise<void> {
     await this.planHeadroomStore?.write(msg);
@@ -2181,10 +1667,7 @@ export class PlatformClient {
     this.onPlanCeiling?.(msg.maxWorkerPeers, msg.evictExcess);
   }
 
-  /**
-   * The ceiling this coordinator enforces, or `null` when none was ever
-   * received — in which case worker joins are admitted freely.
-   */
+  /** Enforced ceiling; `null` (never received) admits worker joins freely. */
   async getWorkerCeiling(): Promise<number | null> {
     const stored = await this.planHeadroomStore?.read();
     return stored ? stored.maxWorkerPeers : null;

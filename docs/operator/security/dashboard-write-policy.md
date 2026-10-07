@@ -57,7 +57,7 @@ Independent of the policy, the orchestrator limits the two **Fleet** operations.
 
 The two **held-run** operations are the one row whose operator equivalent is not universally available. `kici-admin held-run approve` and `reject` answer a hold on an **independent** orchestrator. Wherever a Platform is attached they refuse with a 409: the Platform's own held-run trust gate authorizes each decision against the acting member's org RBAC, and an orchestrator admin token carries none of it.
 
-So on a Platform-attached orchestrator, disabling `held_runs.approve` or `held_runs.reject` removes **every** way to answer a context or reviewer hold. The dashboard, `kici approve` / `kici reject` and the MCP tools all relay through these operations, so those holds can only expire. A hold in the **security** queue is the one exception: it also answers to a `/kici approve` pull-request comment, which the orchestrator handles from its own webhook ingress and this policy never gates. The orchestrator refuses that write: `kici-admin org-settings dashboard-writes set --org <org-id> --op held_runs.approve=false` returns a 409 naming the lockout. The refusal covers `--category` and `--sensitivity` too, because those expand to a list of operations before the write. `dashboard-writes show` flags an orchestrator already in that state, and the orchestrator logs a warning at boot. Neither re-enables the operation, because that is the operator's decision to make.
+So on a Platform-attached orchestrator, disabling `held_runs.approve` or `held_runs.reject` removes **every** way to answer a context or reviewer hold. The dashboard, `kici approve` / `kici reject` and the MCP tools all relay through these operations, so those holds can only expire. A hold in the **security** queue is the one exception: it also answers to a `/kici approve` pull-request comment, which the orchestrator handles from its own webhook ingress and this policy never gates. The orchestrator refuses that write: `kici-admin org-settings dashboard-writes set --org <org-id> --op held_runs.approve=disabled` returns a 409 naming the lockout. The refusal covers `--category` and `--sensitivity` too, because those expand to a list of operations before the write. `dashboard-writes show` flags an orchestrator already in that state, and the orchestrator logs a warning at boot. Neither re-enables the operation, because that is the operator's decision to make.
 
 Dual-control for held runs on a Platform-attached deployment — routing approvals off the dashboard and onto an operator-side channel — needs a Platform-side mechanism, and no such mechanism exists today. The available posture is to keep these two operations enabled and control who may answer a hold through org RBAC and the hold's own `approvers:` clauses.
 
@@ -81,7 +81,7 @@ The orchestrator's RBAC for admin tokens (see [Two-layer RBAC](./rbac-two-layers
 kici-admin org-settings dashboard-writes show --org <org-id>
 ```
 
-Prints every operation grouped by category, the current state (`permissive`, `encrypted`, or `disabled`), and the `kici-admin` equivalent for each. Every `dashboard-writes` subcommand requires `--org` (or its alias `--customer-id`). Two filtering flags reduce the output to a category or sensitivity bucket:
+Prints every operation grouped by category, the current state (`permissive`, `encrypted`, or `disabled`), and the `kici-admin` equivalent for each. Every `dashboard-writes` subcommand requires `--org`. Two filtering flags reduce the output to a category or sensitivity bucket:
 
 ```bash
 kici-admin org-settings dashboard-writes show --org <org-id> --category=Secrets
@@ -96,7 +96,7 @@ kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=dis
 kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=encrypted   # plaintext ops only
 ```
 
-Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled` (the legacy `true`/`false` are still accepted and mean `permissive`/`disabled`). Multiple `--op` flags are accepted in one call. `encrypted` is rejected for any operation outside the two plaintext ops. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
+Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled`. Multiple `--op` flags are accepted in one call. `encrypted` is rejected for any operation outside the two plaintext ops. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
 
 ### Disable a whole category or sensitivity bucket
 
@@ -142,15 +142,15 @@ Disable `plaintext`, plus the `dispatch` operations that release execution or de
 ```bash
 kici-admin org-settings dashboard-writes set --org <org-id> --sensitivity=plaintext --enabled=false
 kici-admin org-settings dashboard-writes set --org <org-id> \
-  --op event_dlq.retry=false \
-  --op event_dlq.discard=false \
-  --op registration.delete=false \
-  --op secrets.delete=false
+  --op event_dlq.retry=disabled \
+  --op event_dlq.discard=disabled \
+  --op registration.delete=disabled \
+  --op secrets.delete=disabled
 ```
 
 Effect: every dispatch decision listed above and every destructive secret / registration operation requires a `kici-admin` invocation. The operator can wrap that in a ticket-gated workflow, where the bastion records who ran the command and against which ticket. The dashboard remains usable for observability, secret-name CRUD, and held-run approval and rejection.
 
-`held_runs.approve` is deliberately **not** in that list on a Platform-attached orchestrator, and the orchestrator refuses the write if you add it. `kici-admin held-run approve` cannot answer a hold there, so disabling the dashboard's held-run write moves the operation to a layer that does not exist and every context or reviewer hold expires unanswered. On an **independent** orchestrator the operator CLI does answer holds, so the disable is coherent and permitted — add `--op held_runs.approve=false` there, and answer with `kici-admin held-run approve --as <user-id>`.
+`held_runs.approve` is deliberately **not** in that list on a Platform-attached orchestrator, and the orchestrator refuses the write if you add it. `kici-admin held-run approve` cannot answer a hold there, so disabling the dashboard's held-run write moves the operation to a layer that does not exist and every context or reviewer hold expires unanswered. On an **independent** orchestrator the operator CLI does answer holds, so the disable is coherent and permitted — add `--op held_runs.approve=disabled` there, and answer with `kici-admin held-run approve --as <user-id>`.
 
 ### Maximum hardening
 

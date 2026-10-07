@@ -22,6 +22,7 @@ function createLogChunk(id: string): AgentToOrchestratorMessage {
     stepIndex: 0,
     lines: ['hello world'],
     timestamp: Date.now(),
+    stream: 'stdout',
   };
 }
 
@@ -67,6 +68,7 @@ describe('EventBuffer', () => {
         stepIndex: 0,
         lines: ['Step 1 output', 'Step 1 done'],
         timestamp: Date.now(),
+        stream: 'stdout',
       };
 
       buffer.add(msg);

@@ -11,6 +11,7 @@ import {
 } from './dashboard.js';
 
 const sampleHost = {
+  confirmed: true,
   agentId: 'agent-1',
   labels: ['region:eu', 'gpu'],
   properties: { cores: 8 },

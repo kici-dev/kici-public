@@ -115,7 +115,7 @@ not the exit code:
 ```bash
 $ kici local status --json
 {"state":"ready","running":true,"pid":3768093,"port":4319,
- "url":"http://127.0.0.1:4319","pgKind":"embedded","stampVersion":3,
+ "url":"http://127.0.0.1:4319","pgKind":"embedded","stampVersion":5,
  "mode":"independent"}
 ```
 

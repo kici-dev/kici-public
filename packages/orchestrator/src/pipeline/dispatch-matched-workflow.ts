@@ -73,7 +73,7 @@ import type { SandboxAllowList } from './sandbox-allowlist-reader.js';
 import { flattenLockSteps } from './flatten-lock-steps.js';
 import { storeWebhookPayload } from './webhook-payload-store.js';
 import type { Database, HeldRun } from '../db/types.js';
-import type { RerunLineage } from '../reporting/execution-tracker.js';
+import type { RerunLineage, TrackedJobRow } from '../reporting/execution-tracker.js';
 import { HostIdentitySource, JobKind } from '../db/types.js';
 import { NEEDS_PENDING_JOB_ID_PREFIX } from '../db/synthetic-job-ids.js';
 import { resolveRunEventContext, type RunEventContext } from './run-event-context.js';
@@ -603,12 +603,73 @@ async function stampChainDepth(ctx: WorkflowDispatchContext): Promise<void> {
     .execute();
 }
 
+/** The event context a run row records: the head context, plus a stated subject event. */
+function runEventContextFor(
+  ctx: WorkflowDispatchContext,
+  event: SimulatedEvent,
+): RunEventContext & { subjectTriggerEvent?: string } {
+  return {
+    ...resolveRunEventContext(event),
+    // fails-when: a re-run of a pull-request run records no subject event and presents a push identity
+    ...(ctx.subjectTriggerEvent !== undefined && { subjectTriggerEvent: ctx.subjectTriggerEvent }),
+  };
+}
+
 /**
- * The two internal-trigger fields every PRE-dispatch recording site has to
- * carry. There are five: the install-gate hold, the trust-policy hold, the
- * trust-policy reject, the init-failure skip, and the build that failed before
- * tracking started. Each writes its `execution_runs` row and returns, so there
- * is no later dispatch step to stamp either value.
+ * Register the run with the execution tracker, then stamp its chain depth.
+ *
+ * Every registration site passes the same context-derived arguments and differs
+ * only in the jobs it registers and the secret contexts it declares.
+ */
+async function startTrackedRun(
+  tracker: NonNullable<ProcessingDeps['executionTracker']>,
+  ctx: WorkflowDispatchContext,
+  setup: DispatchSetup,
+  jobs: TrackedJobRow[],
+  opts: { declaredContexts?: readonly string[] } = {},
+): Promise<void> {
+  const { workflow, repoIdentifier, credentials, event, ref, runId, decision } = ctx;
+  await tracker.onExecutionStarted(
+    runId,
+    workflow.name,
+    setup.info.provider,
+    repoIdentifier,
+    event.targetBranch,
+    ref,
+    setup.effectiveDeliveryId,
+    credentials as Record<string, unknown>,
+    dispatchTriggerDecision(ctx, decision),
+    jobs,
+    setup.info.routingKey,
+    opts.declaredContexts?.length ? [...opts.declaredContexts] : undefined,
+    dispatchTriggerEvent(ctx),
+    extractCommitMessage(setup.info.event, setup.info.payload),
+    ctx.rerunLineage?.parentRunId,
+    ctx.triggeredBy,
+    ctx.rerunLineage?.originalRunId,
+    setup.workflowConcurrency,
+    setup.workflowTimeoutMs,
+    setup.checkMode,
+    ctx.localWorkingTree,
+    event.senderUsername ?? undefined,
+    event.senderUserId ?? undefined,
+    ctx.triggeredByAgentLabel,
+    event.prNumber ?? null,
+    workflowRepoProvenance(ctx),
+    // Where the code came from, which `event.targetBranch` above deliberately
+    // does not say.
+    runEventContextFor(ctx, event),
+  );
+  await stampChainDepth(ctx);
+}
+
+/**
+ * The internal-trigger fields every PRE-dispatch recording site has to carry:
+ * `chainDepth`, `dispatchedByFailureLifecycle` and `rerunLineage`. The sites are
+ * the install-gate hold, the trust-policy hold, the trust-policy reject, the
+ * init-failure skip, and the build that failed before tracking started. Each
+ * writes its `execution_runs` row and returns, so there is no later dispatch
+ * step to stamp them.
  *
  * `chainDepth` is the load-bearing one, and only on the two HOLDS: a hold is
  * RESUMABLE, so released, the run goes on to fire its own invoke gate, and
@@ -631,18 +692,6 @@ async function stampChainDepth(ctx: WorkflowDispatchContext): Promise<void> {
  * where `0` normalizes away (see `inheritedChainDepth`), so that decision lives
  * in one place instead of being re-made at every layer.
  */
-/** The event context a run row records: the head context, plus a stated subject event. */
-function runEventContextFor(
-  ctx: WorkflowDispatchContext,
-  event: SimulatedEvent,
-): RunEventContext & { subjectTriggerEvent?: string } {
-  return {
-    ...resolveRunEventContext(event),
-    // fails-when: a re-run of a pull-request run records no subject event and presents a push identity
-    ...(ctx.subjectTriggerEvent !== undefined && { subjectTriggerEvent: ctx.subjectTriggerEvent }),
-  };
-}
-
 function preDispatchRunProvenance(ctx: WorkflowDispatchContext): {
   chainDepth?: number;
   dispatchedByFailureLifecycle?: boolean;
@@ -1091,19 +1140,6 @@ async function probeCaches(
   if (!ctx.bundle || ctx.localWorkingTree) {
     return { sourceHit, depHit };
   }
-  // A lock compiled before schema 6 carries a `contentHash` over the workflow
-  // ENTRY FILE, not the `.kici/` tree the tarball holds — the identity defect
-  // this layout closes. Serving a cache entry keyed on it would restore a
-  // tarball whose contents the hash never covered, so an un-recompiled repo
-  // clones and installs fresh instead. Legacy objects are orphaned and aged out
-  // by the normal cache TTL; nothing reads the old prefix.
-  if (workflow.compileSchemaVersion !== undefined && workflow.compileSchemaVersion < 6) {
-    logger.info('Skipping source + dep cache probe for a pre-v6 lock', {
-      workflow: workflow.name,
-      compileSchemaVersion: workflow.compileSchemaVersion,
-    });
-    return { sourceHit, depHit };
-  }
   if (buildable && contentHash && deps.sourceCache) {
     sourceHit = await deps.sourceCache.has(ctx.resolvedOrgId, contentHash);
     if (sourceHit) {
@@ -1365,19 +1401,7 @@ async function runBuildJob(args: {
   error: unknown;
 }> {
   const { ctx, setup, contentHash, lockfileHash } = args;
-  const {
-    deps,
-    workflow,
-    repoIdentifier,
-    credentials,
-    event,
-    ref,
-    runId,
-    decision,
-    localWorkingTree,
-    triggeredBy,
-    triggeredByAgentLabel,
-  } = ctx;
+  const { deps, workflow, repoIdentifier, credentials, ref, runId } = ctx;
   const buildJobName = `__build__${workflow.name}`;
   let buildJobId: string | undefined;
   let buildJobLabels: string[] | undefined;
@@ -1411,44 +1435,13 @@ async function runBuildJob(args: {
         rejected = true;
         if (deps.executionTracker) {
           const syntheticId = `rejected-${randomUUID()}`;
-          await deps.executionTracker.onExecutionStarted(
-            runId,
-            workflow.name,
-            setup.info.provider,
-            repoIdentifier,
-            event.targetBranch,
-            ref,
-            setup.effectiveDeliveryId,
-            credentials as Record<string, unknown>,
-            dispatchTriggerDecision(ctx, decision),
-            [
-              {
-                jobId: syntheticId,
-                jobName: buildJobName,
-                runsOnLabels: buildJobInput.runsOnLabels,
-              },
-            ],
-            setup.info.routingKey,
-            undefined,
-            dispatchTriggerEvent(ctx),
-            extractCommitMessage(setup.info.event, setup.info.payload),
-            ctx.rerunLineage?.parentRunId, // parentRunId
-            triggeredBy,
-            ctx.rerunLineage?.originalRunId, // originalRunId
-            setup.workflowConcurrency,
-            setup.workflowTimeoutMs,
-            setup.checkMode,
-            localWorkingTree,
-            event.senderUsername ?? undefined,
-            event.senderUserId ?? undefined,
-            triggeredByAgentLabel, // triggeredByAgentLabel
-            event.prNumber ?? null,
-            workflowRepoProvenance(ctx),
-            // Where the code came from, which `event.targetBranch` above
-            // deliberately does not say.
-            runEventContextFor(ctx, event),
-          );
-          await stampChainDepth(ctx);
+          await startTrackedRun(deps.executionTracker, ctx, setup, [
+            {
+              jobId: syntheticId,
+              jobName: buildJobName,
+              runsOnLabels: buildJobInput.runsOnLabels,
+            },
+          ]);
           await deps.executionTracker.failRun(runId, reason, {
             scope: 'run',
             category: InitFailureCategory.enum.build_coordination,
@@ -1460,38 +1453,9 @@ async function runBuildJob(args: {
       buildJobId = result.jobId;
       buildJobLabels = buildJobInput.runsOnLabels;
       if (deps.executionTracker) {
-        await deps.executionTracker.onExecutionStarted(
-          runId,
-          workflow.name,
-          setup.info.provider,
-          repoIdentifier,
-          event.targetBranch,
-          ref,
-          setup.effectiveDeliveryId,
-          credentials as Record<string, unknown>,
-          dispatchTriggerDecision(ctx, decision),
-          [{ jobId: buildJobId, jobName: buildJobName, runsOnLabels: buildJobLabels }],
-          setup.info.routingKey,
-          undefined,
-          dispatchTriggerEvent(ctx),
-          extractCommitMessage(setup.info.event, setup.info.payload),
-          ctx.rerunLineage?.parentRunId, // parentRunId
-          triggeredBy,
-          ctx.rerunLineage?.originalRunId, // originalRunId
-          setup.workflowConcurrency,
-          setup.workflowTimeoutMs,
-          setup.checkMode,
-          localWorkingTree,
-          event.senderUsername ?? undefined,
-          event.senderUserId ?? undefined,
-          triggeredByAgentLabel, // triggeredByAgentLabel
-          event.prNumber ?? null,
-          workflowRepoProvenance(ctx),
-          // Where the code came from, which `event.targetBranch` above
-          // deliberately does not say.
-          runEventContextFor(ctx, event),
-        );
-        await stampChainDepth(ctx);
+        await startTrackedRun(deps.executionTracker, ctx, setup, [
+          { jobId: buildJobId, jobName: buildJobName, runsOnLabels: buildJobLabels },
+        ]);
         // The run is registered here rather than by `startRunBeforeDispatch`,
         // which returns early for a build-tracked run — so this is the site that
         // owes the row its trust context. Without it the row carried none at all
@@ -3099,7 +3063,7 @@ async function applyContextProtectionGates(args: {
       (gateResult.holdType ?? HoldType.enum.reviewer) === HoldType.enum.reviewer;
     // An approval hold (reviewer gate) defers hold creation to the dispatch
     // loop so the resume path can store the job's dispatch context. Security /
-    // wait / queue holds keep the legacy immediate-create behaviour.
+    // wait / queue holds are created immediately.
     if (deps.heldRunStore && isApprovalHold) {
       // This hold REPLACES whatever `applyStaticApprovalHolds` would have
       // minted (both its branches are guarded on `!approvalHold`), so it must
@@ -3828,8 +3792,8 @@ export async function postPendingHoldCheck(args: {
  * Hold a job awaiting approval: create the `held_runs` row (with the resolved
  * `ApprovalRequirement`) and persist the job's dispatch context so `release()`
  * can re-dispatch it through `dispatchReadyJob` after approval. A job with no
- * `approvalHold` (legacy security / wait / queue holds whose row was created
- * eagerly) just logs and stays held.
+ * `approvalHold` (security / wait / queue holds, whose row was created eagerly)
+ * just logs and stays held.
  */
 async function holdJobForApproval(args: {
   ctx: WorkflowDispatchContext;
@@ -5090,19 +5054,7 @@ async function startRunBeforeDispatch(args: {
   declaredContexts: readonly string[];
 }): Promise<boolean> {
   const { ctx, setup, buildPrep, declaredContexts } = args;
-  const {
-    deps,
-    workflow,
-    repoIdentifier,
-    credentials,
-    event,
-    ref,
-    runId,
-    decision,
-    localWorkingTree,
-    triggeredBy,
-    triggeredByAgentLabel,
-  } = ctx;
+  const { deps, workflow, runId } = ctx;
   const tracker = deps.executionTracker;
   if (!tracker) return false;
   // The source-pack build path already registered the run with the build job
@@ -5118,38 +5070,7 @@ async function startRunBeforeDispatch(args: {
   // `ensureExecutionRunForDeferred`.
   if (buildPrep.buildFailed || buildPrep.materializedJobs.length === 0) return false;
 
-  await tracker.onExecutionStarted(
-    runId,
-    workflow.name,
-    setup.info.provider,
-    repoIdentifier,
-    event.targetBranch,
-    ref,
-    setup.effectiveDeliveryId,
-    credentials as Record<string, unknown>,
-    dispatchTriggerDecision(ctx, decision),
-    [],
-    setup.info.routingKey,
-    declaredContexts.length > 0 ? [...declaredContexts] : undefined,
-    dispatchTriggerEvent(ctx),
-    extractCommitMessage(setup.info.event, setup.info.payload),
-    ctx.rerunLineage?.parentRunId, // parentRunId
-    triggeredBy,
-    ctx.rerunLineage?.originalRunId, // originalRunId
-    setup.workflowConcurrency,
-    setup.workflowTimeoutMs,
-    setup.checkMode,
-    localWorkingTree,
-    event.senderUsername ?? undefined,
-    event.senderUserId ?? undefined,
-    triggeredByAgentLabel,
-    event.prNumber ?? null,
-    workflowRepoProvenance(ctx),
-    // Where the code came from, which `event.targetBranch` above deliberately
-    // does not say.
-    runEventContextFor(ctx, event),
-  );
-  await stampChainDepth(ctx);
+  await startTrackedRun(tracker, ctx, setup, [], { declaredContexts });
   await stampTrustContextBeforeDispatch(ctx);
   ctx.runRegisteredBeforeDispatch = true;
   if (tracker.holdRunForPendingJobs(runId)) {
@@ -5274,22 +5195,7 @@ async function recordRunStart(args: {
     dispatchedJobs,
     runTrackedEarly,
   } = args;
-  const {
-    deps,
-    workflow,
-    repoIdentifier,
-    credentials,
-    event,
-    ref,
-    runId,
-    decision,
-    trustResolution,
-    lockFileSource,
-    localWorkingTree,
-    testRun,
-    triggeredBy,
-    triggeredByAgentLabel,
-  } = ctx;
+  const { deps, runId } = ctx;
   if (!deps.executionTracker) return;
   // Without an early start there is no row yet, so a run that dispatched
   // nothing gets none here — the all-rejected / deferred paths below record it
@@ -5312,39 +5218,26 @@ async function recordRunStart(args: {
       );
     }
   } else {
-    await deps.executionTracker.onExecutionStarted(
-      runId,
-      workflow.name,
-      setup.info.provider,
-      repoIdentifier,
-      event.targetBranch,
-      ref,
-      setup.effectiveDeliveryId,
-      credentials as Record<string, unknown>,
-      dispatchTriggerDecision(ctx, decision),
-      dispatchedJobs,
-      setup.info.routingKey,
-      declaredContexts.length > 0 ? [...declaredContexts] : undefined,
-      dispatchTriggerEvent(ctx),
-      extractCommitMessage(setup.info.event, setup.info.payload),
-      ctx.rerunLineage?.parentRunId, // parentRunId
-      triggeredBy,
-      ctx.rerunLineage?.originalRunId, // originalRunId
-      setup.workflowConcurrency,
-      setup.workflowTimeoutMs,
-      setup.checkMode,
-      localWorkingTree,
-      event.senderUsername ?? undefined,
-      event.senderUserId ?? undefined,
-      triggeredByAgentLabel, // triggeredByAgentLabel
-      event.prNumber ?? null,
-      workflowRepoProvenance(ctx),
-      // Where the code came from, which `event.targetBranch` above deliberately
-      // does not say.
-      runEventContextFor(ctx, event),
-    );
-    await stampChainDepth(ctx);
+    await startTrackedRun(deps.executionTracker, ctx, setup, dispatchedJobs, { declaredContexts });
   }
+  stampRunStartColumns(ctx, runContextName, runContextId);
+}
+
+/**
+ * The per-run column writes that follow a run's registration: its secret
+ * context, trust context, test-run stamp and local-working-tree mark. Every one
+ * is best-effort and never aborts the dispatch.
+ *
+ * Shared by `recordRunStart` and the deferred bootstrap, because a run with no
+ * static job is registered only by the bootstrap, after `recordRunStart` has
+ * already returned for want of a row.
+ */
+function stampRunStartColumns(
+  ctx: WorkflowDispatchContext,
+  runContextName: string | undefined,
+  runContextId: string | undefined,
+): void {
+  const { deps, runId, trustResolution, lockFileSource, localWorkingTree, testRun } = ctx;
   if (runContextName && deps.db) {
     deps.db
       .updateTable('execution_runs')
@@ -7830,6 +7723,9 @@ async function ensureExecutionRunForDeferred(args: {
   reason: 'init' | 'dynamic';
   /** True when the run row already exists (see `recordRunStart`). */
   runTrackedEarly: boolean;
+  /** The run-level secret context the evaluation resolved, for `stampRunStartColumns`. */
+  runContextName: string | undefined;
+  runContextId: string | undefined;
 }): Promise<void> {
   const {
     ctx,
@@ -7840,45 +7736,14 @@ async function ensureExecutionRunForDeferred(args: {
     reason,
     runTrackedEarly,
   } = args;
-  const { deps, workflow, repoIdentifier, credentials, event, ref, runId, decision } = ctx;
-  const { triggeredBy, triggeredByAgentLabel } = ctx;
+  const { deps } = ctx;
   // A second `onExecutionStarted` would reset the in-memory job map, so the row
   // is only bootstrapped here when nothing has registered the run yet.
   if (!deps.executionTracker || runTrackedEarly) return;
   if (dispatchedJobs.length !== 0) return;
   if (reason === 'dynamic' && deferredInitCount > 0) return;
-  await deps.executionTracker.onExecutionStarted(
-    runId,
-    workflow.name,
-    setup.info.provider,
-    repoIdentifier,
-    event.targetBranch,
-    ref,
-    setup.effectiveDeliveryId,
-    credentials as Record<string, unknown>,
-    dispatchTriggerDecision(ctx, decision),
-    [],
-    setup.info.routingKey,
-    declaredContexts.length > 0 ? [...declaredContexts] : undefined,
-    dispatchTriggerEvent(ctx),
-    extractCommitMessage(setup.info.event, setup.info.payload),
-    ctx.rerunLineage?.parentRunId, // parentRunId
-    triggeredBy,
-    ctx.rerunLineage?.originalRunId, // originalRunId
-    setup.workflowConcurrency,
-    setup.workflowTimeoutMs,
-    setup.checkMode,
-    undefined, // localWorkingTree
-    event.senderUsername ?? undefined,
-    event.senderUserId ?? undefined,
-    triggeredByAgentLabel, // triggeredByAgentLabel
-    event.prNumber ?? null,
-    workflowRepoProvenance(ctx),
-    // Where the code came from, which `event.targetBranch` above deliberately
-    // does not say.
-    runEventContextFor(ctx, event),
-  );
-  await stampChainDepth(ctx);
+  await startTrackedRun(deps.executionTracker, ctx, setup, [], { declaredContexts });
+  stampRunStartColumns(ctx, args.runContextName, args.runContextId);
 }
 
 /**
@@ -8469,6 +8334,8 @@ async function startDeferredPhases(args: {
       deferredInitCount: evalResult.deferredInitJobs.length,
       reason: 'init',
       runTrackedEarly,
+      runContextName: evalResult.runContextName,
+      runContextId: evalResult.runContextId,
     });
   }
   startDeferredInitDispatch({
@@ -8501,6 +8368,8 @@ async function startDeferredPhases(args: {
     deferredInitCount: evalResult.deferredInitJobs.length,
     reason: 'dynamic',
     runTrackedEarly,
+    runContextName: evalResult.runContextName,
+    runContextId: evalResult.runContextId,
   });
   startDeferredDynamicDispatch({ ctx, setup, buildPrep, secrets });
 }

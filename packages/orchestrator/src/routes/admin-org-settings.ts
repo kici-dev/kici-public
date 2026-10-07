@@ -18,6 +18,7 @@ import {
   isKnownCapability,
   PLATFORM_CONNECTED_MODES,
   type OrchestratorMode,
+  toIsoString,
 } from '@kici-dev/engine';
 import {
   invalidRepoPatternReason,
@@ -31,9 +32,8 @@ import {
   resolveFullPolicyStateView,
 } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import type { Database, OrgSettings } from '../db/types.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import {
   getDashboardWritePolicy,
   resetDashboardWritePolicy,
@@ -42,6 +42,7 @@ import {
   type PolicyChangeEvent,
 } from '../policy/dashboard-write-policy.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-org-settings' });
 
@@ -69,14 +70,6 @@ interface OrgSettingsRouteDeps {
    */
   accessLog?: AccessLogWriter;
 }
-
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
 
 /**
  * A repo-pattern list that additionally refuses negation forms. The entry
@@ -296,10 +289,8 @@ function projectRow(
     allowSelfApproval: row.allow_self_approval,
     sandboxAllowedCapabilities: row.sandbox_allowed_capabilities ?? [],
     sandboxAllowHostNetwork: row.sandbox_allow_host_network ?? false,
-    createdAt:
-      row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
-    updatedAt:
-      row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
+    createdAt: toIsoString(row.created_at),
+    updatedAt: toIsoString(row.updated_at),
   };
 }
 
@@ -309,35 +300,26 @@ function serializeJsonbList(list: RepoPatternEntry[] | null | undefined): string
 }
 
 export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
   // Org-settings is per-customer (orgId), not per-routing-key; routing-key
   // tokens are refused outright.
-  app.use('/org-settings/*', async (c, next) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
-    await next();
-  });
+  app.use('/org-settings/*', requireUnscoped);
 
   // GET /api/v1/admin/org-settings/global-workflows?customerId=acmeOrg00001
   app.get('/org-settings/global-workflows', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      const customerId = c.req.query('customerId');
-      if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
-      const row = await deps.db
-        .selectFrom('org_settings')
-        .selectAll()
-        .where('customer_id', '=', customerId)
-        .executeTakeFirst();
-      const enabled = await readEffectiveEnabled(deps.db, deps.globalWorkflowsEnabledDefault);
-      return c.json({ settings: projectRow(customerId, row, enabled) });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    const customerId = c.req.query('customerId');
+    if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
+    const row = await deps.db
+      .selectFrom('org_settings')
+      .selectAll()
+      .where('customer_id', '=', customerId)
+      .executeTakeFirst();
+    const enabled = await readEffectiveEnabled(deps.db, deps.globalWorkflowsEnabledDefault);
+    return c.json({ settings: projectRow(customerId, row, enabled) });
   });
 
-  // PATCH /api/v1/admin/org-settings/global-workflows
   app.patch('/org-settings/global-workflows', async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'secret.write');
@@ -531,24 +513,20 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
 
   // GET /api/v1/admin/org-settings/dashboard-writes?customerId=<id>
   app.get('/org-settings/dashboard-writes', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      const customerId = c.req.query('customerId');
-      if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
-      const stored = await getDashboardWritePolicy(deps.db, customerId);
-      return c.json({
-        customerId,
-        stored,
-        effective: resolveFullPolicyView(stored),
-        states: resolveFullPolicyStateView(stored),
-        // Lets the CLI render tell a held-run disable that merely routes the
-        // operation to `kici-admin` from one that leaves no answering surface
-        // at all. The render cannot infer it: the policy map is mode-blind.
-        platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    const customerId = c.req.query('customerId');
+    if (!customerId) return c.json({ error: 'customerId query param required' }, 400);
+    const stored = await getDashboardWritePolicy(deps.db, customerId);
+    return c.json({
+      customerId,
+      stored,
+      effective: resolveFullPolicyView(stored),
+      states: resolveFullPolicyStateView(stored),
+      // Lets the CLI render tell a held-run disable that merely routes the
+      // operation to `kici-admin` from one that leaves no answering surface
+      // at all. The render cannot infer it: the policy map is mode-blind.
+      platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
+    });
   });
 
   // PATCH /api/v1/admin/org-settings/dashboard-writes

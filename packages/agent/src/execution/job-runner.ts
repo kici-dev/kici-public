@@ -193,7 +193,6 @@ async function materializeEvalWorkspace(
       sha: dispatch.sha,
       workDir,
       gitAuth: dispatch.sourceAuth,
-      token: dispatch.sourceAuth ? undefined : dispatch.token,
     });
     cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
   }
@@ -1595,7 +1594,6 @@ export class JobRunner {
       sha: dispatch.sha,
       workDir,
       gitAuth: dispatch.sourceAuth,
-      token: dispatch.sourceAuth ? undefined : dispatch.token,
     });
     const cloneDurationMs = Date.now() - cloneStart;
     cloneDurationSeconds.record(cloneDurationMs / 1000);
@@ -1655,7 +1653,6 @@ export class JobRunner {
         sha: dispatch.sha,
         workDir,
         gitAuth: dispatch.sourceAuth,
-        token: dispatch.sourceAuth ? undefined : dispatch.token,
       });
       cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
     }
@@ -2107,7 +2104,6 @@ export class JobRunner {
           repoUrl: args.dispatch.repoUrl,
           ref: args.dispatch.ref,
           sha: args.dispatch.sha,
-          token: args.dispatch.token,
           sourceAuth: args.dispatch.sourceAuth,
           workflowAuth: args.dispatch.workflowAuth,
           sourceTarUrl: args.dispatch.sourceTarUrl,

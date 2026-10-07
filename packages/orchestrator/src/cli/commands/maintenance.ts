@@ -24,13 +24,15 @@ import {
   purgeScopedSecretsDirect,
   purgeStaleExecutionDirect,
   purgeStaleSourcesDirect,
-  toErrorMessage,
 } from '@kici-dev/shared';
 import type { AdminApiClient } from '../api-client.js';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+} from './shared/cli-action.js';
+import { ORG_LIST_HINT } from './shared/org-id.js';
 
 async function confirmInteractive(prompt: string, expected: string): Promise<boolean> {
   if (!process.stdin.isTTY) return false;
@@ -53,11 +55,11 @@ export function registerMaintenanceCommands(
   queue
     .command('clear')
     .description('TRUNCATE the dispatch_queue table (destructive)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .requiredOption('--confirm', 'Explicit confirmation flag')
     .option('--yes', 'Skip interactive confirmation prompt (for scripted use)')
-    .action(async (opts: { databaseUrl?: string; yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; yes?: boolean }) => {
         if (!opts.yes) {
           const ok = await confirmInteractive('Type "clear" to TRUNCATE dispatch_queue: ', 'clear');
           if (!ok) {
@@ -76,22 +78,19 @@ export function registerMaintenanceCommands(
           );
           console.log(`queue clear: cleared=${result.cleared}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── execution ───────────────────────────────────────────────────────────
   const execution = program.command('execution').description('Execution data maintenance');
   execution
     .command('purge-stale')
     .description('DELETE execution_runs/jobs whose routing_key differs from the current cluster')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .requiredOption('--routing-key <key>', 'Current routing key to preserve')
     .requiredOption('--confirm', 'Explicit confirmation flag')
-    .action(async (opts: { databaseUrl?: string; routingKey: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; routingKey: string }) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result = dbUrl
           ? await purgeStaleExecutionDirect(dbUrl, opts.routingKey)
@@ -102,11 +101,8 @@ export function registerMaintenanceCommands(
         console.log(
           `execution purge-stale: runsDeleted=${result.runsDeleted} jobsDeleted=${result.jobsDeleted}${dbUrl ? ' (direct)' : ''}`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── secret purge ────────────────────────────────────────────────────────
   // Attach the `purge` verb to the existing `secret` namespace (defined in
@@ -120,12 +116,12 @@ export function registerMaintenanceCommands(
   secret
     .command('purge')
     .description('Bulk-delete scoped_secrets. Irreversible — pair with rotate-key for recovery.')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .requiredOption('--confirm', 'Explicit confirmation flag')
-    .option('--org <orgId>', 'Restrict to a single org (defaults to ALL orgs)')
+    .option('--org <orgId>', `Restrict to a single org (defaults to ALL orgs; ${ORG_LIST_HINT})`)
     .option('--yes', 'Skip interactive confirmation prompt (for scripted use)')
-    .action(async (opts: { databaseUrl?: string; org?: string; yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; org?: string; yes?: boolean }) => {
         const target = opts.org ?? '__ALL__';
         if (!opts.yes) {
           const ok = await confirmInteractive(
@@ -146,11 +142,8 @@ export function registerMaintenanceCommands(
         console.log(
           `secret purge: deleted=${result.deleted} (${target})${dbUrl ? ' (direct)' : ''}`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── source purge-stale ─────────────────────────────────────────────────
   const existingSource = program.commands.find((c) => c.name() === 'source');
@@ -160,18 +153,18 @@ export function registerMaintenanceCommands(
     .description(
       'DELETE sources + scoped secrets whose routing_key differs from the current cluster',
     )
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .requiredOption('--routing-key <key>', 'Current routing key to preserve')
     .option('--dry-run', 'Count stale rows without deleting them', false)
     .option('--confirm', 'Explicit confirmation flag (required unless --dry-run)')
     .action(
-      async (opts: {
-        databaseUrl?: string;
-        routingKey: string;
-        dryRun?: boolean;
-        confirm?: boolean;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          databaseUrl?: string;
+          routingKey: string;
+          dryRun?: boolean;
+          confirm?: boolean;
+        }) => {
           if (!opts.dryRun && !opts.confirm) {
             console.error('Error: --confirm is required unless --dry-run is set');
             process.exit(1);
@@ -208,10 +201,7 @@ export function registerMaintenanceCommands(
                 (dbUrl ? ' (direct)' : ''),
             );
           }
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 }

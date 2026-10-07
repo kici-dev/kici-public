@@ -91,7 +91,7 @@ If a worker ACKs a job but the scaler then fails to provision an agent (Docker d
 
 ### Worker spawn retries
 
-A worker retries a failed agent spawn for a rerouted job, within a budget the coordinator sends on `job.reroute` (`spawnRetry: { maxAttempts, backoffMs }`, resolved from the org's `reroute_spawn_max_attempts` / `reroute_spawn_retry_backoff_ms`). A worker that receives no budget, from an older coordinator, applies its own cluster defaults.
+A worker retries a failed agent spawn for a rerouted job, within a budget the coordinator sends on `job.reroute` (`spawnRetry: { maxAttempts, backoffMs }`, resolved from the org's `reroute_spawn_max_attempts` / `reroute_spawn_retry_backoff_ms`).
 
 - **One spawn at a time.** Every scaler request for the job passes a per-job attempt gate. While a spawn is in flight, or during the backoff after a failure, the gate skips the job, so a capacity-freed re-drive cannot start a second spawn. When the backoff ends, the worker offers the job to its scaler again. The gate records which agent the in-flight spawn creates, and only that spawn's failure counts against the budget. A failure from an earlier spawn whose job was handed to another agent and then requeued is ignored, so it cannot open the gate while a newer spawn is in flight.
 - **A verdict on every failure.** The worker relays each `scaler.failed` for the job on `scaler.event` with `final: false` while attempts remain and `final: true` on the last one. A failure that arrives after an agent received the job is not a spawn failure, and its relay carries no verdict. A second report of the same failed spawn also carries no verdict, so the coordinator counts each spawn once.
@@ -154,7 +154,7 @@ The coordinator holds S3 credentials and generates pre-signed URLs. Workers and 
 
 ## Version compatibility
 
-Version compatibility uses a two-layer approach: a protocol version integer as the baseline gate, and capability flags for per-feature negotiation.
+Version compatibility uses a protocol version integer as the baseline gate. Capability schemas carry per-connection data above it.
 
 ### Protocol version (baseline gate)
 
@@ -164,18 +164,17 @@ Defined in `packages/engine/src/protocol/version.ts` as `PROTOCOL_VERSION` and `
 - **Coordinator-worker:** Peer handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 - **Agent-orchestrator:** Agent handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 
-Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION` are both `3`: a peer on protocol 2 (an orchestrator, agent or peer from the 0.8.x line — 0.8.0 already sent `2`) or older is refused at connect with `WS_CLOSE_PROTOCOL_ERROR` and the reason `Unsupported protocol version`. Version 3 exists because a version-2 peer cannot parse the 0.9.0 `trust_policy.update` policy, peer heartbeat and `artifacts.upload.complete` frames.
+Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION` are both `4`: a peer on protocol 3 (an orchestrator, agent or peer from 0.15.x or earlier) or older is refused at connect with `WS_CLOSE_PROTOCOL_ERROR` and the reason `Unsupported protocol version`. Version 4 exists because it requires message fields that a version-3 peer may omit.
 
 The minimum accepted version is pinned to the current version, so raising `PROTOCOL_VERSION` raises the floor: every node must be upgraded in the same window, and no down-convert path for an older peer exists.
 
-### Capability flags (per-feature negotiation)
-
-Above the protocol version baseline, individual features are negotiated via capability flags:
+### Capability schemas
 
 - **Peer capabilities** (`peerCapabilitiesSchema`): exchanged in `peer.auth.response` and `peer.heartbeat`. Current flags: `s3LogAccess`, `logRoutingOverride`.
-- **Orchestrator capabilities** (`orchCapabilitiesSchema`): sent in `auth.request`.
-- **Platform capabilities** (`platformCapabilitiesSchema`): advertised once after authentication as a standalone `platform.capabilities` message, not as a field on `auth.success`. A self-hosted orchestrator can run ahead of the hosted Platform, so it pre-flight-checks its own feature-gated sends against what the Platform advertises.
-- **Orchestrator to agent capabilities** (`orchAgentCapabilitiesSchema`): advertised on `register.ack`, so the agent learns which optional agent-facing features this orchestrator build supports.
+- **Orchestrator capabilities** (`orchCapabilitiesSchema`): sent in `auth.request`. They carry the orchestrator's role and its dashboard settings: `orchRole`, `dashboardWrites`, `dashboardEncryptionKey` and `dashboardVerifiedIssuer`.
+- **Platform capabilities** (`platformCapabilitiesSchema`): advertised once after authentication as a standalone `platform.capabilities` message. Protocol 4 defines no flag.
+- **Orchestrator to agent capabilities** (`orchAgentCapabilitiesSchema`): advertised on `register.ack`. Protocol 4 defines no flag.
+- **Agent to orchestrator capabilities** (`agentCapabilitiesSchema`): advertised on `agent.register`. Protocol 4 defines no flag.
 
 Schemas use `.passthrough()` so newer peers sending unknown flags don't get stripped. Missing flags default to `false` (unsupported).
 
@@ -183,9 +182,9 @@ Schemas use `.passthrough()` so newer peers sending unknown flags don't get stri
 
 Both sides send `softwareVersion` in the peer auth handshake for logging and debugging. It is not used for compatibility gating. `peer.hello` lists the authentication schemes the accepting side supports (`authSchemes`), and both sides require `mutual-v2`. Every coordinator and worker in a cluster runs a release with mutual peer authentication, so upgrade them together: an orchestrator with it and an older one do not connect to each other.
 
-### CLI capability probe (REST)
+### Capability manifest (REST)
 
-The CLI runs over REST, not WebSocket, so it does not receive the WS-layer capability handshake. Instead, the orchestrator exposes a public `GET /api/v1/capabilities` endpoint that returns the same three version fields (`orchestratorVersion`, `protocolVersion`, `minProtocolVersion`). When the CLI detects a capability gap — e.g. an older orchestrator that returns 404 for the logs endpoint — it fetches this manifest on demand and formats an actionable error via `formatCapabilityGapError` (`packages/compiler/src/errors/capability-gap.ts`) showing the feature name, the CLI version, the orchestrator version, and upgrade guidance. The endpoint is unauthenticated, matching the security posture of `/health`, because the CLI must be able to read it even when its authenticated calls fail.
+A REST client does not receive the WS-layer capability handshake. The orchestrator exposes a public `GET /api/v1/capabilities` endpoint that returns the same three version fields (`orchestratorVersion`, `protocolVersion`, `minProtocolVersion`). The endpoint is unauthenticated, matching the security posture of `/health`, so a client can read the versions even when its authenticated calls fail.
 
 ## Stale eviction
 

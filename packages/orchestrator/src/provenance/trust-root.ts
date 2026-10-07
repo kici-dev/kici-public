@@ -10,15 +10,14 @@ export function deriveJwksUri(issuer: string): string {
 }
 
 /**
- * The orchestrator's view of the provenance trust root. The issuer arrives over
- * the `auth.success` connect message for the live process, or from config/env
- * (`KICI_PROVENANCE_ISSUER`) for the CLI backfill which has no live handshake.
- * The JWKS is fetched lazily and cached with a single refetch-on-`kid`-miss.
+ * The orchestrator's view of the provenance trust root. The issuer is fixed at
+ * construction: the orchestrator's own signing issuer, the local dev plane's
+ * `kici-local`, or the configured `KICI_PROVENANCE_ISSUER`. The JWKS is fetched
+ * lazily and cached with a single refetch-on-`kid`-miss.
  */
 export interface ProvenanceTrustRoot {
   getIssuer(): string | null;
   getJwks(kid?: string): Promise<JSONWebKeySet | null>;
-  setIssuer(issuer: string | null): void;
 }
 
 /**
@@ -39,9 +38,6 @@ export function provenanceTrustRootFromRepo(
       const rows = await repo.listTrusted();
       return { keys: rows.map((r) => r.public_jwk) } as JSONWebKeySet;
     },
-    setIssuer: () => {
-      // The orchestrator's own issuer is fixed by config; ignore live mutations.
-    },
   };
 }
 
@@ -61,19 +57,15 @@ export function createProvenanceTrustRoot(
 ): ProvenanceTrustRoot {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const ttlMs = opts.ttlMs ?? 5 * 60_000;
-  let issuer: string | null = opts.issuer ?? null;
+  const issuer: string | null = opts.issuer ?? null;
   let cache: { jwks: JSONWebKeySet; at: number } | null = null;
 
-  // Static in-process JWKS (local dev plane): serve it directly, ignore issuer
-  // mutations of the key set (the issuer stays `kici-local`), and never fetch.
+  // Static in-process JWKS (local dev plane): serve it directly, never fetch.
   if (opts.staticJwks) {
     const staticJwks = opts.staticJwks;
     return {
       getIssuer: () => issuer,
       getJwks: async () => staticJwks,
-      setIssuer: (next) => {
-        issuer = next;
-      },
     };
   }
 
@@ -103,10 +95,6 @@ export function createProvenanceTrustRoot(
       // A refetch happened above; return whatever the fresh set is even if the
       // requested kid is still absent (the verifier decides; one refetch only).
       return jwks;
-    },
-    setIssuer: (next) => {
-      if (next !== issuer) cache = null;
-      issuer = next;
     },
   };
 }

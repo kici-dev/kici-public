@@ -18,9 +18,8 @@ import type { Kysely } from 'kysely';
 import { createLogger } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import { OrchestratorSigningKeyRepo } from '../db/repos/signing-keys-repo.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import { handleAdminError } from './admin-errors.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-signing-keys' });
 
@@ -29,29 +28,15 @@ export interface AdminSigningKeyRoutesDeps {
   rbac: RbacEnforcer;
 }
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
 export function createAdminSigningKeyRoutes(deps: AdminSigningKeyRoutesDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
   const repo = new OrchestratorSigningKeyRepo(deps.db);
 
-  app.get('/signing-keys', async (c) => {
-    try {
-      // fails-when: a routing-key-scoped token reads the orchestrator-wide list.
-      // breaks-if-wrong: an unscoped owner or admin token must still read it.
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      return c.json({ keys: await repo.listTrustedMetadata() });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+  // fails-when: a routing-key-scoped token reads the orchestrator-wide list.
+  // breaks-if-wrong: an unscoped owner or admin token must still read it.
+  app.get('/signing-keys', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    return c.json({ keys: await repo.listTrustedMetadata() });
   });
 
   return app;

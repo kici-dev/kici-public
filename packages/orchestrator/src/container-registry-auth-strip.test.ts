@@ -50,7 +50,7 @@ describe('containerRegistryAuth never reaches the agent inside jobConfig', () =>
         sha: 's1',
         jobConfig: { containerRegistryAuth: REGISTRY_AUTH, npmRegistries: [{ url: 'r' }] },
       },
-      { messageId: 'm-1', timestamp: 1 },
+      { messageId: 'm-1', timestamp: 1, concurrencyWaitTimeoutMs: 1_000 },
     );
     expect(dispatch.jobConfig).not.toHaveProperty('containerRegistryAuth');
     expect(dispatch.jobConfig).not.toHaveProperty('npmRegistries');

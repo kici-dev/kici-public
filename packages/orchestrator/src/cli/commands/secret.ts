@@ -2,145 +2,34 @@
  * Secret management commands for kici-admin.
  *
  * Provides scoped secret operations:
- *   secret scopes, list, set, delete, fix-prefixed-scopes
+ *   secret scopes, list, set, delete
  *   secret scope create|rename|delete
  *
  * Secret values are write-only -- there is no "get value" command.
  */
 
 import type { Command } from 'commander';
-import type { Kysely } from 'kysely';
 import type { AdminApiClient } from '../api-client.js';
-import { setContextSecretDirect, toErrorMessage } from '@kici-dev/shared';
+import { setContextSecretDirect } from '@kici-dev/shared';
 import { assertValidSecretKey } from '@kici-dev/engine';
 import { resolveSecretInput, fingerprintValue } from './shared/secret-input.js';
-import { createPool, createDb } from '../../db/client.js';
-import { PgSecretStore, SecretScopeExistsError } from '../../secrets/pg-secret-store.js';
-import { AuditLogger } from '../../secrets/audit-logger.js';
-import { loadSecretStoreConfig } from '../../secrets/config.js';
-import { DEFAULT_BACKEND_NAME } from '../../secrets/scope-routing.js';
 import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
 import { confirmPrompt } from './shared/confirm.js';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
-
-/** One planned rename from a stored qualified scope to its bare path. */
-export interface PrefixedScopeRename {
-  from: string;
-  to: string;
-  backendName: string;
-}
-
-/** One stored scope that cannot be repaired automatically. */
-export interface PrefixedScopeSkip {
-  scope: string;
-  reason: string;
-}
-
-/** Outcome of planning the repair of legacy qualifier-bearing scopes. */
-export interface PrefixedScopeFixPlan {
-  renames: PrefixedScopeRename[];
-  skips: PrefixedScopeSkip[];
-}
-
-/**
- * Plan the repair of scopes stored with a `<backend>:` qualifier still attached.
- *
- * Before backend-qualified routing landed on the HTTP admin plane, a scope
- * written as `pg:production` was stored verbatim, so the stored name carries a
- * qualifier the resolver now strips before it reaches the store. Such a row is
- * unreachable: every read addresses the bare `production`.
- *
- * Only a `pg:` qualifier is repaired. The scopes handed in come out of the PG
- * store, so a row named `vault:foo` is a PG row wearing another backend's
- * name: renaming it to `foo` would turn it into a genuine PG secret, moving it
- * across a backend boundary and past a `pgCustomerSecrets: false` setting that
- * exists to keep customer secrets out of PG. That is the same cross-backend
- * move the rename route refuses, so it is reported as a skip instead.
- *
- * An unregistered head is left alone entirely -- it is an ordinary (if
- * unusual) scope path, not a stale qualifier.
- *
- * A repair whose bare target already exists is SKIPPED, never merged: merging
- * two scopes would silently overwrite whichever key the two share, and there
- * is no way to tell which value the operator meant to keep.
- *
- * Pure -- no I/O, so the decision table is unit-testable without a database.
- *
- * @param scopes - Scope names as currently stored in the PG backend.
- * @param backendNames - Names of the registered secret backends.
- */
-export function planPrefixedScopeFixes(
-  scopes: string[],
-  backendNames: string[],
-): PrefixedScopeFixPlan {
-  const registered = new Set(backendNames);
-  // Stored scopes are distinct and only the `pg:` head is stripped, so two
-  // repairs can never claim the same destination -- the only collision
-  // possible is with a scope that is ALREADY stored bare.
-  const existing = new Set(scopes);
-  const renames: PrefixedScopeRename[] = [];
-  const skips: PrefixedScopeSkip[] = [];
-
-  for (const scope of scopes) {
-    const colonIdx = scope.indexOf(':');
-    if (colonIdx <= 0) continue;
-    const backendName = scope.slice(0, colonIdx);
-    if (!registered.has(backendName)) continue;
-    const target = scope.slice(colonIdx + 1);
-    if (backendName !== DEFAULT_BACKEND_NAME) {
-      skips.push({
-        scope,
-        reason:
-          `stored in the PG backend under the '${backendName}' qualifier — repairing it here ` +
-          `would move the secret into PG. Copy it into backend '${backendName}' by hand, ` +
-          `then delete this scope`,
-      });
-      continue;
-    }
-    if (target.length === 0) {
-      skips.push({ scope, reason: 'bare qualifier with an empty path — repair by hand' });
-      continue;
-    }
-    if (existing.has(target)) {
-      skips.push({
-        scope,
-        reason: `target scope '${target}' already exists — merge by hand, this command never merges`,
-      });
-      continue;
-    }
-    renames.push({ from: scope, to: target, backendName });
-  }
-
-  return { renames, skips };
-}
-
-/** Open a direct Kysely connection for a break-glass migration command. */
-function openDirectDb(databaseUrl: string): Kysely<any> {
-  return createDb(createPool(databaseUrl));
-}
-
-/** Read the names of every registered secret backend straight from the DB. */
-async function listRegisteredBackendNames(db: Kysely<any>): Promise<string[]> {
-  const rows = (await db.selectFrom('secret_backends').select('name').execute()) as Array<{
-    name: string;
-  }>;
-  return rows.map((r) => r.name);
-}
+import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
+import { ORG_ID_HELP, ORG_LIST_HINT } from './shared/org-id.js';
 
 export function registerSecretCommands(program: Command, getClient: () => AdminApiClient): void {
   const sec = program.command('secret').description('Manage scoped secrets');
 
   sec
-    .command('scopes <orgId>')
+    .command('scopes')
+    .argument('<orgId>', ORG_ID_HELP)
     .description(
       'List secret scopes for an organization, from every registered backend, ' +
         'qualified as <backend>:<path>',
     )
-    .action(async (orgId: string) => {
-      try {
+    .action(
+      cliAction(async (orgId: string) => {
         const { scopes } = await getClient().listScopes(orgId);
         if (scopes.length === 0) {
           console.log('No scopes found.');
@@ -149,17 +38,16 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
         for (const scope of scopes) {
           console.log(`  - ${scope}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   sec
-    .command('list <orgId> <scope>')
+    .command('list')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<scope>')
     .description('List secret key names in a scope (values are never shown)')
-    .action(async (orgId: string, scope: string) => {
-      try {
+    .action(
+      cliAction(async (orgId: string, scope: string) => {
         const { keys } = await getClient().listKeys(orgId, scope);
         if (keys.length === 0) {
           console.log('No secrets found in this scope.');
@@ -168,14 +56,14 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
         for (const key of keys) {
           console.log(`  - ${key}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   sec
-    .command('set [orgId] [scope] [key]')
+    .command('set')
+    .argument('[orgId]', ORG_ID_HELP)
+    .argument('[scope]')
+    .argument('[key]')
     .description(
       'Set a secret value. Positional form: "set <orgId> <scope> <key>". ' +
         'Sugar form (context scope): "set --org <id> --context <env> --key <k>". ' +
@@ -185,7 +73,7 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
     .option('--value <value>', 'Secret value via argv (visible in shell history; prefer --prompt)')
     .option(
       '--org <orgId>',
-      'Org ID (use with --context + --key; mutually exclusive with positional form)',
+      `Org id (use with --context + --key; mutually exclusive with positional form; ${ORG_LIST_HINT})`,
     )
     .option(
       '--context <name>',
@@ -207,26 +95,26 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
       'Direct-DB mode: write encrypted_value verbatim to scoped_secrets (offline; skips HTTP + encryption)',
     )
     .action(
-      async (
-        posOrgId: string | undefined,
-        posScope: string | undefined,
-        posKey: string | undefined,
-        opts: {
-          value?: string;
-          databaseUrl?: string;
-          org?: string;
-          context?: string;
-          key?: string;
-          prompt?: boolean;
-          fromStdin?: boolean;
-          fromFile?: string;
-          fromEnv?: string;
-          trim?: boolean;
-          confirmFingerprint?: string;
-          dryRun?: boolean;
-        },
-      ) => {
-        try {
+      cliAction(
+        async (
+          posOrgId: string | undefined,
+          posScope: string | undefined,
+          posKey: string | undefined,
+          opts: {
+            value?: string;
+            databaseUrl?: string;
+            org?: string;
+            context?: string;
+            key?: string;
+            prompt?: boolean;
+            fromStdin?: boolean;
+            fromFile?: string;
+            fromEnv?: string;
+            trim?: boolean;
+            confirmFingerprint?: string;
+            dryRun?: boolean;
+          },
+        ) => {
           // Resolve (orgId, scope, key) from positional OR sugar form.
           const hasPositional = Boolean(posOrgId || posScope || posKey);
           const hasSugar = Boolean(opts.org || opts.context || opts.key);
@@ -294,19 +182,19 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
             dbUrl,
             client: dbUrl ? undefined : getClient(),
           });
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   sec
-    .command('delete <orgId> <scope> <key>')
+    .command('delete')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<scope>')
+    .argument('<key>')
     .description('Delete a secret')
     .option('--yes', 'Skip confirmation prompt')
-    .action(async (orgId: string, scope: string, key: string, opts: { yes?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (orgId: string, scope: string, key: string, opts: { yes?: boolean }) => {
         if (!opts.yes) {
           const confirmed = await confirmPrompt(
             `Are you sure you want to delete secret '${key}' from scope '${scope}'? [y/N] `,
@@ -318,105 +206,10 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
         }
         await getClient().deleteSecret(orgId, scope, key);
         console.log(`Secret '${key}' deleted from scope '${scope}' for org ${orgId}.`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   registerSecretScopeCommands(sec, getClient);
-
-  sec
-    .command('fix-prefixed-scopes <orgId>')
-    .description(
-      'Repair PG-backend secret scopes stored with a stale pg: qualifier (direct-DB). ' +
-        'Each affected scope is renamed to its bare path, re-encrypting every secret ' +
-        'under the corrected AAD. Exits 2 when any scope needs manual repair.',
-    )
-    .option('--dry-run', 'Print the plan and exit without writing')
-    .option('--database-url <url>', 'Orchestrator DB URL (or KICI_DATABASE_URL)')
-    .action(async (orgId: string, opts: { dryRun?: boolean; databaseUrl?: string }) => {
-      const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
-      if (!dbUrl) {
-        console.error('Error: --database-url or KICI_DATABASE_URL is required (direct-DB only)');
-        process.exit(1);
-        return;
-      }
-      const db = openDirectDb(dbUrl);
-      let skipped = 0;
-      let failed = false;
-      try {
-        const backendNames = await listRegisteredBackendNames(db);
-        const config = loadSecretStoreConfig();
-        const store = await PgSecretStore.create(
-          db,
-          config.masterKey,
-          new AuditLogger(db),
-          config.oldMasterKey,
-        );
-        const plan = planPrefixedScopeFixes(await store.listScopes(orgId), backendNames);
-
-        if (plan.renames.length === 0 && plan.skips.length === 0) {
-          console.log(`No scopes carry a stale backend qualifier for org ${orgId}.`);
-        } else {
-          // The planner's occupancy check reads listScopes, which only sees
-          // scopes holding secret rows -- a destination that exists solely as a
-          // context binding is invisible to it, and the store refuses that
-          // rename. Record it as one more manual-repair skip rather than
-          // letting it abort the loop: one collision must not block every scope
-          // queued behind it, and the operator would have no way to finish the
-          // repair.
-          const allSkips = [...plan.skips];
-          let repaired = 0;
-          for (const r of plan.renames) {
-            console.log(
-              opts.dryRun
-                ? `[dry-run] would rename '${r.from}' -> '${r.to}' (backend '${r.backendName}')`
-                : `Renaming '${r.from}' -> '${r.to}' (backend '${r.backendName}')`,
-            );
-            if (opts.dryRun) {
-              repaired++;
-              continue;
-            }
-            try {
-              // renameScope re-encrypts every row: the AAD binds the scope name,
-              // so a plain SQL UPDATE would leave the ciphertext undecryptable.
-              await store.renameScope(orgId, r.from, r.to);
-              repaired++;
-            } catch (err) {
-              if (!(err instanceof SecretScopeExistsError)) throw err;
-              allSkips.push({
-                scope: r.from,
-                reason:
-                  `target scope '${r.to}' already exists — merge by hand, ` +
-                  `this command never merges`,
-              });
-            }
-          }
-          for (const s of allSkips) {
-            console.error(`SKIPPED '${s.scope}': ${s.reason}`);
-          }
-
-          console.log(
-            `${opts.dryRun ? '[dry-run] ' : ''}${repaired} scope(s) repaired, ` +
-              `${allSkips.length} skipped.`,
-          );
-          skipped = allSkips.length;
-        }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        failed = true;
-      } finally {
-        // Every exit path must close the pool: its idle client holds an open
-        // socket, so an undestroyed pool keeps the event loop alive and the
-        // command hangs instead of returning to the shell.
-        await db.destroy();
-      }
-      if (failed) process.exit(1);
-      // Exit 2 signals "some scopes still need a human" so a deploy script can
-      // distinguish it from a hard failure (1) and from a clean repair (0).
-      if (skipped > 0) process.exit(2);
-    });
 }
 
 /**
@@ -428,72 +221,74 @@ function registerSecretScopeCommands(sec: Command, getClient: () => AdminApiClie
   const scope = sec.command('scope').description('Create, rename or delete a secret scope');
 
   scope
-    .command('create <orgId> <scope>')
+    .command('create')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<scope>')
     .description(
       'Create an empty secret scope. A <backend>: qualifier selects the backend; an ' +
         'unqualified scope targets the PG backend. An existing scope stays unchanged.',
     )
     .option('--json', 'Emit JSON output')
-    .action(async (orgId: string, scopeName: string, opts: { json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (orgId: string, scopeName: string, opts: { json?: boolean }) => {
         const result = await getClient().createScope(orgId, scopeName);
         if (opts.json) {
           console.log(JSON.stringify(result));
         } else {
           console.log(`Secret scope '${scopeName}' created for org ${orgId}.`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   scope
-    .command('rename <orgId> <oldScope> <newScope>')
+    .command('rename')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<oldScope>')
+    .argument('<newScope>')
     .description(
       'Rename a secret scope inside its backend. Refuses a move between backends and a ' +
         'rename onto a scope that already exists.',
     )
     .option('--json', 'Emit JSON output')
-    .action(async (orgId: string, oldScope: string, newScope: string, opts: { json?: boolean }) => {
-      try {
-        const result = await getClient().renameScope(orgId, oldScope, newScope);
-        if (opts.json) {
-          console.log(JSON.stringify(result));
-        } else {
-          console.log(`Secret scope '${oldScope}' renamed to '${newScope}' for org ${orgId}.`);
-        }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+    .action(
+      cliAction(
+        async (orgId: string, oldScope: string, newScope: string, opts: { json?: boolean }) => {
+          const result = await getClient().renameScope(orgId, oldScope, newScope);
+          if (opts.json) {
+            console.log(JSON.stringify(result));
+          } else {
+            console.log(`Secret scope '${oldScope}' renamed to '${newScope}' for org ${orgId}.`);
+          }
+        },
+      ),
+    );
 
   scope
-    .command('delete <orgId> <scope>')
+    .command('delete')
+    .argument('<orgId>', ORG_ID_HELP)
+    .argument('<scope>')
     .description('Delete a secret scope and every secret in it')
     .option('--yes', 'Skip confirmation prompt')
     .option('--json', 'Emit JSON output')
-    .action(async (orgId: string, scopeName: string, opts: { yes?: boolean; json?: boolean }) => {
-      try {
-        if (!opts.yes) {
-          const confirmed = await confirmPrompt(
-            `Are you sure you want to delete scope '${scopeName}' and every secret in it? [y/N] `,
-          );
-          if (!confirmed) {
-            console.log('Aborted.');
-            return;
+    .action(
+      cliAction(
+        async (orgId: string, scopeName: string, opts: { yes?: boolean; json?: boolean }) => {
+          if (!opts.yes) {
+            const confirmed = await confirmPrompt(
+              `Are you sure you want to delete scope '${scopeName}' and every secret in it? [y/N] `,
+            );
+            if (!confirmed) {
+              console.log('Aborted.');
+              return;
+            }
           }
-        }
-        const result = await getClient().deleteScope(orgId, scopeName);
-        if (opts.json) {
-          console.log(JSON.stringify(result));
-        } else {
-          console.log(`Secret scope '${scopeName}' deleted for org ${orgId}.`);
-        }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+          const result = await getClient().deleteScope(orgId, scopeName);
+          if (opts.json) {
+            console.log(JSON.stringify(result));
+          } else {
+            console.log(`Secret scope '${scopeName}' deleted for org ${orgId}.`);
+          }
+        },
+      ),
+    );
 }

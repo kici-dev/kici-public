@@ -24,10 +24,32 @@ import {
   createCipheriv,
 } from 'node:crypto';
 
+/** A pending hold with no clauses: any actor the self-approval gate admits may decide it. */
+function mockApprovals() {
+  return {
+    store: {
+      getById: vi.fn().mockResolvedValue({
+        id: 'held-1',
+        run_id: 'run-1',
+        org_id: 'org-1',
+        status: 'pending',
+        hold_scope: 'job',
+        approval_requirement: { clauses: [], expiresAt: '', reason: '' },
+      }),
+      listDecisions: vi.fn().mockResolvedValue([]),
+      recordDecision: vi.fn().mockResolvedValue(undefined),
+      recordAndRelease: vi.fn().mockResolvedValue({ heldRunId: 'held-1', runId: 'run-1' }),
+    } as any,
+    teamMembershipLookup: () => new Set<string>(),
+    resumeJob: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function createMockDeps(): DashboardContextHandlerDeps & { sent: unknown[] } {
   const sent: unknown[] = [];
   return {
     orgId: 'org-1',
+    approvals: mockApprovals(),
     send: (msg: unknown) => sent.push(msg),
     contextStore: {
       list: vi.fn().mockResolvedValue([
@@ -647,11 +669,12 @@ describe('DashboardContextHandler', () => {
       const handled = await handler.handleMessage({
         type: 'dashboard.held-runs.approve',
         requestId: 'req-h1',
+        actor: { type: 'user', sub: 'kc-approver' },
         heldRunId: 'held-1',
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      expect(deps.db.updateTable).toHaveBeenCalledWith('held_runs');
+      expect(deps.approvals.store.recordAndRelease).toHaveBeenCalled();
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.held-runs.approve.response');
       expect(resp.error).toBeUndefined();
@@ -998,7 +1021,7 @@ describe('DashboardContextHandler', () => {
   //   (1) `approved_by: 'dashboard-user'` is hardcoded instead of derived
   //       from `stringifyActor(msg.actor)`. Attribution is lost in the
   //       `held_runs.approved_by` column but the access log still records
-  //       the Platform-supplied actor via `recordAccess`. That is an
+  //       the Platform-supplied actor via its access recorder. That is an
   //       audit-integrity question, not a tenant-isolation one.
   //   (2) No orch-side automatic dispatch resume mechanism was found wiring
   //       `held_runs.status -> approved` back into `dispatch_queue` /
@@ -1006,50 +1029,36 @@ describe('DashboardContextHandler', () => {
   //       dispatch consequence on this orchestrator without a separate
   // webhook re-trigger or rerun.
   describe('tenant-isolation invariants under a rogue Platform', () => {
-    it('SQL UPDATE filters by org_id, id, and status=pending (tenant-isolation gate)', async () => {
-      // Drive the handler with a forged heldRunId. The mock db.where chain is
-      // fluent (returns this), so we read `db.where.mock.calls` to confirm
-      // every filter on the gate is applied.
+    it('looks the hold up under the connection org (tenant-isolation gate)', async () => {
+      // fails-when: the approve path reads the hold without the org filter.
       await handler.handleMessage({
         type: 'dashboard.held-runs.approve',
         requestId: 'req-isolation-1',
+        actor: { type: 'user', sub: 'kc-approver' },
         heldRunId: 'forged-held-id',
       } as DashboardPlatformToOrchMessage);
 
-      const whereCalls = (deps.db.where as ReturnType<typeof vi.fn>).mock.calls;
-      // The handler chains three .where(...) calls before .executeTakeFirst.
-      // We assert each filter pair is present (column, op, value).
-      expect(whereCalls).toEqual(
-        expect.arrayContaining([
-          ['id', '=', 'forged-held-id'],
-          ['org_id', '=', deps.orgId],
-          ['status', '=', 'pending'],
-        ]),
-      );
+      expect(deps.approvals.store.getById).toHaveBeenCalledWith(deps.orgId, 'forged-held-id');
     });
 
-    it('no rows updated → error response without further side effects', async () => {
-      // The handler first reads the dashboard-write policy (org_settings row,
-      // permissive default), then runs the held_runs UPDATE. Queue both
-      // executeTakeFirst results so the test is independent of the policy
-      // read cache: empty policy row, then a zero-row UPDATE result.
-      (deps.db.executeTakeFirst as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce(undefined)
-        .mockResolvedValueOnce({ numUpdatedRows: 0n });
+    it('an unknown or resolved hold → error response without further side effects', async () => {
+      (deps.approvals.store.getById as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
 
       await handler.handleMessage({
         type: 'dashboard.held-runs.approve',
         requestId: 'req-not-found',
+        actor: { type: 'user', sub: 'kc-approver' },
         heldRunId: 'forged-or-already-resolved',
       } as DashboardPlatformToOrchMessage);
 
       const resp = deps.sent[0] as { type: string; requestId: string; error?: string };
       expect(resp.type).toBe('dashboard.held-runs.approve.response');
       expect(resp.requestId).toBe('req-not-found');
-      expect(resp.error).toBe('Held run not found or already resolved');
+      expect(resp.error).toMatch(/not found or already resolved/i);
 
       // Single response sent; no side effects on any other store.
       expect(deps.sent).toHaveLength(1);
+      expect(deps.approvals.store.recordAndRelease).not.toHaveBeenCalled();
       expect(deps.contextStore.create).not.toHaveBeenCalled();
       expect(deps.variableStore.setVar).not.toHaveBeenCalled();
       expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
@@ -1188,7 +1197,7 @@ describe('DashboardContextHandler', () => {
     it('falls back to the connection org for the held-runs list when no orgId is carried', async () => {
       const handled = await handler.handleMessage({
         type: 'dashboard.held-runs.list',
-        requestId: 'req-hr-list-legacy',
+        requestId: 'req-hr-list-connection-org',
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
@@ -1199,15 +1208,15 @@ describe('DashboardContextHandler', () => {
       const handled = await handler.handleMessage({
         type: 'dashboard.held-runs.approve',
         requestId: 'req-hr-approve',
+        actor: { type: 'user', sub: 'kc-approver' },
         heldRunId: 'hold-1',
         orgId: 'org-remote',
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // The update path filters by the request org so a remote run's hold
-      // (recorded under its `remote_sources` org) is resolvable.
-      expect(deps.db.where).toHaveBeenCalledWith('org_id', '=', 'org-remote');
-      expect(deps.db.where).not.toHaveBeenCalledWith('org_id', '=', 'org-1');
+      // The hold lookup uses the request org so a remote run's hold (recorded
+      // under its `remote_sources` org) is resolvable.
+      expect(deps.approvals.store.getById).toHaveBeenCalledWith('org-remote', 'hold-1');
     });
   });
 
@@ -1465,15 +1474,9 @@ describe('DashboardContextHandler held-runs list hold types', () => {
     return resp.heldRuns[0].holdType;
   }
 
-  it('normalizes a legacy persisted hold type onto the wire', async () => {
-    // A row written by an un-upgraded orchestrator (or before the backfill)
-    // must still render correctly — this is what lets the migration ship
-    // without a lockstep deploy.
-    expect(await listHoldType('wait_timer')).toBe(HoldType.enum.timer);
-  });
-
-  it('normalizes the legacy reviewer spelling onto the wire', async () => {
-    expect(await listHoldType('approval')).toBe(HoldType.enum.reviewer);
+  it('emits a retired spelling verbatim: migration 158 rewrote every stored row', async () => {
+    // fails-when: a reader still maps the retired spelling onto the gate vocabulary.
+    expect(await listHoldType('wait_timer')).toBe('wait_timer');
   });
 
   it('passes a current hold type through untouched', async () => {
@@ -1764,5 +1767,255 @@ describe('DashboardContextHandler held-runs list hold types', () => {
       });
       expect(h.accessLogRecord.mock.calls[0][0].errorMessage).toContain('dispatcher exploded');
     });
+  });
+});
+
+/**
+ * Pins the access_log row and response frame of every single-call handler, so a
+ * refactor of the shared record / respond skeleton cannot move an audit field.
+ */
+describe('DashboardContextHandler access_log rows', () => {
+  const actor: ActorPrincipal = { type: 'user', sub: 'u-pin' };
+  type Deps = ReturnType<typeof createMockDeps>;
+  interface Case {
+    msg: Record<string, unknown>;
+    action: string;
+    target: { type: string; id: string };
+    /** Make the op's store call throw. */
+    fail: (deps: Deps) => void;
+    /** Extra deps the success path needs. */
+    prepare?: (deps: Deps) => void;
+  }
+  const reject = () => vi.fn().mockRejectedValue(new Error('store down'));
+  const scopeOps = (deps: Deps) => {
+    Object.assign(deps.secretStore, {
+      createScope: vi.fn().mockResolvedValue(undefined),
+      renameScope: vi.fn().mockResolvedValue(undefined),
+      deleteScope: vi.fn().mockResolvedValue(undefined),
+    });
+  };
+  const cases: Case[] = [
+    {
+      msg: { type: 'dashboard.contexts.list' },
+      action: 'context.list.read',
+      target: { type: 'context', id: 'org-1' },
+      fail: (d) => (d.contextStore.list = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.variables.list', contextId: 'env-1' },
+      action: 'context_var.list.read',
+      target: { type: 'context', id: 'env-1' },
+      fail: (d) => (d.variableStore.listVars = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.variables.delete', contextId: 'env-1', key: 'K' },
+      action: 'context_var.delete',
+      target: { type: 'context', id: 'env-1:K' },
+      fail: (d) => (d.variableStore.deleteVar = reject()),
+    },
+    {
+      msg: {
+        type: 'dashboard.contexts.source-overrides.list',
+        contextId: 'env-1',
+        routingKey: 'github:o/r',
+      },
+      action: 'source_override.list.read',
+      target: { type: 'context', id: 'env-1:github:o/r' },
+      fail: (d) => (d.variableStore.listSourceOverrides = reject()),
+    },
+    {
+      msg: {
+        type: 'dashboard.contexts.source-overrides.set',
+        contextId: 'env-1',
+        routingKey: 'github:o/r',
+        key: 'K',
+        value: 'v',
+      },
+      action: 'source_override.set',
+      target: { type: 'context', id: 'env-1:github:o/r:K' },
+      fail: (d) => (d.variableStore.setSourceOverride = reject()),
+    },
+    {
+      msg: {
+        type: 'dashboard.contexts.source-overrides.delete',
+        contextId: 'env-1',
+        routingKey: 'github:o/r',
+        key: 'K',
+      },
+      action: 'source_override.delete',
+      target: { type: 'context', id: 'env-1:github:o/r:K' },
+      fail: (d) => (d.variableStore.deleteSourceOverride = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.bindings.list', contextId: 'env-1' },
+      action: 'context_binding.list.read',
+      target: { type: 'context', id: 'env-1' },
+      fail: (d) => (d.bindingStore.list = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.bindings.set', contextId: 'env-1', bindings: [] },
+      action: 'context_binding.set',
+      target: { type: 'context', id: 'env-1' },
+      fail: (d) => (d.bindingStore.set = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.secrets.list' },
+      action: 'secret.list.read',
+      target: { type: 'secret_scope', id: 'org-1' },
+      fail: (d) => (d.loadBackendStores = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.secrets.delete', scope: 'aws/prod', key: 'K' },
+      action: 'secret.delete',
+      target: { type: 'secret_scope', id: 'aws/prod:K' },
+      fail: (d) => (d.secretStore.deleteSecret = reject()),
+    },
+    {
+      msg: { type: 'dashboard.contexts.secrets.scope.create', scope: 'aws/new' },
+      action: 'secret_scope.create',
+      target: { type: 'secret_scope', id: 'aws/new' },
+      prepare: scopeOps,
+      fail: () => undefined, // the mock store has no createScope
+    },
+    {
+      msg: {
+        type: 'dashboard.contexts.secrets.scope.rename',
+        oldScope: 'aws/old',
+        newScope: 'aws/new',
+      },
+      action: 'secret_scope.rename',
+      target: { type: 'secret_scope', id: 'aws/old->aws/new' },
+      prepare: scopeOps,
+      fail: () => undefined, // the mock store has no renameScope
+    },
+    {
+      msg: { type: 'dashboard.contexts.secrets.scope.delete', scope: 'aws/old' },
+      action: 'secret_scope.delete',
+      target: { type: 'secret_scope', id: 'aws/old' },
+      prepare: scopeOps,
+      fail: () => undefined, // the mock store has no deleteScope
+    },
+    {
+      msg: { type: 'dashboard.contexts.history', contextId: 'env-1' },
+      action: 'context.history.read',
+      target: { type: 'context', id: 'env-1' },
+      fail: (d) => Object.assign(d.db, { execute: reject() }),
+    },
+    {
+      msg: { type: 'dashboard.held-runs.list' },
+      action: 'held_run.list.read',
+      target: { type: 'held_run', id: 'org-1' },
+      fail: (d) => Object.assign(d.db, { execute: reject() }),
+    },
+  ];
+
+  const gated: Record<string, string> = {
+    'dashboard.contexts.variables.delete': 'variables.delete',
+    'dashboard.contexts.source-overrides.set': 'contexts.source_overrides.set',
+    'dashboard.contexts.source-overrides.delete': 'contexts.source_overrides.delete',
+    'dashboard.contexts.bindings.set': 'contexts.bindings.set',
+    'dashboard.contexts.secrets.delete': 'secrets.delete',
+    'dashboard.contexts.secrets.scope.create': 'secrets.scope.create',
+    'dashboard.contexts.secrets.scope.rename': 'secrets.scope.rename',
+    'dashboard.contexts.secrets.scope.delete': 'secrets.scope.delete',
+  };
+
+  async function drive(c: Case, mode: 'ok' | 'fail' | 'denied') {
+    invalidateDashboardWritePolicyCache();
+    const deps = createMockDeps();
+    const record = vi.fn().mockResolvedValue(undefined);
+    deps.accessLog = { record } as never;
+    deps.routingKey = 'rk-bound';
+    if (mode === 'fail') c.fail(deps);
+    else c.prepare?.(deps);
+    if (mode === 'denied') {
+      (
+        deps.db as unknown as { executeTakeFirst: ReturnType<typeof vi.fn> }
+      ).executeTakeFirst.mockResolvedValueOnce({
+        dashboard_write_policy: { [gated[c.msg.type as string]]: 'disabled' },
+      });
+    }
+    const handler = new DashboardContextHandler(deps);
+    await handler.handleMessage({
+      ...c.msg,
+      requestId: 'req-pin',
+      actor,
+    } as unknown as DashboardPlatformToOrchMessage);
+    await vi.waitFor(() => expect(record).toHaveBeenCalled());
+    return { deps, sent: deps.sent as Array<Record<string, unknown>>, record };
+  }
+
+  /** The one row an op must write: the bound scope, the case's action and target. */
+  function expectOneRow(
+    record: ReturnType<typeof vi.fn>,
+    c: Case,
+    outcome: string,
+    errorMessage: string | null,
+  ) {
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record).toHaveBeenCalledWith({
+      orgId: 'org-1',
+      routingKey: 'rk-bound',
+      actor,
+      action: c.action,
+      target: c.target,
+      requestId: 'req-pin',
+      source: 'platform_proxy',
+      outcome,
+      errorMessage,
+    });
+  }
+
+  // fails-when: any op's allowed row changes org, routing key, action, target or source
+  it.each(cases)('$msg.type records one allowed row and answers once', async (c) => {
+    const { sent, record } = await drive(c, 'ok');
+    expectOneRow(record, c, 'allowed', null);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: `${c.msg.type}.response`, requestId: 'req-pin' });
+    expect(Object.keys(sent[0]).slice(0, 2)).toEqual(['type', 'requestId']);
+    expect(sent[0].error).toBeUndefined();
+  });
+
+  // fails-when: a policy-disabled write runs its store call, or records anything but one denied row
+  it.each(cases.filter((c) => gated[c.msg.type as string]))(
+    '$msg.type is refused with one denied row when its operation is disabled',
+    async (c) => {
+      const op = gated[c.msg.type as string];
+      const { deps, sent, record } = await drive(c, 'denied');
+      expectOneRow(record, c, 'denied', `operation_disabled:${op}`);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({
+        requestId: 'req-pin',
+        error: 'operation_disabled',
+        operation: op,
+      });
+      const stores = [deps.variableStore, deps.bindingStore, deps.secretStore] as unknown as Array<
+        Record<string, ReturnType<typeof vi.fn>>
+      >;
+      for (const store of stores) {
+        for (const [name, fn] of Object.entries(store)) {
+          if (/^(set|delete|create|rename)/.test(name)) expect(fn, name).not.toHaveBeenCalled();
+        }
+      }
+    },
+  );
+
+  // fails-when: a failing op records allowed, drops its error message, or sends no error frame
+  it.each(cases)('$msg.type records one error row and an error frame on failure', async (c) => {
+    const { sent, record } = await drive(c, 'fail');
+    expect(record).toHaveBeenCalledTimes(1);
+    const row = record.mock.calls[0][0];
+    expect(row).toMatchObject({
+      orgId: 'org-1',
+      routingKey: 'rk-bound',
+      action: c.action,
+      target: c.target,
+      outcome: 'error',
+      source: 'platform_proxy',
+    });
+    expect(typeof row.errorMessage).toBe('string');
+    expect(sent).toEqual([
+      { type: `${c.msg.type}.response`, requestId: 'req-pin', error: row.errorMessage },
+    ]);
   });
 });

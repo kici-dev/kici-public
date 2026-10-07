@@ -9,6 +9,7 @@
  */
 
 import { logger } from '@kici-dev/shared';
+import { sleep as defaultSleep } from '@kici-dev/engine';
 
 /** Default sleep before exiting on a fatal startup error. */
 export const STARTUP_BACKOFF_MS = 30_000;
@@ -30,7 +31,7 @@ export async function exitWithStartupBackoff(
   deps: StartupBackoffDeps = {},
 ): Promise<never> {
   const backoffMs = deps.backoffMs ?? STARTUP_BACKOFF_MS;
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const sleep = deps.sleep ?? defaultSleep;
   const exit = deps.exit ?? ((code: number) => process.exit(code));
 
   logger.error(

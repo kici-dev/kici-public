@@ -15,7 +15,6 @@
  */
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
-import { toErrorMessage } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX } from '../../cluster/cluster-identity.js';
 import {
@@ -23,6 +22,7 @@ import {
   type ReconcileDirection,
   type ReconcileS3Config,
 } from '../../cluster/reconcile-identity.js';
+import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 
 interface ReconcileOpts {
   databaseUrl?: string;
@@ -34,12 +34,6 @@ interface ReconcileOpts {
   adoptDb?: boolean;
   dryRun?: boolean;
   yes?: boolean;
-}
-
-function resolveDatabaseUrl(explicit?: string): string {
-  const url = explicit ?? process.env.KICI_DATABASE_URL;
-  if (!url) throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  return url;
 }
 
 function resolveS3(opts: ReconcileOpts): ReconcileS3Config {
@@ -96,8 +90,8 @@ export function registerClusterCommands(program: Command): void {
     .option('--adopt-db', 'Reverse direction: rewrite the sentinel from the DB cluster_id')
     .option('--dry-run', 'Report drift and exit without changing anything')
     .option('--yes', 'Skip confirmation and apply on drift')
-    .action(async (opts: ReconcileOpts) => {
-      try {
+    .action(
+      cliAction(async (opts: ReconcileOpts) => {
         const databaseUrl = resolveDatabaseUrl(opts.databaseUrl);
         const s3 = resolveS3(opts);
         const direction: ReconcileDirection = opts.adoptDb
@@ -118,9 +112,6 @@ export function registerClusterCommands(program: Command): void {
           console.log('No changes made (declined).');
           process.exit(1);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

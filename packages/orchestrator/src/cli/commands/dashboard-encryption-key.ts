@@ -17,7 +17,7 @@
  * DB and is never exportable — recovery from a lost key is a routine rotation.
  */
 import type { Command } from 'commander';
-import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
+import { createLogger, createPool } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
 import { loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
@@ -26,16 +26,9 @@ import { ClusterSettingsReader } from '../../cluster/cluster-settings-reader.js'
 import { jwksUrlFor, resolveVerifiedIssuer } from '../../cluster/verified-issuer.js';
 import { generateDashboardEncryptionKey } from '../../secrets/dashboard-encryption-key.js';
 import { confirmPrompt } from './shared/confirm.js';
+import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 
 const logger = createLogger({ prefix: 'kici-admin-dashboard-encryption-key' });
-
-function resolveDatabaseUrl(explicit?: string): string {
-  const url = explicit ?? process.env.KICI_DATABASE_URL;
-  if (!url) {
-    throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  }
-  return url;
-}
 
 function resolveSecretKey(): string {
   const config = loadConfig();
@@ -97,8 +90,8 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
     .description('Print the active dashboard-encryption key (kid, public JWK, JWKS URLs)')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--json', 'Emit raw JSON')
-    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
         const { row, verifiedUrl } = await withRepo(opts.databaseUrl, async (repo, db) => ({
           row: await repo.getActiveRow(),
           verifiedUrl: await resolveVerifiedIssuer(new ClusterSettingsReader(db)).then((issuer) =>
@@ -150,19 +143,16 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
         console.log(
           `Verified-tier URL:   ${verifiedUrl ?? '(not configured — convenient tier only)'}`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   group
     .command('list')
     .description('List every dashboard-encryption key on record (kid / status / created_at)')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--json', 'Emit raw JSON')
-    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
         const rows = await withRepo(opts.databaseUrl, (repo) => repo.listServed());
         if (opts.json) {
           console.log(
@@ -181,11 +171,8 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
         for (const r of rows) {
           console.log(`${r.kid}  ${r.status.padEnd(8)}  ${r.created_at}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   group
     .command('rotate')
@@ -195,8 +182,8 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--yes', 'Skip the confirmation prompt')
     .option('--dry-run', 'Show what would happen without rotating')
-    .action(async (opts: { databaseUrl?: string; yes?: boolean; dryRun?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; yes?: boolean; dryRun?: boolean }) => {
         const secretKey = resolveSecretKey();
         await withRepo(opts.databaseUrl, async (repo) => {
           await runIdempotentStep(
@@ -215,9 +202,6 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
             { confirm: confirmPrompt, yes: opts.yes, dryRun: opts.dryRun },
           );
         });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

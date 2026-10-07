@@ -108,11 +108,13 @@ kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-
 
 ### Which trust root do I use?
 
-The trust root is **your orchestrator's provenance issuer** — the orchestrator
-you `kici login` against, which owns the provenance signing key and publishes its
-own JWKS. That is the **default**: omit `--trust-root` and the verifier checks the
-bundle against your configured orchestrator automatically. There are three ways to
-verify, and offline is always the primary one:
+The trust root is **your orchestrator's provenance issuer**. The orchestrator owns
+the provenance signing key and publishes its own JWKS. That is the **default**:
+omit `--trust-root` and the verifier checks the bundle against the orchestrator
+URL in the `endpoint` field of the CLI config file (`~/.kici/config`). `kici login`
+does not set that field; it records only the Platform endpoint. With no
+`endpoint` and no `--trust-root`, the command stops and tells you to supply one.
+Verify in either of these ways; offline is always the primary one:
 
 1. **Offline against a JWKS / trust-root file (air-gap)** — export the
    `{ issuer, jwks }` file once with `kici-admin signing-key export --public` and
@@ -121,11 +123,6 @@ verify, and offline is always the primary one:
    resolves your orchestrator's discovery → JWKS. You can also POST a bundle to
    the orchestrator's native `POST /v1/verify-attestation` endpoint for a verdict
    against its live keys (fresh rotations / revocations included).
-3. **Against the hosted KiCI platform** — bundles produced before your
-   orchestrator owned signing were signed by the hosted platform; those keep
-   verifying forever. When no orchestrator is configured, the default falls back
-   to the hosted platform's issuer so those historical bundles still verify with
-   no flag.
 
 You pass `--trust-root` to verify against a different environment or, most
 commonly, an offline `{ issuer, jwks }` file for air-gapped checks.

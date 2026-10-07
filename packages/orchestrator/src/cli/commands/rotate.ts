@@ -6,7 +6,7 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 /** Every store `rotate-key` sweeps, in the order the summary reports them. */
 const STORES: ReadonlyArray<{
@@ -63,8 +63,8 @@ export function registerRotateCommand(program: Command, getClient: () => AdminAp
         'dashboard_encryption_keys, run_ephemeral_keys, run_secret_outputs and the sealed ' +
         'secrets of queued and waiting jobs)',
     )
-    .action(async () => {
-      try {
+    .action(
+      cliAction(async () => {
         const result = await getClient().rotateKey();
         for (const store of STORES) {
           console.log(`Re-encrypted ${store.reEncrypted(result)} ${store.label}.`);
@@ -84,9 +84,6 @@ export function registerRotateCommand(program: Command, getClient: () => AdminAp
               'sealed under a key that is no longer configured.',
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

@@ -31,6 +31,9 @@ import {
   ScalerVmStopOutcome,
   PeerForgetOutcome,
   peerForgetResponseSchema,
+  ScalerReloadOutcome,
+  peerScalerReloadResponseSchema,
+  scalerReloadInstanceResultSchema,
 } from './peer.js';
 import { ScalerEventType } from './scaler-event.js';
 
@@ -415,7 +418,11 @@ describe('peerClusterSettings request/response schemas', () => {
       type: 'peer.clusterSettings.response',
       messageId: 'm1',
       version: 3,
-      settings: { agentTokenTtlMs: 1_800_000 },
+      settings: {
+        agentTokenTtlMs: 1_800_000,
+        firecrackerApiSocketWaitMs: 30_000,
+        concurrencyWaitTimeoutMs: 900_000,
+      },
     };
     expect(peerClusterSettingsResponseSchema.parse(msg)).toEqual(msg);
   });
@@ -425,21 +432,25 @@ describe('peerClusterSettings request/response schemas', () => {
       type: 'peer.clusterSettings.response',
       messageId: 'm1',
       version: 4,
-      settings: { agentTokenTtlMs: 1_800_000, firecrackerApiSocketWaitMs: 45_000 },
+      settings: {
+        agentTokenTtlMs: 1_800_000,
+        firecrackerApiSocketWaitMs: 45_000,
+        concurrencyWaitTimeoutMs: 900_000,
+      },
     };
     expect(peerClusterSettingsResponseSchema.parse(msg)).toEqual(msg);
   });
 
-  it('accepts a snapshot without firecrackerApiSocketWaitMs, as an older leader sends it', () => {
-    // breaks-if-wrong: a required field would reject every pull from a leader
-    // that predates the knob, leaving the worker on stale settings.
-    const parsed = peerClusterSettingsResponseSchema.parse({
-      type: 'peer.clusterSettings.response',
-      messageId: 'm1',
-      version: 3,
-      settings: { agentTokenTtlMs: 1_800_000 },
-    });
-    expect(parsed.settings.firecrackerApiSocketWaitMs).toBeUndefined();
+  it('refuses a snapshot without firecrackerApiSocketWaitMs', () => {
+    // fails-when: the Firecracker wait stays optional in the worker snapshot.
+    expect(
+      peerClusterSettingsResponseSchema.safeParse({
+        type: 'peer.clusterSettings.response',
+        messageId: 'm1',
+        version: 3,
+        settings: { agentTokenTtlMs: 1_800_000, concurrencyWaitTimeoutMs: 900_000 },
+      }).success,
+    ).toBe(false);
   });
 
   it('rejects a response whose settings omit agentTokenTtlMs', () => {
@@ -480,6 +491,7 @@ describe('jobRerouteSchema', () => {
     runsOnLabels: [['linux', 'arm64']],
     triedConnections: ['conn-1'],
     maxHops: 3,
+    spawnRetry: { maxAttempts: 3, backoffMs: 0 },
     coordinatorId: 'orch-1',
   };
 
@@ -916,6 +928,7 @@ describe('peerToPeerMessageSchema', () => {
       runsOnLabels: [['linux']],
       triedConnections: [],
       maxHops: 3,
+      spawnRetry: { maxAttempts: 3, backoffMs: 0 },
       coordinatorId: 'orch-1',
     };
     expect(peerToPeerMessageSchema.parse(msg)).toEqual(msg);
@@ -1068,8 +1081,9 @@ describe('reroute spawn-retry wire fields', () => {
     timestampMs: 1,
   };
 
-  it('job.reroute parses with and without spawnRetry', () => {
-    expect(jobRerouteSchema.parse(reroute).spawnRetry).toBeUndefined();
+  it('job.reroute requires spawnRetry', () => {
+    // fails-when: the spawn-retry budget stays optional.
+    expect(jobRerouteSchema.safeParse(reroute).success).toBe(false);
     expect(
       jobRerouteSchema.parse({ ...reroute, spawnRetry: { maxAttempts: 3, backoffMs: 0 } })
         .spawnRetry,
@@ -1195,5 +1209,71 @@ describe('peer.forget', () => {
         detail: '',
       }).success,
     ).toBe(false);
+  });
+});
+
+describe('peer.scaler.reload', () => {
+  const plan = {
+    added: ['gpu'],
+    updated: ['linux'],
+    unchanged: [],
+    retired: [],
+    resurrected: [],
+    global: ['globalMaxAgents'],
+  };
+
+  it('both unions accept the request and the response', () => {
+    const req = { type: 'peer.scaler.reload.request', messageId: 'r1' };
+    const res = {
+      type: 'peer.scaler.reload.response',
+      messageId: 'r1',
+      outcome: ScalerReloadOutcome.enum.applied,
+      plan,
+    };
+    for (const schema of [peerToPeerMessageSchema, peerFromPeerMessageSchema]) {
+      expect(schema.safeParse(req).success).toBe(true);
+      expect(schema.safeParse(res).success).toBe(true);
+    }
+  });
+
+  // fails-when: an outcome outside the enum is accepted
+  it('rejects an unknown outcome', () => {
+    expect(
+      peerScalerReloadResponseSchema.safeParse({
+        type: 'peer.scaler.reload.response',
+        messageId: 'r',
+        outcome: 'partial',
+      }).success,
+    ).toBe(false);
+    expect(
+      scalerReloadInstanceResultSchema.safeParse({
+        instanceId: 'a',
+        role: 'coordinator',
+        outcome: 'partial',
+      }).success,
+    ).toBe(false);
+  });
+
+  // fails-when: the scaler outcome is stripped from a forwarded config reload answer
+  it('a config reload response carries the scaler outcome', () => {
+    const res = {
+      type: 'peer.config.reload.response',
+      messageId: 'c1',
+      success: true,
+      scaler: { outcome: ScalerReloadOutcome.enum.rejected, errors: ['overlap'] },
+    };
+    expect(peerFromPeerMessageSchema.parse(res)).toEqual(res);
+  });
+
+  // breaks-if-wrong: a rejected answer carries errors and no plan, and must parse
+  it('a rejected response needs no plan', () => {
+    expect(
+      peerScalerReloadResponseSchema.safeParse({
+        type: 'peer.scaler.reload.response',
+        messageId: 'r',
+        outcome: ScalerReloadOutcome.enum.rejected,
+        errors: ['overlap'],
+      }).success,
+    ).toBe(true);
   });
 });

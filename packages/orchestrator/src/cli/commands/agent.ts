@@ -9,6 +9,7 @@ import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
 import { PRIVILEGED_ROOT_LABEL, resolveRoleLabels } from '@kici-dev/engine';
+import { cliAction, DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP } from './shared/cli-action.js';
 
 /**
  * The authorized label scope a static agent token is minted with.
@@ -85,8 +86,8 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
       `Shorthand for --mandatory-label ${PRIVILEGED_ROOT_LABEL}: mint a confined root agent token (the agent must run as uid 0).`,
     )
     .action(
-      async (opts: { labels?: string; mandatoryLabel: string[]; privilegedRoot?: boolean }) => {
-        try {
+      cliAction(
+        async (opts: { labels?: string; mandatoryLabel: string[]; privilegedRoot?: boolean }) => {
           const mandatorySet = new Set<string>(opts.mandatoryLabel);
           if (opts.privilegedRoot) mandatorySet.add(PRIVILEGED_ROOT_LABEL);
           const mandatoryLabels = mandatorySet.size > 0 ? [...mandatorySet] : undefined;
@@ -109,11 +110,8 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
           console.log('');
           console.log('WARNING: Save this token now -- it cannot be recovered after this point.');
           console.log('Set KICI_AGENT_TOKEN on the agent to use this token.');
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   agent
@@ -124,16 +122,16 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
       '--include-pending',
       'Include agents that have connected via WS but have not completed registration (HTTP mode only; direct-DB cannot see in-memory state)',
     )
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
     .action(
-      async (opts: {
-        type?: string;
-        includePending?: boolean;
-        databaseUrl?: string;
-        json?: boolean;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          type?: string;
+          includePending?: boolean;
+          databaseUrl?: string;
+          json?: boolean;
+        }) => {
           const dbUrl = opts.databaseUrl ?? process.env.KICI_DATABASE_URL;
           if (dbUrl && opts.includePending) {
             console.error(
@@ -209,18 +207,15 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
               }
             }
           }
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   agent
     .command('revoke <id>')
     .description('Revoke an agent token by ID')
-    .action(async (id: string) => {
-      try {
+    .action(
+      cliAction(async (id: string) => {
         const { kicked } = await getClient().revokeAgentToken(id);
         // Surface the kick count so the operator knows the
         // revocation actually closed in-flight WS — a 0 count on a
@@ -228,9 +223,6 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
         // (token never connected, or already disconnected on its own).
         const noun = kicked === 1 ? 'connection' : 'connections';
         console.log(`Agent token ${id} revoked (kicked ${kicked} agent ${noun}).`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

@@ -549,7 +549,7 @@ export abstract class BaseColdStore implements ColdStore {
   /**
    * Archive one (tenant, partitionDate).
    *
-   * - Adapters WITHOUT `coldTtlDays`: legacy single-chunk path. Writes one
+   * - Adapters WITHOUT `coldTtlDays`: single-chunk (v1) path. Writes one
    *   chunk per partition at the day-prefix root with a v1 manifest. The
    *   GC sweep treats v1 chunks as `'forever'`.
    * - Adapters WITH `coldTtlDays`: per-bucket path. Buffers all
@@ -570,14 +570,14 @@ export abstract class BaseColdStore implements ColdStore {
     if (adapter.coldTtlDays) {
       return this.archivePartitionBucketed(adapter, tenantId, partitionDate, summary);
     }
-    return this.archivePartitionLegacy(adapter, tenantId, partitionDate, summary);
+    return this.archivePartitionSingleChunk(adapter, tenantId, partitionDate, summary);
   }
 
   /**
-   * Legacy single-chunk-per-partition flow. Adapters that do not
+   * Single-chunk-per-partition (v1) flow. Adapters that do not
    * implement `coldTtlDays` get a v1 manifest at the day-prefix root.
    */
-  private async archivePartitionLegacy(
+  private async archivePartitionSingleChunk(
     adapter: TableAdapter<unknown>,
     tenantId: string,
     partitionDate: string,
@@ -620,7 +620,7 @@ export abstract class BaseColdStore implements ColdStore {
       encoded,
       partitionStart,
       summary,
-      // Legacy v1: no bucket segment, no v2 manifest fields.
+      // Single-chunk (v1): no bucket segment, no v2 manifest fields.
       bucket: undefined,
       maxColdDays: undefined,
     });
@@ -729,7 +729,7 @@ export abstract class BaseColdStore implements ColdStore {
    * Common chunk-write flow: PUT data, verify, PUT manifest, transactional
    * mark-archived-and-delete on the adapter, increment metrics.
    *
-   * Shared by `archivePartitionLegacy` (v1 manifests) and
+   * Shared by `archivePartitionSingleChunk` (v1 manifests) and
    * `archivePartitionBucketed` (v2 manifests with bucket + maxColdDays).
    */
   private async writeChunk(
@@ -748,8 +748,8 @@ export abstract class BaseColdStore implements ColdStore {
     const label = { db: this.db, table: adapter.table };
 
     // Invariant: bucket and maxColdDays travel together. Either both are set
-    // (per-bucket path → v2 manifest) or both are undefined (legacy
-    // single-chunk path → v1 manifest). A misalignment would write a chunk
+    // (per-bucket path → v2 manifest) or both are undefined
+    // (single-chunk path → v1 manifest). A misalignment would write a chunk
     // under a bucket subprefix with a v1 manifest (or vice versa), creating
     // data the read-through can't find. Surface it loudly.
     if ((bucket === undefined) !== (maxColdDays === undefined)) {

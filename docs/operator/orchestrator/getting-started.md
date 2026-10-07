@@ -405,12 +405,9 @@ The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered w
 
 ## Feature availability and keeping the orchestrator current
 
-Newer dashboard features depend on request types only newer orchestrator builds understand. The orchestrator advertises the set of dashboard request types it supports in its connection handshake, and that manifest drives the dashboard and the hosted relay:
+The hosted Platform, the orchestrator and its agents use one wire protocol version. When a release raises that version, the Platform refuses an orchestrator from an earlier release at connect. Upgrade the orchestrator, its agents and its cluster peers in the same maintenance window. See [Upgrade and rollback](../upgrade-and-rollback.md).
 
-- The dashboard greys out an orchestrator-backed action — with an "orchestrator upgrade required" banner naming the connected version — when the connected orchestrator does not advertise the request types that action needs.
-- If such an action is attempted anyway, the response is a clear "this feature requires a newer orchestrator (connected vX)" error, not a misleading "invalid payload".
-
-The fix in both cases is to **upgrade the orchestrator** to a build that supports the feature. Read-only views are never gated, and tenant-plane actions handled entirely by the hosted relay are unaffected by the orchestrator version. After an upgrade, the greyed actions re-enable automatically on the next connection.
+If the dashboard sends a request type that the connected orchestrator does not know, the response tells you to upgrade the orchestrator. It does not show an "invalid payload" error.
 
 ## See also
 

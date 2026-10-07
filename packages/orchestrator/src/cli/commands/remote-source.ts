@@ -16,21 +16,16 @@ import type { Command } from 'commander';
 import { toErrorMessage } from '@kici-dev/shared';
 import { createDb, createPool } from '../../db/client.js';
 import { getRemoteSource } from '../../pipeline/remote-source-store.js';
-
-function resolveDatabaseUrl(explicit?: string): string {
-  const url = explicit ?? process.env.KICI_DATABASE_URL;
-  if (!url) {
-    throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  }
-  return url;
-}
+import { resolveDatabaseUrl } from './shared/cli-action.js';
+import { ORG_ID_HELP } from './shared/org-id.js';
 
 export function registerRemoteSourceCommands(program: Command): void {
   const rs = program
     .command('remote-source')
     .description('Inspect the auto-provisioned remote-source org anchor');
 
-  rs.command('show <orgId>')
+  rs.command('show')
+    .argument('<orgId>', ORG_ID_HELP)
     .description('Print the remote_sources anchor row for an org (routing key remote:<orgId>).')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--format <format>', 'Output format: json|table', 'table')

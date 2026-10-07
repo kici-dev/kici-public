@@ -18,7 +18,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { AdminApiClient } from '@kici-dev/orchestrator';
-import { EventLogStatus } from '@kici-dev/engine';
+import { EventLogStatus, sleep } from '@kici-dev/engine';
 
 /** A minimal admin-read client (AdminApiClient.get) — injectable for tests. */
 export interface RunDiscoveryClient {
@@ -285,8 +285,4 @@ async function findRunByDelivery(
   const qs = new URLSearchParams({ deliveryId, limit: '1' });
   const { runs } = await client.get<RunsListResponse>(`/api/v1/admin/runs?${qs}`);
   return runs[0]?.runId ?? null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

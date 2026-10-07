@@ -1,17 +1,9 @@
 /**
- * Platform-connected entry point for the customer orchestrator.
+ * Platform-connected orchestrator entry point. 'platform' mode takes webhooks
+ * only via the Platform WS relay; 'hybrid' also serves the direct HTTP endpoint.
  *
- * Operates in 'platform' or 'hybrid' mode:
- * - platform: receives webhooks ONLY via Platform WS relay
- * - hybrid: receives webhooks via both WS relay and direct HTTP endpoint
- *
- * Both modes connect a PlatformClient to the Platform relay and run an agent WS server.
- *
- * Startup sequence (the same one the Platform follows):
- * config -> DB -> migrations -> provider registry -> dispatcher -> PlatformClient -> app -> HTTP -> heartbeat
- *
- * Graceful shutdown in reverse order:
- * Platform client -> agent WS -> heartbeat -> HTTP -> DB
+ * Startup: config -> DB -> migrations -> provider registry -> dispatcher ->
+ * PlatformClient -> app -> HTTP -> heartbeat. Shutdown runs in reverse.
  */
 
 // First import: applies the env file a Windows service names in KICI_ENV_FILE
@@ -58,16 +50,13 @@ const ENGINE_VERSION = typeof KICI_ENGINE_VERSION !== 'undefined' ? KICI_ENGINE_
 const ENGINE_BUNDLE_HASH =
   typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown';
 
-// Initialize OTel SDK BEFORE any metric-creating modules are imported.
-// ESM static imports are hoisted, so we must use dynamic imports for modules
-// that transitively create OTel meters (prometheus.ts, etc.).
+// OTel must initialise BEFORE any meter-creating module loads; static imports
+// are hoisted, so those modules are imported dynamically below.
 const otelSdk = initTelemetry({
   serviceName: 'kici-orchestrator',
   otlpEndpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
 });
 
-// Dynamic imports: these modules create OTel meters at module load time,
-// so they must be imported after initTelemetry() sets up the MeterProvider.
 const { loadConfig } = await import('./config.js');
 const { PlatformClient } = await import('./ws/platform-client.js');
 const { processWebhook } = await import('./pipeline/processor.js');
@@ -127,7 +116,7 @@ const {
 } = await import('./metrics/prometheus.js');
 const { provenanceStorageKey } = await import('@kici-dev/engine/provenance/bundle');
 
-// Type-only imports (safe as static — erased at runtime, no meter creation)
+// Static imports below create no meters.
 import { resolveLinkedUsername } from './security/identity-link.js';
 import type { IdentityLink, PermissionLevel } from './security/identity-link.js';
 import type { TrustDirectory } from './security/trust-directory-store.js';
@@ -174,6 +163,7 @@ import {
   type DashboardEncryptionJwk,
 } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 import { runDetached } from './helpers/run-detached.js';
+import { DashboardAccessRecorder } from './ws/dashboard-access.js';
 import { deliverPeerJobCancel, readDispatchedAgents } from './cancel/peer-job-cancel.js';
 import { answerScalerOrphansRequest } from './scaler/orphan-requests.js';
 
@@ -181,11 +171,8 @@ setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'server' });
 
 /**
- * Return true if `rawUrl` from the static peers list points at this very
- * orchestrator. Compares against the canonical cluster address verbatim and
- * also treats `localhost` / `127.0.0.1` variants at our own port as self so
- * an operator misconfig (listing a loopback URL of this same orch) is a
- * no-op rather than a self-loop dial.
+ * Whether a static peer URL is this orchestrator: the cluster address, or a
+ * loopback URL at our own port (a misconfig that must not self-dial).
  */
 function isSelfPeerUrl(rawUrl: string, clusterAddress: string | undefined, port: number): boolean {
   const normalize = (u: string): string => u.replace(/\/+$/, '');
@@ -204,19 +191,15 @@ function isSelfPeerUrl(rawUrl: string, clusterAddress: string | undefined, port:
 }
 
 /**
- * Boot the Platform-connected orchestrator. Factored out of the module entry so
- * both this file's production entry (which passes no fault injection) and the
- * test-only `server-test.ts` entry (which passes an injected fault-injection
- * policy) run the identical bootstrap through one code path. Exported solely for
- * that single test-only caller; nothing else imports it.
+ * Boot the Platform-connected orchestrator. Exported only so the test-only
+ * `server-test.ts` entry runs the identical bootstrap with a fault-injection policy.
  */
 export async function runServer(
   opts: { faultInjection?: OrchestratorFaultInjection } = {},
 ): Promise<void> {
   await guardStartup(logger, async () => {
-    // SDK drift diagnostic (see docs/operator/troubleshooting.md). Emitted before
-    // any subsystem init so operators can correlate on a fresh install where
-    // config / DB might fail later: the bundle fingerprint is always observable.
+    // SDK drift diagnostic (docs/operator/troubleshooting.md), logged before any
+    // init that could fail so the bundle fingerprint is always observable.
     logger.info('orchestrator.build.info', {
       orchestratorVersion: ORCHESTRATOR_VERSION,
       sdkVersion: SDK_VERSION,
@@ -227,11 +210,9 @@ export async function runServer(
       engineBundleHash: ENGINE_BUNDLE_HASH,
     });
 
-    // 1. Load configuration and validate mode
     const config = loadConfig();
 
-    // Worker mode: branch to worker bootstrap (separate lifecycle, no DB/Platform/Raft)
-    // Works from any entry point — workers don't care about KICI_MODE
+    // Workers have their own lifecycle (no DB/Platform/Raft) and ignore KICI_MODE.
     if (config.cluster.role === 'worker') {
       const { bootstrapWorker } = await import('./worker-core.js');
       await bootstrapWorker(config, { otelSdk });
@@ -255,15 +236,11 @@ export async function runServer(
       });
     }
 
-    // Build the mode-specific hooks. Factored into a function so a test-only
-    // entrypoint (server-test.ts, via runServer) can construct the same hooks
-    // with a fault-injection policy; production passes no `faultInjection`, so
-    // every seam below sees an undefined policy and runs with no fault injection.
+    // Production passes no `faultInjection`; only server-test.ts injects one.
     const buildServerHooks = (
       config: AppConfig,
       faultInjection?: OrchestratorFaultInjection,
     ): OrchestratorHooks => {
-      // Platform-specific state (closures captured by hooks)
       const relayEnabled = RELAY_INGRESS_MODES.includes(config.mode);
       let platformClient: InstanceType<typeof PlatformClient>;
       // Deferred-attestation retrier: constructed after the platform client, driven
@@ -284,7 +261,7 @@ export async function runServer(
             stepIndex: chunk.stepIndex,
             lines: chunk.lines,
             timestamp: chunk.timestamp,
-            ...(chunk.stream !== undefined && { stream: chunk.stream }),
+            stream: chunk.stream,
           });
         },
 
@@ -472,11 +449,7 @@ export async function runServer(
               return teamMemberships.get(name) ?? new Set<string>();
             },
           };
-          /**
-           * Apply a pushed (or cached) approval directory to the three closure
-           * caches above. Shared by the boot-time seed and the Platform push so
-           * both land the same shapes.
-           */
+          /** Apply a pushed or cached approval directory to the closure caches above. */
           const applyTrustDirectory = (directory: TrustDirectory): void => {
             identityLinks = directory.identityLinks;
             orgMemberPermissions = new Map(Object.entries(directory.memberCiTrustLevels));
@@ -489,25 +462,14 @@ export async function runServer(
           const trustDirectoryStore = new TrustDirectoryStore(sub.db);
 
           // Seed the approval directory from its cache so `/kici approve` can
-          // resolve a commenter before the Platform's first push of this
-          // process.
-          //
-          // The read takes the org id from the cached row itself rather than
-          // resolving one: the row is keyed by the org of the last push, which
-          // is exactly the org this directory belongs to. Config carries no org
-          // id, and the DB-derived resolution that does exist (the `sources` →
-          // `generic_webhook_sources` → `remote_sources` fallback) is written
-          // inline in the auth path below rather than extracted.
-          //
-          // Failing to read the cache degrades to the pre-push state rather
-          // than blocking startup.
+          // resolve a commenter before the Platform's first push. The cached
+          // row carries its own org id (the org of the last push). A failed
+          // read degrades to the pre-push state rather than blocking startup.
           try {
             const cached = await trustDirectoryStore.loadLastPushed();
             if (cached) {
               applyTrustDirectory(cached);
-              // The cache's own write time, not now: the age this reports is
-              // how long the directory has gone unrefreshed, and a restart
-              // refreshes nothing.
+              // The cache's write time, not now: a restart refreshes nothing.
               setTrustDirectoryUpdatedAt(cached.updatedAt);
               logger.info('Approval directory restored from cache', {
                 orgId: cached.orgId,
@@ -523,17 +485,14 @@ export async function runServer(
             });
           }
 
-          // Provider sources advertised to the Platform: GitHub-app sources
-          // (SourceManager, DB-first) + servable generic-webhook sources. The same
-          // builder feeds the live republish wired below, so a runtime source
-          // add/remove re-sends the complete set rather than a partial list.
+          // GitHub-app + servable generic-webhook sources. The live republish
+          // below uses the same builder, so it always re-sends the complete set.
           const loadGenericRows = () => loadActiveGenericRoutingKeys(sub.db);
           const providerSources = await buildPlatformProviderSources(
             sub.sourceManager,
             loadGenericRows,
           );
 
-          // Create LogPullHandler
           let logPullSendFn: ((msg: unknown) => void) | null = null;
           const logPullHandler = new LogPullHandler({
             logStorage: sub.logStorage,
@@ -541,17 +500,12 @@ export async function runServer(
             send: (msg) => logPullSendFn?.(msg),
           });
 
-          // Resolved tenant context for diagnostics access_log rows. Populated in
-          // onAuthenticated when the sources table yields a real customer_id /
-          // routing_key; until then the diagnostics handler records rows with
-          // null orgId/routingKey (same behaviour as DashboardHandler pre-resolve).
+          // Tenant context for diagnostics access_log rows, set in onAuthenticated;
+          // until then rows record a null orgId/routingKey.
           let resolvedOrgContext: { orgId: string; routingKey: string } | null = null;
 
-          // Step-approval bridge: opens step-scoped holds when an agent blocks a
-          // `requireApproval` step, and relays the resolution (approve / reject /
-          // expire) back to that agent. Shared by the agent WS handler (via
-          // appDepsExtras), the dashboard approve/reject applier (`onStepRelease` /
-          // `onStepReject`), and the stale detector (expiry).
+          // Opens step-scoped holds for `requireApproval` steps and relays the
+          // approve / reject / expire resolution back to the blocked agent.
           const stepApprovalBridge = new StepApprovalBridge({
             store: heldRunStore,
             resolveOrgId: () => resolvedOrgContext?.orgId ?? '__default__',
@@ -570,38 +524,27 @@ export async function runServer(
             accessLogWriter: sub.accessLogWriter,
           });
 
-          // Subscription to dashboard-write policy changes for the resolved
-          // customer. Installed once after the first successful org-context
-          // resolution and lives for the process lifetime — the orchestrator
-          // is single-tenant so the customer_id never changes between
-          // resolutions. The handler rebroadcasts `orch.capabilities.update`
-          // to Platform via the WebSocket client.
+          // Both installed once, after the first org-context resolution, for the
+          // process lifetime: the orchestrator is single-tenant, so the
+          // customer_id never changes. Policy changes rebroadcast capabilities.
           let policyChangeSubscriber:
             ((evt: { customerId: string; policy: DashboardWritePolicyMap }) => void) | null = null;
 
-          // Installed once and lives for the process lifetime, like the policy
-          // subscriber above — the orchestrator is single-tenant.
           let stopVerifiedIssuerPoller: (() => void) | null = null;
 
-          // The inbound webhook delivery log writer is constructed by
-          // orchestrator-core (so the cleanup scheduler can share it). The relay
-          // path here just borrows the same instance.
           const eventLogWriter = sub.eventLogWriter;
 
-          // Create DashboardHandler
           let dashboardSendFn: ((msg: unknown) => void) | null = null;
           const dashboardHandler = new DashboardHandler({
             db: sub.db,
             logStorage: sub.logStorage,
-            // Orchestrator-owned provenance issuer (when signing is configured) so
-            // the Platform surfaces it as `trustedIssuer` on attestations reads.
+            // Surfaced by the Platform as `trustedIssuer` on attestations reads.
             provenanceSigningIssuer: config.provenanceSigningIssuer ?? null,
             provenanceStorage: sub.cacheStorage,
             artifactStore: sub.artifactStore,
             coldStore: sub.coldStore,
             eventStore: sub.eventStore,
-            // Drains the deferred-attestation outbox in this process (owns the
-            // Platform WS). Wired lazily — the retrier is constructed below.
+            // Lazy: the retrier is constructed below.
             retryAttestations: (opts: { runId?: string; includeRejected?: boolean }) =>
               attestationRetrier
                 ? attestationRetrier.runOnce(opts)
@@ -609,8 +552,7 @@ export async function runServer(
             send: (msg) => dashboardSendFn?.(msg),
             orchestratorId: config.instanceId,
             accessLog: sub.accessLogWriter,
-            // Only the build-time test double injects a rerun-delay hook;
-            // undefined in the shipped orchestrator means no delay.
+            // Test-only; undefined in the shipped orchestrator.
             beforeRerun: faultInjection?.beforeRerun,
             onRerun: async (runId, triggeredBy, triggeredByAgentLabel, requestId, routingKey) => {
               return handleRerun(
@@ -635,9 +577,8 @@ export async function runServer(
                   buildCoordinator: sub.buildCoordinator ?? null,
                   pendingBuilds: sub.pendingBuilds ?? null,
                   coldStore: sub.coldStore,
-                  // The same bag the inbound webhook path uses, so a re-run of a
-                  // failed evaluation round re-drives the organization-wide pass
-                  // against exactly the deps the original delivery had.
+                  // The webhook path's bag, so a re-run of a failed evaluation
+                  // round re-drives the org-wide pass with the original deps.
                   processingDeps: buildProcessingDeps,
                 },
                 requestId,
@@ -692,14 +633,12 @@ export async function runServer(
             }),
           });
 
-          // Create global workflow policy for org-level permission enforcement
           const globalWorkflowPolicy = new GlobalWorkflowPolicy(
             sub.db,
             sub.clusterSettings,
             sub.config.globalWorkflowsEnabled,
           );
 
-          // Create environment stores and DashboardContextHandler
           const contextStore = new ContextStore(sub.db);
           const variableStore = new VariableStore(sub.db);
           const bindingStore = new BindingStore(sub.db);
@@ -757,10 +696,8 @@ export async function runServer(
             clusterSettings: sub.clusterSettings,
           });
           let dashboardEnvSendFn: ((msg: unknown) => void) | null = null;
-          // The configured default-backend store. Falls back to the degraded store
-          // only when the orchestrator runs without a pg secret store at all (reads
-          // report no secrets, writes refuse), never to the registry's own
-          // synthesized PgSecretStore — see `loadRoutableStores`.
+          // The degraded store (no secrets, writes refuse) only when there is no
+          // pg secret store at all, never the registry's synthesized one.
           const dashboardSecretStore: ScopedSecretStore =
             sub.pgSecretStore ?? createUnavailableSecretStore();
           const dashboardEnvHandler = new DashboardContextHandler({
@@ -784,9 +721,7 @@ export async function runServer(
             approvals: {
               store: heldRunStore,
               teamMembershipLookup: (team: string) => teamMembershipLookup.getTeamMembers(team),
-              // Resume a released job/workflow hold by re-dispatching through the
-              // same path the needs scheduler uses (the hold stored a pending
-              // job context keyed by run id + job name).
+              // Re-dispatch through the needs scheduler's own path.
               resumeJob: async (signal) => {
                 await dispatchReadyJob(
                   signal.runId,
@@ -796,9 +731,8 @@ export async function runServer(
                   sub.coordinator,
                   sub.db,
                   sub.invokeGateDeps,
-                  // A released approval hold does not restore the slot the job
-                  // was gated on at dispatch-pass time, so the concurrency limit
-                  // is re-checked here before it dispatches.
+                  // A released hold does not restore the job's concurrency slot,
+                  // so the limit is re-checked before dispatch.
                   {
                     matchContext: (o, n) => contextStore.matchContext(o, n),
                     heldRunStore,
@@ -811,21 +745,15 @@ export async function runServer(
                   },
                 );
               },
-              // Step-scoped release/reject: relay the resolution to the waiting
-              // agent through the step-approval bridge.
               resumeStep: async (signal) => {
                 stepApprovalBridge.resolve(signal.holdId, 'approved');
               },
               rejectStep: (heldRunId, reason) => {
                 stepApprovalBridge.resolve(heldRunId, 'rejected', reason);
               },
-              // Workflow-scoped release/reject: rebuild the dispatch context and
-              // resume, or cancel the run. Both the install gate and the org
-              // trust policy's PR-wide hold arrive here, so the reject reason
-              // comes from the rejecter rather than being named at this site —
-              // a fixed string would label a rejected fork PR an install-gate
-              // rejection. The fallback stays scope-neutral for a rejecter that
-              // supplied none.
+              // Install-gate and trust-policy holds both land here, so the reject
+              // reason comes from the rejecter; a fixed string would mislabel one
+              // as the other. The fallback stays scope-neutral.
               resumeWorkflow: async (signal) => {
                 await resumeWorkflow(signal, buildProcessingDeps(), sub.db);
               },
@@ -836,19 +764,16 @@ export async function runServer(
                   sub.db,
                   reason ?? 'Workflow hold rejected',
                 ),
-              // The applier's own writer for every hold `rejectWorkflow` does
-              // not report on — a job-scoped hold answered from the dashboard
-              // above all, whose row leaves `pending` and is therefore beyond
-              // the stale detector's approval-window sweep from then on.
+              // Settles holds `rejectWorkflow` does not report on, chiefly
+              // dashboard-answered job holds, which leave `pending` and so the
+              // stale detector's sweep.
               settleSecurityCheck: async ({ hold, outcome, actorSub, reason }) =>
                 (
                   await settleSecurityCheckForDecision({
                     db: sub.db,
                     resolvePoster: (routingKey) =>
                       sub.providerRegistry.getByRoutingKey(routingKey)?.checkStatusPoster,
-                    // The identity directory lives in this closure and nowhere
-                    // else the applier can reach, which is why the resolution is
-                    // injected here rather than done inside it.
+                    // Injected: the identity directory lives only in this closure.
                     resolveDisplayName: (actor) => resolveLinkedUsername(identityLinks, actor),
                     hold,
                     outcome,
@@ -859,7 +784,6 @@ export async function runServer(
             },
           });
 
-          // Create registrations handler
           let dashboardRegSendFn: ((msg: unknown) => void) | null = null;
           const dashboardRegistrationsHandler = new DashboardRegistrationsHandler({
             orgId: '__default__',
@@ -870,11 +794,8 @@ export async function runServer(
             accessLog: sub.accessLogWriter,
           });
 
-          // Create global-workflows handler for dashboard org-settings edits.
-          // The customer/org id is resolved post-auth from the sources table;
-          // until then the handler operates against an empty id (queries return
-          // the default "disabled" settings, which is correct for unconnected
-          // orchs).
+          // The customer id is resolved post-auth; until then the empty id yields
+          // the default "disabled" settings, correct for an unconnected orch.
           let dashboardGlobalWorkflowsSendFn: ((msg: unknown) => void) | null = null;
           const dashboardGlobalWorkflowsHandler = new DashboardGlobalWorkflowsHandler({
             customerId: '',
@@ -885,7 +806,6 @@ export async function runServer(
             globalWorkflowsEnabledDefault: sub.config.globalWorkflowsEnabled,
           });
 
-          // Create backends handler for dashboard backend management
           let dashboardBackendsSendFn: ((msg: unknown) => void) | null = null;
           const dashboardBackendsHandler = new DashboardBackendsHandler({
             send: (msg) => dashboardBackendsSendFn?.(msg),
@@ -910,8 +830,7 @@ export async function runServer(
             db: sub.db,
           });
 
-          // Fleet host writes (Model C: declare / remove). Policy-gated via
-          // enforcePolicy + access-log audit; mirrors dashboardBackendsHandler.
+          // Fleet host declare / remove: policy-gated and access-logged.
           let dashboardFleetWriteSendFn: ((msg: unknown) => void) | null = null;
           const dashboardFleetWriteHandler = new DashboardFleetWriteHandler({
             send: (msg) => dashboardFleetWriteSendFn?.(msg),
@@ -920,17 +839,9 @@ export async function runServer(
             db: sub.db,
           });
 
-          // Outbound PeerClient factory shared by Platform-mediated discovery
-          // (onPeerDiscover) and the static dial loop driven by config.cluster.peers.
-          // The initialKey argument is the placeholder under which the caller
-          // registers the client in sub.peerClients before the handshake completes
-          // (URL for static dial, peer.instanceId for discovery). On a successful
-          // handshake the onAuthenticated callback re-keys the entry from
-          // initialKey to the canonical target instanceId so subsequent discovery
-          // events dedupe against the same client.
-          // One coordinator shared by every sibling peer-client of this
-          // orchestrator: it owns the credential file and serializes token-joins so
-          // a reconnect storm never cascades credential revocations across siblings.
+          // One coordinator for every sibling peer client: it owns the credential
+          // file and serializes token-joins so a reconnect storm never cascades
+          // credential revocations across siblings.
           const peerCredentialFile = config.cluster.credentialFile.replace(
             /^~/,
             process.env.HOME ?? '~',
@@ -939,9 +850,8 @@ export async function runServer(
             credentialFile: peerCredentialFile,
             instanceId: config.instanceId,
             joinToken: config.cluster.joinToken,
-            // A coordinator without a join token issues its own credential the
-            // first time a peer client needs one. A single-node orchestrator has
-            // no coordinator peers, so it never issues one.
+            // Without a join token a coordinator self-issues its credential; a
+            // single-node orchestrator has no peers and never does.
             selfIssue: config.cluster.singleNode
               ? undefined
               : coordinatorSelfIssuer({
@@ -958,6 +868,9 @@ export async function runServer(
               : coordinatorRejectionCorroborator({ db: sub.db, instanceId: config.instanceId }),
           });
 
+          // Shared by discovery and the static dial loop. `initialKey` (URL for
+          // static, instanceId for discovery) holds the sub.peerClients slot until
+          // the handshake re-keys it to the canonical instanceId.
           const createOutboundPeerClient = (
             rawUrl: string,
             initialKey: string,
@@ -1017,8 +930,7 @@ export async function runServer(
               onPeerLeaving: (msg) => sub.raft.handlePeerLeaving(msg.instanceId),
               onAgentTokenRevoke: (msg) => {
                 const kicked = sub.agentRegistry.disconnectByTokenId(msg.tokenId);
-                // Always log on receipt -- see orchestrator-core.ts for the
-                // KICI_AGENT_AUTH=none rationale.
+                // Always log on receipt (KICI_AGENT_AUTH=none: orchestrator-core.ts).
                 logger.info('Kicked agent connections after cross-peer revoke', {
                   tokenId: msg.tokenId,
                   senderInstanceId: msg.senderInstanceId,
@@ -1036,6 +948,7 @@ export async function runServer(
                 return reloader.executeReload({ source: 'cluster', drain: msg.drain });
               },
               onPeerForgetRequest: sub.answerPeerForgetRequest,
+              onScalerReloadRequest: sub.scalerFileReload,
               onScalerOrphansRequest: (msg) =>
                 answerScalerOrphansRequest(sub.scalerManager ?? null, msg),
               onLogsCollectRequest: (msg, send) => sub.fleetCollectResponder(msg, send),
@@ -1074,9 +987,6 @@ export async function runServer(
           });
           peerDiscovery.start();
 
-          // Fleet read-relay (roster, host detail, runsOnAll preview). Each read
-          // answers from the host roster store and writes a platform_proxy
-          // access-log row, mirroring onDashboardDiagnostics.
           const buildFleetDeps = () => ({
             db: sub.db,
             rosterStore: sub.hostRosterStore!,
@@ -1085,6 +995,16 @@ export async function runServer(
               resolveWorkflowRunsOnAll(sub.db, workflowName),
             registrationStore: sub.registrationStore,
           });
+          // access_log rows for the reads answered here, attributed to the org this
+          // orchestrator resolved for its Platform connection.
+          const platformAccess = new DashboardAccessRecorder(
+            sub.accessLogWriter,
+            () => ({
+              orgId: resolvedOrgContext?.orgId ?? null,
+              routingKey: resolvedOrgContext?.routingKey ?? null,
+            }),
+            logger,
+          );
           const runFleetRead = async (
             requestId: string,
             actor: ActorPrincipal,
@@ -1093,46 +1013,27 @@ export async function runServer(
           ): Promise<void> => {
             try {
               const response = await run();
-              runDetached(
-                logger,
-                'Access log write',
-                () =>
-                  sub.accessLogWriter?.record({
-                    orgId: resolvedOrgContext?.orgId ?? null,
-                    routingKey: resolvedOrgContext?.routingKey ?? null,
-                    actor,
-                    action: 'fleet.read',
-                    target: { type: 'fleet', id: targetId },
-                    requestId,
-                    source: 'platform_proxy',
-                    outcome: 'allowed',
-                  }),
-                { requestId },
+              platformAccess.record(
+                actor,
+                'fleet.read',
+                { type: 'fleet', id: targetId },
+                requestId,
+                'allowed',
               );
               platformClient!.sendRaw(response);
             } catch (err) {
-              runDetached(
-                logger,
-                'Access log write',
-                () =>
-                  sub.accessLogWriter?.record({
-                    orgId: resolvedOrgContext?.orgId ?? null,
-                    routingKey: resolvedOrgContext?.routingKey ?? null,
-                    actor,
-                    action: 'fleet.read',
-                    target: { type: 'fleet', id: targetId },
-                    requestId,
-                    source: 'platform_proxy',
-                    outcome: 'error',
-                    errorMessage: toErrorMessage(err),
-                  }),
-                { requestId },
+              platformAccess.record(
+                actor,
+                'fleet.read',
+                { type: 'fleet', id: targetId },
+                requestId,
+                'error',
+                toErrorMessage(err),
               );
               throw err;
             }
           };
 
-          // Create PlatformClient
           const clusterName = await getClusterName(sub.db);
           const clusterId = await getClusterId(sub.db);
           platformClient = new PlatformClient({
@@ -1156,31 +1057,20 @@ export async function runServer(
             s3LogAccess: !!sub.cacheStorage,
             queueTimeoutMs: config.queueTimeoutMs,
             orchCapabilities: { orchRole: OrchRole.enum.coordinator },
-            // Combined orchestrator-limit plumbing: report connected worker peers,
-            // cache the pushed ceiling, and drain excess workers on an eviction
-            // directive.
             getWorkerPeers: () =>
               sub.peerRegistry.getConnectedWorkerPeers().map((p) => ({ instanceId: p.instanceId })),
             planHeadroomStore: sub.planHeadroomStore,
             onPlanCeiling: (ceiling, evictExcess) =>
               sub.coordinator.reconcileWorkerEviction(ceiling, evictExcess),
-            // Only the build-time test double injects a capability transform;
-            // undefined in the shipped orchestrator means identity (no omission).
-            capabilitiesTransform: faultInjection?.capabilitiesTransform,
             onAdmit: async (routingKey) => {
-              // Webhook-ingest admission for the WS relay path. Non-queueing
-              // (allowQueue:false) — Platform awaits this ack synchronously, so a
-              // queued admission risks the 5s ack timeout + spurious pool failover;
-              // shed instead and let the sender redeliver.
+              // Never queue: the Platform awaits this ack synchronously, and a
+              // queued admission risks its 5s timeout and a spurious failover.
               const { key, orgCap } = await sub.ingestCapReader.resolve(routingKey);
               return sub.ingestController.admit(key, orgCap, { allowQueue: false });
             },
-            // Recording a shed is unconditional, because the two halves answer
-            // different questions. The overflow row is the replay queue and is
-            // deleted the moment a replay succeeds; the `event_log` breadcrumb
-            // is what makes the shed itself durable, so an operator can tell a
-            // delivery that was shed from one that never arrived — including
-            // when the durable queue is turned off.
+            // The breadcrumb is unconditional: the overflow row is a replay queue
+            // deleted on replay, while the breadcrumb keeps the shed itself
+            // durable, even with the queue turned off.
             onShedCapture: async (meta, body, reason) => {
               await recordShedBreadcrumb(
                 {
@@ -1196,10 +1086,6 @@ export async function runServer(
               }
             },
             onOrgIdentified: ({ orgId, clusterId: cid }) => {
-              // Auto-provision the `remote_sources` anchor (`remote:<orgId>`) so a
-              // Platform-relayed `kici run remote` resolves the real tenant through
-              // the same local-source path a webhook takes. Idempotent upsert; safe
-              // on every (re)connect.
               provisionRemoteSource(sub.db, { orgId, clusterId: cid }).catch((err) =>
                 logger.error('Failed to provision remote_sources anchor', {
                   orgId,
@@ -1207,21 +1093,10 @@ export async function runServer(
                 }),
               );
             },
-            onProvenanceIssuer: (issuer) => {
-              // Learn the provenance trust root from the Platform so the
-              // agent-handler can verify provenance bundles at ingest.
-              sub.provenanceTrustRoot.setIssuer(issuer);
-            },
             onTestRelay: async (msg) => {
-              // Platform-relayed `kici run remote` control plane: route the parsed
-              // `test.relay.*` request to its handler (reusing the test pipeline /
-              // upload / cancel internals) and relay the response over the WS.
               try {
                 const response = await dispatchTestRelay(msg, {
-                  // The full ProcessingDeps bag the webhook entry uses, so the test
-                  // dispatch path runs through the same shared core (needs-DAG, host
-                  // fan-out, deferred init/dynamic). coordinator is left in for
-                  // parity; in the single-orch test path it is unused.
+                  // The webhook entry's bag, so test dispatch runs the same core.
                   ...buildProcessingDeps(),
                   db: sub.db,
                   agentRegistry: sub.agentRegistry,
@@ -1247,219 +1122,169 @@ export async function runServer(
             },
             onJoinRequest: (msg) => sub.joinHandler.handleJoinRequest(msg),
             onLogPullRequest: (msg) => logPullHandler.handleRequest(msg),
-            onDashboardRunDetail: (msg) => dashboardHandler.handleRunDetail(msg),
-            onDashboardRunStructured: (msg) => dashboardHandler.handleRunStructured(msg),
-            onDashboardRunsList: async (msg) => {
-              // The handler records its own access_log row internally and
-              // returns the response envelope; relay it over the WS connection.
-              const response = await dashboardHandler.handleRunsList(msg);
-              platformClient.sendRaw(response);
+            dashboardHandlers: {
+              'dashboard.run.detail': (msg) => dashboardHandler.handleRunDetail(msg),
+              'dashboard.run.structured': (msg) => dashboardHandler.handleRunStructured(msg),
+              'dashboard.run.state': async (msg) => {
+                // RunMirrorReconciler system read: deliberately NOT access-logged.
+                const response = await handleRunState({ db: sub.db }, msg);
+                platformClient!.sendRaw(response);
+              },
+              'dashboard.runs.list': async (msg) => {
+                // The handler records its own access_log row internally and
+                // returns the response envelope; relay it over the WS connection.
+                const response = await dashboardHandler.handleRunsList(msg);
+                platformClient.sendRaw(response);
+              },
+              'dashboard.runs.filters': async (msg) => {
+                // The handler records its own access_log row internally and
+                // returns the response envelope; relay it over the WS connection.
+                const response = await dashboardHandler.handleRunsFilters(msg);
+                platformClient.sendRaw(response);
+              },
+              'dashboard.sources.list': async (msg) => {
+                const response = await dashboardHandler.handleSourcesList(msg);
+                platformClient.sendRaw(response);
+              },
+              'dashboard.admin-tokens.list': async (msg) => {
+                const response = await dashboardHandler.handleAdminTokensList(msg);
+                platformClient.sendRaw(response);
+              },
+              'dashboard.step.logs': (msg) => dashboardHandler.handleStepLogs(msg),
+              'dashboard.attestations.list': (msg) => dashboardHandler.handleAttestationsList(msg),
+              'dashboard.attestations.list.all': (msg) =>
+                dashboardHandler.handleAttestationsListAll(msg),
+              'dashboard.attestation.get': (msg) => dashboardHandler.handleAttestationGet(msg),
+              'dashboard.artifacts.list': (msg) => dashboardHandler.handleArtifactsList(msg),
+              'dashboard.payload': (msg) => dashboardHandler.handlePayload(msg),
+              'dashboard.orch.logs': (msg) => dashboardHandler.handleOrchLogs(msg),
+              'dashboard.diagnostics': async (msg) => {
+                const diagDeps = {
+                  agentRegistry: sub.agentRegistry,
+                  config,
+                  version: ORCHESTRATOR_VERSION,
+                  scalerBackends: sub.scalerManager
+                    ? sub.scalerManager.getStatus().backends.map((b) => b.type)
+                    : [],
+                  jobQueue: sub.queue,
+                  scalerManager: sub.scalerManager,
+                  scalerConfig: sub.scalerConfig,
+                  peerRegistry: sub.peerRegistry,
+                  raftNode: sub.raft,
+                };
+                try {
+                  const response = await handleDiagnosticsRequest(
+                    diagDeps,
+                    msg.requestId,
+                    msg.includeAgents,
+                  );
+                  platformAccess.record(
+                    msg.actor,
+                    'diagnostics.read',
+                    { type: 'diagnostics', id: '_' },
+                    msg.requestId,
+                    'allowed',
+                  );
+                  platformClient.sendRaw(response);
+                } catch (err) {
+                  platformAccess.record(
+                    msg.actor,
+                    'diagnostics.read',
+                    { type: 'diagnostics', id: '_' },
+                    msg.requestId,
+                    'error',
+                    toErrorMessage(err),
+                  );
+                  throw err;
+                }
+              },
+              'dashboard.scaler.capacity': (msg) => {
+                try {
+                  const response = handleScalerCapacityRequest(
+                    sub.scalerManager ?? null,
+                    msg.requestId,
+                  );
+                  platformAccess.record(
+                    msg.actor,
+                    'scaler.capacity.read',
+                    { type: 'scaler', id: '_' },
+                    msg.requestId,
+                    'allowed',
+                  );
+                  platformClient.sendRaw(response);
+                } catch (err) {
+                  platformAccess.record(
+                    msg.actor,
+                    'scaler.capacity.read',
+                    { type: 'scaler', id: '_' },
+                    msg.requestId,
+                    'error',
+                    toErrorMessage(err),
+                  );
+                  throw err;
+                }
+              },
+              'dashboard.scaler.agents': (msg) => {
+                const diagDeps = {
+                  agentRegistry: sub.agentRegistry,
+                  config,
+                  version: ORCHESTRATOR_VERSION,
+                  scalerBackends: sub.scalerManager
+                    ? sub.scalerManager.getStatus().backends.map((b) => b.type)
+                    : [],
+                  scalerManager: sub.scalerManager,
+                };
+                try {
+                  const response = handleScalerAgentsRequest(
+                    diagDeps,
+                    msg.requestId,
+                    msg.scalerName,
+                  );
+                  platformAccess.record(
+                    msg.actor,
+                    'scaler.agents.read',
+                    { type: 'scaler', id: msg.scalerName ?? '_' },
+                    msg.requestId,
+                    'allowed',
+                  );
+                  platformClient.sendRaw(response);
+                } catch (err) {
+                  platformAccess.record(
+                    msg.actor,
+                    'scaler.agents.read',
+                    { type: 'scaler', id: msg.scalerName ?? '_' },
+                    msg.requestId,
+                    'error',
+                    toErrorMessage(err),
+                  );
+                  throw err;
+                }
+              },
+              'dashboard.fleet.hosts': async (msg) => {
+                await runFleetRead(msg.requestId, msg.actor, 'hosts', () =>
+                  handleFleetHostsRequest(buildFleetDeps(), msg.requestId),
+                );
+              },
+              'dashboard.fleet.host': async (msg) => {
+                await runFleetRead(msg.requestId, msg.actor, msg.agentId, () =>
+                  handleFleetHostRequest(buildFleetDeps(), msg.requestId, msg.agentId),
+                );
+              },
+              'dashboard.fleet.preview': async (msg) => {
+                await runFleetRead(msg.requestId, msg.actor, msg.workflowName, () =>
+                  handleFleetPreviewRequest(buildFleetDeps(), msg.requestId, msg.workflowName),
+                );
+              },
+              'dashboard.fleet.workflows-for-host': async (msg) => {
+                await runFleetRead(msg.requestId, msg.actor, msg.agentId, () =>
+                  handleFleetWorkflowsForHostRequest(buildFleetDeps(), msg.requestId, msg.agentId),
+                );
+              },
             },
-            onDashboardRunsFilters: async (msg) => {
-              // The handler records its own access_log row internally and
-              // returns the response envelope; relay it over the WS connection.
-              const response = await dashboardHandler.handleRunsFilters(msg);
-              platformClient.sendRaw(response);
-            },
-            onDashboardSourcesList: async (msg) => {
-              const response = await dashboardHandler.handleSourcesList(msg);
-              platformClient.sendRaw(response);
-            },
-            onDashboardAdminTokensList: async (msg) => {
-              const response = await dashboardHandler.handleAdminTokensList(msg);
-              platformClient.sendRaw(response);
-            },
-            onDashboardStepLogs: (msg) => dashboardHandler.handleStepLogs(msg),
-            onDashboardAttestationsList: (msg) => dashboardHandler.handleAttestationsList(msg),
-            onDashboardAttestationsListAll: (msg) =>
-              dashboardHandler.handleAttestationsListAll(msg),
-            onDashboardAttestationGet: (msg) => dashboardHandler.handleAttestationGet(msg),
             onDashboardAttestationRetry: (msg) => dashboardHandler.handleAttestationRetry(msg),
-            onDashboardArtifactsList: (msg) => dashboardHandler.handleArtifactsList(msg),
             onRunRerun: (msg) => dashboardHandler.handleRerunRequest(msg),
             onManualSchedule: (msg) => dashboardHandler.handleManualScheduleRequest(msg),
             onRunCancel: (msg) => dashboardHandler.handleCancelRequest(msg),
-            onDashboardPayload: (msg) => dashboardHandler.handlePayload(msg),
-            onDashboardOrchLogs: (msg) => dashboardHandler.handleOrchLogs(msg),
-            onDashboardDiagnostics: async (msg) => {
-              const diagDeps = {
-                agentRegistry: sub.agentRegistry,
-                config,
-                version: ORCHESTRATOR_VERSION,
-                scalerBackends: sub.scalerManager
-                  ? sub.scalerManager.getStatus().backends.map((b) => b.type)
-                  : [],
-                jobQueue: sub.queue,
-                scalerManager: sub.scalerManager,
-                scalerConfig: sub.scalerConfig,
-                peerRegistry: sub.peerRegistry,
-                raftNode: sub.raft,
-              };
-              try {
-                const response = await handleDiagnosticsRequest(
-                  diagDeps,
-                  msg.requestId,
-                  msg.includeAgents,
-                );
-                runDetached(
-                  logger,
-                  'Access log write',
-                  () =>
-                    sub.accessLogWriter?.record({
-                      orgId: resolvedOrgContext?.orgId ?? null,
-                      routingKey: resolvedOrgContext?.routingKey ?? null,
-                      actor: msg.actor,
-                      action: 'diagnostics.read',
-                      target: { type: 'diagnostics', id: '_' },
-                      requestId: msg.requestId,
-                      source: 'platform_proxy',
-                      outcome: 'allowed',
-                    }),
-                  { requestId: msg.requestId },
-                );
-                platformClient.sendRaw(response);
-              } catch (err) {
-                runDetached(
-                  logger,
-                  'Access log write',
-                  () =>
-                    sub.accessLogWriter?.record({
-                      orgId: resolvedOrgContext?.orgId ?? null,
-                      routingKey: resolvedOrgContext?.routingKey ?? null,
-                      actor: msg.actor,
-                      action: 'diagnostics.read',
-                      target: { type: 'diagnostics', id: '_' },
-                      requestId: msg.requestId,
-                      source: 'platform_proxy',
-                      outcome: 'error',
-                      errorMessage: toErrorMessage(err),
-                    }),
-                  { requestId: msg.requestId },
-                );
-                throw err;
-              }
-            },
-            onDashboardRunState: async (msg) => {
-              // System reconciliation read for the Platform RunMirrorReconciler:
-              // project the current run state and reply. Deliberately NOT
-              // access-logged (a system read, not user data access).
-              const response = await handleRunState({ db: sub.db }, msg);
-              platformClient!.sendRaw(response);
-            },
-            onFleetHosts: async (msg) => {
-              await runFleetRead(msg.requestId, msg.actor, 'hosts', () =>
-                handleFleetHostsRequest(buildFleetDeps(), msg.requestId),
-              );
-            },
-            onFleetHost: async (msg) => {
-              await runFleetRead(msg.requestId, msg.actor, msg.agentId, () =>
-                handleFleetHostRequest(buildFleetDeps(), msg.requestId, msg.agentId),
-              );
-            },
-            onFleetPreview: async (msg) => {
-              await runFleetRead(msg.requestId, msg.actor, msg.workflowName, () =>
-                handleFleetPreviewRequest(buildFleetDeps(), msg.requestId, msg.workflowName),
-              );
-            },
-            onFleetWorkflowsForHost: async (msg) => {
-              await runFleetRead(msg.requestId, msg.actor, msg.agentId, () =>
-                handleFleetWorkflowsForHostRequest(buildFleetDeps(), msg.requestId, msg.agentId),
-              );
-            },
-            onDashboardScalerCapacity: (msg) => {
-              try {
-                const response = handleScalerCapacityRequest(
-                  sub.scalerManager ?? null,
-                  msg.requestId,
-                );
-                runDetached(
-                  logger,
-                  'Access log write',
-                  () =>
-                    sub.accessLogWriter?.record({
-                      orgId: resolvedOrgContext?.orgId ?? null,
-                      routingKey: resolvedOrgContext?.routingKey ?? null,
-                      actor: msg.actor,
-                      action: 'scaler.capacity.read',
-                      target: { type: 'scaler', id: '_' },
-                      requestId: msg.requestId,
-                      source: 'platform_proxy',
-                      outcome: 'allowed',
-                    }),
-                  { requestId: msg.requestId },
-                );
-                platformClient.sendRaw(response);
-              } catch (err) {
-                runDetached(
-                  logger,
-                  'Access log write',
-                  () =>
-                    sub.accessLogWriter?.record({
-                      orgId: resolvedOrgContext?.orgId ?? null,
-                      routingKey: resolvedOrgContext?.routingKey ?? null,
-                      actor: msg.actor,
-                      action: 'scaler.capacity.read',
-                      target: { type: 'scaler', id: '_' },
-                      requestId: msg.requestId,
-                      source: 'platform_proxy',
-                      outcome: 'error',
-                      errorMessage: toErrorMessage(err),
-                    }),
-                  { requestId: msg.requestId },
-                );
-                throw err;
-              }
-            },
-            onDashboardScalerAgents: (msg) => {
-              const diagDeps = {
-                agentRegistry: sub.agentRegistry,
-                config,
-                version: ORCHESTRATOR_VERSION,
-                scalerBackends: sub.scalerManager
-                  ? sub.scalerManager.getStatus().backends.map((b) => b.type)
-                  : [],
-                scalerManager: sub.scalerManager,
-              };
-              try {
-                const response = handleScalerAgentsRequest(diagDeps, msg.requestId, msg.scalerName);
-                runDetached(
-                  logger,
-                  'Access log write',
-                  () =>
-                    sub.accessLogWriter?.record({
-                      orgId: resolvedOrgContext?.orgId ?? null,
-                      routingKey: resolvedOrgContext?.routingKey ?? null,
-                      actor: msg.actor,
-                      action: 'scaler.agents.read',
-                      target: { type: 'scaler', id: msg.scalerName ?? '_' },
-                      requestId: msg.requestId,
-                      source: 'platform_proxy',
-                      outcome: 'allowed',
-                    }),
-                  { requestId: msg.requestId },
-                );
-                platformClient.sendRaw(response);
-              } catch (err) {
-                runDetached(
-                  logger,
-                  'Access log write',
-                  () =>
-                    sub.accessLogWriter?.record({
-                      orgId: resolvedOrgContext?.orgId ?? null,
-                      routingKey: resolvedOrgContext?.routingKey ?? null,
-                      actor: msg.actor,
-                      action: 'scaler.agents.read',
-                      target: { type: 'scaler', id: msg.scalerName ?? '_' },
-                      requestId: msg.requestId,
-                      source: 'platform_proxy',
-                      outcome: 'error',
-                      errorMessage: toErrorMessage(err),
-                    }),
-                  { requestId: msg.requestId },
-                );
-                throw err;
-              }
-            },
             onDashboardEnvMessage: async (msg) =>
               // The guard guarantees exactly one response frame per forwarded
               // request: a thrown handler or an unhandled type returns a fast
@@ -1980,12 +1805,7 @@ export async function runServer(
           // aggregator is built once in orchestrator-core (subsystems) and
           // shared with the HTTP /metrics scrape path via createApp deps.
           const metricsReporter = new MetricsReporter({
-            // Feature-gated: the periodic telemetry push rides the Platform→orchestrator
-            // capability pre-flight (`orchMetrics`). Backward-safe — a Platform that
-            // never advertises capabilities is treated as "supports it" and metrics
-            // still flow; only an advertised set that explicitly drops `orchMetrics`
-            // suppresses the push with a diagnosable capability-gap warning.
-            send: (msg) => platformClient.sendIfPlatformSupports('orchMetrics', msg),
+            send: (msg) => platformClient.send(msg),
             intervalMs: 30_000,
             agentMetricsAggregator: sub.agentMetricsAggregator,
           });

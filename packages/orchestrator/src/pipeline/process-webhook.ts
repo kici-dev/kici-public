@@ -1841,7 +1841,7 @@ function remedyForRegistrationExclusion(orgId: string, routingKey: string): stri
   return orgId === '__default__'
     ? `the event resolved to the '__default__' org anchor, so no source maps ` +
         `${routingKey} to an organization: map it ` +
-        `(kici-admin source update ${routingKey} --customer-id <org>), and ` +
+        `(kici-admin source update ${routingKey} --org <org>), and ` +
         `${enable} if it is not already`
     : `${enable}, and allow-list the authoring repo for ${orgId} ` +
         `(kici-admin org-settings global-workflows allow-add <pattern> --org ${orgId})`;

@@ -1,4 +1,6 @@
 import { describe, it, expectTypeOf } from 'vitest';
+import type { CacheSpec, GenericInitConfig, InitConfig, MiseInitConfig } from '@kici-dev/sdk';
+import type { LockCacheSpec, LockInitConfig } from '@kici-dev/engine';
 import type { LockJob } from './types.js';
 
 /**
@@ -55,5 +57,36 @@ describe('LockJob dynamic fields', () => {
     };
     expectTypeOf(job.env).toEqualTypeOf<Record<string, string> | undefined>();
     expectTypeOf(job.concurrencyGroup).toEqualTypeOf<string | undefined>();
+  });
+});
+
+/**
+ * The engine cannot import the SDK, so the lock-file cache and init shapes are
+ * structural mirrors. The generator copies the SDK values through unchanged, so
+ * each SDK shape must stay assignable to its mirror.
+ */
+describe('engine lock mirrors of SDK shapes', () => {
+  // fails-when: an engine mirror narrows a field the SDK shape allows (e.g. `paths` becomes a tuple)
+  it('accepts the SDK cache spec and init config', () => {
+    expectTypeOf<CacheSpec>().toMatchTypeOf<LockCacheSpec>();
+    expectTypeOf<InitConfig>().toMatchTypeOf<LockInitConfig>();
+  });
+
+  // Assignability alone passes when the SDK gains a field the mirror lacks, so
+  // the field sets are pinned too.
+  // fails-when: an SDK cache or init shape gains a field its engine mirror does not declare
+  it('declares the same fields as each SDK shape', () => {
+    type LockGeneric = Extract<LockInitConfig, { readonly run: string }>;
+    type LockMise = Extract<LockInitConfig, { readonly mise: unknown }>['mise'];
+    expectTypeOf<keyof LockCacheSpec>().toEqualTypeOf<keyof CacheSpec>();
+    expectTypeOf<keyof LockGeneric>().toEqualTypeOf<keyof GenericInitConfig>();
+    expectTypeOf<keyof LockMise>().toEqualTypeOf<keyof MiseInitConfig>();
+  });
+
+  // control: the matcher rejects a shape the lock never carries, so the assertion above can fail
+  it('refuses a cache spec with a non-string key', () => {
+    expectTypeOf<{ key: number; paths: string[] }>().not.toMatchTypeOf<LockCacheSpec>();
+    expectTypeOf<{ run: number }>().not.toMatchTypeOf<LockInitConfig>();
+    expectTypeOf<keyof LockCacheSpec>().not.toEqualTypeOf<keyof CacheSpec | 'scope'>();
   });
 });

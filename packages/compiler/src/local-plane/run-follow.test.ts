@@ -47,7 +47,7 @@ describe('followRun', () => {
       client,
       quiet: true,
       pollIntervalMs: 1,
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
     });
     expect(outcome.status).toBe('success');
     expect(outcome.jobs).toEqual([
@@ -78,7 +78,7 @@ describe('followRun', () => {
       client,
       onLine: (l) => emitted.push(l),
       pollIntervalMs: 1,
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
     });
     expect(emitted).toContain('hello');
     expect(emitted).toContain('world');
@@ -118,7 +118,7 @@ describe('followRun', () => {
       client,
       onLine: (l) => emitted.push(l),
       pollIntervalMs: 1,
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
     });
     expect(emitted).toContain('✔ the committed test passes');
     expect(emitted).not.toContain(ENVELOPE);
@@ -148,7 +148,7 @@ describe('followRun', () => {
       client: { get: get as RunFollowClient['get'] },
       quiet: true,
       pollIntervalMs: 1,
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
     });
     expect(outcome.status).toBe('failed');
     expect(outcome.jobs[0].status).toBe('failed');
@@ -170,7 +170,7 @@ describe('followRun', () => {
         client,
         quiet: true,
         pollIntervalMs: 1,
-        timeoutMs: 30,
+        idleTimeoutMs: 30,
       }),
     ).rejects.toThrow(/no progress/);
   });

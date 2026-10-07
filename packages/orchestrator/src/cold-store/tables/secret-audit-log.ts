@@ -1,12 +1,11 @@
 /**
  * `secret_audit_log` cold-store adapter (Orchestrator side).
  *
- *
  * Contract:
  *   - tenant column: `routing_key` (NULL → synthetic `__orchestrator__`)
  *   - partition column: `timestamp`
- *   - warm TTL: 90 days (longer window than other audit tables — volume is
- *     low, forensic value is high)
+ *   - warm TTL: `minSecretAuditLogWarmDays()` table-wide, tightened per row
+ *     by `secretAuditLogWarmSqlCase()`
  *
  * Synthetic tenant: rows without `routing_key` (e.g. orchestrator-level
  * key rotations done before any source is bound) collapse to a single
@@ -20,6 +19,7 @@ import {
   type ColdStoreTableConfig,
   type EligiblePartition,
   type TableAdapter,
+  PgTableAdapterBase,
 } from '@kici-dev/shared';
 import {
   getSecretAuditLogColdDays,
@@ -42,10 +42,6 @@ const APPROX_ROW_BYTES = 400;
  * eligible. The CASE further tightens eligibility per row based on action /
  * outcome — sampled `resolve` / `resolve_named` rows can archive at 30d
  * (matching the post-sampling 1% volume), while mutations stay 365d.
- *
- * Lowered from 90d (the prior table-wide default) to 30d as part of the audit
- * per-category retention work; the `archive_chunk`-recording recursive pattern
- * stays bounded since mutations stay in the 365d bucket.
  */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: minSecretAuditLogWarmDays(),
@@ -60,19 +56,21 @@ export interface SecretAuditLogAdapterOptions {
   overrides?: Partial<ColdStoreTableConfig>;
 }
 
-export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
+export class SecretAuditLogAdapter
+  extends PgTableAdapterBase<Database>
+  implements TableAdapter<SecretAuditLogRow>
+{
   readonly db = 'orchestrator' as const;
   readonly table = 'secret_audit_log';
   readonly tenantColumn = 'routing_key';
   readonly partitionColumn = 'timestamp';
-  readonly config: ColdStoreTableConfig;
 
   constructor(
-    private readonly kdb: Kysely<Database>,
+    kdb: Kysely<Database>,
     private readonly instanceId: string,
     opts: SecretAuditLogAdapterOptions = {},
   ) {
-    this.config = { ...DEFAULT_CONFIG, ...(opts.overrides ?? {}) };
+    super(kdb, ADVISORY_LOCK_NAMESPACE, DEFAULT_CONFIG, opts.overrides);
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
@@ -126,25 +124,6 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
     return Number.isFinite(n) ? n * APPROX_ROW_BYTES : 0;
   }
 
-  async withPartitionLock<T>(
-    args: { tenantId: string; partitionDate: string },
-    fn: () => Promise<T>,
-  ): Promise<T | null> {
-    const key = `${ADVISORY_LOCK_NAMESPACE}|${args.tenantId}|${args.partitionDate}`;
-    return await this.kdb.connection().execute(async (conn) => {
-      const lockRes = await sql<{ locked: boolean }>`
-        SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
-      `.execute(conn);
-      const locked = lockRes.rows[0]?.locked === true;
-      if (!locked) return null;
-      try {
-        return await fn();
-      } finally {
-        await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn).catch(() => undefined);
-      }
-    });
-  }
-
   async *selectEligible(args: {
     tenantId: string;
     partitionDate: string;
@@ -188,8 +167,8 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
 
   decodeRow(line: string): SecretAuditLogRow {
     const parsed = JSON.parse(line) as SecretAuditLogRow;
-    coerceDate(parsed, 'timestamp');
-    coerceDate(parsed, 'archived_at');
+    PgTableAdapterBase.coerceDate(parsed, 'timestamp');
+    PgTableAdapterBase.coerceDate(parsed, 'archived_at');
     return parsed;
   }
 
@@ -236,8 +215,6 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
 
       await trx.deleteFrom('secret_audit_log').where('id', 'in', ids).execute();
 
-      // Orchestrator-side audit goes to access_log (the audit split
-      // — Platform → audit_log, Orchestrator → access_log).
       await trx
         .insertInto('access_log')
         .values({
@@ -351,12 +328,5 @@ export class SecretAuditLogAdapter implements TableAdapter<SecretAuditLogRow> {
         })
         .execute();
     });
-  }
-}
-
-function coerceDate<T>(parsed: T, field: keyof T): void {
-  const v = (parsed as unknown as Record<string, unknown>)[field as string];
-  if (typeof v === 'string') {
-    (parsed as unknown as Record<string, unknown>)[field as string] = new Date(v);
   }
 }

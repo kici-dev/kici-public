@@ -307,17 +307,15 @@ describe('orchestrator loadConfig', () => {
       delete process.env.KICI_PLATFORM_URL;
       delete process.env.KICI_PLATFORM_TOKEN;
       process.env.KICI_CLUSTER_ROLE = 'worker';
-      process.env.KICI_CLUSTER_COORDINATOR_URL = 'http://coord';
+      process.env.KICI_CLUSTER_COORDINATOR_URLS = 'http://coord';
       const config = loadConfig();
       expect(config.cluster.role).toBe('worker');
-      expect(config.cluster.coordinatorUrl).toBe('http://coord');
+      expect(config.cluster.coordinatorUrls).toEqual(['http://coord']);
     });
 
     it('rejects worker mode without coordinator URL', () => {
       process.env.KICI_CLUSTER_ROLE = 'worker';
-      expect(() => loadConfig()).toThrow(
-        /KICI_CLUSTER_COORDINATOR_URL or KICI_CLUSTER_COORDINATOR_URLS is required/,
-      );
+      expect(() => loadConfig()).toThrow(/KICI_CLUSTER_COORDINATOR_URLS is required/);
     });
 
     it('rejects a provision-backoff ceiling below its base', () => {
@@ -349,12 +347,29 @@ describe('orchestrator loadConfig', () => {
       ]);
     });
 
-    it('preserves singular KICI_CLUSTER_COORDINATOR_URL when plural is unset', () => {
+    it('refuses the singular KICI_CLUSTER_COORDINATOR_URL with a message naming the plural', () => {
+      // fails-when: the singular name still resolves, or is rejected with no rename advice.
+      // A worker with only the singular name fails the required-URLs rule, which names the plural.
       process.env.KICI_CLUSTER_ROLE = 'worker';
       process.env.KICI_CLUSTER_COORDINATOR_URL = 'http://only-coord:10143';
-      const config = loadConfig();
-      expect(config.cluster.coordinatorUrl).toBe('http://only-coord:10143');
-      expect(config.cluster.coordinatorUrls).toEqual([]);
+      expect(() => loadConfig()).toThrow(/KICI_CLUSTER_COORDINATOR_URLS is required/);
+      // Once the plural is set, the stray singular is still refused, with the rename advice.
+      process.env.KICI_CLUSTER_COORDINATOR_URLS = 'http://only-coord:10143';
+      expect(() => loadConfig()).toThrow(
+        /KICI_CLUSTER_COORDINATOR_URL {4}\(KICI_CLUSTER_COORDINATOR_URL was renamed to KICI_CLUSTER_COORDINATOR_URLS/,
+      );
+      // breaks-if-wrong: the plural alone must still configure the worker.
+      delete process.env.KICI_CLUSTER_COORDINATOR_URL;
+      process.env.KICI_CLUSTER_COORDINATOR_URLS = 'http://only-coord:10143';
+      expect(loadConfig().cluster.coordinatorUrls).toEqual(['http://only-coord:10143']);
+    });
+
+    it('refuses the removed KICI_STORAGE_PATH with advice naming the filesystem backend', () => {
+      // fails-when: KICI_STORAGE_PATH is still a known startup variable.
+      process.env.KICI_STORAGE_PATH = '/tmp/kici-cache';
+      expect(() => loadConfig()).toThrow(
+        /KICI_STORAGE_PATH {4}\(removed — set KICI_STORAGE_TYPE=filesystem/,
+      );
     });
   });
 

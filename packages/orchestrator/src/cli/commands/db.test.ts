@@ -39,6 +39,7 @@ const mockEnsureDatabase = vi.fn(async () => 'created');
 const mockCreateDbRole = vi.fn(async () => 'created');
 const mockCreateReadOnly = vi.fn(async () => 'created');
 const mockIsSchemaCurrent = vi.fn(async () => ({ current: true }));
+const mockFingerprintSchema = vi.fn();
 vi.mock('@kici-dev/shared', async (importActual) => {
   const actual = await importActual<typeof import('@kici-dev/shared')>();
   return {
@@ -49,6 +50,7 @@ vi.mock('@kici-dev/shared', async (importActual) => {
     createDbRole: (...a: unknown[]) => mockCreateDbRole(...(a as [])),
     createReadOnlyDbUser: (...a: unknown[]) => mockCreateReadOnly(...(a as [])),
     isSchemaCurrent: (...a: unknown[]) => mockIsSchemaCurrent(...(a as [])),
+    fingerprintSchema: (...a: unknown[]) => mockFingerprintSchema(...a),
     computeMigrationsHash: vi.fn(async () => 'abcdef012345deadbeef'),
   };
 });
@@ -155,6 +157,8 @@ vi.mock('../service/backup-timer.js', async () => {
 });
 
 import { registerDbCommands } from './db.js';
+import { DEFERRED_INDEXES } from '../../db/deferred-indexes.js';
+import { SCHEMA_SNAPSHOT } from '../../db/schema-snapshot.generated.js';
 import { writeManifest } from '../service/index.js';
 import type { InstanceManifest } from '../service/index.js';
 import { detectPlatform } from '../service/platform-detect.js';
@@ -168,7 +172,7 @@ function buildDbCommand(): Command {
 }
 
 /** Execute a db subcommand through a fresh program, capturing exit code. */
-async function runDb(args: string[]): Promise<{ exitCode: number | null }> {
+async function runDb(args: string[]): Promise<{ exitCode: number | null; stdout: string }> {
   const program = new Command();
   program.exitOverride();
   registerDbCommands(program, () => ({}) as never);
@@ -177,9 +181,17 @@ async function runDb(args: string[]): Promise<{ exitCode: number | null }> {
   const origError = console.error;
   const origExit = process.exit;
   const origWrite = process.stderr.write;
+  const origStdoutWrite = process.stdout.write;
   let exitCode: number | null = null;
+  let stdout = '';
 
-  console.log = () => undefined;
+  console.log = (...a: unknown[]) => {
+    stdout += a.join(' ') + '\n';
+  };
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    stdout += String(chunk);
+    return true;
+  }) as never;
   console.error = () => undefined;
   process.stderr.write = (() => true) as never;
   process.exit = ((code?: number) => {
@@ -197,6 +209,7 @@ async function runDb(args: string[]): Promise<{ exitCode: number | null }> {
       console.error = origError;
       process.exit = origExit;
       process.stderr.write = origWrite;
+      process.stdout.write = origStdoutWrite;
       throw err;
     }
   } finally {
@@ -204,8 +217,9 @@ async function runDb(args: string[]): Promise<{ exitCode: number | null }> {
     console.error = origError;
     process.exit = origExit;
     process.stderr.write = origWrite;
+    process.stdout.write = origStdoutWrite;
   }
-  return { exitCode };
+  return { exitCode, stdout };
 }
 
 describe('kici-admin db namespace', () => {
@@ -362,6 +376,61 @@ describe('db subcommands access-log', () => {
     await runDb(['db', 'collation-check', '--database-url', 'postgres://u:p@h:5432/kici']);
     expect(mockRecord).not.toHaveBeenCalled();
     expect(mockRecordOnDb).not.toHaveBeenCalled();
+  });
+});
+
+describe('kici-admin db schema-diff', () => {
+  const URL_ARGS = ['--database-url', 'postgres://u:p@h:5432/kici'];
+
+  beforeEach(() => {
+    mockFingerprintSchema.mockReset();
+    mockRecord.mockClear();
+    mockRecordOnDb.mockClear();
+  });
+
+  it('exits 0 and prints "schema matches" when the fingerprint matches', async () => {
+    mockFingerprintSchema.mockResolvedValue(structuredClone(SCHEMA_SNAPSHOT));
+    const { exitCode, stdout } = await runDb(['db', 'schema-diff', ...URL_ARGS]);
+    expect(exitCode).toBeNull();
+    expect(stdout).toContain('schema matches');
+    expect(mockRecord).not.toHaveBeenCalled();
+    expect(mockRecordOnDb).not.toHaveBeenCalled();
+  });
+
+  it('exits 2 and prints each difference', async () => {
+    // fails-when: a difference does not change the exit code.
+    const drifted = structuredClone(SCHEMA_SNAPSHOT);
+    drifted.columns['held_runs.surprise'] = { type: 'text', nullable: true, default: null };
+    mockFingerprintSchema.mockResolvedValue(drifted);
+    const { exitCode, stdout } = await runDb(['db', 'schema-diff', ...URL_ARGS]);
+    expect(exitCode).toBe(2);
+    expect(stdout).toContain('extra    columns:held_runs.surprise');
+  });
+
+  it('emits the differences as JSON with --json', async () => {
+    const drifted = structuredClone(SCHEMA_SNAPSHOT);
+    drifted.sequences.push('surprise_seq');
+    mockFingerprintSchema.mockResolvedValue(drifted);
+    const { exitCode, stdout } = await runDb(['db', 'schema-diff', '--json', ...URL_ARGS]);
+    expect(exitCode).toBe(2);
+    expect(JSON.parse(stdout)).toEqual({
+      differences: [{ path: 'sequences:surprise_seq', kind: 'extra', actual: 'surprise_seq' }],
+    });
+  });
+
+  it('exits 1 when the database cannot be read', async () => {
+    mockFingerprintSchema.mockRejectedValue(new Error('connection refused'));
+    const { exitCode } = await runDb(['db', 'schema-diff', ...URL_ARGS]);
+    expect(exitCode).toBe(1);
+  });
+
+  it('passes the deferred index names as exclusions', async () => {
+    // fails-when: the deferred indexes are compared and every live DB reports drift.
+    mockFingerprintSchema.mockResolvedValue(structuredClone(SCHEMA_SNAPSHOT));
+    await runDb(['db', 'schema-diff', ...URL_ARGS]);
+    expect(mockFingerprintSchema.mock.calls[0][1]).toEqual({
+      excludeIndexes: DEFERRED_INDEXES.map((i) => i.name),
+    });
   });
 });
 

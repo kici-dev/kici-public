@@ -16,36 +16,28 @@ const logger = createLogger({ prefix: 'dispatch-git-auth' });
 
 /** Auth the dispatch message carries; every field is optional on the wire. */
 export interface DispatchCloneAuth {
-  /** Bare source-repository token, kept for agents that read only `token`. */
-  token?: string;
   sourceAuth?: ProviderGitAuth;
   workflowAuth?: ProviderGitAuth;
 }
 
 /**
- * Mint structured auth (and a bare token when it is basic auth) for one
- * repository through one bundle. Providers that implement `issueGitAuth()`
- * return the auth kind directly; otherwise a clone token is wrapped in a
- * basic-auth envelope.
+ * Mint structured auth for one repository through one bundle. Providers that
+ * implement `issueGitAuth()` return the auth kind directly; otherwise a clone
+ * token is wrapped in a basic-auth envelope.
  */
 export async function mintRepoGitAuth(
   bundle: ProviderBundle,
   repoIdentifier: string,
   providerContext: unknown,
-): Promise<{ token: string | null; structuredAuth: ProviderGitAuth | null }> {
+): Promise<ProviderGitAuth | null> {
   const provider = bundle.cloneTokenProvider;
-  let structuredAuth: ProviderGitAuth | null = null;
   if (provider?.issueGitAuth) {
-    structuredAuth = await provider.issueGitAuth(repoIdentifier, providerContext);
+    const structuredAuth = await provider.issueGitAuth(repoIdentifier, providerContext);
+    if (structuredAuth) return structuredAuth;
   }
-  let token: string | null = null;
-  if (structuredAuth?.kind === 'basic') {
-    token = structuredAuth.secret;
-  } else if (!structuredAuth && provider?.createCloneToken) {
-    token = await provider.createCloneToken(repoIdentifier, providerContext);
-    if (token) structuredAuth = cloneTokenGitAuth(token);
-  }
-  return { token, structuredAuth };
+  if (!provider?.createCloneToken) return null;
+  const token = await provider.createCloneToken(repoIdentifier, providerContext);
+  return token ? cloneTokenGitAuth(token) : null;
 }
 
 /** The job fields the auth resolution reads. */
@@ -82,12 +74,7 @@ async function mintWorkflowRepoAuth(
   }
   const providerContext = cfg.workflowProviderContext ?? job.providerContext;
   try {
-    const { structuredAuth } = await mintRepoGitAuth(
-      workflowBundle,
-      workflowRepoIdentifier,
-      providerContext,
-    );
-    return structuredAuth;
+    return await mintRepoGitAuth(workflowBundle, workflowRepoIdentifier, providerContext);
   } catch (err) {
     logger.warn('Failed to mint workflowAuth for a global workflow', {
       workflowRoutingKey,
@@ -150,8 +137,8 @@ function isHostlessCloneUrl(url: string): boolean {
  * it may.
  *
  * The agent falls back across the two clones: it clones the source repository
- * with `sourceAuth ?? workflowAuth ?? token` and the workflow repository with
- * `workflowAuth ?? sourceAuth ?? token`. When only one repository's credential is
+ * with `sourceAuth ?? workflowAuth` and the workflow repository with
+ * `workflowAuth ?? sourceAuth`. When only one repository's credential is
  * present, the other clone sends it to that repository's host. On the same host
  * that is a credential the host issued; on another host it hands one provider's
  * credential to another, so the job is refused instead. A job with no source URL
@@ -164,7 +151,7 @@ export function crossHostAuthRefusal(
   auth: DispatchCloneAuth,
 ): string | undefined {
   if (jobConfig.isGlobalWorkflow !== true || !repoUrl) return undefined;
-  const hasSource = !!(auth.sourceAuth || auth.token);
+  const hasSource = !!auth.sourceAuth;
   const hasWorkflow = !!auth.workflowAuth;
   // Both present: each clone uses its own. Neither present: nothing can leak.
   if (hasSource === hasWorkflow) return undefined;
@@ -207,13 +194,8 @@ export async function resolveDispatchCloneAuth(args: {
   const auth: DispatchCloneAuth = {};
   if (bundle) {
     try {
-      const { token, structuredAuth } = await mintRepoGitAuth(
-        bundle,
-        repoIdentifier,
-        job.providerContext,
-      );
-      if (token) auth.token = token;
-      if (structuredAuth) auth.sourceAuth = structuredAuth;
+      const sourceAuth = await mintRepoGitAuth(bundle, repoIdentifier, job.providerContext);
+      if (sourceAuth) auth.sourceAuth = sourceAuth;
     } catch (err) {
       logger.warn('Failed to generate clone token, agent will attempt unauthenticated clone', {
         jobId: job.id,

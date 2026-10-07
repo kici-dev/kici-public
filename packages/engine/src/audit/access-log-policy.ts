@@ -124,9 +124,11 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'cluster_name.update': { kind: 'always' },
   'attestation.retry': { kind: 'always' },
   'scaler.orphan.stop': { kind: 'always' },
+  'scaler.reload': { kind: 'always' },
   'peer.forget': { kind: 'always' },
   // Direct-DB kici-admin mutations (source 'admin_cli') — always recorded.
   'db.fresh': { kind: 'always' },
+  'db.migrate': { kind: 'always' },
   'db.ensure': { kind: 'always' },
   'db.create_role': { kind: 'always' },
   'db.create_readonly_user': { kind: 'always' },

@@ -13,7 +13,8 @@ import * as path from 'node:path';
 import { Option, type Command } from 'commander';
 import { ZipArchive } from 'archiver';
 import type { AdminApiClient, FleetTopologyResponse } from '../api-client.js';
-import { toErrorMessage, addLogsToArchive } from '@kici-dev/shared';
+import { addLogsToArchive } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 interface DebugBundleOptions {
   output: string;
@@ -68,8 +69,8 @@ export function registerDebugBundleCommand(
       (value) => parseInt(value, 10),
       60,
     )
-    .action(async (opts: DebugBundleOptions) => {
-      try {
+    .action(
+      cliAction(async (opts: DebugBundleOptions) => {
         const client = getClient();
         if (opts.fleet) {
           await runFleetBundle(client, opts);
@@ -160,11 +161,8 @@ export function registerDebugBundleCommand(
         const stat = fs.statSync(outputPath);
         const sizeKB = (stat.size / 1024).toFixed(1);
         console.log(`Debug bundle saved to ${outputPath} (${sizeKB} KB)`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }
 
 /**

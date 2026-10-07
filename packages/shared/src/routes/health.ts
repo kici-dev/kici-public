@@ -47,11 +47,6 @@ export interface ReadinessResponse {
 export interface BuildFingerprint {
   /** The KiCI release the service was built from, for example `0.12.0`. */
   version: string;
-  /**
-   * @deprecated Carries {@link BuildFingerprint.version}: a KiCI service reports
-   * no build commit. Read `version` instead. Removed in v1.0.0.
-   */
-  buildCommit: string;
   sdkVersion: string;
   sdkBundleHash: string;
   sharedVersion: string;

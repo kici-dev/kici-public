@@ -245,7 +245,7 @@ function flattenToAppConfig(merged: Record<string, unknown>): Record<string, unk
     peerHeartbeatIntervalMs: cluster?.peerHeartbeatIntervalMs ?? 30000,
     peerMaxReconnectDelayMs: cluster?.peerMaxReconnectDelayMs ?? 60000,
     role: cluster?.role ?? 'coordinator',
-    coordinatorUrl: cluster?.coordinatorUrl as string | undefined,
+    coordinatorUrls: cluster?.coordinatorUrls ?? [],
     peerStaleTimeoutMs: cluster?.peerStaleTimeoutMs ?? 60_000,
     peerDiscovery: cluster?.peerDiscovery ?? PeerDiscoveryMode.enum.platform,
   };

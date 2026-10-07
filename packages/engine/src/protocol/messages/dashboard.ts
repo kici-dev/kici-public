@@ -165,8 +165,6 @@ export const dashboardJobDetailSchema = z.object({
    * Job kind: `standard` runs steps on an agent, `gate` is an invoke gate, and
    * `proxy` mirrors a summoned source-repo run. Absent/null for a standard job.
    *
-   * OPTIONAL, and must stay optional: the wire protocol is compatibility-
-   * protected, so an orchestrator that predates invoke gates omits it.
    */
   jobKind: JobKind.nullable().optional(),
   /**
@@ -184,10 +182,6 @@ export const dashboardJobDetailSchema = z.object({
    * Why this job cannot currently be routed to any agent, present only while it
    * is still queued and nothing in the fleet matches its `runsOn`; cleared once
    * a matching agent or scaler backend appears.
-   *
-   * OPTIONAL, and must stay optional: the wire protocol is compatibility-
-   * protected, so an orchestrator that predates the unroutable probe
-   * omits it.
    */
   routingReason: z.string().nullable().optional(),
   /** Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). */
@@ -371,9 +365,8 @@ export const dashboardAttestationsListResponseSchema = z.object({
    * The provenance issuer that signs this orchestrator's attestations, when it
    * owns signing (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`). The Platform surfaces
    * it as `trustedIssuer` so the dashboard / CLI verify against the orchestrator
-   * that actually signed the bundles; absent → the Platform falls back to its own
-   * issuer (for historical Platform-signed bundles). Optional for backward
-   * compatibility with older orchestrators.
+   * that signed the bundles; null or absent → no trust root, and the dashboard
+   * shows verification as unavailable. Absent on an error response.
    */
   trustedIssuer: z.string().nullable().optional(),
   error: z.string().optional(),
@@ -423,8 +416,7 @@ export const dashboardArtifactsListResponseSchema = z.object({
    * Signature-validity window (seconds) of the presigned `downloadUrl`s in this
    * response, from the storage backend's presigned-GET expiry; the dashboard
    * refreshes the list on a fraction of it so a displayed link is never stale.
-   * Optional for backward compatibility with older orchestrators (mirrors
-   * `trustedIssuer`).
+   * Absent on an error response.
    */
   downloadUrlExpiresInSeconds: z.number().int().positive().optional(),
   error: z.string().optional(),
@@ -529,6 +521,8 @@ export const dashboardAttestationGetResponseSchema = z.object({
   type: z.literal('dashboard.attestation.get.response'),
   requestId: z.string(),
   attestation: attestationListItemSchema.nullable(),
+  /** See `dashboardAttestationsListResponseSchema.trustedIssuer`. */
+  trustedIssuer: z.string().nullable().optional(),
   error: z.string().optional(),
 });
 export type DashboardAttestationGetResponse = z.infer<typeof dashboardAttestationGetResponseSchema>;
@@ -765,12 +759,9 @@ export const runRerunRequestSchema = z.object({
   /**
    * The Platform forwards the original run's `routing_key` so the
    * orchestrator can probe its cold-store under the right tenant prefix
-   * when the run is missing from PG. Optional for backwards compatibility
-   * with older Platform versions in mixed deploys; if absent, the
-   * orchestrator skips the cold-store probe and surfaces the legacy
-   * `runArchivedNotRerunnable` / "Run not found" branches.
+   * when the run is missing from PG.
    */
-  routingKey: z.string().optional(),
+  routingKey: z.string(),
 });
 
 /** Response to a re-run request. */
@@ -1788,13 +1779,8 @@ const heldRunsListResponseSchema = z.object({
         contextId: z.string().nullable(),
         contextName: z.string().nullable(),
         // Carries the gate vocabulary — `HoldType` in @kici-dev/engine, which
-        // the dashboard compares against. Two normalizations put it there, and
-        // both are needed: an orchestrator on a current version maps the
-        // persisted `held_runs.hold_type` through `normalizePersistedHoldType`
-        // before sending, which covers a row an older orchestrator wrote under
-        // a legacy spelling; and the dashboard normalizes again on receipt,
-        // which covers an orchestrator that is itself older than the mapping
-        // and therefore sends a legacy spelling verbatim.
+        // the dashboard compares against. The orchestrator sends the persisted
+        // `held_runs.hold_type` verbatim.
         //
         // Kept `z.string()` for forward-compatibility with orchestrators that
         // introduce new hold types: a strict enum would reject the entire
@@ -1952,10 +1938,10 @@ export type FleetPreviewHost = z.infer<typeof fleetPreviewHostSchema>;
  * A roster host as the dashboard sees it: the SDK inventory entry plus whether
  * an agent registration or an operator declaration confirmed it. An
  * unconfirmed host was created from the dashboard and is not a fan-out or
- * inventory target. Optional so an older orchestrator's frames still parse.
+ * inventory target.
  */
 export const fleetHostEntrySchema = HostInventoryEntry.extend({
-  confirmed: z.boolean().optional(),
+  confirmed: z.boolean(),
 });
 export type FleetHostEntry = z.infer<typeof fleetHostEntrySchema>;
 
@@ -3015,14 +3001,12 @@ export const dashboardStepLogsApiResponseSchema = z.object({
 });
 
 /**
- * REST API response for the run attestations list. The orchestrator-relayed
- * `attestations` array is augmented by Platform with the provenance trust root
- * from its own `oidcIssuer` config: `trustedIssuer` is the issuer the dashboard
- * pins each bundle's identity token to (never the bundle's own `iss`), and
- * `jwksUri` is the discovery JWKS endpoint the dashboard fetches to verify.
- * Both are null when the Platform has no provenance issuer configured — the
- * dashboard then lists + downloads the bundles but renders the badge as
- * "verification unavailable".
+ * REST API response for the run attestations list. `trustedIssuer` is the
+ * signing orchestrator's provenance issuer, which the dashboard pins each
+ * bundle's identity token to (never the bundle's own `iss`), and `jwksUri` is
+ * the discovery JWKS endpoint the dashboard fetches to verify. Both are null
+ * when the orchestrator does not sign — the dashboard then lists + downloads
+ * the bundles but renders the badge as "verification unavailable".
  */
 export const dashboardAttestationsApiResponseSchema = z.object({
   trustedIssuer: z.string().nullable(),
@@ -3337,18 +3321,10 @@ export const runEventSchema = z.object({
 
 export type RunEvent = z.infer<typeof runEventSchema>;
 
-/**
- * Trust policy response (from trust_policies table).
- *
- * `approvalExpirySeconds` is the authoritative window and `approvalExpiryHours`
- * its coarse, rounded-up view, so a client reading only the older field still
- * gets a usable number. Both are always sent by this build; the seconds field is
- * optional so a dashboard build reading an older Platform still parses.
- */
+/** Trust policy response (from trust_policies table). The window is in seconds. */
 export const trustPolicyResponseSchema = z.object({
   forkPolicy: z.string(),
-  approvalExpiryHours: z.number(),
-  approvalExpirySeconds: z.number().optional(),
+  approvalExpirySeconds: z.number(),
 });
 
 export type TrustPolicy = z.infer<typeof trustPolicyResponseSchema>;

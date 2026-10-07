@@ -92,9 +92,9 @@ export interface ProviderBundle {
  *   registry.registerByRoutingKey('github:67890', bundleForApp2);
  *   const bundle = registry.getByRoutingKey('github:12345');
  *
- * Usage (backward-compatible single-app):
- *   registry.register('github', bundle);
- *   const bundle = registry.get('github');
+ * A provider-wide default bundle, registered with `register(type)`, stands in
+ * for every routing key of that type that has no bundle of its own:
+ *   registry.register('generic', genericBundle);
  */
 export class ProviderRegistry {
   private readonly bundles = new Map<string, ProviderBundle>();
@@ -110,43 +110,19 @@ export class ProviderRegistry {
   }
 
   /**
-   * Register a provider implementation bundle by provider type.
-   *
-   * Backward-compatible: stores the bundle under a synthetic routing key
-   * "{type}:default". Only works for single-app scenarios.
-   *
-   * For multi-app support, use registerByRoutingKey() instead.
+   * Register the provider-wide default bundle for `type`, stored under the
+   * synthetic routing key "{type}:default". It answers every routing key of
+   * that type that has no bundle of its own.
    */
   register(type: ProviderType, bundle: ProviderBundle): void {
     this.bundles.set(`${type}:default`, bundle);
   }
 
   /**
-   * Get the provider bundle for a given type.
-   *
-   * Backward-compatible: returns the first bundle matching the provider type
-   * prefix. For multi-app, use getByRoutingKey() instead.
-   */
-  get(type: ProviderType): ProviderBundle | undefined {
-    // Check the synthetic default key first
-    const defaultBundle = this.bundles.get(`${type}:default`);
-    if (defaultBundle) return defaultBundle;
-
-    // Fall back to first bundle matching the provider type prefix
-    const prefix = `${type}:`;
-    for (const [key, bundle] of this.bundles) {
-      if (key.startsWith(prefix)) {
-        return bundle;
-      }
-    }
-    return undefined;
-  }
-
-  /**
    * Whether a bundle is registered at EXACTLY this routing key.
    *
-   * `getByRoutingKey` cannot answer this: it falls back to a provider-type
-   * lookup, so it returns a bundle for a key it has never seen. A caller that
+   * `getByRoutingKey` cannot answer this: it falls back to the type's default
+   * bundle, so it returns a bundle for a key it has never seen. A caller that
    * needs to know whether the source's OWN bundle is present — rather than
    * whether some bundle can be produced — has to ask here.
    */
@@ -158,29 +134,15 @@ export class ProviderRegistry {
    * Get the provider bundle by routing key.
    * Routing keys have the format "{provider}:{id}" (e.g., "github:12345").
    *
-   * Falls back to get(providerType) if the exact key is not found, for
-   * backward compatibility with single-app registration.
-   *
-   * The fallback is deliberately narrower for a `generic:` key. Such a key is
-   * fully qualified (`generic:{orgId}:{sourceId}`), so the type-prefix scan in
-   * `get()` cannot be a "the single configured app" shortcut the way it is for
-   * `github:` — it returns whichever `generic:`-prefixed bundle happens to sit
-   * first in insertion order, which may belong to a different source, or to a
-   * different ORGANIZATION. Only the shared default bundle (`generic:default`,
-   * the one that genuinely stands in for every plain generic source) is an
-   * acceptable stand-in, so that is the only fallback offered here.
+   * A key with no bundle of its own falls back only to its type's default
+   * bundle (`{type}:default`, e.g. `generic:default`, which stands in for every
+   * plain generic source). It never falls back to another key's bundle: that
+   * bundle belongs to a different App or source, possibly in a different
+   * organization.
    */
   getByRoutingKey(routingKey: string): ProviderBundle | undefined {
-    const exact = this.bundles.get(routingKey);
-    if (exact) return exact;
-
-    if (ProviderRegistry.isGenericRoutingKey(routingKey)) {
-      return this.bundles.get('generic:default');
-    }
-
-    // Fallback: try provider type lookup for backward compat
-    const providerType = routingKey.split(':')[0] as ProviderType;
-    return this.get(providerType);
+    const providerType = routingKey.split(':')[0];
+    return this.bundles.get(routingKey) ?? this.bundles.get(`${providerType}:default`);
   }
 
   /**
@@ -199,33 +161,10 @@ export class ProviderRegistry {
   }
 
   /**
-   * Check if a provider type has at least one registered bundle.
-   */
-  has(type: ProviderType): boolean {
-    if (this.bundles.has(`${type}:default`)) return true;
-    const prefix = `${type}:`;
-    for (const key of this.bundles.keys()) {
-      if (key.startsWith(prefix)) return true;
-    }
-    return false;
-  }
-
-  /**
    * Get all registered routing keys.
    */
   getRoutingKeys(): string[] {
     return [...this.bundles.keys()];
-  }
-
-  /**
-   * Get routing keys matching a specific provider type.
-   *
-   * @param type - Provider type (e.g., "github")
-   * @returns Array of routing keys matching the type prefix
-   */
-  getRoutingKeysForProvider(type: ProviderType): string[] {
-    const prefix = `${type}:`;
-    return [...this.bundles.keys()].filter((key) => key.startsWith(prefix));
   }
 
   /**

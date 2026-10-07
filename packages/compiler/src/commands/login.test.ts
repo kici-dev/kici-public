@@ -74,79 +74,28 @@ describe('kici login', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  describe('with --token flag (legacy API key flow)', () => {
-    it('saves token to config', async () => {
-      const result = await loginCommand({ token: 'test-api-key-123' });
-
-      expect(result).toBe(true);
-
-      const config = await loadGlobalConfig();
-      expect(config.token).toBe('test-api-key-123');
+  /** Mock a successful desktop OAuth login that mints `pat`. */
+  function mockOauthLogin(pat: string): void {
+    vi.mocked(isHeadless).mockResolvedValue(false);
+    vi.mocked(pkceFlow).mockResolvedValue('oidc-token');
+    vi.mocked(exchangeTokenForPat).mockResolvedValue({
+      id: `id-${pat}`,
+      token: pat,
+      expiresAt: '2099-01-01T00:00:00Z',
     });
+  }
 
-    it('saves platformEndpoint alongside token', async () => {
-      const result = await loginCommand({
-        token: 'my-key',
-        platformEndpoint: 'https://platform.example.com',
-      });
-
-      expect(result).toBe(true);
-
-      const config = await loadGlobalConfig();
-      expect(config.token).toBe('my-key');
-      expect(config.platformEndpoint).toBe('https://platform.example.com');
-    });
-
-    it('saves all options together', async () => {
-      const result = await loginCommand({
-        token: 'full-key',
-        platformEndpoint: 'https://platform.example.com',
-        routingKey: 'github:42',
-      });
-
-      expect(result).toBe(true);
-
-      const config = await loadGlobalConfig();
-      expect(config.token).toBe('full-key');
-      expect(config.platformEndpoint).toBe('https://platform.example.com');
-      expect(config.routingKey).toBe('github:42');
-    });
-
-    it('LoginOptions no longer carries an endpoint field (run path is Platform-first)', () => {
-      // Compile-time guard: a stray `endpoint` would be a typed property; assert
-      // the shape stays Platform-only. The run path never reads config.endpoint.
-      const opts: import('./login.js').LoginOptions = { token: 't' };
-      expect('endpoint' in opts).toBe(false);
-    });
-
-    it('does not run OAuth flow when --token is provided', async () => {
-      await loginCommand({ token: 'direct-key' });
-
-      expect(pkceFlow).not.toHaveBeenCalled();
-      expect(deviceFlow).not.toHaveBeenCalled();
-      expect(exchangeTokenForPat).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('validation', () => {
-    it('rejects empty token', async () => {
-      const result = await loginCommand({ token: '' });
-
-      expect(result).toBe(false);
-    });
-
-    it('rejects whitespace-only token (trimmed to empty)', async () => {
-      const result = await loginCommand({ token: '   ' });
-
-      // Whitespace-only passes length check (not trimmed by loginCommand)
-      // Orchestrator will reject invalid tokens at auth time
-      expect(result).toBe(true);
-    });
+  it('LoginOptions carries no endpoint or token field (run path is Platform-first)', () => {
+    // Compile-time guard: a stray `endpoint` or `token` would be a typed property.
+    const opts: import('./login.js').LoginOptions = { device: true };
+    expect('endpoint' in opts).toBe(false);
+    expect('token' in opts).toBe(false);
   });
 
   describe('file permissions', () => {
     it('config file has 0o600 permissions after login', async () => {
-      await loginCommand({ token: 'secret-key' });
+      mockOauthLogin('kici_pat_perm');
+      await loginCommand({});
 
       const configPath = path.join(tempDir, '.kici', 'config');
       const stat = await fs.stat(configPath);
@@ -156,7 +105,7 @@ describe('kici login', () => {
   });
 
   describe('config merging', () => {
-    it('preserves existing config when adding token', async () => {
+    it('preserves existing connection settings when saving the PAT', async () => {
       const kiciDir = path.join(tempDir, '.kici');
       await fs.mkdir(kiciDir, { recursive: true });
       await fs.writeFile(
@@ -164,25 +113,18 @@ describe('kici login', () => {
         JSON.stringify({ endpoint: 'https://existing.example.com', routingKey: 'github:42' }),
         { mode: 0o600 },
       );
+      mockOauthLogin('kici_pat_merge');
 
-      await loginCommand({ token: 'new-key' });
+      await loginCommand({});
 
       const config = await loadGlobalConfig();
-      expect(config.token).toBe('new-key');
+      expect(config.pat).toBe('kici_pat_merge');
       expect(config.endpoint).toBe('https://existing.example.com');
       expect(config.routingKey).toBe('github:42');
     });
-
-    it('overwrites existing token on re-login', async () => {
-      await loginCommand({ token: 'first-key' });
-      await loginCommand({ token: 'second-key' });
-
-      const config = await loadGlobalConfig();
-      expect(config.token).toBe('second-key');
-    });
   });
 
-  describe('OAuth flow (no --token)', () => {
+  describe('OAuth flow', () => {
     beforeEach(() => {
       // Clear mock call counts between tests
       vi.clearAllMocks();
@@ -580,24 +522,16 @@ describe('kici login', () => {
       await fs.rm(customConfigDir, { recursive: true, force: true });
     });
 
-    it('saves config to custom directory with --token', async () => {
-      const result = await loginCommand({ token: 'custom-dir-key' });
+    it('saves config to the custom directory', async () => {
+      mockOauthLogin('kici_pat_custom');
+      const result = await loginCommand({});
 
       expect(result).toBe(true);
 
       const configPath = path.join(customConfigDir, 'config');
-      const content = await fs.readFile(configPath, 'utf-8');
-      const parsed = JSON.parse(content);
-      expect(parsed.token).toBe('custom-dir-key');
-    });
-
-    it('loads config from custom directory', async () => {
-      // First login to create config
-      await loginCommand({ token: 'first-key' });
-
-      // Verify it's in the custom dir
-      const config = await loadGlobalConfig();
-      expect(config.token).toBe('first-key');
+      const parsed = JSON.parse(await fs.readFile(configPath, 'utf-8'));
+      expect(parsed.pat).toBe('kici_pat_custom');
+      expect(await loadGlobalConfig()).toMatchObject({ pat: 'kici_pat_custom' });
     });
   });
 

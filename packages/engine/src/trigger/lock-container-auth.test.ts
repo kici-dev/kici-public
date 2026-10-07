@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SCHEMA_VERSION, BREAKING_FLOOR } from './types.js';
+import { SCHEMA_VERSION } from './types.js';
 import type { LockJob } from './types.js';
 
 describe('lock schema container.auth', () => {
@@ -8,12 +8,6 @@ describe('lock schema container.auth', () => {
     // per feature only churns every later bump; what this file cares about is
     // that container.auth is inside the readable window.
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(38);
-  });
-
-  it('kept the breaking floor where it was — the bump is additive', () => {
-    // An additive bump must NOT move the floor: a v30 lock still reads
-    // correctly here, and moving it would reject locks we can still parse.
-    expect(BREAKING_FLOOR).toBe(30);
   });
 
   it('carries registry auth on the container object', () => {

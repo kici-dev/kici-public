@@ -16,7 +16,7 @@ The settings page (`/orgs/:customerId/settings`) uses a tabbed layout:
 7. **Sources** -- read-only list of registered webhook sources (see below)
 8. **Billing** -- plan and payment management
 9. **CI trust** -- trust policy configuration for CI runs (visible with `ci_trust:read` permission)
-10. **Global workflows** -- org-level security knobs for cross-repo workflows (visible with `org_settings:read` permission)
+10. **Global workflows** -- org-level security knobs for cross-repo workflows, read and written on one orchestrator at a time (visible with `org_settings:read` permission)
 11. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
 12. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
 13. **Security** -- dashboard-level security controls for this org: the session max age (every member sees it; only an organization owner can change it) and the orchestrator token reconciliation report (visible with `members:admin`)

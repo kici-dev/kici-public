@@ -34,6 +34,7 @@
 import { step } from './step.js';
 import type { Step } from './types.js';
 import type { StepContext } from './context.js';
+import { sleep } from '@kici-dev/engine';
 
 export interface WaitForOptions<TValue, TSuccess = void, TTimeout = void> {
   /** Optional name surfaced in status lines and the timeout error. */
@@ -110,10 +111,6 @@ export class WaitForTimeoutError extends Error {
 const DEFAULT_NAME = 'waitFor';
 const DEFAULT_INTERVAL_MS = 2000;
 const DEFAULT_TIMEOUT_MS = 60000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function runCheckOnce<TValue>(
   check: () => Promise<TValue | null>,

@@ -27,7 +27,7 @@ export function normalizePeerLogChunk(chunk: PeerLogChunk): NormalizedLogChunk[]
       stepIndex: chunk.stepIndex,
       lines: [line.text],
       timestamp: line.timestamp,
-      ...(line.stream !== undefined && { stream: line.stream }),
+      stream: line.stream,
     });
   }
 

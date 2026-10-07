@@ -17,7 +17,7 @@
  *
  * The two directory writers live in this namespace rather than one of their
  * own because they are the same org-trust concept as the policy, gated by the
- * same mode rule against the same `--customer-id`, and reached through the same
+ * same mode rule against the same `--org`, and reached through the same
  * admin route file. Splitting them out would put half of "who may approve" in a
  * second top-level command with its own copy of that story. They are siblings
  * of the `directory` reader rather than subcommands under it, because turning
@@ -29,10 +29,11 @@ import { formatUptime, toErrorMessage } from '@kici-dev/shared';
 import {
   CiTrustLevel,
   ForkPolicy,
-  MIN_APPROVAL_EXPIRY_SECONDS,
-  SECONDS_PER_HOUR,
+  formatExpiryDuration,
+  parseExpiryDuration,
 } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
+import { cliAction } from './shared/cli-action.js';
 
 /**
  * The policy shape the admin route returns.
@@ -48,11 +49,7 @@ import type { AdminApiClient } from '../api-client.js';
 export interface TrustPolicyView {
   customerId: string;
   forkPolicy?: string;
-  approvalExpiryHours?: number;
-  /**
-   * The authoritative hold window. Absent from any orchestrator that predates
-   * it, in which case `approvalExpiryHours` is the only window on offer.
-   */
+  /** The hold window, in seconds. */
   approvalExpirySeconds?: number;
   source: string | null;
   updatedAt: string | null;
@@ -108,8 +105,7 @@ export function formatPolicy(policy: TrustPolicyView, format: string): string {
  * touched to a policy they never set, so the reader of `trust-policy show`
  * is told outright — with where to look for each individual drop.
  *
- * Returns the lines rather than printing them so the check is unit-testable,
- * matching `policyExpiryWarnings` below.
+ * Returns the lines rather than printing them so the check is unit-testable.
  */
 export function forkDropWarnings(policy: TrustPolicyView): string[] {
   if (policy.forkPolicy !== ForkPolicy.enum.ignore) return [];
@@ -128,7 +124,7 @@ export function forkDropWarnings(policy: TrustPolicyView): string[] {
     // verb the route answers with a 409.
     const remedy = policy.platformManaged
       ? 'Set one under Settings > CI trust in the dashboard.'
-      : `Set one with: kici-admin trust-policy set --customer-id ${policy.customerId} ` +
+      : `Set one with: kici-admin trust-policy set --org ${policy.customerId} ` +
         `--fork-policy ${ForkPolicy.enum.hold}`;
     lines.push(
       `Warning: no policy is stored for this org, so the drop above is a default nobody ` +
@@ -140,25 +136,14 @@ export function forkDropWarnings(policy: TrustPolicyView): string[] {
 }
 
 /**
- * Render the enforced hold window.
- *
- * A whole number of hours still prints as `72 h`, exactly as it always did, so
- * no existing policy's output moves. Anything finer prints in seconds, because
- * the hours spelling cannot express it and rounding would report a window the
- * orchestrator is not applying.
- *
- * A policy carrying neither field is an orchestrator old enough to have
- * resolved no policy at all (see {@link TrustPolicyView}); one carrying only
- * hours is an orchestrator that predates the seconds window.
+ * Render the enforced hold window in the duration spelling `--approval-expiry`
+ * takes (`72h`, `1h30m`). A policy carrying no window is an orchestrator old
+ * enough to have resolved no policy at all (see {@link TrustPolicyView}).
  */
 export function formatExpiry(policy: TrustPolicyView): string {
-  const seconds =
-    policy.approvalExpirySeconds ??
-    (policy.approvalExpiryHours === undefined
-      ? undefined
-      : policy.approvalExpiryHours * SECONDS_PER_HOUR);
-  if (seconds === undefined) return 'unknown';
-  return seconds % SECONDS_PER_HOUR === 0 ? `${seconds / SECONDS_PER_HOUR} h` : `${seconds} s`;
+  return policy.approvalExpirySeconds === undefined
+    ? 'unknown'
+    : formatExpiryDuration(policy.approvalExpirySeconds);
 }
 
 /** Align a label/value list into the `label:<pad> value` shape both verbs print. */
@@ -189,45 +174,16 @@ export function buildPolicyPatch(
     patch[FORK_POLICY_KNOB.field] = forkPolicy;
   }
 
-  for (const [field, flag, min] of EXPIRY_FLAGS) {
-    const raw = opts[field];
-    if (raw === undefined) continue;
-    const n = Number(raw);
-    if (!Number.isInteger(n) || n < min) {
-      console.error(`Error: --${flag} must be an integer >= ${min}`);
+  if (opts.approvalExpiry !== undefined) {
+    try {
+      patch.approvalExpirySeconds = parseExpiryDuration(opts.approvalExpiry);
+    } catch (err) {
+      console.error(`Error: --approval-expiry: ${toErrorMessage(err)}`);
       process.exit(1);
     }
-    patch[field] = n;
   }
 
   return patch;
-}
-
-/** The two spellings of one window: patch field, CLI flag, and its floor. */
-const EXPIRY_FLAGS = [
-  ['approvalExpiryHours', 'approval-expiry-hours', 1],
-  ['approvalExpirySeconds', 'approval-expiry-seconds', MIN_APPROVAL_EXPIRY_SECONDS],
-] as const;
-
-/**
- * Warn when a patch names both spellings of the hold window.
- *
- * The route resolves this deterministically — the more specific seconds value
- * wins — but an operator who passed both asked for two different things, so the
- * one that is not applied is named rather than dropped in silence.
- *
- * Returns the lines rather than printing them so the check is unit-testable,
- * matching `forkDropWarnings` above.
- */
-export function policyExpiryWarnings(patch: Record<string, string | number>): string[] {
-  if (patch.approvalExpiryHours === undefined || patch.approvalExpirySeconds === undefined) {
-    return [];
-  }
-  return [
-    `Warning: --approval-expiry-hours ${patch.approvalExpiryHours} is ignored because ` +
-      `--approval-expiry-seconds ${patch.approvalExpirySeconds} was also given; the more ` +
-      `specific value wins.`,
-  ];
 }
 
 /** One identity link as the directory route reports it. */
@@ -296,8 +252,7 @@ export function formatDirectoryAge(updatedAt: string, now: number): string {
  * The connected wording is a `Note:` and the disconnected one a `Warning:`,
  * because the two ask for different things: one states a property of the design
  * the reader should know, the other names a condition they should act on. The
- * `Warning:` producers above — `forkDropWarnings` and `policyExpiryWarnings` —
- * are both of the second kind.
+ * `Warning:` producer above, `forkDropWarnings`, is of the second kind.
  *
  * Returns the lines rather than printing them so the check is unit-testable,
  * matching `forkDropWarnings` above.
@@ -420,19 +375,16 @@ export function registerTrustPolicyCommands(
 
   tp.command('show')
     .description('Print the trust policy currently enforced for an org')
-    .requiredOption('--customer-id <id>', 'Org / customer id')
+    .requiredOption('--org <id>', 'Org id')
     .option('--format <format>', 'Output format: json|table', 'table')
-    .action(async (opts: { customerId: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { org: string; format: string }) => {
         const res = await getClient().get<PolicyResponse>(
-          `/api/v1/admin/trust-policy?customerId=${encodeURIComponent(opts.customerId)}`,
+          `/api/v1/admin/trust-policy?customerId=${encodeURIComponent(opts.org)}`,
         );
         console.log(formatPolicy(res.policy, opts.format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // The reader, available in every mode. Its writers are the two siblings
   // below, which refuse wherever a Platform is attached.
@@ -441,19 +393,16 @@ export function registerTrustPolicyCommands(
       'Print the stored approval directory — identity links, member CI trust levels, and ' +
         'teams',
     )
-    .requiredOption('--customer-id <id>', 'Org / customer id')
+    .requiredOption('--org <id>', 'Org id')
     .option('--format <format>', 'Output format: json|table', 'table')
-    .action(async (opts: { customerId: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { org: string; format: string }) => {
         const res = await getClient().get<DirectoryResponse>(
-          `/api/v1/admin/trust-policy/directory?customerId=${encodeURIComponent(opts.customerId)}`,
+          `/api/v1/admin/trust-policy/directory?customerId=${encodeURIComponent(opts.org)}`,
         );
         console.log(formatDirectory(res, opts.format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   tp.command('directory-set')
     .description(
@@ -461,7 +410,7 @@ export function registerTrustPolicyCommands(
         'set their CI trust level (independent orchestrators only — a Platform-attached ' +
         'orchestrator is managed from the dashboard)',
     )
-    .requiredOption('--customer-id <id>', 'Org / customer id')
+    .requiredOption('--org <id>', 'Org id')
     .requiredOption('--user-id <id>', 'KiCI user id the approval is attributed to')
     .requiredOption('--provider-username <name>', 'Provider-side username (display only)')
     .requiredOption(
@@ -487,7 +436,7 @@ export function registerTrustPolicyCommands(
         const res = await getClient().patch<DirectoryResponse>(
           '/api/v1/admin/trust-policy/directory',
           {
-            customerId: opts.customerId,
+            customerId: opts.org,
             userId: opts.userId,
             provider: opts.provider,
             providerUsername: opts.providerUsername,
@@ -509,13 +458,13 @@ export function registerTrustPolicyCommands(
       'Revoke a member: remove every identity link they hold and their CI trust level ' +
         '(independent orchestrators only)',
     )
-    .requiredOption('--customer-id <id>', 'Org / customer id')
+    .requiredOption('--org <id>', 'Org id')
     .requiredOption('--user-id <id>', 'KiCI user id to revoke')
     .option('--format <format>', 'Output format: json|table', 'table')
-    .action(async (opts: { customerId: string; userId: string; format?: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { org: string; userId: string; format?: string }) => {
         const res = await getClient().delete<DirectoryResponse>(
-          `/api/v1/admin/trust-policy/directory?customerId=${encodeURIComponent(opts.customerId)}` +
+          `/api/v1/admin/trust-policy/directory?customerId=${encodeURIComponent(opts.org)}` +
             `&userId=${encodeURIComponent(opts.userId)}`,
         );
         const format = opts.format ?? 'table';
@@ -525,11 +474,8 @@ export function registerTrustPolicyCommands(
           console.log(`${opts.userId} held no identity link and no CI trust level; nothing to do.`);
         }
         console.log(formatDirectory(res, format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   const setCmd = tp
     .command('set')
@@ -537,20 +483,15 @@ export function registerTrustPolicyCommands(
       'Set the trust policy (independent orchestrators only — a Platform-attached ' +
         'orchestrator is managed from the dashboard). At least one flag required.',
     )
-    .requiredOption('--customer-id <id>', 'Org / customer id')
+    .requiredOption('--org <id>', 'Org id')
     .option('--format <format>', 'Output format: json|table', 'table');
   setCmd.option(
     `--${FORK_POLICY_KNOB.flag} <value>`,
     `${FORK_POLICY_KNOB.label} (${FORK_POLICY_KNOB.values.join(' | ')})`,
   );
   setCmd.option(
-    '--approval-expiry-hours <value>',
-    'Security-hold approval expiry, in hours (integer >= 1)',
-  );
-  setCmd.option(
-    '--approval-expiry-seconds <value>',
-    `Security-hold approval expiry, in seconds (integer >= ${MIN_APPROVAL_EXPIRY_SECONDS}). ` +
-      'Wins over --approval-expiry-hours when both are given.',
+    '--approval-expiry <duration>',
+    'Security-hold approval expiry, e.g. 72h, 30m or 1h30m',
   );
 
   setCmd.action(async (opts: Record<string, string | undefined>) => {
@@ -559,12 +500,9 @@ export function registerTrustPolicyCommands(
       console.error('Error: at least one policy flag is required');
       process.exit(1);
     }
-    for (const line of policyExpiryWarnings(patch)) {
-      console.warn(line);
-    }
     try {
       const res = await getClient().patch<PolicyResponse>('/api/v1/admin/trust-policy', {
-        customerId: opts.customerId,
+        customerId: opts.org,
         ...patch,
       });
       console.log(formatPolicy(res.policy, opts.format ?? 'table'));

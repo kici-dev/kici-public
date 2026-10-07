@@ -18,6 +18,7 @@ import {
   JOIN_PROTOCOL_UNSUPPORTED_MESSAGE,
   JOIN_PROTOCOL_VERSION,
   JoinErrorCode,
+  OrchRole,
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
   joinResponseSchema,
@@ -269,6 +270,8 @@ export class JoinClient {
             type: 'auth.request',
             token: apiKey,
             protocolVersion: PROTOCOL_VERSION,
+            // The joining host becomes a worker of the cluster it joins.
+            capabilities: { orchRole: OrchRole.enum.worker },
           }),
         );
       });

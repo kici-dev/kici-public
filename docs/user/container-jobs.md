@@ -186,9 +186,8 @@ job('build', {
 Store the secrets first with `kici-admin secret set`, in a scope bound to the
 named context (`kici-admin context bind`). A `prod:` reference is read through
 the bindings of the `prod` context, the same way a job's context secrets are.
-If no scope bound to a context named exactly `prod` carries the secret, the
-reference still reads the scope named `prod`, but that fallback is
-[deprecated](deprecations.md) and logs a warning. Pasting a token straight into the workflow is rejected when the workflow is
+If no scope bound to the `prod` context carries the secret, the reference is
+refused: a scope that only shares the context's name is not read. Pasting a token straight into the workflow is rejected when the workflow is
 defined, because a token written into `.kici/` would be committed to your
 repository.
 

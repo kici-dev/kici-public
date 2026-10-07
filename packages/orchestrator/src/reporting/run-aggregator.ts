@@ -17,6 +17,7 @@ import type { Kysely } from 'kysely';
 import { ExecutionJobStatus, type InitFailure } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { groupNeedsByJobName } from '../dashboard/needs-edges.js';
+import { safeJsonParse } from '../helpers/json.js';
 
 /** A run-detail step row as queried from execution_steps (warm + cold paths). */
 export interface RunDetailStepRow {
@@ -186,16 +187,6 @@ export interface CanonicalRunDetail {
   initFailure: InitFailure | null;
   routingKey: string | null;
   jobs: CanonicalRunDetailJob[];
-}
-
-/** Parse JSON, returning null on invalid input. */
-function safeJsonParse(value: string | null | undefined): unknown {
-  if (!value) return null;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
 }
 
 /** Best-effort base commit SHA from the run's `provider_context` JSON. */

@@ -34,6 +34,7 @@ For full configuration details, see [Configuration management](../config-managem
 
 ```bash
 kici-admin db migrate                     # Run pending migrations (HTTP — orchestrator must be up)
+kici-admin db migrate --database-url <url> # Run pending migrations directly (orchestrator need not run)
 kici-admin db migrate --status            # Show migration status without applying
 kici-admin db migrate --to <migration>    # Revert to a named migration (before a rollback)
 
@@ -44,6 +45,7 @@ kici-admin db ensure <name> [--owner <role>] [--revoke-connect-public] [--grant-
 kici-admin db create-role --user <name> --password <pw> [--createdb]
 kici-admin db create-readonly-user --user <name> --password <pw>
 kici-admin db check-schema [--json]                            # Exit 2 on migration drift
+kici-admin db schema-diff [--json]                             # Exit 2 when the live schema differs from this release
 kici-admin db collation-check [--database-url <url>] [--json]   # Exit 2 on collation drift
 kici-admin db reindex --confirm --reason <text> [--database-url <url>]
 kici-admin db refresh-collation-version --reason <text> [--database-url <url>]
@@ -54,11 +56,12 @@ kici-admin db backup --install-timer | --uninstall-timer [--schedule <spec>] [--
 kici-admin db restore --input <path> [--yes] [--database-url <url>]
 ```
 
-- `migrate` goes through the orchestrator HTTP admin API (orchestrator auto-migrates on startup by default; set `KICI_AUTO_MIGRATE=false` to disable and run manually). `migrate --to <migration>` reverts every migration newer than the named one. Run it before a rollback, while the newer version still serves — only that version carries the `down()` functions of its own migrations.
+- `migrate` goes through the orchestrator HTTP admin API (orchestrator auto-migrates on startup by default; set `KICI_AUTO_MIGRATE=false` to disable and run manually). `migrate --database-url <url>` runs the same migrator directly against the database, so the orchestrator does not need to run; it cannot be combined with `--to` or `--status`, and it records a `db.migrate` access-log row. `migrate --to <migration>` reverts every migration newer than the named one. Run it before a rollback, while the newer version still serves — only that version carries the `down()` functions of its own migrations.
 - `ensure` creates the database when it is missing. `--owner` sets a separate owner role, `--revoke-connect-public` revokes `CONNECT` from `PUBLIC`, and `--grant-connect-role` (repeatable) grants `CONNECT` to a named role. Every successful migration run records the bundled-migration content hash in `_migration_content_hash` — including warm runs that apply zero migrations — so `check-schema` reports the schema as current on a long-lived database whose migrations are already up to date.
-- `fresh` / `ensure` / `create-role` / `create-readonly-user` / `check-schema` / `collation-check` / `reindex` / `refresh-collation-version` open their own pool and run SQL directly — needed for deploy / bootstrap / DR workflows.
+- `fresh` / `ensure` / `create-role` / `create-readonly-user` / `check-schema` / `schema-diff` / `collation-check` / `reindex` / `refresh-collation-version` open their own pool and run SQL directly — needed for deploy / bootstrap / DR workflows.
 - `fresh` prompts for the target database name as a confirmation. Pass `--yes` to skip the prompt (scripted use).
-- `check-schema` compares the bundled migration manifest (names + body hash) against the live schema and the stored `_migration_content_hash` marker. Exit code 2 means drift — call `fresh` or run `migrate` depending on intent.
+- `check-schema` compares the bundled migration manifest (names + body hash) against the live schema and the stored `_migration_content_hash` marker. Exit code 2 means drift — call `fresh` or run `migrate` depending on intent. Exit code 1 means the database could not be read. `--json` prints `{"current", "kind", "reason"}`; `kind` is one of `current`, `missing`, `pending`, `unknown-applied`, `hash-missing` or `hash-mismatch`.
+- `schema-diff` reads the live schema from the PostgreSQL catalog — columns, constraints, indexes, functions, triggers, sequences and extensions — and compares it with the schema this release builds from its migrations. It prints one line per difference: `missing` (the release expects it, the database does not have it), `extra` (the database has it, the release does not expect it) or `changed`. `--json` prints `{"differences": [...]}`. Exit code 0 means the schema matches, 2 means at least one difference, and 1 means an error. The indexes the orchestrator builds in the background after startup are not compared. An extension that the database has and the release does not use is not a difference, because your database host can install its own extensions. Use it after an upgrade, or after a restore, to find a schema that `check-schema` reports as current but that a manual change or an edited migration made different.
 - `collation-check` compares `pg_database.datcollversion` against the running libc collation version. Exit code 2 means the stamped and actual collation versions differ — a libc upgrade changed sort order out from under existing indexes.
 - `reindex` runs `REINDEX DATABASE CONCURRENTLY`, rebuilding every index under the current libc collation rules. Non-blocking but takes minutes and roughly 2× temporary disk. Requires `--confirm` and `--reason`.
 - `refresh-collation-version` runs `ALTER DATABASE … REFRESH COLLATION VERSION` — a metadata-only bump that clears the drift warning. Pair it with `db reindex` after a libc-base image rebuild so the indexes match the new collation. Requires `--reason`.
@@ -167,7 +170,7 @@ Synopsis: `kici-admin config init [options]`
 
 ### `kici-admin config reload`
 
-Trigger config reload across the cluster
+Trigger config reload across the cluster. The result's `scaler` field reports the reload of the scaler config: `applied`, or `rejected` with its errors.
 
 Synopsis: `kici-admin config reload [options]`
 
@@ -362,16 +365,17 @@ Synopsis: `kici-admin db fresh [options]`
 
 ### `kici-admin db migrate`
 
-Run pending database migrations (via orchestrator HTTP admin API)
+Run pending database migrations (via the orchestrator HTTP admin API, or directly with --database-url)
 
 Synopsis: `kici-admin db migrate [options]`
 
 **Options**
 
-| Option             | Default | Description                                                                                                                                                                   |
-| ------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--status`         |         | Show migration status without applying                                                                                                                                        |
-| `--to <migration>` |         | Migrate to a named migration, reverting newer ones. Run this BEFORE a rollback, while the newer binary is still serving — it is the only one carrying their down() functions. |
+| Option                 | Default | Description                                                                                                                                                                   |
+| ---------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--status`             |         | Show migration status without applying                                                                                                                                        |
+| `--database-url <url>` |         | Migrate this database directly instead of through the orchestrator HTTP API                                                                                                   |
+| `--to <migration>`     |         | Migrate to a named migration, reverting newer ones. Run this BEFORE a rollback, while the newer binary is still serving — it is the only one carrying their down() functions. |
 
 ### `kici-admin db refresh-collation-version`
 
@@ -413,5 +417,18 @@ Synopsis: `kici-admin db restore [options]`
 | `--input <path>`       |         | Path to a .dump file produced by `db backup`          |
 | `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
 | `--yes`                |         | Skip interactive confirmation (for scripted use)      |
+
+### `kici-admin db schema-diff`
+
+Compare the live schema with the schema this release expects. Exit 2 on any difference.
+
+Synopsis: `kici-admin db schema-diff [options]`
+
+**Options**
+
+| Option                 | Default | Description                                  |
+| ---------------------- | ------- | -------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)       |
+| `--json`               | `false` | Emit JSON instead of one line per difference |
 
 <!-- END GENERATED: kici-admin-config-and-db -->

@@ -111,7 +111,7 @@ Orchestrator-backed APIs — `ctx.kici.*`, `ctx.artifacts.*`, `ctx.attestProvena
 kici login
 ```
 
-This opens your browser for OAuth authentication and stores a personal access token in `~/.kici/config`. For CI/CD pipelines or headless environments, use `kici login --token <your-api-key>` or `kici login --device` instead. See [CLI authentication](cli-auth.md) for details.
+This opens your browser for OAuth authentication and stores a personal access token in `~/.kici/config`. For headless environments, use `kici login --device` instead. For CI/CD pipelines, see [non-interactive environments](cli-auth.md#non-interactive-environments). See [CLI authentication](cli-auth.md) for details.
 
 ### 2. Write a test fixture
 

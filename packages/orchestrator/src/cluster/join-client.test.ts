@@ -121,6 +121,7 @@ describe('JoinClient through the Platform relay', () => {
       expect(relay.frames[0]).toMatchObject({
         token: 'api-key-1',
         protocolVersion: PROTOCOL_VERSION,
+        capabilities: { orchRole: 'worker' },
       });
     } finally {
       await relay.close();

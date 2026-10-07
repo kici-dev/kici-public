@@ -472,7 +472,7 @@ export const RESERVED_NON_SCHEMA_KICI_PREFIXES: readonly string[] = [
  * As with RESERVED_NON_SCHEMA_KICI_VARS / _PREFIXES, keep this short. Every
  * suffix widens the set of names we can no longer catch as typos.
  */
-export const RESERVED_NON_SCHEMA_KICI_SUFFIXES: readonly string[] = ['_ENV_PROBE'];
+const RESERVED_NON_SCHEMA_KICI_SUFFIXES: readonly string[] = ['_ENV_PROBE'];
 
 export interface ValidateUnknownKiciVarsOptions {
   /** Extra env-var names to treat as known (not all consumers can be migrated in one go). */

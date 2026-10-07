@@ -75,9 +75,9 @@ function reject(reason: DeferredAttestationRejectReason, detail: string): Deferr
  * A rejection is a DROP: the job stays green and has no attestation.
  * That is a degradation, whereas storing an unchecked statement re-introduces
  * the forgery primitive — every gate that lets one through is the hole again.
- * An agent too old to receive `provenanceContext` freezes the legacy statement
- * shape and is dropped for the same reason, with the mismatched field named so
- * the operator can see the upgrade is what fixes it.
+ * A dispatch that carried no `provenanceContext` makes the agent freeze its
+ * local statement, which is dropped for the same reason, with the mismatched
+ * field named.
  */
 export async function checkDeferredCapture(deps: {
   db: Kysely<Database>;

@@ -18,6 +18,7 @@ import type { HostReach } from './reach.js';
 import { probeTargetPlatform } from './probe-platform.js';
 import { stageAgentPayload, type DeliveryMode } from './stage-agent-payload.js';
 import type { AgentPayloadSource } from './payload-source.js';
+import { shQuote } from '@kici-dev/core';
 
 /** Default folder-anchored install base for a permanent fleet agent. */
 const DEFAULT_INSTALL_DIR = '/opt/kici-agent';
@@ -52,11 +53,6 @@ export interface RestageDeps extends SshDeps {
   payloadSource?: AgentPayloadSource;
   /** Ops-agent-side file-hash boundary, injectable for tests. */
   hashLocalFile?: (filePath: string) => Promise<string>;
-}
-
-/** Single-quote a value for safe embedding in a remote shell command. */
-function shQuote(v: string): string {
-  return `'${v.replace(/'/g, `'\\''`)}'`;
 }
 
 /** The versioned payload directory for a version under the install base. */

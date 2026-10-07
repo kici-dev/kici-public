@@ -191,6 +191,9 @@ export class PeerCredentialStore {
       .where('instance_id', '=', instanceId)
       .where('revoked_at', 'is not', null)
       .orderBy('revoked_at', 'desc')
+      // Two rows revoked in the same millisecond tie on revoked_at; the newer
+      // credential is the one issued last.
+      .orderBy('created_at', 'desc')
       .executeTakeFirst();
 
     return row ? mapRow(row) : null;

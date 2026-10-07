@@ -1,15 +1,9 @@
 /**
- * Orchestrator configuration.
+ * Orchestrator startup configuration, read from `KICI_*` environment variables.
  *
- * This is a thin backward-compatible wrapper around the new config resolution
- * chain (config/resolver.ts). It preserves the existing synchronous loadConfig()
- * API so that no other files need changing.
- *
- * The new config system lives in config/ and supports:
- * - YAML config files (config/loader.ts)
- * - Shared DB config store (config/shared-store.ts)
- * - 4-layer resolution: env > YAML > DB > defaults (config/resolver.ts)
- * - KICI_ env var mapping (config/env-overlay.ts)
+ * The runtime config reloader lives in config/: YAML files (config/loader.ts),
+ * the shared DB config store (config/shared-store.ts), the env overlay
+ * (config/env-overlay.ts) and the resolution chain (config/resolver.ts).
  *
  * Provider configuration (GitHub Apps, etc.) is managed via the `sources` table
  * and PgSecretStore, not through config. See SourceStore and SourceManager.
@@ -71,10 +65,10 @@ const baseSchema = z.object({
   dashboardUrl: z.string().optional(),
   /**
    * Provenance trust root (the OIDC issuer) used to verify build-provenance
-   * bundles. The live process learns this over the Platform `auth.success`
-   * connect message; this config/env value is the source for the CLI backfill
-   * (`kici-admin attestations reverify`), which has no live handshake. When
-   * unset, the orchestrator records attestation verdicts as `unverifiable`.
+   * bundles when the orchestrator does not sign its own (no
+   * `provenanceSigningIssuer`). Read at ingest and by the CLI backfill
+   * (`kici-admin attestations reverify`). When unset, the orchestrator records
+   * attestation verdicts as `unverifiable`.
    */
   provenanceIssuer: z.string().optional(),
   /**
@@ -402,7 +396,6 @@ const baseSchema = z.object({
   //   - s3:         pre-signed URLs, multi-host / production
   //   - filesystem: local files served via /api/v1/cache/blob/, single-host
   cacheStorageType: z.enum(['s3', 'filesystem']).optional(),
-  cacheStoragePath: z.string().optional(), // legacy, used for log storage filesystem fallback
   cacheStorageS3Bucket: z.string().optional(), // S3 only
   cacheStorageS3Prefix: z.string().default(DEFAULT_CACHE_STORAGE_S3_PREFIX), // S3 only — empty; the bucket already scopes the cache
   cacheStorageS3Region: z.string().optional(), // S3 only
@@ -617,9 +610,8 @@ const baseSchema = z.object({
   // not register the local mint path. The offline local dev plane sets this to
   // 'true' (with a freshly-generated keypair via KICI_DEV_IDENTITY_KEY_FILE) so
   // `ctx.kici.oidc.token()` / `ctx.attestProvenance()` mint a `kici-local`
-  // dev-signed identity. A Platform-connected orchestrator NEVER reaches this
-  // path — it keeps minting via the Platform relay (app.ts registers the relay
-  // in preference; the local path is the strict else branch).
+  // dev-signed identity. Orchestrator-owned signing, when configured, wins over
+  // this path (the local path is the strict else branch).
   independentIdentity: z
     .enum(['true', 'false'])
     .default('false')
@@ -754,12 +746,10 @@ const baseSchema = z.object({
       peerMaxReconnectDelayMs: z.coerce.number().default(60000),
       /** Cluster role: coordinator (full orchestrator) or worker (delegated execution). Default: coordinator. */
       role: z.enum(['coordinator', 'worker']).default('coordinator'),
-      /** URL of the coordinator to connect to when role=worker. Single-coord mode. */
-      coordinatorUrl: z.string().optional(),
       /**
        * URLs of all coordinators to connect to when role=worker (comma-separated).
        * Worker maintains one outbound PeerClient per coord so every coord can
-       * route work to it. Takes precedence over coordinatorUrl when both are set.
+       * route work to it.
        */
       coordinatorUrls: z
         .string()
@@ -876,16 +866,11 @@ function refineRuntimeRequirements(data: ConfigData, ctx: z.RefinementCtx): void
     });
   }
 
-  // Workers require at least one coordinator URL (singular or plural form).
-  if (
-    isWorker &&
-    !data.cluster.coordinatorUrl &&
-    (!data.cluster.coordinatorUrls || data.cluster.coordinatorUrls.length === 0)
-  ) {
+  // Workers require at least one coordinator URL.
+  if (isWorker && data.cluster.coordinatorUrls.length === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message:
-        'KICI_CLUSTER_COORDINATOR_URL or KICI_CLUSTER_COORDINATOR_URLS is required when KICI_CLUSTER_ROLE=worker',
+      message: 'KICI_CLUSTER_COORDINATOR_URLS is required when KICI_CLUSTER_ROLE=worker',
       path: ['cluster', 'coordinatorUrls'],
     });
   }
@@ -951,7 +936,7 @@ export const packagingConfigSchema = baseSchema.superRefine(refineStorageShape);
 export type AppConfig = z.infer<typeof configSchema> & {
   /** Unique identifier for this orchestrator instance, generated at startup */
   instanceId: string;
-  /** Object storage settings (populated from legacy env vars or SharedConfig) */
+  /** Object storage settings (populated from the KICI_STORAGE_* env vars or SharedConfig) */
   storage?: {
     type?: 's3' | 'filesystem';
     bucket?: string;
@@ -1009,7 +994,6 @@ export const envDef = defineEnv({
     dbPoolAcquireTimeoutMs: 'KICI_DB_POOL_ACQUIRE_TIMEOUT_MS',
     dbStatementTimeoutMs: 'KICI_DB_STATEMENT_TIMEOUT_MS',
     cacheStorageType: 'KICI_STORAGE_TYPE',
-    cacheStoragePath: 'KICI_STORAGE_PATH',
     cacheStorageS3Bucket: 'KICI_STORAGE_BUCKET',
     cacheStorageS3Prefix: 'KICI_STORAGE_PREFIX',
     cacheStorageS3Region: 'KICI_STORAGE_REGION',
@@ -1153,7 +1137,6 @@ export const envDef = defineEnv({
       peerHeartbeatIntervalMs: 'KICI_CLUSTER_PEER_HEARTBEAT_INTERVAL_MS',
       peerMaxReconnectDelayMs: 'KICI_CLUSTER_PEER_MAX_RECONNECT_DELAY_MS',
       role: 'KICI_CLUSTER_ROLE',
-      coordinatorUrl: 'KICI_CLUSTER_COORDINATOR_URL',
       coordinatorUrls: 'KICI_CLUSTER_COORDINATOR_URLS',
       peerStaleTimeoutMs: 'KICI_CLUSTER_PEER_STALE_TIMEOUT_MS',
       electionGracePeriodMs: 'KICI_CLUSTER_ELECTION_GRACE_PERIOD_MS',
@@ -1164,19 +1147,6 @@ export const envDef = defineEnv({
   },
 });
 
-/**
- * Load orchestrator configuration from environment variables.
- *
- * This is the LEGACY synchronous config loader. It reads directly from process.env
- * using the env var names declared in `envDef` (KICI_DATABASE_URL, KICI_PORT, etc.).
- *
- * Provider configuration (GitHub Apps) is no longer loaded from env vars.
- * Use the sources table and SourceManager instead.
- *
- * For new deployments, use resolveLocalConfig() + resolveFullConfig() from
- * config/resolver.ts which support YAML files, KICI_ env var prefixes, and
- * the shared DB config store.
- */
 /**
  * Cold-store env vars consumed by `OrchestratorColdStore` directly via
  * `process.env` (not threaded through the AppConfig schema). Registered
@@ -1260,7 +1230,6 @@ const TEST_ONLY_ENV_VARS = [
   'KICI_TEST_MINT_DEFER_AUDIENCE',
   'KICI_TEST_MINT_REJECT_AUDIENCE',
   'KICI_TEST_RERUN_DELAY_MS',
-  'KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES',
   'KICI_TEST_ADMIN_DATABASE_URL', // admin DB URL that gates real-Postgres repo tests (vitest harness)
   'KICI_SKIP_S3_SENTINEL_VALIDATION', // split-brain sentinel fault-injection (test double only)
   'KICI_SKIP_DB_TESTS', // opt-out that stops the vitest harness starting a throwaway Postgres
@@ -1291,6 +1260,27 @@ const OVERLAY_ONLY_ENV_VAR_ADVICE: Record<string, string> = {
     'not a startup variable, and cluster.autoRotateCredentials has no startup equivalent',
 };
 
+/**
+ * `KICI_*` names the orchestrator no longer reads, mapped to the advice the
+ * boot-time validator prints when it rejects one. An operator who missed the
+ * removal is told what replaced the variable instead of seeing a bare
+ * "no close match".
+ */
+const REMOVED_ENV_VAR_ADVICE: Record<string, string> = {
+  KICI_CLUSTER_COORDINATOR_URL:
+    'KICI_CLUSTER_COORDINATOR_URL was renamed to KICI_CLUSTER_COORDINATOR_URLS (comma-separated)',
+  KICI_STORAGE_PATH:
+    'removed — set KICI_STORAGE_TYPE=filesystem and KICI_STORAGE_FS_PATH for local storage',
+};
+
+/**
+ * Load the startup orchestrator configuration from environment variables.
+ *
+ * It reads `process.env` through the names declared in `envDef`
+ * (KICI_DATABASE_URL, KICI_PORT, …) and refuses unknown `KICI_*` names. The
+ * config reloader (`config/resolver.ts`) layers the YAML file and the shared
+ * DB config store on top at runtime.
+ */
 export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppConfig {
   const packaging = scope === ConfigScope.enum.packaging;
   const data = packaging ? envDef.parse(process.env, packagingConfigSchema) : envDef.parse();
@@ -1323,7 +1313,7 @@ export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppCo
         // workspace-wide, leaving the agent's and Platform's catchers as strict
         // as they were.
         extraKnown: ['KICI_CONFIG'],
-        notStartupVars: OVERLAY_ONLY_ENV_VAR_ADVICE,
+        notStartupVars: { ...OVERLAY_ONLY_ENV_VAR_ADVICE, ...REMOVED_ENV_VAR_ADVICE },
       },
     );
   }

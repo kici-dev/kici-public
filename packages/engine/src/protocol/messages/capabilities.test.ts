@@ -3,18 +3,12 @@ import {
   orchCapabilitiesSchema,
   OrchRole,
   ORCH_CAPABILITIES,
-  hasOrchCapability,
-  OrchCapabilityFlag,
   platformCapabilitiesSchema,
   PLATFORM_CAPABILITIES,
-  hasPlatformCapability,
   orchAgentCapabilitiesSchema,
   ORCH_AGENT_CAPABILITIES,
-  hasOrchAgentCapability,
   agentCapabilitiesSchema,
   AGENT_CAPABILITIES,
-  AgentCapabilityFlag,
-  hasAgentCapability,
 } from './capabilities.js';
 import { agentRegisterSchema } from './orchestrator-agent.js';
 
@@ -36,9 +30,9 @@ describe('OrchRole', () => {
 });
 
 describe('orchCapabilitiesSchema', () => {
-  it('accepts empty object (backward compat with pre-capability orchestrators)', () => {
-    const result = orchCapabilitiesSchema.parse({});
-    expect(result).toEqual({});
+  it('refuses an object without orchRole', () => {
+    // fails-when: orchRole stays optional.
+    expect(orchCapabilitiesSchema.safeParse({}).success).toBe(false);
   });
 
   it('accepts full capabilities object', () => {
@@ -76,173 +70,38 @@ describe('ORCH_CAPABILITIES', () => {
   });
 });
 
-describe('hasOrchCapability', () => {
-  it('returns false for undefined capabilities', () => {
-    expect(hasOrchCapability(undefined, 'someFlag')).toBe(false);
-  });
-
-  it('returns false for missing flag', () => {
-    expect(hasOrchCapability({}, 'someFlag')).toBe(false);
-  });
-
-  it('returns false for non-true value (enum fields like orchRole)', () => {
-    const caps = orchCapabilitiesSchema.parse({ orchRole: 'coordinator' });
-    expect(hasOrchCapability(caps, 'orchRole')).toBe(false);
-  });
-
-  it('returns true for flag set to true', () => {
-    const caps = orchCapabilitiesSchema.parse({ futureFlag: true });
-    expect(hasOrchCapability(caps, 'futureFlag')).toBe(true);
-  });
-
-  it('returns false for flag set to false', () => {
-    const caps = orchCapabilitiesSchema.parse({ futureFlag: false });
-    expect(hasOrchCapability(caps, 'futureFlag')).toBe(false);
-  });
-
-  // fails-when: clusterJoinV2 is missing from OrchCapabilityFlag, or an absent
-  //   capability set reads as capable.
-  it('declares clusterJoinV2 and lists it in OrchCapabilityFlag', () => {
-    expect(orchCapabilitiesSchema.parse({ clusterJoinV2: true }).clusterJoinV2).toBe(true);
-    expect(OrchCapabilityFlag.options).toContain('clusterJoinV2');
-    expect(hasOrchCapability({ clusterJoinV2: true }, OrchCapabilityFlag.enum.clusterJoinV2)).toBe(
-      true,
-    );
-    expect(hasOrchCapability({}, OrchCapabilityFlag.enum.clusterJoinV2)).toBe(false);
-    expect(hasOrchCapability(undefined, OrchCapabilityFlag.enum.clusterJoinV2)).toBe(false);
-  });
-
-  it('rejects a non-boolean clusterJoinV2', () => {
-    expect(orchCapabilitiesSchema.safeParse({ clusterJoinV2: 'yes' }).success).toBe(false);
+describe('orchCapabilitiesSchema without negotiation flags', () => {
+  // fails-when: the removed dashboard-request manifest or join flag is advertised again.
+  it('advertises only the role', () => {
+    expect(ORCH_CAPABILITIES).toEqual({ orchRole: 'coordinator' });
   });
 });
 
-describe('platformCapabilitiesSchema', () => {
-  it('accepts empty object (nothing advertised)', () => {
-    expect(platformCapabilitiesSchema.parse({})).toEqual({});
+describe.each([
+  ['platformCapabilitiesSchema', platformCapabilitiesSchema, PLATFORM_CAPABILITIES],
+  ['orchAgentCapabilitiesSchema', orchAgentCapabilitiesSchema, ORCH_AGENT_CAPABILITIES],
+  ['agentCapabilitiesSchema', agentCapabilitiesSchema, AGENT_CAPABILITIES],
+] as const)('%s', (_name, schema, defaults) => {
+  // fails-when: a removed flag (orchMetrics, artifactCompleteAck,
+  // globalEvalSkipsResultAwareGenerators) is advertised again.
+  it('advertises an empty, frozen set that parses through its own schema', () => {
+    expect(defaults).toEqual({});
+    expect(Object.isFrozen(defaults)).toBe(true);
+    expect(schema.parse(defaults)).toEqual({});
   });
 
-  it('accepts the known flags', () => {
-    const caps = { orchMetrics: true };
-    expect(platformCapabilitiesSchema.parse(caps)).toEqual(caps);
-  });
-
+  // breaks-if-wrong: a newer peer's flag must survive parsing, not be stripped.
   it('preserves unknown flags via passthrough', () => {
-    const caps = { orchMetrics: true, futureFlag: true };
-    expect(platformCapabilitiesSchema.parse(caps)).toEqual(caps);
-  });
-
-  it('rejects a non-boolean known flag', () => {
-    expect(() => platformCapabilitiesSchema.parse({ orchMetrics: 'yes' })).toThrow();
+    expect(schema.parse({ futureFlag: true })).toEqual({ futureFlag: true });
   });
 });
 
-describe('PLATFORM_CAPABILITIES', () => {
-  it('advertises orchMetrics and no mint capability', () => {
-    // fails-when: the Platform advertises the removed `oidcMint` RPC again.
-    expect(PLATFORM_CAPABILITIES.orchMetrics).toBe(true);
-    expect(PLATFORM_CAPABILITIES).not.toHaveProperty('oidcMint');
-  });
-
-  it('is frozen', () => {
-    expect(Object.isFrozen(PLATFORM_CAPABILITIES)).toBe(true);
-  });
-
-  it('parses through its own schema', () => {
-    expect(platformCapabilitiesSchema.parse(PLATFORM_CAPABILITIES)).toEqual(PLATFORM_CAPABILITIES);
-  });
-});
-
-describe('hasPlatformCapability', () => {
-  it('returns false for undefined capabilities', () => {
-    expect(hasPlatformCapability(undefined, 'orchMetrics')).toBe(false);
-  });
-
-  it('returns false for a missing flag', () => {
-    expect(hasPlatformCapability({}, 'orchMetrics')).toBe(false);
-  });
-
-  it('returns true for a flag set to true', () => {
-    const caps = platformCapabilitiesSchema.parse({ orchMetrics: true });
-    expect(hasPlatformCapability(caps, 'orchMetrics')).toBe(true);
-  });
-
-  it('returns false for a flag set to false', () => {
-    const caps = platformCapabilitiesSchema.parse({ orchMetrics: false });
-    expect(hasPlatformCapability(caps, 'orchMetrics')).toBe(false);
-  });
-});
-
-describe('orch capabilities dashboard-request manifest', () => {
-  it('advertises the supported dashboard request set', () => {
-    expect(ORCH_CAPABILITIES.supportedDashboardRequests).toContain(
-      'dashboard.contexts.bindings.set',
-    );
-  });
-  it('parses a capabilities object carrying the manifest', () => {
-    const parsed = orchCapabilitiesSchema.parse({
-      orchRole: 'coordinator',
-      supportedDashboardRequests: ['dashboard.contexts.bindings.set'],
-    });
-    expect(parsed.supportedDashboardRequests).toHaveLength(1);
-  });
-});
-
-describe('orchAgentCapabilitiesSchema', () => {
-  it('defaults advertise artifactCompleteAck', () => {
-    expect(ORCH_AGENT_CAPABILITIES.artifactCompleteAck).toBe(true);
-    expect(orchAgentCapabilitiesSchema.parse(ORCH_AGENT_CAPABILITIES)).toEqual(
-      ORCH_AGENT_CAPABILITIES,
-    );
-  });
-
-  it('preserves unknown flags (passthrough)', () => {
-    const parsed = orchAgentCapabilitiesSchema.parse({
-      artifactCompleteAck: true,
-      futureFlag: true,
-    });
-    expect((parsed as Record<string, unknown>).futureFlag).toBe(true);
-  });
-
-  it('hasOrchAgentCapability is false for undefined / missing / false', () => {
-    expect(hasOrchAgentCapability(undefined, 'artifactCompleteAck')).toBe(false);
-    expect(hasOrchAgentCapability({}, 'artifactCompleteAck')).toBe(false);
-    expect(hasOrchAgentCapability({ artifactCompleteAck: false }, 'artifactCompleteAck')).toBe(
-      false,
-    );
-    expect(hasOrchAgentCapability({ artifactCompleteAck: true }, 'artifactCompleteAck')).toBe(true);
-  });
-});
-
-describe('agentCapabilitiesSchema', () => {
-  const flag = AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators;
-
-  it('defaults advertise globalEvalSkipsResultAwareGenerators', () => {
-    // fails-when: the agent build stops advertising that its round skips result-aware generators
-    expect(hasAgentCapability(AGENT_CAPABILITIES, flag)).toBe(true);
-    expect(agentCapabilitiesSchema.parse(AGENT_CAPABILITIES)).toEqual(AGENT_CAPABILITIES);
-  });
-
-  it('preserves unknown flags (passthrough)', () => {
-    const parsed = agentCapabilitiesSchema.parse({ [flag]: true, futureFlag: true });
-    expect((parsed as Record<string, unknown>).futureFlag).toBe(true);
-  });
-
-  it('hasAgentCapability is false for null / undefined / missing / false', () => {
-    // fails-when: a pre-capability agent (no capabilities) reads as supporting the flag
-    expect(hasAgentCapability(undefined, flag)).toBe(false);
-    expect(hasAgentCapability(null, flag)).toBe(false);
-    expect(hasAgentCapability({}, flag)).toBe(false);
-    expect(hasAgentCapability({ [flag]: false }, flag)).toBe(false);
-    expect(hasAgentCapability({ [flag]: true }, flag)).toBe(true);
-  });
-
-  it('agent.register carries capabilities and still parses without them', () => {
+describe('agent.register capabilities', () => {
+  it('parses with and without the field', () => {
     const base = { type: 'agent.register', messageId: 'm', agentId: 'a', labels: [] };
-    // breaks-if-wrong: a pre-capability agent's register (no field) must still parse
     expect(agentRegisterSchema.parse(base).capabilities).toBeUndefined();
     expect(
       agentRegisterSchema.parse({ ...base, capabilities: AGENT_CAPABILITIES }).capabilities,
-    ).toEqual(AGENT_CAPABILITIES);
+    ).toEqual({});
   });
 });

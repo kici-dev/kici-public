@@ -5,6 +5,9 @@
  *                         orchestrator does not track and, with --stop, stop
  *                         them. Goes through the admin HTTP API; `--target`
  *                         reaches a worker through the coordinator.
+ *   scaler reload         Re-read the scaler config on this orchestrator and
+ *                         every peer it is connected to (admin HTTP API);
+ *                         each one applies its file completely or not at all.
  *   scaler reap-orphans   Free leaked Firecracker/container resources WITHOUT a
  *                         running orchestrator (recovery for a wedged node whose
  *                         data disk is full).
@@ -16,13 +19,18 @@
  * tool that frees disk WITHOUT the orchestrator is required.
  */
 import type { Command } from 'commander';
-import { toErrorMessage } from '@kici-dev/shared';
 import { loadLocalConfig } from '../../config/loader.js';
 import { loadScalerConfig } from '../../scaler/config.js';
 import { reapAllOrphans } from '../../scaler/reap-orphans.js';
 import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
-import { ScalerVmStatus, ScalerVmStopOutcome, type ScalerLiveVm } from '@kici-dev/engine';
+import {
+  ScalerReloadOutcome,
+  ScalerVmStatus,
+  ScalerVmStopOutcome,
+  type ScalerLiveVm,
+  type ScalerReloadInstanceResult,
+} from '@kici-dev/engine';
 import type {
   AdminApiClient,
   ScalerOrphansNode,
@@ -30,6 +38,7 @@ import type {
 } from '../api-client.js';
 import { confirmPrompt } from './shared/confirm.js';
 import { MAX_SCALER_ORPHANS_TIMEOUT_MS } from '../../scaler/orphan-requests.js';
+import { cliAction } from './shared/cli-action.js';
 
 /** Probe the local orchestrator /health endpoint. Healthy => it reaps itself. */
 export async function isOrchestratorHealthy(port: number, basePath: string): Promise<boolean> {
@@ -268,24 +277,85 @@ function registerOrphansCommand(scaler: Command, getClient: () => AdminApiClient
     .option('--dry-run', 'With --stop: show what would be stopped and stop nothing', false)
     .option('--timeout <seconds>', 'How long to wait for a --target node to answer', '30')
     .option('--json', 'Emit machine-readable JSON', false)
-    .action(async (opts: ScalerOrphansOptions) => {
-      try {
+    .action(
+      cliAction(async (opts: ScalerOrphansOptions) => {
         process.exitCode = await runScalerOrphans(getClient(), opts, {
           confirm: (prompt) => confirmPrompt(prompt),
           out: (line) => console.log(line),
           err: (line) => console.error(line),
         });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
+      }),
+    );
+}
+
+export interface ScalerReloadOptions {
+  single: boolean;
+  timeout: string;
+  json: boolean;
+}
+
+/** Outcomes that fail the command: a refused file, or an instance not reached. */
+const FAILED_RELOAD_OUTCOMES: ReadonlySet<ScalerReloadOutcome> = new Set([
+  ScalerReloadOutcome.enum.rejected,
+  ScalerReloadOutcome.enum.unreachable,
+]);
+
+/** One block per instance: what changed, why the file was refused, or why there is no answer. */
+function formatScalerReload(results: ScalerReloadInstanceResult[]): string {
+  const lines: string[] = [];
+  for (const r of results) {
+    lines.push(`${r.instanceId} (${r.role}): ${r.outcome}`);
+    if (r.plan) {
+      for (const bucket of ['added', 'updated', 'retired', 'resurrected', 'global'] as const) {
+        if (r.plan[bucket].length > 0) lines.push(`  ${bucket}: ${r.plan[bucket].join(', ')}`);
       }
-    });
+      lines.push(`  unchanged: ${r.plan.unchanged.length}`);
+    }
+    for (const error of r.errors ?? []) lines.push(`  error: ${error}`);
+    if (r.detail) lines.push(`  ${r.detail}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * `scaler reload`: reload the scaler config and print one block per instance.
+ * Resolves the exit code: 1 when any instance refused its file or was not
+ * reached, else 0. A bad `--timeout` throws before any request.
+ */
+export async function runScalerReload(
+  client: Pick<AdminApiClient, 'scalerReload'>,
+  opts: ScalerReloadOptions,
+  out: (line: string) => void,
+): Promise<number> {
+  const timeoutMs = parseTimeoutMs(opts.timeout);
+  const body = await client.scalerReload({ ...(opts.single ? { single: true } : {}), timeoutMs });
+  out(opts.json ? JSON.stringify(body, null, 2) : formatScalerReload(body.results));
+  return body.results.some((r) => FAILED_RELOAD_OUTCOMES.has(r.outcome)) ? 1 : 0;
+}
+
+/** Register `scaler reload` (admin HTTP API) on the `scaler` group. */
+function registerReloadCommand(scaler: Command, getClient: () => AdminApiClient): void {
+  scaler
+    .command('reload')
+    .description(
+      'Re-read the scaler config on this orchestrator and every orchestrator it is ' +
+        'connected to, and apply each file completely or not at all',
+    )
+    .option('--single', 'Reload only the orchestrator --url points at', false)
+    .option('--timeout <seconds>', 'How long to wait for each peer to answer', '60')
+    .option('--json', 'Emit machine-readable JSON', false)
+    .action(
+      cliAction(async (opts: ScalerReloadOptions) => {
+        process.exitCode = await runScalerReload(getClient(), opts, (line) => console.log(line));
+      }),
+    );
 }
 
 export function registerScalerCommands(program: Command, getClient: () => AdminApiClient): void {
   const scaler = program.command('scaler').description('Scaler maintenance');
 
   registerOrphansCommand(scaler, getClient);
+  registerReloadCommand(scaler, getClient);
 
   scaler
     .command('reap-orphans')
@@ -296,8 +366,8 @@ export function registerScalerCommands(program: Command, getClient: () => AdminA
     )
     .option('--force', 'Reap even if the local orchestrator reports healthy', false)
     .option('--json', 'Emit machine-readable JSON counts', false)
-    .action(async (opts: { config?: string; force: boolean; json: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { config?: string; force: boolean; json: boolean }) => {
         const local = await loadLocalConfig(opts.config);
         // Resolve the scaler config path from the same sources the orchestrator
         // itself uses: the local YAML's scaler.configPath, or the env var that
@@ -344,9 +414,6 @@ export function registerScalerCommands(program: Command, getClient: () => AdminA
           console.log(`Reaped ${total} orphan resource(s):`);
           for (const [name, n] of Object.entries(counts)) console.log(`  ${name}: ${n}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

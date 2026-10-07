@@ -162,15 +162,8 @@ jobs without a second path check.
 A round for a workflow that also declares a `needs` generator must skip that
 generator. An agent reports that it can with the self-reported label
 `kici:agent-feature:global-eval-skips-result-aware`, which scalers also add to
-the agents they spawn. The round job requires the label. The up-front refusal reads
-the agent registry instead: the capability flag
-`globalEvalSkipsResultAwareGenerators` that an agent reports at registration.
-When init-runner agents are registered, every one reports a readable version,
-and none has the flag, the candidates that declare a `needs` generator are
-refused up front and recorded as a failed evaluation. The other candidates of
-the same group still run their round.
-An empty or busy fleet is not refused: the round waits for a capable agent up
-to the round's wait ceiling.
+the agents they spawn. The round job requires the label, so the round waits for
+an agent that carries it up to the round's wait ceiling.
 
 ## SDK usage
 
@@ -428,7 +421,7 @@ routing key — events are filtered by the source they actually arrived on.
 
 ### Universal-git sources
 
-Universal-git sources (Forgejo / Gitea / Gogs / GitLab / plain-GitHub webhooks, routing key `generic:<orgId>:<sourceId>`) share the same org-level row as the org's other sources. The policy code is purely string-based with no hardcoded provider checks, so a universal-git routing key works as a per-entry qualifier just like a `github:*` routing key. Enable cluster-wide via `kici-admin cluster-settings set --global-workflows-enabled true`, then tune the per-org lists via `kici-admin org-settings global-workflows {allow-add, deny-add} --customer-id <orgId> [--source generic:<orgId>:<sourceId>]`. See the [user guide](../user/providers/universal-git.md#global-workflows) for the operator surface.
+Universal-git sources (Forgejo / Gitea / Gogs / GitLab / plain-GitHub webhooks, routing key `generic:<orgId>:<sourceId>`) share the same org-level row as the org's other sources. The policy code is purely string-based with no hardcoded provider checks, so a universal-git routing key works as a per-entry qualifier just like a `github:*` routing key. Enable cluster-wide via `kici-admin cluster-settings set --global-workflows-enabled true`, then tune the per-org lists via `kici-admin org-settings global-workflows {allow-add, deny-add} --org <orgId> [--source generic:<orgId>:<sourceId>]`. See the [user guide](../user/providers/universal-git.md#global-workflows) for the operator surface.
 
 ### Contexts and secrets on global runs
 
@@ -532,7 +525,7 @@ switch, which is operator-only by design.
 
 ### Dashboard settings
 
-The org settings page exposes these knobs through the **Global workflows** tab (`/orgs/:customerId/settings/global-workflows`), visible to any user with `org_settings:read`. Editing requires `org_settings:write`. The tab surfaces:
+The org settings page exposes these knobs through the **Global workflows** tab (`/orgs/:customerId/settings/global-workflows`), visible to any user with `org_settings:read`. Editing requires `org_settings:write`. The settings live in each orchestrator's database, so the tab reads and writes one orchestrator at a time: the only one connected, or the one you pick from its **Orchestrator** selector. The tab surfaces:
 
 - A read-only master-switch badge showing the effective fleet-wide state (`cluster_settings.global_workflows_enabled`). It is set with `kici-admin cluster-settings`, not from the dashboard.
 - An **Allowed author repos** section with its own enable toggle and editable list bound to `global_workflow_allowed_repos` (the authoring axis). When the toggle is off, any repo in the org may author global workflows.
@@ -545,7 +538,7 @@ stores an unqualified entry. Selecting a specific source pins the entry's
 Stored entries whose source has since been deleted render with an
 "Unknown source" badge.
 
-The Platform proxies reads and writes to the orchestrator via the existing dashboard WS channel (`dashboard.global-workflows.get/update`).
+The Platform proxies reads and writes to the named orchestrator (`/orgs/:customerId/orchestrators/:clusterName/global-workflows`) via the existing dashboard WS channel (`dashboard.global-workflows.get/update`).
 
 ### CLI management
 
@@ -555,18 +548,18 @@ Operators enable the fleet-wide switch with `kici-admin cluster-settings`, then 
 # Fleet-wide master switch (once per cluster):
 kici-admin cluster-settings set --global-workflows-enabled true
 
-kici-admin org-settings global-workflows show --customer-id acmeOrg00001
-kici-admin org-settings global-workflows allow-add 'myorg/ci-*' --customer-id acmeOrg00001
-kici-admin org-settings global-workflows deny-add 'myorg/fork-*' --customer-id acmeOrg00001
+kici-admin org-settings global-workflows show --org acmeOrg00001
+kici-admin org-settings global-workflows allow-add 'myorg/ci-*' --org acmeOrg00001
+kici-admin org-settings global-workflows deny-add 'myorg/fork-*' --org acmeOrg00001
 
 # Pin an entry to one webhook source (qualified by routingKey):
 kici-admin org-settings global-workflows allow-add 'myorg/deploy' \
-  --customer-id acmeOrg00001 --source github:42
+  --org acmeOrg00001 --source github:42
 kici-admin org-settings global-workflows deny-add 'myorg/main' \
-  --customer-id acmeOrg00001 --source generic:acmeOrg00001:src-b
+  --org acmeOrg00001 --source generic:acmeOrg00001:src-b
 ```
 
-`--org` is accepted as an alias for `--customer-id`. Omitting `--source`
+Omitting `--source`
 on `*-add` stores an unqualified entry that applies to any source in the
 org; omitting it on `*-remove` targets the unqualified entry. To remove
 a source-qualified entry, pass the same `--source` value used when it

@@ -21,7 +21,7 @@
  */
 import { writeFile } from 'node:fs/promises';
 import type { Command } from 'commander';
-import { createLogger, createPool, toErrorMessage } from '@kici-dev/shared';
+import { createLogger, createPool } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
 import { loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
@@ -32,16 +32,9 @@ import {
 import { DbSigner } from '../../oidc/db-signer.js';
 import type { AdminApiClient } from '../api-client.js';
 import { confirmPrompt } from './shared/confirm.js';
+import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 
 const logger = createLogger({ prefix: 'kici-admin-signing-key' });
-
-function resolveDatabaseUrl(explicit?: string): string {
-  const url = explicit ?? process.env.KICI_DATABASE_URL;
-  if (!url) {
-    throw new Error('Database URL required. Pass --database-url or set KICI_DATABASE_URL.');
-  }
-  return url;
-}
 
 /** The database URL `signing-key list` reads from, or null to read over the admin API. */
 function resolveListDatabaseUrl(explicit?: string): string | null {
@@ -189,8 +182,8 @@ export function registerSigningKeyCommands(
       'Orchestrator DB URL (else KICI_DATABASE_URL; with neither, reads over the admin API)',
     )
     .option('--json', 'Emit raw JSON')
-    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
         const databaseUrl = resolveListDatabaseUrl(opts.databaseUrl);
         let rows: ListedSigningKey[];
         if (databaseUrl) {
@@ -201,11 +194,8 @@ export function registerSigningKeyCommands(
           rows = await fetchSigningKeysOverHttp(client);
         }
         printSigningKeys(rows, opts.json);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   signingKey
     .command('generate')
@@ -213,8 +203,8 @@ export function registerSigningKeyCommands(
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--yes', 'Skip the confirmation prompt')
     .option('--dry-run', 'Show what would happen without generating')
-    .action(async (opts: { databaseUrl?: string; yes?: boolean; dryRun?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; yes?: boolean; dryRun?: boolean }) => {
         const secretKey = resolveSecretKey();
         await withRepo(opts.databaseUrl, async (repo) => {
           await runIdempotentStep(
@@ -238,11 +228,8 @@ export function registerSigningKeyCommands(
             { confirm: confirmPrompt, yes: opts.yes, dryRun: opts.dryRun },
           );
         });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   signingKey
     .command('rotate')
@@ -250,8 +237,8 @@ export function registerSigningKeyCommands(
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--yes', 'Skip the confirmation prompt')
     .option('--dry-run', 'Show what would happen without rotating')
-    .action(async (opts: { databaseUrl?: string; yes?: boolean; dryRun?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; yes?: boolean; dryRun?: boolean }) => {
         const secretKey = resolveSecretKey();
         await withRepo(opts.databaseUrl, async (repo) => {
           await runIdempotentStep(
@@ -270,11 +257,8 @@ export function registerSigningKeyCommands(
             { confirm: confirmPrompt, yes: opts.yes, dryRun: opts.dryRun },
           );
         });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   signingKey
     .command('retire <kid>')
@@ -282,15 +266,12 @@ export function registerSigningKeyCommands(
       'Move a retiring key to retired (stays in the JWKS; historical bundles keep verifying)',
     )
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
-    .action(async (kid: string, opts: { databaseUrl?: string }) => {
-      try {
+    .action(
+      cliAction(async (kid: string, opts: { databaseUrl?: string }) => {
         await withRepo(opts.databaseUrl, (repo) => repo.retire(kid));
         process.stderr.write(`Retired signing key ${kid}.\n`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   signingKey
     .command('revoke <kid>')
@@ -300,25 +281,24 @@ export function registerSigningKeyCommands(
     .requiredOption('--reason <reason>', 'Why the key is being revoked (audit)')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .option('--yes', 'Skip the confirmation prompt')
-    .action(async (kid: string, opts: { reason: string; databaseUrl?: string; yes?: boolean }) => {
-      try {
-        if (!opts.yes) {
-          const ok = await confirmPrompt(
-            `Revoke signing key ${kid}? Everything it ever signed becomes UNVERIFIABLE. [y/N] `,
-          );
-          if (!ok) {
-            console.error('Aborted.');
-            process.exit(1);
+    .action(
+      cliAction(
+        async (kid: string, opts: { reason: string; databaseUrl?: string; yes?: boolean }) => {
+          if (!opts.yes) {
+            const ok = await confirmPrompt(
+              `Revoke signing key ${kid}? Everything it ever signed becomes UNVERIFIABLE. [y/N] `,
+            );
+            if (!ok) {
+              console.error('Aborted.');
+              process.exit(1);
+            }
           }
-        }
-        await withRepo(opts.databaseUrl, (repo) => repo.revoke(kid, opts.reason));
-        logger.info('revoked provenance signing key', { kid, reason: opts.reason });
-        process.stderr.write(`Revoked signing key ${kid}.\n`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+          await withRepo(opts.databaseUrl, (repo) => repo.revoke(kid, opts.reason));
+          logger.info('revoked provenance signing key', { kid, reason: opts.reason });
+          process.stderr.write(`Revoked signing key ${kid}.\n`);
+        },
+      ),
+    );
 
   signingKey
     .command('export')
@@ -331,8 +311,8 @@ export function registerSigningKeyCommands(
     )
     .option('--out <file>', 'Write to a file instead of stdout')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
-    .action(async (opts: { public: boolean; out?: string; databaseUrl?: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { public: boolean; out?: string; databaseUrl?: string }) => {
         const config = loadConfig();
         const issuer = config.provenanceSigningIssuer;
         if (!issuer) {
@@ -349,9 +329,6 @@ export function registerSigningKeyCommands(
         } else {
           console.log(json);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

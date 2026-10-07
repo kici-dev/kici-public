@@ -32,7 +32,7 @@
  * defect this layout closes — so serving it would serve the bug. For a v6 lock
  * the fallback is unreachable anyway, since the schema bump moves every hash.
  * Old objects are orphaned. The cache TTL is enforced lazily on access, so
- * nothing here removes them; `kici-admin cache purge-legacy` does.
+ * nothing here removes them.
  */
 
 import { createLogger, sha256 } from '@kici-dev/shared';

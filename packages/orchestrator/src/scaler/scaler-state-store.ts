@@ -74,6 +74,11 @@ export interface ScalerCapSlot {
    * in that window reads the same pre-spawn count and admits.
    */
   reserve(snapshot: SpawningAgentSnapshot): Promise<void>;
+  /**
+   * Whether this scaler already holds a spawn row bound to `jobId` on any
+   * coordinator. Read inside the same locked transaction as the claim.
+   */
+  hasProvisionForJob(jobId: string): Promise<boolean>;
 }
 
 /** A row the event-provision reaper may need to tear down. */
@@ -252,6 +257,14 @@ export class ScalerStateStore {
         return fn({
           clusterActiveCount: row ? Number(row.n) : 0,
           reserve: (snapshot) => upsertSpawningAgentOn(trx, snapshot),
+          hasProvisionForJob: async (jobId) =>
+            (await trx
+              .selectFrom('scaler_spawning_agents')
+              .select('agent_id')
+              .where('scaler_name', '=', scalerName)
+              .where('bound_job_id', '=', jobId)
+              .limit(1)
+              .executeTakeFirst()) !== undefined,
         });
       });
   }

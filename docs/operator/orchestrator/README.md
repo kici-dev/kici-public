@@ -17,7 +17,7 @@ Complete environment variable reference for the orchestrator. Covers core settin
 
 ### [Auto-scaler](auto-scaler.md)
 
-Configure ephemeral agent provisioning with Docker, bare-metal, and Firecracker backends. Covers YAML configuration schema, label-set matching semantics, Docker socket security warnings, warm pool management, `scalers.d/` multi-file config, SIGHUP reload, Prometheus metrics, troubleshooting, and complete example configurations for simple, mixed, and production deployments.
+Configure ephemeral agent provisioning with Docker, bare-metal, and Firecracker backends. Covers YAML configuration schema, label-set matching semantics, Docker socket security warnings, warm pool management, `scalers.d/` multi-file config, config reload (`kici-admin scaler reload`, SIGHUP), Prometheus metrics, troubleshooting, and complete example configurations for simple, mixed, and production deployments.
 
 ### [Config management guide](config-management.md)
 

@@ -11,16 +11,17 @@ service install.
 ## Before you upgrade
 
 - Read the release notes for the target version so you know what changed.
-- Snapshot your PostgreSQL database with your standard tooling first. Migrations
-  are forward-only, so the snapshot is your only path back to an older version
-  after a migration has applied.
+- Snapshot your PostgreSQL database first, with `kici-admin db backup` or your
+  standard tooling. A migration `down()` can lose data, so the snapshot is the
+  only path back to an older version that keeps all of your data.
 
 ## Safe order: orchestrator first, then agents
 
 Upgrade the orchestrator first, then the agents. When a release raises the
 minimum accepted protocol version, move both tiers in the same maintenance
-window. 0.9.0 raises it to 3: a 0.9.0 orchestrator refuses a 0.8.x agent
-(protocol 2) at connect until the agent is upgraded.
+window. Protocol 4 raises it from 3: an orchestrator on protocol 4 refuses an
+agent from 0.15.x or earlier (protocol 3) at connect until the agent is
+upgraded.
 
 - **Ephemeral scaler-spawned agents** update themselves on the next spawn once
   you update the image reference in the scaler label-set config and reload — each
@@ -34,7 +35,7 @@ version, but that is display metadata only — nothing warns or rejects on an
 application-version mismatch. Running the orchestrator and agents on the same
 release is the supported configuration. Transient skew while a rolling upgrade
 is in flight is tolerated only between releases that share a protocol floor;
-across a floor change (0.8.x → 0.9.0) every not-yet-upgraded agent stays
+across a floor change (protocol 3 → 4) every not-yet-upgraded agent stays
 disconnected until its own upgrade, so upgrade the agents right after the
 orchestrator.
 
@@ -107,14 +108,14 @@ races the schema.
 **With `KICI_AUTO_MIGRATE=false`, migrate before you start the new binary.**
 The orchestrator does not check the schema at startup. An un-migrated database
 produces no boot error, only per-request write failures for whatever the new
-release added. This release is a concrete case: every security-hold insert names
-a column that migration 126 adds. On an un-migrated database the orchestrator
-cannot record a hold, and the affected webhook delivery fails. Run
-`kici-admin db migrate` first.
+release added. Run `kici-admin db migrate --database-url <url>` from the new
+release first. This form migrates the database directly, so the orchestrator
+does not need to run. `kici-admin db migrate` without `--database-url` asks a
+running orchestrator to migrate over its admin API.
 
-Migrations are forward-only — there is no down-migration. Inspect applied
-migrations with `kici-admin db migrate --status` and detect schema drift with
-`kici-admin db check-schema`.
+Inspect applied migrations with `kici-admin db migrate --status`. Detect
+migration drift with `kici-admin db check-schema`. Compare the live schema with
+the schema the release expects with `kici-admin db schema-diff`.
 
 ## Upgrading each deployment shape
 
@@ -153,10 +154,13 @@ token must allow. An agent token scoped to a label set then refuses the agent's
 registration. If you must roll back the orchestrator alone, register the newer
 agents with unscoped tokens until you roll them back too.
 
-Rolling the software back does not roll the database schema back. Migrations are
-forward-only, so an older orchestrator running against a newer schema is
-unsupported. To return to a pre-migration state, restore the database snapshot
-you took before the upgrade.
+Rolling the software back does not roll the database schema back. An older
+orchestrator running against a newer schema is unsupported. Revert the schema
+with `kici-admin db migrate --to <migration>` while the newer version still
+runs, because only that version has the `down()` functions of its own
+migrations. See [Service installation](./distribution/service-installation.md)
+for the native-service rollback. Or restore the database snapshot you took
+before the upgrade.
 
 ## Software rollback is not config rollback
 

@@ -154,7 +154,7 @@ export const peerAuthResponseSchema = z.object({
   role: z.string().optional(),
   /** Software version of the coordinator (for version compat check). */
   softwareVersion: z.string().optional(),
-  // Capabilities included when accepted=true (optional for backward compat)
+  // Capabilities included when accepted=true
   agents: z.array(peerAgentSummarySchema).optional(),
   scalerCapacity: z.array(scalerCapacitySummarySchema).optional(),
   capabilities: peerCapabilitiesSchema.optional(),
@@ -171,13 +171,13 @@ export const peerHeartbeatSchema = z.object({
   draining: z.boolean(),
   agents: z.array(peerAgentSummarySchema),
   capabilities: peerCapabilitiesSchema,
-  /** Optional scaler capacity data for on-demand backends (backward compatible). */
+  /** Scaler capacity data for on-demand backends. */
   scalerCapacity: z.array(scalerCapacitySummarySchema).optional(),
-  /** Shared config version for cross-orchestrator config sync (backward compatible). */
+  /** Shared config version for cross-orchestrator config sync. */
   configVersion: z.number().optional(),
-  /** Registry version for cross-orchestrator registration sync (backward compatible). */
+  /** Registry version for cross-orchestrator registration sync. */
   registryVersion: z.number().optional(),
-  /** Cluster-settings version for the coordinator→worker settings pull (backward compatible). */
+  /** Cluster-settings version for the coordinator→worker settings pull. */
   clusterSettingsVersion: z.number().optional(),
   timestamp: z.number(),
   // --- OS metadata (optional, for diagnostics visibility) ---
@@ -229,7 +229,7 @@ export const jobRerouteSchema = z.object({
   jobName: z.string(),
   workflowName: z.string(),
   runsOnLabels: z.array(z.array(z.string())),
-  /** Labels that the dispatched agent must NOT have (optional for backward compatibility). */
+  /** Labels that the dispatched agent must NOT have. Absent is `[]`. */
   excludeLabels: z.array(z.string()).optional(),
   /**
    * Glob/regex include matchers the receiving peer's agent labels must
@@ -243,11 +243,8 @@ export const jobRerouteSchema = z.object({
   excludePatterns: z.array(LabelMatcher).optional(),
   triedConnections: z.array(z.string()),
   maxHops: z.number(),
-  /**
-   * The worker's spawn-retry budget for this job. Absent from an older sender:
-   * the worker applies its own configured default.
-   */
-  spawnRetry: rerouteSpawnRetrySchema.optional(),
+  /** The worker's spawn-retry budget for this job. */
+  spawnRetry: rerouteSpawnRetrySchema,
   coordinatorId: z.string(),
   requestId: z.string().optional(),
   traceId: z.string().optional(),
@@ -385,7 +382,7 @@ const peerLogChunkSchema = z.object({
     z.object({
       text: z.string(),
       timestamp: z.number(),
-      stream: LogStream.optional(),
+      stream: LogStream,
     }),
   ),
 });
@@ -408,6 +405,68 @@ const peerCacheUploadResponseSchema = z.object({
   runId: z.string(),
   jobId: z.string(),
   uploadUrl: z.string(),
+});
+
+// --- Scaler reload (fan-out from the orchestrator that received it) ---
+
+/**
+ * What a scaler config reload did on one orchestrator. `rejected`: the file did
+ * not load or validate, or an added scaler did not build, and nothing applied.
+ * `not-configured`: the orchestrator runs without a scaler config, so there is
+ * nothing to reload. `unreachable`: the request did not reach the orchestrator,
+ * or it did not answer in time.
+ */
+export const ScalerReloadOutcome = z.enum(['applied', 'rejected', 'not-configured', 'unreachable']);
+export type ScalerReloadOutcome = z.infer<typeof ScalerReloadOutcome>;
+
+/**
+ * What an applied scaler reload changed, as scaler names per bucket. `updated`
+ * holds the kept scalers whose entry changed and `unchanged` the rest of them;
+ * `global` names the changed top-level limits (`globalMaxAgents`,
+ * `globalResourceCap`).
+ */
+export const scalerReloadPlanSchema = z.object({
+  added: z.array(z.string()),
+  updated: z.array(z.string()),
+  unchanged: z.array(z.string()),
+  retired: z.array(z.string()),
+  resurrected: z.array(z.string()),
+  global: z.array(z.string()),
+});
+export type ScalerReloadPlan = z.infer<typeof scalerReloadPlanSchema>;
+
+/** One orchestrator's scaler reload outcome, its plan when applied, its errors when refused. */
+export const scalerReloadAnswerSchema = z.object({
+  outcome: ScalerReloadOutcome,
+  plan: scalerReloadPlanSchema.optional(),
+  errors: z.array(z.string()).optional(),
+});
+export type ScalerReloadAnswer = z.infer<typeof scalerReloadAnswerSchema>;
+
+/** One orchestrator's answer to a scaler reload, as `kici-admin scaler reload` reports it. */
+export const scalerReloadInstanceResultSchema = scalerReloadAnswerSchema.extend({
+  instanceId: z.string(),
+  role: z.enum(['coordinator', 'worker', 'unknown']),
+  /** Why the outcome is what it is, for an instance that was not reached or did not answer. */
+  detail: z.string().optional(),
+});
+export type ScalerReloadInstanceResult = z.infer<typeof scalerReloadInstanceResultSchema>;
+
+/**
+ * Scaler reload request: the orchestrator that received `kici-admin scaler
+ * reload` asks each connected peer to re-read its own scaler config. The peer
+ * answers with peer.scaler.reload.response.
+ */
+export const peerScalerReloadRequestSchema = z.object({
+  type: z.literal('peer.scaler.reload.request'),
+  messageId: z.string(),
+});
+
+/** Scaler reload response: the peer's outcome, its plan when applied, its errors when rejected. */
+export const peerScalerReloadResponseSchema = scalerReloadAnswerSchema.extend({
+  type: z.literal('peer.scaler.reload.response'),
+  messageId: z.string(),
+  detail: z.string().optional(),
 });
 
 // --- Config reload (per-instance targeting) ---
@@ -437,6 +496,8 @@ export const peerConfigReloadResponseSchema = z.object({
   errors: z.array(z.string()).optional(),
   restartRequired: z.array(z.string()).optional(),
   fieldsChanged: z.array(z.string()).optional(),
+  /** The target peer's scaler config reload outcome, when it runs a scaler config. */
+  scaler: scalerReloadAnswerSchema.optional(),
 });
 
 // --- Scaler orphans (per-instance targeting) ---
@@ -570,12 +631,13 @@ export const peerForgetResponseSchema = z.object({
  */
 export const workerClusterSettingsSchema = z.object({
   agentTokenTtlMs: z.number(),
+  /** How long a Firecracker spawn waits for the VM's API socket. */
+  firecrackerApiSocketWaitMs: z.number(),
   /**
-   * How long a Firecracker spawn waits for the VM's API socket. Optional: a
-   * leader that predates the knob omits it, and the worker keeps its own
-   * configured default.
+   * The concurrency-slot wait timeout a worker sends on each `job.dispatch`,
+   * from `cluster_settings.concurrency_wait_timeout_ms`.
    */
-  firecrackerApiSocketWaitMs: z.number().optional(),
+  concurrencyWaitTimeoutMs: z.number(),
 });
 
 /**
@@ -687,16 +749,19 @@ export const peerScalerEventSchema = z.object({
   /**
    * The worker's retry verdict on a `scaler.failed` for a job under its spawn-retry
    * budget: false while attempts remain, true on the last one. Absent on a repeated
-   * report of one failed spawn, on every other relay, and from an older worker; the
-   * coordinator then keeps its spawn window running unchanged.
+   * report of one failed spawn and on every other relay; the coordinator then keeps
+   * its spawn window running unchanged.
    */
   final: z.boolean().optional(),
 });
 
 // --- Discriminated unions ---
 
-/** All peer-to-peer messages (outbound from this node). */
-export const peerToPeerMessageSchema = z.discriminatedUnion('type', [
+/**
+ * Every peer message type. Both directions carry the same set: each node sends
+ * and receives every type, so one list backs both unions.
+ */
+const peerMessageSchemas = [
   peerHelloSchema,
   peerHelloResponseSchema,
   peerAuthRequestSchema,
@@ -717,6 +782,8 @@ export const peerToPeerMessageSchema = z.discriminatedUnion('type', [
   peerConfigReloadResponseSchema,
   peerScalerOrphansRequestSchema,
   peerScalerOrphansResponseSchema,
+  peerScalerReloadRequestSchema,
+  peerScalerReloadResponseSchema,
   peerForgetRequestSchema,
   peerForgetResponseSchema,
   peerClusterSettingsRequestSchema,
@@ -727,41 +794,13 @@ export const peerToPeerMessageSchema = z.discriminatedUnion('type', [
   peerLeavingSchema,
   peerAgentTokenRevokeSchema,
   peerScalerEventSchema,
-]);
+] as const;
+
+/** All peer-to-peer messages (outbound from this node). */
+export const peerToPeerMessageSchema = z.discriminatedUnion('type', peerMessageSchemas);
 
 /** All peer-to-peer messages (inbound to this node). */
-export const peerFromPeerMessageSchema = z.discriminatedUnion('type', [
-  peerHelloSchema,
-  peerHelloResponseSchema,
-  peerAuthRequestSchema,
-  peerAuthResponseSchema,
-  peerHeartbeatSchema,
-  jobRerouteSchema,
-  jobRerouteAckSchema,
-  jobProgressSchema,
-  jobProgressAckSchema,
-  peerJobCancelSchema,
-  raftVoteRequestSchema,
-  raftVoteResponseSchema,
-  raftAppendEntriesSchema,
-  peerLogChunkSchema,
-  peerCacheUploadRequestSchema,
-  peerCacheUploadResponseSchema,
-  peerConfigReloadSchema,
-  peerConfigReloadResponseSchema,
-  peerScalerOrphansRequestSchema,
-  peerScalerOrphansResponseSchema,
-  peerForgetRequestSchema,
-  peerForgetResponseSchema,
-  peerClusterSettingsRequestSchema,
-  peerClusterSettingsResponseSchema,
-  peerLogsCollectRequestSchema,
-  peerLogsCollectChunkSchema,
-  peerLogsCollectErrorSchema,
-  peerLeavingSchema,
-  peerAgentTokenRevokeSchema,
-  peerScalerEventSchema,
-]);
+export const peerFromPeerMessageSchema = z.discriminatedUnion('type', peerMessageSchemas);
 
 // --- Inferred types ---
 
@@ -787,6 +826,8 @@ export type PeerConfigReload = z.infer<typeof peerConfigReloadSchema>;
 export type PeerConfigReloadResponse = z.infer<typeof peerConfigReloadResponseSchema>;
 export type PeerScalerOrphansRequest = z.infer<typeof peerScalerOrphansRequestSchema>;
 export type PeerScalerOrphansResponse = z.infer<typeof peerScalerOrphansResponseSchema>;
+export type PeerScalerReloadRequest = z.infer<typeof peerScalerReloadRequestSchema>;
+export type PeerScalerReloadResponse = z.infer<typeof peerScalerReloadResponseSchema>;
 export type PeerForgetRequest = z.infer<typeof peerForgetRequestSchema>;
 export type PeerForgetResponse = z.infer<typeof peerForgetResponseSchema>;
 export type WorkerClusterSettings = z.infer<typeof workerClusterSettingsSchema>;

@@ -6,7 +6,7 @@
  * through the orchestrator's admin HTTP API.
  *
  * Global options:
- *   --url / -u    Orchestrator URL (env: KICI_ADMIN_URL, default: http://localhost:8080)
+ *   --url / -u    Orchestrator URL (env: KICI_ADMIN_URL, default: http://localhost:4000)
  *   --token / -t  Admin API token (env: KICI_ADMIN_TOKEN, required)
  *   -V / --cli-version / --version  Print the CLI version (--version only before a command)
  *
@@ -20,7 +20,7 @@ import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
 import { Command, type ParseOptionsResult } from 'commander';
-import { AdminApiClient } from './api-client.js';
+import { AdminApiClient, DEFAULT_ADMIN_URL } from './api-client.js';
 import { registerSecretCommands } from './commands/secret.js';
 import { registerRotateCommand } from './commands/rotate.js';
 import { registerAuditCommands } from './commands/audit.js';
@@ -47,6 +47,7 @@ import { registerAgentServiceCommands } from './commands/agent-service/index.js'
 import { registerAgentPackage } from './commands/agent-package.js';
 import { registerPeerCommands } from './commands/peer.js';
 import { registerHostCommands } from './commands/host.js';
+import { registerOrgCommands } from './commands/org.js';
 import { registerOrgSettingsCommands } from './commands/org-settings.js';
 import { registerClusterSettingsCommands } from './commands/cluster-settings.js';
 import { registerTrustPolicyCommands } from './commands/trust-policy.js';
@@ -63,7 +64,6 @@ import { registerRegistrationCommands } from './commands/registration.js';
 import { registerEventCommands } from './commands/event.js';
 import { registerEventDlqCommands } from './commands/event-dlq.js';
 import { registerColdStoreCommands } from './commands/cold-store.js';
-import { registerCacheCommands } from './commands/cache.js';
 import { registerFirecrackerCommands } from './commands/firecracker/index.js';
 import { registerScalerCommands } from './commands/scaler.js';
 import { registerJoinCommand } from './join.js';
@@ -118,11 +118,7 @@ export function buildProgram(): Command {
       `-V, ${ROOT_VERSION_FLAG}`,
       'output the version number (--version also works before a command)',
     )
-    .option(
-      '-u, --url <url>',
-      'Orchestrator URL',
-      process.env.KICI_ADMIN_URL ?? 'http://localhost:8080',
-    )
+    .option('-u, --url <url>', 'Orchestrator URL', process.env.KICI_ADMIN_URL ?? DEFAULT_ADMIN_URL)
     .option('-t, --token <token>', 'Admin API token', process.env.KICI_ADMIN_TOKEN);
 
   /**
@@ -193,6 +189,8 @@ export function buildProgram(): Command {
   registerPeerCommands(program, getClient);
   // Host roster commands use direct DB access (not AdminApiClient)
   registerHostCommands(program);
+  // `org list`: the org ids the org-scoped commands below take.
+  registerOrgCommands(program, getClient);
   registerOrgSettingsCommands(program, getClient);
   registerClusterSettingsCommands(program, getClient);
   registerTrustPolicyCommands(program, getClient);
@@ -229,9 +227,6 @@ export function buildProgram(): Command {
   registerEventDlqCommands(program, getClient);
   // Cold-store CLI stubs (standalone namespace; admin HTTP-backed).
   registerColdStoreCommands(program, getClient);
-  // Cache maintenance talks to the storage backend directly — no admin HTTP
-  // client, no DB, no running orchestrator.
-  registerCacheCommands(program);
   // Join command does not use AdminApiClient (connects directly to Platform/peer)
   registerJoinCommand(program);
 

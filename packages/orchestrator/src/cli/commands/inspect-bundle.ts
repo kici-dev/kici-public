@@ -10,7 +10,8 @@
 
 import type { Command } from 'commander';
 import { readDebugBundle, type BundleSummary } from '../../diagnostics/bundle-reader.js';
-import { formatBytes, toErrorMessage } from '@kici-dev/shared';
+import { formatBytes } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 /** ANSI color codes for terminal output. */
 const COLORS = {
@@ -141,13 +142,10 @@ export function registerInspectBundleCommand(program: Command): void {
   program
     .command('inspect-bundle <path>')
     .description('Parse and display a structured summary of a debug bundle')
-    .action(async (bundlePath: string) => {
-      try {
+    .action(
+      cliAction(async (bundlePath: string) => {
         const summary = await readDebugBundle(bundlePath);
         printSummary(summary);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

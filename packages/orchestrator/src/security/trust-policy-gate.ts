@@ -18,12 +18,7 @@
  * trusted.
  */
 import { z } from 'zod';
-import {
-  DEFAULT_APPROVAL_EXPIRY_HOURS,
-  DEFAULT_APPROVAL_EXPIRY_SECONDS,
-  ForkPolicy,
-  approvalExpirySecondsOf,
-} from '@kici-dev/engine';
+import { DEFAULT_APPROVAL_EXPIRY_SECONDS, ForkPolicy } from '@kici-dev/engine';
 import type { OrchestratorMode, TrustPolicy, TrustTier } from '@kici-dev/engine';
 import { SecurityHoldReason } from '../contexts/held-runs.js';
 import type { StoredTrustPolicy } from './trust-policy-store.js';
@@ -70,10 +65,6 @@ export type TrustPolicyOutcome =
        * divergence between deciding and sizing. `null` means "no window came
        * with this verdict", and the hold site falls back to
        * `DEFAULT_APPROVAL_EXPIRY_SECONDS`.
-       *
-       * Seconds, not hours, because this is what the hold site actually needs:
-       * an hours-only window cannot express the sub-hour hold the policy may now
-       * carry, and rounding it here would silently lengthen it.
        */
       approvalExpirySeconds: number | null;
     }
@@ -109,7 +100,6 @@ export const DEFAULT_FORK_POLICY: ForkPolicy = ForkPolicy.enum.ignore;
  */
 export const FAIL_CLOSED_POLICY: TrustPolicy = Object.freeze({
   forkPolicy: DEFAULT_FORK_POLICY,
-  approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 });
 
@@ -130,7 +120,6 @@ export const FAIL_CLOSED_POLICY: TrustPolicy = Object.freeze({
  */
 export const READ_FAILURE_POLICY: TrustPolicy = Object.freeze({
   forkPolicy: ForkPolicy.enum.hold,
-  approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
   approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 });
 
@@ -183,7 +172,6 @@ export function resolveEffectivePolicy(
     return {
       policy: {
         forkPolicy: stored.forkPolicy,
-        approvalExpiryHours: stored.approvalExpiryHours,
         approvalExpirySeconds: stored.approvalExpirySeconds,
       },
       source: EffectivePolicySource.enum.stored,
@@ -248,9 +236,7 @@ function holdForFork(policy: TrustPolicy): TrustPolicyOutcome {
     action: 'hold',
     reason: SecurityHoldReason.enum.fork_pr,
     message: FORK_PR_MESSAGE,
-    // Resolved through the shared rule rather than read off one field, so a
-    // policy that carries only the coarse hours spelling still sizes the hold.
-    approvalExpirySeconds: approvalExpirySecondsOf(policy),
+    approvalExpirySeconds: policy.approvalExpirySeconds,
   };
 }
 

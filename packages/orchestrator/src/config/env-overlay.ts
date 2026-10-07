@@ -3,10 +3,6 @@
  *
  * Converts KICI_-prefixed env vars to nested config paths and applies
  * them as overrides on top of a config object.
- *
- * Multi-app env var convention:
- * - App name in YAML: `main-org` -> env segment: `MAIN_ORG` (hyphen to underscore, uppercased)
- * - Example: KICI_PROVIDERS_GITHUB_MAIN_ORG_APP_ID -> providers.github[name=main-org].appId
  */
 
 /**
@@ -80,7 +76,7 @@ const DIRECT_MAPPINGS: Record<string, string[]> = {
   CLUSTER_PEER_HEARTBEAT_INTERVAL_MS: ['cluster', 'peerHeartbeatIntervalMs'],
   CLUSTER_PEER_MAX_RECONNECT_DELAY_MS: ['cluster', 'peerMaxReconnectDelayMs'],
   CLUSTER_ROLE: ['cluster', 'role'],
-  CLUSTER_COORDINATOR_URL: ['cluster', 'coordinatorUrl'],
+  CLUSTER_COORDINATOR_URLS: ['cluster', 'coordinatorUrls'],
   CLUSTER_PEER_STALE_TIMEOUT_MS: ['cluster', 'peerStaleTimeoutMs'],
   CLUSTER_PEER_DISCOVERY: ['cluster', 'peerDiscovery'],
 
@@ -110,31 +106,16 @@ const STARTUP_NAME_MAPPINGS: Record<string, string[]> = {
 };
 
 /**
- * Legacy unprefixed env vars honored by the startup `loadConfig()` path
- * (see `config.ts`). These are mapped into the same config shape used by
- * the config reloader so that env-var-only deployments (no YAML file) can
- * successfully reload without tripping schema validation.
+ * Unprefixed env vars the startup `loadConfig()` path (`config.ts`) reads,
+ * mapped into the reloader's config shape so an env-only deployment (no
+ * YAML file) reloads to the same values it booted with.
  *
- * KICI_-prefixed equivalents (above) take precedence over these when both
- * are set, matching startup behavior where KICI_ env vars are the newer
- * canonical form.
- *
- * Only `NODE_ENV` is honored unprefixed — it is an OS-level convention
- * that pre-dates KiCI, owned by the Node.js ecosystem rather than by us.
- * Every other operational env var is `KICI_*` only; the rest of the
- * legacy table was removed during the env-var standardization rollout.
+ * Only `NODE_ENV` is read unprefixed: it is a Node.js ecosystem convention,
+ * not a KiCI setting. A `KICI_*` spelling of the same setting wins when both
+ * are set.
  */
-const LEGACY_MAPPINGS: Record<string, string[]> = {
+const UNPREFIXED_ENV_MAPPINGS: Record<string, string[]> = {
   NODE_ENV: ['nodeEnv'],
-};
-
-/**
- * Known GitHub app field name suffixes (uppercase env -> camelCase config).
- */
-const GITHUB_APP_FIELDS: Record<string, string> = {
-  APP_ID: 'appId',
-  PRIVATE_KEY: 'privateKey',
-  WEBHOOK_SECRET: 'webhookSecret',
 };
 
 /**
@@ -180,16 +161,13 @@ const BOOLEAN_FIELDS = new Set(['cluster.autoRotateCredentials', 'pgCustomerSecr
  * Returns null for non-KICI_ keys or unknown mappings.
  *
  * Handles three patterns:
- * 1. Direct mappings (KICI_DATABASE_URL -> ['database', 'url'])
- * 2. Startup names whose overlay spelling differs (KICI_PORT -> ['server', 'port'])
- * 3. Multi-app GitHub provider (KICI_PROVIDERS_GITHUB_<NAME>_<FIELD> ->
- *    ['providers', 'github', '<name-lowered>', '<camelField>'])
+ * 1. Unprefixed names the startup loader reads (NODE_ENV -> ['nodeEnv'])
+ * 2. Direct mappings (KICI_DATABASE_URL -> ['database', 'url'])
+ * 3. Startup names whose overlay spelling differs (KICI_PORT -> ['server', 'port'])
  */
 export function envKeyToConfigPath(key: string): string[] | null {
-  // Legacy unprefixed env vars (NODE_ENV) used by the startup
-  // loader — honored here so env-only deployments can reload.
-  if (LEGACY_MAPPINGS[key]) {
-    return LEGACY_MAPPINGS[key];
+  if (UNPREFIXED_ENV_MAPPINGS[key]) {
+    return UNPREFIXED_ENV_MAPPINGS[key];
   }
 
   if (!key.startsWith('KICI_')) return null;
@@ -203,28 +181,6 @@ export function envKeyToConfigPath(key: string): string[] | null {
 
   if (STARTUP_NAME_MAPPINGS[remainder]) {
     return STARTUP_NAME_MAPPINGS[remainder];
-  }
-
-  // Check multi-app GitHub provider pattern: PROVIDERS_GITHUB_<NAME>_<FIELD>
-  if (remainder.startsWith('PROVIDERS_GITHUB_')) {
-    const afterGithub = remainder.slice(17); // strip PROVIDERS_GITHUB_
-
-    // Try each known field suffix (longest first to avoid partial matches)
-    const sortedFields = Object.entries(GITHUB_APP_FIELDS).sort(
-      (a, b) => b[0].length - a[0].length,
-    );
-
-    for (const [envSuffix, configField] of sortedFields) {
-      if (afterGithub.endsWith(`_${envSuffix}`)) {
-        // Extract the app name: everything between PROVIDERS_GITHUB_ and _FIELD
-        const appNameUpper = afterGithub.slice(0, -(envSuffix.length + 1));
-        if (appNameUpper.length === 0) continue;
-
-        // Convert UPPER_CASE env name to lower-case-hyphenated config name
-        const appName = appNameUpper.toLowerCase().replace(/_/g, '-');
-        return ['providers', 'github', appName, configField];
-      }
-    }
   }
 
   return null;
@@ -262,26 +218,26 @@ export function applyEnvOverrides(
 ): Record<string, unknown> {
   const result = structuredClone(config);
 
-  // Apply legacy unprefixed env vars first (NODE_ENV), then the overlay's own
+  // Apply unprefixed env vars first (NODE_ENV), then the overlay's own
   // KICI_* names, then the startup names on top. Each group deterministically
   // overrides the one before it when a setting is spelled more than one way,
   // and the startup name goes last so a reload resolves what the process
   // booted with.
-  const legacyEntries: Array<[string, string]> = [];
+  const unprefixedEntries: Array<[string, string]> = [];
   const kiciEntries: Array<[string, string]> = [];
   const startupEntries: Array<[string, string]> = [];
 
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue;
-    if (LEGACY_MAPPINGS[key]) {
-      legacyEntries.push([key, value]);
+    if (UNPREFIXED_ENV_MAPPINGS[key]) {
+      unprefixedEntries.push([key, value]);
     } else if (key.startsWith('KICI_')) {
       if (STARTUP_NAME_MAPPINGS[key.slice(5)]) startupEntries.push([key, value]);
       else kiciEntries.push([key, value]);
     }
   }
 
-  for (const [key, value] of [...legacyEntries, ...kiciEntries, ...startupEntries]) {
+  for (const [key, value] of [...unprefixedEntries, ...kiciEntries, ...startupEntries]) {
     const path = envKeyToConfigPath(key);
     if (!path) continue;
 

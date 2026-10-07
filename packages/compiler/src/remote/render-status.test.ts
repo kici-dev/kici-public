@@ -47,8 +47,9 @@ describe('colorStatus', () => {
     );
   });
 
-  it('resolves the legacy error spelling to the failed colour', () => {
-    expect(colorStatus('error')).toBe(pc.red('error'));
+  it('renders the retired error spelling as an unknown status', () => {
+    // fails-when: `error` still resolves to `failed` through an alias map.
+    expect(colorStatus('error')).toBe(pc.gray('error'));
   });
 
   it('renders every canonical status without falling back to gray', () => {

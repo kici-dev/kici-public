@@ -1,6 +1,6 @@
 /**
  * Shared execution-status presentation vocabulary: the canonical status union,
- * a total precedence order for roll-up aggregates, legacy-spelling resolution,
+ * a total precedence order for roll-up aggregates, canonical-status resolution,
  * and a per-status failure classification.
  *
  * Pure Zod (browser-safe): the engine barrel re-exports this module and the
@@ -75,31 +75,10 @@ export const STATUS_PRECEDENCE: readonly CanonicalStatus[] = Object.freeze(
 );
 
 /**
- * Legacy status spellings that map onto a canonical status. An alias always
- * resolves like the status it aliases, so a consumer never needs a second
- * hand-written copy of the mapping.
- */
-export const LEGACY_STATUS_ALIASES: Readonly<Record<string, CanonicalStatus>> = Object.freeze({
-  passed: ExecutionRunStatus.enum.success,
-  completed: ExecutionRunStatus.enum.success,
-  in_progress: ExecutionRunStatus.enum.running,
-  error: ExecutionRunStatus.enum.failed,
-  canceled: ExecutionRunStatus.enum.cancelled,
-  waiting: ExecutionRunStatus.enum.pending,
-});
-
-/**
  * Resolve a status string onto its canonical status, or `undefined` when it is
- * neither canonical nor a known legacy alias. Callers that accept mixed case
- * lowercase their input first.
- *
- * `Object.hasOwn`, not a bare index: an object literal inherits
- * `Object.prototype`, so indexing it with `toString` / `constructor` /
- * `valueOf` would yield a function rather than `undefined` and the caller's
- * fallback would never fire.
+ * not canonical. Callers that accept mixed case lowercase their input first.
  */
 export function toCanonicalStatus(status: string): CanonicalStatus | undefined {
-  if (Object.hasOwn(LEGACY_STATUS_ALIASES, status)) return LEGACY_STATUS_ALIASES[status];
   return CANONICAL_SET.has(status) ? (status as CanonicalStatus) : undefined;
 }
 

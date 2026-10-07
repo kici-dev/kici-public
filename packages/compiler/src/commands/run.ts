@@ -55,9 +55,8 @@ import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
  * True when the Platform run-status snapshot reports a terminal run status.
  *
  * Resolves through the engine's canonical vocabulary rather than matching a
- * hand-written literal set: that is what makes the legacy `error` spelling
- * terminal without a second copy of the alias, and what stops a newly-added
- * terminal status leaving `kici run` polling a finished run forever.
+ * hand-written literal set, so a newly-added terminal status never leaves
+ * `kici run` polling a finished run forever.
  */
 function isTerminalRunStatus(status: string): boolean {
   const canonical = toCanonicalStatus(status.toLowerCase());

@@ -333,14 +333,13 @@ const heavy = job('build', {
 });
 ```
 
-Three input shapes are accepted; all normalise to the same `{ requests, limits }` pair:
+These input shapes are accepted; all normalise to the same `{ requests, limits }` pair. A `memory` or `cpus` key written directly under `resources` is refused at compile time:
 
-| Shape          | Example                                                    | Effective behavior                               |
-| -------------- | ---------------------------------------------------------- | ------------------------------------------------ |
-| Both           | `{ requests: { memory: '2g' }, limits: { memory: '4g' } }` | Used as-is                                       |
-| Request only   | `{ requests: { memory: '2g' } }`                           | `limits` mirrors the request                     |
-| Limit only     | `{ limits: { memory: '4g' } }`                             | `requests` mirrors the limit                     |
-| Flat shorthand | `{ memory: '2g', cpus: 1 }`                                | Both `requests` and `limits` set to these values |
+| Shape        | Example                                                    | Effective behavior           |
+| ------------ | ---------------------------------------------------------- | ---------------------------- |
+| Both         | `{ requests: { memory: '2g' }, limits: { memory: '4g' } }` | Used as-is                   |
+| Request only | `{ requests: { memory: '2g' } }`                           | `limits` mirrors the request |
+| Limit only   | `{ limits: { memory: '4g' } }`                             | `requests` mirrors the limit |
 
 Memory accepts container-style suffixes: `512m`, `4g`, `2048k`. CPUs are fractional cores (`0.5`, `2`).
 

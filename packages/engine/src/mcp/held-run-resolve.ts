@@ -15,7 +15,6 @@
  * list has to print enough for the caller to pick one.
  */
 import { HeldRunStatus } from '../context/held-run-status.js';
-import { normalizePersistedHoldType } from '../context/hold-type.js';
 
 /** Hold scope, mirroring the engine `HoldScope` enum. */
 export type HeldRunScope = 'workflow' | 'job' | 'step';
@@ -30,9 +29,7 @@ export interface HeldRunSummary {
   status: string;
   /**
    * Persisted `held_runs.hold_type`, when the orchestrator's list response
-   * carried one. Optional and un-normalized: callers pass it through
-   * `normalizePersistedHoldType` before branching. Absent from an older
-   * orchestrator's response.
+   * carried one. Absent from an older orchestrator's response.
    */
   holdType?: string;
   /**
@@ -69,8 +66,7 @@ export interface HeldRunFilter {
   holdId?: string;
   /**
    * Narrow to holds of one type (`reviewer` / `timer` / `concurrency` /
-   * `security`), normalized through `normalizePersistedHoldType` on both sides
-   * so a legacy `approval` row answers to `reviewer`.
+   * `security`), compared verbatim.
    *
    * Composes with {@link job} / {@link step} rather than replacing them: a
    * matrix whose children each carry two holds needs both halves.
@@ -99,7 +95,7 @@ function describeHold(hold: HeldRunSummary): string {
   const job = hold.jobId || '(unnamed hold)';
   const base =
     hold.holdScope === 'step' && hold.stepIndex != null ? `step ${hold.stepIndex} of ${job}` : job;
-  return hold.holdType ? `${base} (${normalizePersistedHoldType(hold.holdType)})` : base;
+  return hold.holdType ? `${base} (${hold.holdType})` : base;
 }
 
 /**
@@ -168,11 +164,9 @@ export function resolveHeldRunId(
     return pickSingle(matches, `hold '${filter.holdId}'`, pending);
   }
 
-  const wanted = filter.holdType && normalizePersistedHoldType(filter.holdType);
+  const wanted = filter.holdType;
   const byType = (candidates: readonly HeldRunSummary[]): readonly HeldRunSummary[] =>
-    wanted === undefined
-      ? candidates
-      : candidates.filter((h) => h.holdType && normalizePersistedHoldType(h.holdType) === wanted);
+    wanted === undefined ? candidates : candidates.filter((h) => h.holdType === wanted);
   const typeLabel = wanted ? ` of type '${wanted}'` : '';
 
   if (filter.step !== undefined) {

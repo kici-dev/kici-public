@@ -24,7 +24,7 @@ import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { cancelRunWithReason } from '../cancel/cancel-run.js';
 import { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { GlobalEvalRoundResult, LockJob } from '@kici-dev/engine';
-import { AgentCapabilityFlag, GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL } from '@kici-dev/engine';
+import { GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL } from '@kici-dev/engine';
 import { dispatchGlobalCandidateViaPipeline } from './global-dispatch.js';
 
 // A pass-through spy: every global dispatch still runs the real pipeline, and a
@@ -2525,7 +2525,7 @@ describe('releasing a held evaluation round', () => {
 });
 
 describe('result-aware generators in an organization-wide workflow', () => {
-  /** One registered, idle init-runner, advertising the capability or not. */
+  /** One registered, idle init-runner, carrying the agent-feature label or not. */
   function oneAgentFleet(capable: boolean) {
     return {
       findAvailable: () => [{ platform: 'linux', arch: 'x64', version: '0.9.3' }],
@@ -2538,9 +2538,6 @@ describe('result-aware generators in an organization-wide workflow', () => {
           platform: 'linux',
           arch: 'x64',
           version: '0.9.3',
-          capabilities: capable
-            ? { [AgentCapabilityFlag.enum.globalEvalSkipsResultAwareGenerators]: true }
-            : null,
         },
       ],
     };
@@ -2606,12 +2603,9 @@ describe('result-aware generators in an organization-wide workflow', () => {
     expect(workflow.jobs).toEqual([staticJob('build'), staticJob('gen-a'), resultAwareEntry()]);
   });
 
-  it.each([
-    { name: 'no registered agent advertises the capability', capable: false },
-    { name: 'the registered agent advertises the capability', capable: true },
-  ])(
-    'records the unsupported-fleet failure for a mixed workflow only when $name',
-    async ({ capable }) => {
+  it.each([false, true])(
+    'dispatches the round of a mixed workflow when the agent carries the label: %s',
+    async (capable) => {
       vi.mocked(dispatchGlobalCandidateViaPipeline).mockClear();
       const h = makeDeps({
         registrations: [makeGlobalRegistration({ jobs: [dynamicEntry(), resultAwareEntry()] })],
@@ -2625,13 +2619,12 @@ describe('result-aware generators in an organization-wide workflow', () => {
       await processWebhook(makeInfo(), h.deps);
 
       const rounds = h.dispatched().filter((d) => String(d.jobName).startsWith(ROUND_JOB_PREFIX));
-      // fails-when: the round is sent to a fleet whose every agent would run the result-aware generator
-      expect(rounds).toHaveLength(capable ? 1 : 0);
-      // Positive control: the same fixture with the flag present dispatches the admitted workflow.
-      expect(pipelineWorkflows()).toHaveLength(capable ? 1 : 0);
-      // The same visible record an unsupported fleet produces: one errored run and one check.
-      expect(h.recordRoundFailure).toHaveBeenCalledTimes(capable ? 0 : 1);
-      expect(h.postGlobalEvalFailedCheck).toHaveBeenCalledTimes(capable ? 0 : 1);
+      // fails-when: the removed capability refusal comes back and records a failure instead
+      expect(rounds).toHaveLength(1);
+      expect(rounds[0].runsOnLabels).toContain(GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL);
+      expect(pipelineWorkflows()).toHaveLength(1);
+      expect(h.recordRoundFailure).not.toHaveBeenCalled();
+      expect(h.postGlobalEvalFailedCheck).not.toHaveBeenCalled();
     },
   );
 });

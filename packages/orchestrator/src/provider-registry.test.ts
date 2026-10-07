@@ -60,47 +60,27 @@ describe('ProviderRegistry', () => {
     });
   });
 
-  describe('backward-compatible register / get', () => {
-    it('register(type) stores under synthetic default key', () => {
+  describe('default bundle fallback', () => {
+    it('getByRoutingKey falls back to the type default bundle', () => {
       const registry = new ProviderRegistry();
       const bundle = createMockBundle();
-
       registry.register('github', bundle);
-
-      // Accessible via get(type)
-      expect(registry.get('github')).toBe(bundle);
-    });
-
-    it('get(type) returns first matching bundle when no default', () => {
-      const registry = new ProviderRegistry();
-      const bundle = createMockBundle();
-
-      registry.registerByRoutingKey('github:12345', bundle);
-
-      // get('github') should find it via prefix scan
-      expect(registry.get('github')).toBe(bundle);
-    });
-
-    it('get(type) prefers default key over routing-key bundles', () => {
-      const registry = new ProviderRegistry();
-      const defaultBundle = createMockBundle();
-      const appBundle = createMockBundle();
-
-      registry.register('github', defaultBundle);
-      registry.registerByRoutingKey('github:12345', appBundle);
-
-      expect(registry.get('github')).toBe(defaultBundle);
-    });
-
-    it('getByRoutingKey falls back to type lookup for backward compat', () => {
-      const registry = new ProviderRegistry();
-      const bundle = createMockBundle();
-
-      // Registered via old API
-      registry.register('github', bundle);
-
-      // getByRoutingKey should find it via fallback
       expect(registry.getByRoutingKey('github:12345')).toBe(bundle);
+    });
+
+    it('never falls back to another App bundle for an unknown github key', () => {
+      // fails-when: the type-prefix scan returns github:1's bundle for github:2.
+      const registry = new ProviderRegistry();
+      registry.registerByRoutingKey('github:1', createMockBundle());
+      expect(registry.getByRoutingKey('github:2')).toBeUndefined();
+    });
+
+    it('resolves a generic routing key through the generic default bundle', () => {
+      // breaks-if-wrong: the live generic fallback (orchestrator-core registers generic) must survive.
+      const registry = new ProviderRegistry();
+      const bundle = createMockBundle();
+      registry.register('generic', bundle);
+      expect(registry.getByRoutingKey('generic:abc:src')).toBe(bundle);
     });
 
     it('never falls back to another source bundle for an unknown generic key', () => {
@@ -141,27 +121,6 @@ describe('ProviderRegistry', () => {
     });
   });
 
-  describe('has', () => {
-    it('returns true when provider has default registration', () => {
-      const registry = new ProviderRegistry();
-      registry.register('github', createMockBundle());
-
-      expect(registry.has('github')).toBe(true);
-    });
-
-    it('returns true when provider has routing-key registration', () => {
-      const registry = new ProviderRegistry();
-      registry.registerByRoutingKey('github:12345', createMockBundle());
-
-      expect(registry.has('github')).toBe(true);
-    });
-
-    it('returns false when provider is not registered', () => {
-      const registry = new ProviderRegistry();
-      expect(registry.has('github')).toBe(false);
-    });
-  });
-
   describe('getRoutingKeys', () => {
     it('returns all registered routing keys', () => {
       const registry = new ProviderRegistry();
@@ -184,23 +143,6 @@ describe('ProviderRegistry', () => {
     it('returns empty array when empty', () => {
       const registry = new ProviderRegistry();
       expect(registry.getRoutingKeys()).toEqual([]);
-    });
-  });
-
-  describe('getRoutingKeysForProvider', () => {
-    it('returns only keys matching provider type', () => {
-      const registry = new ProviderRegistry();
-      registry.registerByRoutingKey('github:12345', createMockBundle());
-      registry.registerByRoutingKey('github:67890', createMockBundle());
-      registry.registerByRoutingKey('gitlab:111', createMockBundle());
-
-      const githubKeys = registry.getRoutingKeysForProvider('github');
-      expect(githubKeys).toContain('github:12345');
-      expect(githubKeys).toContain('github:67890');
-      expect(githubKeys).toHaveLength(2);
-
-      const gitlabKeys = registry.getRoutingKeysForProvider('gitlab');
-      expect(gitlabKeys).toEqual(['gitlab:111']);
     });
   });
 

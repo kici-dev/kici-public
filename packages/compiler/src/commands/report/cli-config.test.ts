@@ -37,7 +37,7 @@ describe('redactCliConfig', () => {
     expect(out.defaultClusters).toEqual({ org_acme: '****' });
   });
 
-  it('masks the legacy token and keeps the legacy endpoint readable', () => {
+  it('masks a stale token key and keeps the orchestrator endpoint readable', () => {
     const out = redactCliConfig({
       endpoint: 'https://orch.example.com',
       token: 'legacy-api-key-value',
@@ -74,14 +74,15 @@ describe('lookupTarget', () => {
     });
   });
 
-  it('falls back to the legacy endpoint, as DashboardClient.fromConfig does', () => {
-    expect(lookupTarget({ endpoint: 'https://orch.example.com', activeOrgId: 'org_a' })).toEqual({
-      endpoint: 'https://orch.example.com',
-      orgId: 'org_a',
-    });
+  it('does not treat a direct-mode endpoint as the Platform URL', () => {
+    // fails-when: lookupTarget falls back to `endpoint` — an orchestrator URL would be
+    // named as the Platform the lookup searched.
+    expect(
+      lookupTarget({ endpoint: 'http://localhost:10143', activeOrgId: 'org_a' }),
+    ).toBeUndefined();
   });
 
-  it('prefers platformEndpoint over the legacy endpoint', () => {
+  it('uses platformEndpoint when both are set', () => {
     expect(
       lookupTarget({
         platformEndpoint: 'https://api.kici.dev',

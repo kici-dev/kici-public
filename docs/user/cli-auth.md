@@ -1,9 +1,9 @@
 ---
 title: CLI authentication
-description: Authenticate the KiCI CLI with browser OAuth, device flow, or API key paste
+description: Authenticate the KiCI CLI with browser OAuth or the device flow
 ---
 
-The KiCI CLI supports three authentication methods: browser-based OAuth (default), device authorization flow (for headless environments), and API key paste (for CI/CD pipelines).
+The KiCI CLI supports two authentication methods: browser-based OAuth (default) and the device authorization flow (for headless environments). Both store a personal access token (PAT) in the local config file.
 
 ## Authentication methods
 
@@ -32,15 +32,18 @@ kici login --device
 
 This displays a URL and a code. Open the URL on any device, enter the code, and authenticate. The CLI polls for completion.
 
-### API key paste
+### Non-interactive environments
 
-For CI/CD pipelines and automated environments, paste an API key directly:
+`kici login` needs a person to approve the sign-in. For a CI/CD pipeline, mint a PAT on your own machine with [`kici pat create`](./cli/account-and-org.md#kici-pat-create). Then write the config file in the pipeline before you run `kici`:
 
 ```bash
-kici login --token kici_sk_abc123...
+mkdir -p ~/.kici
+printf '{ "pat": "%s", "platformEndpoint": "https://api.kici.dev", "activeOrgId": "%s" }\n' \
+  "$KICI_PAT" "<your-org-id>" > ~/.kici/config
+chmod 600 ~/.kici/config
 ```
 
-The API key (starts with `kici_sk_`) is passed directly as the flag value and stored in your local config file.
+Set `KICI_CONFIG_DIR` to keep the file in a different directory.
 
 ## kici logout
 
@@ -54,7 +57,7 @@ This:
 
 1. Revokes the PAT on the server (preventing further use)
 2. Detaches the local dev plane if it is attached, so a logged-out user is not left with a hybrid plane holding an orphaned orchestrator key
-3. Clears the auth fields from the local config file — the PAT, its id and expiry, the API key from a `--token` login, your email, and the active organization
+3. Clears the auth fields from the local config file — the PAT, its id and expiry, your email, and the active organization
 4. Preserves the connection settings (per-org default clusters, Platform endpoint, orchestrator endpoint, OIDC issuer, routing key)
 
 Server revocation is best-effort: if the network call fails, the local config is still cleared.
@@ -163,7 +166,7 @@ JWT and opaque OIDC tokens are validated against the configured OIDC issuer (JWK
 
 ### Permissions
 
-Tokens authenticate; RBAC authorizes. Every org-scoped route runs `orgContextMiddleware` (verifies you are a member of the target org) followed by `requirePermission(resource, level)`. The 18 resources and 5 levels are documented in [RBAC](../architecture/security/rbac.md#permission-model). User API keys carry their own permission matrix bounded above by the creator's effective permissions; PATs inherit the user's role permissions (or are capped further by their `scopes` field).
+Tokens authenticate; RBAC authorizes. Every org-scoped route first verifies that you are a member of the target org, then checks that you hold the permission (resource and level) the route requires. The 18 resources and 5 levels are documented in [RBAC](../architecture/security/rbac.md#permission-model). User API keys carry their own permission matrix bounded above by the creator's effective permissions; PATs inherit the user's role permissions (or are capped further by their `scopes` field).
 
 ### Configurable surfaces
 
@@ -179,7 +182,7 @@ The dashboard is a browser SPA on top of the same `/api/v1/*` surface, so nearly
 
 `POST /pats` is the one route in between: it accepts a browser session **or** an existing `kici_pat_` (so `kici pat create` keeps working), and refuses `kici_sk_` and `kici_sa_`. A token minted from another token can never be wider than that token. The new token is capped by your own permissions **and** by the scopes of the token you called with, whether or not you pass `permissions` explicitly. Mint from an unscoped session when you need a broader token.
 
-The full route tree is the source of truth — every method, request schema, and response schema is enumerated server-side. There is currently no auto-generated OpenAPI spec; the typed `DashboardApiType` export is the canonical contract for TypeScript clients.
+The full route tree is the source of truth — every method, request schema, and response schema is enumerated server-side. There is currently no auto-generated OpenAPI spec.
 
 ### Calling the API
 
@@ -235,7 +238,6 @@ The CLI stores authentication data in `~/.kici/config` with `0600` permissions (
 - Per-org default orchestrator clusters
 - Platform endpoint URL, orchestrator endpoint URL, and the OIDC issuer the PAT was minted against
 - Routing key for webhook source identification
-- API key, when you logged in with `--token`
 
 The web dashboard holds none of these. It keeps only the tokens of your current
 sign-in, in browser storage for the tab's origin. It does not request offline

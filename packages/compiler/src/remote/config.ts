@@ -7,8 +7,6 @@ import os from 'node:os';
  * Contains authentication tokens and endpoint settings.
  */
 export interface GlobalConfig {
-  /** API key for authentication (legacy) */
-  token?: string;
   /** Orchestrator URL for direct mode */
   endpoint?: string;
   /** Platform relay URL */
@@ -47,9 +45,6 @@ function sanitizeConfig(raw: unknown): GlobalConfig {
   const obj = raw as Record<string, unknown>;
   const config: GlobalConfig = {};
 
-  if (typeof obj.token === 'string') {
-    config.token = obj.token;
-  }
   if (typeof obj.endpoint === 'string') {
     config.endpoint = obj.endpoint;
   }
@@ -170,7 +165,6 @@ export async function mergeGlobalConfig(partial: Partial<GlobalConfig>): Promise
 
   // Only merge defined values from partial
   const merged: GlobalConfig = { ...existing };
-  if (partial.token !== undefined) merged.token = partial.token;
   if (partial.endpoint !== undefined) merged.endpoint = partial.endpoint;
   if (partial.platformEndpoint !== undefined) merged.platformEndpoint = partial.platformEndpoint;
   if (partial.routingKey !== undefined) merged.routingKey = partial.routingKey;

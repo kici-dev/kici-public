@@ -165,6 +165,7 @@ describe('executionStatusSchema logBytes', () => {
     workflowName: 'wf',
     status: 'success' as const,
     startedAt: 1700000000000,
+    statusEpoch: 0,
     timestamp: 1700000060000,
   };
 
@@ -229,6 +230,7 @@ describe('stateReplaySchema', () => {
         commitMessage: 'fix: something',
         jobCount: 3,
         startedAt: 1700000000000,
+        statusEpoch: 0,
         completedAt: 1700000060000,
         durationMs: 60000,
         jobs: [
@@ -282,6 +284,7 @@ describe('stateReplaySchema', () => {
           status: 'success',
           jobCount: 1,
           startedAt: 1700000000000,
+          statusEpoch: 0,
           jobs: [],
         },
       ],
@@ -330,6 +333,7 @@ describe('stateReplaySchema', () => {
           status: 'running',
           jobCount: 1,
           startedAt: 1700000000000,
+          statusEpoch: 0,
           jobs: [
             {
               jobId: 'build-1',
@@ -390,6 +394,7 @@ describe('ExecutionRunStatus held', () => {
       workflowName: 'wf',
       status: 'held' as const,
       startedAt: 1,
+      statusEpoch: 0,
       timestamp: 2,
     };
     expect(executionStatusSchema.parse(msg).status).toBe('held');
@@ -448,6 +453,7 @@ describe('RunFailureClass', () => {
       status: 'failed',
       jobCount: 1,
       startedAt: 1,
+      statusEpoch: 0,
       timestamp: 2,
       failureClass: RunFailureClass.enum.timed_out,
     };
@@ -463,6 +469,7 @@ describe('RunFailureClass', () => {
       status: 'success',
       jobCount: 1,
       startedAt: 1,
+      statusEpoch: 0,
       timestamp: 2,
     };
     expect(executionStatusSchema.parse(msg).failureClass).toBeUndefined();
@@ -477,6 +484,7 @@ describe('RunFailureClass', () => {
       status: 'failed',
       jobCount: 1,
       startedAt: 1,
+      statusEpoch: 0,
       timestamp: 2,
       failureClass: 'exploded',
     };
@@ -576,6 +584,7 @@ describe('executionStatusSchema with initFailure', () => {
       workflowName: 'wf',
       status: 'failed' as const,
       startedAt: 1,
+      statusEpoch: 0,
       completedAt: 2,
       durationMs: 1,
       timestamp: 2,
@@ -597,6 +606,7 @@ describe('executionStatusSchema with initFailure', () => {
       workflowName: 'wf',
       status: 'success' as const,
       startedAt: 1,
+      statusEpoch: 0,
       timestamp: 2,
     };
     expect(executionStatusSchema.parse(msg).initFailure).toBeUndefined();
@@ -708,6 +718,7 @@ describe('flood-hardening field bounds', () => {
     workflowName: 'w',
     status: 'failed' as const,
     startedAt: 1,
+    statusEpoch: 0,
     timestamp: 1,
   };
 
@@ -806,6 +817,7 @@ describe('flood-hardening field bounds', () => {
       status: 'failed' as const,
       jobCount: 0,
       startedAt: 1,
+      statusEpoch: 0,
       jobs: [],
     }));
     const r = stateReplaySchema.safeParse({
@@ -824,6 +836,7 @@ describe('flood-hardening field bounds', () => {
       status: 'failed' as const,
       jobCount: 0,
       startedAt: 1,
+      statusEpoch: 0,
       jobs: [],
     }));
     const r = stateReplaySchema.safeParse({
@@ -844,7 +857,17 @@ describe('flood-hardening field bounds', () => {
     const r = stateReplaySchema.safeParse({
       type: 'state.replay',
       messageId: 'm',
-      runs: [{ runId: 'r', workflowName: 'w', status: 'running', jobCount: 1, startedAt: 1, jobs }],
+      runs: [
+        {
+          runId: 'r',
+          workflowName: 'w',
+          status: 'running',
+          jobCount: 1,
+          startedAt: 1,
+          statusEpoch: 0,
+          jobs,
+        },
+      ],
       timestamp: 1,
     });
     expect(r.success).toBe(false);
@@ -878,6 +901,7 @@ describe('executionStatusSchema routingKey (per-run source attribution)', () => 
     workflowName: 'wf',
     status: 'running' as const,
     startedAt: 1,
+    statusEpoch: 0,
     timestamp: 2,
   };
 
@@ -886,7 +910,7 @@ describe('executionStatusSchema routingKey (per-run source attribution)', () => 
     expect(parsed.routingKey).toBe('generic:org:src');
   });
 
-  it('remains valid when routingKey is omitted (old orchestrator)', () => {
+  it('remains valid when routingKey is omitted (a run with no recorded routing key)', () => {
     const parsed = executionStatusSchema.parse(base);
     expect(parsed.routingKey).toBeUndefined();
   });
@@ -903,6 +927,7 @@ describe('workflowRepoIdentifier (the repo that defines a global workflow)', () 
     status: ExecutionRunStatus.enum.running,
     repoIdentifier: 'org/source-repo',
     startedAt: 1,
+    statusEpoch: 0,
     timestamp: 2,
   };
 
@@ -913,6 +938,7 @@ describe('workflowRepoIdentifier (the repo that defines a global workflow)', () 
     repoIdentifier: 'org/source-repo',
     jobCount: 0,
     startedAt: 1,
+    statusEpoch: 0,
     jobs: [],
   };
 
@@ -933,7 +959,7 @@ describe('workflowRepoIdentifier (the repo that defines a global workflow)', () 
     expect(parsed.repoIdentifier).toBe('org/source-repo');
   });
 
-  it('leaves workflowRepoIdentifier undefined when an older orchestrator omits it', () => {
+  it('leaves workflowRepoIdentifier undefined for a per-repository run', () => {
     expect(executionStatusSchema.parse(status).workflowRepoIdentifier).toBeUndefined();
   });
 
@@ -1006,17 +1032,17 @@ describe('statusEpoch (the run status generation)', () => {
     expect(replay.runs[0]!.statusEpoch).toBe(0);
   });
 
-  it('leaves statusEpoch undefined when an older orchestrator omits it', () => {
-    // breaks-if-wrong: an older orchestrator's frame must still parse, and read as unguarded.
-    expect(executionStatusSchema.parse(status).statusEpoch).toBeUndefined();
+  it('refuses a frame without statusEpoch', () => {
+    // fails-when: statusEpoch stays optional, so the Platform applies a frame unguarded.
+    expect(executionStatusSchema.safeParse(status).success).toBe(false);
     expect(
-      stateReplaySchema.parse({
+      stateReplaySchema.safeParse({
         type: 'state.replay',
         messageId: 'm-epoch-3',
         runs: [replayRun],
         timestamp: 2,
-      }).runs[0]!.statusEpoch,
-    ).toBeUndefined();
+      }).success,
+    ).toBe(false);
   });
 
   it('rejects a negative or fractional statusEpoch', () => {

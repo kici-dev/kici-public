@@ -1,6 +1,6 @@
 {
   "name": "kici-monorepo",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.3.0",
@@ -36,6 +36,8 @@
     "eslint-plugin-react-web-api": "^5.19.1",
     "eslint-plugin-react-x": "^5.19.1",
     "husky": "^9.1.7",
+    "jscpd": "5.4.0",
+    "knip": "6.39.0",
     "lint-staged": "^17.5.1",
     "pg": "^8.23.0",
     "prettier": "^3.9.8",

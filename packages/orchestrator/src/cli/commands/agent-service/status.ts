@@ -21,21 +21,16 @@ import {
   type ServiceStatus,
 } from '../../service/index.js';
 import { AGENT_DEFAULT_PORT } from '@kici-dev/shared/env';
-import {
-  formatUptime,
-  toErrorMessage,
-  type AgentLivenessInfo,
-  type LivenessResponse,
-} from '@kici-dev/shared';
+import { formatUptime, type AgentLivenessInfo, type LivenessResponse } from '@kici-dev/shared';
 import {
   buildInfoRows,
   fetchLocalJson,
   formatHealthSection,
-  hideBuildCommit,
   readEnvContent,
   readLocalEndpoint,
   type StatusRow,
 } from '../service-health.js';
+import { cliAction } from '../shared/cli-action.js';
 
 /** Column the values of the agent section start at. */
 const VALUE_COLUMN = 14;
@@ -92,7 +87,7 @@ function buildJsonOutput(
   return {
     service: serviceName,
     ...serviceStatus,
-    health: health ? hideBuildCommit(health) : undefined,
+    health: health ?? undefined,
   };
 }
 
@@ -118,8 +113,8 @@ export function registerAgentStatusCommand(parent: Command): void {
     .option('--system', 'Operate against the system-level service (requires root)')
     .option('--user-level', 'Operate against the user-level service')
     .option('--json', 'Output as JSON')
-    .action(async (opts: StatusOptions) => {
-      try {
+    .action(
+      cliAction(async (opts: StatusOptions) => {
         const userLevel = resolveUserLevel(opts);
         const kiciRoot = kiciConfigRoot(userLevel);
 
@@ -160,9 +155,6 @@ export function registerAgentStatusCommand(parent: Command): void {
         } else {
           console.log(formatStatus(serviceStatus, health, config.name));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

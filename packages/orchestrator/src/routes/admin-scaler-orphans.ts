@@ -34,25 +34,16 @@ import {
   type ScalerVmStopResult,
 } from '@kici-dev/engine';
 import type { AccessLogWriter } from '../audit/access-log.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import {
   MAX_SCALER_ORPHANS_TIMEOUT_MS,
   type ScalerOrphansAnswer,
   type ScalerOrphansRequest,
 } from '../scaler/orphan-requests.js';
 import { ScalerOrphansForwardFailure } from '../cluster/scaler-orphans-peer.js';
-import { handleAdminError } from './admin-errors.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-scaler-orphans' });
-
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
 
 /** What the routes need from the coordinator they run on. */
 export interface ScalerOrphansRouteDeps {
@@ -237,7 +228,7 @@ export function createScalerOrphansRoutes(deps: {
   rbac: RbacEnforcer;
   accessLog?: AccessLogWriter;
 }): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
   const { orphans } = deps;
 
   /** One access_log row; best effort, never gating the response. */
@@ -262,142 +253,130 @@ export function createScalerOrphansRoutes(deps: {
     });
   };
 
-  app.get('/scaler/orphans', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'scaler.read');
-      const query = listQuerySchema.safeParse({
-        target: c.req.query('target'),
-        timeoutMs: c.req.query('timeoutMs'),
+  app.get('/scaler/orphans', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'scaler.read');
+    const query = listQuerySchema.safeParse({
+      target: c.req.query('target'),
+      timeoutMs: c.req.query('timeoutMs'),
+    });
+    if (!query.success) {
+      return c.json({ error: 'Validation error', details: query.error.issues }, 400);
+    }
+    const node = resolveNode(orphans, query.data.target);
+    const outcome = await askNode(
+      orphans,
+      node,
+      { action: ScalerOrphansAction.enum.list },
+      query.data.timeoutMs,
+    );
+    if (!outcome.ok) {
+      await audit(c, AccessLogAction.enum['scaler.orphans.read'], node.instanceId, {
+        error: outcome.error,
       });
-      if (!query.success) {
-        return c.json({ error: 'Validation error', details: query.error.issues }, 400);
-      }
-      const node = resolveNode(orphans, query.data.target);
+      return c.json({ error: outcome.error }, outcome.status);
+    }
+    const vms = outcome.answer.vms ?? [];
+    const tracking = await coordinatorTracking(
+      orphans,
+      vms.map((vm) => vm.vmId),
+    );
+    const missing = orphans.disconnectedCoordinators();
+    await audit(c, AccessLogAction.enum['scaler.orphans.read'], node.instanceId, {});
+    return c.json({
+      node: {
+        instanceId: node.instanceId,
+        role: node.role,
+        firecrackerScalers: outcome.answer.firecrackerScalers ?? [],
+        disconnectedCoordinators: missing,
+      },
+      vms: downgradeOrphans(overlayTracking(vms, tracking), missing),
+    });
+  });
+
+  app.post('/scaler/orphans/stop', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'scaler.manage');
+    const body = stopBodySchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!body.success) {
+      return c.json({ error: 'Validation error', details: body.error.issues }, 400);
+    }
+    const node = resolveNode(orphans, body.data.target);
+    const vmIds = [...new Set(body.data.vmIds)];
+    logger.info('Scaler orphan stop requested', {
+      target: node.instanceId,
+      vmIds,
+      actor: c.get('userId'),
+    });
+
+    // A VM whose agent holds a live job, or is registered anywhere in the
+    // cluster, is tracked whatever its node says: it never reaches the node's stop.
+    const tracking = await coordinatorTracking(orphans, vmIds);
+    // While a coordinator peer is unreachable, an agent registered with it
+    // cannot be ruled out: no VM is an orphan, and none reaches the node.
+    const missing = orphans.disconnectedCoordinators();
+    const unbound = missing.length > 0 ? [] : vmIds.filter((vmId) => !tracking.has(vmId));
+    let nodeResults: ScalerVmStopResult[] = [];
+    let firecrackerScalers: string[] = [];
+    if (unbound.length > 0) {
       const outcome = await askNode(
         orphans,
         node,
-        { action: ScalerOrphansAction.enum.list },
-        query.data.timeoutMs,
+        { action: ScalerOrphansAction.enum.stop, vmIds: unbound },
+        body.data.timeoutMs,
       );
       if (!outcome.ok) {
-        await audit(c, AccessLogAction.enum['scaler.orphans.read'], node.instanceId, {
+        logger.warn('Scaler orphan stop failed', {
+          target: node.instanceId,
+          status: outcome.status,
           error: outcome.error,
+        });
+        await audit(c, AccessLogAction.enum['scaler.orphan.stop'], node.instanceId, {
+          error: outcome.error,
+          meta: { target: node.instanceId, vm_ids: vmIds },
         });
         return c.json({ error: outcome.error }, outcome.status);
       }
-      const vms = outcome.answer.vms ?? [];
-      const tracking = await coordinatorTracking(
-        orphans,
-        vms.map((vm) => vm.vmId),
+      nodeResults = outcome.answer.results ?? [];
+      firecrackerScalers = outcome.answer.firecrackerScalers ?? [];
+    }
+
+    const byId = new Map(nodeResults.map((result) => [result.vmId, result]));
+    const results: ScalerVmStopResult[] = vmIds.map((vmId) => {
+      const seen = tracking.get(vmId);
+      if (seen !== undefined) {
+        return { vmId, outcome: ScalerVmStopOutcome.enum.tracked, detail: seen.detail };
+      }
+      if (missing.length > 0) {
+        return {
+          vmId,
+          outcome: ScalerVmStopOutcome.enum.unverified,
+          detail: missingCoordinatorsReason(missing),
+        };
+      }
+      return (
+        byId.get(vmId) ?? {
+          vmId,
+          outcome: ScalerVmStopOutcome.enum.error,
+          detail: 'the node returned no result for this VM',
+        }
       );
-      const missing = orphans.disconnectedCoordinators();
-      await audit(c, AccessLogAction.enum['scaler.orphans.read'], node.instanceId, {});
-      return c.json({
-        node: {
-          instanceId: node.instanceId,
-          role: node.role,
-          firecrackerScalers: outcome.answer.firecrackerScalers ?? [],
-          disconnectedCoordinators: missing,
-        },
-        vms: downgradeOrphans(overlayTracking(vms, tracking), missing),
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
-  });
+    });
 
-  app.post('/scaler/orphans/stop', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'scaler.manage');
-      const body = stopBodySchema.safeParse(await c.req.json().catch(() => ({})));
-      if (!body.success) {
-        return c.json({ error: 'Validation error', details: body.error.issues }, 400);
-      }
-      const node = resolveNode(orphans, body.data.target);
-      const vmIds = [...new Set(body.data.vmIds)];
-      logger.info('Scaler orphan stop requested', {
-        target: node.instanceId,
-        vmIds,
-        actor: c.get('userId'),
-      });
-
-      // A VM whose agent holds a live job, or is registered anywhere in the
-      // cluster, is tracked whatever its node says: it never reaches the node's stop.
-      const tracking = await coordinatorTracking(orphans, vmIds);
-      // While a coordinator peer is unreachable, an agent registered with it
-      // cannot be ruled out: no VM is an orphan, and none reaches the node.
-      const missing = orphans.disconnectedCoordinators();
-      const unbound = missing.length > 0 ? [] : vmIds.filter((vmId) => !tracking.has(vmId));
-      let nodeResults: ScalerVmStopResult[] = [];
-      let firecrackerScalers: string[] = [];
-      if (unbound.length > 0) {
-        const outcome = await askNode(
-          orphans,
-          node,
-          { action: ScalerOrphansAction.enum.stop, vmIds: unbound },
-          body.data.timeoutMs,
-        );
-        if (!outcome.ok) {
-          logger.warn('Scaler orphan stop failed', {
-            target: node.instanceId,
-            status: outcome.status,
-            error: outcome.error,
-          });
-          await audit(c, AccessLogAction.enum['scaler.orphan.stop'], node.instanceId, {
-            error: outcome.error,
-            meta: { target: node.instanceId, vm_ids: vmIds },
-          });
-          return c.json({ error: outcome.error }, outcome.status);
-        }
-        nodeResults = outcome.answer.results ?? [];
-        firecrackerScalers = outcome.answer.firecrackerScalers ?? [];
-      }
-
-      const byId = new Map(nodeResults.map((result) => [result.vmId, result]));
-      const results: ScalerVmStopResult[] = vmIds.map((vmId) => {
-        const seen = tracking.get(vmId);
-        if (seen !== undefined) {
-          return { vmId, outcome: ScalerVmStopOutcome.enum.tracked, detail: seen.detail };
-        }
-        if (missing.length > 0) {
-          return {
-            vmId,
-            outcome: ScalerVmStopOutcome.enum.unverified,
-            detail: missingCoordinatorsReason(missing),
-          };
-        }
-        return (
-          byId.get(vmId) ?? {
-            vmId,
-            outcome: ScalerVmStopOutcome.enum.error,
-            detail: 'the node returned no result for this VM',
-          }
-        );
-      });
-
-      logger.info('Scaler orphan stop finished', {
-        target: node.instanceId,
-        outcomes: countOutcomes(results),
-      });
-      await audit(c, AccessLogAction.enum['scaler.orphan.stop'], node.instanceId, {
-        meta: { target: node.instanceId, vm_ids: vmIds, results },
-      });
-      return c.json({
-        node: {
-          instanceId: node.instanceId,
-          role: node.role,
-          firecrackerScalers,
-          disconnectedCoordinators: missing,
-        },
-        results,
-      });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
-    }
+    logger.info('Scaler orphan stop finished', {
+      target: node.instanceId,
+      outcomes: countOutcomes(results),
+    });
+    await audit(c, AccessLogAction.enum['scaler.orphan.stop'], node.instanceId, {
+      meta: { target: node.instanceId, vm_ids: vmIds, results },
+    });
+    return c.json({
+      node: {
+        instanceId: node.instanceId,
+        role: node.role,
+        firecrackerScalers,
+        disconnectedCoordinators: missing,
+      },
+      results,
+    });
   });
 
   return app;

@@ -13,8 +13,8 @@
  * once a fix is deployed, or discard if the event is no longer relevant.
  */
 import type { Command } from 'commander';
-import { toErrorMessage } from '@kici-dev/shared';
 import type { AdminApiClient } from '../api-client.js';
+import { cliAction } from './shared/cli-action.js';
 
 interface DlqEvent {
   id: string;
@@ -61,8 +61,8 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
     .option('--limit <n>', 'Max rows (default 50, max 200)', '50')
     .option('--before <iso>', 'Cursor: list events with dlq_at < this ISO timestamp')
     .option('--json', 'Print raw JSON instead of a formatted table', false)
-    .action(async (opts: { limit: string; before?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { limit: string; before?: string; json?: boolean }) => {
         const params = new URLSearchParams();
         if (opts.limit) params.set('limit', opts.limit);
         if (opts.before) params.set('before', opts.before);
@@ -98,56 +98,44 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
         if (res.nextCursor) {
           console.log(`Next page: --before "${res.nextCursor}"`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── count ───────────────────────────────────────────────────────
   dlq
     .command('count')
     .description('Print the total number of events in the DLQ')
-    .action(async () => {
-      try {
+    .action(
+      cliAction(async () => {
         const res = await getClient().get<CountResponse>('/api/v1/admin/event-dlq/count');
         console.log(res.total);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── retry ───────────────────────────────────────────────────────
   dlq
     .command('retry <id>')
     .description('Clear the DLQ flag, reset attempts, and schedule the event for immediate retry')
-    .action(async (id: string) => {
-      try {
+    .action(
+      cliAction(async (id: string) => {
         await getClient().post<{ retried: boolean; id: string }>(
           `/api/v1/admin/event-dlq/${encodeURIComponent(id)}/retry`,
           {},
         );
         console.log(`Event ${id} reset for retry.`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── discard ─────────────────────────────────────────────────────
   dlq
     .command('discard <id>')
     .description('Permanently delete an event from the DLQ')
-    .action(async (id: string) => {
-      try {
+    .action(
+      cliAction(async (id: string) => {
         await getClient().delete<{ discarded: boolean; id: string }>(
           `/api/v1/admin/event-dlq/${encodeURIComponent(id)}`,
         );
         console.log(`Event ${id} discarded.`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

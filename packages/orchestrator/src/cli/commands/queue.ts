@@ -11,25 +11,15 @@
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
+import { listQueueDirect, showQueueEntryDirect, type DispatchQueueRow } from '@kici-dev/shared';
 import {
-  listQueueDirect,
-  showQueueEntryDirect,
-  toErrorMessage,
-  type DispatchQueueRow,
-} from '@kici-dev/shared';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
-
-function parseIntOption(raw: string | undefined, label: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || Math.floor(n) !== n) {
-    throw new Error(`${label}: must be an integer (got "${raw}")`);
-  }
-  return n;
-}
+  cliAction,
+  resolveDirectDbUrl,
+  parseIntOption,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+  printJsonOr,
+} from './shared/cli-action.js';
 
 function printQueueTable(entries: DispatchQueueRow[]): void {
   if (entries.length === 0) {
@@ -70,10 +60,10 @@ export function registerQueueCommands(program: Command, getClient: () => AdminAp
     .option('--workflow-name <n>', 'Filter by exact workflow_name')
     .option('--created-after <iso>', 'Filter created_at > <ISO timestamp>')
     .option('--limit <n>', 'Max rows to return (default 100, max 1000)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const limit = parseIntOption(opts.limit, '--limit');
         const statusNotIn = opts.statusNotIn
           ? String(opts.statusNotIn)
@@ -94,8 +84,7 @@ export function registerQueueCommands(program: Command, getClient: () => AdminAp
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           const result = await listQueueDirect(dbUrl, query);
-          if (opts.json) console.log(JSON.stringify(result));
-          else printQueueTable(result.entries);
+          printJsonOr(opts.json, result, (r) => printQueueTable(r.entries));
         } else {
           const params = new URLSearchParams();
           if (opts.status) params.set('status', opts.status);
@@ -110,22 +99,18 @@ export function registerQueueCommands(program: Command, getClient: () => AdminAp
           const result = await getClient().get<{ entries: DispatchQueueRow[] }>(
             `/api/v1/admin/queue${qs ? `?${qs}` : ''}`,
           );
-          if (opts.json) console.log(JSON.stringify(result));
-          else printQueueTable(result.entries);
+          printJsonOr(opts.json, result, (r) => printQueueTable(r.entries));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   queue
     .command('show <id>')
     .description('Show a single dispatch_queue row by id')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const entry = dbUrl
           ? await showQueueEntryDirect(dbUrl, { id })
@@ -138,9 +123,6 @@ export function registerQueueCommands(program: Command, getClient: () => AdminAp
             console.log(`${k}: ${v === null ? '-' : String(v)}`);
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

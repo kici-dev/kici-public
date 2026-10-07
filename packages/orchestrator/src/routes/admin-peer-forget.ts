@@ -26,19 +26,10 @@ import {
 } from '@kici-dev/engine';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { LOCAL_REFUSALS, type PeerForgetResult } from '../cluster/peer-forget.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import { handleAdminError } from './admin-errors.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-peer-forget' });
-
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
 
 /** What the route needs from the coordinator it runs on. */
 export interface PeerForgetRouteDeps {
@@ -73,66 +64,60 @@ export function createPeerForgetRoutes(deps: {
   rbac: RbacEnforcer;
   accessLog?: AccessLogWriter;
 }): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
-  app.post('/peers/forget', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'peer.manage');
-      const body = bodySchema.safeParse(await c.req.json().catch(() => ({})));
-      if (!body.success) {
-        return c.json({ error: 'Validation error', details: body.error.issues }, 400);
-      }
-      const { instanceId, timeoutMs } = body.data;
-      const acknowledgeBackstop = body.data.acknowledgeBackstop === true;
-      const results = await deps.peerForget.forget(instanceId, timeoutMs, acknowledgeBackstop);
-
-      // The first result is this coordinator's: a peer it keeps (connected,
-      // heard from inside its liveness window, or guarding its backstop without an
-      // acknowledgement) is refused outright, and nothing changed anywhere. A
-      // peer no coordinator knows is unknown.
-      const local = results[0];
-      let error: { status: 404 | 409; message: string } | undefined;
-      if (local && LOCAL_REFUSALS.has(local.outcome)) {
-        error = { status: 409, message: local.detail };
-      } else if (results.every((r) => r.outcome === PeerForgetOutcome.enum['not-found'])) {
-        error = { status: 404, message: `peer ${instanceId} is not known to any coordinator` };
-      }
-
-      logger.info('Peer forget finished', {
-        instanceId,
-        actor: c.get('userId'),
-        results: results.map((r) => `${r.coordinator}:${r.outcome}`),
-      });
-      await deps.accessLog?.record({
-        orgId: null,
-        routingKey: null,
-        actor: { type: ActorType.enum.service_account, id: c.get('userId') },
-        action: AccessLogAction.enum['peer.forget'],
-        target: { type: AccessLogTargetType.enum.fleet, id: instanceId },
-        requestId: null,
-        source: AccessLogSource.enum.admin_http,
-        outcome: error ? AccessLogOutcome.enum.error : AccessLogOutcome.enum.allowed,
-        ...(error ? { errorMessage: error.message } : {}),
-        meta: { results, acknowledge_backstop: acknowledgeBackstop },
-      });
-      if (error) {
-        const acknowledgementRequired =
-          local?.outcome === PeerForgetOutcome.enum['acknowledgement-required'];
-        return c.json(
-          {
-            error: error.message,
-            results,
-            ...(acknowledgementRequired ? { acknowledgementRequired } : {}),
-          },
-          error.status,
-        );
-      }
-      return c.json({ instanceId, results });
-    } catch (err) {
-      return handleAdminError(c, err, logger);
+  app.post('/peers/forget', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'peer.manage');
+    const body = bodySchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!body.success) {
+      return c.json({ error: 'Validation error', details: body.error.issues }, 400);
     }
+    const { instanceId, timeoutMs } = body.data;
+    const acknowledgeBackstop = body.data.acknowledgeBackstop === true;
+    const results = await deps.peerForget.forget(instanceId, timeoutMs, acknowledgeBackstop);
+
+    // The first result is this coordinator's: a peer it keeps (connected,
+    // heard from inside its liveness window, or guarding its backstop without an
+    // acknowledgement) is refused outright, and nothing changed anywhere. A
+    // peer no coordinator knows is unknown.
+    const local = results[0];
+    let error: { status: 404 | 409; message: string } | undefined;
+    if (local && LOCAL_REFUSALS.has(local.outcome)) {
+      error = { status: 409, message: local.detail };
+    } else if (results.every((r) => r.outcome === PeerForgetOutcome.enum['not-found'])) {
+      error = { status: 404, message: `peer ${instanceId} is not known to any coordinator` };
+    }
+
+    logger.info('Peer forget finished', {
+      instanceId,
+      actor: c.get('userId'),
+      results: results.map((r) => `${r.coordinator}:${r.outcome}`),
+    });
+    await deps.accessLog?.record({
+      orgId: null,
+      routingKey: null,
+      actor: { type: ActorType.enum.service_account, id: c.get('userId') },
+      action: AccessLogAction.enum['peer.forget'],
+      target: { type: AccessLogTargetType.enum.fleet, id: instanceId },
+      requestId: null,
+      source: AccessLogSource.enum.admin_http,
+      outcome: error ? AccessLogOutcome.enum.error : AccessLogOutcome.enum.allowed,
+      ...(error ? { errorMessage: error.message } : {}),
+      meta: { results, acknowledge_backstop: acknowledgeBackstop },
+    });
+    if (error) {
+      const acknowledgementRequired =
+        local?.outcome === PeerForgetOutcome.enum['acknowledgement-required'];
+      return c.json(
+        {
+          error: error.message,
+          results,
+          ...(acknowledgementRequired ? { acknowledgementRequired } : {}),
+        },
+        error.status,
+      );
+    }
+    return c.json({ instanceId, results });
   });
 
   return app;

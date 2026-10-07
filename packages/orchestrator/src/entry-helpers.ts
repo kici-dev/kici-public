@@ -8,6 +8,7 @@
 import { statSync } from 'node:fs';
 import { type SourceProvider, SourceSubtype } from '@kici-dev/engine';
 import { LocalSourceConfigSchema } from './providers/local/local-source-config.js';
+import { safeJsonParse } from './helpers/json.js';
 
 /**
  * Final path segment of a filesystem path or a `file://` URL, splitting on both
@@ -168,13 +169,4 @@ export function canServeGenericProviderType(
     }
   }
   return false;
-}
-
-/** Parse JSON, returning null on any error (the `git_config` column is dual-purpose). */
-function safeJsonParse(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
 }

@@ -64,17 +64,11 @@ import { runDetached } from '../helpers/run-detached.js';
  */
 interface CheckRunReporterDeps {
   /**
-   * Provider registry for per-routing-key credential lookup.
-   * When provided, the reporter resolves GitHub App credentials by routing key
-   * from the registry's CloneTokenProvider config. Takes precedence over githubConfig.
+   * Provider registry for per-routing-key credential lookup: the reporter
+   * resolves GitHub App credentials by routing key from the registry's
+   * CloneTokenProvider config.
    */
   providerRegistry?: ProviderRegistry;
-  /**
-   * GitHub App config for creating Octokit instances.
-   * Fallback for backward compatibility when providerRegistry is not provided
-   * or when no routing key is available.
-   */
-  githubConfig?: GitHubAppConfig;
   /** Step log buffer for enriched failure summaries. */
   stepLogBuffer?: StepLogBuffer;
   /**
@@ -104,8 +98,7 @@ interface CheckRunReporterDeps {
    * Resolver for the orchestrator's owning org public alias. Typically
    * wired to `PlatformClient.getOrgPublicAlias()`. Returns the
    * `oal_<12-char>` alias supplied by Platform on `auth.success`, or
-   * `undefined` before auth completes / when running against a
-   * Platform that predates the alias plumbing.
+   * `undefined` before auth completes.
    */
   getOrgPublicAlias?: () => string | undefined;
 }
@@ -292,7 +285,7 @@ interface UpdateStepProgressOptions {
   jobName: string;
   stepIndex: number;
   stepName: string;
-  state: 'running' | 'success' | 'failed' | 'skipped' | 'cancelled' | 'error'; // step progress states (broader than ExecutionStepStatus)
+  state: 'running' | 'success' | 'failed' | 'skipped' | 'cancelled';
   durationMs?: number;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
@@ -887,14 +880,9 @@ export class CheckRunReporter {
   // -- Private implementation --
 
   /**
-   * Resolve GitHub App credentials for a given routing key.
-   *
-   * Resolution order:
-   * 1. If providerRegistry is provided AND routingKey is given, look up the bundle
-   *    by routing key and extract config from the CloneTokenProvider's getAppConfig().
-   * 2. Fall back to the direct githubConfig dep (backward compatible).
-   *
-   * Returns undefined if no config is available.
+   * Resolve GitHub App credentials for a given routing key from the bundle's
+   * CloneTokenProvider `getAppConfig()`. Returns undefined when no routing key,
+   * registry, bundle or GitHub provider is available.
    */
   private resolveGithubConfig(routingKey?: string): GitHubAppConfig | undefined {
     if (routingKey && this.deps.providerRegistry) {
@@ -912,8 +900,7 @@ export class CheckRunReporter {
         }
       }
     }
-    // Fallback to direct githubConfig
-    return this.deps.githubConfig;
+    return undefined;
   }
 
   /**
@@ -1329,10 +1316,7 @@ export class CheckRunReporter {
     // The Platform sends the field on exactly the condition that recorded it —
     // only when the two repositories differ — so an absent field and a value
     // equal to the acted-on repository are one case, and `workflowLabel` maps
-    // both to the unqualified name. That is also what a Platform predating the
-    // field produces, which is why absence keeps cleaning the unqualified check
-    // rather than skipping: an older Platform omits the field for every run,
-    // and skipping would leave an ordinary run's check stuck `in_progress`.
+    // both to the unqualified name.
     const label = this.workflowLabel(opts);
     const expectedNames = new Set<string>();
     expectedNames.add(`kici/${label}`);
@@ -2088,8 +2072,7 @@ export function buildJobFailureDescription(data: Record<string, unknown>): strin
   // Check for stepResults array with a failed step
   if (Array.isArray(data.stepResults)) {
     const failedStep = data.stepResults.find(
-      (s: Record<string, unknown>) =>
-        s.status === ExecutionStepStatus.enum.failed || s.status === 'error',
+      (s: Record<string, unknown>) => s.status === ExecutionStepStatus.enum.failed,
     );
     if (failedStep) {
       const name = failedStep.name ?? 'unknown';

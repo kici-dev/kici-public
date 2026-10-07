@@ -263,9 +263,6 @@ function collectSecretRefs(
  * it set one, otherwise the `HoldType` member its action implies. Column and
  * gate share one vocabulary, so nothing is translated here.
  *
- * Distinct from the engine's `normalizePersistedHoldType`, which maps a value
- * read back OUT of the column onto that same vocabulary.
- *
  * Exported for tests.
  */
 export function resolveHoldType(

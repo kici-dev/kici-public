@@ -34,7 +34,6 @@ import {
 } from '@kici-dev/engine';
 import type { ChangedFilesStatus } from '@kici-dev/engine';
 import { computeChangedFiles } from '../../checkout/changed-files.js';
-import type { GitAuth } from '../../checkout/git-clone.js';
 import type {
   Step,
   StepInput,
@@ -1000,7 +999,8 @@ function extractRepoIdentifier(repoUrl: string): string {
  * the same run row the mint reads, so the frozen statement is field-for-field
  * what a live mint would have produced and the orchestrator can cross-check it.
  *
- * Falls back to the agent's local view when an older orchestrator sent none.
+ * Falls back to the agent's local view when the dispatch carries none (no
+ * provenance issuer configured, or a job a worker dispatched).
  * That fallback disagrees with the claims by construction: `request.ref` is the
  * job's CHECKOUT ref, which for a pull request is the HEAD branch where the
  * claim is the BASE branch, and `request.workflowRef` is a global workflow's
@@ -2186,7 +2186,7 @@ async function evaluateConcurrencyGroupIfPresent(
       });
       // Prefer the orchestrator-pushed cluster value (fleet-wide
       // cluster_settings.concurrency_wait_timeout_ms); fall back to the agent's
-      // own env/config default when the dispatch omits it (older orchestrators).
+      // own env/config default when the dispatch omits it.
       const waitCapMs =
         request.concurrencyWaitTimeoutMs ??
         (Number.parseInt(process.env.KICI_CONCURRENCY_WAIT_TIMEOUT_MS ?? '', 10) || 3_600_000);
@@ -2666,13 +2666,9 @@ export async function resolveChangedFilesForRules(
   // Authenticate the git deepen/fetch with the same credentials the clone used
   // for the SOURCE repo (its own were ephemeral), so a private remote resolves.
   // Mirror cloneRepoIfRequested's source-auth chain exactly: for a global
-  // workflow the source clone falls back to workflowAuth, then `token` (the
-  // transition-window Basic-auth fallback synthesised by computeChangedFiles).
+  // workflow the source clone falls back to workflowAuth.
   const sourceAuth = request.sourceAuth ?? request.workflowAuth;
-  const auth: GitAuth | undefined =
-    sourceAuth ??
-    (request.token ? { kind: 'basic', user: 'x-access-token', secret: request.token } : undefined);
-  const resolved = await computeChangedFiles(workDir, request.event as EventPayload, auth);
+  const resolved = await computeChangedFiles(workDir, request.event as EventPayload, sourceAuth);
   ev.changedFiles = resolved.files;
   ev.changedFilesStatus = resolved.status;
 }

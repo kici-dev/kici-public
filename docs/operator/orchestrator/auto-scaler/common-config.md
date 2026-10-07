@@ -22,8 +22,9 @@ machinePools: # Optional. Named machine-wide pools shared across orchestrator in
       maxMemory: '128g'
 defaults: # Optional. Global defaults for all label sets.
   resources:
-    memory: '2g' # Optional. Default memory limit (e.g., "512m", "2g").
-    cpus: 2 # Optional. Default CPU limit in fractional cores.
+    limits:
+      memory: '2g' # Optional. Default memory limit (e.g., "512m", "2g").
+      cpus: 2 # Optional. Default CPU limit in fractional cores.
 scalers: # Required. Array of scaler backend definitions.
   - ...
 firecracker: # Optional. Global Firecracker network configuration (shared across all Firecracker scalers).
@@ -74,8 +75,9 @@ Each label set maps a set of labels to agent provisioning details. Labels with t
 labelSets:
   - labels: ['linux', 'container'] # Required. Label set (min 1 label, no 'kici:' prefix).
     resources: # Optional. Override global defaults.
-      memory: '4g'
-      cpus: 4
+      limits:
+        memory: '4g'
+        cpus: 4
     env: # Optional. Additional env vars for spawned agents.
       MY_VAR: 'value'
     networkPolicy: # Optional. Network isolation policy for this label set.
@@ -93,9 +95,8 @@ The provisioning field that tells the backend _what_ to spawn is type-specific: 
 
 Per-job resource limits use a Kubernetes-style `requests` / `limits` split. `requests` are what the scaler bills against the per-scaler / global / machine-pool caps when deciding whether a spawn fits; `limits` are what the kernel enforces on the running agent (cgroup `memory.max`, CPU quota).
 
-The scaler accepts these input shapes and normalises them all to the same `{ requests, limits }` pair:
+A `memory` or `cpus` key written directly under `resources` is refused when the config loads. The scaler accepts these input shapes and normalises them all to the same `{ requests, limits }` pair:
 
-- **Flat shorthand** (back-compat with legacy configs). `resources: { memory: '2g', cpus: 2 }` is treated as both the request and the limit.
 - **Request only.** `resources: { requests: { memory: '2g' } }` mirrors to `limits: { memory: '2g' }`.
 - **Limit only.** `resources: { limits: { memory: '4g' } }` mirrors to `requests: { memory: '4g' }`.
 - **Both.** `resources: { requests: { memory: '2g' }, limits: { memory: '4g' } }` is taken as-is.
@@ -123,11 +124,12 @@ scalers:
     labelSets:
       - labels: ['linux', 'heavy']
         image: 'ghcr.io/myorg/kici-agent:latest'
-        # Flat shorthand below is equivalent to
+        # A limit alone also sets the request: this is
         # resources: { requests: {memory: '8g', cpus: 4}, limits: {memory: '8g', cpus: 4} }
         resources:
-          memory: '8g'
-          cpus: 4
+          limits:
+            memory: '8g'
+            cpus: 4
 ```
 
 Memory values use container-style suffixes: `k` (kilobytes), `m` (megabytes), `g` (gigabytes). Case-insensitive.
@@ -199,7 +201,7 @@ Two mechanisms drive this, and both route through the same spawn path (so the `m
 - **Capacity-freed hook** — near-zero latency. The moment a slot opens, the oldest pending jobs are re-offered (oldest-first, so the longest-waiting job in a burst gets the freed slot first). A short debounce coalesces a burst of simultaneous releases into one re-dispatch pass.
 - **Leader-gated sweep** — a periodic backstop that re-runs the same re-offer on a timer, catching any edge case the hook could miss (a silently failed spawn, a reservation freed on a non-leader coordinator). The interval is `KICI_SCALER_PENDING_SWEEP_INTERVAL_MS` (default `10000`). The sweep runs only on the cluster leader, so multiple coordinators don't each drive the queue.
 
-A job re-offered while the scaler is still at capacity stays queued for the next release or sweep tick — there is no per-job retry state to tune. The `kici_orch_scaler_redispatch_total` counter (labeled `trigger="hook"` / `"sweep"`) reports how many jobs each mechanism has re-dispatched.
+A job re-offered while the scaler is still at capacity stays queued for the next release or sweep tick — there is no per-job retry state to tune. A job whose agent is still being provisioned, or has registered but has not yet taken the job, is not provisioned again: the re-offer skips it on every coordinator. It is offered again only if that provision fails or times out. The `kici_orch_scaler_redispatch_total` counter (labeled `trigger="hook"` / `"sweep"`) reports how many jobs each mechanism has re-dispatched.
 
 ### Machine-pool ledger
 
@@ -262,8 +264,9 @@ scalers:
       - labels: ['linux', 'container']
         image: 'ghcr.io/myorg/kici-agent:latest'
         resources: # required for a warm pool — the size of each ready agent
-          cpus: 2
-          memory: '4g'
+          limits:
+            cpus: 2
+            memory: '4g'
 ```
 
 ### Capacity interaction
@@ -354,7 +357,7 @@ scalers:
     labelSets:
       - labels: [linux, gpu]
         image: ghcr.io/me/agent-gpu:latest
-        resources: { memory: '64g', cpus: 16 }
+        resources: { limits: { memory: '64g', cpus: 16 } }
 ```
 
 A workflow with `runsOn: ['linux']` cannot land on `gpu-pool` — the gate requires `gpu` in `runsOn`. A workflow with `runsOn: ['linux', 'gpu']` satisfies the gate and is dispatched.
@@ -367,7 +370,7 @@ A workflow with `runsOn: ['linux']` cannot land on `gpu-pool` — the gate requi
 
 Case never matters here. A pool declaring `mandatoryLabels: ['GPU']` gates on `gpu`, and a job asking for `runsOn: ['gpu']` or `runsOn: ['GPU']` satisfies it either way. The orchestrator stores the label as `gpu`. See [label matching](./operations.md#label-matching).
 
-**Structured `platform` field (canonical):** a scaler entry may declare its platform explicitly:
+**Structured `platform` field:** a scaler entry declares its platform explicitly:
 
     scalers:
       - name: windows-builders
@@ -381,19 +384,17 @@ Case never matters here. A pool declaring `mandatoryLabels: ['GPU']` gates on `g
 
 On Windows, `binaryPath` names the `kici-agent.cmd` launcher. See [Windows launchers](./bare-metal.md#windows-launchers).
 
-When `platform` is set, BOTH the auto-injected `kici:os:*` / `kici:arch:*` labels AND the mandatory taint derive from this one field. A non-default `os` (`macos`, `windows`) or `arch` (`arm64`) taints the pool, and the plain taint token (`macos` / `windows` / `arm64`) is injected as a matchable label — so a job whose `runsOn` requests that platform is routed to the pool without you also declaring the platform in `labels`, even when the pool's plain labels use a non-canonical name (`windows-builders`, `osx`) that the label-based detection below would miss. When `platform` is omitted, a bare-metal pool derives its platform from the host OS/arch, and container / firecracker pools default to Linux.
+When `platform` is set, BOTH the auto-injected `kici:os:*` / `kici:arch:*` labels AND the mandatory taint derive from this one field. A non-default `os` (`macos`, `windows`) or `arch` (`arm64`) taints the pool. The plain taint token (`macos` / `windows` / `arm64`) is injected as a matchable label. So a job whose `runsOn` requests that platform is routed to the pool without a platform entry in `labels`, even when the pool's plain labels use a non-canonical name (`windows-builders`, `osx`). When `platform` is omitted, a bare-metal pool derives its platform from the host OS/arch, and container / firecracker pools default to Linux.
 
 The orchestrator also gives the taint token to each agent it starts for the pool. So the agent carries the label the job asks for, and a warm pool on such a scaler counts its own agents as ready.
 
-Declaring the structured field is preferred; the orchestrator logs a warning when a plain platform label is used without it.
+**Plain platform labels need the field.** A label set whose `labels` include `windows`, `win32`, `macos`, `darwin`, `arm64`, `aarch64` or `arm` on a scaler entry with no `platform` field is refused when the config loads: `label "macos" names a platform; declare platform: { os, arch } instead`. A plain label taints nothing on its own, so without the field the pool would take every unqualified job. Linux and x64 are the defaults and carry no taint, so an unqualified `runsOn: 'bare-metal'` (Linux-x64) job routes to a Linux-x64 pool and is never dispatched to a Windows, macOS or ARM pool. The platform taint stacks with any explicit `mandatoryLabels` you configure.
 
-**Automatic platform taint (fallback):** a label set whose declared `labels` include a non-default OS or architecture — `windows`, `win32`, `macos`, `darwin`, `arm64`, `aarch64`, or `arm` — is **also** automatically gated on that platform label, with no extra configuration. This label-based detection is the fallback for pools that have not yet declared the structured `platform` field. Only jobs whose `runsOn` requests that platform are routed to such a label set, locally or via cross-peer reroute. Linux and x64/amd64 are the defaults and carry no taint. So an unqualified `runsOn: 'bare-metal'` (Linux-x64) job still routes to a Linux-x64 pool, and is never dispatched to a Windows, macOS, or ARM pool it cannot run. The derived taint stacks with any explicit `mandatoryLabels` you configure.
+The `platform` field applies to every label set of the scaler entry. To serve two platforms, declare two scaler entries.
 
-The derived taint is scoped to **the label set that declares it**. A scaler can therefore mix platforms across its label sets: a pool declaring `[linux, gpu]` alongside `[macos, xcode]` gates only the second set on `macos`, and a `runsOn: ['linux', 'gpu']` job still routes to the first. Your configured `mandatoryLabels` apply to the whole scaler entry and stack on top of each label set's own derived taint.
+For example, a pool with `platform: { os: windows, arch: x64 }` only accepts a job whose `runsOn` includes `windows` (e.g. `runsOn: ['windows', 'bare-metal']`); a plain `runsOn: 'bare-metal'` job is rejected there and lands on a Linux pool instead.
 
-For example, a Windows pool declared with `labels: [windows, bare-metal]` only accepts a job whose `runsOn` includes `windows` (e.g. `runsOn: ['windows', 'bare-metal']`); a plain `runsOn: 'bare-metal'` job is rejected there and lands on a Linux pool instead.
-
-**Cross-peer routing:** the gate (including the automatic platform taint above) is advertised per label set over the peer heartbeat protocol, so cluster-mode reroute decisions apply the same rule. A coordinator will not reroute a job to a peer unless one label set both supplies every label the job requires and has its own gate satisfied by them.
+**Cross-peer routing:** the gate (including the platform taint above) is advertised per label set over the peer heartbeat protocol, so cluster-mode reroute decisions apply the same rule. A coordinator will not reroute a job to a peer unless one label set both supplies every label the job requires and has its own gate satisfied by them.
 
 `mandatoryLabels` and `excludeLabels` are two orthogonal mechanisms that control which scaler a job lands on. Both filter at the scaler-matcher level; the dispatcher applies them together.
 

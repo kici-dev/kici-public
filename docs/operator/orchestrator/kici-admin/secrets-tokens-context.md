@@ -13,16 +13,15 @@ kici-admin secret list <orgId> <scope>
 kici-admin secret set [orgId] [scope] [key] [--value <v> | --prompt | --from-stdin | --from-file <p> | --from-env <var>] [--no-trim] [--confirm-fingerprint <sha256>] [--dry-run] [--database-url <url>]
 kici-admin secret set --org <orgId> --context <name> --key <k> [value-source flags as above]
 kici-admin secret delete <orgId> <scope> <key> [--yes]
-kici-admin secret fix-prefixed-scopes <orgId> [--dry-run] [--database-url <url>]
 kici-admin secret scope create <orgId> <scope> [--json]
 kici-admin secret scope rename <orgId> <oldScope> <newScope> [--json]
 kici-admin secret scope delete <orgId> <scope> [--yes] [--json]
 ```
 
+- `<orgId>` is an org id this orchestrator holds. `kici-admin org list` prints them.
 - Secret values are **write-only** -- there is no command to read a secret value.
 - A `<scope>` may be **qualified** with the backend that owns it (`pg:production`, `openbao-prod:aws/creds`). The qualifier selects the backend and is not part of the stored name; an unqualified scope targets the PG backend. A head that names no registered backend stays part of the path.
 - `scopes` aggregates every registered backend and prints each scope in qualified form. A backend that is unreachable at that moment is skipped with a warning.
-- `fix-prefixed-scopes` repairs PG-backend scopes that an older orchestrator stored with a `pg:` qualifier attached (and which are therefore unreachable after upgrading). It re-encrypts each value as it renames, because the scope name is bound into the encryption. Preview with `--dry-run`; it never merges two scopes, never moves a secret between backends, and exits `2` when any scope was skipped.
 - `set` accepts either the positional `<orgId> <scope> <key>` form or the context-scope sugar form (`--org` + `--context` + `--key`). The two forms are mutually exclusive.
 - Value sources (mutually exclusive; first matching wins): `--prompt` (interactive no-echo, default on TTY), `--from-stdin` (read piped stdin until EOF; default when stdin is a pipe), `--from-file <path>` (file body, trailing newline trimmed unless `--no-trim`), `--from-env <var>` (named env var), `--value <plaintext>` (visible in shell history — discouraged).
 - `--confirm-fingerprint <sha256hex>` refuses the write unless `SHA-256(value)` matches the supplied 64-hex string. Pair with a value source for unattended automation.
@@ -34,7 +33,7 @@ kici-admin secret scope delete <orgId> <scope> [--yes] [--json]
   - `scope rename` keeps the scope in its backend. It re-encrypts every secret under the new name, and the bindings to the old name move with it. It refuses a move to another backend and a rename onto a scope that already exists.
   - `scope delete` removes the scope, every secret in it, and the bindings to it. It asks for confirmation unless `--yes` is passed.
   - Each verb writes a row to the secret audit log: `createScope`, `renameScope` or `deleteScope`. Query them with `kici-admin audit --action <action>`.
-- After a successful `set`, the command checks whether a context has the same name as the scope. When that context is a fixed or glob context with no binding, it prints a warning on stderr. Jobs that list that context in `contexts:` get none of its secrets until a scope is bound to it. The secret still reaches any other context bound to its scope. For a fixed context, a `<context>:<key>` git credential or registry reference still reads the scope named after the context, through a [deprecated](../../../user/deprecations.md) fallback, and the warning says so. The warning names the `kici-admin context bind` command. The exit code stays 0.
+- After a successful `set`, the command checks whether a context has the same name as the scope. When that context is a fixed or glob context with no binding, it prints a warning on stderr. Jobs that list that context in `contexts:` get none of its secrets until a scope is bound to it. The secret still reaches any other context bound to its scope. A `<context>:<key>` git credential or registry reference to that context resolves nothing either. The warning names the `kici-admin context bind` command. The exit code stays 0.
 
 For full details on encryption, backends, and key rotation, see [Secrets management](../../security/secrets.md).
 
@@ -186,7 +185,7 @@ kici-admin context source-override delete --org <id> --env <name> --routing-key 
 Seeds and mutates context rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — for a test setup that seeds contexts before the orchestrator is up.
 
 - `create` upserts a context (idempotent by `org + name`). On a new context, an omitted policy flag leaves that rule unset. On an existing context, an omitted policy flag leaves the stored value unchanged in both modes, and an explicit empty value (`'[]'`, an empty CSV, or `--minimum-trust null`) clears it. `--glob-pattern` is required when `--type glob` and sets the match pattern that resolves run scopes to this context; passing it with any other `--type` is an error. `--repo-patterns` limits the context to repositories whose `owner/repo` matches one of the globs (see [Repository patterns](../../../user/contexts.md#repository-patterns)).
-- `create` prints a warning on stderr when the context it created or updated is a fixed or glob context with no binding, because such a context delivers no secrets to the jobs that list it in `contexts:`. For a fixed context, the warning also names the deprecated fallback a `<context>:<key>` reference takes to the scope named after the context. The warning names the `kici-admin context bind` command. The exit code stays 0.
+- `create` prints a warning on stderr when the context it created or updated is a fixed or glob context with no binding, because such a context delivers no secrets to the jobs that list it in `contexts:`. A `<context>:<key>` reference to such a context resolves nothing either. The warning names the `kici-admin context bind` command. The exit code stays 0.
 - `bind` upserts a `context_bindings` row mapping a scope pattern to a context. `--host <pattern>` scopes the binding to a subset of hosts (default `**` = all hosts) — see [Per-host secret scoping](../../security/secrets.md#per-host-secret-scoping) for the host dimension, the templating syntax, and precedence.
 - `set-policy` updates only the provided policy fields on an existing context. Pass `--minimum-trust null` to clear the tier gate, `--repo-patterns '[]'` to clear the repository patterns, and `--hold-expiry ''` (an empty value) to clear the hold expiry. Omitting a flag leaves that field untouched, which is why clearing needs an explicit empty / `null` value rather than omission. `--allow-local-execution true|false` sets whether test runs may resolve the context (see [The `allowLocalExecution` context flag](../../../user/testing-guide.md#the-allowlocalexecution-context-flag)).
 - `list` / `show` read back the current state; `show` also returns variables and bindings.
@@ -385,7 +384,7 @@ Synopsis: `kici-admin context bind [options]`
 
 | Option                 | Default | Description                                                                 |
 | ---------------------- | ------- | --------------------------------------------------------------------------- |
-| `--org <id>`           |         | Org ID                                                                      |
+| `--org <id>`           |         | Org id (kici-admin org list prints the org ids)                             |
 | `--env <name>`         |         | Context name                                                                |
 | `--scope <pattern>`    |         | Scope pattern (e.g. "staging" or "aws/prod/**")                             |
 | `--host <pattern>`     | `**`    | Host selector (exact/glob/regex over agentId/host/labels); "**" = all hosts |
@@ -402,7 +401,7 @@ Synopsis: `kici-admin context create [options]`
 
 | Option                         | Default | Description                                                                               |
 | ------------------------------ | ------- | ----------------------------------------------------------------------------------------- |
-| `--org <id>`                   |         | Org ID                                                                                    |
+| `--org <id>`                   |         | Org id (kici-admin org list prints the org ids)                                           |
 | `--name <name>`                |         | Context name                                                                              |
 | `--type <t>`                   | `fixed` | Context type (fixed\|glob\|template)                                                      |
 | `--glob-pattern <pattern>`     |         | Glob pattern matched against declared context names (required with --type glob)           |
@@ -426,7 +425,7 @@ Synopsis: `kici-admin context create-template [options]`
 
 | Option                         | Default    | Description                                             |
 | ------------------------------ | ---------- | ------------------------------------------------------- |
-| `--org <id>`                   |            | Org ID                                                  |
+| `--org <id>`                   |            | Org id (kici-admin org list prints the org ids)         |
 | `--template <name>`            |            | Template name                                           |
 | `--type <t>`                   | `template` | Context type (defaults to "template")                   |
 | `--branch-restrictions <json>` |            | JSON array of allowed branches                          |
@@ -448,7 +447,7 @@ Synopsis: `kici-admin context delete [options]`
 
 | Option                 | Default | Description                                         |
 | ---------------------- | ------- | --------------------------------------------------- |
-| `--org <id>`           |         | Org ID                                              |
+| `--org <id>`           |         | Org id (kici-admin org list prints the org ids)     |
 | `--name <name>`        |         | Context name                                        |
 | `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
 | `--json`               |         | Emit JSON output                                    |
@@ -463,7 +462,7 @@ Synopsis: `kici-admin context list [options]`
 
 | Option                 | Default | Description                                         |
 | ---------------------- | ------- | --------------------------------------------------- |
-| `--org <id>`           |         | Org ID                                              |
+| `--org <id>`           |         | Org id (kici-admin org list prints the org ids)     |
 | `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
 | `--json`               |         | Emit JSON output                                    |
 
@@ -475,11 +474,11 @@ Synopsis: `kici-admin context purge [options]`
 
 **Options**
 
-| Option                 | Default | Description                                             |
-| ---------------------- | ------- | ------------------------------------------------------- |
-| `--database-url <url>` |         | Use direct DB access (or KICI_DATABASE_URL)             |
-| `--org <id>`           |         | Restrict purge to a single org (omit to purge all orgs) |
-| `--json`               |         | Emit JSON output                                        |
+| Option                 | Default | Description                                                                                     |
+| ---------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access (or KICI_DATABASE_URL)                                                     |
+| `--org <id>`           |         | Restrict purge to a single org (omit to purge all orgs; kici-admin org list prints the org ids) |
+| `--json`               |         | Emit JSON output                                                                                |
 
 ### `kici-admin context set-policy`
 
@@ -491,7 +490,7 @@ Synopsis: `kici-admin context set-policy [options]`
 
 | Option                           | Default | Description                                                                               |
 | -------------------------------- | ------- | ----------------------------------------------------------------------------------------- |
-| `--org <id>`                     |         | Org ID                                                                                    |
+| `--org <id>`                     |         | Org id (kici-admin org list prints the org ids)                                           |
 | `--env <name>`                   |         | Context name                                                                              |
 | `--branch-restrictions <json>`   |         | JSON array of allowed branches                                                            |
 | `--repo-patterns <json>`         |         | JSON array of owner/repo globs the context is limited to (e.g. '["acme/*"]'; '[]' clears) |
@@ -514,7 +513,7 @@ Synopsis: `kici-admin context show [options]`
 
 | Option                 | Default | Description                                         |
 | ---------------------- | ------- | --------------------------------------------------- |
-| `--org <id>`           |         | Org ID                                              |
+| `--org <id>`           |         | Org id (kici-admin org list prints the org ids)     |
 | `--name <name>`        |         | Context name                                        |
 | `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
 | `--json`               |         | Emit JSON output                                    |
@@ -535,7 +534,7 @@ Synopsis: `kici-admin context source-override delete [options]`
 
 | Option                | Default | Description                                       |
 | --------------------- | ------- | ------------------------------------------------- |
-| `--org <id>`          |         | Org ID                                            |
+| `--org <id>`          |         | Org id (kici-admin org list prints the org ids)   |
 | `--env <name>`        |         | Context name                                      |
 | `--routing-key <key>` |         | Routing key of the source the override applies to |
 | `--key <key>`         |         | Variable key                                      |
@@ -551,7 +550,7 @@ Synopsis: `kici-admin context source-override list [options]`
 
 | Option                | Default | Description                                         |
 | --------------------- | ------- | --------------------------------------------------- |
-| `--org <id>`          |         | Org ID                                              |
+| `--org <id>`          |         | Org id (kici-admin org list prints the org ids)     |
 | `--env <name>`        |         | Context name                                        |
 | `--routing-key <key>` |         | Only list the overrides for this source routing key |
 | `--json`              |         | Emit JSON output                                    |
@@ -566,7 +565,7 @@ Synopsis: `kici-admin context source-override set [options]`
 
 | Option                | Default | Description                                       |
 | --------------------- | ------- | ------------------------------------------------- |
-| `--org <id>`          |         | Org ID                                            |
+| `--org <id>`          |         | Org id (kici-admin org list prints the org ids)   |
 | `--env <name>`        |         | Context name                                      |
 | `--routing-key <key>` |         | Routing key of the source the override applies to |
 | `--key <key>`         |         | Variable key                                      |
@@ -593,36 +592,17 @@ Synopsis: `kici-admin secret delete <orgId> <scope> <key> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
-| `scope`  | yes      | no       |             |
-| `key`    | yes      | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `scope`  | yes      | no       |                                                 |
+| `key`    | yes      | no       |                                                 |
 
 **Options**
 
 | Option  | Default | Description              |
 | ------- | ------- | ------------------------ |
 | `--yes` |         | Skip confirmation prompt |
-
-### `kici-admin secret fix-prefixed-scopes`
-
-Repair PG-backend secret scopes stored with a stale pg: qualifier (direct-DB). Each affected scope is renamed to its bare path, re-encrypting every secret under the corrected AAD. Exits 2 when any scope needs manual repair.
-
-Synopsis: `kici-admin secret fix-prefixed-scopes <orgId> [options]`
-
-**Arguments**
-
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
-
-**Options**
-
-| Option                 | Default | Description                                |
-| ---------------------- | ------- | ------------------------------------------ |
-| `--dry-run`            |         | Print the plan and exit without writing    |
-| `--database-url <url>` |         | Orchestrator DB URL (or KICI_DATABASE_URL) |
 
 ### `kici-admin secret list`
 
@@ -632,10 +612,10 @@ Synopsis: `kici-admin secret list <orgId> <scope>`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
-| `scope`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `scope`  | yes      | no       |                                                 |
 
 ### `kici-admin secret purge`
 
@@ -645,12 +625,12 @@ Synopsis: `kici-admin secret purge [options]`
 
 **Options**
 
-| Option                 | Default | Description                                             |
-| ---------------------- | ------- | ------------------------------------------------------- |
-| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)     |
-| `--confirm`            |         | Explicit confirmation flag                              |
-| `--org <orgId>`        |         | Restrict to a single org (defaults to ALL orgs)         |
-| `--yes`                |         | Skip interactive confirmation prompt (for scripted use) |
+| Option                 | Default | Description                                                                             |
+| ---------------------- | ------- | --------------------------------------------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)                                     |
+| `--confirm`            |         | Explicit confirmation flag                                                              |
+| `--org <orgId>`        |         | Restrict to a single org (defaults to ALL orgs; kici-admin org list prints the org ids) |
+| `--yes`                |         | Skip interactive confirmation prompt (for scripted use)                                 |
 
 ### `kici-admin secret scope`
 
@@ -666,10 +646,10 @@ Synopsis: `kici-admin secret scope create <orgId> <scope> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
-| `scope`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `scope`  | yes      | no       |                                                 |
 
 **Options**
 
@@ -685,10 +665,10 @@ Synopsis: `kici-admin secret scope delete <orgId> <scope> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
-| `scope`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `scope`  | yes      | no       |                                                 |
 
 **Options**
 
@@ -705,11 +685,11 @@ Synopsis: `kici-admin secret scope rename <orgId> <oldScope> <newScope> [options
 
 **Arguments**
 
-| Argument   | Required | Variadic | Description |
-| ---------- | -------- | -------- | ----------- |
-| `orgId`    | yes      | no       |             |
-| `oldScope` | yes      | no       |             |
-| `newScope` | yes      | no       |             |
+| Argument   | Required | Variadic | Description                                     |
+| ---------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`    | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `oldScope` | yes      | no       |                                                 |
+| `newScope` | yes      | no       |                                                 |
 
 **Options**
 
@@ -725,9 +705,9 @@ Synopsis: `kici-admin secret scopes <orgId>`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | yes      | no       | Org id (kici-admin org list prints the org ids) |
 
 ### `kici-admin secret set`
 
@@ -737,28 +717,28 @@ Synopsis: `kici-admin secret set [orgId] [scope] [key] [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `orgId`  | no       | no       |             |
-| `scope`  | no       | no       |             |
-| `key`    | no       | no       |             |
+| Argument | Required | Variadic | Description                                     |
+| -------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`  | no       | no       | Org id (kici-admin org list prints the org ids) |
+| `scope`  | no       | no       |                                                 |
+| `key`    | no       | no       |                                                 |
 
 **Options**
 
-| Option                              | Default | Description                                                                                         |
-| ----------------------------------- | ------- | --------------------------------------------------------------------------------------------------- |
-| `--value <value>`                   |         | Secret value via argv (visible in shell history; prefer --prompt)                                   |
-| `--org <orgId>`                     |         | Org ID (use with --context + --key; mutually exclusive with positional form)                        |
-| `--context <name>`                  |         | Context scope — sugar for positional <scope>. Requires --org and --key.                             |
-| `--key <key>`                       |         | Secret key name (use with --org + --context)                                                        |
-| `--prompt`                          |         | Interactive no-echo prompt (requires TTY)                                                           |
-| `--from-stdin`                      |         | Read value from piped stdin until EOF                                                               |
-| `--from-file <path>`                |         | Read value from a file (trailing newline trimmed)                                                   |
-| `--from-env <var>`                  |         | Read value from a named environment variable                                                        |
-| `--no-trim`                         |         | When reading --from-file, keep the trailing newline (default: trim once)                            |
-| `--confirm-fingerprint <sha256hex>` |         | Refuse the write unless SHA-256(value) matches this 64-hex string                                   |
-| `--dry-run`                         |         | Parse + validate the value, print fingerprint + length, do not write                                |
-| `--database-url <url>`              |         | Direct-DB mode: write encrypted_value verbatim to scoped_secrets (offline; skips HTTP + encryption) |
+| Option                              | Default | Description                                                                                                          |
+| ----------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `--value <value>`                   |         | Secret value via argv (visible in shell history; prefer --prompt)                                                    |
+| `--org <orgId>`                     |         | Org id (use with --context + --key; mutually exclusive with positional form; kici-admin org list prints the org ids) |
+| `--context <name>`                  |         | Context scope — sugar for positional <scope>. Requires --org and --key.                                              |
+| `--key <key>`                       |         | Secret key name (use with --org + --context)                                                                         |
+| `--prompt`                          |         | Interactive no-echo prompt (requires TTY)                                                                            |
+| `--from-stdin`                      |         | Read value from piped stdin until EOF                                                                                |
+| `--from-file <path>`                |         | Read value from a file (trailing newline trimmed)                                                                    |
+| `--from-env <var>`                  |         | Read value from a named environment variable                                                                         |
+| `--no-trim`                         |         | When reading --from-file, keep the trailing newline (default: trim once)                                             |
+| `--confirm-fingerprint <sha256hex>` |         | Refuse the write unless SHA-256(value) matches this 64-hex string                                                    |
+| `--dry-run`                         |         | Parse + validate the value, print fingerprint + length, do not write                                                 |
+| `--database-url <url>`              |         | Direct-DB mode: write encrypted_value verbatim to scoped_secrets (offline; skips HTTP + encryption)                  |
 
 ### `kici-admin token`
 
@@ -819,11 +799,11 @@ Synopsis: `kici-admin variable delete <orgId> <context> <key> [options]`
 
 **Arguments**
 
-| Argument  | Required | Variadic | Description |
-| --------- | -------- | -------- | ----------- |
-| `orgId`   | yes      | no       |             |
-| `context` | yes      | no       |             |
-| `key`     | yes      | no       |             |
+| Argument  | Required | Variadic | Description                                     |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`   | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `context` | yes      | no       |                                                 |
+| `key`     | yes      | no       |                                                 |
 
 **Options**
 
@@ -839,11 +819,11 @@ Synopsis: `kici-admin variable get <orgId> <context> <key>`
 
 **Arguments**
 
-| Argument  | Required | Variadic | Description |
-| --------- | -------- | -------- | ----------- |
-| `orgId`   | yes      | no       |             |
-| `context` | yes      | no       |             |
-| `key`     | yes      | no       |             |
+| Argument  | Required | Variadic | Description                                     |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`   | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `context` | yes      | no       |                                                 |
+| `key`     | yes      | no       |                                                 |
 
 ### `kici-admin variable list`
 
@@ -853,10 +833,10 @@ Synopsis: `kici-admin variable list <orgId> <context> [options]`
 
 **Arguments**
 
-| Argument  | Required | Variadic | Description |
-| --------- | -------- | -------- | ----------- |
-| `orgId`   | yes      | no       |             |
-| `context` | yes      | no       |             |
+| Argument  | Required | Variadic | Description                                     |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`   | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `context` | yes      | no       |                                                 |
 
 **Options**
 
@@ -872,11 +852,11 @@ Synopsis: `kici-admin variable set <orgId> <context> <key> [options]`
 
 **Arguments**
 
-| Argument  | Required | Variadic | Description |
-| --------- | -------- | -------- | ----------- |
-| `orgId`   | yes      | no       |             |
-| `context` | yes      | no       |             |
-| `key`     | yes      | no       |             |
+| Argument  | Required | Variadic | Description                                     |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `orgId`   | yes      | no       | Org id (kici-admin org list prints the org ids) |
+| `context` | yes      | no       |                                                 |
+| `key`     | yes      | no       |                                                 |
 
 **Options**
 

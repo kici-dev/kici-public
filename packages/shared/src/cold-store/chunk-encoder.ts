@@ -143,7 +143,12 @@ function toDate(v: Date | string): Date {
   return v instanceof Date ? v : new Date(v);
 }
 
-function compareRowIds(a: string | number, b: string | number): number {
+/**
+ * Order row ids the way chunk bounds are computed: numerically when both are
+ * numbers, else by string. `computeChunkId` hashes these bounds, so any code
+ * that re-derives a chunk id must order ids with this function.
+ */
+export function compareRowIds(a: string | number, b: string | number): number {
   if (typeof a === 'number' && typeof b === 'number') {
     return a - b;
   }

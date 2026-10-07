@@ -75,9 +75,10 @@ describe('worstStatus', () => {
     );
   });
 
-  it('resolves legacy aliases', () => {
+  it('skips a retired spelling instead of resolving it', () => {
+    // fails-when: `error` still resolves to `failed` through an alias map.
     expect(worstStatus(['error', ExecutionJobStatus.enum.success])).toBe(
-      ExecutionRunStatus.enum.failed,
+      ExecutionRunStatus.enum.success,
     );
   });
 
@@ -94,9 +95,17 @@ describe('toCanonicalStatus', () => {
     );
   });
 
-  it('resolves known legacy spellings', () => {
-    expect(toCanonicalStatus('canceled')).toBe(ExecutionRunStatus.enum.cancelled);
-    expect(toCanonicalStatus('in_progress')).toBe(ExecutionRunStatus.enum.running);
+  it.each(['passed', 'completed', 'in_progress', 'error', 'canceled', 'waiting'])(
+    'does not resolve the retired spelling %s',
+    (status) => {
+      // fails-when: LEGACY_STATUS_ALIASES survives.
+      expect(toCanonicalStatus(status)).toBeUndefined();
+    },
+  );
+
+  it('resolves every canonical status', () => {
+    // breaks-if-wrong: deleting the aliases must not drop a canonical status.
+    for (const status of CANONICAL_STATUSES) expect(toCanonicalStatus(status)).toBe(status);
   });
 
   it('does not resolve inherited Object.prototype keys', () => {

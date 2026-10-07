@@ -40,8 +40,8 @@ export async function patCreateCommand(options: PatCreateOptions = {}): Promise<
   const doFetch = options.fetchImpl ?? fetch;
   try {
     const config = await loadGlobalConfig();
-    const token = config.pat ?? config.token;
-    const endpoint = config.platformEndpoint ?? config.endpoint;
+    const token = config.pat;
+    const endpoint = config.platformEndpoint;
     if (!token || !endpoint) {
       console.error(pc.red('Not logged in. Run `kici login` first.'));
       return false;

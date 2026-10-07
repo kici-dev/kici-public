@@ -12,12 +12,7 @@
  *
  * Assembled here so `bootstrapWorker` only wires it.
  */
-import {
-  ScalerEventType,
-  type JobReroute,
-  type PeerScalerEvent,
-  type RerouteSpawnRetry,
-} from '@kici-dev/engine';
+import { ScalerEventType, type JobReroute, type PeerScalerEvent } from '@kici-dev/engine';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { ScalerManager } from '../scaler/manager.js';
 import type { ScaleResult, ScalerEvent } from '../scaler/types.js';
@@ -41,8 +36,6 @@ export interface RerouteSpawnControlDeps {
   jobOwnership: Map<string, string>;
   /** Relay a message to the coordinator that owns the job. */
   sendToOwningCoord: (jobId: string, msg: PeerScalerEvent) => void;
-  /** The worker's configured budget, used when the coordinator sent none. */
-  defaults: RerouteSpawnRetry;
   logger: {
     debug(message: string, meta?: Record<string, unknown>): unknown;
     info(message: string, meta?: Record<string, unknown>): unknown;
@@ -90,7 +83,7 @@ export function createRerouteSpawnControl(deps: RerouteSpawnControlDeps): Rerout
 
   return {
     registerReroute(msg) {
-      budget.register(msg.jobId, msg.runId, msg.spawnRetry ?? deps.defaults);
+      budget.register(msg.jobId, msg.runId, msg.spawnRetry);
     },
 
     forgetReroute(jobId) {

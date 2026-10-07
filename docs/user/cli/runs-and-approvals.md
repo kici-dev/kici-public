@@ -286,7 +286,6 @@ recently. If deliveries came in but nothing produced a run, it prints a
 one-line summary ("3 webhooks received in the last hour, 0 matched") and
 suggests `kici preview push` to test your triggers locally — the fast way to
 find a misconfigured trigger. When nothing arrived it prints "No runs found."
-as before.
 
 ```bash
 kici runs list [options]

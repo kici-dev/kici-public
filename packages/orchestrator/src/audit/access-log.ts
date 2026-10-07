@@ -229,7 +229,7 @@ export class AccessLogWriter {
    * synthetic `__orchestrator__` tenant is scanned (matches the
    * NULL-org_id rows the orchestrator itself emits via
    * `cold-store-archive` / `cold-store-purge`). The CLI exposes this as
-   * `kici-admin access-log show <id> --org-id <orgId>`.
+   * `kici-admin access-log show <id> --org <orgId>`.
    *
    * Best-effort contract: a cold-store error logs a warn line and
    * returns null, matching `loadAccessLogRange` and

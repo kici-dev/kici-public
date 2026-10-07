@@ -1824,8 +1824,8 @@ describe('fleet host entries carry confirmed', () => {
     expect(host.host?.confirmed).toBe(true);
   });
 
-  it('an entry without confirmed still parses', () => {
-    // breaks-if-wrong: an older orchestrator sends entries with no confirmed.
-    expect(fleetHostEntrySchema.parse(INVENTORY_ENTRY).confirmed).toBeUndefined();
+  it('refuses an entry without confirmed', () => {
+    // fails-when: confirmed stays optional.
+    expect(fleetHostEntrySchema.safeParse(INVENTORY_ENTRY).success).toBe(false);
   });
 });

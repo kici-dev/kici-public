@@ -31,5 +31,3 @@ export type {
 // Error types
 export { formatError, compilerError, isCompilerError } from './errors/index.js';
 export type { SourceLocation, CompilerError } from './errors/index.js';
-export { CapabilityGapError, formatCapabilityGapError } from './errors/index.js';
-export type { CapabilityGapInfo } from './errors/index.js';

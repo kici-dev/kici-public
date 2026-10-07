@@ -16,8 +16,8 @@ import {
   KNOWN_ROLES,
   ScalerBackendType,
   canonicalizeLabels,
-  derivePlatformTaints,
   platformToTaints,
+  resourceRequestNestedSchema,
   scalerPlatformSchema,
 } from '@kici-dev/engine';
 import { ImagePullPolicy } from './types.js';
@@ -36,57 +36,37 @@ import { toErrorMessage } from '@kici-dev/shared';
 export const DEFAULT_MAX_CONCURRENT_SPAWNS = 8;
 
 /**
- * Zod schema for a single resource spec (cpus + memory).
- *
- * The flat shape used to be the public scaler config form (`{ cpus, memory }`).
- * It's still accepted at the label-set / defaults level via `resourceRequestSchema`
- * below, where it's normalized to the nested `{ requests, limits }` form.
+ * Plain OS/arch labels an operator might write to mean "this pool is that
+ * platform". The structured `platform` field is the only thing that taints a
+ * pool, so a label set naming one of these without it is refused.
  */
-const resourceSpecSchema = z
-  .object({
-    memory: z.string().optional(),
-    cpus: z.number().positive().max(256).optional(),
-  })
-  .strict();
+const PLAIN_PLATFORM_LABELS = new Set<string>([
+  'windows',
+  'win32',
+  'macos',
+  'darwin',
+  'arm64',
+  'aarch64',
+  'arm',
+]);
 
 /**
- * Zod schema for nested-form `ResourceRequest` (`{ requests, limits }`).
+ * Resource request schema accepted at the label-set / defaults level:
+ * `{ requests?: {cpus, memory}, limits?: {cpus, memory} }`. A `{ cpus, memory }`
+ * object written directly under `resources` is refused with a message naming
+ * the nested form, so the operator is told where the keys belong.
  */
-const nestedResourceRequestSchema = z
-  .object({
-    requests: resourceSpecSchema.optional(),
-    limits: resourceSpecSchema.optional(),
-  })
-  .strict();
-
-/**
- * Resource request schema accepted at the label-set / defaults level.
- *
- * Two input forms:
- * - Nested (preferred): `{ requests?: {cpus, memory}, limits?: {cpus, memory} }`.
- * - Flat shorthand: `{ cpus, memory }` -- treated as `limits`, `requests` mirrored from it.
- *
- * Always normalizes to the nested form so downstream code sees one shape.
- */
-const resourceRequestSchema = z.union([nestedResourceRequestSchema, resourceSpecSchema]).transform(
-  (
-    value,
-  ): {
-    requests?: { cpus?: number; memory?: string };
-    limits?: { cpus?: number; memory?: string };
-  } => {
-    // Flat form: treat as `limits`, mirror to `requests`.
-    if ('cpus' in value || 'memory' in value) {
-      const flat = value as { cpus?: number; memory?: string };
-      if (flat.cpus === undefined && flat.memory === undefined) return {};
-      return { requests: { ...flat }, limits: { ...flat } };
-    }
-    return value as {
-      requests?: { cpus?: number; memory?: string };
-      limits?: { cpus?: number; memory?: string };
-    };
-  },
-);
+const resourceRequestSchema = z.preprocess((value, ctx) => {
+  if (value && typeof value === 'object' && ('cpus' in value || 'memory' in value)) {
+    ctx.addIssue({
+      code: 'custom',
+      message:
+        'resources takes { requests, limits }: nest cpus and memory under limits (a limit alone also sets the request)',
+    });
+    return z.NEVER;
+  }
+  return value;
+}, resourceRequestNestedSchema);
 
 /**
  * Zod schema for an aggregate resource cap (per-scaler / per-orchestrator / per-machine).
@@ -180,11 +160,7 @@ export const labelSetConfigSchema = z
     // a moving tag opts into `Always` explicitly.
     imagePullPolicy: ImagePullPolicy.default(ImagePullPolicy.enum.IfNotPresent),
     binaryPath: z.string().optional(),
-    /**
-     * Per-label-set resource request and limit. Accepts either the nested
-     * form `{ requests, limits }` or the legacy flat `{ cpus, memory }`
-     * (treated as `limits`, with `requests` mirrored). Always normalized to nested.
-     */
+    /** Per-label-set resource request and limit (`{ requests, limits }`). */
     resources: resourceRequestSchema.optional(),
     volumes: z.array(z.string()).optional(),
     containerSocket: z.boolean().default(false),
@@ -381,19 +357,30 @@ const scalerEntrySchema = z
         }
       });
     }
-    // Every label set's DERIVED gate must be reachable from that label set,
-    // otherwise no job can route through it: the matcher demands every gate
-    // label in the job's `runsOn`, and only labels the set actually matches on
-    // can supply them. The gate is the configured `mandatoryLabels`, the
-    // structured platform taints, and the legacy taints derived from the set's
-    // own labels — the same three the manager unions per label set.
-    //
-    // The reachable set is the label set plus the structured platform taints,
-    // which the manager injects into every label set as matchable labels. The
-    // legacy taints derive from the set's own labels and so are always
-    // reachable; only a configured label can be unreachable in practice, but
-    // checking the whole derived gate is what keeps this validation and the
-    // manager's gate the same rule.
+    // A plain platform label (`windows`, `macos`, `arm64`, …) does not taint a
+    // pool: only the structured `platform` field does. A pool that names one
+    // without declaring `platform` would take every unqualified job, so it is
+    // refused and the operator is pointed at the field.
+    if (!data.platform) {
+      data.labelSets.forEach((ls, i) => {
+        for (const label of ls.labels) {
+          if (PLAIN_PLATFORM_LABELS.has(label.toLowerCase())) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `Scaler "${data.name}" labelSets[${i}]: label "${label}" names a platform; declare platform: { os, arch } instead`,
+              path: ['labelSets', i, 'labels'],
+            });
+          }
+        }
+      });
+    }
+    // Every label set's gate must be reachable from that label set, otherwise
+    // no job can route through it: the matcher demands every gate label in the
+    // job's `runsOn`, and only labels the set actually matches on can supply
+    // them. The gate is the configured `mandatoryLabels` plus the structured
+    // platform taints — the same pair the manager unions per label set. The
+    // reachable set is the label set plus the structured platform taints, which
+    // the manager injects into every label set as matchable labels.
     //
     // A bare-metal pool that declares no `platform` host-derives it at runtime,
     // which this validation deliberately does not do: a config's validity must
@@ -405,7 +392,6 @@ const scalerEntrySchema = z
       const gate = new Set([
         ...data.mandatoryLabels.map((l) => l.toLowerCase()),
         ...structuredTaints.map((l) => l.toLowerCase()),
-        ...derivePlatformTaints(ls.labels),
       ]);
       if (gate.size === 0) return;
       const reachable = new Set([

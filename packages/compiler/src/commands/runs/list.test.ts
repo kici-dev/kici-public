@@ -44,7 +44,16 @@ describe('runsListCommand', () => {
         approxTotal: 0,
         pageSize: 20,
       }),
-      getWebhookActivity: async () => null,
+      getWebhookActivity: async () => ({
+        windowMinutes: 60,
+        received: 0,
+        delivered: 0,
+        edgeRejected: 0,
+        failed: 0,
+        matched: 0,
+        unmatched: 0,
+        orchestratorUnavailable: false,
+      }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const ok = await runsListCommand({});
@@ -109,7 +118,7 @@ describe('runsListCommand', () => {
     expect(out).not.toMatch(/0 matched/);
   });
 
-  it('degrades silently to "No runs found." when activity is unavailable', async () => {
+  it('surfaces a webhook-activity failure as an error', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       listRuns: async () => ({
         runs: [],
@@ -119,14 +128,17 @@ describe('runsListCommand', () => {
         approxTotal: 0,
         pageSize: 20,
       }),
-      getWebhookActivity: async () => null,
+      getWebhookActivity: async () => {
+        throw new clientMod.DashboardClientError('not_found', 'Not found.');
+      },
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
     const ok = await runsListCommand({});
-    expect(ok).toBe(true);
-    const out = log.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(out).toContain('No runs found.');
-    expect(out).not.toMatch(/webhooks received/);
+    // fails-when: the activity call is still wrapped in a catch — the command
+    // would print "No runs found." and succeed.
+    expect(ok).toBe(false);
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).not.toContain('No runs found.');
   });
 
   it('emits raw JSON with --json', async () => {

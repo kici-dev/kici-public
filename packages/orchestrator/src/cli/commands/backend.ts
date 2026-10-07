@@ -15,12 +15,9 @@
 import { readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { purgeSecretBackendsDirect, toErrorMessage } from '@kici-dev/shared';
+import { purgeSecretBackendsDirect } from '@kici-dev/shared';
 import { confirmPrompt } from './shared/confirm.js';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
 
 export function registerBackendCommands(program: Command, getClient: () => AdminApiClient): void {
   const backend = program.command('backend').description('Manage secret backends');
@@ -50,8 +47,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     // Common options
     .option('--scope-filter <pattern>', 'Scope filter glob pattern (default: **)', '**')
     .option('--sync-interval <ms>', 'Sync interval in milliseconds (default: 300000)', '300000')
-    .action(async (name: string, opts) => {
-      try {
+    .action(
+      cliAction(async (name: string, opts) => {
         const backendType = opts.type;
         if (backendType !== 'pg' && backendType !== 'vault') {
           console.error('Error: --type must be "pg" or "vault"');
@@ -76,11 +73,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
 
         console.log('Backend registered:');
         printBackendSummary(result);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── backend remove <name> ─────────────────────────────────────────
 
@@ -88,8 +82,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     .command('remove <name>')
     .description('Remove a registered secret backend')
     .option('--yes', 'Skip confirmation prompt')
-    .action(async (name: string, opts) => {
-      try {
+    .action(
+      cliAction(async (name: string, opts) => {
         if (!opts.yes) {
           // Fetch backend to show scope count in confirmation
           let scopeInfo = '';
@@ -110,19 +104,16 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
 
         const result = await getClient().removeBackend(name);
         console.log(`Backend "${name}" removed (${result.scopeCount} scopes affected).`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── backend list ──────────────────────────────────────────────────
 
   backend
     .command('list')
     .description('List all registered secret backends')
-    .action(async () => {
-      try {
+    .action(
+      cliAction(async () => {
         const { backends } = await getClient().listBackends();
         if (backends.length === 0) {
           console.log('No backends registered.');
@@ -157,11 +148,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
             ].join('  '),
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── backend test [name] ───────────────────────────────────────────
 
@@ -180,8 +168,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     .option('--mount-path <path>', 'Vault mount path', 'secret')
     .option('--base-path <path>', 'Vault base path')
     .option('--connection-string <url>', 'PG connection string (env: KICI_BACKEND_PG_URL)')
-    .action(async (name: string | undefined, opts) => {
-      try {
+    .action(
+      cliAction(async (name: string | undefined, opts) => {
         let result: { ok: boolean; error?: string; latencyMs: number };
 
         if (name && !opts.type) {
@@ -213,11 +201,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
           console.error(`Connection FAILED: ${result.error} (${result.latencyMs}ms)`);
           process.exit(1);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── backend purge-stale ───────────────────────────────────────────
   //
@@ -238,8 +223,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     )
     .option('--database-url <url>', 'Orchestrator DB URL (or KICI_DATABASE_URL / DATABASE_URL)')
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (!dbUrl) {
           console.error(
@@ -253,19 +238,16 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
         } else {
           console.log(`backend purge-stale: deleted=${deleted} (direct)`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── backend sync [name] ───────────────────────────────────────────
 
   backend
     .command('sync [name]')
     .description('Trigger scope discovery sync (all backends if name omitted)')
-    .action(async (name?: string) => {
-      try {
+    .action(
+      cliAction(async (name?: string) => {
         if (name) {
           const result = await getClient().syncBackend(name);
           console.log(`Backend "${name}" synced: ${result.scopeCount} scopes discovered.`);
@@ -285,11 +267,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
             }
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

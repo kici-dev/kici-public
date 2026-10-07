@@ -9,7 +9,6 @@
  * TS2307s. Only the declaration lives here — its one dependency is a type from
  * `@kici-dev/engine`, so nothing test-only is pulled along with it.
  */
-import type { OrchCapabilities } from '@kici-dev/engine';
 
 /**
  * The set of synthetic faults a test-only entrypoint can inject into the
@@ -45,9 +44,4 @@ export interface OrchestratorFaultInjection {
    * the first coordinator slow enough that the Platform relay fails over.
    */
   beforeRerun?: () => Promise<void>;
-  /**
-   * Transform the advertised capability manifest — used to reproduce an older
-   * / sourceless orchestrator that predates a given dashboard capability.
-   */
-  capabilitiesTransform?: (c: OrchCapabilities) => OrchCapabilities;
 }

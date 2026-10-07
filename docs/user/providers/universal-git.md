@@ -222,18 +222,18 @@ kici-admin cluster-settings set --global-workflows-enabled true
 # Allow authors from any source in the org
 kici-admin org-settings global-workflows allow-add \
   'forgejo.example.com/ci-workflows/*' \
-  --customer-id <orgId>
+  --org <orgId>
 
 # Allow authors only when the workflow lives on a specific source
 kici-admin org-settings global-workflows allow-add \
   'forgejo.example.com/ci-workflows/*' \
-  --customer-id <orgId> \
+  --org <orgId> \
   --source "generic:<orgId>:<sourceId>"
 
 # Forbid events from a specific source from firing any global workflow
 kici-admin org-settings global-workflows deny-add \
   'forgejo.example.com/untrusted/*' \
-  --customer-id <orgId> \
+  --org <orgId> \
   --source "generic:<orgId>:<sourceId>"
 ```
 

@@ -8,6 +8,7 @@ import {
   jobRerouteSchema,
   ExecutionJobStatus,
   ScalerOrphansAction,
+  ScalerReloadOutcome,
   ScalerVmStopOutcome,
   PeerForgetOutcome,
   type JobReroute,
@@ -1006,6 +1007,7 @@ describe('PeerClient', () => {
 
       const reroute = {
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: 'msg-1',
         jobId: 'job-1',
         runId: 'run-1',
@@ -1101,7 +1103,11 @@ describe('PeerClient', () => {
         type: 'peer.clusterSettings.response',
         messageId: 'cs-1',
         version: 4,
-        settings: { agentTokenTtlMs: 42_000 },
+        settings: {
+          agentTokenTtlMs: 42_000,
+          firecrackerApiSocketWaitMs: 30_000,
+          concurrencyWaitTimeoutMs: 900_000,
+        },
       };
       mock.emit('message', encryptMessage(JSON.stringify(response), sessionKey));
 
@@ -1293,7 +1299,7 @@ describe('PeerClient', () => {
         runId: 'run-1',
         jobId: 'job-1',
         stepIndex: 0,
-        lines: [{ text: 'Hello, world!', timestamp: Date.now() }],
+        lines: [{ text: 'Hello, world!', timestamp: Date.now(), stream: 'stdout' }],
       });
 
       expect(result).toBe(true);
@@ -1533,6 +1539,101 @@ describe('PeerClient', () => {
         outcome: PeerForgetOutcome.enum.error,
         detail: 'peer forget requests are not handled by this peer',
       });
+    });
+  });
+
+  describe('scaler reload routing', () => {
+    function reloadReply(mock: any, sessionKey: Buffer, countBefore: number): any {
+      for (const msg of mock.sentMessages.slice(countBefore)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.scaler.reload.response') return parsed;
+        } catch {
+          // ignore
+        }
+      }
+      return null;
+    }
+
+    it('answers an incoming request through onScalerReloadRequest', async () => {
+      const onScalerReloadRequest = vi
+        .fn()
+        .mockResolvedValue({ outcome: ScalerReloadOutcome.enum.rejected, errors: ['overlap'] });
+      const { client } = createPeerClient({ onScalerReloadRequest });
+      const { mock, sessionKey } = await authenticateClient(client);
+      const countBefore = mock.sentMessages.length;
+
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({ type: 'peer.scaler.reload.request', messageId: 'rl-client-1' }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onScalerReloadRequest).toHaveBeenCalledTimes(1);
+      expect(reloadReply(mock, sessionKey, countBefore)).toEqual({
+        type: 'peer.scaler.reload.response',
+        messageId: 'rl-client-1',
+        outcome: ScalerReloadOutcome.enum.rejected,
+        errors: ['overlap'],
+      });
+    });
+
+    it('answers rejected when no handler is wired', async () => {
+      const { client } = createPeerClient();
+      const { mock, sessionKey } = await authenticateClient(client);
+      const countBefore = mock.sentMessages.length;
+
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({ type: 'peer.scaler.reload.request', messageId: 'rl-client-2' }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(reloadReply(mock, sessionKey, countBefore)).toMatchObject({
+        outcome: ScalerReloadOutcome.enum.rejected,
+        detail: 'scaler reload requests are not handled by this peer',
+      });
+    });
+
+    it('sendScalerReloadAndWait resolves with the matching response', async () => {
+      const { client } = createPeerClient();
+      const { mock, sessionKey } = await authenticateClient(client);
+
+      const promise = client.sendScalerReloadAndWait(
+        { type: 'peer.scaler.reload.request', messageId: 'rl-out-1' },
+        5_000,
+      );
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.scaler.reload.response',
+            messageId: 'rl-out-1',
+            outcome: ScalerReloadOutcome.enum.applied,
+          }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await promise).toMatchObject({ outcome: ScalerReloadOutcome.enum.applied });
+    });
+
+    it('sendScalerReloadAndWait returns null when not connected, and timeout without an answer', async () => {
+      const { client } = createPeerClient();
+      const msg = { type: 'peer.scaler.reload.request' as const, messageId: 'rl-2' };
+      expect(await client.sendScalerReloadAndWait(msg, 500)).toBeNull();
+
+      await authenticateClient(client);
+      const promise = client.sendScalerReloadAndWait(msg, 500);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await promise).toBe('timeout');
     });
   });
 
@@ -1783,6 +1884,7 @@ describe('PeerClient', () => {
     function makeJobReroute(): JobReroute {
       return jobRerouteSchema.parse({
         type: 'job.reroute',
+        spawnRetry: { maxAttempts: 3, backoffMs: 0 },
         messageId: `msg-${randomBytes(4).toString('hex')}`,
         jobId: 'job-1',
         runId: 'run-1',

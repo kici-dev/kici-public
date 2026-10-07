@@ -23,10 +23,7 @@ import {
   PeerCredentialStore,
   type PeerCredential,
 } from '../../cluster/peer-credentials.js';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
 
 /**
  * Format peer credentials as a table.
@@ -165,38 +162,37 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
       false,
     )
     .option('--json', 'Emit machine-readable JSON', false)
-    .action(async (instanceId: string, opts: { json: boolean; timeout: string; yes: boolean }) => {
-      try {
-        process.exitCode = await runPeerForget(getClient(), instanceId, opts, {
-          out: (line) => console.log(line),
-          confirm: (prompt) => confirmPrompt(prompt),
-          interactive: process.stdin.isTTY === true,
-        });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+    .action(
+      cliAction(
+        async (instanceId: string, opts: { json: boolean; timeout: string; yes: boolean }) => {
+          process.exitCode = await runPeerForget(getClient(), instanceId, opts, {
+            out: (line) => console.log(line),
+            confirm: (prompt) => confirmPrompt(prompt),
+            interactive: process.stdin.isTTY === true,
+          });
+        },
+      ),
+    );
 
   peer
     .command('create-token')
     .description('Create a join token for a new peer')
     .option('--role <role>', 'Peer role (worker or coordinator)', 'coordinator')
     .option('--expiry-hours <hours>', 'Token expiry in hours', '1')
-    .option('--org-id <id>', 'Organization ID', 'default')
+    .option('--org <id>', 'Org id', 'default')
     .option('--routing-key <key>', 'Routing key', 'default')
     .option('--created-by <actor>', 'Attribution written to join_tokens.created_by', 'cli')
     .option('--json', 'Emit JSON { token, role, expiresAt, orgId, routingKey } on stdout', false)
     .action(
-      async (opts: {
-        role: string;
-        expiryHours: string;
-        orgId: string;
-        routingKey: string;
-        createdBy: string;
-        json: boolean;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          role: string;
+          expiryHours: string;
+          org: string;
+          routingKey: string;
+          createdBy: string;
+          json: boolean;
+        }) => {
           const role = opts.role as 'coordinator' | 'worker';
           if (role !== 'coordinator' && role !== 'worker') {
             console.error('Error: --role must be "coordinator" or "worker"');
@@ -219,7 +215,7 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
           const token = await withDb(async (db) => {
             const tokenManager = new JoinTokenManager({ db });
             return tokenManager.createToken({
-              orgId: opts.orgId,
+              orgId: opts.org,
               routingKey: opts.routingKey,
               createdBy: opts.createdBy,
               role,
@@ -236,7 +232,7 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
                 {
                   token,
                   role,
-                  orgId: opts.orgId,
+                  orgId: opts.org,
                   routingKey: opts.routingKey,
                   expiresAt: expiresAt.toISOString(),
                 },
@@ -252,11 +248,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
           console.log(token);
           console.log('');
           console.log('This token works until it expires. Treat it like a password.');
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   peer
@@ -267,8 +260,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
       'Emit JSON { peers: [{ id, instanceId, role, selfIssued, createdAt, lastSeenAt, lastValidatedBy, expiresAt }] } on stdout',
       false,
     )
-    .action(async (opts: { json: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { json: boolean }) => {
         const peers = await withDb(async (db) => {
           const store = new PeerCredentialStore(db);
           return store.listActive();
@@ -279,18 +272,15 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
           return;
         }
         console.log(formatPeerTable(peers));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   peer
     .command('revoke')
     .description('Revoke a peer credential by instance ID')
     .requiredOption('--instance-id <id>', 'Instance ID of the peer to revoke')
-    .action(async (opts: { instanceId: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { instanceId: string }) => {
         await withDb(async (db) => {
           const store = new PeerCredentialStore(db);
           await store.revoke(opts.instanceId);
@@ -299,11 +289,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
         console.log(
           `Peer ${opts.instanceId} credential revoked. Its next connection attempt is refused; its open connections stay up.`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   peer
     .command('revoke-all')
@@ -339,8 +326,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
     )
     .option('--database-url <url>', 'Use direct DB access (offline mode, required)')
     .option('--json', 'Emit JSON { deleted } on stdout', false)
-    .action(async (opts: { filter: string; databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { filter: string; databaseUrl?: string; json?: boolean }) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (!dbUrl) {
           console.error(
@@ -359,11 +346,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
         } else {
           console.log(`peer credentials pruned: ${result.deleted} rows deleted`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   peer
     .command('reset-raft-state')
@@ -372,8 +356,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
     )
     .option('--database-url <url>', 'Use direct DB access (offline mode, required)')
     .option('--json', 'Emit JSON { rowsDeleted } on stdout', false)
-    .action(async (opts: { databaseUrl?: string; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (!dbUrl) {
           console.error(
@@ -390,9 +374,6 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
         } else {
           console.log(`raft_state reset: ${result.rowsDeleted} rows deleted`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

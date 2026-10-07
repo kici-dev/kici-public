@@ -1,10 +1,8 @@
 /**
  * Bounded wait for the orchestrator's provenance signer.
  *
- * A mint that arrives before any node has generated the key must NOT fall
- * back to a Platform-signed bundle (it would fail verification against the
- * orchestrator trust root), so the resolver waits for the key instead of
- * deferring on the first miss. But the wait exists for ONE condition — a
+ * A mint that arrives before any node has generated the key must not fail,
+ * so the resolver waits for the key instead of deferring on the first miss. But the wait exists for ONE condition — a
  * reconcile that returns `null` because a non-leader is still leaving key
  * creation to the leader. A reconcile that THROWS is a different answer:
  * a signing key sealed under a master key this process does not hold, or `db`
@@ -17,6 +15,7 @@
  * So: retry the null, stop on the throw, and say why once per distinct cause.
  */
 import type { Signer } from './signer.js';
+import { sleep as defaultSleep } from '@kici-dev/engine';
 
 export interface ResolveSignerOptions {
   /** One reconcile pass: a signer, `null` while the key is not ready, or a throw. */
@@ -46,7 +45,7 @@ export interface ResolveSignerCallBudget {
 export function createBoundedSignerResolver(
   opts: ResolveSignerOptions,
 ): (budget?: ResolveSignerCallBudget) => Promise<Signer | null> {
-  const sleep = opts.sleep ?? ((ms) => new Promise<void>((res) => setTimeout(res, ms)));
+  const sleep = opts.sleep ?? defaultSleep;
   let cached: Signer | null = null;
   let lastReportedCause: string | undefined;
   return async (budget) => {

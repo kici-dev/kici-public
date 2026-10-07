@@ -1,15 +1,13 @@
 /**
  * `access_log` cold-store adapter (Orchestrator side).
  *
- *
  * Contract:
  *   - tenant column: `org_id` (NULL → synthetic `__orchestrator__`)
  *   - partition column: `created_at`
  *   - warm TTL: 30 days
  *
- * Replaces the previous 90-day `expires_at`-based hard delete (removed
- * by migration 007). Rows older than 30 days now live in S3
- * indefinitely.
+ * Rows older than 30 days live in S3 indefinitely; there is no
+ * `expires_at`-based hard delete.
  *
  * Synthetic tenant: orchestrator-level access events (e.g. scheduler
  * tick failures, admin-triggered scheduled jobs) carry `org_id IS
@@ -27,6 +25,7 @@ import {
   type ColdStoreTableConfig,
   type EligiblePartition,
   type TableAdapter,
+  PgTableAdapterBase,
 } from '@kici-dev/shared';
 import {
   type AccessLogAction,
@@ -64,19 +63,21 @@ export interface AccessLogAdapterOptions {
   overrides?: Partial<ColdStoreTableConfig>;
 }
 
-export class AccessLogAdapter implements TableAdapter<AccessLogColdStoreRow> {
+export class AccessLogAdapter
+  extends PgTableAdapterBase<Database>
+  implements TableAdapter<AccessLogColdStoreRow>
+{
   readonly db = 'orchestrator' as const;
   readonly table = 'access_log';
   readonly tenantColumn = 'org_id';
   readonly partitionColumn = 'created_at';
-  readonly config: ColdStoreTableConfig;
 
   constructor(
-    private readonly kdb: Kysely<Database>,
+    kdb: Kysely<Database>,
     private readonly instanceId: string,
     opts: AccessLogAdapterOptions = {},
   ) {
-    this.config = { ...DEFAULT_CONFIG, ...(opts.overrides ?? {}) };
+    super(kdb, ADVISORY_LOCK_NAMESPACE, DEFAULT_CONFIG, opts.overrides);
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
@@ -127,25 +128,6 @@ export class AccessLogAdapter implements TableAdapter<AccessLogColdStoreRow> {
     return Number.isFinite(n) ? n * APPROX_ROW_BYTES : 0;
   }
 
-  async withPartitionLock<T>(
-    args: { tenantId: string; partitionDate: string },
-    fn: () => Promise<T>,
-  ): Promise<T | null> {
-    const key = `${ADVISORY_LOCK_NAMESPACE}|${args.tenantId}|${args.partitionDate}`;
-    return await this.kdb.connection().execute(async (conn) => {
-      const lockRes = await sql<{ locked: boolean }>`
-        SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
-      `.execute(conn);
-      const locked = lockRes.rows[0]?.locked === true;
-      if (!locked) return null;
-      try {
-        return await fn();
-      } finally {
-        await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn).catch(() => undefined);
-      }
-    });
-  }
-
   async *selectEligible(args: {
     tenantId: string;
     partitionDate: string;
@@ -189,8 +171,8 @@ export class AccessLogAdapter implements TableAdapter<AccessLogColdStoreRow> {
 
   decodeRow(line: string): AccessLogColdStoreRow {
     const parsed = JSON.parse(line) as AccessLogColdStoreRow;
-    coerceDate(parsed, 'created_at');
-    coerceDate(parsed, 'archived_at');
+    PgTableAdapterBase.coerceDate(parsed, 'created_at');
+    PgTableAdapterBase.coerceDate(parsed, 'archived_at');
     return parsed;
   }
 
@@ -353,12 +335,5 @@ export class AccessLogAdapter implements TableAdapter<AccessLogColdStoreRow> {
         })
         .execute();
     });
-  }
-}
-
-function coerceDate<T>(parsed: T, field: keyof T): void {
-  const v = (parsed as unknown as Record<string, unknown>)[field as string];
-  if (typeof v === 'string') {
-    (parsed as unknown as Record<string, unknown>)[field as string] = new Date(v);
   }
 }

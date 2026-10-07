@@ -17,7 +17,6 @@ import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
 import type {
   AccessLogAction,
-  AccessLogOutcome,
   AccessLogTargetType,
   ActorPrincipal,
   DashboardRunDetailRequest,
@@ -106,7 +105,8 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
-import { runDetached } from '../helpers/run-detached.js';
+import { DashboardAccessRecorder } from '../ws/dashboard-access.js';
+import { decodeCursor, encodeCursor } from './cursor.js';
 
 const logger = createLogger({ prefix: 'dashboard-handler' });
 
@@ -117,7 +117,7 @@ interface DashboardHandlerDeps {
    * The orchestrator's own provenance issuer (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`)
    * when it owns signing. Surfaced on attestations-list responses so the Platform
    * returns it as `trustedIssuer` — the dashboard / CLI verify against the
-   * orchestrator that actually signed the bundles, not the Platform's own issuer.
+   * orchestrator that signed the bundles.
    */
   provenanceSigningIssuer?: string | null;
   /**
@@ -238,6 +238,7 @@ export class DashboardHandler {
   private readonly send: (msg: unknown) => void;
   private readonly orchestratorId: string | undefined;
   private readonly accessLog: AccessLogWriter | undefined;
+  private readonly access: DashboardAccessRecorder;
   private orgId: string | null;
   private routingKey: string | null;
   private readonly onRerun: DashboardHandlerDeps['onRerun'];
@@ -258,6 +259,11 @@ export class DashboardHandler {
     this.send = deps.send;
     this.orchestratorId = deps.orchestratorId;
     this.accessLog = deps.accessLog;
+    this.access = new DashboardAccessRecorder(
+      deps.accessLog,
+      () => ({ orgId: this.orgId, routingKey: this.routingKey }),
+      logger,
+    );
     this.orgId = deps.orgId ?? null;
     this.routingKey = deps.routingKey ?? null;
     this.onRerun = deps.onRerun;
@@ -273,7 +279,7 @@ export class DashboardHandler {
    * Update the bound orgId + routingKey. Called from server.ts after resolving
    * the single tenant org from the `sources` / `generic_webhook_sources` table.
    *
-   * NOTE: this binding is the **fallback** for `recordAccess`. Run-targeted
+   * NOTE: this binding is the **fallback** access_log scope. Run-targeted
    * handlers resolve the run-owning org per-request via `resolveOrgForRun`;
    * the bound pair is consulted only when the per-target lookup yields no
    * result (e.g. cold-archived run, deleted source). On a multi-tenant
@@ -394,7 +400,7 @@ export class DashboardHandler {
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           action,
@@ -408,43 +414,6 @@ export class DashboardHandler {
       }
       throw err;
     }
-  }
-
-  /**
-   * Write an access_log row for a handler invocation. The caller resolves
-   * the run-owning org via `resolveOrgForRun` (or the registration / event-
-   * log equivalents) and threads it in here so each row carries the org
-   * that owns the target — not the handler-bound (multi-tenant: non-
-   * deterministic) pair. Best-effort; the writer swallows failures.
-   */
-  private recordAccess(
-    ctx: { orgId: string | null; routingKey: string | null },
-    actor: ActorPrincipal,
-    action: AccessLogAction,
-    target: { type: AccessLogTargetType; id: string } | null,
-    requestId: string | null,
-    outcome: AccessLogOutcome,
-    errorMessage?: string | null,
-  ): void {
-    const accessLog = this.accessLog;
-    if (!accessLog) return;
-    runDetached(
-      logger,
-      'Access log write',
-      () =>
-        accessLog.record({
-          orgId: ctx.orgId,
-          routingKey: ctx.routingKey,
-          actor,
-          action,
-          target,
-          requestId,
-          source: 'platform_proxy',
-          outcome,
-          errorMessage: errorMessage ?? null,
-        }),
-      { requestId },
-    );
   }
 
   /**
@@ -619,7 +588,7 @@ export class DashboardHandler {
           runId: msg.runId,
           errors: validated.error.issues,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'run.detail.read',
@@ -637,7 +606,7 @@ export class DashboardHandler {
         return;
       }
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.detail.read',
@@ -659,7 +628,7 @@ export class DashboardHandler {
         error: toErrorMessage(err),
       });
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.detail.read',
@@ -700,7 +669,7 @@ export class DashboardHandler {
       ]);
       const ctx = this.contextOrFallback(resolved);
       const result = detail ? mapToAgentRunResult(detail) : null;
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.structured.read',
@@ -728,7 +697,7 @@ export class DashboardHandler {
         durationMs: Date.now() - start,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.structured.read',
@@ -903,7 +872,7 @@ export class DashboardHandler {
 
       // Unbound orchestrator (no org resolved yet) — nothing to scope to.
       if (!this.orgId) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['runs.list.read'],
@@ -923,7 +892,7 @@ export class DashboardHandler {
       // an unbounded query.
       const routingKeys = await this.resolveOrgRoutingKeys(this.orgId);
       if (routingKeys.length === 0) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['runs.list.read'],
@@ -965,7 +934,7 @@ export class DashboardHandler {
 
       // Cursor: { createdAt: ISO, runId }. Stable on the (created_at, run_id) pair.
       if (msg.cursor) {
-        const cur = decodeRunsCursor(msg.cursor);
+        const cur = decodeCursor(msg.cursor, ['createdAt', 'runId']);
         if (cur) {
           query = query.where((eb) =>
             eb.or([
@@ -1014,10 +983,10 @@ export class DashboardHandler {
       const lastRow = pageRows[pageRows.length - 1];
       const nextCursor =
         hasMore && lastRow
-          ? encodeRunsCursor({ createdAt: lastRow.created_at.toISOString(), runId: lastRow.run_id })
+          ? encodeCursor({ createdAt: lastRow.created_at.toISOString(), runId: lastRow.run_id })
           : undefined;
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['runs.list.read'],
@@ -1035,7 +1004,7 @@ export class DashboardHandler {
       logger.error('Error handling dashboard.runs.list', {
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['runs.list.read'],
@@ -1089,7 +1058,7 @@ export class DashboardHandler {
     try {
       // Unbound orchestrator (no org resolved yet) — nothing to scope to.
       if (!this.orgId) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['runs.filters.read'],
@@ -1105,7 +1074,7 @@ export class DashboardHandler {
       // an unbounded query.
       const routingKeys = await this.resolveOrgRoutingKeys(this.orgId);
       if (routingKeys.length === 0) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['runs.filters.read'],
@@ -1140,7 +1109,7 @@ export class DashboardHandler {
         .map((routingKey) => ({ routingKey, name: identities.get(routingKey)?.name ?? null }))
         .sort((a, b) => a.routingKey.localeCompare(b.routingKey));
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['runs.filters.read'],
@@ -1162,7 +1131,7 @@ export class DashboardHandler {
       logger.error('Error handling dashboard.runs.filters', {
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['runs.filters.read'],
@@ -1193,7 +1162,7 @@ export class DashboardHandler {
     const ctx = { orgId: this.orgId, routingKey: this.routingKey };
     try {
       if (!this.orgId) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['sources.list.read'],
@@ -1241,7 +1210,7 @@ export class DashboardHandler {
         })),
       ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['sources.list.read'],
@@ -1252,7 +1221,7 @@ export class DashboardHandler {
       return { type: 'dashboard.sources.list.response', requestId: msg.requestId, sources };
     } catch (err) {
       logger.error('Error handling dashboard.sources.list', { error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['sources.list.read'],
@@ -1326,7 +1295,7 @@ export class DashboardHandler {
         revoked: r.revoked,
       }));
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['admin_tokens.list.read'],
@@ -1337,7 +1306,7 @@ export class DashboardHandler {
       return { type: 'dashboard.admin-tokens.list.response', requestId: msg.requestId, tokens };
     } catch (err) {
       logger.error('Error handling dashboard.admin-tokens.list', { error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['admin_tokens.list.read'],
@@ -1382,7 +1351,7 @@ export class DashboardHandler {
             .executeTakeFirst();
 
       if (!step) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'step.logs.read',
@@ -1402,7 +1371,7 @@ export class DashboardHandler {
       }
 
       if (!step.log_path) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'step.logs.read',
@@ -1451,7 +1420,7 @@ export class DashboardHandler {
           stepIndex: msg.stepIndex,
           errors: validated.error.issues,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'step.logs.read',
@@ -1471,7 +1440,7 @@ export class DashboardHandler {
         return;
       }
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'step.logs.read',
@@ -1495,7 +1464,7 @@ export class DashboardHandler {
         error: toErrorMessage(err),
       });
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'step.logs.read',
@@ -1553,7 +1522,7 @@ export class DashboardHandler {
    * Handle a dashboard.attestations.list request: list the run's provenance
    * attestations, inlining each stored bundle from object storage so the
    * dashboard verifies it client-side. Mirrors `handleStepLogs` (per-run org
-   * resolution + `recordAccess` + `send`). Rows whose bundle can't be read are
+   * resolution + `access.recordIn` + `send`). Rows whose bundle can't be read are
    * skipped (best-effort) rather than failing the whole list.
    */
   async handleAttestationsList(msg: DashboardAttestationsListRequest): Promise<void> {
@@ -1561,7 +1530,7 @@ export class DashboardHandler {
     const target = { type: 'run' as const, id: msg.runId };
     try {
       if (!this.provenanceStorage) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'attestations.read',
@@ -1597,7 +1566,7 @@ export class DashboardHandler {
           runId: msg.runId,
           errors: validated.error.issues,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'attestations.read',
@@ -1615,14 +1584,14 @@ export class DashboardHandler {
         return;
       }
 
-      this.recordAccess(ctx, msg.actor, 'attestations.read', target, msg.requestId, 'allowed');
+      this.access.recordIn(ctx, msg.actor, 'attestations.read', target, msg.requestId, 'allowed');
       this.send(validated.data);
     } catch (err) {
       logger.error('Error handling dashboard.attestations.list', {
         runId: msg.runId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'attestations.read',
@@ -1643,7 +1612,7 @@ export class DashboardHandler {
   /**
    * Handle a dashboard.artifacts.list request: list the run's named artifacts
    * with a presigned GET per entry. Mirrors `handleAttestationsList` (per-run
-   * org resolution + `recordAccess` + `send`). Org is resolved server-side from
+   * org resolution + `access.recordIn` + `send`). Org is resolved server-side from
    * the run row, never the wire, so the listing cannot cross tenants.
    */
   async handleArtifactsList(msg: DashboardArtifactsListRequest): Promise<void> {
@@ -1651,7 +1620,7 @@ export class DashboardHandler {
     const target = { type: 'run' as const, id: msg.runId };
     try {
       if (!this.artifactStore || !ctx.orgId) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'artifacts.read',
@@ -1684,7 +1653,7 @@ export class DashboardHandler {
           runId: msg.runId,
           errors: validated.error.issues,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'artifacts.read',
@@ -1702,14 +1671,14 @@ export class DashboardHandler {
         return;
       }
 
-      this.recordAccess(ctx, msg.actor, 'artifacts.read', target, msg.requestId, 'allowed');
+      this.access.recordIn(ctx, msg.actor, 'artifacts.read', target, msg.requestId, 'allowed');
       this.send(validated.data);
     } catch (err) {
       logger.error('Error handling dashboard.artifacts.list', {
         runId: msg.runId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'artifacts.read',
@@ -1923,7 +1892,7 @@ export class DashboardHandler {
         logger.error('Outgoing dashboard.attestations.list.all response validation failed', {
           errors: validated.error.issues,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['attestations.read'],
@@ -1943,7 +1912,7 @@ export class DashboardHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['attestations.read'],
@@ -1956,7 +1925,7 @@ export class DashboardHandler {
       logger.error('Error handling dashboard.attestations.list.all', {
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['attestations.read'],
@@ -2004,7 +1973,7 @@ export class DashboardHandler {
         throw new Error('deferred-attestation retry is not available on this orchestrator');
       }
       const result = await this.retryAttestations(msg.runId ? { runId: msg.runId } : {});
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['attestations.read'],
@@ -2020,7 +1989,7 @@ export class DashboardHandler {
       });
     } catch (err) {
       logger.error('Error handling dashboard.attestation.retry', { error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['attestations.read'],
@@ -2096,13 +2065,14 @@ export class DashboardHandler {
         type: 'dashboard.attestation.get.response',
         requestId: msg.requestId,
         attestation,
+        trustedIssuer: this.provenanceSigningIssuer,
       });
       if (!validated.success) {
         logger.error('Outgoing dashboard.attestation.get response validation failed', {
           attestationId: msg.attestationId,
           errors: validated.error.issues,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           AccessLogActionEnum.enum['attestations.read'],
@@ -2119,7 +2089,7 @@ export class DashboardHandler {
         });
         return;
       }
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['attestations.read'],
@@ -2133,7 +2103,7 @@ export class DashboardHandler {
         attestationId: msg.attestationId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['attestations.read'],
@@ -2182,7 +2152,7 @@ export class DashboardHandler {
           logStorageBackend: backend,
           orchestratorId: this.orchestratorId,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'run.payload.read',
@@ -2210,7 +2180,7 @@ export class DashboardHandler {
           logStorageBackend: backend,
           bytes: result.data.length,
         });
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'run.payload.read',
@@ -2233,7 +2203,7 @@ export class DashboardHandler {
         bytes: result.data.length,
         orchestratorId: this.orchestratorId,
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.payload.read',
@@ -2255,7 +2225,7 @@ export class DashboardHandler {
         error: toErrorMessage(err),
       });
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.payload.read',
@@ -2303,7 +2273,7 @@ export class DashboardHandler {
 
       const allLines = [...orchLines, ...provLines];
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.orch_logs.read',
@@ -2318,7 +2288,7 @@ export class DashboardHandler {
         totalLines: allLines.length,
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.orch_logs.read',
@@ -2370,7 +2340,7 @@ export class DashboardHandler {
         msg.routingKey,
       );
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.rerun',
@@ -2389,7 +2359,7 @@ export class DashboardHandler {
         error: toErrorMessage(err),
       });
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.rerun',
@@ -2433,7 +2403,7 @@ export class DashboardHandler {
         msg.force,
       );
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.cancel',
@@ -2467,7 +2437,7 @@ export class DashboardHandler {
         });
       }
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.cancel',
@@ -2541,7 +2511,7 @@ export class DashboardHandler {
 
       // Cursor: { receivedAt: ISO, id: UUID }. Stable on (received_at, id) pair.
       if (msg.cursor) {
-        const cur = decodeEventLogCursor(msg.cursor);
+        const cur = decodeCursor(msg.cursor, ['receivedAt', 'id']);
         if (cur) {
           query = query.where((eb) =>
             eb.or([
@@ -2564,13 +2534,13 @@ export class DashboardHandler {
       const items: EventLogListItem[] = pageRows.map((r) => rowToListItem(r));
       const nextCursor =
         hasMore && pageRows.length > 0
-          ? encodeEventLogCursor({
+          ? encodeCursor({
               receivedAt: pageRows[pageRows.length - 1].received_at.toISOString(),
               id: pageRows[pageRows.length - 1].id,
             })
           : null;
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.list.read',
@@ -2589,7 +2559,7 @@ export class DashboardHandler {
         orgId: msg.orgId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.list.read',
@@ -2651,7 +2621,7 @@ export class DashboardHandler {
         failed: Number(row.failed),
       };
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['event_log.list.read'],
@@ -2669,7 +2639,7 @@ export class DashboardHandler {
         orgId: msg.orgId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         AccessLogActionEnum.enum['event_log.list.read'],
@@ -2730,7 +2700,7 @@ export class DashboardHandler {
         cursor: msg.cursor,
       });
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'access_log.list.read',
@@ -2749,7 +2719,7 @@ export class DashboardHandler {
         orgId: msg.orgId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'access_log.list.read',
@@ -2792,7 +2762,7 @@ export class DashboardHandler {
       });
 
       if (!row) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'event_log.detail.read',
@@ -2811,7 +2781,7 @@ export class DashboardHandler {
 
       const item = rowToListItem(row);
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.detail.read',
@@ -2830,7 +2800,7 @@ export class DashboardHandler {
         deliveryId: msg.deliveryId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.detail.read',
@@ -2893,7 +2863,7 @@ export class DashboardHandler {
         deliveryId: msg.deliveryId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.payload.read',
@@ -2907,7 +2877,7 @@ export class DashboardHandler {
     }
 
     if (!row) {
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.payload.read',
@@ -2921,7 +2891,7 @@ export class DashboardHandler {
     }
 
     if (row.payload_omitted || !row.payload_key) {
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.payload.read',
@@ -2950,7 +2920,7 @@ export class DashboardHandler {
         payloadKey: row.payload_key,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_log.payload.read',
@@ -2963,7 +2933,7 @@ export class DashboardHandler {
       return;
     }
 
-    this.recordAccess(
+    this.access.recordIn(
       ctx,
       msg.actor,
       'event_log.payload.read',
@@ -3061,7 +3031,7 @@ export class DashboardHandler {
 
       const nextCursor = items.length === limit ? (items[items.length - 1].dlqAt ?? null) : null;
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_dlq.list.read',
@@ -3080,7 +3050,7 @@ export class DashboardHandler {
         orgId: msg.orgId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_dlq.list.read',
@@ -3169,7 +3139,7 @@ export class DashboardHandler {
 
       const existing = await this.eventStore.getById(msg.eventId);
       if (!existing || !existing.dlqAt) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'event_dlq.retry',
@@ -3207,7 +3177,7 @@ export class DashboardHandler {
         });
       }
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_dlq.retry',
@@ -3226,7 +3196,7 @@ export class DashboardHandler {
         eventId: msg.eventId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_dlq.retry',
@@ -3275,7 +3245,7 @@ export class DashboardHandler {
 
       const existing = await this.eventStore.getById(msg.eventId);
       if (!existing || !existing.dlqAt) {
-        this.recordAccess(
+        this.access.recordIn(
           ctx,
           msg.actor,
           'event_dlq.discard',
@@ -3302,7 +3272,7 @@ export class DashboardHandler {
         return;
       }
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_dlq.discard',
@@ -3321,7 +3291,7 @@ export class DashboardHandler {
         eventId: msg.eventId,
         error: toErrorMessage(err),
       });
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'event_dlq.discard',
@@ -3352,7 +3322,7 @@ export class DashboardHandler {
         msg.requestId,
       );
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.manual_schedule',
@@ -3371,7 +3341,7 @@ export class DashboardHandler {
         error: toErrorMessage(err),
       });
 
-      this.recordAccess(
+      this.access.recordIn(
         ctx,
         msg.actor,
         'run.manual_schedule',
@@ -3633,42 +3603,6 @@ function rowToListItem(r: {
     payloadSizeBytes: r.payload_size_bytes,
     payloadHash: r.payload_hash,
   };
-}
-
-/** Encode a pagination cursor as base64url(JSON({receivedAt, id})). */
-function encodeEventLogCursor(c: { receivedAt: string; id: string }): string {
-  return Buffer.from(JSON.stringify(c), 'utf-8').toString('base64url');
-}
-
-function decodeEventLogCursor(s: string): { receivedAt: string; id: string } | null {
-  try {
-    const decoded = Buffer.from(s, 'base64url').toString('utf-8');
-    const parsed = JSON.parse(decoded) as { receivedAt?: unknown; id?: unknown };
-    if (typeof parsed.receivedAt === 'string' && typeof parsed.id === 'string') {
-      return { receivedAt: parsed.receivedAt, id: parsed.id };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/** Encode a runs-list pagination cursor as base64url(JSON({createdAt, runId})). */
-function encodeRunsCursor(c: { createdAt: string; runId: string }): string {
-  return Buffer.from(JSON.stringify(c), 'utf-8').toString('base64url');
-}
-
-function decodeRunsCursor(s: string): { createdAt: string; runId: string } | null {
-  try {
-    const decoded = Buffer.from(s, 'base64url').toString('utf-8');
-    const parsed = JSON.parse(decoded) as { createdAt?: unknown; runId?: unknown };
-    if (typeof parsed.createdAt === 'string' && typeof parsed.runId === 'string') {
-      return { createdAt: parsed.createdAt, runId: parsed.runId };
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 /** The execution_runs columns `handleRunsList` projects for each page row. */

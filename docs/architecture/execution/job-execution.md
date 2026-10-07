@@ -265,7 +265,7 @@ log.chunk {
   messageId, runId, jobId, stepIndex,
   lines: string[],
   timestamp,
-  stream?: 'stdout' | 'stderr'   // absent is read as stdout
+  stream: 'stdout' | 'stderr'
 }
 ```
 

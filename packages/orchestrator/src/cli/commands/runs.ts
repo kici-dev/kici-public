@@ -28,8 +28,9 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
 import { ExecutionJobStatus, type AgentStepLogs } from '@kici-dev/engine';
+import { cliAction } from './shared/cli-action.js';
+import { renderTable } from './shared/table.js';
 
 /** Run summary shape returned by GET /api/v1/admin/runs. */
 interface RunSummaryDTO {
@@ -189,26 +190,6 @@ interface AgentRunResultDTO {
   }>;
 }
 
-/**
- * Render an aligned ASCII table.
- * Same pattern as workflow.ts — deliberately no cli-table dependency.
- */
-function renderTable(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
-
-  const fmtRow = (cells: string[]) =>
-    cells
-      .map((c, i) => (c ?? '').padEnd(widths[i]!))
-      .join('  ')
-      .trimEnd();
-
-  const lines: string[] = [];
-  lines.push(fmtRow(headers));
-  lines.push(widths.map((w) => '-'.repeat(w)).join('  '));
-  for (const r of rows) lines.push(fmtRow(r));
-  return lines.join('\n');
-}
-
 /** Format duration in ms to human-readable string. */
 function formatDuration(ms: number | null): string {
   if (ms == null) return '-';
@@ -284,8 +265,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     .option('--limit <n>', 'Max results (default 20, max 100)', '20')
     .option('--offset <n>', 'Skip first N results', '0')
     .option('--json', 'Emit raw JSON instead of a table')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         if (opts.count) {
           const response = await getClient().countRuns({
             status: opts.status,
@@ -348,11 +329,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         console.log(
           `Showing ${data.runs.length} of ${data.total} (offset ${data.offset}, limit ${data.limit})`,
         );
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── runs show <runId> ──────────────────────────────────────────
   // The orchestrator splits run detail across two endpoints:
@@ -364,8 +342,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     .command('show <runId>')
     .description('Show run detail with jobs and steps')
     .option('--json', 'Emit raw JSON instead of formatted output')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         const client = getClient();
         const [runRespRaw, jobsRespRaw] = await Promise.all([
           client.getRun(runId),
@@ -459,11 +437,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             console.log(renderTable(stepHeaders, stepRows));
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── runs structured <runId> ────────────────────────────────────
   // Machine-first provenance-tagged run result. --json is lossless (untrusted
@@ -472,8 +447,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     .command('structured <runId>')
     .description('Show the provenance-tagged structured run result (agent read path; /structured)')
     .option('--json', 'Emit the raw AgentRunResult (untrusted envelopes preserved)')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         const result = (await getClient().getRunStructured(runId)) as unknown as AgentRunResultDTO;
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
@@ -519,11 +494,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           ]);
           console.log(renderTable(stepHeaders, stepRows));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── runs jobs <runId> ──────────────────────────────────────────
   runs
@@ -531,8 +503,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     .description('List jobs for a run (admin API: /api/v1/admin/runs/:runId/jobs)')
     .option('--include-steps', 'Embed step list inside each job (default false)')
     .option('--json', 'Emit raw JSON instead of a table')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         const response = (await getClient().getRunJobs(runId, {
           includeSteps: Boolean(opts.includeSteps),
         })) as unknown as JobsResponse;
@@ -575,11 +547,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             console.log(renderTable(stepHeaders, stepRows));
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── runs logs <runId> ──────────────────────────────────────────
   // The only kici-admin path to a step's log lines. It reads the admin route
@@ -598,8 +567,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     .option('--limit <n>', 'Max lines to return (default 500, server caps at 2000)', '500')
     .option('--cursor <c>', 'Line-offset cursor from a previous page')
     .option('--json', 'Emit raw JSON instead of plain lines')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         const params = new URLSearchParams({ limit: String(opts.limit) });
         if (opts.cursor) params.set('cursor', String(opts.cursor));
         const path =
@@ -620,19 +589,16 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         }
         const note = emptyStepLogNote(parseInt(String(opts.step), 10), response);
         if (note) console.error(note);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── runs ephemeral-key <runId> ─────────────────────────────────
   runs
     .command('ephemeral-key <runId>')
     .description('Show whether the run-ephemeral key has been scrubbed yet')
     .option('--json', 'Emit raw JSON instead of plain text')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         const response = (await getClient().getRunEphemeralKey(
           runId,
         )) as unknown as EphemeralKeyResponse;
@@ -647,11 +613,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           console.log(`exists: false`);
           console.log(`created_at: -`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── runs secret-outputs <runId> ────────────────────────────────
   runs
@@ -663,8 +626,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
       'Decrypt and print plaintext values. Audited with actor=secret-outputs.reveal; requires secret.reveal permission',
     )
     .option('--json', 'Emit raw JSON instead of a table')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         if (opts.reveal) {
           process.stderr.write(
             '⚠  --reveal will decrypt secret values; this call is recorded in secret_audit_log.\n',
@@ -694,9 +657,6 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             : [o.jobId, o.outputKey, String(o.masked), o.createdAt],
         );
         console.log(renderTable(headers, rows));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

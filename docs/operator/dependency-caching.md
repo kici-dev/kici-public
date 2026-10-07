@@ -164,8 +164,9 @@ scalers:
         image: kici-agent:latest
         # Build agents need npm available (ships with Node.js)
         resources: # required for a warm pool — the size of each ready agent
-          cpus: 2
-          memory: '4g'
+          limits:
+            cpus: 2
+            memory: '4g'
     warmPool:
       enabled: true
       size: 1
@@ -183,8 +184,9 @@ scalers:
       - labels: ['default']
         image: kici-agent:latest
         resources: # required for a warm pool — the size of each ready agent
-          cpus: 2
-          memory: '4g'
+          limits:
+            cpus: 2
+            memory: '4g'
     warmPool:
       enabled: true
       size: 1

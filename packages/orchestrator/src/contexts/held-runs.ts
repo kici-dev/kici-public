@@ -14,7 +14,6 @@ import {
   HoldScope,
   HoldType,
   TriggerSource,
-  persistedHoldTypeSpellings,
 } from '@kici-dev/engine';
 import type { Database, HeldRun, HeldRunApproval } from '../db/types.js';
 
@@ -620,19 +619,16 @@ export class HeldRunStore {
    * incidental: `expireOverdue` is not scope-filtered, so a released-but-not-yet-
    * resumed row would otherwise be expired out from under its resume.
    *
-   * The filter matches every persisted spelling of the timer hold type, so a row
-   * an un-upgraded orchestrator wrote as `wait_timer` still resumes rather than
-   * falling through to the expire-and-fail sweep. It deliberately does NOT
-   * filter on `hold_scope`: a job-scoped timer hold used to be excluded here,
-   * which left it with no release path at all — created, never released,
-   * eventually expired, its job never dispatched.
+   * The filter deliberately does NOT filter on `hold_scope`: a job-scoped timer
+   * hold used to be excluded here, which left it with no release path at all —
+   * created, never released, eventually expired, its job never dispatched.
    */
   async releaseDueWaitHolds(): Promise<ReleaseSignal[]> {
     const rows = await this.db
       .updateTable('held_runs')
       .set({ status: HeldRunStatus.Released, resolved_at: sql`now()` })
       .where('status', '=', HeldRunStatus.Pending)
-      .where('hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.timer))
+      .where('hold_type', '=', HoldType.enum.timer)
       .where('expires_at', '<', sql<Date>`now()`)
       .returningAll()
       .execute();
@@ -668,7 +664,7 @@ export class HeldRunStore {
       .innerJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
       .select(['held_runs.org_id as orgId', 'execution_runs.context as concurrencyGroup'])
       .where('held_runs.status', '=', HeldRunStatus.Pending)
-      .where('held_runs.hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.concurrency))
+      .where('held_runs.hold_type', '=', HoldType.enum.concurrency)
       .execute();
     return rows;
   }
@@ -690,7 +686,7 @@ export class HeldRunStore {
       .selectAll('held_runs')
       .where('held_runs.org_id', '=', orgId)
       .where('held_runs.status', '=', HeldRunStatus.Pending)
-      .where('held_runs.hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.concurrency))
+      .where('held_runs.hold_type', '=', HoldType.enum.concurrency)
       .where('execution_runs.context', '=', concurrencyGroup)
       .where('execution_runs.customer_id', '=', orgId)
       .orderBy('held_runs.created_at', 'asc')

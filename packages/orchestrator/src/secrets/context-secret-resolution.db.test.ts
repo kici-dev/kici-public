@@ -71,8 +71,7 @@ const pgSecretStore = {
     })),
   ],
   decryptValue: (_org: string, _scope: string, _key: string, value: string) => value,
-  // The system-scoped direct lookup by scope name: a job reference reaches it only
-  // through the deprecated same-named-scope fallback.
+  // The system-scoped direct lookup by scope name: a job reference never reaches it.
   getSecrets: async (_org: string, scope: string) =>
     scope in SECRETS_BY_SCOPE ? { DEPLOY_TOKEN: SECRETS_BY_SCOPE[scope] } : {},
 } as unknown as PgSecretStore;
@@ -202,20 +201,17 @@ describeDb('context secret resolution through the matched row (real Postgres)', 
     expect(await qualifiedSecret('deploy-prod')).toBe('from-fixed-context');
   });
 
-  it('still reads the same-named scope of an exact context that binds nothing (deprecated)', async () => {
-    // breaks-if-wrong: a reference whose secret sits in an unbound same-named scope stops resolving
-    expect(await qualifiedSecret('legacy-ci')).toBe('from-unbound-context-scope');
+  it('refuses a reference to an exact context that binds nothing, though its same-named scope holds the key', async () => {
+    // fails-when: the reference still reads the unbound scope named after the context
+    await expect(qualifiedSecret('legacy-ci')).rejects.toThrow(/Secret not found/);
   });
 
-  it('reads the same-named scope of an exact context whose bound scopes lack the key (deprecated)', async () => {
-    // fails-when: the fallback is limited to a context that binds no scope at all
-    expect(await qualifiedSecret('bound-ci')).toBe('from-bound-context-same-named-scope');
+  it('refuses a reference to a context whose bound scopes lack the key', async () => {
+    // fails-when: the same-named scope is read when the bound scopes miss the key
+    await expect(qualifiedSecret('bound-ci')).rejects.toThrow(/Secret not found/);
   });
 
-  it('never reads the same-named scope for a glob-matched context that binds nothing', async () => {
-    // fails-when: the fallback's name check is dropped — the matched row is 'preview-any', not
-    // 'preview-7', so that check alone refuses it here; the glob-type check is pinned by the
-    // job-secret-gate unit test for a glob row whose own name equals the reference
+  it('refuses a reference to a glob-matched context that binds nothing', async () => {
     await expect(qualifiedSecret('preview-7')).rejects.toThrow(/Secret not found/);
   });
 });

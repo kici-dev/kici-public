@@ -83,7 +83,7 @@ On success the output prints the **origin org** (the customer's public org id �
 kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-file>] [options]
 ```
 
-**Trust root:** `--trust-root` defaults to your **configured orchestrator** — the orchestrator you `kici login` against, which owns the provenance signing key and publishes its own JWKS (see [Which trust root do I use?](../provenance.md#which-trust-root-do-i-use)), so the common case needs no flag. When no orchestrator is configured, the default falls back to the hosted KiCI platform's provenance issuer so historical platform-signed bundles still verify. The verifier never trusts the issuer named inside the token; supplying it out-of-band is what prevents a forged bundle from self-attesting. To override the default, pass `--trust-root` in one of two forms:
+**Trust root:** `--trust-root` defaults to your **configured orchestrator**, the orchestrator URL in the `endpoint` field of the CLI config file (`~/.kici/config`). That orchestrator owns the provenance signing key and publishes its own JWKS (see [Which trust root do I use?](../provenance.md#which-trust-root-do-i-use)). `kici login` does not set `endpoint`; it records only the Platform endpoint. With no `endpoint` and no `--trust-root`, the command exits 1 and names both remedies. The verifier never trusts the issuer named inside the token; supplying it out-of-band is what prevents a forged bundle from self-attesting. To override the default, pass `--trust-root` in one of two forms:
 
 - **Online — an HTTPS issuer URL.** The verifier fetches `<url>/.well-known/openid-configuration`, reads its `issuer` and `jwks_uri`, and fetches the JWKS. The token's `iss` is pinned to the discovery document's `issuer`.
 - **Offline — a self-contained trust-root file.** A local JSON file with the issuer and JWKS inlined, so no network access is needed (air-gapped verification):
@@ -584,11 +584,11 @@ Synopsis: `kici verify-attestation [artifact] [options]`
 
 **Options**
 
-| Option                       | Default | Description                                                                                                                          |
-| ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `--bundle <path>`            |         | Path or URL to the attestation bundle JSON                                                                                           |
-| `--trust-root <url-or-file>` |         | Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator, else the hosted KiCI platform) |
-| `--audience <aud>`           |         | Expected token audience                                                                                                              |
-| `--json`                     | `false` | Output structured JSON result                                                                                                        |
+| Option                       | Default | Description                                                                                           |
+| ---------------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
+| `--bundle <path>`            |         | Path or URL to the attestation bundle JSON                                                            |
+| `--trust-root <url-or-file>` |         | Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator) |
+| `--audience <aud>`           |         | Expected token audience                                                                               |
+| `--json`                     | `false` | Output structured JSON result                                                                         |
 
 <!-- END GENERATED: kici-notifications-and-diagnostics -->

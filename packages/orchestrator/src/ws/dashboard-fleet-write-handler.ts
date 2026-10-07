@@ -8,7 +8,7 @@
  *
  * Mirrors `DashboardBackendsHandler`: a policy gate (`enforcePolicy`) that
  * short-circuits a disabled op with a structured `operation_disabled` envelope
- * plus a `denied` access-log row, and a `recordAccess` helper that attributes
+ * plus a `denied` access-log row, and a `DashboardAccessRecorder` that attributes
  * every outcome to the calling actor.
  *
  * The handler never passes a write authority, so the roster store applies the
@@ -20,7 +20,6 @@
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type {
   AccessLogAction,
-  AccessLogOutcome,
   AccessLogTargetType,
   ActorPrincipal,
   FleetHostDeclareRequest,
@@ -40,7 +39,7 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
-import { runDetached } from '../helpers/run-detached.js';
+import { DashboardAccessRecorder } from './dashboard-access.js';
 
 const logger = createLogger({ prefix: 'dashboard-fleet-write-handler' });
 
@@ -70,13 +69,17 @@ export class DashboardFleetWriteHandler {
   private readonly deps: DashboardFleetWriteHandlerDeps;
   private orgId: string | null;
   private routingKey: string | null;
-  private readonly accessLog: AccessLogWriter | undefined;
+  private readonly access: DashboardAccessRecorder;
 
   constructor(deps: DashboardFleetWriteHandlerDeps) {
     this.deps = deps;
     this.orgId = deps.orgId ?? null;
     this.routingKey = deps.routingKey ?? null;
-    this.accessLog = deps.accessLog;
+    this.access = new DashboardAccessRecorder(
+      deps.accessLog,
+      () => ({ orgId: this.orgId, routingKey: this.routingKey }),
+      logger,
+    );
   }
 
   /**
@@ -109,7 +112,7 @@ export class DashboardFleetWriteHandler {
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           action,
           target,
@@ -125,39 +128,6 @@ export class DashboardFleetWriteHandler {
   }
 
   /**
-   * Write an access_log row for a handler invocation. Best-effort; the writer
-   * swallows failures.
-   */
-  private recordAccess(
-    actor: ActorPrincipal,
-    action: AccessLogAction,
-    target: { type: AccessLogTargetType; id: string } | null,
-    requestId: string | null,
-    outcome: AccessLogOutcome,
-    errorMessage?: string | null,
-  ): void {
-    const accessLog = this.accessLog;
-    if (!accessLog) return;
-    runDetached(
-      logger,
-      'Access log write',
-      () =>
-        accessLog.record({
-          orgId: this.orgId,
-          routingKey: this.routingKey,
-          actor,
-          action,
-          target,
-          requestId,
-          source: 'platform_proxy',
-          outcome,
-          errorMessage: errorMessage ?? null,
-        }),
-      { requestId },
-    );
-  }
-
-  /**
    * Answer a write the roster store refused for the Platform's authority: a
    * `denied` access-log row with `<code>:<detail>`, and the refusal code in the
    * response `error` field (plus the reserved keys for `reserved_property`).
@@ -168,7 +138,7 @@ export class DashboardFleetWriteHandler {
     responseType: string,
     err: HostWriteRefusedError,
   ): void {
-    this.recordAccess(
+    this.access.record(
       msg.actor,
       action,
       { type: 'fleet', id: msg.agentId },
@@ -222,7 +192,7 @@ export class DashboardFleetWriteHandler {
         hostname: msg.hostname,
         properties: msg.properties,
       });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'fleet.host.declare',
         { type: 'fleet', id: msg.agentId },
@@ -241,7 +211,7 @@ export class DashboardFleetWriteHandler {
         return;
       }
       logger.error('Failed to declare host', { agentId: msg.agentId, error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'fleet.host.declare',
         { type: 'fleet', id: msg.agentId },
@@ -272,7 +242,7 @@ export class DashboardFleetWriteHandler {
     try {
       // No authority: the store's Platform default removes only unconfirmed hosts.
       const deleted = await this.deps.rosterStore.removeStatic(msg.agentId);
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'fleet.host.remove',
         { type: 'fleet', id: msg.agentId },
@@ -292,7 +262,7 @@ export class DashboardFleetWriteHandler {
         return;
       }
       logger.error('Failed to remove host', { agentId: msg.agentId, error: toErrorMessage(err) });
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'fleet.host.remove',
         { type: 'fleet', id: msg.agentId },

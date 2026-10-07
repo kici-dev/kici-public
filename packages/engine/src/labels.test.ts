@@ -18,8 +18,6 @@ import {
   isSelfReportedLabel,
   AGENT_FEATURE_LABELS,
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
-  derivePlatformTaints,
-  PLATFORM_TAINT_LABELS,
   ScalerOs,
   ScalerArch,
   scalerPlatformSchema,
@@ -367,34 +365,6 @@ describe('isSelfReportedLabel', () => {
   it('does NOT treat user labels as self-reported', () => {
     expect(isSelfReportedLabel('linux')).toBe(false);
     expect(isSelfReportedLabel('container')).toBe(false);
-  });
-});
-
-describe('derivePlatformTaints', () => {
-  it('taints a windows bare-metal pool with windows', () => {
-    expect(derivePlatformTaints(['windows', 'bare-metal'])).toEqual(['windows']);
-  });
-  it('taints a macos pool with its os labels', () => {
-    expect(derivePlatformTaints(['macos', 'darwin', 'bare-metal']).sort()).toEqual([
-      'darwin',
-      'macos',
-    ]);
-  });
-  it('taints an arm64 linux pool with arm64 only (linux is default)', () => {
-    expect(derivePlatformTaints(['arm64', 'linux', 'bare-metal'])).toEqual(['arm64']);
-  });
-  it('does not taint a linux/x64 pool', () => {
-    expect(derivePlatformTaints(['linux', 'bare-metal'])).toEqual([]);
-    expect(derivePlatformTaints(['bare-metal'])).toEqual([]);
-  });
-  it('is case-insensitive and de-duplicates', () => {
-    expect(derivePlatformTaints(['Windows', 'WINDOWS', 'bare-metal'])).toEqual(['windows']);
-  });
-  it('excludes the defaults from the taint set', () => {
-    expect(PLATFORM_TAINT_LABELS.has('linux')).toBe(false);
-    expect(PLATFORM_TAINT_LABELS.has('x64')).toBe(false);
-    expect(PLATFORM_TAINT_LABELS.has('amd64')).toBe(false);
-    expect(PLATFORM_TAINT_LABELS.has('windows')).toBe(true);
   });
 });
 

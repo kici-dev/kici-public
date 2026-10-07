@@ -13,8 +13,7 @@ import type { Kysely } from 'kysely';
 import type pg from 'pg';
 import { runMigrations, getMigrationStatus, migrateTo, withMigrationPool } from '../db/migrator.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
-import type { Role } from '../secrets/rbac.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-db' });
 
@@ -41,26 +40,13 @@ async function onMigrationPool<T>(
   return withMigrationPool(deps.databaseUrl, fn);
 }
 
-type AdminDbEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
-export function createDbRoutes(deps: DbRouteDeps): Hono<AdminDbEnv> {
-  const app = new Hono<AdminDbEnv>();
+export function createDbRoutes(deps: DbRouteDeps): Hono<AdminEnv> {
+  const app = createAdminApp(logger);
 
   // DB migrations are orchestrator-wide; routing-key tokens have no
   // legitimate use here.
-  app.use('/db/*', async (c, next) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
-    await next();
-  });
+  app.use('/db/*', requireUnscoped);
 
-  // POST /api/v1/admin/db/migrate -- run pending migrations
   app.post('/db/migrate', async (c) => {
     try {
       const results = await onMigrationPool(deps, runMigrations);
@@ -101,7 +87,6 @@ export function createDbRoutes(deps: DbRouteDeps): Hono<AdminDbEnv> {
     }
   });
 
-  // GET /api/v1/admin/db/migrate/status -- show migration status
   app.get('/db/migrate/status', async (c) => {
     try {
       const status = await getMigrationStatus(deps);

@@ -58,6 +58,7 @@ import { normalizeCacheSpecs, normalizeApproval } from '@kici-dev/sdk/internal';
 import type { ApprovalConfig } from '@kici-dev/sdk';
 import {
   SCHEMA_VERSION,
+  BREAKING_FLOOR,
   type LockFile,
   type LockSource,
   type LockWorkflow,
@@ -106,14 +107,12 @@ import {
 } from '../errors/index.js';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { resolveHashFiles } from './hash-files.js';
-import { lockMinReaderVersion } from './min-reader.js';
 
 /**
  * Courtesy compatibility warning for `kici compile`.
  *
- * `minReader` is the emitted lock's `minReaderVersion`: `BREAKING_FLOOR`, or
- * `GLOBAL_APPROVAL_MIN_READER` for a lock whose global workflow declares
- * `approval`. `version` is the schema version the compiler emits
+ * `minReader` is the emitted lock's `minReaderVersion` (`BREAKING_FLOOR`).
+ * `version` is the schema version the compiler emits
  * (`SCHEMA_VERSION`). When `minReader` reaches `version`, which happens only
  * while that constant is the newest schema version, orchestrators older than
  * `version` cannot read the lock, so return a one-line heads-up naming the
@@ -289,9 +288,8 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
   // Compute top-level content hash from the full lock file content (excluding the hash itself).
   // This hash changes only when workflows, triggers, jobs, or bundle hashes change.
   // minReaderVersion stamps the newest breaking version at emit time so a reader
-  // that predates a breaking change rejects the lock instead of mis-parsing it,
-  // raised when a global workflow's approval gate needs a reader that enforces it.
-  const minReaderVersion = lockMinReaderVersion(workflows);
+  // that predates a breaking change rejects the lock instead of mis-parsing it.
+  const minReaderVersion = BREAKING_FLOOR;
   const partial = {
     schemaVersion: SCHEMA_VERSION,
     minReaderVersion,

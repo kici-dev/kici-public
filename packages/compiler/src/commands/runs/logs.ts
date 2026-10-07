@@ -1,7 +1,7 @@
 /** kici runs logs — step logs for a run (replaces `kici status --logs`). */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
-import { JobKind, TERMINAL_RUN_STATES, type DashboardJobDetail } from '@kici-dev/engine';
+import { JobKind, TERMINAL_RUN_STATES, type DashboardJobDetail, sleep } from '@kici-dev/engine';
 import { DashboardClient, DashboardClientError } from '../../remote/dashboard-client.js';
 import { unwrapStoredLogLine } from '../../remote/output/streaming.js';
 import { colorStatus } from '../../remote/render.js';
@@ -44,8 +44,6 @@ function setupJsonKey(jobName: string): string {
  * job's setup lines, when it wrote any, under {@link setupJsonKey}.
  */
 type RunLogsJson = Record<string, string[]>;
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
 export async function runsLogsCommand(
   runId: string,
   options: RunsLogsOptions = {},

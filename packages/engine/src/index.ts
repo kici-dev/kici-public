@@ -25,10 +25,8 @@ export * from './protocol/messages/capabilities.js';
 
 // --- Protocol: Platform <-> Orchestrator messages ---
 // Explicit curated re-exports of the platform-orchestrator protocol surface,
-// rather than `export *`. The list deliberately omits the capabilities-update
-// shapes (orchCapabilitiesUpdateSchema / OrchCapabilitiesUpdate) and the bare
-// `ExecutionEvent` type: those stay internal to the discriminated unions and
-// are not part of the barrel surface (only executionEventSchema is exported).
+// rather than `export *`. The capabilities-update schema stays internal to the
+// discriminated union and is not part of the barrel surface.
 export {
   webhookRelaySchema,
   webhookRelayStartSchema,
@@ -65,14 +63,10 @@ export {
   type OrchMetrics,
   type ClusterMembership,
   type PlanHeadroom,
-  DEFAULT_APPROVAL_EXPIRY_HOURS,
   DEFAULT_APPROVAL_EXPIRY_SECONDS,
   SECONDS_PER_HOUR,
   MIN_APPROVAL_EXPIRY_SECONDS,
-  MAX_APPROVAL_EXPIRY_HOURS,
   MAX_APPROVAL_EXPIRY_SECONDS,
-  approvalExpirySecondsOf,
-  approvalExpiryHoursOf,
   ForkPolicy,
   CiTrustLevel,
   trustPolicySchema,
@@ -122,6 +116,7 @@ export * from './protocol/messages/access-log.js';
 
 // --- Approval: shared requirement + clause types (browser-safe, pure Zod) ---
 export * from './approval/types.js';
+export { formatExpiryDuration, parseExpiryDuration } from './approval/expiry-duration.js';
 
 // --- Audit: per-action access-log policy + sampling helper ---
 export * from './audit/access-log-policy.js';
@@ -244,8 +239,6 @@ export * from './context/index.js';
 // --- Structured auto-labels (kici:os:, kici:arch:, kici:agent:, kici:scaler:, kici:host:, kici:role:) ---
 export {
   deriveOsArchLabels,
-  derivePlatformTaints,
-  PLATFORM_TAINT_LABELS,
   ScalerOs,
   ScalerArch,
   scalerPlatformSchema,
@@ -358,3 +351,18 @@ export * from './billing/subscription-status.js';
 
 // --- Diagnostics: infrastructure alert vocabulary (browser-safe, pure Zod) ---
 export * from './diagnostics/infra-alert.js';
+
+// --- Small browser-safe helpers ---
+export { sleep } from './util/sleep.js';
+export { toIsoString } from './util/date.js';
+export { parseDuration } from './util/parse-duration.js';
+
+// --- Permission matrix (Platform enforcement + dashboard rendering) ---
+export {
+  ALL_RESOURCES,
+  PERMISSION_HIERARCHY,
+  hasPermission,
+  type PermissionLevel,
+  type Permissions,
+  type Resource,
+} from './auth/permissions.js';

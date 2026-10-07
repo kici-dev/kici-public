@@ -585,22 +585,11 @@ export interface JobExecutionRequest {
   ref: string;
   /** Git commit SHA. */
   sha: string;
-  /**
-   * Short-lived clone token (optional, for private repos).
-   *
-   * Deprecated in favour of `sourceAuth` / `workflowAuth` — retained as a
-   * back-compat field so same-provider GitHub App flows keep working while
-   * universal-git / cross-provider dispatches migrate to structured auth.
-   */
-  token?: string;
-  /**
-   * Structured auth for the source repo clone. When set, the
-   * workflow runner uses this instead of `token`.
-   */
+  /** Structured auth for the source repo clone. */
   sourceAuth?: GitAuthDispatch;
   /**
    * Structured auth for the workflow repo clone (global workflows only).
-   * Falls back to `sourceAuth` → `token` when absent.
+   * Falls back to `sourceAuth` when absent.
    */
   workflowAuth?: GitAuthDispatch;
 
@@ -701,7 +690,7 @@ export interface JobExecutionRequest {
    * Verification load-bearing. A deferred attestation's frozen statement is
    * built from this so it is field-for-field what a live mint would have
    * produced, and the orchestrator therefore cross-checks it against its own
-   * run row before storing it. Absent from an older orchestrator's dispatch, in
+   * run row before storing it. Absent when the dispatch carries none, in
    * which case the agent falls back to its local guess — a statement the
    * capture check rejects, so the defer is dropped rather than stored unchecked.
    */
@@ -766,7 +755,7 @@ export interface JobExecutionRequest {
   /**
    * Orchestrator-resolved concurrency-slot wait timeout (ms), pushed on
    * `job.dispatch` from the fleet-wide `cluster_settings.concurrency_wait_timeout_ms`.
-   * Absent for older orchestrators — the runner falls back to its own default.
+   * Absent when the dispatch omits it — the runner falls back to its own default.
    */
   concurrencyWaitTimeoutMs?: number;
   /** Git branch for concurrency group context. */

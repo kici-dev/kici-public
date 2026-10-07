@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import * as lockTypes from './types.js';
 import {
   BREAKING_FLOOR,
-  GLOBAL_APPROVAL_MIN_READER,
   NeedsEntrySchema,
   NeedsGroupEntrySchema,
   SCHEMA_VERSION,
@@ -18,19 +17,13 @@ describe('lock schema version window', () => {
   });
 
   it('pins the current window (bump floor ONLY on a breaking schema change)', () => {
+    // fails-when: the floor drops below 42 — a reader would accept locks compiled
+    // before the current schema.
     expect(SCHEMA_VERSION).toBe(42);
-    expect(BREAKING_FLOOR).toBe(30);
+    expect(BREAKING_FLOOR).toBe(42);
   });
 
-  it('the global-approval reader floor sits between the breaking floor and the current version', () => {
-    // fails-when: GLOBAL_APPROVAL_MIN_READER exceeds SCHEMA_VERSION — every lock
-    // carrying a gated global workflow would then be refused by this same build.
-    expect(GLOBAL_APPROVAL_MIN_READER).toBe(42);
-    expect(GLOBAL_APPROVAL_MIN_READER).toBeGreaterThan(BREAKING_FLOOR);
-    expect(GLOBAL_APPROVAL_MIN_READER).toBeLessThanOrEqual(SCHEMA_VERSION);
-  });
-
-  it('LockJob.invoke is additive — the floor stays below the version', () => {
+  it('LockJob.invoke carries the invoke gate', () => {
     const gate: LockJob = {
       _type: 'static',
       name: 'repo-tests',
@@ -41,7 +34,6 @@ describe('lock schema version window', () => {
     expect(gate.invoke?.event).toBe('myorg.repo-tests');
     expect(gate.invoke?.scope).toBe('source');
     expect(gate.invoke?.optional).toBe(true);
-    expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
 
     // A bare invoke gate carries no `optional` (require-by-default).
     const required: LockJob = {
@@ -54,9 +46,7 @@ describe('lock schema version window', () => {
     expect(required.invoke?.optional).toBeUndefined();
   });
 
-  it('LockJob.sandbox is additive — the floor stays below the version', () => {
-    // The per-job sandbox escape-hatch request is an additive optional field:
-    // an older orchestrator ignores it, so the breaking floor is NOT bumped.
+  it('LockJob.sandbox carries the per-job sandbox request', () => {
     const withSandbox: LockJob = {
       _type: 'static',
       name: 'build',
@@ -65,7 +55,6 @@ describe('lock schema version window', () => {
       sandbox: { capabilities: ['NET_ADMIN'], network: 'host' },
     };
     expect(withSandbox.sandbox?.capabilities).toEqual(['NET_ADMIN']);
-    expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
   });
 });
 

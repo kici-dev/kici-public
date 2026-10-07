@@ -14,7 +14,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from './shared/cli-action.js';
 
 /**
  * YAML import helper. Uses the 'yaml' package (already a dependency of the orchestrator).
@@ -147,8 +147,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .requiredOption('--file <path>', 'Path to YAML config file')
     .option('--description <desc>', 'Change description')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (opts: { file: string; description?: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { file: string; description?: string; format: string }) => {
         const content = await readFile(opts.file, 'utf-8');
         const config = (await parseYaml(content)) as Record<string, unknown>;
 
@@ -168,19 +168,16 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
 
         const result = await getClient().configSeed(config, opts.description);
         console.log(formatOutput(result, opts.format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 2. config get ───────────────────────────────────────────────
   cfg
     .command('get [path]')
     .description('Get current effective config (merged local + shared + env)')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (path: string | undefined, opts: { format: string }) => {
-      try {
+    .action(
+      cliAction(async (path: string | undefined, opts: { format: string }) => {
         const result = await getClient().configGet(path);
         if (opts.format === 'yaml') {
           const yaml = await stringifyYaml(result.config);
@@ -188,11 +185,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
         } else {
           console.log(formatOutput(result, opts.format));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 3. config set ───────────────────────────────────────────────
   cfg
@@ -200,26 +194,25 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .description('Set a single field in the shared config')
     .option('--description <desc>', 'Change description')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (path: string, value: string, opts: { description?: string; format: string }) => {
-      try {
-        // Try to parse value as JSON, fall back to string
-        let parsedValue: unknown;
-        try {
-          parsedValue = JSON.parse(value);
-        } catch {
-          parsedValue = value;
-        }
+    .action(
+      cliAction(
+        async (path: string, value: string, opts: { description?: string; format: string }) => {
+          // Try to parse value as JSON, fall back to string
+          let parsedValue: unknown;
+          try {
+            parsedValue = JSON.parse(value);
+          } catch {
+            parsedValue = value;
+          }
 
-        const result = await getClient().configSet(path, parsedValue, opts.description);
-        console.log(formatOutput(result, opts.format));
+          const result = await getClient().configSet(path, parsedValue, opts.description);
+          console.log(formatOutput(result, opts.format));
 
-        const warning = sharedConfigSetWarning(path);
-        if (warning) console.error(warning);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+          const warning = sharedConfigSetWarning(path);
+          if (warning) console.error(warning);
+        },
+      ),
+    );
 
   // ── 4. config delete ────────────────────────────────────────────
   cfg
@@ -227,23 +220,20 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .description('Remove a field from the shared config')
     .option('--description <desc>', 'Change description')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (path: string, opts: { description?: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (path: string, opts: { description?: string; format: string }) => {
         const result = await getClient().configDelete(path, opts.description);
         console.log(formatOutput(result, opts.format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 5. config export ────────────────────────────────────────────
   cfg
     .command('export')
     .description('Export shared config (sensitive values redacted)')
     .option('--format <format>', 'Output format: json|yaml', 'yaml')
-    .action(async (opts: { format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { format: string }) => {
         const result = await getClient().configExport();
         if (opts.format === 'yaml') {
           const yaml = await stringifyYaml(result.config);
@@ -251,11 +241,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
         } else {
           console.log(formatOutput(result, opts.format));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 6. config validate ──────────────────────────────────────────
   cfg
@@ -265,8 +252,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .option('--type <type>', 'Schema type: local|shared|full', 'shared')
     .option('--offline', 'Validate locally without contacting orchestrator')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (opts: { file: string; type: string; offline?: boolean; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { file: string; type: string; offline?: boolean; format: string }) => {
         const content = await readFile(opts.file, 'utf-8');
         const config = await parseYaml(content);
 
@@ -312,30 +299,24 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
           console.log(formatOutput(result, opts.format));
           if (!result.valid) process.exit(1);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 7. config diff ──────────────────────────────────────────────
   cfg
     .command('diff')
     .description('Compare local YAML config vs shared DB config')
     .option('--format <format>', 'Output format: json|yaml|table', 'table')
-    .action(async (opts: { format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { format: string }) => {
         const result = await getClient().configDiff();
         if (opts.format === 'table') {
           console.log(formatDiffTable(result.differences));
         } else {
           console.log(formatOutput(result, opts.format));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 8. config history ───────────────────────────────────────────
   cfg
@@ -343,8 +324,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .description('Show config version history')
     .option('--limit <n>', 'Maximum versions to show', '20')
     .option('--format <format>', 'Output format: json|yaml|table', 'table')
-    .action(async (opts: { limit: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { limit: string; format: string }) => {
         const limit = parseInt(opts.limit, 10);
         const result = await getClient().configHistory(limit);
         if (opts.format === 'table') {
@@ -352,11 +333,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
         } else {
           console.log(formatOutput(result, opts.format));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 9. config rollback ──────────────────────────────────────────
   cfg
@@ -364,8 +342,8 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .description('Rollback shared config to a specific version')
     .requiredOption('--to <version>', 'Target version number')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (opts: { to: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { to: string; format: string }) => {
         const version = parseInt(opts.to, 10);
         if (Number.isNaN(version) || version < 1) {
           console.error('Error: --to must be a positive integer');
@@ -373,48 +351,42 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
         }
         const result = await getClient().configRollback(version);
         console.log(formatOutput(result, opts.format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 10. config reload ───────────────────────────────────────────
   cfg
     .command('reload')
-    .description('Trigger config reload across the cluster')
+    .description(
+      "Trigger config reload across the cluster. The result's `scaler` field reports the " +
+        'reload of the scaler config: `applied`, or `rejected` with its errors.',
+    )
     .option('--drain', 'Drain in-flight work before reloading')
     .option('--target <instance-id>', 'Target specific instance')
     .option('--format <format>', 'Output format: json|yaml|table', 'json')
-    .action(async (opts: { drain?: boolean; target?: string; format: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { drain?: boolean; target?: string; format: string }) => {
         const result = await getClient().configReload({
           drain: opts.drain,
           target: opts.target,
         });
         console.log(formatOutput(result, opts.format));
         if (!result.success) process.exit(1);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // ── 11. config init ─────────────────────────────────────────────
   cfg
     .command('init')
     .description('Generate a starter orchestrator.yaml with commented defaults')
     .option('--output <path>', 'Output file path', './orchestrator.yaml')
-    .action(async (opts: { output: string }) => {
-      try {
+    .action(
+      cliAction(async (opts: { output: string }) => {
         const template = generateConfigTemplate();
         await writeFile(opts.output, template, 'utf-8');
         console.log(`Config template written to ${opts.output}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }
 
 /**

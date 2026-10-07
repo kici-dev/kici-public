@@ -80,8 +80,7 @@ version of a worker is the version that its next spawn uses.
 
 The list shows only the orchestrators that are connected to the coordinator you
 ask. A worker connects to every coordinator in its
-`KICI_CLUSTER_COORDINATOR_URLS` list (or to the one
-`KICI_CLUSTER_COORDINATOR_URL`). The version does not show the cache-sizing
+`KICI_CLUSTER_COORDINATOR_URLS` list. The version does not show the cache-sizing
 knobs, which apply only at the next restart.
 
 `--format json` adds a `propagation` object with the same data:

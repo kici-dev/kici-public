@@ -13,13 +13,9 @@
 
 import type { Command } from 'commander';
 import { registerAgentInstall } from './install.js';
-import { registerAgentUninstall } from './uninstall.js';
-import { registerAgentStart } from './start.js';
-import { registerAgentStop } from './stop.js';
-import { registerAgentRestart } from './restart.js';
 import { registerAgentStatusCommand } from './status.js';
-import { registerAgentLogsCommand } from './logs.js';
 import { registerAgentUpgradeCommand } from './upgrade.js';
+import { registerServiceLifecycleVerbs, registerServiceLogsVerb } from '../shared/service-verbs.js';
 
 export function registerAgentServiceCommands(program: Command): void {
   const agent = program.commands.find((cmd) => cmd.name() === 'agent');
@@ -30,11 +26,8 @@ export function registerAgentServiceCommands(program: Command): void {
   }
 
   registerAgentInstall(agent);
-  registerAgentUninstall(agent);
-  registerAgentStart(agent);
-  registerAgentStop(agent);
-  registerAgentRestart(agent);
+  registerServiceLifecycleVerbs(agent, 'agent');
   registerAgentStatusCommand(agent);
-  registerAgentLogsCommand(agent);
+  registerServiceLogsVerb(agent, 'agent');
   registerAgentUpgradeCommand(agent);
 }

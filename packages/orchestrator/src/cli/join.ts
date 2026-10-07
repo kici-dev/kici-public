@@ -11,8 +11,8 @@
  */
 
 import type { Command } from 'commander';
-import { toErrorMessage } from '@kici-dev/shared';
 import { DEFAULT_JOIN_ENV_FILE, JoinClient } from '../cluster/join-client.js';
+import { cliAction } from './commands/shared/cli-action.js';
 
 export function registerJoinCommand(program: Command): void {
   program
@@ -45,14 +45,14 @@ Join protocol:
 `,
     )
     .action(
-      async (opts: {
-        token: string;
-        platform?: string;
-        peer?: string;
-        apiKey?: string;
-        envFile?: string;
-      }) => {
-        try {
+      cliAction(
+        async (opts: {
+          token: string;
+          platform?: string;
+          peer?: string;
+          apiKey?: string;
+          envFile?: string;
+        }) => {
           const envFile = opts.envFile ?? DEFAULT_JOIN_ENV_FILE;
           const client = new JoinClient({
             token: opts.token,
@@ -78,10 +78,7 @@ Join protocol:
           );
           console.log('  3. Start the orchestrator: kici-admin orchestrator start');
           console.log('');
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 }

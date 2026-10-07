@@ -140,6 +140,7 @@ describe('ExecutionTracker.getReplayDataWithDb', () => {
         runId: 'run-shared',
         workflowName: 'ci',
         status: 'success',
+        statusEpoch: 0,
         routingKey: 'github:1',
         repoIdentifier: 'org/repo',
         sha: 'a',

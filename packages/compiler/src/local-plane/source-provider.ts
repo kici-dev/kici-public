@@ -28,6 +28,7 @@ import {
   type OverlayEntries,
 } from '../remote/overlay-links.js';
 import { selectOverlayFiles } from '../remote/uploader.js';
+import { shQuote } from '@kici-dev/core';
 
 /** The `kici-local` branch the isolated profile commits its overlay onto. */
 export const LOCAL_RUN_BRANCH = 'kici-local';
@@ -115,7 +116,7 @@ async function materializeIsolated(
   // Base tree at HEAD: local clone then pin to the exact SHA. `--no-hardlinks`
   // copies the object store (hardlinks cannot span filesystems: repo under
   // $HOME, tmp under /tmp on a separate mount would otherwise fail).
-  execSync(`git clone --no-hardlinks --quiet ${shellQuote(repoRoot)} ${shellQuote(tmpDir)}`, {
+  execSync(`git clone --no-hardlinks --quiet ${shQuote(repoRoot)} ${shQuote(tmpDir)}`, {
     stdio: 'ignore',
   });
   execSync(`git checkout --quiet ${sha}`, { cwd: tmpDir, stdio: 'ignore' });
@@ -271,9 +272,4 @@ export function readParentSha(dir: string, sha: string): string | undefined {
 /** Run a git command in `cwd` and return trimmed stdout. */
 function gitOut(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
-}
-
-/** Minimal single-quote shell escaping for paths passed to git via execSync. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

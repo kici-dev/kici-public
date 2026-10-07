@@ -22,11 +22,8 @@
  *
  * The value is then read through the secret-scope bindings of the context row
  * those rules ran against — for a name a glob context matches, the glob row —
- * the way a job's bound context secrets resolve. One deprecated fallback remains
- * (removal planned for v1.0.0): when the row matched by the exact name is not a
- * glob context and no scope bound to it carries the key, the scope named after
- * the context is read instead, and a deprecation warning is logged. A
- * glob-matched row never reads a same-named scope.
+ * the way a job's bound context secrets resolve. A key no bound scope carries is
+ * refused: the scope named after the context is never read.
  *
  * The lock declaration is the fourth check and lives at the callers: the relay
  * pins the wire ref to `execution_jobs.git_credentials`, and container-registry
@@ -36,8 +33,7 @@
  * is the system-scoped direct lookup and applies none of the above.
  */
 
-import { ContextType, type Context as EngineContext, type TrustTier } from '@kici-dev/engine';
-import { createLogger } from '@kici-dev/shared';
+import { type Context as EngineContext, type TrustTier } from '@kici-dev/engine';
 import type { ContextStore } from '../contexts/context-store.js';
 import { toContext } from '../contexts/context-store.js';
 import {
@@ -46,8 +42,6 @@ import {
 } from '../contexts/protection/pipeline.js';
 import { isUntrustedTier } from '../security/trust-tier.js';
 import type { SecretResolverApi, SecretResolutionAttribution } from './secret-resolver.js';
-
-const logger = createLogger({ prefix: 'job-secret-gate' });
 
 /**
  * The org id the orchestrator stores its OWN credentials under — GitHub App
@@ -186,43 +180,13 @@ export async function resolveJobQualifiedSecret(
     undefined,
     attribution,
   );
-  const value = values[key] ?? (await readSameNamedContextScope(args, env, attribution));
-  // fails-when: a glob-matched row reads the scope named after the reference
+  const value = values[key];
+  // fails-when: a key no bound scope carries resolves (e.g. from the scope named after the context)
   // breaks-if-wrong: a key bound to the matched context, fixed or glob, must still resolve
   if (value === undefined) {
     throw new JobSecretRefusedError(
       `Secret not found: context=${context} key=${key} (no secret bound to that context carries the key)`,
     );
   }
-  return value;
-}
-
-/**
- * Read `<context>:<key>` from the secret store scope named after the context,
- * for a context matched by its exact name when no scope bound to it carries the
- * key. Keeps a reference working when its secret was stored under the
- * context's name without binding that scope to the context, whether the
- * context binds no scope or binds others. Returns `undefined` for a
- * glob-matched row, and when that scope does not carry the key.
- *
- * @deprecated Removal planned for v1.0.0. Bind the scope to the context with
- * `kici-admin context bind`; the reference then resolves through the binding.
- */
-async function readSameNamedContextScope(
-  args: ResolveJobQualifiedSecretArgs,
-  env: EngineContext,
-  attribution: SecretResolutionAttribution,
-): Promise<string | undefined> {
-  const { resolver, orgId, context, key } = args;
-  // fails-when: a glob-matched row reads the scope named after the reference
-  // breaks-if-wrong: an exact-named context, bound or not, keeps resolving a key only its same-named scope carries
-  if (env.type === ContextType.enum.glob || env.name !== context) return undefined;
-  const value = await resolver.resolveNamedInternal(orgId, context, key, attribution);
-  if (value === null) return undefined;
-  logger.warn(
-    'Deprecated: a secret reference read the scope named after its context, because no scope ' +
-      'bound to the context carries the key; bind the scope with kici-admin context bind before v1.0.0',
-    { orgId, context, runId: args.runId, jobId: args.jobId },
-  );
   return value;
 }

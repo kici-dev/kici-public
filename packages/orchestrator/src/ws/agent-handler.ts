@@ -157,8 +157,8 @@ async function completeUploadWithRetry(
  * `undefined` fields mean the deployment opted out of agent auth
  * (`agentAuthMode === 'none'`); the gates are skipped in that case.
  *
- * `tokenLabels === null` is the back-compat carve-out for tokens issued
- * before `agent_tokens.labels` became an enforced authorization signal.
+ * `tokenLabels === null` is an unscoped token: one minted without `--labels`,
+ * which carries no label constraint.
  */
 type AuthState = {
   tokenId?: string;
@@ -786,7 +786,7 @@ export function isValidLogChunk(raw: unknown): raw is {
   stepIndex: number;
   lines: string[];
   timestamp: number;
-  stream?: LogStream;
+  stream: LogStream;
 } {
   if (typeof raw !== 'object' || raw === null) return false;
   const msg = raw as Record<string, unknown>;
@@ -798,9 +798,7 @@ export function isValidLogChunk(raw: unknown): raw is {
     typeof msg.stepIndex === 'number' &&
     Array.isArray(msg.lines) &&
     typeof msg.timestamp === 'number' &&
-    // Optional for backward compatibility with agents that omit it; when
-    // present it must be one of the two known streams.
-    (msg.stream === undefined || LogStream.safeParse(msg.stream).success)
+    LogStream.safeParse(msg.stream).success
   );
 }
 
@@ -824,8 +822,8 @@ export interface AgentLogChunkInput {
   stepIndex: number;
   lines: string[];
   timestamp: number;
-  /** Absent when the agent does not report a stream; read as `stdout`. */
-  stream?: LogStream;
+  /** The stream the lines came from. */
+  stream: LogStream;
 }
 
 /**
@@ -1000,9 +998,8 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
       tokenId?: string;
       /**
        * Token-bound label authorization scope, captured from `agent_tokens.labels`
-       * at auth time. `null` means the token has no label constraint (back-compat
-       * carve-out for tokens issued before the column became an enforced
-       * authorization signal). `undefined` only when auth mode is `none` (in
+       * at auth time. `null` means an unscoped token (minted without `--labels`),
+       * which has no label constraint. `undefined` only when auth mode is `none` (in
        * which case label scoping is not applicable — the deployment opted out
        * of agent authentication entirely).
        *
@@ -1619,7 +1616,6 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
             nodeVersion: parsed.data.nodeVersion,
             runningAsUser: parsed.data.runningAsUser,
             runningAsUid: parsed.data.runningAsUid,
-            capabilities: parsed.data.capabilities,
             // Threaded through so AgentRegistry.disconnectByTokenId(...)
             // can enumerate every in-flight WS for a revoked token. Null
             // when auth mode is `none` (no token-bound authority).
@@ -1765,7 +1761,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
             stepIndex: raw.stepIndex,
             lines: raw.lines,
             timestamp: raw.timestamp,
-            ...(raw.stream !== undefined && { stream: raw.stream }),
+            stream: raw.stream,
           },
           () => gateOwnership(ownershipTracker, agentId, raw.jobId, 'log.chunk'),
         );
@@ -1866,7 +1862,6 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
               nodeVersion: msg.nodeVersion,
               runningAsUser: msg.runningAsUser,
               runningAsUid: msg.runningAsUid,
-              capabilities: msg.capabilities,
               mandatoryLabels: existingEntry ? [...existingEntry.mandatoryLabels] : undefined,
               // Keep the token binding: revocation, expiry and the agent-id
               // collision check all read it from the registry entry.
@@ -1886,9 +1881,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           wsToAgentId.set(ws, msg.agentId);
           setAgentsActive(registry.getActiveCount());
 
-          // Send register.ack for re-registration. Capabilities are re-advertised
-          // so a reconnecting agent does not fall back to the pre-capability
-          // behavior of any optional feature it negotiated on first register.
+          // Send register.ack for re-registration.
           sendJson(ws, {
             type: 'register.ack',
             agentId: msg.agentId,
@@ -2118,7 +2111,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           await acceptLogChunk(
             deps,
             agentId,
-            { runId, jobId, stepIndex, lines, timestamp, ...(stream !== undefined && { stream }) },
+            { runId, jobId, stepIndex, lines, timestamp, stream },
             () => gateOwnership(ownershipTracker, agentId, jobId, 'log.chunk'),
           );
           break;
@@ -2334,16 +2327,8 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
                 break;
               }
               // Content-addressed, exactly like deps below: the tarball is
-              // stored under its own digest. An older agent omits
-              // `sourceTarDigest` — fall back to the contentHash-derived name so
-              // a mixed-version rollout still uploads somewhere rather than
-              // failing the build. Such an entry gets no pointer, so nothing
-              // will ever resolve to it and it ages out on TTL; the next build
-              // with a current agent repopulates.
-              uploadUrl = await sourceCache.getUploadUrl(
-                orgId,
-                msg.sourceTarDigest ?? msg.contentHash!,
-              );
+              // stored under its own digest.
+              uploadUrl = await sourceCache.getUploadUrl(orgId, msg.sourceTarDigest);
             } else {
               if (!depCache) {
                 logger.warn('cache.upload.request for deps but depCache not configured', {
@@ -2357,16 +2342,8 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
                 break;
               }
               // Content-addressed: the tarball is stored under its own hash, so
-              // sign for that. An older agent omits `depsHash` — fall back to
-              // the lockfile-derived name so a mixed-version rollout still
-              // uploads somewhere rather than failing the build. Such an entry
-              // gets no pointer, so nothing will ever resolve to it and it ages
-              // out on TTL; the next build with a current agent repopulates.
-              uploadUrl = await depCache.getUploadUrl(
-                msg.depsHash ?? msg.lockfileHash!,
-                msg.platform,
-                msg.arch,
-              );
+              // sign for that.
+              uploadUrl = await depCache.getUploadUrl(msg.depsHash, msg.platform, msg.arch);
             }
             sendJson(ws, {
               type: 'cache.upload.response',
@@ -2415,20 +2392,14 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
               break;
             }
 
-            // Compute the storage key from the message fields. A dep tarball is
-            // addressed by its own content hash; only fall back to the lockfile
-            // name for an older agent that sent no `depsHash` (see the upload-URL
-            // branch above — the two must agree on the key or initMeta stamps TTL
-            // bookkeeping onto an object that does not exist).
-            let storageKey: string;
-            if (msg.cacheType === 'source') {
-              storageKey = sourceTarballKey(
-                uploadOrgId ?? '',
-                msg.sourceTarDigest ?? msg.contentHash!,
-              );
-            } else {
-              storageKey = depTarballKey(msg.depsHash ?? msg.lockfileHash!, msg.platform, msg.arch);
-            }
+            // Compute the storage key from the message fields. Each tarball is
+            // addressed by its own content hash, the same key the upload-URL
+            // branch above signed (or initMeta stamps TTL bookkeeping onto an
+            // object that does not exist).
+            const storageKey =
+              msg.cacheType === 'source'
+                ? sourceTarballKey(uploadOrgId ?? '', msg.sourceTarDigest)
+                : depTarballKey(msg.depsHash, msg.platform, msg.arch);
 
             if (cacheStorage) {
               try {
@@ -2436,7 +2407,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
                 // Publish the pointer only now, after the agent confirmed the
                 // upload landed. Publishing earlier would let a reader resolve a
                 // lockfile to bytes that are not there yet.
-                if (msg.cacheType === 'deps' && msg.depsHash && msg.lockfileHash && depCache) {
+                if (msg.cacheType === 'deps' && msg.lockfileHash && depCache) {
                   await depCache.publishPointer(
                     msg.lockfileHash,
                     msg.platform,
@@ -2445,13 +2416,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
                     msg.siblingsDigest,
                   );
                 }
-                if (
-                  msg.cacheType === 'source' &&
-                  msg.sourceTarDigest &&
-                  msg.contentHash &&
-                  uploadOrgId &&
-                  sourceCache
-                ) {
+                if (msg.cacheType === 'source' && msg.contentHash && uploadOrgId && sourceCache) {
                   await sourceCache.publishPointer(
                     uploadOrgId,
                     msg.contentHash,
@@ -2735,8 +2700,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
 
         case 'artifacts.upload.complete': {
           // Every path below that belongs to this agent's job sends exactly one
-          // ack: an agent that advertised-capability-awaits the ack must never
-          // hang on a silent drop, and a commit that failed must fail the step
+          // ack: the agent awaits it, so it must never hang on a silent drop, and a commit that failed must fail the step
           // rather than leave a green run with no artifact.
           const sendCompleteAck = (outcome: ArtifactCompleteAckOutcome, reason?: string): void => {
             sendJson(ws, {

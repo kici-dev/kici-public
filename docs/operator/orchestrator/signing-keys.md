@@ -181,9 +181,11 @@ signing key itself does not change:
   orchestrator re-encrypts it under the current key and logs
   `provenance signing key was sealed under the old master key — re-encrypted
 under the current key (self-heal)`.
-- **A key neither master key opens stops the boot**, with an error naming the
-  store and the recovery. Restore the previous key as `KICI_SECRET_KEY_OLD`,
-  restart, then re-run `kici-admin rotate-key`.
+- **A key neither master key opens does not stop the boot.** The orchestrator
+  logs `provenance signing key cannot be loaded; mints will defer until fixed`,
+  with an error naming the store and the recovery, and every mint defers until
+  the key opens. Restore the previous key as `KICI_SECRET_KEY_OLD`, restart,
+  then re-run `kici-admin rotate-key`.
 
 After retiring the old master key, confirm the orchestrator still serves
 `/.well-known/jwks.json` with the same `kid` it served before — that is the

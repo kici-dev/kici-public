@@ -206,7 +206,7 @@ describe('kici-admin context CLI', () => {
         'postgres://localhost/test',
       ]);
       // fails-when: create leaves a bindingless fixed context without a warning
-      expect(stderr).toContain(unboundContextWarning('org-1', 'staging', ContextType.enum.fixed));
+      expect(stderr).toContain(unboundContextWarning('org-1', 'staging'));
       expect(exitCode).toBeNull();
     });
 

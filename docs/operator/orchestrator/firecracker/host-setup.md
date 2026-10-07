@@ -676,6 +676,9 @@ scalers:
     kernelPath: /opt/kici/Image # arm64: PE format
     uid: 10000
     gid: 10000
+    platform:
+      os: linux
+      arch: arm64
     labelSets:
       - labels: [linux, vm, arm64]
         rootfsPath: /opt/kici/rootfs-arm64.ext4

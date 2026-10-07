@@ -227,14 +227,14 @@ describe('crossHostAuthRefusal', () => {
     expect(crossHostAuthRefusal(cfg, 'not a url', { workflowAuth })).toBeDefined();
   });
 
-  it('dispatches a networked source with a token next to a file:// workflow repository', () => {
+  it('dispatches a networked source with source auth next to a file:// workflow repository', () => {
     // A file:// clone reaches no host, so the one credential cannot leak to one.
     // breaks-if-wrong: a local workflow repository paired with a networked source must still dispatch
     expect(
       crossHostAuthRefusal(
         { ...cfg, workflowRepoUrl: 'file:///srv/repos/org/ci' },
         `https://github.com/${SOURCE_REPO}.git`,
-        { token: 'src-tok', sourceAuth: workflowAuth },
+        { sourceAuth: workflowAuth },
       ),
     ).toBeUndefined();
   });
@@ -262,7 +262,7 @@ describe('crossHostAuthRefusal', () => {
       crossHostAuthRefusal(
         { ...cfg, workflowRepoUrl: 'github.com:org/ci.git' },
         'https://git.forge.example/org/app.git',
-        { token: 'src-tok' },
+        { sourceAuth: { kind: 'basic', user: 'x-access-token', secret: 'src-tok' } },
       ),
     ).toBeDefined();
   });
@@ -274,7 +274,7 @@ describe('crossHostAuthRefusal', () => {
       crossHostAuthRefusal(
         { ...cfg, workflowRepoUrl: 'git@GitHub.com:org/ci.git' },
         'https://github.com/org/app.git',
-        { token: 'src-tok' },
+        { sourceAuth: { kind: 'basic', user: 'x-access-token', secret: 'src-tok' } },
       ),
     ).toBeUndefined();
   });
@@ -286,7 +286,7 @@ describe('crossHostAuthRefusal', () => {
       crossHostAuthRefusal(
         { ...cfg, workflowRepoUrl: 'ssh://git@GitHub.com/org/ci.git' },
         'git@github.com:org/app.git',
-        { token: 'src-tok' },
+        { sourceAuth: { kind: 'basic', user: 'x-access-token', secret: 'src-tok' } },
       ),
     ).toBeUndefined();
   });

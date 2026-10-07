@@ -17,6 +17,7 @@ import { sql, type Kysely, type Updateable } from 'kysely';
 import type { Database, ExecutionJobTable } from '../db/types.js';
 import { JobKind } from '../db/types.js';
 import { aggregateGateStatus } from '../pipeline/invoke-gate.js';
+import { runSummaryFields, statusEpochField } from './run-summary-fields.js';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
 import {
   ExecutionJobStatus,
@@ -500,11 +501,6 @@ export interface ExecutionTrackerDeps {
 
 /** The org used when no routing key / resolver is available (matches the column DEFAULT). */
 const DEFAULT_CUSTOMER_ID = '__default__';
-
-/** The `statusEpoch` context field for a run, omitted at 0 (its default). */
-function statusEpochField(epoch: number | null | undefined): { statusEpoch?: number } {
-  return epoch ? { statusEpoch: epoch } : {};
-}
 
 /**
  * Whether a live job report may reopen a run row: the run failed, and not on a
@@ -1428,25 +1424,8 @@ export class ExecutionTracker {
       runId,
       run.status,
       {
-        workflowName: run.workflowName,
-        ...statusEpochField(run.statusEpoch),
-        provider: run.provider,
-        repoIdentifier: run.repoIdentifier,
-        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
-        sha: run.sha,
+        ...runSummaryFields(run),
         ...(run.localWorkingTree && { localWorkingTree: true }),
-        installationId: run.installationId,
-        requestId: run.requestId,
-        routingKey: run.routingKey,
-        ref: run.ref,
-        triggerEvent: run.triggerEvent,
-        commitMessage: run.commitMessage,
-        parentRunId: run.parentRunId,
-        originalRunId: run.originalRunId,
-        triggeredBy: run.triggeredBy,
-        triggeredByAgentLabel: run.triggeredByAgentLabel,
-        triggerActorUsername: run.triggerActorUsername,
-        triggerActorUserId: run.triggerActorUserId,
       },
       run.jobs.size,
       run.startedAt,
@@ -2170,26 +2149,7 @@ export class ExecutionTracker {
     this.onExecutionStatusChange?.(
       runId,
       ExecutionRunStatus.enum.running,
-      {
-        workflowName: run.workflowName,
-        ...statusEpochField(run.statusEpoch),
-        provider: run.provider,
-        repoIdentifier: run.repoIdentifier,
-        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
-        sha: run.sha,
-        installationId: run.installationId,
-        requestId: run.requestId,
-        routingKey: run.routingKey,
-        ref: run.ref,
-        triggerEvent: run.triggerEvent,
-        commitMessage: run.commitMessage,
-        parentRunId: run.parentRunId,
-        originalRunId: run.originalRunId,
-        triggeredBy: run.triggeredBy,
-        triggeredByAgentLabel: run.triggeredByAgentLabel,
-        triggerActorUsername: run.triggerActorUsername,
-        triggerActorUserId: run.triggerActorUserId,
-      },
+      runSummaryFields(run),
       run.jobs.size,
       run.startedAt,
     );
@@ -2238,26 +2198,7 @@ export class ExecutionTracker {
     this.onExecutionStatusChange?.(
       runId,
       ExecutionRunStatus.enum.cancelling,
-      {
-        workflowName: run.workflowName,
-        ...statusEpochField(run.statusEpoch),
-        provider: run.provider,
-        repoIdentifier: run.repoIdentifier,
-        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
-        sha: run.sha,
-        installationId: run.installationId,
-        requestId: run.requestId,
-        routingKey: run.routingKey,
-        ref: run.ref,
-        triggerEvent: run.triggerEvent,
-        commitMessage: run.commitMessage,
-        parentRunId: run.parentRunId,
-        originalRunId: run.originalRunId,
-        triggeredBy: run.triggeredBy,
-        triggeredByAgentLabel: run.triggeredByAgentLabel,
-        triggerActorUsername: run.triggerActorUsername,
-        triggerActorUserId: run.triggerActorUserId,
-      },
+      runSummaryFields(run),
       run.jobs.size,
       run.startedAt,
     );
@@ -2789,24 +2730,7 @@ export class ExecutionTracker {
       runId,
       overallStatus,
       {
-        workflowName: run.workflowName,
-        ...statusEpochField(run.statusEpoch),
-        provider: run.provider,
-        repoIdentifier: run.repoIdentifier,
-        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
-        sha: run.sha,
-        installationId: run.installationId,
-        requestId: run.requestId,
-        routingKey: run.routingKey,
-        ref: run.ref,
-        triggerEvent: run.triggerEvent,
-        commitMessage: run.commitMessage,
-        parentRunId: run.parentRunId,
-        originalRunId: run.originalRunId,
-        triggeredBy: run.triggeredBy,
-        triggeredByAgentLabel: run.triggeredByAgentLabel,
-        triggerActorUsername: run.triggerActorUsername,
-        triggerActorUserId: run.triggerActorUserId,
+        ...runSummaryFields(run),
         failureClass,
       },
       run.jobs.size,
@@ -3073,24 +2997,7 @@ export class ExecutionTracker {
       this.onExecutionStatusChange?.(
         runId,
         ExecutionRunStatus.enum.failed,
-        {
-          workflowName: run.workflowName,
-          ...statusEpochField(run.statusEpoch),
-          provider: run.provider,
-          repoIdentifier: run.repoIdentifier,
-          ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
-          sha: run.sha,
-          routingKey: run.routingKey,
-          ref: run.ref,
-          triggerEvent: run.triggerEvent,
-          commitMessage: run.commitMessage,
-          parentRunId: run.parentRunId,
-          originalRunId: run.originalRunId,
-          triggeredBy: run.triggeredBy,
-          triggeredByAgentLabel: run.triggeredByAgentLabel,
-          triggerActorUsername: run.triggerActorUsername,
-          triggerActorUserId: run.triggerActorUserId,
-        },
+        runSummaryFields(run),
         run.jobs.size,
         run.startedAt,
         completedAt,
@@ -4008,22 +3915,7 @@ export class ExecutionTracker {
         runId,
         ExecutionRunStatus.enum.failed,
         {
-          workflowName: run.workflowName,
-          ...statusEpochField(run.statusEpoch),
-          provider: run.provider,
-          repoIdentifier: run.repoIdentifier,
-          ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
-          sha: run.sha,
-          routingKey: run.routingKey,
-          ref: run.ref,
-          triggerEvent: run.triggerEvent,
-          commitMessage: run.commitMessage,
-          parentRunId: run.parentRunId,
-          originalRunId: run.originalRunId,
-          triggeredBy: run.triggeredBy,
-          triggeredByAgentLabel: run.triggeredByAgentLabel,
-          triggerActorUsername: run.triggerActorUsername,
-          triggerActorUserId: run.triggerActorUserId,
+          ...runSummaryFields(run),
           failureClass: RunFailureClass.enum.never_started,
         },
         run.jobs.size,
@@ -4627,7 +4519,7 @@ export class ExecutionTracker {
     startedAt: number;
     completedAt?: number;
     durationMs?: number;
-    statusEpoch?: number;
+    statusEpoch: number;
     jobs: Array<{
       jobId: string;
       jobName: string;
@@ -4657,7 +4549,7 @@ export class ExecutionTracker {
       startedAt: number;
       completedAt?: number;
       durationMs?: number;
-      statusEpoch?: number;
+      statusEpoch: number;
       jobs: Array<{
         jobId: string;
         jobName: string;
@@ -5150,27 +5042,8 @@ export class ExecutionTracker {
       runId,
       overallStatus,
       {
-        workflowName: memRun.workflowName,
-        ...statusEpochField(memRun.statusEpoch),
-        provider: memRun.provider,
-        repoIdentifier: memRun.repoIdentifier,
-        ...(memRun.workflowRepoIdentifier && {
-          workflowRepoIdentifier: memRun.workflowRepoIdentifier,
-        }),
-        sha: memRun.sha,
+        ...runSummaryFields(memRun),
         ...(memRun.localWorkingTree && { localWorkingTree: true }),
-        installationId: memRun.installationId,
-        requestId: memRun.requestId,
-        routingKey: memRun.routingKey,
-        ref: memRun.ref,
-        triggerEvent: memRun.triggerEvent,
-        commitMessage: memRun.commitMessage,
-        parentRunId: memRun.parentRunId,
-        originalRunId: memRun.originalRunId,
-        triggeredBy: memRun.triggeredBy,
-        triggeredByAgentLabel: memRun.triggeredByAgentLabel,
-        triggerActorUsername: memRun.triggerActorUsername,
-        triggerActorUserId: memRun.triggerActorUserId,
         failureClass,
       },
       memRun.jobs.size,

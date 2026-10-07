@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { PeerScalerOrphansRequest, PeerScalerOrphansResponse } from '@kici-dev/engine';
 import type { ScalerOrphansAnswer } from '../scaler/orphan-requests.js';
+import { PeerRequestWaiters } from './peer-request-waiters.js';
 
 const logger = createLogger({ prefix: 'scaler-orphans-peer' });
 
@@ -58,46 +59,14 @@ export function replyToScalerOrphansRequest(
   });
 }
 
-/** Pending scaler orphan requests, keyed by message id. */
-export class ScalerOrphansWaiters {
-  private readonly waiters = new Map<
-    string,
-    {
-      resolve: (response: PeerScalerOrphansResponse | typeof SCALER_ORPHANS_TIMEOUT) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }
-  >();
-
-  /** Wait for the response to `messageId`, or {@link SCALER_ORPHANS_TIMEOUT}. */
-  wait(
-    messageId: string,
-    timeoutMs: number,
-  ): Promise<PeerScalerOrphansResponse | typeof SCALER_ORPHANS_TIMEOUT> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(messageId);
-        resolve(SCALER_ORPHANS_TIMEOUT);
-      }, timeoutMs);
-      timer.unref?.();
-      this.waiters.set(messageId, { resolve, timer });
-    });
-  }
-
-  /** Hand a response to the request waiting for it. An unknown id is dropped. */
-  resolve(response: PeerScalerOrphansResponse): void {
-    const waiter = this.waiters.get(response.messageId);
-    if (!waiter) return;
-    clearTimeout(waiter.timer);
-    this.waiters.delete(response.messageId);
-    waiter.resolve(response);
-  }
-
-  /** End every pending wait with an `ok: false` response naming `reason`. */
-  rejectAll(reason: string): void {
-    for (const [messageId, waiter] of this.waiters) {
-      clearTimeout(waiter.timer);
-      waiter.resolve({ type: 'peer.scaler.orphans.response', messageId, ok: false, error: reason });
-    }
-    this.waiters.clear();
+/** Pending scaler orphan requests; a close answers each `ok: false` naming the reason. */
+export class ScalerOrphansWaiters extends PeerRequestWaiters<PeerScalerOrphansResponse> {
+  constructor() {
+    super((messageId, reason) => ({
+      type: 'peer.scaler.orphans.response',
+      messageId,
+      ok: false,
+      error: reason,
+    }));
   }
 }

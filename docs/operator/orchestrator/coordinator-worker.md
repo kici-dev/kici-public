@@ -25,7 +25,7 @@ This outputs a one-time join token (e.g., `kici_join_v1.xxx.yyy`).
 
 ```bash
 KICI_CLUSTER_ROLE=worker \
-KICI_CLUSTER_COORDINATOR_URL=ws://coordinator-host:4000/ws/peer \
+KICI_CLUSTER_COORDINATOR_URLS=ws://coordinator-host:4000/ws/peer \
 KICI_CLUSTER_JOIN_TOKEN=kici_join_v1.xxx.yyy \
 KICI_CLUSTER_INSTANCE_ID=mac-mini-1 \
 KICI_SCALER_CONFIG_PATH=/etc/kici/scalers.yaml \
@@ -46,17 +46,16 @@ curl -s http://worker-host:4000/status | jq .
 
 ## Required environment variables
 
-| Variable                        | Required                                | Description                                                                                                                                                                                                 |
-| ------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KICI_CLUSTER_ROLE`             | Yes                                     | Set to `worker`                                                                                                                                                                                             |
-| `KICI_CLUSTER_COORDINATOR_URL`  | Yes, or `KICI_CLUSTER_COORDINATOR_URLS` | WebSocket URL of the coordinator's peer endpoint (e.g., `ws://coordinator:4000/ws/peer`)                                                                                                                    |
-| `KICI_CLUSTER_COORDINATOR_URLS` | No                                      | Comma-separated peer endpoint URLs of every coordinator. The worker connects to each one, so every coordinator can route work to it. Takes precedence over `KICI_CLUSTER_COORDINATOR_URL` when both are set |
-| `KICI_CLUSTER_JOIN_TOKEN`       | First start only                        | One-time join token from the coordinator. After first connection, a persistent credential is issued                                                                                                         |
-| `KICI_CLUSTER_CREDENTIAL_FILE`  | No                                      | Path to store the persistent credential (default: `~/.kici/peer-credential`)                                                                                                                                |
-| `KICI_CLUSTER_INSTANCE_ID`      | No                                      | Human-readable instance ID (default: random UUID). Recommended for observability                                                                                                                            |
-| `KICI_SCALER_CONFIG_PATH`       | Yes                                     | Path to the scaler config for local agents                                                                                                                                                                  |
-| `KICI_PORT`                     | No                                      | HTTP port for the worker's health/status endpoints (default: 4000)                                                                                                                                          |
-| `KICI_LOG_LEVEL`                | No                                      | Log level (default: `info`)                                                                                                                                                                                 |
+| Variable                        | Required         | Description                                                                                                                                                                                  |
+| ------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_CLUSTER_ROLE`             | Yes              | Set to `worker`                                                                                                                                                                              |
+| `KICI_CLUSTER_COORDINATOR_URLS` | Yes              | Comma-separated WebSocket URLs of the peer endpoint of every coordinator (e.g., `ws://coordinator:4000/ws/peer`). The worker connects to each one, so every coordinator can route work to it |
+| `KICI_CLUSTER_JOIN_TOKEN`       | First start only | One-time join token from the coordinator. After first connection, a persistent credential is issued                                                                                          |
+| `KICI_CLUSTER_CREDENTIAL_FILE`  | No               | Path to store the persistent credential (default: `~/.kici/peer-credential`)                                                                                                                 |
+| `KICI_CLUSTER_INSTANCE_ID`      | No               | Human-readable instance ID (default: random UUID). Recommended for observability                                                                                                             |
+| `KICI_SCALER_CONFIG_PATH`       | Yes              | Path to the scaler config for local agents                                                                                                                                                   |
+| `KICI_PORT`                     | No               | HTTP port for the worker's health/status endpoints (default: 4000)                                                                                                                           |
+| `KICI_LOG_LEVEL`                | No               | Log level (default: `info`)                                                                                                                                                                  |
 
 ## What workers do NOT need
 
@@ -82,6 +81,9 @@ scalers:
     type: container
     maxAgents: 4
     orchestratorUrl: ws://localhost:4000/ws
+    platform:
+      os: macos
+      arch: arm64
     labelSets:
       - labels: [self-hosted, macos, arm64]
         image: kici-agent:latest
@@ -185,7 +187,7 @@ Workers are stateless, so upgrading is straightforward:
 2. **Replace the binary** -- deploy the new version
 3. **Restart** -- the worker reconnects using its persisted credential (no new join token needed)
 
-Coordinators and workers can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. 0.9.0 raises it to 3, so a 0.8.x node (protocol 2) is refused by an upgraded peer until it is upgraded too.
+Coordinators and workers can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. Upgrade every node in the same window when a release raises the **minimum accepted** version — the release notes name it. Protocol 4 raises it from 3, so a node from 0.15.x or earlier (protocol 3) is refused by an upgraded peer until it is upgraded too.
 
 ## Troubleshooting
 
@@ -201,7 +203,7 @@ Coordinators and workers can be upgraded in any order as long as every node's pr
 
 **Checks:**
 
-1. Verify `KICI_CLUSTER_COORDINATOR_URL` is correct and reachable
+1. Verify each URL in `KICI_CLUSTER_COORDINATOR_URLS` is correct and reachable
 2. Check firewall rules allow WebSocket connections to the coordinator port
 3. Verify the coordinator is running and healthy (`curl coordinator:4000/health`)
 4. If using a reverse proxy, ensure WebSocket upgrade is supported
@@ -249,7 +251,7 @@ services:
     image: kici-orchestrator:latest
     environment:
       KICI_CLUSTER_ROLE: worker
-      KICI_CLUSTER_COORDINATOR_URL: ws://coordinator:4000/ws/peer
+      KICI_CLUSTER_COORDINATOR_URLS: ws://coordinator:4000/ws/peer
       KICI_CLUSTER_JOIN_TOKEN: ${WORKER_JOIN_TOKEN}
       KICI_CLUSTER_INSTANCE_ID: worker-1
       KICI_SCALER_CONFIG_PATH: /config/scalers.yaml

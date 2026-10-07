@@ -23,7 +23,7 @@ describe('ProvenanceTrustRoot', () => {
     expect(tr.getIssuer()).toBeNull();
   });
 
-  it('accepts an issuer from construction (CLI path)', () => {
+  it('accepts an issuer from construction', () => {
     expect(createProvenanceTrustRoot({ issuer: 'https://i.example' }).getIssuer()).toBe(
       'https://i.example',
     );
@@ -31,8 +31,10 @@ describe('ProvenanceTrustRoot', () => {
 
   it('fetches + caches the jwks for a set issuer', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(jwks), { status: 200 }));
-    const tr = createProvenanceTrustRoot({ fetchImpl: fetchImpl as unknown as typeof fetch });
-    tr.setIssuer('https://i.example');
+    const tr = createProvenanceTrustRoot({
+      issuer: 'https://i.example',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
     expect(await tr.getJwks()).toEqual(jwks);
     await tr.getJwks();
     expect(fetchImpl).toHaveBeenCalledTimes(1); // cached
@@ -43,8 +45,10 @@ describe('ProvenanceTrustRoot', () => {
       .fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(jwks), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify(jwks2), { status: 200 }));
-    const tr = createProvenanceTrustRoot({ fetchImpl: fetchImpl as unknown as typeof fetch });
-    tr.setIssuer('https://i.example');
+    const tr = createProvenanceTrustRoot({
+      issuer: 'https://i.example',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
     await tr.getJwks(); // caches jwks (k1 only)
     const got = await tr.getJwks('k2'); // k2 absent -> refetch -> jwks2
     expect(got).toEqual(jwks2);
@@ -53,19 +57,11 @@ describe('ProvenanceTrustRoot', () => {
 
   it('returns null when the jwks fetch fails', async () => {
     const fetchImpl = vi.fn(async () => new Response('nope', { status: 500 }));
-    const tr = createProvenanceTrustRoot({ fetchImpl: fetchImpl as unknown as typeof fetch });
-    tr.setIssuer('https://i.example');
+    const tr = createProvenanceTrustRoot({
+      issuer: 'https://i.example',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
     expect(await tr.getJwks()).toBeNull();
-  });
-
-  it('clears the cache when the issuer changes', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(jwks), { status: 200 }));
-    const tr = createProvenanceTrustRoot({ fetchImpl: fetchImpl as unknown as typeof fetch });
-    tr.setIssuer('https://a.example');
-    await tr.getJwks();
-    tr.setIssuer('https://b.example');
-    await tr.getJwks();
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it('serves a static in-process JWKS without fetching (local dev plane)', async () => {

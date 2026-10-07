@@ -12,8 +12,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { TokenManager } from '../secrets/token-manager.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
-import { handleAdminError } from './admin-errors.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import type { PgSecretStore } from '../secrets/pg-secret-store.js';
 import type { AuditLogger } from '../secrets/audit-logger.js';
@@ -37,10 +36,13 @@ import {
 } from './admin-cluster-settings.js';
 import { createClusterNameRoutes } from './admin-cluster-name.js';
 import { createAdminSigningKeyRoutes } from './admin-signing-keys.js';
+import { createAdminOrgRoutes } from './admin-orgs.js';
+import { listHeldOrgIds } from '../db/repos/org-ids-repo.js';
 import { createMaintenanceRoutes } from './admin-maintenance.js';
 import { createOrchestratorDrainRoutes } from './admin-orchestrator-drain.js';
 import { createScalerOrphansRoutes, type ScalerOrphansRouteDeps } from './admin-scaler-orphans.js';
 import { createPeerForgetRoutes, type PeerForgetRouteDeps } from './admin-peer-forget.js';
+import { createScalerReloadRoutes, type ScalerReloadRouteDeps } from './admin-scaler-reload.js';
 import type { DrainController } from '../drain/drain-controller.js';
 import { createAdminContextRoutes } from './admin-contexts.js';
 import { createAdminQueueExecutionRoutes } from './admin-queue-execution.js';
@@ -61,12 +63,10 @@ import type pg from 'pg';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
 import type { WebhookUrlResolution } from '../sources/webhook-url-resolvers.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-api' });
 
-/**
- * Dependencies for admin API routes.
- */
 export interface AdminRouteDeps {
   tokenManager: TokenManager;
   /**
@@ -88,6 +88,12 @@ export interface AdminRouteDeps {
    * an independent orchestrator and on a test admin, which have no connection.
    */
   platformConnected?: () => boolean;
+  /**
+   * The org the Platform named on `auth.success`, read per request; `undefined`
+   * before the first authentication. Backs the attachment `GET /org-ids` reports.
+   * Absent on an independent orchestrator and on a test admin.
+   */
+  getPlatformOrgId?: () => string | undefined;
   rbac: RbacEnforcer;
   secretStore: PgSecretStore;
   auditLogger: AuditLogger;
@@ -197,6 +203,12 @@ export interface AdminRouteDeps {
    */
   scalerOrphans?: ScalerOrphansRouteDeps;
   /**
+   * Optional -- reload the scaler config here and on every connected peer.
+   * Backs `POST /api/v1/admin/scaler/reload` (`kici-admin scaler reload`).
+   * Bound by orchestrator-core once the cluster is up.
+   */
+  scalerReload?: ScalerReloadRouteDeps;
+  /**
    * Optional -- forget a departed peer here and on every connected sibling
    * coordinator. Backs `POST /api/v1/admin/peers/forget` (`kici-admin peer
    * forget`). Bound by orchestrator-core once the cluster is up.
@@ -228,17 +240,6 @@ export interface AdminRouteDeps {
    */
   heldRunRelease?: HeldRunReleaseWiring;
 }
-
-/** Hono env type for admin routes with context variables. */
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
-// ── Zod schemas for request validation ──────────────────────────────
 
 const setScopedSecretSchema = z.object({
   value: z.string(),
@@ -275,9 +276,8 @@ const createJoinTokenSchema = z.object({
  * @returns Hono app with admin routes mounted at /api/v1/admin/*
  */
 export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
-  // ── Bearer token auth middleware ────────────────────────────────
   const authMiddleware = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
     scope: 'admin',
@@ -314,447 +314,367 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
 
   // List an org's scopes across every registered backend, each qualified as
   // `<backend>:<path>`.
-  app.get('/api/v1/admin/secrets/scopes', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      const orgId = c.req.query('orgId');
-      if (!orgId) return c.json({ error: 'orgId required' }, 400);
-      const stores = await loadStores();
-      const scopes: string[] = [];
-      for (const [backendName, store] of stores) {
-        try {
-          for (const path of await store.listScopes(orgId)) {
-            scopes.push(toWireScope(backendName, path));
-          }
-        } catch (err) {
-          // One unreachable backend must not blank the whole listing — the
-          // operator still needs to see the backends that ARE reachable.
-          logger.warn('Skipping unreachable secret backend during scope listing', {
-            backendName,
-            error: toErrorMessage(err),
-          });
+  app.get('/api/v1/admin/secrets/scopes', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    const orgId = c.req.query('orgId');
+    if (!orgId) return c.json({ error: 'orgId required' }, 400);
+    const stores = await loadStores();
+    const scopes: string[] = [];
+    for (const [backendName, store] of stores) {
+      try {
+        for (const path of await store.listScopes(orgId)) {
+          scopes.push(toWireScope(backendName, path));
         }
+      } catch (err) {
+        // One unreachable backend must not blank the whole listing — the
+        // operator still needs to see the backends that ARE reachable.
+        logger.warn('Skipping unreachable secret backend during scope listing', {
+          backendName,
+          error: toErrorMessage(err),
+        });
       }
-      scopes.sort();
-      return c.json({ scopes }, 200);
-    } catch (err) {
-      return handleError(c, err);
     }
+    scopes.sort();
+    return c.json({ scopes }, 200);
   });
 
   // List secret key names in a scope (no values)
-  app.get('/api/v1/admin/secrets/keys', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.read');
-      const orgId = c.req.query('orgId');
-      const scope = c.req.query('scope');
-      if (!orgId || !scope) return c.json({ error: 'orgId and scope required' }, 400);
-      const resolved = await routeScope(scope);
-      const keys = await resolved.store.listKeys(orgId, resolved.path);
-      return c.json({ keys }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+  app.get('/api/v1/admin/secrets/keys', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    const orgId = c.req.query('orgId');
+    const scope = c.req.query('scope');
+    if (!orgId || !scope) return c.json({ error: 'orgId and scope required' }, 400);
+    const resolved = await routeScope(scope);
+    const keys = await resolved.store.listKeys(orgId, resolved.path);
+    return c.json({ keys }, 200);
   });
 
   // ── Scope CRUD (registered before generic :orgId/:scope/:key routes
   //    to avoid Hono's LinearRouter matching "scopes" as :orgId) ──
 
-  // Create empty scope
-  app.post('/api/v1/admin/secrets/scopes', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.write');
-      const body = await c.req.json();
-      const parsed = z.object({ orgId: z.string(), scope: z.string() }).parse(body);
-      const resolved = await routeScope(parsed.scope);
-      const scopeError = validateScopeName(resolved.path);
-      if (scopeError) return c.json({ error: scopeError }, 400);
-      if (!resolved.store.createScope) {
-        return c.json(
-          { error: `Backend '${resolved.backendName}' does not support scope creation` },
-          400,
-        );
-      }
-      await resolved.store.createScope(parsed.orgId, resolved.path);
-
-      await deps.auditLogger.log({
-        action: 'createScope',
-        // Recorded exactly as the caller sent it — see setSecret below.
-        contextName: parsed.scope,
-        routingKey: null,
-        secretKeys: null,
-        outcome: 'allowed',
-        runId: null,
-        jobId: null,
-        userId: c.get('userId'),
-        role: c.get('role'),
-        metadata: { orgId: parsed.orgId },
-      });
-
-      return c.json({ created: true }, 200);
-    } catch (err) {
-      return handleError(c, err);
+  app.post('/api/v1/admin/secrets/scopes', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.write');
+    const body = await c.req.json();
+    const parsed = z.object({ orgId: z.string(), scope: z.string() }).parse(body);
+    const resolved = await routeScope(parsed.scope);
+    const scopeError = validateScopeName(resolved.path);
+    if (scopeError) return c.json({ error: scopeError }, 400);
+    if (!resolved.store.createScope) {
+      return c.json(
+        { error: `Backend '${resolved.backendName}' does not support scope creation` },
+        400,
+      );
     }
+    await resolved.store.createScope(parsed.orgId, resolved.path);
+
+    await deps.auditLogger.log({
+      action: 'createScope',
+      // Recorded exactly as the caller sent it — see setSecret below.
+      contextName: parsed.scope,
+      routingKey: null,
+      secretKeys: null,
+      outcome: 'allowed',
+      runId: null,
+      jobId: null,
+      userId: c.get('userId'),
+      role: c.get('role'),
+      metadata: { orgId: parsed.orgId },
+    });
+
+    return c.json({ created: true }, 200);
   });
 
-  // Rename scope
-  app.put('/api/v1/admin/secrets/scopes/rename', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.write');
-      const body = await c.req.json();
-      const parsed = z
-        .object({ orgId: z.string(), oldScope: z.string(), newScope: z.string() })
-        .parse(body);
-      const stores = await loadStores();
-      const from = resolveScope(parsed.oldScope, stores, deps.secretStore);
-      const to = resolveScope(parsed.newScope, stores, deps.secretStore);
-      // A rename is a per-backend operation — the source store re-encrypts each
-      // row under the new scope's AAD. Moving a scope BETWEEN backends is a
-      // copy plus a delete, which this route does not perform, so reject it
-      // outright rather than silently renaming inside the source backend.
-      if (from.backendName !== to.backendName) {
-        return c.json(
-          {
-            error:
-              `Cannot rename a scope across backends ` +
-              `('${from.backendName}' -> '${to.backendName}'). ` +
-              `Recreate the secrets in the destination backend instead.`,
-          },
-          400,
-        );
-      }
-      // Validate only the destination name — renaming a pre-existing malformed
-      // scope to a conforming one is the built-in cleanup path.
-      const scopeError = validateScopeName(to.path);
-      if (scopeError) return c.json({ error: scopeError }, 400);
-      if (!from.store.renameScope) {
-        return c.json(
-          { error: `Backend '${from.backendName}' does not support scope rename` },
-          400,
-        );
-      }
-      await from.store.renameScope(parsed.orgId, from.path, to.path);
-
-      await deps.auditLogger.log({
-        action: 'renameScope',
-        // The row files under the scope's old name, so `kici-admin audit
-        // --context <old>` ends that scope's history with the rename; the new
-        // name rides in the metadata.
-        contextName: parsed.oldScope,
-        routingKey: null,
-        secretKeys: null,
-        outcome: 'allowed',
-        runId: null,
-        jobId: null,
-        userId: c.get('userId'),
-        role: c.get('role'),
-        metadata: { orgId: parsed.orgId, newScope: parsed.newScope },
-      });
-
-      return c.json({ renamed: true }, 200);
-    } catch (err) {
-      return handleError(c, err);
+  app.put('/api/v1/admin/secrets/scopes/rename', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.write');
+    const body = await c.req.json();
+    const parsed = z
+      .object({ orgId: z.string(), oldScope: z.string(), newScope: z.string() })
+      .parse(body);
+    const stores = await loadStores();
+    const from = resolveScope(parsed.oldScope, stores, deps.secretStore);
+    const to = resolveScope(parsed.newScope, stores, deps.secretStore);
+    // A rename is a per-backend operation — the source store re-encrypts each
+    // row under the new scope's AAD. Moving a scope BETWEEN backends is a
+    // copy plus a delete, which this route does not perform, so reject it
+    // outright rather than silently renaming inside the source backend.
+    if (from.backendName !== to.backendName) {
+      return c.json(
+        {
+          error:
+            `Cannot rename a scope across backends ` +
+            `('${from.backendName}' -> '${to.backendName}'). ` +
+            `Recreate the secrets in the destination backend instead.`,
+        },
+        400,
+      );
     }
+    // Validate only the destination name — renaming a pre-existing malformed
+    // scope to a conforming one is the built-in cleanup path.
+    const scopeError = validateScopeName(to.path);
+    if (scopeError) return c.json({ error: scopeError }, 400);
+    if (!from.store.renameScope) {
+      return c.json({ error: `Backend '${from.backendName}' does not support scope rename` }, 400);
+    }
+    await from.store.renameScope(parsed.orgId, from.path, to.path);
+
+    await deps.auditLogger.log({
+      action: 'renameScope',
+      // The row files under the scope's old name, so `kici-admin audit
+      // --context <old>` ends that scope's history with the rename; the new
+      // name rides in the metadata.
+      contextName: parsed.oldScope,
+      routingKey: null,
+      secretKeys: null,
+      outcome: 'allowed',
+      runId: null,
+      jobId: null,
+      userId: c.get('userId'),
+      role: c.get('role'),
+      metadata: { orgId: parsed.orgId, newScope: parsed.newScope },
+    });
+
+    return c.json({ renamed: true }, 200);
   });
 
-  // Delete scope and all its secrets
-  app.delete('/api/v1/admin/secrets/scopes/:orgId/:scope', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.delete');
-      const orgId = c.req.param('orgId');
-      const scope = c.req.param('scope');
-      const resolved = await routeScope(scope);
-      if (!resolved.store.deleteScope) {
-        return c.json(
-          { error: `Backend '${resolved.backendName}' does not support scope deletion` },
-          400,
-        );
-      }
-      await resolved.store.deleteScope(orgId, resolved.path);
-
-      await deps.auditLogger.log({
-        action: 'deleteScope',
-        // Recorded exactly as the caller sent it — see setSecret below.
-        contextName: scope,
-        routingKey: null,
-        secretKeys: null,
-        outcome: 'allowed',
-        runId: null,
-        jobId: null,
-        userId: c.get('userId'),
-        role: c.get('role'),
-        metadata: { orgId },
-      });
-
-      return c.json({ deleted: true }, 200);
-    } catch (err) {
-      return handleError(c, err);
+  app.delete('/api/v1/admin/secrets/scopes/:orgId/:scope', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.delete');
+    const orgId = c.req.param('orgId');
+    const scope = c.req.param('scope');
+    const resolved = await routeScope(scope);
+    if (!resolved.store.deleteScope) {
+      return c.json(
+        { error: `Backend '${resolved.backendName}' does not support scope deletion` },
+        400,
+      );
     }
+    await resolved.store.deleteScope(orgId, resolved.path);
+
+    await deps.auditLogger.log({
+      action: 'deleteScope',
+      // Recorded exactly as the caller sent it — see setSecret below.
+      contextName: scope,
+      routingKey: null,
+      secretKeys: null,
+      outcome: 'allowed',
+      runId: null,
+      jobId: null,
+      userId: c.get('userId'),
+      role: c.get('role'),
+      metadata: { orgId },
+    });
+
+    return c.json({ deleted: true }, 200);
   });
 
-  // Set scoped secret
-  app.put('/api/v1/admin/secrets/:orgId/:scope/:key', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.write');
-      const body = await c.req.json();
-      const parsed = setScopedSecretSchema.parse(body);
-      const orgId = c.req.param('orgId');
-      const scope = c.req.param('scope');
-      const key = c.req.param('key');
-      const resolved = await routeScope(scope);
-      const scopeError = validateScopeName(resolved.path);
-      if (scopeError) return c.json({ error: scopeError }, 400);
-      // Write-path only. A `:` in the key would make the at-rest AAD
-      // `orgId:scope:key` ambiguous, so two locations could share one binding.
-      // Read and delete stay unvalidated so a key stored before this rule
-      // remains readable and deletable.
-      const keyError = validateSecretKey(key);
-      if (keyError) return c.json({ error: keyError }, 400);
-      await resolved.store.setSecret(orgId, resolved.path, key, parsed.value);
+  app.put('/api/v1/admin/secrets/:orgId/:scope/:key', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.write');
+    const body = await c.req.json();
+    const parsed = setScopedSecretSchema.parse(body);
+    const orgId = c.req.param('orgId');
+    const scope = c.req.param('scope');
+    const key = c.req.param('key');
+    const resolved = await routeScope(scope);
+    const scopeError = validateScopeName(resolved.path);
+    if (scopeError) return c.json({ error: scopeError }, 400);
+    // Write-path only. A `:` in the key would make the at-rest AAD
+    // `orgId:scope:key` ambiguous, so two locations could share one binding.
+    // Read and delete stay unvalidated so a key stored before this rule
+    // remains readable and deletable.
+    const keyError = validateSecretKey(key);
+    if (keyError) return c.json({ error: keyError }, 400);
+    await resolved.store.setSecret(orgId, resolved.path, key, parsed.value);
 
-      await deps.auditLogger.log({
-        action: 'setSecret',
-        // The scope exactly as the caller sent it. The audit filter matches
-        // `context_name` exactly, so normalising an unqualified scope into its
-        // `pg:` form would hide the row from `kici-admin audit --context <s>`
-        // and split one scope's history across two spellings at the upgrade.
-        contextName: scope,
-        routingKey: null,
-        secretKeys: [key],
-        outcome: 'allowed',
-        runId: null,
-        jobId: null,
-        userId: c.get('userId'),
-        role: c.get('role'),
-        metadata: { orgId },
-      });
+    await deps.auditLogger.log({
+      action: 'setSecret',
+      // The scope exactly as the caller sent it. The audit filter matches
+      // `context_name` exactly, so normalising an unqualified scope into its
+      // `pg:` form would hide the row from `kici-admin audit --context <s>`
+      // and split one scope's history across two spellings at the upgrade.
+      contextName: scope,
+      routingKey: null,
+      secretKeys: [key],
+      outcome: 'allowed',
+      runId: null,
+      jobId: null,
+      userId: c.get('userId'),
+      role: c.get('role'),
+      metadata: { orgId },
+    });
 
-      return c.json({ set: true }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json({ set: true }, 200);
   });
 
-  // Delete scoped secret
-  app.delete('/api/v1/admin/secrets/:orgId/:scope/:key', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'secret.delete');
-      const orgId = c.req.param('orgId');
-      const scope = c.req.param('scope');
-      const key = c.req.param('key');
-      const resolved = await routeScope(scope);
-      await resolved.store.deleteSecret(orgId, resolved.path, key);
+  app.delete('/api/v1/admin/secrets/:orgId/:scope/:key', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.delete');
+    const orgId = c.req.param('orgId');
+    const scope = c.req.param('scope');
+    const key = c.req.param('key');
+    const resolved = await routeScope(scope);
+    await resolved.store.deleteSecret(orgId, resolved.path, key);
 
-      await deps.auditLogger.log({
-        action: 'deleteSecret',
-        // Recorded exactly as the caller sent it — see setSecret above.
-        contextName: scope,
-        routingKey: null,
-        secretKeys: [key],
-        outcome: 'allowed',
-        runId: null,
-        jobId: null,
-        userId: c.get('userId'),
-        role: c.get('role'),
-        metadata: { orgId },
-      });
+    await deps.auditLogger.log({
+      action: 'deleteSecret',
+      // Recorded exactly as the caller sent it — see setSecret above.
+      contextName: scope,
+      routingKey: null,
+      secretKeys: [key],
+      outcome: 'allowed',
+      runId: null,
+      jobId: null,
+      userId: c.get('userId'),
+      role: c.get('role'),
+      metadata: { orgId },
+    });
 
-      return c.json({ deleted: true }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json({ deleted: true }, 200);
   });
 
   // ── Key rotation ────────────────────────────────────────────────
 
-  app.post('/api/v1/admin/rotate-key', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'key.rotate');
-      // Two sequential transactions — secrets first, then config. Keeps the
-      // secrets rotation atomic on its own so a config-rotation bug can't
-      // roll back a successful secrets rotation. Both are idempotent, so on
-      // partial failure the operator just re-runs `rotate-key`.
-      const secretsResult = await deps.secretStore.rotateKey();
-      const configsResult = deps.sharedStore
-        ? await deps.sharedStore.rotateKey()
-        : { reEncrypted: 0, skipped: 0 };
-      // Third sweep: external secret-backend configs, in their own transaction
-      // so a backend bug can't roll back a good scoped_secrets rotation. Same
-      // skip-and-count discipline as the config sweep.
-      const backendsResult = deps.backendRegistry
-        ? await deps.backendRegistry.rotateKey()
-        : { reEncrypted: 0, skipped: 0 };
-      // Sweeps four through eight: the provenance signing key, the
-      // dashboard-encryption key, run ephemeral keys, stored secret outputs and
-      // the sealed secrets of stored jobs.
-      // Each has its own transaction for the same reason as the three above.
-      // Leaving them out is what made the published rotation procedure
-      // destructive: dropping the old key stranded every one of them, and for
-      // the signing key that means the next boot throws.
-      const wrapped =
-        deps.masterKeys && deps.db
-          ? await rotateMasterKeyWrappedTables(deps.db, deps.masterKeys, (message, meta) =>
-              logger.warn(message, meta),
-            )
-          : {
-              signingKeys: { reEncrypted: 0, skipped: 0 },
-              dashboardKeys: { reEncrypted: 0, skipped: 0 },
-              ephemeralKeys: { reEncrypted: 0, skipped: 0 },
-              secretOutputs: { reEncrypted: 0, skipped: 0 },
-              jobSecrets: { reEncrypted: 0, skipped: 0 },
-            };
-      await deps.auditLogger.log({
-        action: 'rotateKey',
-        contextName: '*',
-        routingKey: null,
-        secretKeys: null,
-        outcome: 'allowed',
-        runId: null,
-        jobId: null,
-        userId: c.get('userId'),
-        role: c.get('role'),
-        metadata: {
-          reEncrypted: secretsResult.reEncrypted,
-          reEncryptedConfigs: configsResult.reEncrypted,
-          skippedConfigs: configsResult.skipped,
-          reEncryptedBackends: backendsResult.reEncrypted,
-          skippedBackends: backendsResult.skipped,
-          reEncryptedSigningKeys: wrapped.signingKeys.reEncrypted,
-          skippedSigningKeys: wrapped.signingKeys.skipped,
-          reEncryptedDashboardKeys: wrapped.dashboardKeys.reEncrypted,
-          skippedDashboardKeys: wrapped.dashboardKeys.skipped,
-          reEncryptedEphemeralKeys: wrapped.ephemeralKeys.reEncrypted,
-          skippedEphemeralKeys: wrapped.ephemeralKeys.skipped,
-          reEncryptedSecretOutputs: wrapped.secretOutputs.reEncrypted,
-          skippedSecretOutputs: wrapped.secretOutputs.skipped,
-          reEncryptedJobSecrets: wrapped.jobSecrets.reEncrypted,
-          skippedJobSecrets: wrapped.jobSecrets.skipped,
-        },
-      });
-      return c.json(
-        {
-          reEncrypted: secretsResult.reEncrypted,
-          reEncryptedConfigs: configsResult.reEncrypted,
-          skippedConfigs: configsResult.skipped,
-          reEncryptedBackends: backendsResult.reEncrypted,
-          skippedBackends: backendsResult.skipped,
-          reEncryptedSigningKeys: wrapped.signingKeys.reEncrypted,
-          skippedSigningKeys: wrapped.signingKeys.skipped,
-          reEncryptedDashboardKeys: wrapped.dashboardKeys.reEncrypted,
-          skippedDashboardKeys: wrapped.dashboardKeys.skipped,
-          reEncryptedEphemeralKeys: wrapped.ephemeralKeys.reEncrypted,
-          skippedEphemeralKeys: wrapped.ephemeralKeys.skipped,
-          reEncryptedSecretOutputs: wrapped.secretOutputs.reEncrypted,
-          skippedSecretOutputs: wrapped.secretOutputs.skipped,
-          reEncryptedJobSecrets: wrapped.jobSecrets.reEncrypted,
-          skippedJobSecrets: wrapped.jobSecrets.skipped,
-        },
-        200,
-      );
-    } catch (err) {
-      return handleError(c, err);
-    }
+  app.post('/api/v1/admin/rotate-key', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'key.rotate');
+    // Two sequential transactions — secrets first, then config. Keeps the
+    // secrets rotation atomic on its own so a config-rotation bug can't
+    // roll back a successful secrets rotation. Both are idempotent, so on
+    // partial failure the operator just re-runs `rotate-key`.
+    const secretsResult = await deps.secretStore.rotateKey();
+    const configsResult = deps.sharedStore
+      ? await deps.sharedStore.rotateKey()
+      : { reEncrypted: 0, skipped: 0 };
+    // Third sweep: external secret-backend configs, in their own transaction
+    // so a backend bug can't roll back a good scoped_secrets rotation. Same
+    // skip-and-count discipline as the config sweep.
+    const backendsResult = deps.backendRegistry
+      ? await deps.backendRegistry.rotateKey()
+      : { reEncrypted: 0, skipped: 0 };
+    // Sweeps four through eight: the provenance signing key, the
+    // dashboard-encryption key, run ephemeral keys, stored secret outputs and
+    // the sealed secrets of stored jobs.
+    // Each has its own transaction for the same reason as the three above.
+    // Leaving them out is what made the published rotation procedure
+    // destructive: dropping the old key stranded every one of them, and for
+    // the signing key that means the next boot throws.
+    const wrapped =
+      deps.masterKeys && deps.db
+        ? await rotateMasterKeyWrappedTables(deps.db, deps.masterKeys, (message, meta) =>
+            logger.warn(message, meta),
+          )
+        : {
+            signingKeys: { reEncrypted: 0, skipped: 0 },
+            dashboardKeys: { reEncrypted: 0, skipped: 0 },
+            ephemeralKeys: { reEncrypted: 0, skipped: 0 },
+            secretOutputs: { reEncrypted: 0, skipped: 0 },
+            jobSecrets: { reEncrypted: 0, skipped: 0 },
+          };
+    await deps.auditLogger.log({
+      action: 'rotateKey',
+      contextName: '*',
+      routingKey: null,
+      secretKeys: null,
+      outcome: 'allowed',
+      runId: null,
+      jobId: null,
+      userId: c.get('userId'),
+      role: c.get('role'),
+      metadata: {
+        reEncrypted: secretsResult.reEncrypted,
+        reEncryptedConfigs: configsResult.reEncrypted,
+        skippedConfigs: configsResult.skipped,
+        reEncryptedBackends: backendsResult.reEncrypted,
+        skippedBackends: backendsResult.skipped,
+        reEncryptedSigningKeys: wrapped.signingKeys.reEncrypted,
+        skippedSigningKeys: wrapped.signingKeys.skipped,
+        reEncryptedDashboardKeys: wrapped.dashboardKeys.reEncrypted,
+        skippedDashboardKeys: wrapped.dashboardKeys.skipped,
+        reEncryptedEphemeralKeys: wrapped.ephemeralKeys.reEncrypted,
+        skippedEphemeralKeys: wrapped.ephemeralKeys.skipped,
+        reEncryptedSecretOutputs: wrapped.secretOutputs.reEncrypted,
+        skippedSecretOutputs: wrapped.secretOutputs.skipped,
+        reEncryptedJobSecrets: wrapped.jobSecrets.reEncrypted,
+        skippedJobSecrets: wrapped.jobSecrets.skipped,
+      },
+    });
+    return c.json(
+      {
+        reEncrypted: secretsResult.reEncrypted,
+        reEncryptedConfigs: configsResult.reEncrypted,
+        skippedConfigs: configsResult.skipped,
+        reEncryptedBackends: backendsResult.reEncrypted,
+        skippedBackends: backendsResult.skipped,
+        reEncryptedSigningKeys: wrapped.signingKeys.reEncrypted,
+        skippedSigningKeys: wrapped.signingKeys.skipped,
+        reEncryptedDashboardKeys: wrapped.dashboardKeys.reEncrypted,
+        skippedDashboardKeys: wrapped.dashboardKeys.skipped,
+        reEncryptedEphemeralKeys: wrapped.ephemeralKeys.reEncrypted,
+        skippedEphemeralKeys: wrapped.ephemeralKeys.skipped,
+        reEncryptedSecretOutputs: wrapped.secretOutputs.reEncrypted,
+        skippedSecretOutputs: wrapped.secretOutputs.skipped,
+        reEncryptedJobSecrets: wrapped.jobSecrets.reEncrypted,
+        skippedJobSecrets: wrapped.jobSecrets.skipped,
+      },
+      200,
+    );
   });
 
   // ── Audit log ───────────────────────────────────────────────────
 
   app.get('/api/v1/admin/audit', async (c) => {
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'audit.read');
-      const tokenRoutingKey = c.get('routingKey');
-      const requestedRoutingKey = c.req.query('routingKey') ?? undefined;
-      // Routing-key-scoped tokens can only read audit rows that match
-      // their scope. If the caller asked for a different routing key,
-      // refuse; otherwise force the filter so unfiltered queries don't
-      // leak rows from other routing keys.
-      if (tokenRoutingKey) {
-        if (requestedRoutingKey && requestedRoutingKey !== tokenRoutingKey) {
-          const denied = enforceRoutingKeyScope(c, requestedRoutingKey);
-          if (denied) return denied;
-        }
+    deps.rbac.requirePermission(c.get('role'), 'audit.read');
+    const tokenRoutingKey = c.get('routingKey');
+    const requestedRoutingKey = c.req.query('routingKey') ?? undefined;
+    // Routing-key-scoped tokens can only read audit rows that match
+    // their scope. If the caller asked for a different routing key,
+    // refuse; otherwise force the filter so unfiltered queries don't
+    // leak rows from other routing keys.
+    if (tokenRoutingKey) {
+      if (requestedRoutingKey && requestedRoutingKey !== tokenRoutingKey) {
+        const denied = enforceRoutingKeyScope(c, requestedRoutingKey);
+        if (denied) return denied;
       }
-      const effectiveRoutingKey = tokenRoutingKey ?? requestedRoutingKey;
-      const query = {
-        contextName: c.req.query('contextName') ?? undefined,
-        routingKey: effectiveRoutingKey,
-        action: c.req.query('action') ?? undefined,
-        from: c.req.query('from') ? new Date(c.req.query('from')!) : undefined,
-        to: c.req.query('to') ? new Date(c.req.query('to')!) : undefined,
-        limit: c.req.query('limit') ? parseInt(c.req.query('limit')!, 10) : 100,
-        offset: c.req.query('offset') ? parseInt(c.req.query('offset')!, 10) : undefined,
-        // Opt-in: include archived rows from cold-store.
-        includeArchived: c.req.query('includeArchived') === 'true',
-      };
-      const entries = await deps.auditLogger.query(query);
-      return c.json({ entries }, 200);
-    } catch (err) {
-      return handleError(c, err);
     }
+    const effectiveRoutingKey = tokenRoutingKey ?? requestedRoutingKey;
+    const query = {
+      contextName: c.req.query('contextName') ?? undefined,
+      routingKey: effectiveRoutingKey,
+      action: c.req.query('action') ?? undefined,
+      from: c.req.query('from') ? new Date(c.req.query('from')!) : undefined,
+      to: c.req.query('to') ? new Date(c.req.query('to')!) : undefined,
+      limit: c.req.query('limit') ? parseInt(c.req.query('limit')!, 10) : 100,
+      offset: c.req.query('offset') ? parseInt(c.req.query('offset')!, 10) : undefined,
+      // Opt-in: include archived rows from cold-store.
+      includeArchived: c.req.query('includeArchived') === 'true',
+    };
+    const entries = await deps.auditLogger.query(query);
+    return c.json({ entries }, 200);
   });
 
   // ── Token management ────────────────────────────────────────────
 
-  // Create token
-  app.post('/api/v1/admin/tokens', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      const body = await c.req.json();
-      const parsed = createTokenSchema.parse(body);
-      const result = await deps.tokenManager.generateToken(
-        parsed.label,
-        parsed.role,
-        parsed.routingKey,
-        parsed.expiresAt ? new Date(parsed.expiresAt) : undefined,
-        parsed.subject,
-      );
-      return c.json({ token: result.token, id: result.id }, 201);
-    } catch (err) {
-      return handleError(c, err);
-    }
+  app.post('/api/v1/admin/tokens', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    const body = await c.req.json();
+    const parsed = createTokenSchema.parse(body);
+    const result = await deps.tokenManager.generateToken(
+      parsed.label,
+      parsed.role,
+      parsed.routingKey,
+      parsed.expiresAt ? new Date(parsed.expiresAt) : undefined,
+      parsed.subject,
+    );
+    return c.json({ token: result.token, id: result.id }, 201);
   });
 
   // List tokens (without hashes)
-  app.get('/api/v1/admin/tokens', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      const tokens = await deps.tokenManager.listTokens();
-      return c.json({ tokens }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+  app.get('/api/v1/admin/tokens', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    const tokens = await deps.tokenManager.listTokens();
+    return c.json({ tokens }, 200);
   });
 
-  // Revoke token
-  app.delete('/api/v1/admin/tokens/:id', async (c) => {
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      await deps.tokenManager.revokeToken(c.req.param('id'));
-      return c.json({ revoked: true }, 200);
-    } catch (err) {
-      return handleError(c, err);
-    }
+  app.delete('/api/v1/admin/tokens/:id', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    await deps.tokenManager.revokeToken(c.req.param('id'));
+    return c.json({ revoked: true }, 200);
   });
 
   // ── Agent Token CRUD ──────────────────────────────────────────────
@@ -764,34 +684,30 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     if (!deps.tokenStore) {
       return c.json({ error: 'Agent token management not available' }, 503);
     }
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      const body = await c.req.json().catch(() => ({}));
-      const parsed = createAgentTokenSchema.parse(body);
-      const result = await deps.tokenStore.createStatic({
-        labels: parsed.labels,
-        mandatoryLabels: parsed.mandatoryLabels,
-        createdBy: parsed.createdBy ?? c.get('userId'),
-      });
-      // Fetch the created row for full response (without hash)
-      const tokens = await deps.tokenStore.list();
-      const created = tokens.find((t) => t.id === result.id);
-      return c.json(
-        {
-          id: result.id,
-          token: result.token,
-          tokenPrefix: created?.token_prefix ?? result.token.slice(0, 12),
-          labels: parsed.labels ?? [],
-          agentType: 'static',
-          createdAt: created?.created_at ?? new Date().toISOString(),
-        },
-        201,
-      );
-    } catch (err) {
-      return handleError(c, err);
-    }
+    const denied = requireUnscopedToken(c);
+    if (denied) return denied;
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = createAgentTokenSchema.parse(body);
+    const result = await deps.tokenStore.createStatic({
+      labels: parsed.labels,
+      mandatoryLabels: parsed.mandatoryLabels,
+      createdBy: parsed.createdBy ?? c.get('userId'),
+    });
+    // Fetch the created row for full response (without hash)
+    const tokens = await deps.tokenStore.list();
+    const created = tokens.find((t) => t.id === result.id);
+    return c.json(
+      {
+        id: result.id,
+        token: result.token,
+        tokenPrefix: created?.token_prefix ?? result.token.slice(0, 12),
+        labels: parsed.labels ?? [],
+        agentType: 'static',
+        createdAt: created?.created_at ?? new Date().toISOString(),
+      },
+      201,
+    );
   });
 
   // List agent tokens (non-revoked)
@@ -799,26 +715,22 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     if (!deps.tokenStore) {
       return c.json({ error: 'Agent token management not available' }, 503);
     }
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      const typeFilter = c.req.query('type') ?? undefined;
-      const tokens = await deps.tokenStore.list(typeFilter ? { agentType: typeFilter } : undefined);
-      return c.json({
-        tokens: tokens.map((t) => ({
-          id: t.id,
-          tokenPrefix: t.token_prefix,
-          labels: t.labels ? (typeof t.labels === 'string' ? JSON.parse(t.labels) : t.labels) : [],
-          agentType: t.agent_type,
-          createdAt: t.created_at,
-          lastSeenAt: t.last_seen_at,
-          expiresAt: t.expires_at,
-        })),
-      });
-    } catch (err) {
-      return handleError(c, err);
-    }
+    const denied = requireUnscopedToken(c);
+    if (denied) return denied;
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    const typeFilter = c.req.query('type') ?? undefined;
+    const tokens = await deps.tokenStore.list(typeFilter ? { agentType: typeFilter } : undefined);
+    return c.json({
+      tokens: tokens.map((t) => ({
+        id: t.id,
+        tokenPrefix: t.token_prefix,
+        labels: t.labels ? (typeof t.labels === 'string' ? JSON.parse(t.labels) : t.labels) : [],
+        agentType: t.agent_type,
+        createdAt: t.created_at,
+        lastSeenAt: t.last_seen_at,
+        expiresAt: t.expires_at,
+      })),
+    });
   });
 
   // Revoke agent token
@@ -833,29 +745,25 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       // data-plane authority until it disconnected.
       return c.json({ error: 'Agent registry not available' }, 503);
     }
-    try {
-      const denied = requireUnscopedToken(c);
-      if (denied) return denied;
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      const id = c.req.param('id');
-      const revoked = await deps.tokenStore.revoke(id);
-      if (!revoked) {
-        return c.json({ error: 'Agent token not found or already revoked' }, 404);
-      }
-      // Synchronous local kick: close every in-flight WS authenticated
-      // under this token before responding so the operator's CLI
-      // feedback reflects what actually happened on the wire.
-      const kicked = deps.agentRegistry.disconnectByTokenId(id);
-      // Fan out the revoke to every peer in a clustered orchestrator so
-      // each peer kicks its own in-flight WS for the same token. The
-      // helper is unset on standalone deployments — the local kick is
-      // sufficient there.
-      deps.broadcastAgentTokenRevoke?.(id);
-      logger.info('Agent token revoked', { tokenId: id, kicked });
-      return c.json({ kicked }, 200);
-    } catch (err) {
-      return handleError(c, err);
+    const denied = requireUnscopedToken(c);
+    if (denied) return denied;
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    const id = c.req.param('id');
+    const revoked = await deps.tokenStore.revoke(id);
+    if (!revoked) {
+      return c.json({ error: 'Agent token not found or already revoked' }, 404);
     }
+    // Synchronous local kick: close every in-flight WS authenticated
+    // under this token before responding so the operator's CLI
+    // feedback reflects what actually happened on the wire.
+    const kicked = deps.agentRegistry.disconnectByTokenId(id);
+    // Fan out the revoke to every peer in a clustered orchestrator so
+    // each peer kicks its own in-flight WS for the same token. The
+    // helper is unset on standalone deployments — the local kick is
+    // sufficient there.
+    deps.broadcastAgentTokenRevoke?.(id);
+    logger.info('Agent token revoked', { tokenId: id, kicked });
+    return c.json({ kicked }, 200);
   });
 
   // ── Join token management ──────────────────────────────────────────
@@ -865,27 +773,23 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     if (!deps.joinTokenManager) {
       return c.json({ error: 'Join token management not available' }, 503);
     }
-    try {
-      deps.rbac.requirePermission(c.get('role'), 'token.manage');
-      const body = await c.req.json();
-      const parsed = createJoinTokenSchema.parse(body);
-      const denied = enforceRoutingKeyScope(c, parsed.routingKey);
-      if (denied) return denied;
-      const token = await deps.joinTokenManager.createToken({
-        orgId: parsed.orgId,
-        routingKey: parsed.routingKey,
-        createdBy: c.get('userId'),
-        expiryMs: parsed.expiryMs,
-      });
+    deps.rbac.requirePermission(c.get('role'), 'token.manage');
+    const body = await c.req.json();
+    const parsed = createJoinTokenSchema.parse(body);
+    const denied = enforceRoutingKeyScope(c, parsed.routingKey);
+    if (denied) return denied;
+    const token = await deps.joinTokenManager.createToken({
+      orgId: parsed.orgId,
+      routingKey: parsed.routingKey,
+      createdBy: c.get('userId'),
+      expiryMs: parsed.expiryMs,
+    });
 
-      // Calculate expiry for response
-      const expiryMs = parsed.expiryMs ?? 3600_000;
-      const expiresAt = new Date(Date.now() + expiryMs).toISOString();
+    // Calculate expiry for response
+    const expiryMs = parsed.expiryMs ?? 3600_000;
+    const expiresAt = new Date(Date.now() + expiryMs).toISOString();
 
-      return c.json({ token, expiresAt }, 201);
-    } catch (err) {
-      return handleError(c, err);
-    }
+    return c.json({ token, expiresAt }, 201);
   });
 
   // Mount source management routes (optional -- only when sourceStore is provided)
@@ -1016,6 +920,20 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     app.route('/api/v1/admin', createAdminSigningKeyRoutes({ db: deps.db, rbac: deps.rbac }));
   }
 
+  // The org ids this orchestrator holds (`kici-admin org list`, the `Org:` line
+  // of `kici-admin orchestrator status`). Optional -- only when db is provided.
+  if (deps.db) {
+    const db = deps.db;
+    app.route(
+      '/api/v1/admin',
+      createAdminOrgRoutes({
+        listOrgs: () => listHeldOrgIds(db),
+        rbac: deps.rbac,
+        ...(deps.getPlatformOrgId && { getPlatformOrgId: deps.getPlatformOrgId }),
+      }),
+    );
+  }
+
   // Mount maintenance routes (queue clear, purge-stale, secrets purge).
   // Optional -- only when db is provided (never a WS-only admin).
   if (deps.db) {
@@ -1038,6 +956,19 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       '/api/v1/admin',
       createScalerOrphansRoutes({
         orphans: deps.scalerOrphans,
+        rbac: deps.rbac,
+        accessLog: deps.accessLog,
+      }),
+    );
+  }
+
+  // Reload the scaler config across the cluster (`kici-admin scaler reload`).
+  // Mounted whenever the coordinator wires it.
+  if (deps.scalerReload) {
+    app.route(
+      '/api/v1/admin',
+      createScalerReloadRoutes({
+        scalerReload: deps.scalerReload,
         rbac: deps.rbac,
         accessLog: deps.accessLog,
       }),
@@ -1074,37 +1005,33 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       } catch {
         runId = undefined;
       }
-      try {
-        // Cluster-wide mutating op: draining / re-arming the deferred-attestation
-        // outbox affects the whole orchestrator, so require an unscoped token and
-        // the dedicated attestation.retry permission (owner+admin, not auditor).
-        const denied = requireUnscopedToken(c);
-        if (denied) return denied;
-        deps.rbac.requirePermission(c.get('role'), 'attestation.retry');
-        const result = await retry({ ...(runId ? { runId } : {}), includeRejected });
-        // Audit every retry — especially the include_rejected re-arm, which
-        // clears a terminal rejection marker.
-        await deps.accessLog?.record({
-          orgId: null,
-          routingKey: null,
-          actor: { type: 'service_account' as const, id: c.get('userId') as string },
-          action: 'attestation.retry',
-          target: { type: 'attestation', id: runId ?? 'all-pending' },
-          requestId: null,
-          source: 'admin_http',
-          outcome: 'allowed',
-          meta: {
-            include_rejected: includeRejected,
-            run_id: runId ?? null,
-            minted: result.minted,
-            still_pending: result.stillPending,
-            rejected: result.rejected,
-          },
-        });
-        return c.json(result);
-      } catch (err) {
-        return handleError(c, err);
-      }
+      // Cluster-wide mutating op: draining / re-arming the deferred-attestation
+      // outbox affects the whole orchestrator, so require an unscoped token and
+      // the dedicated attestation.retry permission (owner+admin, not auditor).
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
+      deps.rbac.requirePermission(c.get('role'), 'attestation.retry');
+      const result = await retry({ ...(runId ? { runId } : {}), includeRejected });
+      // Audit every retry — especially the include_rejected re-arm, which
+      // clears a terminal rejection marker.
+      await deps.accessLog?.record({
+        orgId: null,
+        routingKey: null,
+        actor: { type: 'service_account' as const, id: c.get('userId') as string },
+        action: 'attestation.retry',
+        target: { type: 'attestation', id: runId ?? 'all-pending' },
+        requestId: null,
+        source: 'admin_http',
+        outcome: 'allowed',
+        meta: {
+          include_rejected: includeRejected,
+          run_id: runId ?? null,
+          minted: result.minted,
+          still_pending: result.stillPending,
+          rejected: result.rejected,
+        },
+      });
+      return c.json(result);
     });
   }
 
@@ -1121,8 +1048,4 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   }
 
   return app;
-}
-
-function handleError(c: any, err: unknown) {
-  return handleAdminError(c, err, logger);
 }

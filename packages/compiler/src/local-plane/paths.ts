@@ -3,11 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 /**
- * On-disk layout version of the local dev plane. Bumped when the state-dir
- * structure changes incompatibly, so a stamped plane from an older layout is
- * recreated rather than reused.
+ * On-disk layout version of the local dev plane. Bumped when a plane an older
+ * build stamped cannot be reused — an incompatible state-dir layout, or an
+ * orchestrator database this build cannot migrate — so it is recreated rather
+ * than reused.
  */
-export const PLANE_STAMP_VERSION = 3;
+export const PLANE_STAMP_VERSION = 5;
 
 /**
  * Root directory of the local dev plane's state, following the same

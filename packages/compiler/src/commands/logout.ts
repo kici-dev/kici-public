@@ -22,7 +22,7 @@ import { planeStatus, detachPlane } from '../local-plane/plane-manager.js';
 export async function logoutCommand(): Promise<boolean> {
   const config = await loadGlobalConfig();
 
-  if (!config.pat && !config.token) {
+  if (!config.pat) {
     console.log(pc.gray('Not logged in.'));
     return true;
   }
@@ -72,7 +72,6 @@ export async function logoutCommand(): Promise<boolean> {
   delete cleanConfig.patExpiresAt;
   delete cleanConfig.userEmail;
   delete cleanConfig.activeOrgId;
-  delete cleanConfig.token;
 
   await saveGlobalConfig(cleanConfig);
 

@@ -20,14 +20,14 @@ import type { Kysely } from 'kysely';
 import { createLogger } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
-import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { RbacEnforcer } from '../secrets/rbac.js';
 import {
   ACCESS_LOG_ACTION_TRIGGER,
   OrchestratorScheduledJobName,
   findOrchestratorScheduledJob,
 } from '../queue/scheduled-job.js';
-import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
+import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-scheduled-jobs' });
 
@@ -37,16 +37,8 @@ export interface AdminScheduledJobsRoutesDeps {
   rbac: RbacEnforcer;
 }
 
-type AdminEnv = {
-  Variables: {
-    role: Role;
-    userId: string;
-    routingKey: string | null;
-  };
-};
-
 export function createAdminScheduledJobsRoutes(deps: AdminScheduledJobsRoutesDeps): Hono<AdminEnv> {
-  const app = new Hono<AdminEnv>();
+  const app = createAdminApp(logger);
 
   const authMiddleware = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
@@ -54,9 +46,7 @@ export function createAdminScheduledJobsRoutes(deps: AdminScheduledJobsRoutesDep
   });
   app.use('/api/v1/admin/scheduled-jobs/*', authMiddleware);
 
-  app.post('/api/v1/admin/scheduled-jobs/:name/trigger', async (c) => {
-    const denied = requireUnscopedToken(c);
-    if (denied) return denied;
+  app.post('/api/v1/admin/scheduled-jobs/:name/trigger', requireUnscoped, async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'scheduled_job.trigger');
     } catch (err) {

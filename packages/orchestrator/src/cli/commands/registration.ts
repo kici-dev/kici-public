@@ -26,19 +26,14 @@ import {
   type WorkflowRegistrationRow,
   type ShowRegistrationResult,
 } from '@kici-dev/shared';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
-
-function parseIntOption(raw: string | undefined, label: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || Math.floor(n) !== n) {
-    throw new Error(`${label}: must be an integer (got "${raw}")`);
-  }
-  return n;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  parseIntOption,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+  printJsonOr,
+} from './shared/cli-action.js';
 
 function printRegistrationsTable(rows: WorkflowRegistrationRow[]): void {
   if (rows.length === 0) {
@@ -93,10 +88,10 @@ export function registerRegistrationCommands(
     .option('--repo <ident>', 'Filter by repo_identifier')
     .option('--trigger-type <type>', 'Filter by trigger type (in trigger_types[])')
     .option('--limit <n>', 'Max rows (default 100, max 1000)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const limit = parseIntOption(opts.limit, '--limit');
         const query = {
           customerId: opts.org,
@@ -108,8 +103,7 @@ export function registerRegistrationCommands(
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           const result = await listRegistrationsDirect(dbUrl, query);
-          if (opts.json) console.log(JSON.stringify(result));
-          else printRegistrationsTable(result.registrations);
+          printJsonOr(opts.json, result, (r) => printRegistrationsTable(r.registrations));
         } else {
           const params = new URLSearchParams();
           if (opts.org) params.set('customerId', opts.org);
@@ -124,35 +118,27 @@ export function registerRegistrationCommands(
             total?: number;
             registryVersion?: number | null;
           }>(`/api/v1/admin/registrations${qs ? `?${qs}` : ''}`);
-          if (opts.json) console.log(JSON.stringify(result));
-          else printRegistrationsTable(result.registrations);
+          printJsonOr(opts.json, result, (r) => printRegistrationsTable(r.registrations));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   reg
     .command('show <id>')
     .description('Show a single workflow_registrations row by id')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result = dbUrl
           ? await showRegistrationDirect(dbUrl, { id })
           : await getClient().get<ShowRegistrationResult>(
               `/api/v1/admin/registrations/${encodeURIComponent(id)}`,
             );
-        if (opts.json) console.log(JSON.stringify(result));
-        else printRegistrationShow(result);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+        printJsonOr(opts.json, result, (r) => printRegistrationShow(r));
+      }),
+    );
 
   registerRegistrationWriteCommands(reg, getClient);
 }
@@ -208,8 +194,8 @@ function registerRegistrationWriteCommands(reg: Command, getClient: () => AdminA
     .description('Delete a workflow registration by id')
     .option('--yes', 'Skip confirmation prompt')
     .option('--json', 'Emit JSON output')
-    .action(async (id: string, opts: { yes?: boolean; json?: boolean }) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts: { yes?: boolean; json?: boolean }) => {
         if (!opts.yes) {
           const confirmed = await confirmPrompt(
             `Are you sure you want to delete registration '${id}'? [y/N] `,
@@ -230,9 +216,6 @@ function registerRegistrationWriteCommands(reg: Command, getClient: () => AdminA
               `registry_version=${result.registryVersion}`,
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

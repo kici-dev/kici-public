@@ -16,7 +16,7 @@ import { createRerouteSpawnControl, type ScaleRequest } from './reroute-spawn-co
 const RUN = 'run-1';
 const JOB = 'job-1';
 
-function rerouteMsg(spawnRetry?: RerouteSpawnRetry): JobReroute {
+function rerouteMsg(spawnRetry: RerouteSpawnRetry): JobReroute {
   return {
     type: 'job.reroute',
     messageId: 'm-1',
@@ -33,7 +33,7 @@ function rerouteMsg(spawnRetry?: RerouteSpawnRetry): JobReroute {
     triedConnections: ['coord'],
     maxHops: 3,
     coordinatorId: 'coord',
-    ...(spawnRetry && { spawnRetry }),
+    spawnRetry,
   };
 }
 
@@ -55,10 +55,7 @@ interface Relay {
  * The worker's assembly with a real queue, tracker and dispatcher: the same
  * construction `bootstrapWorker` performs, with the scaler request faked.
  */
-async function setup(
-  spawnRetry: RerouteSpawnRetry | undefined,
-  defaults: RerouteSpawnRetry = { maxAttempts: 3, backoffMs: 1000 },
-) {
+async function setup(spawnRetry: RerouteSpawnRetry) {
   const queue = new InMemoryJobQueue();
   const forward = vi.fn();
   const executionTracker = new InMemoryExecutionTracker({ onStatusForward: forward });
@@ -82,7 +79,6 @@ async function setup(
     executionTracker,
     jobOwnership,
     sendToOwningCoord,
-    defaults,
     logger,
   });
   dispatcher = new Dispatcher({
@@ -278,14 +274,6 @@ describe('createRerouteSpawnControl', () => {
     expect(s.requestScale).toHaveBeenCalledTimes(3);
     // breaks-if-wrong: the deferral spends an attempt (one relay, one verdict).
     expect(finals(s.relays)).toEqual([false]);
-  });
-
-  it('(v) an older coordinator sends no budget: the worker default applies', async () => {
-    const s = await setup(undefined, { maxAttempts: 2, backoffMs: 1000 });
-    s.control.onScalerEvent(RUN, JOB, failed('a1'));
-    await vi.advanceTimersByTimeAsync(1000);
-    s.control.onScalerEvent(RUN, JOB, failed('a2'));
-    expect(finals(s.relays)).toEqual([false, true]);
   });
 
   it('(vi) relays carry no verdict for other events or a job an agent took', async () => {

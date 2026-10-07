@@ -21,21 +21,36 @@ function readerOver(...rows: Array<Record<string, unknown> | undefined>): Cluste
   return new ClusterSettingsReader(db, 0);
 }
 
-const DEFAULTS = { agentTokenTtlMs: 3_600_000, firecrackerApiSocketWaitMs: 30_000 };
+const DEFAULTS = {
+  agentTokenTtlMs: 3_600_000,
+  firecrackerApiSocketWaitMs: 30_000,
+  concurrencyWaitTimeoutMs: 3_600_000,
+};
 
 describe('resolveWorkerClusterSettingsSnapshot', () => {
   it('serves the stored firecracker_api_socket_wait_ms override with the row version', async () => {
     // BIGINT columns come back from PostgreSQL as strings.
     const snapshot = await resolveWorkerClusterSettingsSnapshot(
-      readerOver({ id: 'default', version: '3', firecracker_api_socket_wait_ms: '45000' }),
+      readerOver({
+        id: 'default',
+        version: '3',
+        firecracker_api_socket_wait_ms: '45000',
+        concurrency_wait_timeout_ms: '900000',
+      }),
       DEFAULTS,
     );
 
     // fails-when: the coordinator leaves the knob out of the snapshot, so a
     // DB-less worker never applies an operator's override.
+    // fails-when: the snapshot leaves out concurrency_wait_timeout_ms, so a
+    // worker-dispatched job ignores the operator's fleet-wide wait.
     expect(snapshot).toEqual({
       version: 3,
-      settings: { agentTokenTtlMs: 3_600_000, firecrackerApiSocketWaitMs: 45_000 },
+      settings: {
+        agentTokenTtlMs: 3_600_000,
+        firecrackerApiSocketWaitMs: 45_000,
+        concurrencyWaitTimeoutMs: 900_000,
+      },
     });
   });
 
@@ -53,7 +68,11 @@ describe('resolveWorkerClusterSettingsSnapshot', () => {
 
     expect(snapshot).toEqual({
       version: 4,
-      settings: { agentTokenTtlMs: 3_600_000, firecrackerApiSocketWaitMs: 45_000 },
+      settings: {
+        agentTokenTtlMs: 3_600_000,
+        firecrackerApiSocketWaitMs: 45_000,
+        concurrencyWaitTimeoutMs: 3_600_000,
+      },
     });
   });
 
@@ -64,6 +83,7 @@ describe('resolveWorkerClusterSettingsSnapshot', () => {
         version: 3,
         firecracker_api_socket_wait_ms: null,
         agent_token_ttl_ms: null,
+        concurrency_wait_timeout_ms: null,
       }),
       DEFAULTS,
     );

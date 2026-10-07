@@ -91,9 +91,9 @@ export interface TableAdapter<TRow> {
    * when another archiver replica already holds the lock. The adapter
    * owns this because the lock lives on its Kysely instance.
    *
-   * Implementations SHOULD use `pg_try_advisory_xact_lock` inside a
-   * short-lived transaction so the lock is auto-released on commit
-   * or rollback.
+   * `PgTableAdapterBase` implements it with a session lock
+   * (`pg_try_advisory_lock`) on one pinned connection, released in a
+   * `finally`, so the archive body can run its own transactions on the pool.
    */
   withPartitionLock<T>(
     args: { tenantId: string; partitionDate: string },
@@ -195,7 +195,7 @@ export interface TableAdapter<TRow> {
    *
    * Adapters that don't implement this method opt out of the per-bucket
    * layout: every chunk is written to the day-prefix root with the
-   * legacy v1 manifest and is treated as `'forever'` by the GC sweep.
+   * single-chunk (v1) manifest and is treated as `'forever'` by the GC sweep.
    * Audit-style adapters (`audit_log`, `access_log`, `secret_audit_log`)
    * implement this; the high-volume execution / event tables retain
    * their existing layout until their own retention policy is finalized.

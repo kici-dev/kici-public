@@ -8,9 +8,8 @@
  *   The agent's wire-supplied `agent.register.labels` MUST be a subset of
  *   this set; any wire label outside the token-bound scope is a token
  *   authorization failure and the WS is closed with
- *   `WS_CLOSE_AGENT_AUTH_FAILED`. `tokenRow.labels === null` is the
- *   back-compat carve-out for tokens issued before the column became an
- *   enforced authorization signal.
+ *   `WS_CLOSE_AGENT_AUTH_FAILED`. `tokenRow.labels === null` is an unscoped
+ *   token (minted without `--labels`), which carries no label constraint.
  *
  *   Without this check, a token issued for `[ci, build]` could register as
  *   `[ci, build, prod, secret-vault]` and harvest secrets resolved for the

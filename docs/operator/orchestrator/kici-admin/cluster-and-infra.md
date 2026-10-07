@@ -22,6 +22,8 @@ kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <versio
 
 Manages the orchestrator as a native system service. The `install --wizard` flow handles database setup, encryption key generation, Platform credentials, and optionally adding your first source. `--no-wizard` skips it and writes a stub env file to edit by hand. `--mode` sets the operating mode written to the env file (default `hybrid`). Lifecycle targeting is folder-anchored — see [Service installation guide](../../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
 
+`status` also prints an `Org:` line. It asks the orchestrator admin API on the instance's own address, with the admin token from `--token` or `KICI_ADMIN_TOKEN`. A Platform-attached orchestrator shows its org id. An independent orchestrator shows `none`. Without a token, the line says how to give one. `--json` carries the same answer as `org`.
+
 The `upgrade` command uses a name-scoped versioned directory layout: new versions are extracted under the resolved instance's own `<installBase>/<name>/` tree alongside old ones, and a per-instance symlink is atomically switched. Other installed instances on the host are not touched. Use `--rollback` to revert to the previous version and `--cleanup` to remove old versions (keeping current and previous). Use `--pick` to switch to any already-installed version: it lists every installed version, lets you choose one interactively (the active version is shown but not selectable), prints the change summary, and confirms before switching. Like `--rollback`, `--pick` only switches between versions already extracted under the instance's install base — it never downloads.
 
 Before it stops the service, `upgrade` takes a database dump and drains the coordinator. `--skip-backup` and `--no-drain` opt out of each step, and `--backup-dir` / `--drain-timeout` tune them. `--migrate-down` reverts the schema on a rollback whose database is ahead of the target version. `--restart-only` restarts onto a package you already installed yourself. After an upgrade, the command also packages and uploads agent payloads for the new version, unless you pass `--no-agent-packages`. See [What an upgrade does before it stops the service](../../distribution/service-installation.md#what-an-upgrade-does-before-it-stops-the-service) and [Upgrade CLI flags](../../distribution/service-installation.md#upgrade-cli-flags) for the full behavior.
@@ -90,12 +92,15 @@ Changing a knob takes effect on the running cluster without a restart — the or
 ```bash
 kici-admin scaler orphans [--target <instance-id>] [--all] [--json]
 kici-admin scaler orphans --stop [--vm <id>]... [--yes] [--dry-run] [--target <instance-id>] [--timeout <seconds>]
+kici-admin scaler reload [--single] [--timeout <seconds>] [--json]
 kici-admin scaler reap-orphans [--config <path>] [--force] [--json]
 ```
 
 `orphans` lists the live Firecracker VMs that a node's running orchestrator does not track: no in-memory VM, no spawn in progress, no registered agent, and no job bound to its agent. With no `--target`, the coordinator that `--url` names answers for its own host. With `--target`, the coordinator forwards the request to that node over the authenticated cluster connection, so one URL and one token reach every worker. `kici-admin debug-bundle --fleet --list` shows the instance ids. Each VM is `orphaned`, `unverified` (a process runs at its PID but is not provably its firecracker) or `tracked` (shown only with `--all`). While a coordinator peer of the cluster is not connected, the coordinator cannot rule out an agent registered with that peer. Every untracked VM is then `unverified`, the output names the missing peers, and `--stop` stops nothing.
 
 `--stop` shows the orphaned VMs, asks for confirmation (`--yes` skips it, `--dry-run` stops nothing), and stops exactly those VMs. It never sends an `unverified` VM. The node checks each VM again when it stops it, and refuses one that became tracked since the listing. The command exits 1 when a VM comes back as anything other than `stopped`, or when a `--vm` id is not an orphaned VM and so is never sent. Listing needs the `scaler.read` permission (owner, admin, auditor); stopping needs `scaler.manage` (owner, admin). Both need a token with no routing-key scope, and the coordinator records each stop in the access log as `scaler.orphan.stop`. See [A live VM the orchestrator does not track](../firecracker/host-setup.md#a-live-vm-the-orchestrator-does-not-track).
+
+`reload` re-reads the scaler config on the orchestrator that `--url` names and on every orchestrator connected to it, over the authenticated cluster connection. Each one applies its own `scalers.yaml` completely or not at all, and the command prints one result per orchestrator: `applied` with what changed, `rejected` with the errors (nothing applied), `not-configured`, or `unreachable`. `--single` reloads only the orchestrator `--url` names, and `--timeout` sets how long to wait for each peer (default 60 seconds). The command exits 1 when an orchestrator rejected its file or was unreachable. It needs `scaler.manage` (owner, admin) and a token with no routing-key scope, and the orchestrator records each reload in the access log as `scaler.reload`. See [Config reload](../auto-scaler/operations.md#config-reload).
 
 `reap-orphans` frees leaked Firecracker / container resources (orphaned microVMs, TAP devices, containers) without a running orchestrator. Runs locally against the host using the orchestrator config, so it is the recovery path when the orchestrator crashed and left scaler-managed resources behind. It never stops a Firecracker VM whose process still runs; use `orphans --stop` for that.
 
@@ -585,5 +590,19 @@ Synopsis: `kici-admin scaler reap-orphans [options]`
 | `--config <path>` |         | Path to the orchestrator config (default: KICI_CONFIG or /etc/kici/orchestrator.yaml) |
 | `--force`         | `false` | Reap even if the local orchestrator reports healthy                                   |
 | `--json`          | `false` | Emit machine-readable JSON counts                                                     |
+
+### `kici-admin scaler reload`
+
+Re-read the scaler config on this orchestrator and every orchestrator it is connected to, and apply each file completely or not at all
+
+Synopsis: `kici-admin scaler reload [options]`
+
+**Options**
+
+| Option                | Default | Description                                  |
+| --------------------- | ------- | -------------------------------------------- |
+| `--single`            | `false` | Reload only the orchestrator --url points at |
+| `--timeout <seconds>` | `60`    | How long to wait for each peer to answer     |
+| `--json`              | `false` | Emit machine-readable JSON                   |
 
 <!-- END GENERATED: kici-admin-cluster-and-infra -->

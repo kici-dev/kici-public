@@ -22,7 +22,7 @@ export const CONTAINER_BUILD_STEP_NAME = 'container:build';
  * A large positive constant, for two reasons that are easy to trip over:
  *
  * - `step.status` carries `z.number().int().nonnegative()`, so a negative index
- *   is not available. An agent that sent one to an OLDER orchestrator would be
+ *   is not available. An agent that sent one would be
  *   disconnected mid-job (an invalid message closes the socket), and two
  *   consumers read a negative index as absent — the check-run reporter writes
  *   `steps[stepIndex]`, and the dashboard gates log fetching on `stepIndex >= 0`.

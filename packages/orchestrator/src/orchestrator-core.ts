@@ -81,7 +81,6 @@ import { DedupCache } from './webhook/dedup.js';
 import { ObserverRegistry } from './ws/observer-registry.js';
 import { AgentHeartbeatMonitor } from './ws/agent-heartbeat.js';
 import {
-  scalerConfigReloadsTotal,
   pgPoolClientErrorsTotal,
   setIngestAdmissionState,
   setIngestAdmissionLimits,
@@ -141,6 +140,11 @@ import {
   detectLabelSetOverlaps,
   storageHostAccessEntries,
 } from './scaler/index.js';
+import { createScalerFileReload, type ScalerFileReload } from './scaler/file-reload.js';
+import {
+  reloadScalersAcrossCluster,
+  type SendScalerReload,
+} from './cluster/scaler-reload-fanout.js';
 import type {
   BackendFactoryContext,
   ScalerBackend,
@@ -260,7 +264,7 @@ import {
 } from './cluster/index.js';
 import { extractRepoIdentifier } from './entry-helpers.js';
 import { runMigrations, withMigrationPool } from './db/migrator.js';
-import { buildDeferredIndexes } from './db/deferred-indexes.js';
+import { buildDeferredIndexes } from './db/deferred-index-build.js';
 import { SourceStore, SourceManager } from './sources/index.js';
 import { GithubAppNameRefresher } from './github-app-name-refresher/github-app-name-refresher.js';
 import { fetchGithubAppIdentity, listGithubAppInstallations } from './providers/github/manifest.js';
@@ -375,9 +379,9 @@ export interface OrchestratorSubsystems {
   scalerConfig: ScalerConfig | null;
   cacheStorage: CacheStorage | undefined;
   /**
-   * Provenance trust root used to verify build-provenance bundles at ingest.
-   * The mode-specific hook (server.ts) wires the live issuer onto it from the
-   * Platform `auth.success` message via `onProvenanceIssuer`.
+   * Provenance trust root used to verify build-provenance bundles at ingest:
+   * the orchestrator's own key set, the local dev plane's signer, or the
+   * configured `KICI_PROVENANCE_ISSUER`.
    */
   provenanceTrustRoot: ProvenanceTrustRoot;
   /**
@@ -458,6 +462,12 @@ export interface OrchestratorSubsystems {
    * in setupCluster).
    */
   answerPeerForgetRequest: PeerForgetRequestHandler;
+  /**
+   * Reloads this orchestrator's scaler config (`kici-admin scaler reload`,
+   * SIGHUP). Wired into every outgoing PeerClient to answer a
+   * peer.scaler.reload.request.
+   */
+  scalerFileReload: ScalerFileReload;
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   broadcastHeartbeatToAllPeers: () => void;
   broadcastAgentTokenRevoke: (tokenId: string) => void;
@@ -2124,6 +2134,7 @@ function initializeCluster(
   registrationIndex: RegistrationIndex,
   cronScheduler: CronScheduler,
   configReloaderRef: { current: ConfigReloader | null },
+  scalerFileReloadRef: { current: ScalerFileReload | null },
   localConfigVersionRef: { value: number },
   stepLogBuffer: StepLogBuffer,
   eventRetryScannerRef: { onBecomeLeader: () => void; onLoseLeadership: () => void },
@@ -2467,6 +2478,13 @@ function initializeCluster(
     // `kici-admin peer forget` fanned out by a sibling coordinator. The peer
     // handler refuses one a worker sends.
     onPeerForgetRequest: answerPeerForgetRequest,
+    // `kici-admin scaler reload` fanned out by a sibling coordinator. The peer
+    // handler refuses one a worker sends.
+    onScalerReloadRequest: async () => {
+      const reload = scalerFileReloadRef.current;
+      if (!reload) throw new Error('scaler reload is not ready yet on this orchestrator');
+      return reload();
+    },
     onPeerClusterSettingsRequest: async () => {
       // A DB-less worker pulls the worker-relevant settings snapshot. The async
       // DB read lives here (off the synchronous heartbeat hot path). Every
@@ -2475,6 +2493,7 @@ function initializeCluster(
       const { version, settings } = await resolveWorkerClusterSettingsSnapshot(clusterSettings, {
         agentTokenTtlMs: config.agentTokenTtlMs,
         firecrackerApiSocketWaitMs: config.firecrackerApiSocketWaitMs,
+        concurrencyWaitTimeoutMs: config.concurrencyWaitTimeoutMs,
       });
       logger.info('Serving worker cluster-settings pull', { version, ...settings });
       return { version, settings };
@@ -3864,6 +3883,7 @@ export async function bootstrapOrchestrator(
 
   // 21. Initialize cluster
   const configReloaderRef: { current: ConfigReloader | null } = { current: null };
+  const scalerFileReloadRef: { current: ScalerFileReload | null } = { current: null };
 
   const cluster = initializeCluster(
     config,
@@ -3877,6 +3897,7 @@ export async function bootstrapOrchestrator(
     registrationIndex,
     cronScheduler,
     configReloaderRef,
+    scalerFileReloadRef,
     localConfigVersionRef,
     stepLogBuffer,
     eventRetryScannerRef,
@@ -4076,9 +4097,7 @@ export async function bootstrapOrchestrator(
   // Resolve the signer, WAITING (bounded) for the key to be provisioned rather
   // than immediately deferring. This closes the security-critical mint-in-boot-
   // window race: a mint that arrives before any node has generated the key
-  // must NOT fall back to the Platform relay (which would produce an intermittent
-  // Platform-signed bundle that fails verification against the orchestrator trust
-  // root). Once provisioned (eager reconcile at boot, or the first mint), the
+  // must wait for it rather than fail. Once provisioned (eager reconcile at boot, or the first mint), the
   // signer is memoized and returned immediately. Only a not-ready reconcile is
   // waited out; a reconcile that throws (a stranded key, no master key) ends the
   // wait at once and is logged, since it cannot resolve itself within the window.
@@ -4151,7 +4170,7 @@ export async function bootstrapOrchestrator(
   // Provenance trust root: for orchestrator-owned signing, verify at ingest
   // against the orchestrator's own key set (fresh rotations/revocations). For the
   // offline local dev plane, serve the in-process signer's JWKS under the fixed
-  // `kici-local` issuer. Otherwise the config/env value seeds the CLI path.
+  // `kici-local` issuer. Otherwise the configured `KICI_PROVENANCE_ISSUER`.
   const provenanceTrustRoot =
     provenanceSigningEnabled && orchestratorSigningRepo
       ? provenanceTrustRootFromRepo(
@@ -4224,6 +4243,20 @@ export async function bootstrapOrchestrator(
     ingestOverflowReplayer.start();
   }
 
+  // The one scaler file reload, behind SIGHUP (through the ConfigReloader),
+  // `POST /admin/scaler/reload` and a peer's peer.scaler.reload.request. Its
+  // first caller arrives after `subsystems` below exists: the ConfigReloader
+  // and the admin routes are built after it, and the peer channel reaches it
+  // through a ref set right after it.
+  const scalerFileReload = createScalerFileReload({
+    manager: scalerManager,
+    load: () => loadScalerConfig(config.scalerConfigPath!, config.scalerConfigDir),
+    onApplied: (applied) => {
+      subsystems.scalerConfig = applied;
+    },
+    logger,
+  });
+
   const subsystems: OrchestratorSubsystems = {
     config,
     db,
@@ -4295,6 +4328,7 @@ export async function bootstrapOrchestrator(
     peerHandler: cluster.peerHandler,
     peerClients: cluster.peerClients,
     answerPeerForgetRequest: cluster.answerPeerForgetRequest,
+    scalerFileReload,
     getLocalInventory: cluster.getLocalInventory,
     broadcastHeartbeatToAllPeers: cluster.broadcastHeartbeatToAllPeers,
     broadcastAgentTokenRevoke: cluster.broadcastAgentTokenRevoke,
@@ -4333,6 +4367,7 @@ export async function bootstrapOrchestrator(
     // too early fails loudly instead of resuming a run against nothing.
     buildProcessingDeps: () => requireProcessingDeps(processingDepsRef)(),
   };
+  scalerFileReloadRef.current = scalerFileReload;
 
   // 24. Call mode-specific hook for wiring
   const modeResult = await hooks.onSubsystemsReady(subsystems);
@@ -4468,45 +4503,7 @@ export async function bootstrapOrchestrator(
             routingKeys: providerRegistry.getRoutingKeys(),
           });
         }) as any),
-    onScalerReload: scalerManager
-      ? async () => {
-          scalerConfigReloadsTotal.add(1, { result: 'attempted' });
-          try {
-            const newScalerConfig = await loadScalerConfig(
-              config.scalerConfigPath!,
-              config.scalerConfigDir,
-            );
-            const overlaps = detectLabelSetOverlaps(newScalerConfig.scalers);
-            if (overlaps.length > 0) {
-              logger.error('New config has label-set overlaps, keeping current config', {
-                overlaps,
-              });
-              scalerConfigReloadsTotal.add(1, { result: 'failed' });
-              return;
-            }
-            const result = await scalerManager!.reload(newScalerConfig);
-            if (!result.valid) {
-              logger.error('Config reload validation failed, keeping current config', {
-                errors: result.errors,
-              });
-              scalerConfigReloadsTotal.add(1, { result: 'failed' });
-              return;
-            }
-            // The dashboard diagnostics snapshot renders its scaler list from
-            // this stored config, not from the manager, so leaving it at the
-            // boot-time value makes the panel hide a scaler the reload just
-            // added and keep showing one it removed.
-            subsystems.scalerConfig = newScalerConfig;
-            logger.info('Scaler configuration reloaded successfully');
-            scalerConfigReloadsTotal.add(1, { result: 'success' });
-          } catch (err) {
-            logger.error('Scaler config reload error', {
-              error: toErrorMessage(err),
-            });
-            scalerConfigReloadsTotal.add(1, { result: 'failed' });
-          }
-        }
-      : undefined,
+    onScalerReload: scalerManager ? () => scalerFileReload() : undefined,
     onPlatformReconnect: modeResult.configReloaderExtras?.onPlatformReconnect as any,
     onConfigApplied: (_newConfig) => {
       localConfigVersionRef.value++;
@@ -4562,6 +4559,7 @@ export async function bootstrapOrchestrator(
           errors: response.errors,
           restartRequired: response.restartRequired,
           fieldsChanged: response.fieldsChanged,
+          ...(response.scaler ? { scaler: response.scaler } : {}),
         };
       }
     }
@@ -4579,6 +4577,7 @@ export async function bootstrapOrchestrator(
         errors: response.errors,
         restartRequired: response.restartRequired,
         fieldsChanged: response.fieldsChanged,
+        ...(response.scaler ? { scaler: response.scaler } : {}),
       };
     }
 
@@ -4612,6 +4611,32 @@ export async function bootstrapOrchestrator(
     );
     return response ?? ScalerOrphansForwardFailure.enum['not-connected'];
   };
+  // `kici-admin scaler reload`: reload here and on every connected peer. A
+  // request is sent on one path only: the incoming connection is tried only
+  // when the outgoing PeerClient could not send at all.
+  const sendScalerReload: SendScalerReload = async (instanceId, msg, timeoutMs) => {
+    const outgoing = cluster.peerClients.get(instanceId);
+    const response =
+      outgoing && outgoing.state === 'connected'
+        ? await outgoing.sendScalerReloadAndWait(msg, timeoutMs)
+        : null;
+    return response ?? cluster.peerHandler.sendScalerReloadAndWait(instanceId, msg, timeoutMs);
+  };
+  if (adminDeps) {
+    adminDeps.scalerReload = {
+      instanceId: config.instanceId,
+      reload: (single, timeoutMs) =>
+        reloadScalersAcrossCluster({
+          selfInstanceId: config.instanceId,
+          selfRole: config.cluster.role,
+          registry: cluster.peerRegistry,
+          local: scalerFileReload,
+          send: sendScalerReload,
+          single,
+          timeoutMs,
+        }),
+    };
+  }
   // `kici-admin peer forget`: forget a departed peer here, then on every
   // connected sibling coordinator, each of which holds its own registry. A
   // forget is sent on one path only: the incoming connection is tried only

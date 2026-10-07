@@ -83,6 +83,46 @@ export function localUrl(endpoint: LocalEndpoint, pathname: string): string {
   return `http://${host}:${endpoint.port}${endpoint.pathPrefix}${pathname}`;
 }
 
+/** What a local JSON request got: a body, a refusing status, or no answer at all. */
+export type LocalJsonResult<T> =
+  | { kind: 'ok'; status: number; body: T }
+  | { kind: 'http-error'; status: number }
+  | { kind: 'no-answer' };
+
+/**
+ * GET a JSON body from a service on this host. `acceptStatuses` names the
+ * non-2xx codes whose body is still an answer; `headers` carries credentials.
+ */
+export async function requestLocalJson<T>(
+  endpoint: LocalEndpoint,
+  pathname: string,
+  opts: {
+    acceptStatuses?: readonly number[];
+    timeoutMs?: number;
+    headers?: Record<string, string>;
+  } = {},
+): Promise<LocalJsonResult<T>> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+  );
+  try {
+    const res = await fetch(localUrl(endpoint, pathname), {
+      signal: controller.signal,
+      ...(opts.headers && { headers: opts.headers }),
+    });
+    if (!res.ok && !(opts.acceptStatuses ?? []).includes(res.status)) {
+      return { kind: 'http-error', status: res.status };
+    }
+    return { kind: 'ok', status: res.status, body: (await res.json()) as T };
+  } catch {
+    return { kind: 'no-answer' };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
  * GET a JSON body from a service on this host. `acceptStatuses` names the
  * non-2xx codes whose body is still an answer: `/ready` returns its checks
@@ -93,41 +133,14 @@ export async function fetchLocalJson<T>(
   pathname: string,
   opts: { acceptStatuses?: readonly number[]; timeoutMs?: number } = {},
 ): Promise<T | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-  );
-  try {
-    const res = await fetch(localUrl(endpoint, pathname), { signal: controller.signal });
-    if (!res.ok && !(opts.acceptStatuses ?? []).includes(res.status)) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/**
- * A `/health` body with its deprecated `buildCommit` replaced by its version.
- * A service older than this CLI reports a commit ID from KiCI's private
- * repository there, which a reader cannot resolve; `--json` keeps the key, a
- * string as before, and carries the release version in it. A body that reports
- * no `buildCommit` comes back unchanged.
- */
-export function hideBuildCommit<T extends { version?: string; buildCommit?: string }>(
-  health: T,
-): T {
-  if (!('buildCommit' in health)) return health;
-  return { ...health, buildCommit: health.version ?? 'unknown' };
+  const result = await requestLocalJson<T>(endpoint, pathname, opts);
+  return result.kind === 'ok' ? result.body : null;
 }
 
 /**
  * Rows for the build fingerprint and process uptime of a `/health` body. A
  * field the body lacks is skipped, so a service older than this CLI renders
- * the fields it does report. The version line never shows `buildCommit`
- * (see {@link hideBuildCommit}).
+ * the fields it does report.
  */
 export function buildInfoRows(
   health: Partial<LivenessBase & BuildFingerprint & { buildDate: string }>,

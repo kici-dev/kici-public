@@ -34,6 +34,17 @@ import {
 
 const logger = createLogger({ prefix: 'event-router' });
 
+/** Wrap a registration's single lock entry in a lock file the matcher can read. */
+function registrationLockFile(reg: RegisteredWorkflow): LockFile {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    minReaderVersion: SCHEMA_VERSION,
+    source: reg.lockEntry.source ?? { file: 'registered', export: '#default' },
+    contentHash: reg.lockEntry.contentHash ?? '',
+    workflows: [reg.lockEntry],
+  };
+}
+
 /**
  * System events are exempt from the per-source event-storm rate limiter: they
  * are orchestrator-emitted (never a user `ctx.emit`) with a bounded chain depth,
@@ -608,13 +619,7 @@ export class EventRouter {
         }
       }
 
-      // Build a LockFile-like structure from the registration's lock entry
-      const syntheticLockFile: LockFile = {
-        schemaVersion: SCHEMA_VERSION,
-        source: reg.lockEntry.source ?? { file: 'registered', export: '#default' },
-        contentHash: reg.lockEntry.contentHash ?? '',
-        workflows: [reg.lockEntry],
-      };
+      const syntheticLockFile = registrationLockFile(reg);
 
       // Match against the registered workflow
       const decisions = matchAllWorkflows(syntheticLockFile.workflows, simulatedEvent);
@@ -854,12 +859,7 @@ export class EventRouter {
       decisions: WorkflowDecision[];
     }> = [];
     for (const reg of registrations) {
-      const lockFile: LockFile = {
-        schemaVersion: SCHEMA_VERSION,
-        source: reg.lockEntry.source ?? { file: 'registered', export: '#default' },
-        contentHash: reg.lockEntry.contentHash ?? '',
-        workflows: [reg.lockEntry],
-      };
+      const lockFile = registrationLockFile(reg);
       const decisions = matchAllWorkflows(lockFile.workflows, simulatedEvent).filter(
         (d) => d.matched,
       );

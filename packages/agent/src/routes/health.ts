@@ -75,8 +75,6 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Hono {
         activeJobs: status.activeJobs,
         connected: status.connected,
         version: safe('version'),
-        // Deprecated: carries the version (BuildFingerprint.buildCommit).
-        buildCommit: safe('version'),
         sdkVersion: safe('sdkVersion'),
         sdkBundleHash: safe('sdkBundleHash'),
         sharedVersion: safe('sharedVersion'),

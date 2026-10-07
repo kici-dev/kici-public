@@ -285,6 +285,9 @@ rejections all surface as the corrupt-lock signal:
 
 - **Not valid JSON**, or **missing/invalid `schemaVersion`** — the file is
   truncated or not a lock file.
+- **Missing `minReaderVersion`** — the lock was not written by `kici compile`
+  or was edited by hand (`Lock file is missing a valid minReaderVersion`).
+  Recompile it with `kici compile`.
 - **Out-of-window `schemaVersion`** — the lock's schema version falls outside the
   orchestrator's compatibility window. A lock **below the floor** was compiled by
   an SDK predating a breaking change this orchestrator relies on (`Lock file

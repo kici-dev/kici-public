@@ -14,23 +14,17 @@ import type { AdminApiClient } from '../api-client.js';
 import {
   listExecutionRunsDirect,
   showExecutionRunDirect,
-  toErrorMessage,
   type ExecutionJobRow,
   type ExecutionRunRow,
 } from '@kici-dev/shared';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
-
-function parseIntOption(raw: string | undefined, label: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || Math.floor(n) !== n) {
-    throw new Error(`${label}: must be an integer (got "${raw}")`);
-  }
-  return n;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  parseIntOption,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+  printJsonOr,
+} from './shared/cli-action.js';
 
 function printRunsTable(runs: ExecutionRunRow[]): void {
   if (runs.length === 0) {
@@ -88,10 +82,10 @@ export function registerExecutionCommands(program: Command, getClient: () => Adm
     .option('--status <s>', 'Filter by status')
     .option('--workflow-name <n>', 'Filter by workflow_name')
     .option('--limit <n>', 'Max rows to return (default 100, max 1000)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         const limit = parseIntOption(opts.limit, '--limit');
         const query = {
           routingKey: opts.routingKey,
@@ -102,8 +96,7 @@ export function registerExecutionCommands(program: Command, getClient: () => Adm
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           const result = await listExecutionRunsDirect(dbUrl, query);
-          if (opts.json) console.log(JSON.stringify(result));
-          else printRunsTable(result.runs);
+          printJsonOr(opts.json, result, (r) => printRunsTable(r.runs));
         } else {
           const params = new URLSearchParams();
           if (opts.routingKey) params.set('routingKey', opts.routingKey);
@@ -114,33 +107,25 @@ export function registerExecutionCommands(program: Command, getClient: () => Adm
           const result = await getClient().get<{ runs: ExecutionRunRow[] }>(
             `/api/v1/admin/executions${qs ? `?${qs}` : ''}`,
           );
-          if (opts.json) console.log(JSON.stringify(result));
-          else printRunsTable(result.runs);
+          printJsonOr(opts.json, result, (r) => printRunsTable(r.runs));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   exec
     .command('show <runId>')
     .description('Show one run + its jobs (by run_id)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
-    .action(async (runId: string, opts) => {
-      try {
+    .action(
+      cliAction(async (runId: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result = dbUrl
           ? await showExecutionRunDirect(dbUrl, { runId })
           : await getClient().get<{ run: ExecutionRunRow; jobs: ExecutionJobRow[] }>(
               `/api/v1/admin/executions/${encodeURIComponent(runId)}`,
             );
-        if (opts.json) console.log(JSON.stringify(result));
-        else printRunShow(result.run, result.jobs);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+        printJsonOr(opts.json, result, (r) => printRunShow(r.run, r.jobs));
+      }),
+    );
 }

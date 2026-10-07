@@ -23,8 +23,6 @@ import {
   type JobCancel,
   type FleetLogsRequest,
   ArtifactCompleteAckOutcome,
-  hasOrchAgentCapability,
-  type OrchAgentCapabilities,
   AGENT_CAPABILITIES,
   AGENT_FEATURE_LABELS,
 } from '@kici-dev/engine';
@@ -179,14 +177,6 @@ export class OrchestratorClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
   private intentionalDisconnect = false;
-
-  /**
-   * Agent-facing capabilities advertised by the orchestrator on `register.ack`.
-   * Undefined until the first ack arrives, and on a pre-capability orchestrator
-   * that never advertises — both cases mean "assume unsupported" for every
-   * optional feature gated on it.
-   */
-  private orchCapabilities: OrchAgentCapabilities | undefined;
 
   // Log batching: accumulate lines and flush every 100ms or 50 lines
   private pendingLogBatch: string[] = [];
@@ -868,11 +858,8 @@ export class OrchestratorClient {
    *
    * - `beginUpload` -> `artifacts.upload.request`, awaits `artifacts.upload.response`.
    * - `completeUpload` -> `artifacts.upload.complete`, awaits
-   *   `artifacts.upload.complete.ack` when the orchestrator advertises the
-   *   `artifactCompleteAck` capability, and rejects when the commit failed so
+   *   `artifacts.upload.complete.ack`, and rejects when the commit failed so
    *   the workflow step fails instead of losing the artifact behind a green run.
-   *   Against an orchestrator that never advertises it, the message stays
-   *   fire-and-forget and resolves immediately.
    * - `download` -> `artifacts.download.request`, awaits `artifacts.download.response`.
    *
    * Times out after 30 seconds for the round-trip ops.
@@ -890,11 +877,6 @@ export class OrchestratorClient {
         name: request.name,
         sha256: request.sha256!,
       } as AgentToOrchestratorMessage;
-
-      if (!hasOrchAgentCapability(this.orchCapabilities, 'artifactCompleteAck')) {
-        this.sendDirect(complete);
-        return { type: 'artifacts.response', requestId: request.requestId };
-      }
 
       return new Promise<ArtifactResponseIpc>((resolve, reject) => {
         // Shared by reference with the maps below, so `record.messageId` always
@@ -1526,7 +1508,7 @@ export class OrchestratorClient {
   /**
    * Re-send every upload-complete parked by the disconnect sweep.
    *
-   * Called from `register.ack`, once the new connection's capabilities are known.
+   * Called from `register.ack`, once the new connection is registered.
    * Each frame is re-keyed with a fresh `messageId` before it goes out: the id is
    * the correlation key, so reusing it would let a late ack for the pre-disconnect
    * send resolve the new pending.
@@ -1540,23 +1522,7 @@ export class OrchestratorClient {
     const held = [...this.heldCompletes];
     this.heldCompletes.clear();
 
-    // A reconnected orchestrator that no longer acks cannot tell us the commit
-    // landed. Resolving anyway would report success for an artifact we never saw
-    // committed — the fail-open loss the ack exists to prevent — so give up
-    // fail-closed instead, naming the ambiguity.
-    const canAck = hasOrchAgentCapability(this.orchCapabilities, 'artifactCompleteAck');
-
     for (const record of held) {
-      if (!canAck) {
-        record.pending.reject(
-          new Error(
-            'artifact upload-complete cannot be acknowledged by the reconnected ' +
-              `orchestrator — ${COMMIT_MAY_HAVE_LANDED}`,
-          ),
-        );
-        continue;
-      }
-
       if (record.attempts >= MAX_COMPLETE_RESEND_ATTEMPTS) {
         record.pending.reject(
           new Error(
@@ -1622,8 +1588,7 @@ export class OrchestratorClient {
   }
 
   /**
-   * Complete registration: adopt the orchestrator's negotiated capabilities,
-   * enter the `registered` state, flush everything parked while disconnected,
+   * Complete registration: enter the `registered` state, flush everything parked while disconnected,
    * and hand the ack's lifetime flags to `onRegistered`.
    */
   private handleRegisterAck(msg: Extract<OrchestratorToAgentMessage, { type: 'register.ack' }>) {
@@ -1635,18 +1600,13 @@ export class OrchestratorClient {
       warmPool: msg.warmPool ?? false,
     });
 
-    // Optional agent-facing features are gated on what this orchestrator
-    // advertises; absent means "stay on the unnegotiated behavior".
-    this.orchCapabilities = msg.capabilities;
-
     // Transition to registered state
     this._state = 'registered';
     this.reconnectAttempts = 0;
     this.startHeartbeat();
     this.flushBuffer();
 
-    // Completes parked by the disconnect sweep go out again now that this
-    // connection's capabilities are known.
+    // Completes parked by the disconnect sweep go out again on this connection.
     this.resendHeldCompletes();
 
     this.onRegistered?.({

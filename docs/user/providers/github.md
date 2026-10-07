@@ -250,7 +250,7 @@ identifier every other KiCI surface uses to talk about the source:
 
 - `kici-admin source update github:<appId> ...` for rotation / updates
 - `kici-admin source remove github:<appId>` to decommission
-- `kici-admin org-settings global-workflows ... --customer-id <orgId> [--source github:<appId>]` for policy (org-scoped row, optional per-entry source qualifier)
+- `kici-admin org-settings global-workflows ... --org <orgId> [--source github:<appId>]` for policy (org-scoped row, optional per-entry source qualifier)
 - The orchestrator's source records and event-log entries key on
   `github:<appId>`; org-level settings key on `customer_id` (one row
   per org)
@@ -315,7 +315,7 @@ deliveries and routing them onward.
 ## Global workflows
 
 A GitHub App source opts in to org-wide global workflows using the
-org-scoped settings row. Pass `--customer-id <orgId>` (alias `--org`)
+org-scoped settings row. Pass `--org <orgId>`
 to select the row; on `*-add` mutators, pass `--source github:<appId>`
 when you want a list entry pinned to this specific App rather than
 applying to any source in the org:
@@ -326,15 +326,15 @@ kici-admin cluster-settings set --global-workflows-enabled true
 
 # Allow the listed repo as an author for any source in the org
 kici-admin org-settings global-workflows allow-add 'my-org/ci-workflows/*' \
-  --customer-id <orgId>
+  --org <orgId>
 
 # Allow the listed repo as an author only when authored on this App
 kici-admin org-settings global-workflows allow-add 'my-org/ci-workflows/*' \
-  --customer-id <orgId> --source github:12345
+  --org <orgId> --source github:12345
 
 # Deny events from untrusted repos delivered on this App
 kici-admin org-settings global-workflows deny-add 'my-org/contrib/*' \
-  --customer-id <orgId> --source github:12345
+  --org <orgId> --source github:12345
 ```
 
 Global workflows authored in a GitHub App repo can dispatch against

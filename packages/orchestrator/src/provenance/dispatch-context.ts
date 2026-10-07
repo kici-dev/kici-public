@@ -34,13 +34,11 @@ import { DEFAULT_ORG_ID } from '../oidc/orchestrator-mint.js';
  * `repository` / `ref` / `sha` / `workflowRef` / `runId` / `jobId`, none of
  * which depends on who signs the token. Only the statement's `builder.id`
  * needs an issuer, and an unset one reproduces the `/orchestrator/unknown`
- * builder the local guess has always recorded.
- *
- * Gating on the issuer here dropped the context for every orchestrator still
- * on the deprecated Platform-relay mint, so its agent fell back to the local
- * guess — `repository: 'unknown/unknown'` for a `file://` clone, and a bare
- * workflow name where the claim is `<name>@<sha>` — and the capture check
- * then refused every one of its deferred attestations.
+ * builder the local guess has always recorded. Gating on the issuer would send
+ * an orchestrator without one back to the local guess —
+ * `repository: 'unknown/unknown'` for a `file://` clone, and a bare workflow
+ * name where the claim is `<name>@<sha>` — and the capture check would refuse
+ * every one of its deferred attestations.
  */
 export async function loadProvenanceContext(
   db: Kysely<Database>,

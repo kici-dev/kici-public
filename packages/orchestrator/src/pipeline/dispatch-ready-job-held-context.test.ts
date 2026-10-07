@@ -405,7 +405,7 @@ describe('dispatchReadyJob — registry credentials of a released job', () => {
     expect(stores.resolveNamedInternal).not.toHaveBeenCalled();
   });
 
-  it("gives a released job registry credentials from the context's same-named scope when no bound scope carries them (deprecated)", async () => {
+  it("gives a released job no registry credentials when they sit only in the context's same-named scope", async () => {
     const { jobName } = await holdJob({ row: REVIEWERS, container: PROD_AUTH_CONTAINER });
     const stores = releaseStores({
       rows: { [CONTEXT]: REVIEWERS },
@@ -414,11 +414,9 @@ describe('dispatchReadyJob — registry credentials of a released job', () => {
       resolveNamedInternal: async (_org, _scope, key) => REGISTRY_VALUES[key] ?? null,
     });
     const { dispatched } = await release(jobName, stores.gateDeps);
-    // breaks-if-wrong: registry auth stored only in the same-named scope stops resolving on release
-    expect(dispatched[0].jobConfig.containerRegistryAuth).toMatchObject({
-      username: 'robot',
-      password: 'reg-tok',
-    });
+    // fails-when: release still reads the scope named after the context
+    expect(dispatched[0].jobConfig).not.toHaveProperty('containerRegistryAuth');
+    expect(stores.resolveNamedInternal).not.toHaveBeenCalled();
   });
 
   it('fails the job when the registry secret lookup itself fails', async () => {

@@ -99,171 +99,145 @@ export const gitAuthSchema = z
 export type GitAuth = z.infer<typeof gitAuthSchema>;
 
 /** Dispatch a job to an agent for execution. */
-export const jobDispatchSchema = z
-  .object({
-    type: z.literal('job.dispatch'),
-    messageId: z.string(),
-    runId: z.string(),
-    jobId: z.string(),
-    repoUrl: z.string(),
-    ref: z.string(),
-    sha: z.string(),
-    lockFileUrl: z.string(),
-    /** Pass-through job configuration. Shape is `LockJob | LockDynamicJobFn` from the lock file. */
-    jobConfig: z
-      .record(z.string(), z.unknown())
-      .describe('Job configuration from the lock file (LockJob | LockDynamicJobFn)'),
-    timestamp: z.number(),
-    /** Short-lived GitHub installation token for private repo clone auth. */
-    token: z.string().optional(),
-    /** Orchestrator-provided secrets to merge into step environment. */
-    secrets: z.record(z.string(), z.string()).optional(),
-    /** Namespaced secrets by context name: { 'context-name': { KEY: 'value' } } */
-    namespacedSecrets: z.record(z.string(), z.record(z.string(), z.string())).optional(),
-    /** Max log size per step in bytes. Agent falls back to its own config default (10MB). */
-    maxLogSizeBytes: z.coerce.number().optional(),
-    /**
-     * Orchestrator-resolved concurrency-slot wait timeout (ms), from the
-     * fleet-wide `cluster_settings.concurrency_wait_timeout_ms`. Agent falls
-     * back to its own env/config default (1h) when absent (older orchestrators).
-     */
-    concurrencyWaitTimeoutMs: z.coerce.number().optional(),
-    /** URL or file:// path to a pre-packed `.kici/` source tarball. If present, agent extracts it into workDir instead of cloning the repo. */
-    sourceTarUrl: z.string().optional(),
-    /**
-     * SHA-256 of the source tarball's own bytes, for integrity verification
-     * before extraction. The sibling of `depsHash`, which has always carried
-     * the dependency tarball's real digest.
-     */
-    sourceTarDigest: z.string().optional(),
-    /** URL or file:// path to pre-built dependency tarball. If present, agent extracts to .kici/node_modules/ instead of running install. */
-    depsUrl: z.string().optional(),
-    /** SHA-256 hash of the dependency tarball for integrity verification. */
-    depsHash: z.string().optional(),
-    /** Trace ID propagated across tiers for distributed tracing. */
-    requestId: z.string().optional(),
-    /** Base64-encoded X25519 public key for the workflow run (for encrypting secret outputs). */
-    runPublicKey: z.string().optional(),
-    /**
-     * The orchestrator's own view of the build, for a provenance statement the
-     * agent has to freeze before its identity token exists (the deferred path).
-     *
-     * Every field is what `buildIdTokenClaims` derives from the run row, so a
-     * frozen statement built from this is field-for-field what a live mint
-     * would have produced — and the server can therefore cross-check it. The
-     * agent's local guess is NOT: the job's checkout `ref` is a pull request's
-     * HEAD branch where the claim is the BASE branch, and `workflowRef` here is
-     * the `<name>@<sha>` claim rather than a global workflow's clone ref.
-     *
-     * Additive and optional: an older orchestrator omits it and the agent falls
-     * back to its local guess. That fallback statement fails the capture
-     * cross-check, so the defer is dropped rather than stored unchecked.
-     */
-    provenanceContext: provenanceContextSchema.optional(),
-    /** Plain outputs from upstream jobs (keyed by job name, then by step name). Populated for downstream jobs with `needs` dependencies. */
-    upstreamJobOutputs: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
-    /** Terminal status of each upstream job (keyed by job name; per-child for fan-out). Powers `ctx.needs.<job>.status`. */
-    upstreamJobStatuses: z.record(z.string(), ExecutionJobStatus).optional(),
-    /**
-     * Per-invoke-gate results for any upstream gate this job `needs`, keyed by
-     * gate job name. One {@link invokeResultSchema} entry per run the gate
-     * triggered, carrying the invoked run's non-secret declared outputs. Powers
-     * a standard downstream job's `ctx.needs['<gate>'].result`. Additive and
-     * optional — older orchestrators omit it and the agent resolves the gate
-     * need through the fan-out group shape instead.
-     */
-    upstreamInvokeResults: z.record(z.string(), z.array(invokeResultSchema)).optional(),
-    /**
-     * Structured clone auth for the source repo. Preferred over `token` (which
-     * remains as a backward-compat field for same-provider GitHub App flows
-     * during the transition to universal-git / cross-provider global workflows).
-     *
-     * When both `token` and `sourceAuth` are set, a Zod refinement enforces
-     * that they agree (`sourceAuth.kind === 'basic'` and
-     * `sourceAuth.secret === token`) — otherwise the dispatch is rejected to
-     * prevent silent credential mismatches.
-     */
-    sourceAuth: gitAuthSchema.optional(),
-    /**
-     * Structured clone auth for the **workflow** repo in a global-workflow
-     * dispatch (when the workflow is authored on a different source than the
-     * source repo). When `jobConfig.isGlobalWorkflow === true` and the two
-     * providers differ, the orchestrator populates `sourceAuth` from the
-     * inbound bundle and `workflowAuth` from the registration's bundle.
-     *
-     * For same-provider global workflows this is typically absent and the
-     * agent reuses `sourceAuth` for both clones.
-     */
-    workflowAuth: gitAuthSchema.optional(),
-    /**
-     * Private npm registries the agent should authenticate against before
-     * `npm install`. Each entry's `token` is the resolved value (the
-     * orchestrator already looked it up via the per-environment
-     * secretResolver path; protection-rule gates have already passed at this
-     * point). Untrusted contributors get an empty list.
-     */
-    npmRegistries: z
-      .array(
-        z.object({
-          url: z.string().url(),
-          scope: z.string().optional(),
-          alwaysAuth: z.boolean(),
-          token: z.string().min(1),
-        }),
-      )
-      .optional(),
-    /**
-     * Registry credentials for pulling this job's container image, already
-     * resolved by the orchestrator (the lock carries secret NAMES; the agent
-     * never resolves them itself).
-     *
-     * Optional for backward compatibility with older orchestrators, which do
-     * not send it — an agent that receives no auth pulls anonymously, exactly
-     * as it did before.
-     */
-    containerRegistryAuth: z
-      .object({
-        username: z.string().min(1),
-        password: z.string().min(1),
-        serveraddress: z.string().min(1),
-      })
-      .optional(),
-    /**
-     * Extra resolved secrets to project as env vars on the install
-     * subprocess. Keyed by the bare secret name (the qualified env: prefix
-     * is stripped at resolution time). For use with a customer-committed
-     * `.kici/.npmrc` containing `${VAR}` placeholders.
-     */
-    installEnvSecrets: z.record(z.string(), z.string()).optional(),
-    /** Org id that owns this run — namespaces the user-facing cache (per-tenant isolation). */
-    orgId: z.string().optional(),
-    /** Repo identifier (e.g. "owner/repo") — second namespacing level for the user-facing cache. */
-    repoId: z.string().optional(),
-    /**
-     * Cache write scope for this job. `shared` lets the job write the
-     * org-shared default-branch cache; `isolated` confines writes to a
-     * per-run scope while still allowing shared-scope reads. Absent ⇒ treated
-     * as `isolated` by the agent (fail-closed).
-     */
-    cacheRefScope: CacheRefScope.optional(),
-  })
-  .superRefine((val, ctx) => {
-    if (val.token && val.sourceAuth) {
-      if (val.sourceAuth.kind !== 'basic') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['sourceAuth', 'kind'],
-          message: 'token is set; sourceAuth.kind must be "basic" to agree',
-        });
-      } else if (val.sourceAuth.secret !== val.token) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['sourceAuth', 'secret'],
-          message: 'token and sourceAuth.secret must match when both are set',
-        });
-      }
-    }
-  });
+export const jobDispatchSchema = z.object({
+  type: z.literal('job.dispatch'),
+  messageId: z.string(),
+  runId: z.string(),
+  jobId: z.string(),
+  repoUrl: z.string(),
+  ref: z.string(),
+  sha: z.string(),
+  lockFileUrl: z.string(),
+  /** Pass-through job configuration. Shape is `LockJob | LockDynamicJobFn` from the lock file. */
+  jobConfig: z
+    .record(z.string(), z.unknown())
+    .describe('Job configuration from the lock file (LockJob | LockDynamicJobFn)'),
+  timestamp: z.number(),
+  /** Orchestrator-provided secrets to merge into step environment. */
+  secrets: z.record(z.string(), z.string()).optional(),
+  /** Namespaced secrets by context name: { 'context-name': { KEY: 'value' } } */
+  namespacedSecrets: z.record(z.string(), z.record(z.string(), z.string())).optional(),
+  /** Max log size per step in bytes. Agent falls back to its own config default (10MB). */
+  maxLogSizeBytes: z.coerce.number().optional(),
+  /**
+   * Orchestrator-resolved concurrency-slot wait timeout (ms), from the
+   * fleet-wide `cluster_settings.concurrency_wait_timeout_ms`. The agent falls
+   * back to its own env/config default (1h) when absent.
+   */
+  concurrencyWaitTimeoutMs: z.coerce.number().optional(),
+  /** URL or file:// path to a pre-packed `.kici/` source tarball. If present, agent extracts it into workDir instead of cloning the repo. */
+  sourceTarUrl: z.string().optional(),
+  /**
+   * SHA-256 of the source tarball's own bytes, for integrity verification
+   * before extraction. The sibling of `depsHash`, which has always carried
+   * the dependency tarball's real digest.
+   */
+  sourceTarDigest: z.string().optional(),
+  /** URL or file:// path to pre-built dependency tarball. If present, agent extracts to .kici/node_modules/ instead of running install. */
+  depsUrl: z.string().optional(),
+  /** SHA-256 hash of the dependency tarball for integrity verification. */
+  depsHash: z.string().optional(),
+  /** Trace ID propagated across tiers for distributed tracing. */
+  requestId: z.string().optional(),
+  /** Base64-encoded X25519 public key for the workflow run (for encrypting secret outputs). */
+  runPublicKey: z.string().optional(),
+  /**
+   * The orchestrator's own view of the build, for a provenance statement the
+   * agent has to freeze before its identity token exists (the deferred path).
+   *
+   * Every field is what `buildIdTokenClaims` derives from the run row, so a
+   * frozen statement built from this is field-for-field what a live mint
+   * would have produced — and the server can therefore cross-check it. The
+   * agent's local guess is NOT: the job's checkout `ref` is a pull request's
+   * HEAD branch where the claim is the BASE branch, and `workflowRef` here is
+   * the `<name>@<sha>` claim rather than a global workflow's clone ref.
+   *
+   * Absent when the orchestrator has no provenance issuer configured, or when
+   * a worker dispatches a rerouted job. The agent then falls back to its local
+   * guess. That fallback statement fails the capture cross-check, so the
+   * defer is dropped rather than stored unchecked.
+   */
+  provenanceContext: provenanceContextSchema.optional(),
+  /** Plain outputs from upstream jobs (keyed by job name, then by step name). Populated for downstream jobs with `needs` dependencies. */
+  upstreamJobOutputs: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+  /** Terminal status of each upstream job (keyed by job name; per-child for fan-out). Powers `ctx.needs.<job>.status`. */
+  upstreamJobStatuses: z.record(z.string(), ExecutionJobStatus).optional(),
+  /**
+   * Per-invoke-gate results for any upstream gate this job `needs`, keyed by
+   * gate job name. One {@link invokeResultSchema} entry per run the gate
+   * triggered, carrying the invoked run's non-secret declared outputs. Powers
+   * a standard downstream job's `ctx.needs['<gate>'].result`. Absent when the
+   * job needs no invoke gate, or when a worker dispatches a rerouted job; the
+   * agent then resolves the gate need through the fan-out group shape.
+   */
+  upstreamInvokeResults: z.record(z.string(), z.array(invokeResultSchema)).optional(),
+  /**
+   * Structured clone auth for the source repo. Absent when the job's provider
+   * mints no clone credential (a public or local repository).
+   */
+  sourceAuth: gitAuthSchema.optional(),
+  /**
+   * Structured clone auth for the **workflow** repo in a global-workflow
+   * dispatch (when the workflow is authored on a different source than the
+   * source repo). When `jobConfig.isGlobalWorkflow === true` and the two
+   * providers differ, the orchestrator populates `sourceAuth` from the
+   * inbound bundle and `workflowAuth` from the registration's bundle.
+   *
+   * For same-provider global workflows this is typically absent and the
+   * agent reuses `sourceAuth` for both clones.
+   */
+  workflowAuth: gitAuthSchema.optional(),
+  /**
+   * Private npm registries the agent should authenticate against before
+   * `npm install`. Each entry's `token` is the resolved value (the
+   * orchestrator already looked it up via the per-environment
+   * secretResolver path; protection-rule gates have already passed at this
+   * point). Untrusted contributors get an empty list.
+   */
+  npmRegistries: z
+    .array(
+      z.object({
+        url: z.string().url(),
+        scope: z.string().optional(),
+        alwaysAuth: z.boolean(),
+        token: z.string().min(1),
+      }),
+    )
+    .optional(),
+  /**
+   * Registry credentials for pulling this job's container image, already
+   * resolved by the orchestrator (the lock carries secret NAMES; the agent
+   * never resolves them itself).
+   *
+   * Absent when the job's image needs no registry credential — the agent
+   * then pulls anonymously.
+   */
+  containerRegistryAuth: z
+    .object({
+      username: z.string().min(1),
+      password: z.string().min(1),
+      serveraddress: z.string().min(1),
+    })
+    .optional(),
+  /**
+   * Extra resolved secrets to project as env vars on the install
+   * subprocess. Keyed by the bare secret name (the qualified env: prefix
+   * is stripped at resolution time). For use with a customer-committed
+   * `.kici/.npmrc` containing `${VAR}` placeholders.
+   */
+  installEnvSecrets: z.record(z.string(), z.string()).optional(),
+  /** Org id that owns this run — namespaces the user-facing cache (per-tenant isolation). */
+  orgId: z.string().optional(),
+  /** Repo identifier (e.g. "owner/repo") — second namespacing level for the user-facing cache. */
+  repoId: z.string().optional(),
+  /**
+   * Cache write scope for this job. `shared` lets the job write the
+   * org-shared default-branch cache; `isolated` confines writes to a
+   * per-run scope while still allowing shared-scope reads. Absent ⇒ treated
+   * as `isolated` by the agent (fail-closed).
+   */
+  cacheRefScope: CacheRefScope.optional(),
+});
 
 /** Cancel a running or queued job. */
 export const jobCancelSchema = z.object({
@@ -306,17 +280,10 @@ export const registerAckSchema = z.object({
    * reaper's back, re-creating the spawn/reap churn that reaping only surplus
    * agents exists to prevent.
    *
-   * Absent on orchestrators that predate warm pools. An agent that does not
-   * understand this field arms the short KICI_SCALER_IDLE_TIMEOUT timer exactly
-   * as before — so warm pools do not work against it, which is today's
-   * behaviour rather than a regression.
+   * Absent for a job-bound spawn and for a static agent.
    */
   warmPool: z.boolean().optional(),
-  /**
-   * Optional agent-facing capabilities this orchestrator supports (absent on
-   * pre-capability orchestrators). The agent reads it to decide whether to
-   * await optional acks like `artifacts.upload.complete.ack`.
-   */
+  /** Agent-facing capabilities this orchestrator advertises; none are defined at protocol 4. */
   capabilities: orchAgentCapabilitiesSchema.optional(),
 });
 
@@ -332,7 +299,7 @@ export const agentRegisterSchema = z.object({
   platform: z.string().optional(),
   /** Agent architecture (os.arch(), e.g. 'x64', 'arm64') */
   arch: z.string().optional(),
-  /** Agent version (e.g. "0.0.1"). Optional for backward compatibility with older agents. */
+  /** Agent version (e.g. "0.0.1"). Absent when the agent cannot read its own package version. */
   version: z.string().optional(),
   /** Maximum concurrent jobs this agent can handle. Defaults to 1 if not specified. */
   maxConcurrency: z.number().int().positive().optional(),
@@ -368,11 +335,7 @@ export const agentRegisterSchema = z.object({
    * `host_properties` (agent-reported keys win). Optional — omitted ⇒ none.
    */
   properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
-  /**
-   * Optional agent behaviours this agent build implements (absent on
-   * pre-capability agents, which the orchestrator treats as supporting none).
-   * The orchestrator reads it to route work that depends on one of them.
-   */
+  /** Optional agent behaviours this agent advertises; none are defined at protocol 4. */
   capabilities: agentCapabilitiesSchema.optional(),
 });
 
@@ -428,8 +391,8 @@ export const jobStatusSchema = z.object({
  * `LockJob` interface in `trigger/types.ts`, and a hand-written Zod copy would
  * drift and start rejecting legitimate generated jobs.
  *
- * Every field beyond the verdict itself is `.optional()` so an older peer
- * tolerates the message unchanged.
+ * Every field beyond the verdict itself is `.optional()`: an undecided or
+ * job-less verdict omits them.
  */
 export const globalEvalCandidateResultSchema = z.object({
   /** The candidate workflow's name, as it appears in the lock file. */
@@ -531,11 +494,8 @@ export const agentLogChunkSchema = z.object({
   stepIndex: z.number(),
   lines: z.array(z.string()),
   timestamp: z.number(),
-  /**
-   * Which stream these lines came from. Optional for backward compatibility
-   * with agents that do not send it; absent is read as `stdout`.
-   */
-  stream: LogStream.optional(),
+  /** Which stream these lines came from. */
+  stream: LogStream,
 });
 
 /** Step-level execution state report (agent -> orchestrator). */
@@ -642,37 +602,40 @@ export const configAckSchema = z.object({
 
 // --- Cache upload protocol (agent direct-to-S3 uploads) ---
 
-/** Agent -> Orchestrator: request a pre-signed upload URL for cache storage. */
-const cacheUploadRequestSchema = z.object({
-  type: z.literal('cache.upload.request'),
-  messageId: z.string(),
-  jobId: z.string(),
-  cacheType: z.enum(['source', 'deps']),
-  contentHash: z.string().optional(),
-  lockfileHash: z.string().optional(),
-  platform: z.string(),
-  arch: z.string(),
-  /**
-   * SHA-256 of the dependency tarball about to be uploaded. Deps uploads only.
-   *
-   * The dep tarball is stored under its own content hash, so the orchestrator
-   * needs it to sign the upload URL — the agent has already built the tarball
-   * and hashed it by the time it asks. Optional so an older agent that omits it
-   * still gets a usable (lockfile-keyed) URL during a mixed-version rollout.
-   */
-  depsHash: z.string().optional(),
-  /**
-   * SHA-256 of the source tarball about to be uploaded. Source uploads only.
-   *
-   * The source tarball is stored under its own content hash, so the
-   * orchestrator needs it to sign the upload URL — the agent has already packed
-   * and hashed it by the time it asks. Optional so an older agent that omits it
-   * still gets a usable URL during a mixed-version rollout.
-   */
-  sourceTarDigest: z.string().optional(),
-  /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
-  siblingsDigest: z.string().optional(),
-});
+/**
+ * Agent -> Orchestrator: request a pre-signed upload URL for cache storage.
+ *
+ * Each tarball is stored under its own content hash, so the orchestrator needs
+ * that hash to sign the upload URL: `sourceTarDigest` for a source upload,
+ * `depsHash` for a deps upload. The agent has already packed and hashed the
+ * tarball by the time it asks.
+ */
+const cacheUploadRequestSchema = z.discriminatedUnion('cacheType', [
+  z.object({
+    type: z.literal('cache.upload.request'),
+    messageId: z.string(),
+    jobId: z.string(),
+    cacheType: z.literal('source'),
+    contentHash: z.string().optional(),
+    platform: z.string(),
+    arch: z.string(),
+    /** SHA-256 of the source tarball about to be uploaded. */
+    sourceTarDigest: z.string(),
+  }),
+  z.object({
+    type: z.literal('cache.upload.request'),
+    messageId: z.string(),
+    jobId: z.string(),
+    cacheType: z.literal('deps'),
+    lockfileHash: z.string().optional(),
+    platform: z.string(),
+    arch: z.string(),
+    /** SHA-256 of the dependency tarball about to be uploaded. */
+    depsHash: z.string(),
+    /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
+    siblingsDigest: z.string().optional(),
+  }),
+]);
 
 /** Orchestrator -> Agent: return the pre-signed upload URL. */
 const cacheUploadResponseSchema = z.object({
@@ -682,22 +645,32 @@ const cacheUploadResponseSchema = z.object({
 });
 
 /** Agent -> Orchestrator: confirm upload complete (for metadata update). */
-const cacheUploadCompleteSchema = z.object({
-  type: z.literal('cache.upload.complete'),
-  messageId: z.string(),
-  jobId: z.string(),
-  cacheType: z.enum(['source', 'deps']),
-  contentHash: z.string().optional(),
-  lockfileHash: z.string().optional(),
-  platform: z.string(),
-  arch: z.string(),
-  /** SHA-256 hash of the dependency tarball for integrity verification. Only present for deps uploads. */
-  depsHash: z.string().optional(),
-  /** SHA-256 of the source tarball's own bytes. Only present for source uploads. */
-  sourceTarDigest: z.string().optional(),
-  /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
-  siblingsDigest: z.string().optional(),
-});
+const cacheUploadCompleteSchema = z.discriminatedUnion('cacheType', [
+  z.object({
+    type: z.literal('cache.upload.complete'),
+    messageId: z.string(),
+    jobId: z.string(),
+    cacheType: z.literal('source'),
+    contentHash: z.string().optional(),
+    platform: z.string(),
+    arch: z.string(),
+    /** SHA-256 of the source tarball's own bytes. */
+    sourceTarDigest: z.string(),
+  }),
+  z.object({
+    type: z.literal('cache.upload.complete'),
+    messageId: z.string(),
+    jobId: z.string(),
+    cacheType: z.literal('deps'),
+    lockfileHash: z.string().optional(),
+    platform: z.string(),
+    arch: z.string(),
+    /** SHA-256 hash of the dependency tarball for integrity verification. */
+    depsHash: z.string(),
+    /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
+    siblingsDigest: z.string().optional(),
+  }),
+]);
 
 // --- User-facing cache protocol (declarative + imperative ctx.cache) ---
 
@@ -874,8 +847,7 @@ export const artifactsUploadResponseSchema = z.object({
    * uploads are not configured on the orchestrator, the job's run could not be
    * resolved, the job is not owned by this agent, or the orchestrator hit an
    * internal error. A safe, fixed,
-   * human-readable string; never a raw exception. Older agents ignore the field
-   * and fall back to a generic rejection message.
+   * human-readable string; never a raw exception.
    */
   error: z.string().optional(),
 });
@@ -908,9 +880,7 @@ export type ArtifactCompleteAckOutcome = z.infer<typeof ArtifactCompleteAckOutco
 
 /**
  * Orchestrator -> Agent: the outcome of committing an
- * `artifacts.upload.complete`. Sent by orchestrators that advertise the
- * `artifactCompleteAck` capability on `register.ack`; the agent awaits it and
- * fails the workflow step on `failed`/timeout, so a lost commit surfaces as a
+ * `artifacts.upload.complete`. The agent awaits it and fails the workflow step on `failed`/timeout, so a lost commit surfaces as a
  * failed step instead of a green run with a missing artifact. `requestId`
  * echoes the complete message's `messageId`.
  */
@@ -958,8 +928,7 @@ export const artifactsDownloadResponseSchema = z.object({
    * the job's run could not be resolved, the job is not owned by this agent, or
    * the orchestrator hit an internal error — rather than a genuinely missing
    * artifact. A safe, fixed,
-   * human-readable string; never a raw exception. Older agents ignore the field
-   * and render the plain not-found message.
+   * human-readable string; never a raw exception.
    */
   error: z.string().optional(),
 });
@@ -1004,8 +973,7 @@ export const eventEmitResponseSchema = z.object({
  * A provisioned agent normally sends this itself to self-bootstrap — the claim
  * code is the authorization, so it may send it before it authenticates or
  * registers. A provisioning workflow can also send it to obtain the token
- * directly. Additive/negotiated by presence — older peers that never emit it
- * are unaffected, so it needs no `PROTOCOL_VERSION` bump of its own.
+ * directly.
  */
 export const scalerClaimCredentialsSchema = z.object({
   type: z.literal('scaler.claim-credentials'),

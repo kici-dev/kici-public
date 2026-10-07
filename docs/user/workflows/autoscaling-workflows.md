@@ -11,6 +11,29 @@ This page assumes you know the [`kiciEvent()`](../sdk/triggers.md) trigger and [
 
 The SDK exports the two event names and their payload schemas, so you subscribe with the same constant the scaler emits and parse the payload instead of casting it. Import `SCALER_EVENT_NAMES`, `ScalerScaleUpPayload`, `ScalerScaleDownPayload` and `ScaleDownReason` from `@kici-dev/sdk` — see [validation and events](../sdk/validation-events.md#event-scaler-events).
 
+## Where the workflows live
+
+The provisioning and teardown workflows are ordinary workflows with a `kiciEvent()` trigger. They are not [global workflows](../global-workflows.md). Put them in one repository and name that repository in the scaler's `provisioningTargets`, as `owner/repo`. The orchestrator delivers `kici.scaler.scale-up` and `kici.scaler.scale-down` only to workflows registered in the repositories that list names.
+
+That repository needs two things:
+
+- **KiCI receives its pushes.** Install the GitHub App of your webhook source on it, the same as for any repository KiCI runs.
+- **The workflows are on its default branch.** Event-based triggers register only from the default branch's lock file (see [the registration model](../events.md#the-registration-model)).
+
+A dedicated repository such as `myorg/infra` keeps the provisioning code and its reviews apart from your application repositories:
+
+```text
+myorg/infra/
+└── .kici/
+    ├── package.json            # declares @kici-dev/sdk (kici init writes it)
+    ├── workflows/
+    │   ├── hetzner-provision.ts
+    │   └── hetzner-teardown.ts
+    └── kici.lock.json          # written by kici compile
+```
+
+The repositories whose jobs run on the pool need no change except the label: a job with `runsOn: ['hetzner']` allocates on the scaler that provisions that label set. To confirm the two workflows registered after the push, run `kici-admin registration list --repo myorg/infra`.
+
 ## The provisioning workflow
 
 The provisioning workflow subscribes to `kici.scaler.scale-up` and matches on the scaler name. It reads the payload from `ctx.rawPayload`, forwards the single-use claim code into a cloud instance, and boots that instance. The agent claims its own token in-instance and registers with the given `agentId`.

@@ -71,8 +71,8 @@ export interface PlaneStamp {
   /** Build date of the CLI that booted this plane (see planeBuildIsStale). */
   buildDate: string;
   stampVersion: number;
-  /** Offline (independent) vs attached (hybrid). Absent (legacy) reads as independent. */
-  mode?: PlaneMode;
+  /** Offline (independent) vs attached (hybrid). */
+  mode: PlaneMode;
 }
 
 export interface PlaneStatus {

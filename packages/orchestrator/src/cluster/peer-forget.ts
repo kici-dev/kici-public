@@ -16,6 +16,7 @@ import {
 } from '@kici-dev/engine';
 import { z } from 'zod';
 import type { PeerRegistry } from './peer-registry.js';
+import { PeerRequestWaiters } from './peer-request-waiters.js';
 import {
   adopterIsLive,
   clusterViewSufficient,
@@ -377,51 +378,14 @@ export function disconnectedCoordinatorIds(
     .sort();
 }
 
-/** Pending forget requests sent to siblings, keyed by message id. */
-export class PeerForgetWaiters {
-  private readonly waiters = new Map<
-    string,
-    {
-      resolve: (response: PeerForgetResponse | typeof PEER_FORGET_TIMEOUT) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }
-  >();
-
-  /** Wait for the response to `messageId`, or {@link PEER_FORGET_TIMEOUT}. */
-  wait(
-    messageId: string,
-    timeoutMs: number,
-  ): Promise<PeerForgetResponse | typeof PEER_FORGET_TIMEOUT> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(messageId);
-        resolve(PEER_FORGET_TIMEOUT);
-      }, timeoutMs);
-      timer.unref?.();
-      this.waiters.set(messageId, { resolve, timer });
-    });
-  }
-
-  /** Hand a response to the request waiting for it. An unknown id is dropped. */
-  resolve(response: PeerForgetResponse): void {
-    const waiter = this.waiters.get(response.messageId);
-    if (!waiter) return;
-    clearTimeout(waiter.timer);
-    this.waiters.delete(response.messageId);
-    waiter.resolve(response);
-  }
-
-  /** End every pending wait with an `error` response naming `reason`. */
-  rejectAll(reason: string): void {
-    for (const [messageId, waiter] of this.waiters) {
-      clearTimeout(waiter.timer);
-      waiter.resolve({
-        type: 'peer.forget.response',
-        messageId,
-        outcome: PeerForgetOutcome.enum.error,
-        detail: reason,
-      });
-    }
-    this.waiters.clear();
+/** Pending forget requests sent to siblings; a close answers each `error` naming the reason. */
+export class PeerForgetWaiters extends PeerRequestWaiters<PeerForgetResponse> {
+  constructor() {
+    super((messageId, reason) => ({
+      type: 'peer.forget.response',
+      messageId,
+      outcome: PeerForgetOutcome.enum.error,
+      detail: reason,
+    }));
   }
 }

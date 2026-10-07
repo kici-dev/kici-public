@@ -12,7 +12,7 @@ export type {
 
 export { TrustTierSchema, MinimumTrustSchema } from './types.js';
 
-export { HoldType, normalizePersistedHoldType, persistedHoldTypeSpellings } from './hold-type.js';
+export { HoldType } from './hold-type.js';
 
 export { trustedContributorHoldReason } from './hold-reason.js';
 

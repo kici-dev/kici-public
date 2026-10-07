@@ -217,18 +217,13 @@ rules ran against (`resolveForContext`), the same resolution a bound context's
 secrets take. For a name only a glob context matches, that is the glob row. The
 audit entry records the run and job the reference was resolved for.
 
-One deprecated fallback remains until v1.0.0. It applies when the bound
-resolution lacks the key, and the matched row carries the exact referenced name
-and is not a glob context. The row may bind no scope, or bind scopes that do not
-carry the key. The scope named after the context is then read instead, and the
-orchestrator logs a deprecation warning naming the org, context, run and job. A
-glob-matched row never reads a scope that merely shares its name.
+When the bound resolution lacks the key, the reference is refused. A scope that
+merely shares the context's name is never read.
 
 The direct lookup that applies none of these checks is
 `SecretResolverApi.resolveNamedInternal`. Its name says so: it is for
 system-scoped callers resolving the orchestrator's own credentials. A
-job-originated reference reaches it only through the deprecated fallback above,
-after every check of the gate has passed.
+job-originated reference never reaches it.
 
 ### Reserved namespaces
 

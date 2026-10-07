@@ -320,8 +320,8 @@ export const executionStatusSchema = z.object({
   workflowName: z.string().max(STATUS_ID_MAX),
   status: ExecutionRunStatus,
   /**
-   * Routing key of the run's own source. Optional for backward compatibility
-   * with older orchestrators (absent → the Platform falls back to the WS
+   * Routing key of the run's own source. Absent for a run the orchestrator
+   * recorded no routing key for (the Platform then falls back to the WS
    * connection's first routing key). Lets the Platform mirror attribute each
    * run to its real source even when one orchestrator serves multiple sources.
    */
@@ -332,8 +332,7 @@ export const executionStatusSchema = z.object({
    * `repoIdentifier` — a global workflow authored in one repository and
    * dispatched against another. Absent for every per-repository run, where the
    * two are the same repository, so "present" is a precise marker for a
-   * cross-repository global run. Optional for backward compatibility with an
-   * older orchestrator that never sends it.
+   * cross-repository global run.
    */
   workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   /**
@@ -343,8 +342,7 @@ export const executionStatusSchema = z.object({
    * The Platform mirrors it so its own re-run refusal can admit a round: a
    * round is definitionally cross-repository, and re-running one re-evaluates
    * the original event instead of resolving a workflow out of the acted-on
-   * repository's lock file. Absent means an ordinary run — optional for
-   * backward compatibility with an orchestrator that never sends it.
+   * repository's lock file. Absent means an ordinary run.
    */
   isGlobalEvalRound: z.boolean().optional(),
   /**
@@ -409,10 +407,8 @@ export const executionStatusSchema = z.object({
    * already dispatched reported in, and then continues). The Platform keeps a
    * terminal status against a non-terminal frame unless the frame's generation
    * is newer, so a frame that arrives late cannot move a finished run back.
-   * Optional for backward compatibility: an older orchestrator omits it, and the
-   * Platform then applies the frame unguarded.
    */
-  statusEpoch: statusEpochSchema.optional(),
+  statusEpoch: statusEpochSchema,
 });
 
 /** Per-step status forwarded from agent to Platform (real-time). */
@@ -466,8 +462,7 @@ export const jobStatusForwardSchema = z.object({
   initFailure: initFailureSchema.optional(),
   /**
    * Job kind. Absent means an ordinary `standard` job. `gate`/`proxy` mark an
-   * invoke gate and its per-run proxy children. Additive/optional — an older
-   * peer ignores it.
+   * invoke gate and its per-run proxy children.
    */
   jobKind: JobKind.optional(),
   /** For a `proxy` job, the summoned run it mirrors. Additive/optional. */
@@ -513,7 +508,7 @@ export const stateReplayRunSchema = z.object({
   /** Why the run failed (`RunFailureClass`); only present for failed/cancelled runs. */
   failureClass: RunFailureClass.optional(),
   /** The run's status generation, with the same meaning as on `execution.status`. */
-  statusEpoch: statusEpochSchema.optional(),
+  statusEpoch: statusEpochSchema,
   jobs: z
     .array(
       z.object({

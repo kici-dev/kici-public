@@ -23,10 +23,13 @@ import { readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { emitKiciEventDirect, toErrorMessage } from '@kici-dev/shared';
-
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+} from './shared/cli-action.js';
+import { renderTable } from './shared/table.js';
 
 interface EmitResult {
   eventId: string;
@@ -57,18 +60,6 @@ interface EventDetail extends EventRow {
   dlqAt: string | null;
   dlqReason: string | null;
   runs: Array<{ runId: string; workflowName: string; status: string; createdAt: string }>;
-}
-
-function renderTable(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
-  const fmtRow = (cells: string[]) =>
-    cells
-      .map((c, i) => (c ?? '').padEnd(widths[i]!))
-      .join('  ')
-      .trimEnd();
-  return [fmtRow(headers), widths.map((w) => '-'.repeat(w)).join('  '), ...rows.map(fmtRow)].join(
-    '\n',
-  );
 }
 
 /**
@@ -228,20 +219,20 @@ export function registerEventCommands(program: Command, getClient: () => AdminAp
       'Source routing key for cross-repo event matching (default: empty)',
     )
     .option('--source-repo <r>', 'Source repo identifier for cross-repo matching (default: empty)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output { eventId } on stdout', false)
     .action(
-      async (
-        name: string,
-        opts: {
-          payloadFile: string;
-          sourceRoutingKey?: string;
-          sourceRepo?: string;
-          databaseUrl?: string;
-          json?: boolean;
-        },
-      ) => {
-        try {
+      cliAction(
+        async (
+          name: string,
+          opts: {
+            payloadFile: string;
+            sourceRoutingKey?: string;
+            sourceRepo?: string;
+            databaseUrl?: string;
+            json?: boolean;
+          },
+        ) => {
           // Read and parse the payload file. We do this client-side so both
           // dual-mode paths share the same validation surface and so ENOENT /
           // JSON-parse errors surface before any DB connection is opened.
@@ -289,11 +280,8 @@ export function registerEventCommands(program: Command, getClient: () => AdminAp
           } else {
             console.log(`Event emitted: ${result.eventId}`);
           }
-        } catch (err) {
-          console.error(`Error: ${toErrorMessage(err)}`);
-          process.exit(1);
-        }
-      },
+        },
+      ),
     );
 
   registerEventReadCommands(event, getClient);

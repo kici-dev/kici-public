@@ -96,7 +96,7 @@ async function readFileOrNull(filePath: string): Promise<string | null> {
  * Load secrets from multiple sources with merge precedence.
  *
  * Merge order (lowest to highest priority):
- * 1. .kici/.secrets (INI-style, backward compat)
+ * 1. .kici/.secrets (INI-style; its `[section]` blocks are the only context-scoped source)
  * 2. .kici/.env.local (dotenv format)
  * 3. .kici/secrets.yaml (YAML with context scopes, merged flat)
  * 4. --env KEY=VALUE CLI flags
@@ -111,7 +111,7 @@ export async function loadLocalSecrets(
   kiciDir: string,
   envFlags?: string[],
 ): Promise<ParsedSecrets> {
-  // 1. Load .secrets (backward compat) -- lowest priority
+  // 1. Load .secrets -- lowest priority
   const iniSecrets = await loadSecretsFile(kiciDir);
 
   // Start with INI secrets as base

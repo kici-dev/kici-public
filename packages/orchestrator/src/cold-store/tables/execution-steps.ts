@@ -1,25 +1,13 @@
 /**
  * `execution_steps` cold-store adapter (Orchestrator side).
  *
+ * Tenant column `routing_key`, partition column `created_at`, warm TTL 30
+ * days. Steps are append-only, so age alone makes a row eligible.
  *
- * Contract:
- *   - tenant column: `routing_key` (denormalized in migration 006)
- *   - partition column: `created_at`
- *   - warm TTL: 30 days
- *   - eligibility: created_at < cutoff (steps are append-only and have no
- *     terminal-status predicate — there is no UPDATE statement against
- *     `execution_steps` in the orchestrator codebase, so age alone is
- *     sufficient)
- *
- * Order: registered FIRST in the orchestrator cold-store. Within one
- * cycle the framework iterates adapters in registration order
- * (steps → jobs → runs); steps go first so the FK chain
- * (execution_jobs.run_id → execution_runs.run_id) doesn't break when
- * jobs and runs are archived later.
- *
- * Audit emission: orchestrator-side adapters write to `access_log`
- * (the orchestrator's audit surface; `audit_log` is Platform-side only).
- * The row uses actor_type='system', actor_id='cold-store-archive:<id>'.
+ * Registered first: the framework archives in registration order (steps →
+ * jobs → runs), which keeps the `execution_jobs.run_id → execution_runs` FK
+ * chain intact. The archive audit row goes to `access_log`, the
+ * orchestrator's audit surface, as actor `cold-store-archive:<instanceId>`.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import {
@@ -27,6 +15,7 @@ import {
   type ColdStoreTableConfig,
   type EligiblePartition,
   type TableAdapter,
+  PgTableAdapterBase,
 } from '@kici-dev/shared';
 import type { Database, ExecutionStepTable } from '../../db/types.js';
 
@@ -35,7 +24,6 @@ export type ExecutionStepRow = Selectable<ExecutionStepTable>;
 const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|execution_steps';
 const APPROX_ROW_BYTES = 600;
 
-/** Per-table defaults. */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 10 * 1024 * 1024,
@@ -49,27 +37,25 @@ export interface ExecutionStepsAdapterOptions {
   overrides?: Partial<ColdStoreTableConfig>;
 }
 
-export class ExecutionStepsAdapter implements TableAdapter<ExecutionStepRow> {
+export class ExecutionStepsAdapter
+  extends PgTableAdapterBase<Database>
+  implements TableAdapter<ExecutionStepRow>
+{
   readonly db = 'orchestrator' as const;
   readonly table = 'execution_steps';
   readonly tenantColumn = 'routing_key';
   readonly partitionColumn = 'created_at';
-  readonly config: ColdStoreTableConfig;
 
   constructor(
-    private readonly kdb: Kysely<Database>,
+    kdb: Kysely<Database>,
     private readonly instanceId: string,
     opts: ExecutionStepsAdapterOptions = {},
   ) {
-    this.config = { ...DEFAULT_CONFIG, ...(opts.overrides ?? {}) };
+    super(kdb, ADVISORY_LOCK_NAMESPACE, DEFAULT_CONFIG, opts.overrides);
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
-    // routing_key IS NOT NULL — rows without a denormalized tenant are
-    // skipped (e.g. ancient rows that never got backfilled). The
-    // backfill in migration 006 populates everything that has a parent
-    // run; orphans without a parent run can't be archived because we
-    // don't know their tenant.
+    // A row with no denormalized routing_key has no known tenant and is skipped.
     const rows = await sql<{ tenant_id: string; partition_date: string }>`
       SELECT routing_key AS tenant_id,
              TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS partition_date
@@ -93,25 +79,6 @@ export class ExecutionStepsAdapter implements TableAdapter<ExecutionStepRow> {
     `.execute(this.kdb);
     const n = Number(res.rows[0]?.n ?? '0');
     return Number.isFinite(n) ? n * APPROX_ROW_BYTES : 0;
-  }
-
-  async withPartitionLock<T>(
-    args: { tenantId: string; partitionDate: string },
-    fn: () => Promise<T>,
-  ): Promise<T | null> {
-    const key = `${ADVISORY_LOCK_NAMESPACE}|${args.tenantId}|${args.partitionDate}`;
-    return await this.kdb.connection().execute(async (conn) => {
-      const lockRes = await sql<{ locked: boolean }>`
-        SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
-      `.execute(conn);
-      const locked = lockRes.rows[0]?.locked === true;
-      if (!locked) return null;
-      try {
-        return await fn();
-      } finally {
-        await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn).catch(() => undefined);
-      }
-    });
   }
 
   async *selectEligible(args: {
@@ -141,10 +108,10 @@ export class ExecutionStepsAdapter implements TableAdapter<ExecutionStepRow> {
 
   decodeRow(line: string): ExecutionStepRow {
     const parsed = JSON.parse(line) as ExecutionStepRow;
-    coerceDate(parsed, 'created_at');
-    coerceDate(parsed, 'started_at');
-    coerceDate(parsed, 'completed_at');
-    coerceDate(parsed, 'archived_at');
+    PgTableAdapterBase.coerceDate(parsed, 'created_at');
+    PgTableAdapterBase.coerceDate(parsed, 'started_at');
+    PgTableAdapterBase.coerceDate(parsed, 'completed_at');
+    PgTableAdapterBase.coerceDate(parsed, 'archived_at');
     return parsed;
   }
 
@@ -174,8 +141,6 @@ export class ExecutionStepsAdapter implements TableAdapter<ExecutionStepRow> {
 
       await trx.deleteFrom('execution_steps').where('id', 'in', ids).execute();
 
-      // Orchestrator-side audit: access_log (the audit split —
-      // Platform writes to audit_log, Orchestrator writes to access_log).
       await trx
         .insertInto('access_log')
         .values({
@@ -208,12 +173,5 @@ export class ExecutionStepsAdapter implements TableAdapter<ExecutionStepRow> {
           last_archived_at = now()
       `.execute(trx);
     });
-  }
-}
-
-function coerceDate<T>(parsed: T, field: keyof T): void {
-  const v = (parsed as unknown as Record<string, unknown>)[field as string];
-  if (typeof v === 'string') {
-    (parsed as unknown as Record<string, unknown>)[field as string] = new Date(v);
   }
 }

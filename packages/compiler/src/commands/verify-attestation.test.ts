@@ -28,6 +28,7 @@ vi.mock('@kici-dev/engine/provenance/verify', () => ({
 
 vi.mock('../remote/config.js', () => ({
   loadGlobalConfig: vi.fn().mockResolvedValue({}),
+  getConfigPath: () => '/home/u/.kici/config',
 }));
 
 import { sha256File } from '@kici-dev/core';
@@ -225,22 +226,22 @@ describe('kici verify-attestation', () => {
     expect(mockVerify).not.toHaveBeenCalled();
   });
 
-  it('defaults --trust-root to the hosted prod issuer when omitted and no orchestrator is configured', async () => {
-    mockVerify.mockResolvedValue({
-      verified: true,
-      mode: 'kici',
-      checks: {},
-      claims: {},
-      failures: [],
-    });
+  it('fails with both remedies when no trust root and no orchestrator are configured', async () => {
+    // fails-when: the command still falls back to the hosted Platform issuer.
     const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
-    expect(ok).toBe(true);
-    expect(mockResolve).toHaveBeenCalledWith('https://api.kici.dev');
-    expect(logOutput.join('\n')).toContain('Using default trust root https://api.kici.dev');
-    expect(logOutput.join('\n')).toContain('hosted KiCI platform');
+    expect(ok).toBe(false);
+    expect(mockResolve).not.toHaveBeenCalled();
+    expect(mockVerify).not.toHaveBeenCalled();
+    const out = logOutput.join('\n');
+    expect(out).toContain('--trust-root');
+    // fails-when: the remedy names `kici login`, which never sets the
+    // orchestrator endpoint, instead of the config field the default reads.
+    expect(out).toContain('set "endpoint" in /home/u/.kici/config');
+    expect(out).not.toContain('kici login');
   });
 
-  it('defaults --trust-root to the CONFIGURED ORCHESTRATOR when one is set (the new root of trust)', async () => {
+  it('defaults --trust-root to the CONFIGURED ORCHESTRATOR when one is set', async () => {
+    // breaks-if-wrong: the orchestrator default must survive the fallback removal.
     mockLoadConfig.mockResolvedValue({ endpoint: 'https://orch.example' });
     mockVerify.mockResolvedValue({
       verified: true,
@@ -252,19 +253,19 @@ describe('kici verify-attestation', () => {
     const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
     expect(ok).toBe(true);
     expect(mockResolve).toHaveBeenCalledWith('https://orch.example');
-    expect(mockResolve).not.toHaveBeenCalledWith('https://api.kici.dev');
     expect(logOutput.join('\n')).toContain('configured orchestrator');
   });
 
   it('gives a provenance-not-enabled message when the default issuer returns 503', async () => {
+    mockLoadConfig.mockResolvedValue({ endpoint: 'https://orch.example' });
     mockResolve.mockRejectedValue(
-      new Error('failed to fetch https://api.kici.dev/.well-known/openid-configuration: 503'),
+      new Error('failed to fetch https://orch.example/.well-known/openid-configuration: 503'),
     );
     const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
     expect(ok).toBe(false);
     expect(mockVerify).not.toHaveBeenCalled();
     expect(logOutput.join('\n')).toContain(
-      'build provenance signing is not enabled on the hosted KiCI platform',
+      'build provenance signing is not enabled on your configured orchestrator',
     );
   });
 

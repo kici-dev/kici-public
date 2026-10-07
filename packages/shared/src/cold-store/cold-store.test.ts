@@ -782,7 +782,7 @@ describe('BaseColdStore', () => {
     }
   });
 
-  it('falls back to legacy single-chunk path when adapter has no coldTtlDays (v1 manifest)', async () => {
+  it('uses the single-chunk path when adapter has no coldTtlDays (v1 manifest)', async () => {
     const mock = makeMockS3();
     const { adapter } = makeTestAdapter();
     // Sanity check: this adapter does NOT implement coldTtlDays.

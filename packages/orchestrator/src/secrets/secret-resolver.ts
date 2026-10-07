@@ -234,10 +234,8 @@ export class SecretResolver implements SecretResolverApi {
    * A JOB-ORIGINATED reference goes through `resolveJobQualifiedSecret`
    * (`secrets/job-secret-gate.ts`) instead, which runs the named context's
    * protection rules and the trust-tier strip, then reads the value through
-   * that context's bindings with `resolveForContext`. It calls this method in
-   * one deprecated case only, after its own checks pass: a non-glob context
-   * matched by its exact name, whose bound scopes do not carry the key, reads
-   * the scope named after the context (removal planned for v1.0.0). The `Internal` suffix marks the
+   * that context's bindings with `resolveForContext`, and never calls this
+   * method. The `Internal` suffix marks the
    * boundary: a warning in a doc comment is not one, but a name shows up in a
    * grep of callers.
    *

@@ -42,6 +42,7 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import type { GenericWebhookSource } from '../db/types.js';
+import { safeJsonParse } from '../helpers/json.js';
 
 const logger = createLogger({ prefix: 'register-source-bundle' });
 
@@ -206,15 +207,6 @@ function registerLocalBundle(row: GenericWebhookSource, deps: RegisterSourceBund
     sourceName: row.name,
     repoBasePath: parsed.data.repoBasePath,
   });
-}
-
-/** Parse JSON, returning null on any error (used for the dual-purpose git_config column). */
-function safeJsonParse(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
 }
 
 /** What {@link registerAllGenericSourceBundles} needs beyond the per-row deps. */

@@ -131,6 +131,17 @@ Each operation below is driven by `kici-admin`; the `kici-admin` subcommand wrap
 
 Secrets are organized by org ID and scope (e.g., context name, repo pattern).
 
+**List the org IDs:**
+
+```bash
+kici-admin org list
+```
+
+```bash
+curl "$KICI_ADMIN_URL/api/v1/admin/org-ids" \
+  -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
+```
+
 **List scopes:**
 
 ```bash
@@ -757,44 +768,6 @@ kici-admin secret scopes org-1
 
 A backend that is unreachable at that moment is skipped with a warning rather
 than failing the whole listing.
-
-### Repairing scopes stored with a stale qualifier
-
-Orchestrators that predate backend-qualified routing stored the qualifier as
-part of the scope name, so a secret written to `pg:production` was saved under
-the literal scope `pg:production`. Reads now address the bare `production`, so
-those rows are unreachable.
-
-`secret fix-prefixed-scopes` repairs them. The scope name is bound into each
-secret's authenticated encryption, so the command re-encrypts every value as it
-renames -- a direct SQL rename would leave the ciphertext undecryptable.
-
-```bash
-# Preview
-kici-admin secret fix-prefixed-scopes org-1 --dry-run --database-url "$KICI_DATABASE_URL"
-
-# Apply
-kici-admin secret fix-prefixed-scopes org-1 --database-url "$KICI_DATABASE_URL"
-```
-
-Run it once per organization after upgrading. It is idempotent -- a second run
-finds nothing to repair.
-
-The command repairs only the `pg:` qualifier, and it never merges two scopes.
-A scope is reported as `SKIPPED` and left untouched when:
-
-- the bare target already exists (both `pg:production` and `production` hold
-  secrets) -- merging would silently overwrite whichever keys the two share; or
-- the stored name carries another backend's qualifier (e.g. a PG row named
-  `openbao-prod:aws/creds`) -- repairing it here would turn it into a genuine PG
-  secret, moving it across a backend boundary. Copy those values into the named
-  backend yourself, then delete the stale scope; or
-- the stored name is a bare qualifier with no path after it (`pg:`) -- there is
-  no bare name to rename it to, so it needs a hand-written name.
-
-The command exits `2` when anything was skipped, so an upgrade script can tell
-"some scopes need a human" apart from a hard failure (exit `1`) and a clean
-repair (exit `0`).
 
 ### PG customer secrets toggle
 

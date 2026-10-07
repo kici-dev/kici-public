@@ -176,7 +176,7 @@ KICI_QUEUE_TIMEOUT_MS=7200000
 | ----------------- | ------------------ | -------------------------------------------------------------------------------- |
 | `queue.timeoutMs` | `3600000` (1 hour) | How long a job can wait in the dispatch queue before expiring. `0` = indefinite. |
 
-The cluster value is the last fallback. A queued job's deadline is resolved as `job.timeoutMs ?? org_settings.queue_timeout_ms ?? queue.timeoutMs`: a job-level `timeout` on the workflow wins outright, then a per-org override set with [`kici-admin org-settings queue-timeout set <ms> --customer-id <id>`](orchestrator/kici-admin/org-settings.md#queue-timeout--per-org-dispatch-queue-job-timeout) (`reset` clears it), and only then the cluster-wide `queue.timeoutMs`. `0` at any layer means indefinite.
+The cluster value is the last fallback. A queued job's deadline is resolved as `job.timeoutMs ?? org_settings.queue_timeout_ms ?? queue.timeoutMs`: a job-level `timeout` on the workflow wins outright, then a per-org override set with [`kici-admin org-settings queue-timeout set <ms> --org <id>`](orchestrator/kici-admin/org-settings.md#queue-timeout--per-org-dispatch-queue-job-timeout) (`reset` clears it), and only then the cluster-wide `queue.timeoutMs`. `0` at any layer means indefinite.
 
 ### Platform safety-net GC
 

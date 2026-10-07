@@ -4,6 +4,8 @@
  * Shows OS-level service status (state, PID, uptime) and queries the
  * running orchestrator's `/health` and `/ready` endpoints for its version,
  * build fingerprint, uptime and readiness (database reachable, boot finished).
+ * With an admin token (`--token` / KICI_ADMIN_TOKEN) it also asks the
+ * instance's admin API which org the Platform attached it to.
  *
  * Target resolution goes through resolveInstanceTarget — the same priority chain
  * every lifecycle command uses (--instance-dir > --name > CWD manifest >
@@ -25,7 +27,6 @@ import { readEnvValue } from '../../service/backup-timer.js';
 import {
   formatUptime,
   ReadinessStatus,
-  toErrorMessage,
   type LivenessResponse,
   type ReadinessResponse,
 } from '@kici-dev/shared';
@@ -33,14 +34,21 @@ import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 import { DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS } from '../../../config.js';
 import type { OrchestratorLivenessInfo } from '../../../routes/health.js';
 import {
+  ORG_LIST_PATH,
+  PlatformAttachment,
+  type OrgListResponse,
+} from '../../../db/repos/org-ids-repo.js';
+import {
   buildInfoRows,
   fetchLocalJson,
   formatHealthSection,
-  hideBuildCommit,
   readEnvContent,
   readLocalEndpoint,
+  requestLocalJson,
+  type LocalEndpoint,
   type StatusRow,
 } from '../service-health.js';
+import { cliAction } from '../shared/cli-action.js';
 
 /** Time `/ready` gets beyond the database-pool acquire timeout, for its query and its response. */
 const READINESS_MARGIN_MS = 3000;
@@ -102,6 +110,61 @@ export function formatConfigPaths(args: {
   return lines;
 }
 
+/** What `status` learned about the orchestrator's Platform org. */
+type StatusOrg =
+  | { platformAttachment: PlatformAttachment; attachedOrgId: string | null }
+  | { platformAttachment: 'unknown'; reason: string };
+
+/**
+ * Ask the instance's admin API which org the Platform attached it to. Needs an
+ * admin token; the answer is never read from the unauthenticated `/health`.
+ */
+async function readStatusOrg(
+  endpoint: LocalEndpoint,
+  token: string | undefined,
+): Promise<StatusOrg> {
+  if (!token) {
+    return {
+      platformAttachment: 'unknown',
+      reason: 'pass --token or set KICI_ADMIN_TOKEN to read it',
+    };
+  }
+  const result = await requestLocalJson<OrgListResponse>(endpoint, ORG_LIST_PATH, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (result.kind === 'no-answer') {
+    return { platformAttachment: 'unknown', reason: 'the admin API did not answer' };
+  }
+  if (result.kind === 'http-error') {
+    return {
+      platformAttachment: 'unknown',
+      reason:
+        result.status === 404
+          ? 'this orchestrator predates the org listing'
+          : `the admin API answered HTTP ${result.status}`,
+    };
+  }
+  const { platformAttachment, attachedOrgId } = result.body;
+  if (!platformAttachment) {
+    return { platformAttachment: 'unknown', reason: 'the admin API did not report an attachment' };
+  }
+  return { platformAttachment, attachedOrgId: attachedOrgId ?? null };
+}
+
+/** The `Org:` line of the orchestrator section. */
+function formatOrgRow(org: StatusOrg): StatusRow {
+  switch (org.platformAttachment) {
+    case PlatformAttachment.enum.attached:
+      return ['Org', `${org.attachedOrgId} (attached to the Platform)`];
+    case PlatformAttachment.enum.pending:
+      return ['Org', 'unknown (not yet authenticated with the Platform)'];
+    case PlatformAttachment.enum.none:
+      return ['Org', 'none (independent orchestrator; kici-admin org list shows its org ids)'];
+    default:
+      return ['Org', `unknown (${org.reason})`];
+  }
+}
+
 /** `yes` when every readiness check passed, otherwise `no` and the failing checks. */
 function formatReadiness(readiness: OrchestratorReadiness): string {
   if (readiness.status === ReadinessStatus.Ready) return 'yes';
@@ -116,6 +179,7 @@ function formatStatus(
   serviceStatus: ServiceStatus,
   health: OrchestratorHealth | null,
   readiness: OrchestratorReadiness | null,
+  org: StatusOrg | null,
   serviceName: string,
 ): string {
   const lines: string[] = [];
@@ -139,6 +203,7 @@ function formatStatus(
       'Ready',
       readiness ? formatReadiness(readiness) : 'unknown (/ready did not answer)',
     ]);
+    if (org) rows.push(formatOrgRow(org));
     rows.push(...buildInfoRows(health));
     lines.push(...formatHealthSection('--- KiCI orchestrator ---', rows, VALUE_COLUMN));
   } else if (serviceStatus.state === 'running') {
@@ -154,6 +219,7 @@ function buildJsonOutput(
   serviceStatus: ServiceStatus,
   health: OrchestratorHealth | null,
   readiness: OrchestratorReadiness | null,
+  org: StatusOrg | null,
   serviceName: string,
   configPaths: Record<string, string>,
 ): Record<string, unknown> {
@@ -161,8 +227,9 @@ function buildJsonOutput(
     service: serviceName,
     ...serviceStatus,
     configPaths,
-    health: health ? hideBuildCommit(health) : undefined,
+    health: health ?? undefined,
     readiness: readiness ?? undefined,
+    org: org ?? undefined,
   };
 }
 
@@ -188,8 +255,8 @@ export function registerStatusCommand(parent: Command): void {
     .option('--system', 'Operate against the system-level service (requires root)')
     .option('--user-level', 'Operate against the user-level service')
     .option('--json', 'Output as JSON')
-    .action(async (opts: StatusOptions) => {
-      try {
+    .action(
+      cliAction(async (opts: StatusOptions, cmd: Command) => {
         const userLevel = resolveUserLevel(opts);
         const kiciRoot = kiciConfigRoot(userLevel);
 
@@ -238,14 +305,19 @@ export function registerStatusCommand(parent: Command): void {
 
         let health: OrchestratorHealth | null = null;
         let readiness: OrchestratorReadiness | null = null;
+        let org: StatusOrg | null = null;
         if (serviceStatus.state === 'running') {
           const endpoint = readLocalEndpoint(envContent, ORCHESTRATOR_DEFAULT_PORT);
-          [health, readiness] = await Promise.all([
+          // The root --token / KICI_ADMIN_TOKEN goes only to this instance's
+          // own endpoint, never to the global --url.
+          const token = cmd.optsWithGlobals<{ token?: string }>().token;
+          [health, readiness, org] = await Promise.all([
             fetchLocalJson<OrchestratorHealth>(endpoint, '/health'),
             fetchLocalJson<OrchestratorReadiness>(endpoint, '/ready', {
               acceptStatuses: [503],
               timeoutMs: readinessTimeoutMs(envContent),
             }),
+            readStatusOrg(endpoint, token),
           ]);
         }
 
@@ -259,19 +331,16 @@ export function registerStatusCommand(parent: Command): void {
         if (opts.json) {
           console.log(
             JSON.stringify(
-              buildJsonOutput(serviceStatus, health, readiness, config.name, jsonConfigPaths),
+              buildJsonOutput(serviceStatus, health, readiness, org, config.name, jsonConfigPaths),
               null,
               2,
             ),
           );
         } else {
-          console.log(formatStatus(serviceStatus, health, readiness, config.name));
+          console.log(formatStatus(serviceStatus, health, readiness, org, config.name));
           console.log('');
           console.log(configPathLines.join('\n'));
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

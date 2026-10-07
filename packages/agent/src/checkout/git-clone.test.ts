@@ -59,13 +59,13 @@ describe('gitClone', () => {
     expect(cloneCall.args).toContain('/tmp/work');
   });
 
-  it('uses -c http.extraHeader for token auth (NOT in the URL)', async () => {
+  it('uses -c http.extraHeader for basic auth (NOT in the URL)', async () => {
     await gitClone({
       repoUrl: 'https://github.com/org/repo.git',
       ref: 'main',
       sha: 'abc123',
       workDir: '/tmp/work',
-      token: 'ghs_secret123',
+      gitAuth: { kind: 'basic', user: 'x-access-token', secret: 'ghs_secret123' },
     });
 
     const cloneCall = execFileSyncCalls[0];
@@ -176,7 +176,7 @@ describe('gitClone', () => {
       ref: 'main',
       sha: 'abc123',
       workDir: '/tmp/work',
-      token,
+      gitAuth: { kind: 'basic', user: 'x-access-token', secret: token },
     }).catch((e) => e);
 
     expect(err).toBeInstanceOf(Error);
@@ -207,7 +207,7 @@ describe('gitClone', () => {
       ref: 'main',
       sha: 'abc123',
       workDir: '/tmp/work',
-      token,
+      gitAuth: { kind: 'basic', user: 'x-access-token', secret: token },
     }).catch((e) => e);
 
     expect(err).toBeInstanceOf(Error);
@@ -318,24 +318,6 @@ describe('gitClone', () => {
     expect(cloneCall.args).toContain(`http.extraHeader=Authorization: Basic ${basicB64}`);
   });
 
-  it('prefers gitAuth over legacy token when both set', async () => {
-    await gitClone({
-      repoUrl: 'https://forgejo.example.com/alice/repo.git',
-      ref: 'main',
-      sha: '',
-      workDir: '/tmp/work',
-      token: 'legacy-ignored',
-      gitAuth: { kind: 'basic', user: 'x-access-token', secret: 'new-pat' },
-    });
-
-    const cloneCall = execFileSyncCalls[0];
-    const basicB64 = Buffer.from('x-access-token:new-pat').toString('base64');
-    expect(cloneCall.args).toContain(`http.extraHeader=Authorization: Basic ${basicB64}`);
-    // The legacy token string must NOT appear in any encoded header
-    const legacyB64 = Buffer.from('x-access-token:legacy-ignored').toString('base64');
-    expect(cloneCall.args.join(' ')).not.toContain(legacyB64);
-  });
-
   it('sets GIT_SSH_COMMAND when gitAuth.kind is ssh', async () => {
     await gitClone({
       repoUrl: 'git@forgejo.example.com:alice/repo.git',
@@ -425,7 +407,7 @@ describe('gitClone', () => {
         ref: 'main',
         sha: 'abc123',
         workDir: '/tmp/work',
-        token: 'ghs_secret123',
+        gitAuth: { kind: 'basic', user: 'x-access-token', secret: 'ghs_secret123' },
         credentialHelperPath: '/opt/kici/git-credential-kici',
       });
 

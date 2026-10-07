@@ -56,6 +56,17 @@ const githubConfig = {
   appId: '12345',
   privateKey: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
 };
+const ROUTING_KEY = 'github:12345';
+
+/** A registry whose GitHub bundle at `routingKey` carries `githubConfig`. */
+function githubRegistry(routingKey: string = ROUTING_KEY): ProviderRegistry {
+  const registry = new ProviderRegistry();
+  registry.registerByRoutingKey(routingKey, {
+    normalizer: {} as never,
+    cloneTokenProvider: { provider: 'github', getAppConfig: () => githubConfig } as never,
+  });
+  return registry;
+}
 
 /**
  * An all-stub `CheckRunTrackingStore`. Shared by the tracking-store suite and
@@ -89,7 +100,7 @@ describe('CheckRunReporter', () => {
 
   describe('setPending', () => {
     it('creates check runs for workflow and jobs via checks.create', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -99,6 +110,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobNames: ['test', 'lint'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       // Wait for fire-and-forget to complete
@@ -139,7 +151,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('handles non-GitHub provider gracefully (no-op with log)', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'gitlab',
@@ -149,6 +161,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       // Give the fire-and-forget a tick to complete
@@ -157,7 +170,7 @@ describe('CheckRunReporter', () => {
       expect(mockChecksCreate).not.toHaveBeenCalled();
     });
 
-    it('skips when githubConfig is missing', async () => {
+    it('skips when no provider registry is configured', async () => {
       const reporter = new CheckRunReporter({});
 
       reporter.setPending({
@@ -168,6 +181,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await new Promise((r) => setTimeout(r, 50));
@@ -176,7 +190,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('skips when installationId is missing', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -195,7 +209,7 @@ describe('CheckRunReporter', () => {
 
   describe('updateJobStatus', () => {
     it('updates job check run with success conclusion', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       // First, create check runs so IDs are tracked
       reporter.setPending({
@@ -206,6 +220,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -222,6 +237,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -254,7 +270,7 @@ describe('CheckRunReporter', () => {
       trustTier?: string;
       lockFileSource?: string;
     }): Promise<string> {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
       reporter.setPending({
         provider: 'github',
         owner: 'myorg',
@@ -263,6 +279,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -277,6 +294,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         ...over,
       });
 
@@ -313,7 +331,7 @@ describe('CheckRunReporter', () => {
       // PATCHes the check run back open. A check run stuck in a non-terminal
       // status is the very state this reporter exists to avoid, so completion
       // has to be a one-way latch.
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -323,6 +341,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -337,6 +356,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -358,6 +378,7 @@ describe('CheckRunReporter', () => {
         stepName: 'late-step',
         state: ExecutionStepStatus.enum.running,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       // Drain the queue instead of sleeping: the suppressed path is a few
@@ -369,7 +390,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('maps failed to failure conclusion', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -379,6 +400,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -394,6 +416,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -412,7 +435,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('maps cancelled to cancelled conclusion', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -422,6 +445,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -437,6 +461,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.cancelled,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -455,7 +480,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('uses custom description when provided', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -465,6 +490,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -480,6 +506,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         description: 'Step "Build" failed with exit code 1',
       });
 
@@ -498,7 +525,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('skips when check run ID is not found (warning, no crash)', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       // Don't call setPending -- no check run IDs tracked
       reporter.updateJobStatus({
@@ -510,6 +537,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await new Promise((r) => setTimeout(r, 50));
@@ -518,7 +546,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('handles non-GitHub provider gracefully', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.updateJobStatus({
         provider: 'bitbucket',
@@ -529,6 +557,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await new Promise((r) => setTimeout(r, 50));
@@ -548,7 +577,7 @@ describe('CheckRunReporter', () => {
       // The rich-summary branch needs a log buffer; an empty one keeps the
       // fixture cheap while still taking that path.
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         stepLogBuffer: { getLastLines: () => undefined } as unknown as never,
       });
       reporter.setPending({
@@ -559,6 +588,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -573,6 +603,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runIdForLogs: 'run-1',
         jobId: 'job-1',
         data: {
@@ -604,7 +635,7 @@ describe('CheckRunReporter', () => {
     it('leads the workflow roll-up check with the note too', async () => {
       // The roll-up is the check a branch-protection rule usually requires, so
       // a contributor may read only this one.
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
       reporter.setPending({
         provider: 'github',
         owner: 'myorg',
@@ -613,6 +644,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -626,6 +658,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         trustTier: 'unknown',
       });
 
@@ -640,7 +673,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('leaves the workflow roll-up alone for a trusted ref', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
       reporter.setPending({
         provider: 'github',
         owner: 'myorg',
@@ -649,6 +682,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -662,6 +696,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         trustTier: 'trusted',
       });
 
@@ -677,7 +712,7 @@ describe('CheckRunReporter', () => {
 
   describe('updateWorkflowStatus', () => {
     it('updates workflow check run with success conclusion', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -687,6 +722,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -701,6 +737,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -724,7 +761,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('maps failed to failure with "One or more jobs failed"', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -734,6 +771,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -748,6 +786,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -766,7 +805,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('maps cancelled to cancelled conclusion', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -776,6 +815,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -790,6 +830,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.cancelled,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -808,7 +849,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('uses custom description when provided', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -818,6 +859,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -832,6 +874,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         description: 'Job "deploy" failed',
       });
 
@@ -850,7 +893,7 @@ describe('CheckRunReporter', () => {
     });
 
     it('skips when check run ID is not found', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.updateWorkflowStatus({
         provider: 'github',
@@ -860,6 +903,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await new Promise((r) => setTimeout(r, 50));
@@ -899,6 +943,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -922,7 +967,7 @@ describe('CheckRunReporter', () => {
       trackingStore.setStepProgress.mockImplementation(() => stepPersistGate);
 
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       await seedWorkflowCheckRun(reporter);
@@ -940,6 +985,7 @@ describe('CheckRunReporter', () => {
         stepName: 'build',
         state: ExecutionStepStatus.enum.running,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-1',
       });
 
@@ -954,6 +1000,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-1',
       });
       await vi.waitFor(() => {
@@ -1000,7 +1047,7 @@ describe('CheckRunReporter', () => {
 
       const trackingStore = makeTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       await seedWorkflowCheckRun(reporter);
@@ -1018,6 +1065,7 @@ describe('CheckRunReporter', () => {
         stepName: 'build',
         state: ExecutionStepStatus.enum.running,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-1',
       });
       await vi.waitFor(() => {
@@ -1037,6 +1085,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-1',
       });
       await new Promise((r) => setTimeout(r, 50));
@@ -1065,7 +1114,7 @@ describe('CheckRunReporter', () => {
     it('stamps terminal_sent_at when a completed update succeeds', async () => {
       const trackingStore = makeTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       await seedWorkflowCheckRun(reporter);
@@ -1078,6 +1127,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       });
 
@@ -1101,7 +1151,7 @@ describe('CheckRunReporter', () => {
     it('does NOT stamp it for an in_progress update', async () => {
       const trackingStore = makeTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       await seedWorkflowCheckRun(reporter);
@@ -1117,6 +1167,7 @@ describe('CheckRunReporter', () => {
         stepName: 'build',
         state: ExecutionStepStatus.enum.running,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1130,7 +1181,7 @@ describe('CheckRunReporter', () => {
     it('does not stamp it when the GitHub PATCH throws', async () => {
       const trackingStore = makeTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       await seedWorkflowCheckRun(reporter);
@@ -1144,6 +1195,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1161,7 +1213,7 @@ describe('CheckRunReporter', () => {
       const trackingStore = makeTrackingStore();
       trackingStore.markTerminalSent.mockRejectedValue(new Error('db down'));
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       await seedWorkflowCheckRun(reporter);
@@ -1174,6 +1226,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1187,7 +1240,7 @@ describe('CheckRunReporter', () => {
 
   describe('full lifecycle', () => {
     it('setPending -> updateJobStatus -> updateWorkflowStatus', async () => {
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       // 1. Create check runs (queued)
       reporter.setPending({
@@ -1198,6 +1251,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test', 'build'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1214,6 +1268,7 @@ describe('CheckRunReporter', () => {
         jobName: 'test',
         state: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1230,6 +1285,7 @@ describe('CheckRunReporter', () => {
         jobName: 'build',
         state: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1245,6 +1301,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         overallStatus: ExecutionJobStatus.enum.failed,
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       await vi.waitFor(() => {
@@ -1281,7 +1338,7 @@ describe('CheckRunReporter', () => {
       });
       mockChecksCreate.mockRejectedValueOnce(error);
 
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       reporter.setPending({
         provider: 'github',
@@ -1291,6 +1348,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       // Wait for the fire-and-forget to complete (it shouldn't throw)
@@ -1303,7 +1361,7 @@ describe('CheckRunReporter', () => {
     it('does not propagate API errors (fire-and-forget)', async () => {
       mockChecksCreate.mockRejectedValueOnce(new Error('Network error'));
 
-      const reporter = new CheckRunReporter({ githubConfig });
+      const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
       // This should not throw
       reporter.setPending({
@@ -1314,6 +1372,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'CI',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
       });
 
       // Wait for the fire-and-forget to complete
@@ -1328,7 +1387,7 @@ describe('CheckRunReporter', () => {
     it('records the runId when persisting a freshly created check-run ID', async () => {
       const trackingStore = createTrackingStoreStub();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
 
@@ -1340,6 +1399,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       });
 
@@ -1355,7 +1415,7 @@ describe('CheckRunReporter', () => {
     it('does not delete database rows on cleanupRun', async () => {
       const trackingStore = createTrackingStoreStub();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
 
@@ -1367,6 +1427,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       });
       await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalled());
@@ -1444,7 +1505,7 @@ describe('CheckRunReporter', () => {
       // check run stays unresolved on the commit forever.
       const { store: trackingStore } = createStatefulTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
 
@@ -1456,6 +1517,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobNames: ['test'],
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       });
       await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalledTimes(2));
@@ -1475,6 +1537,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         overallStatus: ExecutionJobStatus.enum.success,
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       });
 
@@ -1501,7 +1564,7 @@ describe('CheckRunReporter', () => {
       // PATCHed the completed check run back open.
       const { store: trackingStore } = createStatefulTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       const job = {
@@ -1512,6 +1575,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobName: 'test',
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       };
 
@@ -1552,7 +1616,7 @@ describe('CheckRunReporter', () => {
       // nothing unless the same setup can produce a presence.
       const { store: trackingStore } = createStatefulTrackingStore();
       const reporter = new CheckRunReporter({
-        githubConfig,
+        providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
       const job = {
@@ -1563,6 +1627,7 @@ describe('CheckRunReporter', () => {
         workflowName: 'build',
         jobName: 'test',
         installationId: 42,
+        routingKey: ROUTING_KEY,
         runId: 'run-xyz',
       };
 
@@ -1722,49 +1787,14 @@ describe('CheckRunReporter multi-app credential resolution', () => {
     expect(calls[1][1]).toBe(200);
   });
 
-  it('falls back to githubConfig when routingKey is not provided', async () => {
-    const fallbackConfig = {
-      appId: '12345',
-      privateKey: '-----BEGIN RSA PRIVATE KEY-----\nfallback\n-----END RSA PRIVATE KEY-----',
-    };
+  it('skips when the routing key has no registered bundle', async () => {
+    // fails-when: an unknown routing key borrows another App's credentials.
     const registry = new ProviderRegistry();
-
-    const reporter = new CheckRunReporter({
-      providerRegistry: registry,
-      githubConfig: fallbackConfig,
+    registry.registerByRoutingKey('github:other', {
+      normalizer: {} as never,
+      cloneTokenProvider: { provider: 'github', getAppConfig: () => githubConfig } as never,
     });
-
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      // No routingKey -- should fall back to githubConfig
-    });
-
-    await vi.waitFor(() => {
-      expect(mockChecksCreate).toHaveBeenCalledTimes(2);
-    });
-
-    const { createInstallationOctokit } = await import('../providers/github/auth.js');
-    expect(createInstallationOctokit).toHaveBeenCalledWith(fallbackConfig, 42);
-  });
-
-  it('falls back to githubConfig when routing key not found in registry', async () => {
-    const fallbackConfig = {
-      appId: '12345',
-      privateKey: '-----BEGIN RSA PRIVATE KEY-----\nfallback\n-----END RSA PRIVATE KEY-----',
-    };
-    const registry = new ProviderRegistry();
-    // Registry is empty -- no bundles registered
-
-    const reporter = new CheckRunReporter({
-      providerRegistry: registry,
-      githubConfig: fallbackConfig,
-    });
+    const reporter = new CheckRunReporter({ providerRegistry: registry });
 
     reporter.setPending({
       provider: 'github',
@@ -1777,12 +1807,8 @@ describe('CheckRunReporter multi-app credential resolution', () => {
       routingKey: 'github:unknown',
     });
 
-    await vi.waitFor(() => {
-      expect(mockChecksCreate).toHaveBeenCalledTimes(2);
-    });
-
-    const { createInstallationOctokit } = await import('../providers/github/auth.js');
-    expect(createInstallationOctokit).toHaveBeenCalledWith(fallbackConfig, 42);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockChecksCreate).not.toHaveBeenCalled();
   });
 
   it('skips when no config is resolvable (no registry, no githubConfig)', async () => {
@@ -1843,11 +1869,19 @@ describe('buildJobFailureDescription', () => {
     expect(result).toBe('Job failed');
   });
 
-  it('handles stepResults with error status', () => {
+  it('handles stepResults with failed status', () => {
+    const result = buildJobFailureDescription({
+      stepResults: [{ name: 'compile', status: 'failed', error: 'OOM killed' }],
+    });
+    expect(result).toBe("Step 'compile' failed: OOM killed");
+  });
+
+  it('does not read the retired error step status as a failure', () => {
+    // fails-when: the `error` alias reader survives in buildJobFailureDescription.
     const result = buildJobFailureDescription({
       stepResults: [{ name: 'compile', status: 'error', error: 'OOM killed' }],
     });
-    expect(result).toBe("Step 'compile' failed: OOM killed");
+    expect(result).toBe('Job failed');
   });
 
   it('prefers stepResults over top-level error', () => {
@@ -1871,7 +1905,7 @@ describe('details_url with public alias', () => {
 
   it('emits details_url using the public alias when dashboardUrl + alias resolver are wired', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
@@ -1884,6 +1918,7 @@ describe('details_url with public alias', () => {
       workflowName: 'build',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -1902,7 +1937,7 @@ describe('details_url with public alias', () => {
 
   it('strips a trailing slash on dashboardUrl', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard/',
       getOrgPublicAlias: () => ALIAS,
     });
@@ -1915,6 +1950,7 @@ describe('details_url with public alias', () => {
       workflowName: 'build',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -1928,7 +1964,7 @@ describe('details_url with public alias', () => {
 
   it('omits details_url when dashboardUrl is unset (preserves today behaviour)', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       getOrgPublicAlias: () => ALIAS,
     });
 
@@ -1940,6 +1976,7 @@ describe('details_url with public alias', () => {
       workflowName: 'build',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -1952,7 +1989,7 @@ describe('details_url with public alias', () => {
 
   it('omits details_url when alias resolver returns undefined', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => undefined,
     });
@@ -1965,6 +2002,7 @@ describe('details_url with public alias', () => {
       workflowName: 'build',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -1977,7 +2015,7 @@ describe('details_url with public alias', () => {
 
   it('omits details_url when no real runId is available (N/A sentinel)', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
@@ -1990,6 +2028,7 @@ describe('details_url with public alias', () => {
       workflowName: 'build',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       // No runId, no AsyncLocalStorage context — resolveTraceIds yields 'N/A'.
     });
 
@@ -2002,7 +2041,7 @@ describe('details_url with public alias', () => {
 
   it('propagates details_url through job-completion update', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
@@ -2015,6 +2054,7 @@ describe('details_url with public alias', () => {
       workflowName: 'CI',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -2031,6 +2071,7 @@ describe('details_url with public alias', () => {
       jobName: 'test',
       state: ExecutionJobStatus.enum.success,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -2047,7 +2088,7 @@ describe('details_url with public alias', () => {
     // without a request-context ALS frame, so the reporter must accept an
     // explicit runId rather than relying on getRequestContext().
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
@@ -2060,6 +2101,7 @@ describe('details_url with public alias', () => {
       workflowName: 'CI',
       jobNames: ['test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -2077,6 +2119,7 @@ describe('details_url with public alias', () => {
       jobName: 'test',
       state: ExecutionJobStatus.enum.failed,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -2092,7 +2135,7 @@ describe('details_url with public alias', () => {
     // outside any request-context ALS frame, so the reporter must accept
     // an explicit runId for the workflow-level check-run completion path.
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
@@ -2107,6 +2150,7 @@ describe('details_url with public alias', () => {
       workflowName: 'CI',
       jobNames: [],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -2120,6 +2164,7 @@ describe('details_url with public alias', () => {
       workflowName: 'CI',
       overallStatus: ExecutionJobStatus.enum.failed,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
 
@@ -2132,7 +2177,7 @@ describe('details_url with public alias', () => {
 
   it('setOrgPublicAliasResolver late-binds the resolver', async () => {
     const reporter = new CheckRunReporter({
-      githubConfig,
+      providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
     });
     // First call: no resolver yet → omit details_url.
@@ -2144,6 +2189,7 @@ describe('details_url with public alias', () => {
       workflowName: 'w1',
       jobNames: [],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
     await vi.waitFor(() => {
@@ -2161,6 +2207,7 @@ describe('details_url with public alias', () => {
       workflowName: 'w2',
       jobNames: [],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
     await vi.waitFor(() => {
@@ -2175,7 +2222,7 @@ describe('check-run conclusion mappers cover every terminal job status', () => {
   const mappers = ['mapBuildConclusion', 'mapJobConclusion', 'mapWorkflowConclusion'] as const;
 
   const call = (mapper: string, status: string): { conclusion: string; description: string } => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     return (reporter as unknown as Record<string, Mapper>)[mapper](status);
   };
 
@@ -2297,6 +2344,7 @@ describe('cross-repository global workflow check runs', () => {
       workflowName: WORKFLOW,
       jobNames: [JOB],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: 'run-per-repo',
     });
     expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -2307,7 +2355,7 @@ describe('cross-repository global workflow check runs', () => {
   }
 
   it('names a global workflow check run after the repository that defines it', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
     await reporter.setPendingAwait({
       provider: 'github',
@@ -2317,6 +2365,7 @@ describe('cross-repository global workflow check runs', () => {
       workflowName: WORKFLOW,
       jobNames: [JOB],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       workflowRepoIdentifier: WORKFLOW_REPO,
       runId: 'run-global',
     });
@@ -2339,7 +2388,7 @@ describe('cross-repository global workflow check runs', () => {
     // A global workflow firing on its own repository's event is not a
     // cross-repository run: the acted-on and defining repositories are the
     // same, so nothing can collide and the customer-visible name must not move.
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
     await reporter.setPendingAwait({
       provider: 'github',
@@ -2349,6 +2398,7 @@ describe('cross-repository global workflow check runs', () => {
       workflowName: WORKFLOW,
       jobNames: [JOB],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       workflowRepoIdentifier: ACTED_ON,
       runId: 'run-global-same-repo',
     });
@@ -2363,7 +2413,10 @@ describe('cross-repository global workflow check runs', () => {
 
   it('completes its own workflow check run, not the acted-on repository one', async () => {
     const trackingStore = createGlobalOnlyTrackingStore();
-    const reporter = new CheckRunReporter({ githubConfig, trackingStore: trackingStore as never });
+    const reporter = new CheckRunReporter({
+      providerRegistry: githubRegistry(),
+      trackingStore: trackingStore as never,
+    });
     const { workflowCheckRunId } = await seedPerRepositoryChecks(reporter);
 
     reporter.updateWorkflowStatus({
@@ -2374,6 +2427,7 @@ describe('cross-repository global workflow check runs', () => {
       workflowName: WORKFLOW,
       overallStatus: ExecutionJobStatus.enum.failed,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       workflowRepoIdentifier: WORKFLOW_REPO,
       runId: 'run-global',
     });
@@ -2393,7 +2447,10 @@ describe('cross-repository global workflow check runs', () => {
 
   it('completes its own job check run, not the acted-on repository one', async () => {
     const trackingStore = createGlobalOnlyTrackingStore();
-    const reporter = new CheckRunReporter({ githubConfig, trackingStore: trackingStore as never });
+    const reporter = new CheckRunReporter({
+      providerRegistry: githubRegistry(),
+      trackingStore: trackingStore as never,
+    });
     const { jobCheckRunId } = await seedPerRepositoryChecks(reporter);
 
     reporter.updateJobStatus({
@@ -2405,6 +2462,7 @@ describe('cross-repository global workflow check runs', () => {
       jobName: JOB,
       state: ExecutionJobStatus.enum.failed,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       workflowRepoIdentifier: WORKFLOW_REPO,
       runId: 'run-global',
     });
@@ -2421,7 +2479,10 @@ describe('cross-repository global workflow check runs', () => {
 
   it('reports step progress on its own job check run, not the acted-on repository one', async () => {
     const trackingStore = createGlobalOnlyTrackingStore();
-    const reporter = new CheckRunReporter({ githubConfig, trackingStore: trackingStore as never });
+    const reporter = new CheckRunReporter({
+      providerRegistry: githubRegistry(),
+      trackingStore: trackingStore as never,
+    });
     const { jobCheckRunId } = await seedPerRepositoryChecks(reporter);
 
     reporter.updateStepProgress({
@@ -2435,6 +2496,7 @@ describe('cross-repository global workflow check runs', () => {
       stepName: 'build',
       state: ExecutionStepStatus.enum.running,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       workflowRepoIdentifier: WORKFLOW_REPO,
       runId: 'run-global',
     });
@@ -2456,7 +2518,10 @@ describe('cross-repository global workflow check runs', () => {
     // the acted-on repository's key would register it as its own and evict that
     // run's check-run id and terminal latch on prune.
     const trackingStore = createGlobalOnlyTrackingStore();
-    const reporter = new CheckRunReporter({ githubConfig, trackingStore: trackingStore as never });
+    const reporter = new CheckRunReporter({
+      providerRegistry: githubRegistry(),
+      trackingStore: trackingStore as never,
+    });
     const { jobCheckRunId } = await seedPerRepositoryChecks(reporter);
 
     reporter.updateStepProgress({
@@ -2470,6 +2535,7 @@ describe('cross-repository global workflow check runs', () => {
       stepName: 'build',
       state: ExecutionStepStatus.enum.running,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       workflowRepoIdentifier: WORKFLOW_REPO,
       runId: 'run-global',
     });
@@ -2490,6 +2556,7 @@ describe('cross-repository global workflow check runs', () => {
       jobName: JOB,
       state: ExecutionJobStatus.enum.success,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: 'run-per-repo',
     });
 
@@ -2556,7 +2623,7 @@ describe('stale check-run cleanup names the workflow repository', () => {
   }
 
   it('times out the global run check, not the acted-on repository one', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([
       { id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}` },
       { id: GLOBAL_CHECK_ID, name: `kici/${WORKFLOW_REPO}/${WORKFLOW}` },
@@ -2576,7 +2643,7 @@ describe('stale check-run cleanup names the workflow repository', () => {
   });
 
   it('times out the global run job check, not the acted-on repository one', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([
       { id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}/job/${JOB}` },
       { id: GLOBAL_CHECK_ID, name: `kici/${WORKFLOW_REPO}/${WORKFLOW}/job/${JOB}` },
@@ -2592,7 +2659,7 @@ describe('stale check-run cleanup names the workflow repository', () => {
   });
 
   it('times out the global run setup check, not the acted-on repository one', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([
       { id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}/setup` },
       { id: GLOBAL_CHECK_ID, name: `kici/${WORKFLOW_REPO}/${WORKFLOW}/setup` },
@@ -2612,7 +2679,7 @@ describe('stale check-run cleanup names the workflow repository', () => {
     // and an ordinary run is the overwhelming majority. Skipping on absence
     // would trade a rare, bounded wrong red for hung checks on every stale run
     // that Platform reports — so absence keeps naming the unqualified check.
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([{ id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}` }]);
 
     cleanup(reporter);
@@ -2630,7 +2697,7 @@ describe('stale check-run cleanup names the workflow repository', () => {
     // cross-repository run, so its check-run name never moved and cleanup must
     // still reach it. This is the same case as an absent field, which is why
     // the Platform never sends a value equal to the acted-on repository.
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([{ id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}` }]);
 
     cleanup(reporter, ACTED_ON);
@@ -2665,12 +2732,13 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowName: WORKFLOW,
       jobNames,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
   }
 
   it('completes the workflow check and every per-job check with the given conclusion', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await seedQueuedChecks(reporter, ['build', 'test']);
     // Non-vacuity: the seed really created three QUEUED checks, so the
     // completions below are turning those exact runs terminal.
@@ -2685,6 +2753,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowName: WORKFLOW,
       jobNames: ['build', 'test'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
       conclusion: CheckRunConclusion.enum.cancelled,
       summary: 'This run was cancelled before any job started.',
@@ -2707,7 +2776,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
   });
 
   it('leaves the build check alone', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await seedQueuedChecks(reporter, []);
     reporter.setBuildPending({
       provider: 'github',
@@ -2716,6 +2785,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       sha: SHA,
       workflowName: WORKFLOW,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
     await vi.waitFor(() => {
@@ -2733,6 +2803,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowName: WORKFLOW,
       jobNames: [],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
       conclusion: CheckRunConclusion.enum.timed_out,
       summary: 'The approval window elapsed.',
@@ -2750,7 +2821,10 @@ describe('completing the check runs of a workflow that never dispatched', () => 
     // the row but adds nothing to the in-process set) resolves here with no
     // latch, and completing it again would overwrite its real conclusion.
     const trackingStore = createTrackingStoreStub();
-    const reporter = new CheckRunReporter({ githubConfig, trackingStore: trackingStore as never });
+    const reporter = new CheckRunReporter({
+      providerRegistry: githubRegistry(),
+      trackingStore: trackingStore as never,
+    });
     await seedQueuedChecks(reporter, []);
     trackingStore.getState.mockClear();
 
@@ -2762,6 +2836,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowName: WORKFLOW,
       jobNames: [],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
       conclusion: CheckRunConclusion.enum.cancelled,
       summary: 'cancelled',
@@ -2775,7 +2850,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
 
   it('skips a check run it cannot resolve an id for', async () => {
     // No seed: nothing was ever created, so nothing is resolvable.
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await reporter.completeUndispatchedCheckRuns({
       provider: 'github',
       owner: OWNER,
@@ -2784,6 +2859,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowName: WORKFLOW,
       jobNames: ['build'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
       conclusion: CheckRunConclusion.enum.cancelled,
       summary: 'nothing to close',
@@ -2792,7 +2868,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
   });
 
   it('does not reopen a check this reporter already reported terminal', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await seedQueuedChecks(reporter, ['build']);
     reporter.updateJobStatus({
       provider: 'github',
@@ -2803,6 +2879,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       jobName: 'build',
       state: ExecutionJobStatus.enum.success,
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
     await vi.waitFor(() => {
@@ -2817,6 +2894,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowName: WORKFLOW,
       jobNames: ['build'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
       conclusion: CheckRunConclusion.enum.cancelled,
       summary: 'This run was cancelled before any job started.',
@@ -2828,7 +2906,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
   });
 
   it('qualifies the names for a cross-repository global run', async () => {
-    const reporter = new CheckRunReporter({ githubConfig });
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await reporter.setPendingAwait({
       provider: 'github',
       owner: OWNER,
@@ -2838,6 +2916,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowRepoIdentifier: 'acme/ci-defs',
       jobNames: ['build'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
     });
     expect((mockChecksCreate.mock.calls[0][0] as any).name).toBe(`kici/acme/ci-defs/${WORKFLOW}`);
@@ -2851,6 +2930,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       workflowRepoIdentifier: 'acme/ci-defs',
       jobNames: ['build'],
       installationId: 42,
+      routingKey: ROUTING_KEY,
       runId: RUN_ID,
       conclusion: CheckRunConclusion.enum.cancelled,
       summary: 'cancelled',

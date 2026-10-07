@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
+  ScalerReloadOutcome,
   ScalerVmStatus,
   ScalerVmStopOutcome,
   ScalerVmTracker,
@@ -9,6 +10,7 @@ import {
   formatAge,
   isOrchestratorHealthy,
   runScalerOrphans,
+  runScalerReload,
   type ScalerOrphansOptions,
 } from './scaler.js';
 
@@ -270,5 +272,102 @@ describe('formatAge', () => {
     expect(formatAge(723)).toBe('12m3s');
     expect(formatAge(3_720)).toBe('1h2m');
     expect(formatAge(3 * 86_400 + 4 * 3_600)).toBe('3d4h');
+  });
+});
+
+describe('kici-admin scaler reload (runScalerReload)', () => {
+  const plan = {
+    added: ['arm'],
+    updated: ['linux'],
+    unchanged: ['gpu', 'mac'],
+    retired: [],
+    resurrected: [],
+    global: [],
+  };
+
+  function run(
+    results: unknown[],
+    opts: Partial<{ single: boolean; timeout: string; json: boolean }> = {},
+  ) {
+    const lines: string[] = [];
+    const client = {
+      scalerReload: vi.fn(async () => ({ scope: 'cluster' as const, results: results as never })),
+    };
+    const code = runScalerReload(
+      client,
+      { single: false, timeout: '60', json: false, ...opts },
+      (line) => lines.push(line),
+    );
+    return { client, lines, code };
+  }
+
+  // breaks-if-wrong: an all-applied cluster exits 0
+  it('prints one block per instance and exits 0 when every instance applied', async () => {
+    const { client, lines, code } = run([
+      {
+        instanceId: 'coord-a',
+        role: 'coordinator',
+        outcome: ScalerReloadOutcome.enum.applied,
+        plan,
+      },
+      {
+        instanceId: 'worker-b',
+        role: 'worker',
+        outcome: ScalerReloadOutcome.enum['not-configured'],
+      },
+    ]);
+    expect(await code).toBe(0);
+    expect(client.scalerReload).toHaveBeenCalledWith({ timeoutMs: 60_000 });
+    expect(lines.join('\n')).toBe(
+      [
+        'coord-a (coordinator): applied',
+        '  added: arm',
+        '  updated: linux',
+        '  unchanged: 2',
+        'worker-b (worker): not-configured',
+      ].join('\n'),
+    );
+  });
+
+  // fails-when: a partial failure exits 0
+  it('exits 1 and prints the errors when an instance refused or was not reached', async () => {
+    const { lines, code } = run([
+      {
+        instanceId: 'coord-a',
+        role: 'coordinator',
+        outcome: ScalerReloadOutcome.enum.rejected,
+        errors: ['overlap'],
+      },
+      {
+        instanceId: 'coord-b',
+        role: 'coordinator',
+        outcome: ScalerReloadOutcome.enum.unreachable,
+        detail: 'no answer',
+      },
+    ]);
+    expect(await code).toBe(1);
+    expect(lines.join('\n')).toContain('  error: overlap');
+    expect(lines.join('\n')).toContain('  no answer');
+  });
+
+  it('--json prints the response body, --single and --timeout reach the request', async () => {
+    const results = [
+      {
+        instanceId: 'coord-a',
+        role: 'coordinator',
+        outcome: ScalerReloadOutcome.enum.applied,
+        plan,
+      },
+    ];
+    const { client, lines, code } = run(results, { single: true, timeout: '5', json: true });
+    expect(await code).toBe(0);
+    expect(client.scalerReload).toHaveBeenCalledWith({ single: true, timeoutMs: 5_000 });
+    expect(JSON.parse(lines.join('\n'))).toEqual({ scope: 'cluster', results });
+  });
+
+  it('refuses a bad --timeout before any request', async () => {
+    const { client, code } = run([], { timeout: 'soon' });
+    await expect(code).rejects.toThrow('--timeout must be a whole number of seconds');
+    expect(client.scalerReload).not.toHaveBeenCalled();
   });
 });

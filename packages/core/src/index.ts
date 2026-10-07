@@ -16,6 +16,7 @@ export {
   type RequestContext,
 } from './request-context.js';
 export { formatBytes } from './format-bytes.js';
+export { shQuote } from './shell-quote.js';
 export { redactConfig, scrubText } from './diagnostics-redaction.js';
 export { REPO_ANCHOR, HOME_ANCHOR } from './cache-anchors.js';
 export { formatDuration, formatUptime } from './format-duration.js';
@@ -41,3 +42,4 @@ export {
   type DiagnoseResponse,
 } from './diagnostics-contract.js';
 export { docsUrl } from './docs-url.js';
+export { compareReleaseVersions } from './release-version.js';

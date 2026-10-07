@@ -38,7 +38,6 @@ import {
   HoldType,
   INSTALL_JOB_ID_PREFIX,
   isSecurityHoldJobId,
-  normalizePersistedHoldType,
   type CheckStatus,
   type CheckStatusPoster,
 } from '@kici-dev/engine';
@@ -178,10 +177,7 @@ export function postedPendingSecurityCheck(hold: SecurityCheckHold): boolean {
   // Every hold `holdJobForApproval` wrote through its approval path.
   if (hold.approval_requirement != null) return true;
   // The per-env context gate's own security hold.
-  return (
-    hold.hold_scope === HoldScope.enum.job &&
-    normalizePersistedHoldType(hold.hold_type) === HoldType.enum.security
-  );
+  return hold.hold_scope === HoldScope.enum.job && hold.hold_type === HoldType.enum.security;
 }
 
 /**

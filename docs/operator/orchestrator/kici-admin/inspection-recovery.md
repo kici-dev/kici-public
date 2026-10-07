@@ -1,6 +1,6 @@
 ---
 title: 'kici-admin: inspection & recovery'
-description: 'Cold-storage inspection, cache maintenance, attestation backfill, access / event logs, and diagnostic bundles'
+description: 'Cold-storage inspection, attestation backfill, access / event logs, and diagnostic bundles'
 ---
 
 ## Guide
@@ -28,24 +28,10 @@ Inspects and operates the orchestrator-side cold-storage archival. Every subcomm
 - `verify-chunk <chunkId>` recomputes the gzipped `contentHash` and compares to the manifest. Exit 1 on mismatch, 0 on match.
 - `replay-chunk <chunkId>` re-runs the UPDATE+DELETE+audit step for a chunk that landed in S3 but not in PG (recovery for a crash mid-archive).
 - `replay-into-pg <chunkId>` promotes every row in a chunk back into orchestrator PG, clearing `archived_at` and writing a replay audit entry. Used when an archived chunk needs to be brought back into hot storage for inspection or re-processing.
-- `reconcile <table>` walks the S3 prefix and rebuilds missing manifests from data files. `--confirm-cleanup` additionally deletes `chunk_counts` rows whose S3 objects are gone.
+- `reconcile <table>` walks the S3 prefix and rebuilds missing manifests from data files, including chunks under a cold-retention bucket. `--confirm-cleanup` is deprecated and has no effect.
 - `list-purgeable` (read-only) lists chunks past their cold-retention horizon. `--table` filters to a single adapter, `--bucket` scopes to a single cold-bucket (`30d` / `180d` / `1y` / `2y`), `--limit` caps candidates inspected (default 1000).
 - `purge-now` deletes expired chunks from S3 + PG bookkeeping. **Defaults to dry-run** — pass `--apply` to actually delete. Same `--table` / `--bucket` / `--limit` filters as `list-purgeable`.
 - `peek-chunk <chunkId>` streams the first N rows of a chunk to stdout (default `--limit 10`) for debugging.
-
-### cache -- object-storage cache maintenance (direct storage access)
-
-```bash
-kici-admin cache purge-legacy [--yes] [--org <id>]
-```
-
-Removes cache objects written under the retired key layouts. The orchestrator reads only the current layouts (see [retired layouts](../storage-layout.md#retired-layouts)). The cache TTL is enforced lazily on access, so the product never removes an object nothing reads. A retired `cache/` entry goes only through over-quota eviction; a retired `source/` or `deps/` object stays for good. This command is the removal path, alongside a bucket lifecycle rule the operator manages. It talks **directly** to the configured cache storage backend — the same `KICI_STORAGE_*` configuration the orchestrator runs with — and needs no database, no admin token, and no running orchestrator.
-
-- Without `--yes` the command is a **dry run**: it lists the object count and byte total per prefix (`cache/`, `source/`, `deps/`) and deletes nothing.
-- `--yes` deletes the listed objects and prints the counts.
-- `--org <id>` narrows the sweep to the user-cache prefix of that org (`cache/<org>/`). The retired source and dependency layouts carry no org segment, so an org-scoped run leaves them untouched.
-
-An object the current writers produce is never a candidate: a user-cache entry whose stem carries a discriminator, an in-flight `.tmp-` upload, a `source/v2/` object, or a content-addressed dependency tarball. A retired dependency tarball is recognised by its same-stem `.hash` sidecar; the sidecar itself stays, because its key is also a valid current pointer key and the next build for that lock file overwrites it.
 
 ### attestations -- provenance verdict backfill and listing
 
@@ -137,15 +123,15 @@ Requires the orchestrator's master key (`KICI_SECRET_KEY`) — the private half 
 ### access-log -- read / admin-mutation attribution log
 
 ```bash
-kici-admin access-log list [--org-id <orgId>] [--actor-type <t>] [--actor-id <id>] [--action <action>] [--source <s>] [--outcome <o>] [--target-type <t>] [--target-id <id>] [--from <ts>] [--to <ts>] [--q <text>] [--agent-label <label>] [--agent-only] [--limit <n>] [--cursor <c>] [--json]
-kici-admin access-log show <id> [--org-id <orgId>] [--json]
+kici-admin access-log list [--org <orgId>] [--actor-type <t>] [--actor-id <id>] [--action <action>] [--source <s>] [--outcome <o>] [--target-type <t>] [--target-id <id>] [--from <ts>] [--to <ts>] [--q <text>] [--agent-label <label>] [--agent-only] [--limit <n>] [--cursor <c>] [--json]
+kici-admin access-log show <id> [--org <orgId>] [--json]
 ```
 
 Operator-facing read access to the orchestrator's `access_log` table — every read / admin-mutation attributed to an `ActorPrincipal` (user, api_key, service_account, platform_operator, system). It replaces raw `psql` when an operator asks "who read this run's payload last Tuesday" or "show me everything a platform_operator actor did".
 
 Output includes actor (type + id + optional metadata), action, source, outcome, target (if any), request ID, and timestamps.
 
-`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org-id <orgId>` names the tenant to scan in cold storage when the row is archived (older than 30 days). Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
+`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org <orgId>` names the tenant to scan in cold storage when the row is archived (older than 30 days). Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
 
 ### event-log -- inbound webhook delivery log
 
@@ -253,7 +239,7 @@ Synopsis: `kici-admin access-log list [options]`
 
 | Option                  | Default | Description                                                                      |
 | ----------------------- | ------- | -------------------------------------------------------------------------------- |
-| `--org-id <orgId>`      |         | Filter by org/tenant ID                                                          |
+| `--org <orgId>`         |         | Filter by org/tenant ID                                                          |
 | `--actor-type <t>`      |         | Filter by actor type (user\|api_key\|service_account\|platform_operator\|system) |
 | `--actor-id <id>`       |         | Filter by actor id (zsub, keyId, service_account id, ...)                        |
 | `--action <action>`     |         | Filter by dotted action (e.g. run.detail.read, run.cancel)                       |
@@ -284,10 +270,10 @@ Synopsis: `kici-admin access-log show <id> [options]`
 
 **Options**
 
-| Option             | Default | Description                                                                                                                                                                                                                                                                                |
-| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--org-id <orgId>` |         | Tenant scope for cold-store fallback when the row is archived (>30d old). Without this hint, only the synthetic **orchestrator** tenant is scanned, so a row whose org_id is set won't be found. Single-tenant cold scans typically take seconds-to-minutes for one-shot operator queries. |
-| `--json`           |         | Emit raw JSON instead of formatted output                                                                                                                                                                                                                                                  |
+| Option          | Default | Description                                                                                                                                                                                                                                                                                |
+| --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--org <orgId>` |         | Tenant scope for cold-store fallback when the row is archived (>30d old). Without this hint, only the synthetic **orchestrator** tenant is scanned, so a row whose org_id is set won't be found. Single-tenant cold scans typically take seconds-to-minutes for one-shot operator queries. |
+| `--json`        |         | Emit raw JSON instead of formatted output                                                                                                                                                                                                                                                  |
 
 ### `kici-admin attestations`
 
@@ -338,25 +324,6 @@ Synopsis: `kici-admin attestations reverify [options]`
 | `--all`                |         | Re-evaluate every attestation (default: only pending/unverifiable) |
 | `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL)                       |
 | `--yes`                |         | Skip the --all confirmation prompt                                 |
-
-### `kici-admin cache`
-
-Maintain the orchestrator object-storage cache (direct storage access)
-
-Synopsis: `kici-admin cache`
-
-### `kici-admin cache purge-legacy`
-
-Remove cache objects written under the retired key layouts. DRY RUN by default — pass --yes to delete.
-
-Synopsis: `kici-admin cache purge-legacy [options]`
-
-**Options**
-
-| Option       | Default | Description                                                             |
-| ------------ | ------- | ----------------------------------------------------------------------- |
-| `--yes`      |         | Delete the matched objects (default is a dry run that only counts them) |
-| `--org <id>` |         | Only sweep this org user-cache prefix (cache/<org>/)                    |
 
 ### `kici-admin cold-store`
 
@@ -493,11 +460,11 @@ Synopsis: `kici-admin cold-store reconcile <table> [options]`
 
 **Options**
 
-| Option                 | Default | Description                                             |
-| ---------------------- | ------- | ------------------------------------------------------- |
-| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL)      |
-| `--tenant <rk>`        |         | Scope to a single routing key                           |
-| `--confirm-cleanup`    |         | Also delete chunk_counts rows whose S3 objects are gone |
+| Option                 | Default | Description                                        |
+| ---------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL) |
+| `--tenant <rk>`        |         | Scope to a single routing key                      |
+| `--confirm-cleanup`    |         | Deprecated: has no effect (removed in v1.0.0)      |
 
 ### `kici-admin cold-store replay-chunk`
 

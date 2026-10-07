@@ -180,21 +180,31 @@ describeDb('ensureCoordinatorCredential against Postgres', () => {
       expect(await store.findByInstanceId(INSTANCE)).toBeNull();
     });
 
+    /** Issue credential 'a', replace it with 'b', then revoke 'b'. */
+    async function saveTwoThenRevoke(): Promise<void> {
+      for (const h of ['a', 'b']) {
+        await store.save({
+          instanceId: INSTANCE,
+          credentialHash: h.repeat(64),
+          role: 'coordinator',
+          routingKeys: [],
+        });
+      }
+      await store.revoke(INSTANCE);
+    }
+
     it('findLatestRevokedByInstanceId returns the newest revoked row, or null', async () => {
       expect(await store.findLatestRevokedByInstanceId(INSTANCE)).toBeNull();
-      await store.save({
-        instanceId: INSTANCE,
-        credentialHash: 'a'.repeat(64),
-        role: 'coordinator',
-        routingKeys: [],
-      });
-      await store.save({
-        instanceId: INSTANCE,
-        credentialHash: 'b'.repeat(64),
-        role: 'coordinator',
-        routingKeys: [],
-      });
-      await store.revoke(INSTANCE);
+      await saveTwoThenRevoke();
+      expect((await store.findLatestRevokedByInstanceId(INSTANCE))?.credentialHash).toBe(
+        'b'.repeat(64),
+      );
+    });
+
+    // fails-when: rows revoked in the same millisecond come back in arbitrary order
+    it('findLatestRevokedByInstanceId breaks a revoked_at tie by the newer credential', async () => {
+      await saveTwoThenRevoke();
+      await sql`UPDATE peer_credentials SET revoked_at = now()`.execute(db);
       expect((await store.findLatestRevokedByInstanceId(INSTANCE))?.credentialHash).toBe(
         'b'.repeat(64),
       );

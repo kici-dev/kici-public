@@ -40,8 +40,9 @@ import { getInstallBase } from '../shared/versioned-upgrade.js';
 import { resolveWizardMode, writeInstallEnvFile, DEFAULT_INSTALL_MODE } from './install-env.js';
 import { OrchestratorMode } from '@kici-dev/engine';
 import { formatSourceAddHint } from '../../wizard/orchestrator-wizard.js';
-import { toErrorMessage, kiciMkdtemp } from '@kici-dev/shared';
+import { kiciMkdtemp } from '@kici-dev/shared';
 import { isCiEnvironment } from '@kici-dev/shared/ci-env';
+import { cliAction } from '../shared/cli-action.js';
 
 interface InstallOptions {
   platform?: ServicePlatform;
@@ -164,8 +165,8 @@ Token vocabulary:
       'Deploy folder; the instance manifest is written here (default: current working directory)',
     )
     .option('--force', 'Overwrite an existing same-named foreign instance')
-    .action(async (opts: InstallOptions, command: Command) => {
-      try {
+    .action(
+      cliAction(async (opts: InstallOptions, command: Command) => {
         // A kici-admin from a standalone package has no import.meta.resolve:
         // without --binary it cannot locate the server, so it stops here,
         // before the wizard or any file.
@@ -429,9 +430,6 @@ Token vocabulary:
             console.log(line);
           }
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

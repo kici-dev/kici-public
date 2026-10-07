@@ -15,12 +15,7 @@
  */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import type {
-  AccessLogAction,
-  AccessLogOutcome,
-  AccessLogTargetType,
-  ActorPrincipal,
-} from '@kici-dev/engine';
+import type { AccessLogAction, AccessLogTargetType, ActorPrincipal } from '@kici-dev/engine';
 import type {
   GlobalWorkflowsGetRequest,
   GlobalWorkflowsUpdateRequest,
@@ -37,7 +32,8 @@ import {
   buildPolicyDeniedResponse,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
-import { runDetached } from '../helpers/run-detached.js';
+import { DashboardAccessRecorder } from './dashboard-access.js';
+import { toIsoString } from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'dashboard-global-workflows-handler' });
 
@@ -73,11 +69,15 @@ export function isDashboardGlobalWorkflowsMessage(
 
 export class DashboardGlobalWorkflowsHandler {
   private readonly deps: DashboardGlobalWorkflowsHandlerDeps;
-  private readonly accessLog: AccessLogWriter | undefined;
+  private readonly access: DashboardAccessRecorder;
 
   constructor(deps: DashboardGlobalWorkflowsHandlerDeps) {
     this.deps = deps;
-    this.accessLog = deps.accessLog;
+    this.access = new DashboardAccessRecorder(
+      deps.accessLog,
+      () => ({ orgId: this.deps.customerId || null, routingKey: null }),
+      logger,
+    );
   }
 
   /** Update the customer / org id this handler operates on. */
@@ -103,7 +103,7 @@ export class DashboardGlobalWorkflowsHandler {
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
-        this.recordAccess(
+        this.access.record(
           msg.actor,
           action,
           target,
@@ -116,39 +116,6 @@ export class DashboardGlobalWorkflowsHandler {
       }
       throw err;
     }
-  }
-
-  /**
-   * Write an access_log row for a handler invocation. Best-effort; the writer
-   * swallows failures.
-   */
-  private recordAccess(
-    actor: ActorPrincipal,
-    action: AccessLogAction,
-    target: { type: AccessLogTargetType; id: string } | null,
-    requestId: string | null,
-    outcome: AccessLogOutcome,
-    errorMessage?: string | null,
-  ): void {
-    const accessLog = this.accessLog;
-    if (!accessLog) return;
-    runDetached(
-      logger,
-      'Access log write',
-      () =>
-        accessLog.record({
-          orgId: this.deps.customerId || null,
-          routingKey: null,
-          actor,
-          action,
-          target,
-          requestId,
-          source: 'platform_proxy',
-          outcome,
-          errorMessage: errorMessage ?? null,
-        }),
-      { requestId },
-    );
   }
 
   async handleMessage(msg: GlobalWorkflowsMessage): Promise<boolean> {
@@ -167,7 +134,7 @@ export class DashboardGlobalWorkflowsHandler {
   private async handleGet(msg: GlobalWorkflowsGetRequest): Promise<void> {
     try {
       const row = await this.readRow();
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'global_workflows.get.read',
         { type: 'context', id: this.deps.customerId },
@@ -180,7 +147,7 @@ export class DashboardGlobalWorkflowsHandler {
         settings: rowToSettings(this.deps.customerId, row, await this.effectiveEnabled()),
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'global_workflows.get.read',
         { type: 'context', id: this.deps.customerId },
@@ -206,7 +173,7 @@ export class DashboardGlobalWorkflowsHandler {
     }
     const patternError = firstInvalidPattern(msg);
     if (patternError) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'global_workflows.update',
         { type: 'context', id: this.deps.customerId },
@@ -226,7 +193,7 @@ export class DashboardGlobalWorkflowsHandler {
       const patch = buildPatch(existing, msg);
       await this.upsertRow(patch);
       const updated = await this.readRow();
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'global_workflows.update',
         { type: 'context', id: this.deps.customerId },
@@ -239,7 +206,7 @@ export class DashboardGlobalWorkflowsHandler {
         settings: rowToSettings(this.deps.customerId, updated, await this.effectiveEnabled()),
       });
     } catch (err) {
-      this.recordAccess(
+      this.access.record(
         msg.actor,
         'global_workflows.update',
         { type: 'context', id: this.deps.customerId },
@@ -399,9 +366,7 @@ export function rowToSettings(
     enabled,
     allowedRepos: row.global_workflow_allowed_repos,
     deniedRepos: row.global_workflow_denied_repos,
-    createdAt:
-      row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
-    updatedAt:
-      row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
+    createdAt: toIsoString(row.created_at),
+    updatedAt: toIsoString(row.updated_at),
   };
 }

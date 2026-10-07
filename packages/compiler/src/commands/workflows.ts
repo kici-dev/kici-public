@@ -13,6 +13,7 @@ import {
   type RegistrationsListResult,
 } from '../remote/dashboard-client.js';
 import { toErrorMessage } from '@kici-dev/core';
+import { parseDuration } from '@kici-dev/engine';
 
 /** Options for the workflows list command. */
 export interface WorkflowsListOptions {
@@ -28,29 +29,6 @@ export interface WorkflowsListOptions {
 
 /** API response shape (the Platform registrations-list payload). */
 type RegistrationsResponse = RegistrationsListResult;
-
-/**
- * Parse a duration string like "30d", "7d", "24h", "2h" into milliseconds.
- * Returns null if the string is not a valid duration.
- */
-function parseDuration(duration: string): number | null {
-  const match = duration.match(/^(\d+)(d|h|m)$/);
-  if (!match) return null;
-
-  const value = parseInt(match[1], 10);
-  const unit = match[2];
-
-  switch (unit) {
-    case 'd':
-      return value * 24 * 60 * 60 * 1000;
-    case 'h':
-      return value * 60 * 60 * 1000;
-    case 'm':
-      return value * 60 * 1000;
-    default:
-      return null;
-  }
-}
 
 /**
  * List permanently registered workflows.

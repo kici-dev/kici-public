@@ -7,9 +7,10 @@ import {
 } from './access-log.js';
 
 describe('access-log enums — admin_cli db subcommands', () => {
-  it('carries the six db.* action values', () => {
+  it('carries every db.* action value', () => {
     for (const a of [
       'db.fresh',
+      'db.migrate',
       'db.ensure',
       'db.create_role',
       'db.create_readonly_user',

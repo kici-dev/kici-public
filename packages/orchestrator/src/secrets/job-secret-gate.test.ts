@@ -1,16 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextType } from '@kici-dev/engine';
 
-// Capture the module logger so the deprecated fallback's warning can be asserted.
-const mockWarn = vi.hoisted(() => vi.fn());
-vi.mock('@kici-dev/shared', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
-  return {
-    ...actual,
-    createLogger: () => ({ info: vi.fn(), warn: mockWarn, error: vi.fn(), debug: vi.fn() }),
-  };
-});
-
 import type { ContextStore } from '../contexts/context-store.js';
 import type { JobDispatchContext } from '../contexts/protection/pipeline.js';
 import type { SecretResolverApi } from './secret-resolver.js';
@@ -170,11 +160,9 @@ describe('resolveJobQualifiedSecret', () => {
     expect(resolver.resolveNamedInternal).not.toHaveBeenCalled();
   });
 
-  describe('deprecated same-named scope for an exact context whose bindings lack the key', () => {
-    beforeEach(() => mockWarn.mockClear());
-
-    /** Resolve `prod:DEPLOY_TOKEN` against `row`; no scope bound to it carries the key. */
-    function resolveUnbound(row: unknown, resolver: SecretResolverApi) {
+  describe('a key no bound scope carries', () => {
+    /** Resolve `prod:DEPLOY_TOKEN` against `row`. */
+    function resolveRef(row: unknown, resolver: SecretResolverApi) {
       return resolveJobQualifiedSecret({
         resolver,
         contextStore: storeReturning(row),
@@ -188,41 +176,22 @@ describe('resolveJobQualifiedSecret', () => {
       });
     }
 
-    it('reads the same-named scope and warns, naming org, context, run and job', async () => {
+    it('is refused, and the scope named after the context is never read', async () => {
       const resolver = resolverReturning(null);
-      vi.mocked(resolver.resolveNamedInternal).mockResolvedValue('legacy-value');
-      // breaks-if-wrong: an exact-named context with no binding still resolves its same-named scope
-      await expect(resolveUnbound(contextRow(), resolver)).resolves.toBe('legacy-value');
-      expect(resolver.resolveNamedInternal).toHaveBeenCalledWith(ORG, 'prod', 'DEPLOY_TOKEN', {
-        runId: 'run-1',
-        jobId: 'build',
-      });
-      expect(mockWarn).toHaveBeenCalledTimes(1);
-      const [message, fields] = mockWarn.mock.calls[0];
-      expect(message).toMatch(/deprecated/i);
-      expect(fields).toEqual({ orgId: ORG, context: 'prod', runId: 'run-1', jobId: 'build' });
-      // fails-when: the warning carries the secret value
-      expect(JSON.stringify(mockWarn.mock.calls)).not.toContain('legacy-value');
+      vi.mocked(resolver.resolveNamedInternal).mockResolvedValue('same-named-scope-value');
+      // fails-when: the same-named scope fallback still runs for an exact-named context
+      await expect(resolveRef(contextRow(), resolver)).rejects.toThrow(/Secret not found/);
+      expect(resolver.resolveNamedInternal).not.toHaveBeenCalled();
     });
 
-    it('reads the same-named scope for a bound context whose bound scopes lack the key', async () => {
-      // The context binds scopes that carry OTHER_KEY; DEPLOY_TOKEN sits only in the
-      // scope named after the context.
+    it('is refused when the context binds scopes that carry other keys', async () => {
       const resolver = resolverReturning('bound-value', 'OTHER_KEY');
-      vi.mocked(resolver.resolveNamedInternal).mockResolvedValue('legacy-value');
-      // fails-when: the fallback is limited to a context with no binding at all
-      await expect(resolveUnbound(contextRow(), resolver)).resolves.toBe('legacy-value');
-      expect(mockWarn).toHaveBeenCalledTimes(1);
-      expect(mockWarn.mock.calls[0][0]).toMatch(/deprecated/i);
+      vi.mocked(resolver.resolveNamedInternal).mockResolvedValue('same-named-scope-value');
+      await expect(resolveRef(contextRow(), resolver)).rejects.toThrow(/Secret not found/);
+      expect(resolver.resolveNamedInternal).not.toHaveBeenCalled();
     });
 
-    it('refuses when the same-named scope does not carry the key either', async () => {
-      const resolver = resolverReturning(null);
-      await expect(resolveUnbound(contextRow(), resolver)).rejects.toThrow(/Secret not found/);
-      expect(mockWarn).not.toHaveBeenCalled();
-    });
-
-    it('never falls back for a glob-matched row', async () => {
+    it('is refused for a glob-matched row', async () => {
       const globRow = contextRow({
         id: 'ctx-glob',
         name: 'pr*',
@@ -230,17 +199,7 @@ describe('resolveJobQualifiedSecret', () => {
         glob_pattern: 'pr*',
       });
       const resolver = resolverReturning(null);
-      vi.mocked(resolver.resolveNamedInternal).mockResolvedValue('same-named-scope-value');
-      // fails-when: a glob row reads the scope named after the declared name
-      await expect(resolveUnbound(globRow, resolver)).rejects.toThrow(/Secret not found/);
-      expect(resolver.resolveNamedInternal).not.toHaveBeenCalled();
-    });
-
-    it('never falls back for a glob row whose own name equals the reference', async () => {
-      const globRow = contextRow({ type: ContextType.enum.glob, glob_pattern: 'pr*' });
-      const resolver = resolverReturning(null);
-      vi.mocked(resolver.resolveNamedInternal).mockResolvedValue('same-named-scope-value');
-      await expect(resolveUnbound(globRow, resolver)).rejects.toThrow(/Secret not found/);
+      await expect(resolveRef(globRow, resolver)).rejects.toThrow(/Secret not found/);
       expect(resolver.resolveNamedInternal).not.toHaveBeenCalled();
     });
   });

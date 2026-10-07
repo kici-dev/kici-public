@@ -46,8 +46,8 @@ describe('normalizePeerLogChunk', () => {
   it('splits on a timestamp change', () => {
     const out = normalizePeerLogChunk(
       chunkOf([
-        { text: 'a', timestamp: 100 },
-        { text: 'b', timestamp: 200 },
+        { text: 'a', timestamp: 100, stream: LogStream.enum.stdout },
+        { text: 'b', timestamp: 200, stream: LogStream.enum.stdout },
       ]),
     );
 
@@ -55,25 +55,6 @@ describe('normalizePeerLogChunk', () => {
       [['a'], 100],
       [['b'], 200],
     ]);
-  });
-
-  it('keeps an absent stream absent rather than defaulting it', () => {
-    const out = normalizePeerLogChunk(chunkOf([{ text: 'a', timestamp: 100 }]));
-
-    expect(out).toHaveLength(1);
-    expect(out[0].stream).toBeUndefined();
-    expect('stream' in out[0]).toBe(false);
-  });
-
-  it('treats an absent stream and stdout as different groups', () => {
-    const out = normalizePeerLogChunk(
-      chunkOf([
-        { text: 'a', timestamp: 100 },
-        { text: 'b', timestamp: 100, stream: LogStream.enum.stdout },
-      ]),
-    );
-
-    expect(out).toHaveLength(2);
   });
 
   it('returns no groups for an empty chunk', () => {

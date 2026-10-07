@@ -345,7 +345,7 @@ describe('kici-admin source add generic --provider-type', () => {
   });
 });
 
-describe('kici-admin source update --customer-id', () => {
+describe('kici-admin source update --org', () => {
   it('forwards customerId to the PATCH body', async () => {
     const received: Array<{ path: string; body: unknown }> = [];
     const client: Partial<AdminApiClient> = {
@@ -356,7 +356,7 @@ describe('kici-admin source update --customer-id', () => {
     };
 
     const { exitCode } = await runCommand(
-      ['source', 'update', 'github:42', '--customer-id', 'org-xyz'],
+      ['source', 'update', 'github:42', '--org', 'org-xyz'],
       client,
     );
     expect(exitCode).toBeNull();
@@ -687,12 +687,12 @@ describe('kici-admin source --database-url dispatch (bypasses HTTP client)', () 
     expect(exitCode).toBe(1);
   });
 
-  it('update --customer-id --database-url hits the DB path, never the HTTP client', async () => {
+  it('update --org --database-url hits the DB path, never the HTTP client', async () => {
     const { httpUsed, exitCode } = await runDirect([
       'source',
       'update',
       'github:1',
-      '--customer-id',
+      '--org',
       'o',
       '--database-url',
       'postgresql://127.0.0.1:1/none',

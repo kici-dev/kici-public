@@ -42,7 +42,7 @@ import type { InstanceManifest, ServiceConfig, ServicePlatform } from '../../ser
 import { getInstallBase } from '../shared/versioned-upgrade.js';
 import { ENV_FILE_MODE } from '../shared/env-file-mode.js';
 import { copyFileSecurelySync, writeFileSecurelySync } from '../../../helpers/secure-write.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { cliAction } from '../shared/cli-action.js';
 
 interface InstallOptions {
   platform?: ServicePlatform;
@@ -97,8 +97,8 @@ export function registerAgentInstall(agent: Command): void {
       'Deploy folder; the instance manifest is written here (default: current working directory)',
     )
     .option('--force', 'Overwrite an existing same-named foreign instance')
-    .action(async (opts: InstallOptions) => {
-      try {
+    .action(
+      cliAction(async (opts: InstallOptions) => {
         // A kici-admin from a standalone package has no import.meta.resolve:
         // without --binary it cannot locate the server, so it stops here,
         // before the wizard or any file.
@@ -291,9 +291,6 @@ export function registerAgentInstall(agent: Command): void {
         console.log(`\nNext steps:`);
         console.log(`  1. Edit ${envFilePath} with your configuration`);
         console.log(`  2. Run \`kici-admin agent start\` to start the service`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

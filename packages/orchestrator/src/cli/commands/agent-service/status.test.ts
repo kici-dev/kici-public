@@ -218,7 +218,6 @@ function agentHealthBody(
     connected: true,
     activeJobs: 2,
     version: '9.8.7',
-    buildCommit: 'c0ffee123',
     sdkVersion: '9.8.6',
     sdkBundleHash: 'b012bd8bace3df9e574252bf290c652b',
     sharedVersion: '9.8.5',
@@ -308,9 +307,6 @@ describe('agent status — health section', () => {
     expect(lines).toContain('Orchestrator: connected');
     expect(lines).toContain('Active jobs:  2');
     expect(lines).toContain('Version:      9.8.7');
-    // fails-when: the renderer prints the build commit an agent older than this
-    // CLI reports — a commit ID from the private repository.
-    expect(text).not.toContain('c0ffee123');
     expect(lines).toContain('SDK:          9.8.6 (bundle b012bd8bace3)');
     expect(lines).toContain('Uptime:       3m 46s');
     expect(lines.some((l) => l.startsWith('Labels:'))).toBe(false);
@@ -368,9 +364,8 @@ describe('agent status — health section', () => {
     expect(lines[heading + 1]).toMatch(/^Health: +\S/);
   });
 
-  it('returns the /health body in --json, with the version in the deprecated buildCommit', async () => {
-    // fails-when: --json passes through the build commit an older agent reports.
-    // breaks-if-wrong: every other field of the body comes back unchanged.
+  it('returns the /health body in --json unchanged', async () => {
+    // fails-when: --json rewrites or drops a field of the body.
     installWithEnv('KICI_PORT=5555\n');
     const body = agentHealthBody();
     serveHealth(body);
@@ -378,7 +373,6 @@ describe('agent status — health section', () => {
     const text = await runStatus(['--json']);
     const json = JSON.parse(text) as { health: unknown };
 
-    expect(json.health).toEqual({ ...body, buildCommit: body.version });
-    expect(text).not.toContain('c0ffee123');
+    expect(json.health).toEqual(body);
   });
 });

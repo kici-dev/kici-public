@@ -58,12 +58,12 @@ export async function resolveHeldRunContext(
     return null;
   };
 
-  const token = config.pat ?? config.token;
+  const token = config.pat;
   if (!token) {
     return fail('Not authenticated. Run `kici login` to get started.');
   }
 
-  const endpoint = config.platformEndpoint ?? config.endpoint;
+  const endpoint = config.platformEndpoint;
   if (!endpoint) {
     return fail('No endpoint configured. Run `kici login` to configure.');
   }

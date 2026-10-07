@@ -17,6 +17,7 @@ import type { AppConfig, SharedConfig } from './types.js';
 import type { SharedConfigStore } from './shared-store.js';
 import { configReloadTotal, setConfigVersion } from '../metrics/prometheus.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import type { ScalerFileReloadResult } from '../scaler/file-reload.js';
 
 /**
  * Source of a reload trigger.
@@ -34,6 +35,12 @@ export interface ReloadResult {
   restartRequired?: string[];
   /** Fields that were hot-reloaded */
   fieldsChanged?: string[];
+  /**
+   * The scaler config's own reload outcome, when this orchestrator runs one.
+   * `success` describes the orchestrator config only: a refused scaler file
+   * shows here as `rejected` while `success` stays true.
+   */
+  scaler?: ScalerFileReloadResult;
 }
 
 /**
@@ -59,8 +66,8 @@ export interface ConfigReloaderDeps {
 
   /** Called after successful reload when provider config changed */
   onProviderChange?: (newConfig: AppConfig, oldConfig: AppConfig) => Promise<void>;
-  /** Called to reload scaler configuration */
-  onScalerReload?: () => Promise<void>;
+  /** Called to reload scaler configuration; its outcome is returned as `ReloadResult.scaler`. */
+  onScalerReload?: () => Promise<ScalerFileReloadResult | void>;
   /** Called when Platform connection settings changed */
   onPlatformReconnect?: (newConfig: AppConfig) => Promise<void>;
   /** Atomic swap callback -- replaces the config reference */
@@ -215,9 +222,7 @@ export class ConfigReloader {
         await this.deps.onProviderChange(newConfig, oldConfig);
       }
 
-      if (this.deps.onScalerReload) {
-        await this.deps.onScalerReload();
-      }
+      const scaler = this.deps.onScalerReload ? await this.deps.onScalerReload() : undefined;
 
       if (this.deps.onPlatformReconnect && hasPlatformChanges(oldConfig, newConfig)) {
         await this.deps.onPlatformReconnect(newConfig);
@@ -248,6 +253,7 @@ export class ConfigReloader {
         version: dbVersion,
         fieldsChanged,
         restartRequired: restartRequired.length > 0 ? restartRequired : undefined,
+        ...(scaler ? { scaler } : {}),
       };
     } catch (err) {
       const errorMsg = toErrorMessage(err);

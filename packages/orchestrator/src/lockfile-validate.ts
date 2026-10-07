@@ -69,10 +69,16 @@ export function assertLockFileSchemaCompatible(
         `v${BREAKING_FLOOR} — recompile with a current SDK (\`kici compile\`) and push again.`,
     );
   }
+  const minReader: unknown = lockFile.minReaderVersion;
+  if (typeof minReader !== 'number' || !Number.isInteger(minReader) || minReader < 1) {
+    throw new LockFileParseError(
+      repoIdentifier,
+      ref,
+      `Lock file is missing a valid minReaderVersion — recompile with a current SDK ` +
+        `(\`kici compile\`) and push again.`,
+    );
+  }
   // Too new (breaking): the lock requires a reader newer than this orchestrator.
-  // Pre-window locks omit minReaderVersion; fall back to schemaVersion so a
-  // newer lock without the field keeps exact-match strictness (safe default).
-  const minReader = lockFile.minReaderVersion ?? lockFile.schemaVersion;
   if (readerVersion < minReader) {
     throw new LockFileParseError(
       repoIdentifier,

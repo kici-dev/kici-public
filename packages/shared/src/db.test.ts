@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import pg from 'pg';
-import { createPool, isPoolAcquireTimeout } from './db.js';
+import {
+  BROKEN_CONNECTION_ATTEMPTS,
+  createPool,
+  isBrokenConnectionError,
+  isPoolAcquireTimeout,
+  retryOnBrokenConnection,
+} from './db.js';
 
 // pg.Pool never connects at construction time, so emitting events on the
 // returned pool exercises the handlers without a database.
@@ -159,5 +165,72 @@ describe('isPoolAcquireTimeout', () => {
     expect(isPoolAcquireTimeout('timeout exceeded when trying to connect')).toBe(false);
     expect(isPoolAcquireTimeout(undefined)).toBe(false);
     expect(isPoolAcquireTimeout(null)).toBe(false);
+  });
+});
+
+/** A pg-style error carrying a SQLSTATE or socket code. */
+function pgError(message: string, code?: string): Error {
+  return Object.assign(new Error(message), code === undefined ? {} : { code });
+}
+
+describe('isBrokenConnectionError', () => {
+  it.each([
+    [
+      'admin_shutdown (pg_terminate_backend, leader demotion)',
+      pgError('terminating connection due to administrator command', '57P01'),
+    ],
+    [
+      'crash_shutdown',
+      pgError('terminating connection because of crash of another server process', '57P02'),
+    ],
+    ['a class 08 connection exception', pgError('connection failure', '08006')],
+    ['a socket reset', pgError('read ECONNRESET', 'ECONNRESET')],
+    ['the pg client noticing its socket died', pgError('Connection terminated unexpectedly')],
+    [
+      'a client already marked broken',
+      pgError('Client has encountered a connection error and is not queryable'),
+    ],
+  ])('matches %s', (_label, err) => {
+    expect(isBrokenConnectionError(err)).toBe(true);
+  });
+
+  it.each([
+    [
+      'cannot_connect_now — the database refusing new work',
+      pgError('the database system is starting up', '57P03'),
+    ],
+    ['an unreachable host', pgError('connect ECONNREFUSED 127.0.0.1:5432', 'ECONNREFUSED')],
+    ['an acquire timeout', new Error('timeout exceeded when trying to connect')],
+    ['a query error', pgError('relation "dedup_cache" does not exist', '42P01')],
+    ['a non-Error value', 'Connection terminated unexpectedly'],
+  ])('does not match %s', (_label, err) => {
+    expect(isBrokenConnectionError(err)).toBe(false);
+  });
+});
+
+describe('retryOnBrokenConnection', () => {
+  it('runs the probe again after a dead pooled connection and returns its result', async () => {
+    // fails-when: the helper rethrows the first broken-connection error.
+    const probe = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(pgError('Connection terminated unexpectedly'))
+      .mockResolvedValueOnce('ok');
+    await expect(retryOnBrokenConnection(probe)).resolves.toBe('ok');
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('rethrows any other error at once, so a real outage is not hidden', async () => {
+    // breaks-if-wrong: an unreachable database must still fail the probe on the first try.
+    const outage = pgError('connect ECONNREFUSED 127.0.0.1:5432', 'ECONNREFUSED');
+    const probe = vi.fn<() => Promise<string>>().mockRejectedValue(outage);
+    await expect(retryOnBrokenConnection(probe)).rejects.toBe(outage);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after a bounded number of broken connections', async () => {
+    const dead = pgError('terminating connection due to administrator command', '57P01');
+    const probe = vi.fn<() => Promise<string>>().mockRejectedValue(dead);
+    await expect(retryOnBrokenConnection(probe)).rejects.toBe(dead);
+    expect(probe).toHaveBeenCalledTimes(BROKEN_CONNECTION_ATTEMPTS);
   });
 });

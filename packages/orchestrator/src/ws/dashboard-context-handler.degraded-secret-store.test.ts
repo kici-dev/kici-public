@@ -50,6 +50,8 @@ function createDeps(secretStore: ScopedSecretStore): DashboardContextHandlerDeps
     contextStore: {} as any,
     variableStore: {} as any,
     bindingStore: {} as any,
+    // These tests drive no approval; the held-run deps are never read.
+    approvals: {} as any,
     secretStore,
     db: {
       selectFrom: vi.fn().mockReturnThis(),

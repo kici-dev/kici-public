@@ -143,10 +143,10 @@ export function formatDecision(res: DecisionResponse, decision: ApprovalDecision
 /** Fetch the run's pending holds, resolve the one the filters name, or exit. */
 async function resolveHold(
   getClient: () => AdminApiClient,
-  opts: { customerId: string; runId: string } & HoldFilterOptions,
+  opts: { org: string; runId: string } & HoldFilterOptions,
 ): Promise<string> {
   const listed = await getClient().get<HeldRunListResponse>(
-    `/api/v1/admin/held-runs?customerId=${encodeURIComponent(opts.customerId)}` +
+    `/api/v1/admin/held-runs?customerId=${encodeURIComponent(opts.org)}` +
       `&runId=${encodeURIComponent(opts.runId)}`,
   );
   const resolution = resolveHeldRunId(listed.heldRuns ?? [], {
@@ -182,13 +182,13 @@ export function registerHeldRunCommands(program: Command, getClient: () => Admin
   group
     .command('list')
     .description('Print the pending holds for a run, with the approvers each one requires')
-    .requiredOption('--customer-id <id>', 'Org / customer id')
+    .requiredOption('--org <id>', 'Org id')
     .requiredOption('--run-id <id>', 'Run whose holds to list')
     .option('--format <format>', 'Output format: json|table', 'table')
-    .action(async (opts: { customerId: string; runId: string; format: string }) => {
+    .action(async (opts: { org: string; runId: string; format: string }) => {
       try {
         const res = await getClient().get<{ heldRuns: AdminHeldRunSummary[] }>(
-          `/api/v1/admin/held-runs?customerId=${encodeURIComponent(opts.customerId)}` +
+          `/api/v1/admin/held-runs?customerId=${encodeURIComponent(opts.org)}` +
             `&runId=${encodeURIComponent(opts.runId)}`,
         );
         console.log(formatHeldRuns(res, opts.format));
@@ -209,12 +209,12 @@ export function registerHeldRunCommands(program: Command, getClient: () => Admin
             'trusted: an untrusted fork PR still resumes with the base-branch lock file, no ' +
             'install or registry secrets, and an isolated cache write scope',
         )
-        .requiredOption('--customer-id <id>', 'Org / customer id')
+        .requiredOption('--org <id>', 'Org id')
         .requiredOption('--run-id <id>', 'Run whose hold to approve'),
     ),
   );
   approve.action(
-    async (opts: { customerId: string; runId: string } & HoldFilterOptions & ApproveAsOption) => {
+    async (opts: { org: string; runId: string } & HoldFilterOptions & ApproveAsOption) => {
       await postDecision(getClient, opts, ApprovalDecision.enum.approve);
     },
   );
@@ -224,15 +224,14 @@ export function registerHeldRunCommands(program: Command, getClient: () => Admin
       group
         .command('reject')
         .description('Reject a held run, cancelling the element it was holding')
-        .requiredOption('--customer-id <id>', 'Org / customer id')
+        .requiredOption('--org <id>', 'Org id')
         .requiredOption('--run-id <id>', 'Run whose hold to reject')
         .requiredOption('--reason <text>', 'Why the hold is being rejected'),
     ),
   );
   reject.action(
     async (
-      opts: { customerId: string; runId: string; reason: string } & HoldFilterOptions &
-        ApproveAsOption,
+      opts: { org: string; runId: string; reason: string } & HoldFilterOptions & ApproveAsOption,
     ) => {
       await postDecision(getClient, opts, ApprovalDecision.enum.reject, opts.reason);
     },
@@ -242,14 +241,14 @@ export function registerHeldRunCommands(program: Command, getClient: () => Admin
 /** Resolve the named hold and POST the decision, reporting what the applier did. */
 async function postDecision(
   getClient: () => AdminApiClient,
-  opts: { customerId: string; runId: string } & HoldFilterOptions & ApproveAsOption,
+  opts: { org: string; runId: string } & HoldFilterOptions & ApproveAsOption,
   decision: ApprovalDecision,
   reason?: string,
 ): Promise<void> {
   try {
     const heldRunId = await resolveHold(getClient, opts);
     const res = await getClient().post<DecisionResponse>('/api/v1/admin/held-runs/decision', {
-      customerId: opts.customerId,
+      customerId: opts.org,
       heldRunId,
       decision,
       ...(reason !== undefined && { reason }),

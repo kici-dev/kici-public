@@ -149,13 +149,11 @@ describe('jobDispatchSchema', () => {
   it('parses successfully with all new optional fields present', () => {
     const withNewFields = {
       ...validDispatch,
-      token: 'ghs_abc123xyz',
       secrets: { NPM_TOKEN: 'npm_xxxx', DEPLOY_KEY: 'deploy_yyyy' },
       maxLogSizeBytes: 5242880,
       concurrencyWaitTimeoutMs: 900_000,
     };
     const parsed = jobDispatchSchema.parse(withNewFields);
-    expect(parsed.token).toBe('ghs_abc123xyz');
     expect(parsed.secrets).toEqual({ NPM_TOKEN: 'npm_xxxx', DEPLOY_KEY: 'deploy_yyyy' });
     expect(parsed.maxLogSizeBytes).toBe(5242880);
     expect(parsed.concurrencyWaitTimeoutMs).toBe(900_000);
@@ -163,7 +161,6 @@ describe('jobDispatchSchema', () => {
 
   it('parses successfully without the new optional fields (backward compatibility)', () => {
     const parsed = jobDispatchSchema.parse(validDispatch);
-    expect(parsed.token).toBeUndefined();
     expect(parsed.secrets).toBeUndefined();
     expect(parsed.maxLogSizeBytes).toBeUndefined();
     expect(parsed.concurrencyWaitTimeoutMs).toBeUndefined();
@@ -267,33 +264,16 @@ describe('jobDispatchSchema', () => {
     expect(parsed.workflowAuth?.secret).toBe('ghs_github');
   });
 
-  it('accepts token alongside matching basic sourceAuth (transition-window compat)', () => {
-    const msg = {
+  it('strips a bare clone token, so only structured auth reaches the agent', () => {
+    // fails-when: job.dispatch still carries the removed bare `token` field.
+    const parsed = jobDispatchSchema.parse({
       ...validDispatch,
       token: 'ghs_abc',
       sourceAuth: { kind: 'basic', user: 'x-access-token', secret: 'ghs_abc' },
-    };
-    expect(jobDispatchSchema.parse(msg)).toBeDefined();
-  });
-
-  it('rejects token + sourceAuth when secrets disagree', () => {
-    const msg = {
-      ...validDispatch,
-      token: 'ghs_abc',
-      sourceAuth: { kind: 'basic', user: 'x-access-token', secret: 'different_token' },
-    };
-    expect(() => jobDispatchSchema.parse(msg)).toThrow(/token and sourceAuth.secret must match/);
-  });
-
-  it('rejects token + sourceAuth when kind is ssh (token cannot represent ssh)', () => {
-    const msg = {
-      ...validDispatch,
-      token: 'ghs_abc',
-      sourceAuth: { kind: 'ssh', secret: '-----BEGIN KEY-----' },
-    };
-    // The Zod error is emitted as a JSON-serialized issue array where
-    // double-quotes are backslash-escaped — match the escape-free substring.
-    expect(() => jobDispatchSchema.parse(msg)).toThrow(/sourceAuth\.kind must be/);
+    }) as Record<string, unknown>;
+    expect(parsed).not.toHaveProperty('token');
+    // breaks-if-wrong: the structured source auth must still reach the agent.
+    expect(parsed.sourceAuth).toEqual({ kind: 'basic', user: 'x-access-token', secret: 'ghs_abc' });
   });
 
   it('parses job.dispatch with org/repo/cacheRefScope', () => {
@@ -992,6 +972,7 @@ describe('agentLogChunkSchema', () => {
     stepIndex: 0,
     lines: ['$ npm install', 'added 42 packages'],
     timestamp: Date.now(),
+    stream: LogStream.enum.stdout,
   };
 
   it('validates a well-formed log chunk message', () => {
@@ -1010,8 +991,10 @@ describe('agentLogChunkSchema', () => {
     expect(parsed.stream).toBe(LogStream.enum.stderr);
   });
 
-  it('accepts a chunk with no stream and leaves it undefined', () => {
-    expect(agentLogChunkSchema.parse(validLogChunk).stream).toBeUndefined();
+  it('refuses a chunk with no stream', () => {
+    // fails-when: `stream` stays optional.
+    const { stream: _stream, ...rest } = validLogChunk;
+    expect(agentLogChunkSchema.safeParse(rest).success).toBe(false);
   });
 
   it('rejects an unknown stream value', () => {
@@ -1200,7 +1183,7 @@ describe('orchestratorToAgentMessageSchema', () => {
     expect(orchestratorToAgentMessageSchema.parse(msg)).toEqual(msg);
   });
 
-  it('accepts job.dispatch with token, secrets, and maxLogSizeBytes', () => {
+  it('accepts job.dispatch with secrets and maxLogSizeBytes', () => {
     const msg = {
       type: 'job.dispatch',
       messageId: 'msg-600',
@@ -1212,7 +1195,6 @@ describe('orchestratorToAgentMessageSchema', () => {
       lockFileUrl: 'https://s3.example.com/lock.json',
       jobConfig: {},
       timestamp: 123,
-      token: 'ghs_token123',
       secrets: { API_KEY: 'secret' },
       maxLogSizeBytes: 1048576,
     };
@@ -1300,6 +1282,7 @@ describe('agentToOrchestratorMessageSchema', () => {
       stepIndex: 0,
       lines: ['output line'],
       timestamp: 123,
+      stream: 'stdout',
     };
     expect(agentToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
   });
@@ -2101,12 +2084,12 @@ describe('registerAckSchema capabilities', () => {
       type: 'register.ack',
       agentId: 'a1',
       labels: [],
-      capabilities: { artifactCompleteAck: true },
+      capabilities: { futureFlag: true },
     });
-    expect(m.capabilities?.artifactCompleteAck).toBe(true);
+    expect(m.capabilities).toEqual({ futureFlag: true });
   });
 
-  it('accepts register.ack with no capabilities (pre-capability orchestrator)', () => {
+  it('accepts register.ack with no capabilities', () => {
     const m = registerAckSchema.parse({ type: 'register.ack', agentId: 'a1', labels: [] });
     expect(m.capabilities).toBeUndefined();
   });
@@ -2129,4 +2112,42 @@ describe('rate.limit.warning', () => {
       'rate.limit.warning',
     );
   });
+});
+
+describe('cache upload frames require the tarball hash of their cache type', () => {
+  const base = { messageId: 'm', jobId: 'j', platform: 'linux', arch: 'x64' };
+  const complete = {
+    'cache.upload.request': {
+      source: { ...base, cacheType: 'source', contentHash: 'c', sourceTarDigest: 'd' },
+      deps: { ...base, cacheType: 'deps', lockfileHash: 'l', depsHash: 'h' },
+    },
+    'cache.upload.complete': {
+      source: { ...base, cacheType: 'source', contentHash: 'c', sourceTarDigest: 'd' },
+      deps: { ...base, cacheType: 'deps', lockfileHash: 'l', depsHash: 'h' },
+    },
+  } as const;
+
+  it.each(['cache.upload.request', 'cache.upload.complete'] as const)(
+    '%s refuses a frame without its tarball hash',
+    (type) => {
+      // fails-when: depsHash / sourceTarDigest stay optional.
+      const { sourceTarDigest: _d, ...source } = complete[type].source;
+      const { depsHash: _h, ...deps } = complete[type].deps;
+      expect(agentToOrchestratorMessageSchema.safeParse({ type, ...source }).success).toBe(false);
+      expect(agentToOrchestratorMessageSchema.safeParse({ type, ...deps }).success).toBe(false);
+    },
+  );
+
+  it.each(['cache.upload.request', 'cache.upload.complete'] as const)(
+    'a complete %s parses',
+    (type) => {
+      // breaks-if-wrong: requiring the hash must not refuse what the agent sends.
+      expect(
+        agentToOrchestratorMessageSchema.safeParse({ type, ...complete[type].source }).success,
+      ).toBe(true);
+      expect(
+        agentToOrchestratorMessageSchema.safeParse({ type, ...complete[type].deps }).success,
+      ).toBe(true);
+    },
+  );
 });

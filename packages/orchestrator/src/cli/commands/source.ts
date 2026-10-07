@@ -25,6 +25,7 @@ import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { sql } from 'kysely';
 import type { Command } from 'commander';
+import { DEFAULT_ADMIN_URL } from '../api-client.js';
 import type { AdminApiClient, GenericSourceResponse } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
 import { createPool, createDb } from '../../db/client.js';
@@ -41,12 +42,12 @@ import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
 import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
 import { runGithubManifestSetup } from './source-manifest.js';
 import { confirmPrompt } from './shared/confirm.js';
-
-/** Mirror of the identical helper in queue.ts / event.ts / etc.: an explicit
- *  --database-url wins, else KICI_DATABASE_URL, else null (→ HTTP path). */
-function resolveDirectDbUrl(explicit?: string): string | null {
-  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
-}
+import {
+  cliAction,
+  resolveDirectDbUrl,
+  DIRECT_DB_URL_FLAG,
+  DIRECT_DB_URL_HELP,
+} from './shared/cli-action.js';
 
 /** Run `fn` with a GenericSourceManager backed by a one-shot pool built from
  *  `dbUrl`, always closing the pool. GenericSourceManager's constructor takes
@@ -192,7 +193,7 @@ export function renderSourceListText(
 
 /** Default orchestrator base URL for the webhook trigger route, matching the
  *  kici-admin global `--url` default. */
-const DEFAULT_ORCH_URL = process.env.KICI_ADMIN_URL ?? 'http://localhost:8080';
+const DEFAULT_ORCH_URL = process.env.KICI_ADMIN_URL ?? DEFAULT_ADMIN_URL;
 
 /** Parse a generic source's git_config (string or object) into a LocalSourceConfig.
  *  Returns null when the row is not a valid local source. */
@@ -731,8 +732,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       'Provider implementation: generic (default) or local (a git repo on the agent filesystem cloned via file://)',
     )
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
-    .action(async (opts) => {
-      try {
+    .action(
+      cliAction(async (opts) => {
         // Build verification config from secret input
         const secret = await resolveSecret({
           value: opts.secret,
@@ -790,11 +791,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
             `  Git URL:      ${(gitConfig as { gitUrlTemplate: string }).gitUrlTemplate}`,
           );
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // source add local
   // Register a git repository present on the agent's filesystem as a file://
@@ -814,9 +812,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       'Optional git://|http:// base for remote agents that do not share the orchestrator filesystem (default: file://)',
     )
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
-    .action(async (opts) => {
-      try {
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
+    .action(
+      cliAction(async (opts) => {
         if (!path.isAbsolute(opts.path)) {
           console.error(`Error: --path must be an absolute path: ${opts.path}`);
           process.exit(1);
@@ -871,11 +869,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         console.log('');
         console.log(`Trigger runs with: kici-admin source trigger-local ${s.id}`);
         console.log(`Or install a push hook: kici-admin source install-hook ${s.id}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source list-presets --
   // Dump the built-in universal-git preset table so operators can discover
@@ -931,9 +926,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--org <orgId>', 'Filter generic sources by organization ID')
     .option('--include-deleted', 'Include soft-deleted generic sources')
     .option('--json', 'Emit raw JSON ({github: [...], generic: [...]}) instead of formatted text')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
-    .action(async (opts) => {
-      try {
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
+    .action(
+      cliAction(async (opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           const githubSources = await listGithubSourcesDirect(dbUrl);
@@ -992,18 +987,15 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         renderSourceListText(githubSources, genericSources, Boolean(opts.org), {
           directDb: false,
         });
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source get-webhook-secret <routingKey> --
   src
     .command('get-webhook-secret <routingKey>')
     .description('Get the webhook secret for a source (for GitHub webhook configuration)')
-    .action(async (routingKey: string) => {
-      try {
+    .action(
+      cliAction(async (routingKey: string) => {
         const result = await getClient().get<{
           routingKey: string;
           webhookSecret: string | null;
@@ -1018,19 +1010,16 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         }
 
         console.log(result.webhookSecret);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source get <id> --
   src
     .command('get <id>')
     .description('Get details of a generic webhook source')
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const { source } = await getClient().getGenericSource(id);
         if (opts.json) {
           console.log(JSON.stringify(source, null, 2));
@@ -1038,11 +1027,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         }
         console.log('Generic source:');
         formatGenericSource(source);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source update <routingKey> (GitHub sources) --
   src
@@ -1053,13 +1039,10 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--webhook-secret <secret>', 'New webhook secret')
     .option('--from-env <varName>', 'Read new private key from environment variable')
     .option('--stdin', 'Read new private key from stdin')
-    .option(
-      '--customer-id <orgId>',
-      'Update the customer/org ID used for secret and environment scoping',
-    )
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
-    .action(async (routingKey: string, opts) => {
-      try {
+    .option('--org <orgId>', 'Update the org ID used for secret and environment scoping')
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
+    .action(
+      cliAction(async (routingKey: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           // Direct-DB mode only reassigns customer_id (the secret-free column).
@@ -1068,16 +1051,16 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           // rather than silently dropping the changes.
           if (opts.privateKey || opts.webhookSecret || opts.stdin || opts.fromEnv || opts.name) {
             console.error(
-              'Error: --database-url mode supports only --customer-id updates; ' +
+              'Error: --database-url mode supports only --org updates; ' +
                 'secret/key/name updates require HTTP (drop --database-url)',
             );
             process.exit(1);
           }
-          if (!opts.customerId) {
-            console.error('Error: --database-url mode requires --customer-id');
+          if (!opts.org) {
+            console.error('Error: --database-url mode requires --org');
             process.exit(1);
           }
-          await updateGithubCustomerIdDirect(dbUrl, routingKey, opts.customerId);
+          await updateGithubCustomerIdDirect(dbUrl, routingKey, opts.org);
           console.log(`Source updated: ${routingKey}`);
           return;
         }
@@ -1091,18 +1074,15 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         if (opts.name) body.name = opts.name;
         if (privateKey) body.privateKey = privateKey;
         if (opts.webhookSecret) body.webhookSecret = opts.webhookSecret;
-        if (opts.customerId) body.customerId = opts.customerId;
+        if (opts.org) body.customerId = opts.org;
 
         const result = await getClient().patch<{ routingKey: string }>(
           `/api/v1/admin/sources/${encodeURIComponent(routingKey)}`,
           body,
         );
         console.log(`Source updated: ${result.routingKey}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source refresh <routingKey> --
   // Re-sync a GitHub source's display name + slug from GitHub. GitHub is the
@@ -1117,8 +1097,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     )
     .option('--all', 'Refresh every GitHub source')
     .option('--json', 'Emit raw JSON instead of formatted text')
-    .action(async (routingKey: string | undefined, opts) => {
-      try {
+    .action(
+      cliAction(async (routingKey: string | undefined, opts) => {
         if (opts.all) {
           const res = await getClient().post<{
             results: Array<RefreshResultJson>;
@@ -1151,11 +1131,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           return;
         }
         printRefreshResult(result);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source redeliver <routingKey> --
   // Ask GitHub to resend every delivery for this App in a time window. The
@@ -1169,8 +1146,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .requiredOption('--until <iso>', 'Window end, ISO-8601 (exclusive)')
     .option('--dry-run', 'List the matching deliveries without asking GitHub to resend them')
     .option('--json', 'Emit raw JSON instead of formatted text')
-    .action(async (routingKey: string, opts) => {
-      try {
+    .action(
+      cliAction(async (routingKey: string, opts) => {
         for (const [flag, value] of [
           ['--since', opts.since],
           ['--until', opts.until],
@@ -1194,11 +1171,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         }
         printRedeliverResult(res);
         if (res.failed > 0) process.exit(1);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source update-generic <id> --
   src
@@ -1241,8 +1215,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       'Provider implementation: generic (default) or local (a git repo on the agent filesystem cloned via file://)',
     )
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const secret = await resolveSecret({
           value: opts.secret,
           stdin: opts.stdin,
@@ -1298,11 +1272,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         } else {
           console.log(`Generic source updated: ${result.source.id} (${result.source.name})`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source update-local <id> --
   // Update a local (file://) source's repoBasePath / cloneUrlBase.
@@ -1313,9 +1284,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--path <dir>', 'New absolute repo base path on the agent filesystem')
     .option('--clone-url-base <url>', 'New git://|http:// clone base (default: file://)')
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
-    .action(async (id: string, opts) => {
-      try {
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
+    .action(
+      cliAction(async (id: string, opts) => {
         const data: {
           name?: string;
           localConfig?: { repoBasePath: string; cloneUrlBase?: string };
@@ -1373,11 +1344,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         } else {
           console.log(`Local source updated: ${result.source.id} (${result.source.name})`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source remove <routingKey> --
   src
@@ -1387,9 +1355,9 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--generic', 'Remove a generic source (routingKey is treated as source ID)')
     .option('--local', 'Remove a local (file://) source (routingKey is treated as source ID)')
     .option('--hard', 'Permanently delete a generic/local source (requires --generic or --local)')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
-    .action(async (routingKey: string, opts) => {
-      try {
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
+    .action(
+      cliAction(async (routingKey: string, opts) => {
         if (!opts.yes && !(await confirmPrompt(`Remove source "${routingKey}"? (y/N) `))) {
           console.log('Cancelled.');
           return;
@@ -1431,19 +1399,16 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           await getClient().delete(`/api/v1/admin/sources/${encodeURIComponent(routingKey)}`);
           console.log(`Source removed: ${routingKey}`);
         }
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source enable <id> --
   src
     .command('enable <id>')
     .description('Enable a generic webhook source')
-    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
-    .action(async (id: string, opts: { databaseUrl?: string }) => {
-      try {
+    .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
+    .action(
+      cliAction(async (id: string, opts: { databaseUrl?: string }) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           await withGenericManager(dbUrl, (mgr) => mgr.enable(id));
@@ -1451,25 +1416,19 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           await getClient().enableGenericSource(id);
         }
         console.log(`Generic source enabled: ${id}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source disable <id> --
   src
     .command('disable <id>')
     .description('Disable a generic webhook source')
-    .action(async (id: string) => {
-      try {
+    .action(
+      cliAction(async (id: string) => {
         await getClient().disableGenericSource(id);
         console.log(`Generic source disabled: ${id}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source trigger-local <id> --
   // Drive a run against a local source by POSTing a synthetic GitHub-shaped
@@ -1488,8 +1447,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     )
     .option('--repo-full-name <name>', 'owner/name identifier used in the payload', 'local/repo')
     .option('--base-url <url>', 'Orchestrator base URL', DEFAULT_ORCH_URL)
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const { source } = await getClient().getGenericSource(id);
         const cfg = parseLocalConfig(source);
         if (!cfg) {
@@ -1516,11 +1475,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         const status = await sendLocalTrigger(opts.baseUrl, req);
         console.log(`Triggered local source ${id}: HTTP ${status}`);
         if (status >= 400) process.exit(1);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 
   // -- source install-hook <id> --
   // Write a post-receive hook into the local repo so every push triggers a run.
@@ -1529,8 +1485,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .description('Install a post-receive hook in the local source repo that triggers runs on push')
     .option('--repo <path>', 'Repo path (default: the source repoBasePath)')
     .option('--base-url <url>', 'Orchestrator base URL', DEFAULT_ORCH_URL)
-    .action(async (id: string, opts) => {
-      try {
+    .action(
+      cliAction(async (id: string, opts) => {
         const { source } = await getClient().getGenericSource(id);
         const cfg = parseLocalConfig(source);
         if (!cfg) {
@@ -1542,9 +1498,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         const hookPath = installPostReceiveHook(repoPath, script);
         console.log(`Installed post-receive hook: ${hookPath}`);
         console.log(`Every push to ${repoPath} will now trigger a run for source ${id}.`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+      }),
+    );
 }

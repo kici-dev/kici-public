@@ -9,10 +9,9 @@
  * nothing when there are none. So such a context with no binding delivers no
  * secret to those jobs, whatever its scopes hold, and nothing fails loudly — a
  * workflow's `ctx.secrets.get()` throws at run time instead. A
- * `<context>:<key>` git-credential or registry reference to a fixed context
- * still reads the scope named after it, through a deprecated fallback; a glob
- * context has no such fallback. The warning names the context, that fallback
- * where it applies, and the `context bind` command that fixes it.
+ * `<context>:<key>` git-credential or registry reference resolves through the
+ * same bindings, so it finds nothing either. The warning names the context and
+ * the `context bind` command that fixes it.
  *
  * Advisory only: the lookup runs after the command's own write succeeded, and
  * a failed lookup prints nothing, so the command's exit code never changes.
@@ -37,17 +36,11 @@ export interface WarnIfContextUnboundArgs {
   warn?: (line: string) => void;
 }
 
-/** The warning line for a context of `type` with no binding. */
-export function unboundContextWarning(orgId: string, name: string, type: ContextType): string {
-  // fails-when: a glob context's warning promises a same-named-scope fallback it does not have
-  // breaks-if-wrong: a fixed context's warning must name the deprecated fallback its references take
-  const fallback =
-    type === ContextType.enum.fixed
-      ? `A '${name}:<key>' reference still reads scope '${name}', through a deprecated fallback. `
-      : '';
+/** The warning line for a context with no binding. */
+export function unboundContextWarning(orgId: string, name: string): string {
   return (
-    `warning: context '${name}' has no binding, so no job that lists it in contexts: receives its secrets. ` +
-    fallback +
+    `warning: context '${name}' has no binding, so no job that lists it in contexts: receives its secrets, ` +
+    `and a '${name}:<key>' reference resolves nothing. ` +
     `Bind a secret scope to it: kici-admin context bind --org ${orgId} --env ${name} --scope ${name}`
   );
 }
@@ -94,6 +87,6 @@ export async function warnIfContextUnbound(args: WarnIfContextUnboundArgs): Prom
   // breaks-if-wrong: a bound context, a template, or a name that is no context must stay silent
   const type = found ? ContextType.safeParse(found.context.type) : undefined;
   if (found && type?.success && found.bindings.length === 0) {
-    (args.warn ?? console.error)(unboundContextWarning(args.orgId, args.name, type.data));
+    (args.warn ?? console.error)(unboundContextWarning(args.orgId, args.name));
   }
 }

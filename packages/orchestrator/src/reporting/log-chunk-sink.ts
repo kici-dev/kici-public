@@ -26,7 +26,7 @@ export interface NormalizedLogChunk {
   stepIndex: number;
   lines: string[];
   timestamp: number;
-  stream?: LogStream;
+  stream: LogStream;
 }
 
 /** Which ingress produced the chunk. Stamped onto the two log counters. */

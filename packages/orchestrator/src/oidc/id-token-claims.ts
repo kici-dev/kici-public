@@ -1,7 +1,7 @@
 /**
  * OIDC ID-token claims for orchestrator-side minting — shared by the
  * production orchestrator-owned mint (`orchestrator-mint.ts`) and the local
- * dev-signed identity (`local-mint.ts`). Mirrors the Platform's claim shape so
+ * dev-signed identity (`local-mint.ts`). One claim shape, so
  * every bundle carries the exact same claims the agent's statement builder +
  * the engine verifier expect — the cross-check between the in-toto statement
  * and the token claims is identical across all minters. The dev-signed path
