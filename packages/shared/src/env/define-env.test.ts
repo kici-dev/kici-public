@@ -328,6 +328,20 @@ describe('validateUnknownKiciVars', () => {
     ).not.toThrow();
   });
 
+  it('allowlists KICI_ORCHESTRATOR_TOKEN (the CLI direct-target credential)', () => {
+    // A developer or CI job exports it for `kici run remote` against an
+    // orchestrator; a service started from that shell inherits it.
+    // fails-when: the name leaves RESERVED_NON_SCHEMA_KICI_VARS — the service
+    // refuses to boot with "Unknown KICI_* env var".
+    expect(() =>
+      validateUnknownKiciVars(
+        ['KICI_SECRET_KEY'],
+        {},
+        { KICI_SECRET_KEY: 'x', KICI_ORCHESTRATOR_TOKEN: 'tok' },
+      ),
+    ).not.toThrow();
+  });
+
   it('leaves KICI_CONFIG to the one service that reads it', () => {
     // KICI_CONFIG picks which local YAML file the reload path and
     // `kici-admin scaler` read, and only the orchestrator reads either. It is
@@ -346,7 +360,12 @@ describe('validateUnknownKiciVars', () => {
 
   it('still rejects near-misses of an allowlisted name', () => {
     // breaks-if-wrong: the allowlist entry is an exact name, never a prefix.
-    for (const name of ['KICI_CONFIGX', 'KICI_CONFG', 'KICI_CONFIG_DIRX']) {
+    for (const name of [
+      'KICI_CONFIGX',
+      'KICI_CONFG',
+      'KICI_CONFIG_DIRX',
+      'KICI_ORCHESTRATOR_TOKN',
+    ]) {
       expect(() =>
         validateUnknownKiciVars(['KICI_SECRET_KEY'], {}, { KICI_SECRET_KEY: 'x', [name]: 'y' }),
       ).toThrow(/Unknown KICI_\* env var/);

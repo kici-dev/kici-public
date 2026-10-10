@@ -5,6 +5,8 @@ import {
   buildTargetSelector,
   buildDispatchInputs,
   lookupDispatchInputsDescriptor,
+  requestRunCancel,
+  watchRunHolds,
   withStdoutOnStderr,
 } from './run.js';
 
@@ -54,6 +56,40 @@ vi.mock('../remote/platform-client.js', () => {
       constructor(m = 'Resource not found') {
         super(m);
         this.name = 'NotFoundError';
+      }
+    },
+  };
+});
+
+// The direct transport's client: same shape, captured constructor args.
+const mockDirect = {
+  url: 'https://ci.example.com',
+  whoami: vi.fn(),
+  initUpload: vi.fn(),
+  trigger: vi.fn(),
+  runStatus: vi.fn(),
+  runLogs: vi.fn(),
+  cancel: vi.fn(),
+  listHolds: vi.fn(),
+  decideHold: vi.fn(),
+};
+const directClientConfigs: Record<string, unknown>[] = [];
+vi.mock('../remote/direct-client.js', () => {
+  class MockDirectRunClient {
+    constructor(config: Record<string, unknown>) {
+      directClientConfigs.push(config);
+      return mockDirect;
+    }
+  }
+  return {
+    DirectRunClient: MockDirectRunClient,
+    HoldsUnavailableError: class extends Error {
+      constructor(
+        m: string,
+        readonly status: number,
+      ) {
+        super(m);
+        this.name = 'HoldsUnavailableError';
       }
     },
   };
@@ -160,6 +196,10 @@ describe('kici run command', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     platformClientConfigs.length = 0;
+    directClientConfigs.length = 0;
+    // An empty value counts as unset; the developer's own shell never leaks in.
+    vi.stubEnv('KICI_ORCHESTRATOR_URL', '');
+    vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', '');
 
     mockHistory.load.mockResolvedValue([]);
     mockHistory.addEntry.mockResolvedValue(undefined);
@@ -450,6 +490,39 @@ describe('kici run command', () => {
       expect(compileOrder).toBeLessThan(overlayOrder);
     });
 
+    it('passes --orchestrator-url to the compile so its types refresh reads that orchestrator', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'env-tok');
+      mockDirect.whoami.mockResolvedValue({
+        tokenId: 't',
+        label: 'dev',
+        subject: null,
+        role: 'admin',
+        mode: 'independent',
+        orgId: '__default__',
+        permissions: { trigger: true, read: true },
+      });
+      mockDirect.initUpload.mockResolvedValue({
+        uploadId: 'u',
+        signedUrl: 'http://s/put',
+        publicKey: Buffer.from('k').toString('base64'),
+        expiresIn: 1,
+      });
+      mockDirect.trigger.mockResolvedValue({ runId: 'r', status: 'accepted' });
+
+      await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        wait: false,
+        orchestratorUrl: 'https://ci.example.com',
+      });
+
+      // fails-when: the compile's types refresh falls back to a saved Platform login
+      expect(compileCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ orchestratorUrl: 'https://ci.example.com' }),
+      );
+    });
+
     it('aborts the run (no upload, no dispatch) when compile fails', async () => {
       compileFixtures.mockResolvedValue([fixture]);
       filterFixtures.mockReturnValue([fixture]);
@@ -513,6 +586,283 @@ describe('kici run command', () => {
       await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
 
       expect(compileCommand).toHaveBeenCalledWith(expect.objectContaining({ quiet: false }));
+    });
+  });
+
+  describe('direct transport', () => {
+    const WHOAMI = {
+      tokenId: 'tok-1',
+      label: 'dev',
+      subject: 'dev@x',
+      role: 'admin',
+      mode: 'independent',
+      orgId: '__default__',
+      permissions: { trigger: true, read: true },
+    };
+
+    beforeEach(() => {
+      mockDirect.whoami.mockResolvedValue(WHOAMI);
+      mockDirect.initUpload.mockResolvedValue({
+        uploadId: 'upload-d',
+        signedUrl: 'http://127.0.0.1:14333/kici-cache/x?X-Amz-Signature=sig',
+        publicKey: Buffer.from('orchpub').toString('base64'),
+        expiresIn: 3600,
+      });
+      mockDirect.trigger.mockResolvedValue({ runId: 'run-d', status: 'accepted' });
+      mockDirect.runLogs.mockResolvedValue({ lines: ['x'], nextCursor: 1, done: true });
+      mockDirect.runStatus.mockResolvedValue({
+        runId: 'run-d',
+        status: 'success',
+        jobs: [],
+        done: true,
+      });
+      mockDirect.cancel.mockResolvedValue({ cancelled: true });
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+    });
+
+    it('runs on the --orchestrator-url orchestrator, never the Platform', async () => {
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'env-tok');
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        wait: false,
+        orchestratorUrl: 'https://ci.example.com/',
+      });
+      expect(result).toBe(true);
+      expect(directClientConfigs).toEqual([{ url: 'https://ci.example.com', token: 'env-tok' }]);
+      expect(mockDirect.whoami).toHaveBeenCalledTimes(1);
+      expect(mockDirect.whoami.mock.invocationCallOrder[0]).toBeLessThan(
+        mockDirect.initUpload.mock.invocationCallOrder[0],
+      );
+      expect(mockDirect.trigger).toHaveBeenCalledWith(
+        expect.objectContaining({ fixtureId: 'push-main', uploadId: 'upload-d', fullRepo: true }),
+      );
+      // fails-when: the flag is ignored and the run goes through the Platform relay
+      expect(platformClientConfigs).toHaveLength(0);
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+    });
+
+    it('uses a saved direct target without a flag', async () => {
+      loadGlobalConfig.mockResolvedValue({
+        pat: 'test-pat',
+        platformEndpoint: 'https://platform.invalid',
+        activeOrgId: 'org_a',
+        direct: { url: 'https://ci.example.com', token: 'saved-tok' },
+      });
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+      expect(directClientConfigs).toEqual([{ url: 'https://ci.example.com', token: 'saved-tok' }]);
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+    });
+
+    it('ignores an env URL without a token and keeps the Platform login', async () => {
+      vi.stubEnv('KICI_ORCHESTRATOR_URL', 'ws://host:4000/ws');
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+      // breaks-if-wrong: an agent host's own socket URL must not move a run off the Platform
+      expect(directClientConfigs).toHaveLength(0);
+      expect(mockClient.trigger).toHaveBeenCalled();
+    });
+
+    it('stops before any upload when the token cannot start runs', async () => {
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'aud');
+      mockDirect.whoami.mockResolvedValue({
+        ...WHOAMI,
+        role: 'auditor',
+        permissions: { trigger: false, read: true },
+      });
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        orchestratorUrl: 'https://ci.example.com',
+      });
+      expect(result).toBe(false);
+      expect(mockDirect.initUpload).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('cannot start runs'));
+    });
+
+    it('warns about --org and --routing-key on a direct run and still runs', async () => {
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'env-tok');
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const result = await runRemoteCommand('push-main', {
+          kiciDir: '.kici',
+          wait: false,
+          orchestratorUrl: 'https://ci.example.com',
+          org: 'org_x',
+          routingKey: 'github:1',
+        });
+        expect(result).toBe(true);
+        const written = stderr.mock.calls.map((c) => String(c[0])).join('');
+        expect(written).toContain('the orchestrator chooses the organization');
+        expect(written).toContain('v1.0.0');
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    /** A running run whose first log poll delivers Ctrl-C, as the terminal would. */
+    function interruptFirstPoll(): void {
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'env-tok');
+      mockDirect.runLogs.mockImplementationOnce(async () => {
+        process.emit('SIGINT');
+        return { lines: [], nextCursor: 0, done: false };
+      });
+      mockDirect.runStatus.mockResolvedValueOnce({
+        runId: 'run-d',
+        status: 'running',
+        jobs: [],
+        done: false,
+      });
+      mockDirect.listHolds.mockResolvedValue([]);
+    }
+
+    /** Hold the next cancel request open; the returned function answers it. */
+    function holdNextCancel(): (answer: { cancelled: boolean }) => void {
+      let answer: (v: { cancelled: boolean }) => void = () => {};
+      mockDirect.cancel.mockImplementationOnce(
+        () => new Promise<{ cancelled: boolean }>((resolve) => (answer = resolve)),
+      );
+      return (v) => answer(v);
+    }
+
+    it('cancels through the orchestrator on SIGINT', async () => {
+      interruptFirstPoll();
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        quiet: true,
+        orchestratorUrl: 'https://ci.example.com',
+      });
+      expect(result).toBe(false);
+      expect(mockDirect.cancel).toHaveBeenCalledWith('run-d');
+    });
+
+    it('returns only after the cancel request on SIGINT has settled', async () => {
+      interruptFirstPoll();
+      const answer = holdNextCancel();
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        let settled = false;
+        const done = runRemoteCommand('push-main', {
+          kiciDir: '.kici',
+          quiet: true,
+          orchestratorUrl: 'https://ci.example.com',
+        }).finally(() => (settled = true));
+
+        await vi.waitFor(() => expect(mockDirect.cancel).toHaveBeenCalledWith('run-d'));
+        // Several poll intervals pass while the orchestrator has not answered.
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        // fails-when: the poll loop returns as soon as Ctrl-C sets its flag, so the
+        // CLI reports and exits while the cancel request is still in flight
+        expect(settled).toBe(false);
+
+        answer({ cancelled: true });
+        expect(await done).toBe(false);
+        const written = stderr.mock.calls.map((c) => String(c[0])).join('');
+        expect(written).toContain('Cancelled run run-d.');
+      } finally {
+        stderr.mockRestore();
+      }
+    }, 10_000);
+
+    it('exits at once on a second SIGINT while the cancel is pending', async () => {
+      interruptFirstPoll();
+      const answer = holdNextCancel();
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const done = runRemoteCommand('push-main', {
+          kiciDir: '.kici',
+          quiet: true,
+          orchestratorUrl: 'https://ci.example.com',
+        });
+        await vi.waitFor(() => expect(mockDirect.cancel).toHaveBeenCalled());
+        expect(exit).not.toHaveBeenCalled();
+        process.emit('SIGINT');
+        expect(exit).toHaveBeenCalledWith(130);
+        // breaks-if-wrong: the second Ctrl-C must not send a second cancel
+        expect(mockDirect.cancel).toHaveBeenCalledTimes(1);
+        answer({ cancelled: true });
+        await done;
+      } finally {
+        exit.mockRestore();
+        stderr.mockRestore();
+      }
+    });
+
+    it('does not start the next fixture of a batch after Ctrl-C', async () => {
+      interruptFirstPoll();
+      compileFixtures.mockResolvedValue([fixture, { ...fixture, id: 'push-other' }]);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const result = await runRemoteCommand(undefined, {
+          kiciDir: '.kici',
+          all: true,
+          quiet: true,
+          orchestratorUrl: 'https://ci.example.com',
+        });
+        expect(result).toBe(false);
+        // fails-when: a cancelled result does not end the serial loop, so Ctrl-C
+        // cancels one run and the CLI starts the next fixture's run
+        expect(mockDirect.trigger).toHaveBeenCalledTimes(1);
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it('records the orchestrator URL in the run history', async () => {
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'env-tok');
+      await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        wait: false,
+        orchestratorUrl: 'https://ci.example.com',
+      });
+      expect(mockHistory.addEntry).toHaveBeenCalledWith(
+        expect.objectContaining({ endpoint: 'https://ci.example.com' }),
+      );
+    });
+
+    it('names the upload address and setting when the upload fails', async () => {
+      vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'env-tok');
+      uploadTarball.mockImplementation(async () => {
+        throw new Error('fetch failed');
+      });
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        wait: false,
+        orchestratorUrl: 'https://ci.example.com',
+      });
+      expect(result).toBe(false);
+      const printed = (logger.info as ReturnType<typeof vi.fn>).mock.calls
+        .concat((logger.error as ReturnType<typeof vi.fn>).mock.calls)
+        .map((c) => String(c[0]))
+        .join('\n');
+      expect(printed).toContain('http://127.0.0.1:14333');
+      expect(printed).toContain('KICI_STORAGE_UPLOAD_ENDPOINT');
+      expect(printed).not.toContain('X-Amz-Signature');
+    });
+  });
+
+  describe('watchRunHolds', () => {
+    it('prints an unavailable-holds message once and stops listing', async () => {
+      const { HoldsUnavailableError } = await import('../remote/direct-client.js');
+      const list = vi.fn(async () => {
+        throw new HoldsUnavailableError('Held runs are answered through the KiCI Platform', 409);
+      });
+      const transport = {
+        kind: 'direct' as const,
+        holds: {
+          list,
+          context: vi.fn(),
+          approve: vi.fn(),
+          reject: vi.fn(),
+          answerHint: vi.fn(),
+        },
+      };
+      const state = { seen: new Set<string>(), unavailable: false };
+      for (let i = 0; i < 3; i++) await watchRunHolds('run-1', state, transport, {});
+      expect(list).toHaveBeenCalledTimes(1);
+      const printed = (logger.info as ReturnType<typeof vi.fn>).mock.calls.filter((c) =>
+        String(c[0]).includes('answered through the KiCI Platform'),
+      );
+      expect(printed).toHaveLength(1);
     });
   });
 
@@ -844,6 +1194,58 @@ describe('withStdoutOnStderr', () => {
       expect(stdoutChunks).toContain('AFTER_THROW\n');
     } finally {
       restore();
+    }
+  });
+});
+
+describe('requestRunCancel', () => {
+  function captureStderr(): { text: () => string; restore: () => void } {
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    return {
+      text: () => spy.mock.calls.map((c) => String(c[0])).join(''),
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  it('reports a run that had already finished', async () => {
+    const err = captureStderr();
+    try {
+      await requestRunCancel({ cancel: async () => ({ cancelled: false }) }, 'run-x', {
+        quiet: true,
+      });
+      expect(err.text()).toContain('Run run-x had already finished; nothing to cancel.');
+    } finally {
+      err.restore();
+    }
+  });
+
+  it('reports a failed cancel request instead of throwing', async () => {
+    const err = captureStderr();
+    try {
+      await requestRunCancel(
+        {
+          cancel: async () => {
+            throw new Error('Connection refused');
+          },
+        },
+        'run-x',
+        { quiet: true },
+      );
+      expect(err.text()).toContain('Could not cancel run run-x: Connection refused.');
+    } finally {
+      err.restore();
+    }
+  });
+
+  it('stops waiting for an orchestrator that never answers', async () => {
+    const err = captureStderr();
+    try {
+      // fails-when: the wait is unbounded, so this promise never settles and
+      // the CLI hangs after Ctrl-C until a second one
+      await requestRunCancel({ cancel: () => new Promise(() => {}) }, 'run-x', { quiet: true }, 50);
+      expect(err.text()).toContain('the orchestrator did not answer within 0.05s');
+    } finally {
+      err.restore();
     }
   });
 });

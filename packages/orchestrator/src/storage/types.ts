@@ -76,10 +76,10 @@ export interface CacheStorage {
   getUploadUrl(key: string): Promise<string>;
 
   /**
-   * Generate a pre-signed PUT URL using the internal endpoint.
-   * Use this when the uploader is on the host (e.g., CLI uploads),
-   * not in a container. Falls back to getUploadUrl() when no
-   * external endpoint is configured.
+   * Generate the pre-signed PUT URL a developer machine running
+   * `kici run remote` uploads the overlay to. The S3 backend signs it with
+   * `KICI_STORAGE_UPLOAD_ENDPOINT`, else the agent-facing
+   * `KICI_STORAGE_EXTERNAL_ENDPOINT`, else `KICI_STORAGE_ENDPOINT`.
    */
   getInternalUploadUrl(key: string): Promise<string>;
 

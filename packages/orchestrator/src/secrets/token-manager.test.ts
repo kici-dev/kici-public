@@ -157,6 +157,27 @@ describe('TokenManager', () => {
       expect(result!.role).toBe('admin');
       expect(result!.routingKey).toBe('github:42');
       expect(result!.label).toBe('my-token');
+      // fails-when: validate drops the stored holder, so whoami cannot name it
+      expect(result!.subject).toBeNull();
+    });
+
+    it('returns the stored subject of a valid token', async () => {
+      const plaintext = 'b'.repeat(64);
+      const row = {
+        id: 'tok-v2',
+        token_hash: createHash('sha256').update(plaintext).digest('hex'),
+        label: 'dev',
+        role: 'owner',
+        routing_key: null,
+        subject: 'alice@example.test',
+        created_at: new Date(),
+        expires_at: null,
+        last_used_at: null,
+        revoked: false,
+      };
+      const { db } = createMockDb({ selectFirstRow: row });
+      const result = await new TokenManager(db as any).validate(plaintext);
+      expect(result!.subject).toBe('alice@example.test');
     });
 
     it('returns null for wrong token', async () => {

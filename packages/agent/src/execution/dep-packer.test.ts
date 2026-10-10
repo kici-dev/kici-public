@@ -1,5 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, symlink, readFile, realpath, rm, stat } from 'node:fs/promises';
+import {
+  link,
+  mkdtemp,
+  mkdir,
+  writeFile,
+  symlink,
+  readFile,
+  realpath,
+  rm,
+  stat,
+} from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -101,6 +111,48 @@ describe('packNodeModules + restoreDeps round-trip', () => {
       await realpath(join(dst, 'packages', 'core')),
     );
   });
+
+  it('pnpm: packs hard-linked store files and restores identical content', async () => {
+    const src = join(root, 'src-hardlinks');
+    const kiciDir = join(src, '.kici');
+    const pnpmStore = join(root, 'pnpm-store');
+    await mkdir(pnpmStore, { recursive: true });
+    await mkdir(join(kiciDir, 'node_modules'), { recursive: true });
+    await writeFile(join(src, 'pnpm-lock.yaml'), '');
+    await writeFile(join(pnpmStore, 'shared.d.ts'), 'export {};\n');
+
+    // pnpm hard-links each store file into the virtual store; identical files
+    // of one package share a store inode. This order (plain, link, plain,
+    // plain, link, plain) is the one that stops node-tar's own hard-link
+    // handling for good.
+    const pkg = join(src, 'node_modules', '.pnpm', 'zod@1.0.0', 'node_modules', 'zod');
+    await mkdir(pkg, { recursive: true });
+    for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) await writeFile(join(pkg, name), name);
+    for (const name of ['b.d.ts', 'e.d.ts']) {
+      await link(join(pnpmStore, 'shared.d.ts'), join(pkg, name));
+    }
+    await symlink(
+      '../../node_modules/.pnpm/zod@1.0.0/node_modules/zod',
+      join(kiciDir, 'node_modules', 'zod'),
+    );
+
+    // fails-when: packNodeModules hands node-tar no single-link caches, so
+    // the pack never ends and this test times out
+    const { tarball } = await packNodeModules(kiciDir);
+
+    const dst = join(root, 'dst-hardlinks');
+    await mkdir(join(dst, '.kici'), { recursive: true });
+    await restoreDeps(dst, await tarballUrl(root, tarball));
+    // breaks-if-wrong: every linked path restores as a readable file with the
+    // store's content, reached through the .kici symlink as Node resolves it
+    const restored = join(dst, '.kici', 'node_modules', 'zod');
+    for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) {
+      expect(await readFile(join(restored, name), 'utf-8')).toBe(name);
+    }
+    for (const name of ['b.d.ts', 'e.d.ts']) {
+      expect(await readFile(join(restored, name), 'utf-8')).toBe('export {};\n');
+    }
+  }, 15_000);
 
   it('yarn standalone: packs .kici/node_modules + in-repo sibling and restores', async () => {
     const src = join(root, 'src-ystand');

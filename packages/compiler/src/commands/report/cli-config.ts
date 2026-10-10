@@ -16,7 +16,8 @@ import { DashboardClientError } from '../../remote/dashboard-client.js';
  * Top-level CLI config fields kept readable in a redacted bundle. Each is a
  * location or a timestamp, never a credential. The PAT, its id, the legacy
  * token, the routing key, the user's email and the per-org cluster map stay
- * masked.
+ * masked. The direct orchestrator target keeps its `url` readable and its
+ * `token` masked (see `redactCliConfig`).
  */
 export const REPORT_READABLE_CONFIG_KEYS = [
   'platformEndpoint',
@@ -37,6 +38,11 @@ export function redactCliConfig(config: Record<string, unknown>): Record<string,
   for (const key of REPORT_READABLE_CONFIG_KEYS) {
     const value = config[key];
     if (typeof value === 'string') redacted[key] = value;
+  }
+  // The direct orchestrator's URL is a location; its token stays masked.
+  const direct = config.direct as { url?: unknown } | undefined;
+  if (typeof direct?.url === 'string') {
+    redacted.direct = { ...(redacted.direct as Record<string, unknown>), url: direct.url };
   }
   return redacted;
 }

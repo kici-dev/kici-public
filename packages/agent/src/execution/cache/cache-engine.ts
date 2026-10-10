@@ -110,6 +110,8 @@ export async function packCachePaths(
       await cp(e.abs, dest, { recursive: true, verbatimSymlinks: true });
       topLevel.add(e.anchor);
     }
+    // `cp` writes every file afresh, so the copied tree holds no hard links
+    // and needs no `singleLinkTarCaches` (`@kici-dev/core/tar-single-link`).
     const stream = tarCreate({ gzip: true, portable: true, cwd: staging }, [...topLevel]);
     const chunks: Buffer[] = [];
     for await (const chunk of stream as AsyncIterable<Uint8Array>) {

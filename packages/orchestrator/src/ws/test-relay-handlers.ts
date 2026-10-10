@@ -1,19 +1,25 @@
 /**
- * Orchestrator-side handlers for the Platform-relayed `kici run remote` control
- * plane. The Platform relays five `test.relay.*` requests over the authenticated
- * dashboard-proxy WS connection; each handler here performs the action by
- * reusing the existing test pipeline / upload / cancel internals (no
- * duplication) and returns the response payload the caller sends back keyed by
- * `requestId`.
+ * Orchestrator-side handlers for the `kici run remote` control plane. Two
+ * transports call them: the Platform relays the `test.relay.*` requests over
+ * the authenticated dashboard-proxy WS connection, and the direct test-run
+ * routes (`routes/test-direct.ts`, `/api/v1/test/*`) serve the same actions
+ * over HTTP to a caller holding an orchestrator admin token. Each handler
+ * performs the action by reusing the existing test pipeline / upload / cancel
+ * internals and returns the response payload.
  *
  * The control plane carries only small JSON. The overlay tarball never reaches
- * the Platform — `handleTestUploadsInit` returns an external presigned URL the
+ * the Platform — `handleTestUploadsInit` returns a presigned URL the
  * developer PUTs to directly.
  */
 
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
-import { ExecutionRunStatus, TERMINAL_RUN_STATES, stringifyActor } from '@kici-dev/engine';
+import {
+  AccessLogSource,
+  ExecutionRunStatus,
+  TERMINAL_RUN_STATES,
+  stringifyActor,
+} from '@kici-dev/engine';
 import { createLogger } from '@kici-dev/shared';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
 import type {
@@ -40,7 +46,7 @@ const logger = createLogger({ prefix: 'test-relay' });
 // a newly-added terminal status silently leaves this relay reporting `done:
 // false` forever.
 
-/** Dependencies shared by all five test-relay handlers. */
+/** Dependencies shared by every test-relay handler. */
 export interface TestRelayHandlerDeps extends ProcessingDeps {
   db: Kysely<Database>;
   /** Agent registry — required here: the cancel handler resolves the job's agent. */
@@ -56,6 +62,11 @@ export interface TestRelayHandlerDeps extends ProcessingDeps {
   orgId?: string | null;
   /** Routing key resolved for this orchestrator's bound org (for access_log attribution). */
   routingKey?: string | null;
+  /**
+   * The transport recorded on access_log rows: `admin_http` for the direct
+   * test-run routes. Defaults to `platform_proxy`, the relay's own source.
+   */
+  accessLogSource?: AccessLogSource;
 }
 
 /** Response payload for `test.relay.uploads.init.response` (minus envelope fields). */
@@ -67,7 +78,7 @@ export interface TestUploadsInitPayload {
 }
 
 /**
- * Mint an upload record + external presigned PUT URL. The developer's PAT
+ * Mint an upload record + the developer-facing presigned PUT URL. The developer's PAT
  * identity (`msg.actor`) is recorded as the upload owner so the upload is
  * attributable.
  */
@@ -83,7 +94,6 @@ export async function handleTestUploadsInit(
       fileCount: msg.fileCount,
       compressedSize: msg.compressedSize,
       createdBy: stringifyActor(msg.actor),
-      internal: false,
     },
   );
 }
@@ -174,7 +184,7 @@ export async function handleTestTrigger(
         action: 'run.trigger',
         target: { type: 'run', id: result.runId },
         requestId: msg.requestId,
-        source: 'platform_proxy',
+        source: deps.accessLogSource ?? AccessLogSource.enum.platform_proxy,
         outcome: result.status === 'accepted' ? 'allowed' : 'denied',
         ...(result.reason ? { errorMessage: result.reason } : {}),
       }),
@@ -450,7 +460,7 @@ export async function handleTestCancel(
         action: 'run.cancel',
         target: { type: 'run', id: runId },
         requestId: msg.requestId,
-        source: 'platform_proxy',
+        source: deps.accessLogSource ?? AccessLogSource.enum.platform_proxy,
         outcome: 'allowed',
       }),
     { requestId: msg.requestId, runId },

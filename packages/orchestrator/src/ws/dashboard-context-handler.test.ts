@@ -1749,6 +1749,24 @@ describe('DashboardContextHandler held-runs list hold types', () => {
       });
     });
 
+    // fails-when: the relayed `autoApprove` marker is dropped — the entry is then
+    // the interactive `held_run.approve`. Pins the Platform-routed half of the
+    // shared action mapping the direct admin route also uses.
+    it('audits a relayed --approve-all as held_run.auto_approve', async () => {
+      const h = applierHandler(() => Promise.resolve());
+
+      await h.handler.handleMessage({
+        ...approveMsg,
+        autoApprove: true,
+      } as DashboardPlatformToOrchMessage);
+
+      await vi.waitFor(() => expect(h.accessLogRecord).toHaveBeenCalledTimes(1));
+      expect(h.accessLogRecord.mock.calls[0][0]).toMatchObject({
+        action: 'held_run.auto_approve',
+        outcome: 'allowed',
+      });
+    });
+
     it('still answers OK when the resume throws, and audits the failure as error', async () => {
       // Where a failed resume surfaces: one `held_run.approve` access-log entry
       // with outcome `error` and the failure message, readable in the dashboard

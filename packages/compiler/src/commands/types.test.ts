@@ -167,8 +167,10 @@ describe('kici types', () => {
       const content = await readStub(kiciDir);
       expect(content).toContain("declare module '@kici-dev/sdk'");
       expect(content).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
-      expect(content).toContain('// Source: offline stub -- Platform unreachable');
-      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      expect(content).toContain(
+        '// Source: offline stub -- no orchestrator, Platform or local secret files',
+      );
+      const errors = consoleErrorSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
       expect(errors).toContain('offline type stub');
     });
 
@@ -182,7 +184,9 @@ describe('kici types', () => {
       // No org means no fetch is attempted (the client refuses before the wire).
       expect(mockFetch).not.toHaveBeenCalled();
       const content = await readStub(kiciDir);
-      expect(content).toContain('// Source: offline stub -- Platform unreachable');
+      expect(content).toContain(
+        '// Source: offline stub -- no orchestrator, Platform or local secret files',
+      );
     });
 
     it('does NOT overwrite an existing populated file on a transient offline error', async () => {
@@ -203,7 +207,7 @@ describe('kici types', () => {
       // a Platform blip must not downgrade type-checking to "any key accepted".
       expect(result).toBe(true);
       expect(await readStub(kiciDir)).toBe(populated);
-      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      const errors = consoleErrorSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
       expect(errors).toContain('Keeping the existing');
     });
 
@@ -216,7 +220,9 @@ describe('kici types', () => {
 
       expect(result).toBe(true);
       const content = await readStub(kiciDir);
-      expect(content).toContain('// Source: offline stub -- Platform unreachable');
+      expect(content).toContain(
+        '// Source: offline stub -- no orchestrator, Platform or local secret files',
+      );
       expect(content).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
     });
   });
@@ -237,11 +243,105 @@ describe('kici types', () => {
       // A forbidden response is a real permission problem the user must see —
       // masking it behind a stub would hide the misconfiguration.
       expect(result).toBe(false);
-      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      const errors = consoleErrorSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
       expect(errors).toContain('contexts.read');
       await expect(readStub(kiciDir)).rejects.toThrow();
     });
   });
+  describe('sources beyond the Platform', () => {
+    const DIRECT = { url: 'http://orch:4000', token: 'orch-tok' };
+    const res = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      });
+    const whoami = {
+      tokenId: 't',
+      label: 'dev',
+      subject: null,
+      role: 'admin',
+      mode: 'independent',
+      orgId: '__default__',
+      permissions: { trigger: true, read: true },
+    };
+
+    async function project(): Promise<string> {
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+      return kiciDir;
+    }
+
+    it('reads key names from a saved direct target, not the Platform login', async () => {
+      await writeConfig({ ...platformConfig, direct: DIRECT });
+      mockFetch.mockImplementation(async (url: string) =>
+        url.endsWith('/api/v1/test/whoami')
+          ? res(whoami)
+          : res({ contexts: [{ name: 'production', secret_keys: ['DEPLOY_KEY'] }] }),
+      );
+      const kiciDir = await project();
+
+      expect(await typesCommand({ kiciDir })).toBe(true);
+      const urls = mockFetch.mock.calls.map((c: unknown[]) => String(c[0]));
+      expect(urls).toContain(
+        'http://orch:4000/api/v1/admin/contexts?orgId=__default__&includeSecrets=true',
+      );
+      // fails-when: the Platform login wins over the direct target
+      expect(urls.some((u) => u.startsWith('https://platform.example.com'))).toBe(false);
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: orchestrator http://orch:4000');
+      expect(content).toContain('DEPLOY_KEY: string;');
+    });
+
+    it('reads key names from local secret files with no remote source', async () => {
+      const kiciDir = await project();
+      await fs.writeFile(path.join(kiciDir, 'secrets.yaml'), 'production:\n  DEPLOY_TOKEN: x\n');
+
+      expect(await typesCommand({ kiciDir })).toBe(true);
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: local files');
+      expect(content).toContain('DEPLOY_TOKEN: string;');
+      // Key names only: a secret value never reaches the declaration file.
+      expect(content).not.toMatch(/\bx\b.*string|'x'/);
+    });
+
+    it('keeps a remote key set when only local files are available', async () => {
+      const kiciDir = await project();
+      await fs.writeFile(path.join(kiciDir, 'secrets.yaml'), 'production:\n  LOCAL_ONLY: x\n');
+      await fs.mkdir(path.join(kiciDir, 'types'), { recursive: true });
+      const remote =
+        '// @generated by kici types -- DO NOT EDIT\n// Source: https://api.kici.dev\n' +
+        "declare module '@kici-dev/sdk' { interface KnownSecretKeys { TEAM_KEY: string } }\n";
+      await fs.writeFile(path.join(kiciDir, 'types', 'secrets.d.ts'), remote, 'utf-8');
+
+      expect(await typesCommand({ kiciDir })).toBe(true);
+      // fails-when: local files narrow a remote key set (incl. an older CLI's URL header)
+      expect(await readStub(kiciDir)).toBe(remote);
+      const errors = consoleErrorSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+      expect(errors).toContain('local secret files never replace');
+    });
+
+    it('fails without writing a stub when the orchestrator refuses the token', async () => {
+      await writeConfig({ direct: DIRECT });
+      mockFetch.mockResolvedValue(res({ error: 'Permission denied: secret.read required' }, 403));
+      const kiciDir = await project();
+
+      expect(await typesCommand({ kiciDir })).toBe(false);
+      await expect(readStub(kiciDir)).rejects.toThrow();
+    });
+
+    it('falls back to local files when the orchestrator is unreachable', async () => {
+      await writeConfig({ direct: DIRECT });
+      mockFetch.mockRejectedValue(new TypeError('fetch failed'));
+      const kiciDir = await project();
+      await fs.writeFile(path.join(kiciDir, '.secrets'), '[staging]\nAPI_KEY=v\n');
+
+      expect(await typesCommand({ kiciDir })).toBe(true);
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: local files');
+      expect(content).toContain('API_KEY: string;');
+    });
+  });
+
   describe('digest invariance (the drift-gate seam)', () => {
     /**
      * The lock file's `contentHash` is a digest over the whole `.kici/` tree,

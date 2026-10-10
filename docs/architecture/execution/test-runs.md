@@ -58,9 +58,11 @@ Developer workstation            Orchestrator              Agent
 
 ### Request path
 
-The diagram draws the CLI's control calls as if they go straight to the orchestrator. They reach it through the hosted KiCI Platform. The CLI calls the Platform's `/api/v1/orgs/:customerId/test/...` endpoints with the developer's personal access token. The Platform relays each call to the orchestrator over the orchestrator's WebSocket connection as a `test.relay.*` message: `test.relay.uploads.init`, `test.relay.trigger`, `test.relay.run.status`, `test.relay.run.logs`, or `test.relay.cancel`. So the orchestrator does not have to be reachable from the developer's network. Each relayed request carries the developer's identity, which the orchestrator writes to its `access_log`.
+The diagram draws the CLI's control calls as if they go straight to the orchestrator. On the default path they reach it through the hosted KiCI Platform. The CLI calls the Platform's `/api/v1/orgs/:customerId/test/...` endpoints with the developer's personal access token. The Platform relays each call to the orchestrator over the orchestrator's WebSocket connection as a `test.relay.*` message: `test.relay.uploads.init`, `test.relay.trigger`, `test.relay.run.status`, `test.relay.run.logs`, or `test.relay.cancel`. So the orchestrator does not have to be reachable from the developer's network. Each relayed request carries the developer's identity, which the orchestrator writes to its `access_log`.
 
-The overlay tarball does not go through the relay. The CLI uploads it straight to object storage through the external presigned URL that `test.relay.uploads.init` returns.
+In direct mode (`kici connect`, `--orchestrator-url`, or `KICI_ORCHESTRATOR_TOKEN`) the calls do go straight to the orchestrator: the CLI calls its `/api/v1/test/*` routes (`whoami`, `uploads/init`, `trigger`, `runs/:runId`, `runs/:runId/logs`, `runs/:runId/cancel`) with an orchestrator admin token. The routes run the same handlers as the relay, with the same payloads. The orchestrator authenticates the token itself, attributes the run to the token's service account, and chooses the org and routing key.
+
+The overlay tarball does not go through either control path. The CLI uploads it straight to object storage through the presigned URL that the upload-init call returns. The orchestrator signs it with `KICI_STORAGE_UPLOAD_ENDPOINT`, falling back to `KICI_STORAGE_EXTERNAL_ENDPOINT`, then `KICI_STORAGE_ENDPOINT`.
 
 ## Upload encryption
 
@@ -156,6 +158,8 @@ overlay.tar.gz
   tests/
     added-test.ts
 ```
+
+The CLI writes the manifest into the tarball from a temporary directory. It never writes into the working tree. `.kici-overlay-tmp/` is reserved: the CLI never uploads a file at that path in the repository, because it would collide with the manifest.
 
 ### Manifest format
 

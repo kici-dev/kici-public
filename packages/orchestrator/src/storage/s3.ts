@@ -49,12 +49,12 @@ export interface S3CacheStorageOptions {
    */
   externalEndpoint?: string;
   /**
-   * Separate endpoint for the host-facing (CLI) pre-signed upload URL.
-   * The CLI running `kici run remote` is on the developer's host, which may
-   * reach the bucket at a different address than the orchestrator's own
-   * `endpoint` (e.g. an orchestrator in a container uses the compose DNS name
-   * while the host CLI uses localhost). When unset, `getInternalUploadUrl`
-   * falls back to the internal `endpoint` client (current behavior).
+   * Separate endpoint for the pre-signed URL a developer machine running
+   * `kici run remote` PUTs the overlay to. The developer's machine may reach
+   * the bucket at a different address than the orchestrator or its agents (an
+   * orchestrator in a container uses the compose DNS name while the host CLI
+   * uses localhost). When unset, `getInternalUploadUrl` signs with the
+   * agent-facing `externalEndpoint`, else with `endpoint`.
    */
   uploadEndpoint?: string;
   /** Use path-style access instead of virtual-hosted-style (required for most S3-compatible services) */
@@ -65,7 +65,7 @@ export class S3CacheStorage implements CacheStorage {
   private readonly client: S3Client;
   /** Separate client for pre-signed URL generation (uses externalEndpoint if configured). */
   private readonly presignClient: S3Client;
-  /** Separate client for the host CLI's pre-signed upload URL (uses uploadEndpoint if configured). */
+  /** Client for the developer upload URL: uploadEndpoint, else the presign client. */
   private readonly uploadPresignClient: S3Client;
   private readonly bucket: string;
   private readonly prefix: string;
@@ -92,16 +92,11 @@ export class S3CacheStorage implements CacheStorage {
       this.presignClient = this.client;
     }
 
-    // Host CLI uploads (getInternalUploadUrl) may need a different address than
-    // the orchestrator's own endpoint. Falls back to `client` when unset.
-    if (options.uploadEndpoint) {
-      this.uploadPresignClient = createS3Client({
-        ...options,
-        endpoint: options.uploadEndpoint,
-      });
-    } else {
-      this.uploadPresignClient = this.client;
-    }
+    // Developer uploads (getInternalUploadUrl) sign against uploadEndpoint,
+    // else the agent-facing presign client (externalEndpoint, else endpoint).
+    this.uploadPresignClient = options.uploadEndpoint
+      ? createS3Client({ ...options, endpoint: options.uploadEndpoint })
+      : this.presignClient;
   }
 
   // -- Helpers --

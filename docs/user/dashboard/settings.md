@@ -20,7 +20,7 @@ The settings page (`/orgs/:customerId/settings`) uses a tabbed layout:
 11. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
 12. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
 13. **Security** -- dashboard-level security controls for this org: the session max age (every member sees it; only an organization owner can change it) and the orchestrator token reconciliation report (visible with `members:admin`)
-14. **Orchestrator security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
+14. **Orchestrator security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission). It opens the policy page of the org's orchestrator, or asks you to pick one when the org has several
 15. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
 
 Audit-log-style entries are not a settings tab; they live on the dedicated **Activity** page accessible from the sidebar.

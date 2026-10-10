@@ -6,6 +6,8 @@ import {
   canonicalizeMatcher,
   compileRegexMatcher,
   partitionMatchers,
+  formatLabelMatcher,
+  formatLabelMatchers,
   hostSatisfiesTarget,
   HostTargetSelector,
 } from './labels-match.js';
@@ -193,5 +195,25 @@ describe('case-insensitive label matching', () => {
   it('leaves matcherMatches case-sensitive so host patterns do not widen', () => {
     expect(matcherMatches({ kind: 'exact', value: 'Prod-01' }, 'prod-01')).toBe(false);
     expect(matcherMatches({ kind: 'regex', source: '^prod-', flags: '' }, 'PROD-01')).toBe(false);
+  });
+});
+
+describe('formatLabelMatcher(s)', () => {
+  it('renders exact as its value and regex as /source/flags', () => {
+    // fails-when: a regex matcher is interpolated as an object ("[object Object]")
+    expect(formatLabelMatcher({ kind: 'exact', value: 'linux' })).toBe('linux');
+    expect(formatLabelMatcher({ kind: 'regex', source: '^gpu-.*$', flags: 'i' })).toBe(
+      '/^gpu-.*$/i',
+    );
+  });
+
+  it('joins a list with the separator and renders an empty list as empty', () => {
+    const ms = [
+      { kind: 'exact' as const, value: 'linux' },
+      { kind: 'regex' as const, source: 'x64|arm64', flags: '' },
+    ];
+    expect(formatLabelMatchers(ms)).toBe('linux, /x64|arm64/');
+    expect(formatLabelMatchers(ms, ' + ')).toBe('linux + /x64|arm64/');
+    expect(formatLabelMatchers([])).toBe('');
   });
 });

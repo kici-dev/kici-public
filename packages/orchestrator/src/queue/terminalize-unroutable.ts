@@ -1,5 +1,5 @@
 import { type Kysely, sql } from 'kysely';
-import { ExecutionJobStatus, type LabelMatcher } from '@kici-dev/engine';
+import { ExecutionJobStatus, formatLabelMatcher, type LabelMatcher } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
@@ -117,13 +117,9 @@ export enum UnroutableCause {
  * that went unmatched. Regex matchers are rendered as their source so the
  * message stays readable rather than printing `[object Object]`.
  */
-function renderMatcher(m: LabelMatcher): string {
-  return m.kind === 'exact' ? m.value : `/${m.source}/${m.flags}`;
-}
-
 export function unroutableMessage(job: JobRoutingFacts, cause = UnroutableCause.NoMatch): string {
-  const required = [...job.runsOnLabels, ...job.runsOnPatterns.map(renderMatcher)];
-  const excluded = [...job.excludeLabels, ...job.excludePatterns.map(renderMatcher)];
+  const required = [...job.runsOnLabels, ...job.runsOnPatterns.map(formatLabelMatcher)];
+  const excluded = [...job.excludeLabels, ...job.excludePatterns.map(formatLabelMatcher)];
   const matching =
     (required.length > 0 ? `the agents that match runsOn [${required.join(', ')}]` : 'the agents') +
     (excluded.length > 0 ? ` excluding [${excluded.join(', ')}]` : '');

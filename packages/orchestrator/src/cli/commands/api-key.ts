@@ -1,8 +1,10 @@
 /**
- * Platform API key management commands for kici-admin.
+ * `kici-admin api-key` — deprecated.
  *
- * These commands target the Platform admin API for managing API keys
- * and routing key permissions. Uses the same --url flag (point to Platform URL).
+ * The group targeted `/api/v1/api-keys`, which no KiCI server serves, so it
+ * never worked. Both subcommands stay registered until v1.0.0 and exit with a
+ * message that points at `kici-admin token create`, the per-person
+ * orchestrator token a developer passes to `kici connect`.
  *
  *   api-key create, add-routing-key
  */
@@ -11,48 +13,37 @@ import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { cliAction } from './shared/cli-action.js';
 
-export function registerApiKeyCommands(program: Command, getClient: () => AdminApiClient): void {
-  const apiKey = program
-    .command('api-key')
-    .description('Manage Platform API keys and routing keys');
+export const API_KEY_DEPRECATED_MESSAGE =
+  'kici-admin api-key is deprecated and has no effect: no KiCI server serves /api/v1/api-keys. ' +
+  'Mint a per-person orchestrator token instead: kici-admin token create <label> --role admin --subject <who> --expires <duration>. ' +
+  'This command is removed in v1.0.0.';
+
+const DEPRECATED_DESCRIPTION = 'Deprecated: use kici-admin token create (removed in v1.0.0)';
+
+/**
+ * Register the deprecated `api-key` group. `getClient` is accepted for the
+ * registration signature every command group shares and is never called.
+ */
+export function registerApiKeyCommands(program: Command, _getClient: () => AdminApiClient): void {
+  const apiKey = program.command('api-key').description(DEPRECATED_DESCRIPTION);
 
   apiKey
     .command('create')
-    .description('Create a new API key with optional routing key permissions')
-    .option('--label <label>', 'Label for the API key', 'unnamed')
-    .option(
-      '--routing-keys <keys>',
-      'Comma-separated routing key patterns (e.g. github:42,github:99)',
-    )
+    .description(DEPRECATED_DESCRIPTION)
+    .option('--label <label>', 'Ignored', 'unnamed')
+    .option('--routing-keys <keys>', 'Ignored')
     .action(
-      cliAction(async (opts: { label: string; routingKeys?: string }) => {
-        const routingKeys = opts.routingKeys
-          ? opts.routingKeys.split(',').map((k) => k.trim())
-          : undefined;
-        const result = await getClient().createApiKey({
-          label: opts.label,
-          routingKeys,
-        });
-        console.log(`API key created successfully.`);
-        console.log(`Key ID: ${result.id}`);
-        console.log(`Key:    ${result.key}`);
-        if (result.routingKeys?.length) {
-          console.log(`Routing keys: ${result.routingKeys.join(', ')}`);
-        }
-        console.log('');
-        console.log('WARNING: Save this key now -- it cannot be recovered after this point.');
+      cliAction(async () => {
+        throw new Error(API_KEY_DEPRECATED_MESSAGE);
       }),
     );
 
   apiKey
     .command('add-routing-key <id> <pattern>')
-    .description('Add a routing key permission pattern to an API key')
+    .description(DEPRECATED_DESCRIPTION)
     .action(
-      cliAction(async (id: string, pattern: string) => {
-        const result = await getClient().addRoutingKeyPermission(id, pattern);
-        console.log(`Routing key permission added.`);
-        console.log(`Permission ID: ${result.id}`);
-        console.log(`Pattern:       ${result.pattern}`);
+      cliAction(async () => {
+        throw new Error(API_KEY_DEPRECATED_MESSAGE);
       }),
     );
 }

@@ -6,9 +6,10 @@
  * gate that carries a computed-drift payload). The poll loop calls
  * `handleNewHolds` each tick with the run's pending holds. For each hold not
  * seen before it prints the payload (if any) and, in a TTY, prompts the
- * operator to approve/reject inline — reusing the same Platform held-run HTTP
- * path as `kici approve` / `kici reject`. In a non-TTY it prints guidance and
- * keeps polling (the run stays held until resolved out-of-band).
+ * operator to approve/reject inline — through the run transport's hold access
+ * (the Platform held-run path `kici approve` / `kici reject` use, or the
+ * orchestrator's admin held-run routes on a direct run). In a non-TTY it prints
+ * guidance and keeps polling (the run stays held until resolved out-of-band).
  */
 
 import pc from 'picocolors';
@@ -94,6 +95,11 @@ export async function handleNewHolds(args: {
    * stays pure.
    */
   output?: HoldOutput;
+  /**
+   * The command that answers a hold out of band, printed instead of the
+   * Platform's `kici approve` text (a direct run names `kici-admin`).
+   */
+  answerHint?: (hold: HeldRunSummary) => string;
   /** Override for tests; defaults to the shared Platform held-run context. */
   resolveContext?: () => Promise<HeldRunContext | null>;
   /** Override for tests. */
@@ -116,6 +122,9 @@ export async function handleNewHolds(args: {
     );
   }
 
+  const hint = (hold: HeldRunSummary): string | undefined =>
+    args.answerHint ? `Run held; approve via \`${args.answerHint(hold)}\`.` : undefined;
+
   for (const action of actions) {
     printHold(action.hold, out);
     ctx = ctx ?? (await resolveCtx());
@@ -125,7 +134,8 @@ export async function handleNewHolds(args: {
       // run-only command cannot tell them apart.
       out(
         pc.dim(
-          `Run held; approve via \`kici approve ${action.hold.runId} --hold ${action.hold.id}\`.`,
+          hint(action.hold) ??
+            `Run held; approve via \`kici approve ${action.hold.runId} --hold ${action.hold.id}\`.`,
         ),
       );
       continue;
@@ -140,7 +150,8 @@ export async function handleNewHolds(args: {
     if (action.kind === 'notify') {
       out(
         pc.dim(
-          `Run held; approve via the dashboard or \`kici approve ${action.hold.runId} --hold ${action.hold.id}\`.`,
+          hint(action.hold) ??
+            `Run held; approve via the dashboard or \`kici approve ${action.hold.runId} --hold ${action.hold.id}\`.`,
         ),
       );
       continue;

@@ -180,13 +180,28 @@ kici diagnostics --json
 
 Walk your KiCI setup end to end and print the exact next command for each
 problem found. Where `kici diagnostics` shows the org's infrastructure, `kici
-doctor` checks **your own setup**: it runs six checks in onboarding order —
-login (stored, unexpired credentials), active organization, a present, fresh,
-and committed lock file, a live token probe against the platform, a connected
-orchestrator for the org, and whether every workflow's `runsOn` labels are
-satisfiable by a connected agent or scaler. Each check reports pass/warn/fail
-with the fix command (e.g. `kici login`, `kici org use <name>`,
-`kici compile`), so the first failing row tells you exactly what to run next.
+doctor` checks **your own setup**, in onboarding order:
+
+- `run-target` — where `kici run remote` sends a run without
+  `--orchestrator-url`: a direct orchestrator target (from
+  `KICI_ORCHESTRATOR_TOKEN` or `kici connect`) or your Platform login. For a direct target, doctor asks
+  the orchestrator who the token is, and reports its role and the
+  orchestrator mode.
+- `login` — stored, unexpired Platform credentials.
+- `active-org` — an active organization.
+- `lock-file` — a present, fresh and committed lock file.
+- `token-live` — a live token probe against the Platform.
+- `orchestrator` — a connected orchestrator for the org.
+- `labels` — every workflow's `runsOn` labels are satisfiable by a
+  connected agent or scaler.
+- `config` — shown only when `~/.kici/config` carries a deprecated field.
+
+If you run only against an orchestrator (a direct target and no Platform
+login), doctor skips the Platform rows (`login`, `active-org`,
+`token-live`, `orchestrator`, `labels`). Each check reports
+pass/warn/fail with the fix command (for example `kici connect <url>`,
+`kici login`, `kici org use <name>`, `kici compile`), so the first failing
+row tells you what to run next.
 
 ```bash
 kici doctor [options]

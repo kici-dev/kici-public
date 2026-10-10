@@ -10,12 +10,12 @@ description: Sidebar, mobile navigation, theme, time display, keyboard shortcuts
 The left sidebar provides persistent navigation across all org-scoped pages:
 
 - **Org switcher** -- dropdown at the top to switch between organizations
-- **Getting started** -- onboarding checklist (shows a `done/total` badge until complete or dismissed)
+- **Getting started** -- onboarding checklist (shows a `done/total` badge until complete or dismissed; the collapsed sidebar shows the count of remaining steps). The entry is hidden once the org has a connected orchestrator, a webhook source, and at least one run
 - **Runs** -- the default landing page, showing your workflow run history
 - **Workflows** -- permanently registered workflows listening for events
 - **Fleet** -- read-only view of the organization's declared host fleet, listing each host's status, labels, and a per-host detail page (shown directly below Workflows, only when you hold `fleet:read`)
 - **Attestations** -- build-provenance attestations produced by workflow runs, with a verify-status filter and a per-attestation detail page
-- **Infrastructure** -- per-org infrastructure health: an orchestrator → scaler → agent tree, execution metrics, infrastructure alerts, and secret-backend health. Each orchestrator cluster is a row keyed by cluster name with a **Manage** link into its per-cluster scoped views (overview, contexts, secrets, DLQ, workflows)
+- **Infrastructure** -- per-org infrastructure health: an orchestrator → scaler → agent tree, execution metrics, infrastructure alerts, and secret-backend health. Each orchestrator cluster is a row keyed by cluster name with a **Manage** link into its per-cluster scoped views (overview, contexts, secrets, DLQ, workflows, security policy)
 - **Metrics** -- time-series charts of orchestrator health (dispatch & agents, execution, webhooks, caching, logs, errors), scoped to this org
 - **Contexts** -- deployment contexts with protection rules. Contexts and secrets belong to an orchestrator, so this entry opens the contexts page of the org's orchestrator (or asks you to pick one when the org has several), and stays highlighted while you are on it
 - **Secrets** -- secret scope management with context bindings, opened on the org's orchestrator the same way as Contexts

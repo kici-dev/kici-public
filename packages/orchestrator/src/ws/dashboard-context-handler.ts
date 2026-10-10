@@ -14,7 +14,11 @@ import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { HeldRunStore, ReleaseSignal } from '../contexts/held-runs.js';
 import type { TeamMembershipLookup } from '../approvals/approval-resolver.js';
-import { applyDecision, type ApplyDecisionDeps } from '../approvals/apply-decision.js';
+import {
+  applyDecision,
+  heldRunDecisionAction,
+  type ApplyDecisionDeps,
+} from '../approvals/apply-decision.js';
 import { adminActorSub, triggererSubjectFor } from '../approvals/triggerer-subject.js';
 import type {
   AccessLogAction,
@@ -1577,16 +1581,10 @@ export class DashboardContextHandler {
       decision === 'approve'
         ? 'dashboard.held-runs.approve.response'
         : 'dashboard.held-runs.reject.response';
-    // `--approve-all` breakglass approvals audit as a distinct action so the
-    // trail shows "auto-approved by the dispatcher" vs an interactive approve.
-    const autoApprove =
-      decision === 'approve' && (msg as HeldRunApproveRequest).autoApprove === true;
-    const auditAction =
-      decision === 'approve'
-        ? autoApprove
-          ? 'held_run.auto_approve'
-          : 'held_run.approve'
-        : 'held_run.reject';
+    const auditAction = heldRunDecisionAction(
+      decision,
+      (msg as HeldRunApproveRequest).autoApprove === true,
+    );
     const reason = decision === 'reject' ? (msg as HeldRunRejectRequest).reason : undefined;
 
     const result = await applyDecision(

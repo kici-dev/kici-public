@@ -22,7 +22,11 @@ export interface LoginOptions {
   platformEndpoint?: string;
   /** OIDC issuer URL override */
   oidcIssuer?: string;
-  /** Routing key for webhook source identification */
+  /**
+   * `--routing-key`: still written to the config, never read.
+   *
+   * @deprecated Nothing reads the saved value; removed in v1.0.0.
+   */
   routingKey?: string;
   /** Force device authorization flow regardless of environment */
   device?: boolean;
@@ -129,7 +133,15 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
     oidcIssuer: issuer,
   };
 
-  if (options.routingKey) next.routingKey = options.routingKey;
+  if (options.routingKey) {
+    // Deprecated: kept writing until v1.0.0 so the flag keeps its old effect.
+    console.error(
+      pc.yellow(
+        '--routing-key is deprecated and has no effect: nothing reads the saved value. It will be removed in v1.0.0.',
+      ),
+    );
+    next.routingKey = options.routingKey;
+  }
 
   // activeOrgId + defaultClusters belong to a specific environment; a new
   // endpoint invalidates them, so drop them and let `kici org use` re-select.

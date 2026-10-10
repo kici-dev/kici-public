@@ -1,14 +1,15 @@
 /**
  * PAT-authenticated client for the Platform's dev-facing run-remote routes.
  *
- * This is the developer CLI's contact point for `kici run remote` and its
- * companion commands. It targets the Platform (`config.platformEndpoint`), which
- * relays each control request over the WS dashboard-proxy to the org's
- * orchestrator cluster — the orchestrator's own HTTP API is never reached
- * directly (it may live on a hidden network).
+ * One of the two transports `kici run remote` uses. It targets the Platform
+ * (`config.platformEndpoint`), which relays each control request over the WS
+ * dashboard-proxy to the org's orchestrator cluster, so the orchestrator's
+ * own HTTP API need not be reachable from the developer machine. The other
+ * transport, `DirectRunClient` (`direct-client.ts`), calls an orchestrator's
+ * `/api/v1/test` routes itself.
  *
  * The overlay tarball does NOT flow through here: `initUpload` returns an
- * external presigned URL the CLI PUTs to directly (data plane).
+ * presigned URL the CLI PUTs to directly (data plane).
  */
 
 import { toErrorMessage } from '@kici-dev/core';
@@ -300,15 +301,7 @@ export class PlatformRunClient {
 
   /** Map a non-OK Platform response to a typed error. Always throws. */
   private async throwForStatus(response: Response): Promise<never> {
-    if (response.status === 401) {
-      throw new AuthenticationError();
-    }
-    if (response.status === 403) {
-      throw new AccessDeniedError(await readError(response, 'Access denied'));
-    }
-    if (response.status === 404) {
-      throw new NotFoundError(await readError(response, 'Resource not found'));
-    }
+    await throwForAccessStatus(response);
     if (response.status === 422) {
       const body = (await readJson(response)) as {
         error?: string;
@@ -335,8 +328,25 @@ export class PlatformRunClient {
   }
 }
 
+/**
+ * Throw the typed error for a 401, 403 or 404 response, and return for any
+ * other status. `authMessage` replaces the default `kici login` remedy.
+ */
+export async function throwForAccessStatus(
+  response: Response,
+  authMessage?: string,
+): Promise<void> {
+  if (response.status === 401) throw new AuthenticationError(authMessage);
+  if (response.status === 403) {
+    throw new AccessDeniedError(await readError(response, 'Access denied'));
+  }
+  if (response.status === 404) {
+    throw new NotFoundError(await readError(response, 'Resource not found'));
+  }
+}
+
 /** Read a JSON body, returning `{}` on any parse failure. */
-async function readJson(response: Response): Promise<Record<string, unknown>> {
+export async function readJson(response: Response): Promise<Record<string, unknown>> {
   try {
     return (await response.json()) as Record<string, unknown>;
   } catch {
@@ -345,7 +355,7 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
 }
 
 /** Read the `error` field of a JSON body, falling back to text then a default. */
-async function readError(response: Response, fallback: string): Promise<string> {
+export async function readError(response: Response, fallback: string): Promise<string> {
   try {
     const body = (await response.clone().json()) as { error?: string; message?: string };
     if (body.error) return body.error;

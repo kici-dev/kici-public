@@ -6,6 +6,7 @@ import { realpathSync } from 'node:fs';
 import { Command, Argument, CommanderError } from 'commander';
 import pc from 'picocolors';
 import { shouldSuppressBanner } from './cli-banner.js';
+import { guardUnsettledExit } from './cli-unsettled-guard.js';
 
 declare const KICI_VERSION: string;
 const version = typeof KICI_VERSION !== 'undefined' ? KICI_VERSION : '0.0.1';
@@ -205,7 +206,14 @@ export function buildProgram(): Command {
     .option('--json', 'Output structured JSON result', false)
     .option('--junit <path>', 'Output JUnit XML result')
     .option('--history', 'Show recent run history', false)
-    .option('--routing-key <key>', 'Override routing key for this run')
+    .option(
+      '--routing-key <key>',
+      'Deprecated; has no effect (the orchestrator chooses the routing key)',
+    )
+    .option(
+      '--orchestrator-url <url>',
+      'Run on this orchestrator directly, skipping the Platform (token: KICI_ORCHESTRATOR_TOKEN or kici connect)',
+    )
     .option('--org <id>', 'Target organization (overrides the active org)')
     .option('--orchestrator <name>', 'Target orchestrator cluster (overrides the per-org default)')
     .option('--debug', 'Verbose internals', false)
@@ -382,7 +390,7 @@ export function buildProgram(): Command {
       '--oidc-issuer <url>',
       'OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another)',
     )
-    .option('--routing-key <key>', 'Routing key for webhook source identification')
+    .option('--routing-key <key>', 'Deprecated; saved to the config but never read')
     .option('--no-attach', 'Skip the post-login prompt to attach the local dev plane')
     .addHelpText(
       'after',
@@ -414,6 +422,28 @@ Environment variables:
     .action(async () => {
       const { logoutCommand } = await import('./commands/index.js');
       const success = await logoutCommand();
+      process.exit(success ? 0 : 1);
+    });
+
+  program
+    .command('connect')
+    .argument('<url>', "The orchestrator's HTTP address, e.g. https://ci.example.com")
+    .description(
+      'Run kici run remote and kici types against this orchestrator directly, with an orchestrator token',
+    )
+    .option('--token-stdin', 'Read the orchestrator token from standard input', false)
+    .action(async (url: string, options: { tokenStdin?: boolean }) => {
+      const { connectCommand } = await import('./commands/index.js');
+      const success = await connectCommand(url, { tokenStdin: options.tokenStdin });
+      process.exit(success ? 0 : 1);
+    });
+
+  program
+    .command('disconnect')
+    .description('Forget the saved orchestrator target; runs go through your Platform login again')
+    .action(async () => {
+      const { disconnectCommand } = await import('./commands/index.js');
+      const success = await disconnectCommand();
       process.exit(success ? 0 : 1);
     });
 
@@ -872,10 +902,15 @@ Environment variables:
     .command('types')
     .description('Generate TypeScript declarations for secret contexts')
     .option('--kici-dir <path>', 'Path to .kici directory', '.kici')
+    .option(
+      '--orchestrator-url <url>',
+      'Read secret key names from this orchestrator directly (token: KICI_ORCHESTRATOR_TOKEN or kici connect)',
+    )
     .action(async (options) => {
       const { typesCommand } = await import('./commands/index.js');
       const success = await typesCommand({
         kiciDir: options.kiciDir,
+        orchestratorUrl: options.orchestratorUrl,
       });
       process.exit(success ? 0 : 1);
     });
@@ -1104,15 +1139,20 @@ function handleCliParseExit(err: CommanderError, argv: string[], program: Comman
   process.exit(err.exitCode ?? 1);
 }
 
-/** Build the program and parse argv — the bin-shim entry point. */
+/**
+ * Build the program and parse argv — the bin-shim entry point. The process
+ * exits 1 with an internal-error message, never 0, when the event loop empties
+ * while the command's action is still pending.
+ */
 export function runCli(argv: string[] = process.argv): void {
   const program = buildProgram();
   program.exitOverride();
-  try {
-    program.parse(argv);
-  } catch (err) {
-    handleCliParseExit(err as CommanderError, argv, program);
-  }
+  const run = program.parseAsync(argv);
+  guardUnsettledExit(run);
+  run.catch((err: unknown) => {
+    if (!(err instanceof CommanderError)) throw err;
+    handleCliParseExit(err, argv, program);
+  });
 }
 
 /**

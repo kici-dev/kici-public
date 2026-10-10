@@ -81,14 +81,15 @@ export interface TestTriggerInput {
   /** Request trace ID from the HTTP request. */
   requestId: string;
   /**
-   * The principal that initiated this run, relayed by the Platform on
-   * `test.relay.trigger` (where the wire schema has always required it).
+   * The principal that initiated this run: the one the Platform relays on
+   * `test.relay.trigger`, or the admin token's service account on the direct
+   * test-run routes.
    *
-   * Required rather than optional: the relay handler is the only production
-   * caller, so there is no path that legitimately lacks an actor, and an
-   * optional field would let a future caller silently drop attribution — which
-   * is exactly how `execution_runs.triggered_by` stayed NULL for every remote
-   * test run while the column claimed to hold the initiator.
+   * Required rather than optional: the relay handler and the direct test-run
+   * routes are the production callers and both always pass an actor, and an
+   * optional field would let a future caller silently drop attribution, which
+   * leaves `execution_runs.triggered_by` NULL while the column claims to hold
+   * the initiator.
    */
   actor: ActorPrincipal;
   /** JSON-stringified lock file content for local repos with no remote. */

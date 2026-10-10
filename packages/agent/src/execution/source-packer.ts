@@ -14,9 +14,9 @@
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { c as tarCreate } from 'tar';
-import { createLogger, sha256 } from '@kici-dev/shared';
+import { createLogger } from '@kici-dev/shared';
 import { KICI_SOURCE_EXCLUDED_PREFIX } from '@kici-dev/core/kici-source-digest';
+import { packGzipTarball } from './tar-pack.js';
 
 const logger = createLogger({ prefix: 'source-packer' });
 
@@ -29,27 +29,14 @@ export async function packKiciSource(workDir: string): Promise<{ tarball: Buffer
   logger.info('Packing .kici/ source tarball', { dir: workDir });
   const startTime = Date.now();
 
-  // portable: strips user/group info + mtime for cross-machine determinism.
-  // filter: exclude node_modules/ (already in the deps tarball). The prefix is
-  // the one `hashKiciSourceTree` skips, so the digest and the tarball cover the
-  // same set of files rather than two strings that must be kept in step.
-  const stream = tarCreate(
-    {
-      gzip: true,
-      cwd: workDir,
-      portable: true,
-      filter: (filePath) => !filePath.startsWith(KICI_SOURCE_EXCLUDED_PREFIX),
-    },
+  // The filter excludes node_modules/ (already in the deps tarball). The prefix
+  // is the one `hashKiciSourceTree` skips, so the digest and the tarball cover
+  // the same set of files rather than two strings that must be kept in step.
+  const { tarball, hash } = await packGzipTarball(
+    workDir,
     ['.kici'],
+    (filePath) => !filePath.startsWith(KICI_SOURCE_EXCLUDED_PREFIX),
   );
-
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.from(chunk as Uint8Array));
-  }
-  const tarball = Buffer.concat(chunks);
-
-  const hash = sha256(tarball);
 
   const sizeKB = (tarball.length / 1024).toFixed(2);
   const durationMs = Date.now() - startTime;

@@ -118,6 +118,8 @@ Tokens are assigned one of three roles. The role determines which admin API oper
 | scaler.read            | yes   | yes   | yes     |
 | scaler.manage          | yes   | yes   |         |
 | peer.manage            | yes   | yes   |         |
+| test_run.trigger       | yes   | yes   |         |
+| test_run.read          | yes   | yes   | yes     |
 | token.manage           | yes   |       |         |
 | key.rotate             | yes   |       |         |
 

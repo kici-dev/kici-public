@@ -65,6 +65,18 @@ type PathKind =
   | { kind: EntryKind.BeneathLink }
   | { kind: EntryKind.Directory };
 
+/**
+ * The overlay tarball directory that holds `manifest.json`, where the agent
+ * reads it. No repository path under it ships: a copy in the developer's tree
+ * would collide with the real manifest at the same tarball path.
+ */
+export const OVERLAY_MANIFEST_DIR = '.kici-overlay-tmp';
+
+/** True for repo-relative paths inside the reserved overlay manifest directory. */
+export function isReservedOverlayPath(relPath: string): boolean {
+  return relPath === OVERLAY_MANIFEST_DIR || relPath.startsWith(`${OVERLAY_MANIFEST_DIR}/`);
+}
+
 /** True for repo-relative paths inside the `.git` directory. */
 export function isGitDirPath(relPath: string): boolean {
   return relPath === '.git' || relPath.startsWith('.git/');
@@ -207,7 +219,7 @@ async function linkTargets(
   }
   if (wanted.size === 0) return [];
   const shippable = gitShippable(repoRoot, [...wanted]);
-  return [...wanted].filter((p) => shippable.has(p) && !isIgnored(p));
+  return [...wanted].filter((p) => shippable.has(p) && !isIgnored(p) && !isReservedOverlayPath(p));
 }
 
 /** The paths among `dirs` the git index in `repoRoot` records as a submodule. */

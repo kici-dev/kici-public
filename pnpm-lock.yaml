@@ -290,6 +290,10 @@ importers:
       zx:
         specifier: ^8.8.5
         version: 8.8.5
+    devDependencies:
+      tar:
+        specifier: ^7.5.22
+        version: 7.5.22
 
   packages/engine:
     dependencies:

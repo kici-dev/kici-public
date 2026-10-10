@@ -6,7 +6,7 @@ description: The dashboard onboarding checklist and your organizations list.
 
 ## Getting started
 
-When you first sign in to a brand-new organization with no orchestrator, no webhook source, and no runs, the dashboard opens this page automatically. Once your organization has any activity, the run list becomes your landing page instead. The **Getting started** sidebar entry stays available so you can return to the checklist at any time.
+When you first sign in to a brand-new organization with no orchestrator, no webhook source, and no runs, the dashboard opens this page automatically. Once your organization has any activity, the run list becomes your landing page instead. The **Getting started** sidebar entry stays available until your organization has a connected orchestrator, a webhook source, and at least one run. After that, the entry is hidden, and a visit to the getting-started URL opens the run list.
 
 The six steps are:
 

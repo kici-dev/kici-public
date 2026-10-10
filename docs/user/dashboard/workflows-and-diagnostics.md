@@ -18,7 +18,7 @@ Filters include trigger type, repository, and workflow name, plus a **Hide git-o
 The infrastructure page (`/orgs/:customerId/infrastructure`) provides infrastructure health monitoring. The orchestrator → scaler → agent tree is the canonical list of every orchestrator connected to this org — each top-level row carries a **Manage →** link into that cluster's per-cluster views. It has four sections plus a filter:
 
 
-- **Filter** -- a search box plus Status and Scaler-type facets above the tree. Typing narrows the tree to matching orchestrators, scalers, and agents (a node stays visible if it or any descendant matches), auto-expands branches that match on a descendant, and shows a running result count. While a filter is active, every scaler's agents are loaded up front so agent-level matches resolve across collapsed branches; with no filter the tree loads agents lazily on expand.
+- **Filter** -- a search box plus Status and Scaler-type facets above the tree. Typing narrows the tree to matching orchestrators, scalers, and agents (a node stays visible if it or any descendant matches), auto-expands branches that match on a descendant, and shows a running result count.
 
 1. **Execution metrics** -- cards showing total runs (24h), success rate, average duration, and active jobs (queued + running). Refreshes every 30 seconds.
 2. **Infrastructure alerts** -- banner summarizing any critical or warning alerts from connected orchestrators. Each alert carries a type (`zero-agents`, `capacity`, `label-gaps`, `no-raft-leader`) and a severity (`warning` or `critical`). A severity the page does not recognize is rendered at the critical level, so an unfamiliar alert is never shown as less urgent than it might be.
@@ -36,5 +36,7 @@ The infrastructure page (`/orgs/:customerId/infrastructure`) provides infrastruc
 
 ## Per-cluster views
 
-Click an orchestrator's **Manage →** link in the infrastructure tree to drill into that cluster's per-orch surfaces (security policy, contexts, secrets, DLQ, registrations, global workflows), keyed by **cluster name** — the human-friendly name set on the orch via `kici-admin cluster-name set <name>`, or an auto-generated `cluster-<6hex>` if no operator has renamed it. Different clusters in the same org can have different settings, so the tree row is the entry point that lets you pick which cluster you're configuring.
+Click an orchestrator's **Manage →** link in the infrastructure tree to drill into that cluster's per-orch surfaces. The view is keyed by **cluster name** — the human-friendly name set on the orch via `kici-admin cluster-name set <name>`, or an auto-generated `cluster-<6hex>` if no operator has renamed it. Different clusters in the same org can have different settings, so the tree row is the entry point that lets you pick which cluster you're configuring.
+
+The per-cluster view opens on an **Overview** tab: the connection ID, instance ID, routing keys, scaler backends, S3 log storage, and connection time. The other tabs are **Contexts** (`contexts:read`), **Secrets** (`secrets:read`), **DLQ** (`event_dlq:read`), **Workflows** (`workflows:read`), and **Security**, the read-only dashboard-write policy. A tab with a permission in parentheses appears only when you hold that permission.
 

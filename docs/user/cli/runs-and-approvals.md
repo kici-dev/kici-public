@@ -203,7 +203,14 @@ for the `when` gating model.
 
 #### How the run is routed
 
-A remote run is dispatched to your **active organization** — the one set with `kici org use <org>`, or overridden per-run with `--org <id>`. The org is resolved in this order:
+`kici run remote` sends a run either through the KiCI Platform or straight to an orchestrator. It picks the target in this order:
+
+1. The `--orchestrator-url <url>` flag (see [Direct mode](#direct-mode)).
+2. `KICI_ORCHESTRATOR_TOKEN`, with `KICI_ORCHESTRATOR_URL` or the orchestrator saved by `kici connect`.
+3. The orchestrator saved by `kici connect`.
+4. Your Platform login, saved by `kici login`.
+
+Through the Platform, a remote run is dispatched to your **active organization** — the one set with `kici org use <org>`, or overridden per-run with `--org <id>`. The org is resolved in this order:
 
 1. The `--org <id>` flag, if provided.
 2. Otherwise the active org saved in your global config by `kici org use <org>`.
@@ -222,10 +229,39 @@ When an org has more than one connected orchestrator cluster, the CLI picks the 
 
 `kici run remote` uses two independent paths:
 
-- **Control plane** — run initiation, trigger, status, log retrieval, and cancellation flow from your machine through the Platform, which relays them over a WebSocket connection to the org's orchestrator. Logs are delivered by the CLI polling the Platform for log chunks (tracked by a monotonic line cursor) and run status until the run reaches a terminal state; there is no direct streaming socket to the orchestrator.
+- **Control plane** — run initiation, trigger, status, log retrieval, and cancellation flow from your machine through the Platform, which relays them over a WebSocket connection to the org's orchestrator. In [direct mode](#direct-mode) they go to the orchestrator's HTTP API instead, with the same requests and responses. The CLI polls the Platform for log chunks (tracked by a monotonic line cursor) and run status until the run reaches a terminal state; there is no direct streaming socket to the orchestrator.
 - **Data plane** — your working-tree overlay tarball uploads **directly** from your machine to the orchestrator's object store via a presigned PUT URL. The overlay never passes through the Platform. This is why the orchestrator's object-store upload endpoint must be reachable from your machine; see [Storage layout](../../operator/orchestrator/storage-layout.md).
 
-An orchestrator with no Platform connection cannot serve remote runs — the Platform is the service that offers them. For executing workflow steps on your own machine without an orchestrator (no scaler, agents, or environments), use [`kici run <event> --local`](#kici-run-event---local).
+#### Direct mode
+
+In direct mode, `kici run remote` talks to an orchestrator's own HTTP API (`/api/v1/test`) and skips the Platform. You need no KiCI Platform account. It works with an orchestrator in any mode: `independent`, `hybrid`, `observed` or `platform`.
+
+Ask the orchestrator's operator for a personal orchestrator token (`kici-admin token create <label> --role admin --subject <you>`), then save the target:
+
+```bash
+kici connect https://ci.example.com          # prompts for the token
+echo "$TOKEN" | kici connect https://ci.example.com --token-stdin
+kici run remote push-main                    # runs on that orchestrator
+```
+
+For a single run, or in CI, pass the target without saving it:
+
+```bash
+KICI_ORCHESTRATOR_TOKEN=... kici run remote push-main --orchestrator-url https://ci.example.com
+```
+
+`KICI_ORCHESTRATOR_URL` selects a target only together with `KICI_ORCHESTRATOR_TOKEN`. The agent and the orchestrator read `KICI_ORCHESTRATOR_URL` as their own socket address, so a machine that runs one often has it set. The URL alone never moves a run off the Platform.
+
+What changes in direct mode:
+
+- **Who you are.** The CLI first asks the orchestrator who the token belongs to, and prints the caller, its role and the orchestrator mode. An `auditor` token can follow runs but cannot start them, so the run stops before the upload.
+- **Which organization.** The orchestrator chooses it: its default organization when `independent`, or the organization the Platform assigned it otherwise. `--org` and `--orchestrator` are ignored, with a warning.
+- **Storage.** The overlay still uploads straight to the object store. The orchestrator signs the upload address from `KICI_STORAGE_UPLOAD_ENDPOINT` (then `KICI_STORAGE_EXTERNAL_ENDPOINT`, then `KICI_STORAGE_ENDPOINT`). If your machine cannot reach that address, the error names it and the setting.
+- **Approval holds.** On an `independent` orchestrator you answer a hold inline (or with `--approve-all`) through the orchestrator's held-run routes; the token needs the `owner` or `admin` role. The orchestrator records an `--approve-all` approval as an automatic approval (`held_run.auto_approve` in its access log) by the token's subject, and still checks each hold's eligibility. On a Platform-connected orchestrator, holds are answered through the Platform (the dashboard, `kici approve`, or a PR comment), and the CLI says so once.
+
+Direct mode leaves runs routed through the Platform unchanged. Run `kici disconnect` to forget the saved orchestrator, and `kici doctor` to see which target is active.
+
+For executing workflow steps on your own machine without an orchestrator (no scaler, agents, or environments), use [`kici run <event> --local`](#kici-run-event---local).
 
 #### Fresh repos (no GitHub remote)
 
@@ -236,7 +272,7 @@ An orchestrator with no Platform connection cannot serve remote runs — the Pla
 - The build cache is skipped: no `__build__` job runs, and no cached source or dependencies are used
 - A bound context that does not set `allowLocalExecution: true` (the default is `false`) is skipped for the run, and the run shows a warning that names it
 
-Destination routing is unchanged for fresh repos: the run still goes to your active org through the Platform.
+Destination routing is unchanged for fresh repos: the run goes to the same target as any other run (your active org through the Platform, or the direct orchestrator).
 
 For a detailed guide on writing fixtures, configuring secrets, and understanding the upload flow, see [Testing guide](../testing-guide.md).
 
@@ -579,30 +615,31 @@ Synopsis: `kici run remote [fixture] [options]`
 
 **Options**
 
-| Option                      | Default | Description                                                                                 |
-| --------------------------- | ------- | ------------------------------------------------------------------------------------------- |
-| `--workflow <name>`         |         | Run a specific workflow directly (bypass triggers)                                          |
-| `--all`                     | `false` | Run all available fixtures                                                                  |
-| `-p, --pick`                | `false` | Interactively pick fixtures to run                                                          |
-| `--parallel`                | `false` | Run matching fixtures concurrently                                                          |
-| `--no-wait`                 |         | Fire and forget (print runIds, don't stream)                                                |
-| `--quiet`                   | `false` | Suppress output except final result                                                         |
-| `--json`                    | `false` | Output structured JSON result                                                               |
-| `--junit <path>`            |         | Output JUnit XML result                                                                     |
-| `--history`                 | `false` | Show recent run history                                                                     |
-| `--routing-key <key>`       |         | Override routing key for this run                                                           |
-| `--org <id>`                |         | Target organization (overrides the active org)                                              |
-| `--orchestrator <name>`     |         | Target orchestrator cluster (overrides the per-org default)                                 |
-| `--debug`                   | `false` | Verbose internals                                                                           |
-| `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                     |
-| `--context <ctx.key=value>` |         | Inject a namespaced context secret, uploaded encrypted to the orchestrator (repeatable)     |
-| `--env <KEY=VALUE>`         |         | Provide a per-run secret (repeatable); uploaded encrypted to the orchestrator               |
-| `--check`                   | `false` | Run in check mode: report drift, change nothing                                             |
-| `--fail-on-drift`           | `false` | In check mode, exit non-zero if any step reports drift                                      |
-| `--target <selector>`       |         | Narrow runsOnAll jobs to hosts matching this label selector (repeatable, AND-combined)      |
-| `--target-allow-empty`      | `false` | A --target that narrows a runsOnAll job to zero hosts skips it instead of failing           |
-| `--input <KEY=VALUE>`       |         | Typed workflow-dispatch input (repeatable)                                                  |
-| `--yes, --approve-all`      | `false` | Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced) |
+| Option                      | Default | Description                                                                                               |
+| --------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `--workflow <name>`         |         | Run a specific workflow directly (bypass triggers)                                                        |
+| `--all`                     | `false` | Run all available fixtures                                                                                |
+| `-p, --pick`                | `false` | Interactively pick fixtures to run                                                                        |
+| `--parallel`                | `false` | Run matching fixtures concurrently                                                                        |
+| `--no-wait`                 |         | Fire and forget (print runIds, don't stream)                                                              |
+| `--quiet`                   | `false` | Suppress output except final result                                                                       |
+| `--json`                    | `false` | Output structured JSON result                                                                             |
+| `--junit <path>`            |         | Output JUnit XML result                                                                                   |
+| `--history`                 | `false` | Show recent run history                                                                                   |
+| `--routing-key <key>`       |         | Deprecated; has no effect (the orchestrator chooses the routing key)                                      |
+| `--orchestrator-url <url>`  |         | Run on this orchestrator directly, skipping the Platform (token: KICI_ORCHESTRATOR_TOKEN or kici connect) |
+| `--org <id>`                |         | Target organization (overrides the active org)                                                            |
+| `--orchestrator <name>`     |         | Target orchestrator cluster (overrides the per-org default)                                               |
+| `--debug`                   | `false` | Verbose internals                                                                                         |
+| `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                                   |
+| `--context <ctx.key=value>` |         | Inject a namespaced context secret, uploaded encrypted to the orchestrator (repeatable)                   |
+| `--env <KEY=VALUE>`         |         | Provide a per-run secret (repeatable); uploaded encrypted to the orchestrator                             |
+| `--check`                   | `false` | Run in check mode: report drift, change nothing                                                           |
+| `--fail-on-drift`           | `false` | In check mode, exit non-zero if any step reports drift                                                    |
+| `--target <selector>`       |         | Narrow runsOnAll jobs to hosts matching this label selector (repeatable, AND-combined)                    |
+| `--target-allow-empty`      | `false` | A --target that narrows a runsOnAll job to zero hosts skips it instead of failing                         |
+| `--input <KEY=VALUE>`       |         | Typed workflow-dispatch input (repeatable)                                                                |
+| `--yes, --approve-all`      | `false` | Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)               |
 
 ### `kici runs`
 

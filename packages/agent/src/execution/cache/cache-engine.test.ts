@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir, homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { packCachePaths, extractCacheTarball, resolveCachePath } from './cache-engine.js';
@@ -72,6 +72,42 @@ describe('cache-engine pack/extract', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('round-trips a node_modules tree whose files are hard-linked', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cache-src-'));
+    const dest = await mkdtemp(join(tmpdir(), 'cache-dst-'));
+    try {
+      // pnpm hard-links identical files to one store inode; this order (plain,
+      // link, plain, plain, link, plain) is the one that stops node-tar's own
+      // hard-link handling for good.
+      const pkg = join(root, 'node_modules', '.pnpm', 'p@1.0.0', 'node_modules', 'p');
+      await mkdir(pkg, { recursive: true });
+      await writeFile(join(root, 'shared.d.ts'), 'export {};\n');
+      for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) await writeFile(join(pkg, name), name);
+      for (const name of ['b.d.ts', 'e.d.ts']) {
+        await link(join(root, 'shared.d.ts'), join(pkg, name));
+      }
+
+      // packCachePaths tars a fresh copy of each path, which holds no hard
+      // links, so the pack ends without single-link caches.
+      // fails-when: that copy starts preserving hard links, so this pack never
+      // ends until packCachePaths passes singleLinkTarCaches
+      const { tarball, hash } = await packCachePaths(root, ['node_modules']);
+      await extractCacheTarball(tarball, dest, hash);
+
+      // breaks-if-wrong: each linked path must restore with its own content
+      const restored = join(dest, 'node_modules', '.pnpm', 'p@1.0.0', 'node_modules', 'p');
+      for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) {
+        expect(await readFile(join(restored, name), 'utf-8')).toBe(name);
+      }
+      for (const name of ['b.d.ts', 'e.d.ts']) {
+        expect(await readFile(join(restored, name), 'utf-8')).toBe('export {};\n');
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(dest, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it('throws an actionable error on checksum mismatch', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cache-src-'));

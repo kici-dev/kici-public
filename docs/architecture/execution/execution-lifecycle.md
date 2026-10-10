@@ -95,7 +95,7 @@ The dashboard and CLI implement a two-level cancel pattern:
 1. **First cancel request** -- graceful. The run transitions to `cancelling` (amber badge). The cancel button changes to "Force cancel" (red).
 2. **Second cancel request** -- force. The run transitions immediately to `cancelled`. All hooks are skipped.
 
-In the CLI: first Ctrl+C sends graceful cancel, second Ctrl+C sends force cancel.
+In `kici run remote`, the first Ctrl+C sends a graceful cancel and waits for the orchestrator to answer. A second Ctrl+C exits the CLI at once and sends nothing more.
 
 ## Hook execution order
 

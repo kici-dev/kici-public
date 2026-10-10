@@ -33,8 +33,9 @@ Each item lists the local substitute where one exists.
   register sources with `kici-admin source add` as always (see the note below).
 - **User identity and login.** Signing in (OIDC), personal access tokens, and the
   `kici login` developer flow authenticate against the hosted Platform. A
-  self-hosted orchestrator authenticates callers with local bearer tokens and
-  orchestrator API keys instead.
+  self-hosted orchestrator authenticates callers with orchestrator admin tokens
+  (`kici-admin token create`) instead; a developer passes one to
+  `kici connect`.
 - **Organizations, teams, and member roles.** The multi-tenant control plane —
   inviting users, organizing teams, and assigning per-user roles — lives on the
   Platform. (Your orchestrator still enforces its own admin-action permissions.)
@@ -60,9 +61,10 @@ Each item lists the local substitute where one exists.
 - **Platform-side developer CLI commands.** `kici login`, `kici org`,
   `kici orchestrators`, `kici runs`, `kici approve` / `kici reject`,
   `kici workflows`, `kici notifications`, `kici secrets list`, `kici pat`, and
-  connected/routed runs talk to the Platform.
-  Compiling workflows, running locally (`kici run --local`), and verifying
-  attestations offline do not.
+  Platform-routed `kici run remote` runs talk to the Platform.
+  Compiling workflows, running locally (`kici run --local`), verifying
+  attestations offline, and `kici run remote` or `kici types` against an
+  orchestrator directly (`kici connect`) do not.
 - **Private issue-report upload.** `kici report` writes its diagnostic bundle
   locally with no Platform involvement. Sending it — `kici report --upload`, and
   the `kici report list` / `kici report withdraw` commands that manage what you
@@ -91,6 +93,9 @@ With no Platform at all (`independent` mode), the whole execution path works:
 - Clustering across instances that share a database, with statically configured
   peers.
 - `kici run --local` and offline `kici verify-attestation`.
+- `kici run remote` and `kici types` straight against the orchestrator, with a
+  per-person orchestrator admin token (`kici connect`). See
+  [Direct mode](../../user/cli/runs-and-approvals.md#direct-mode).
 - **Build provenance and attestations.** Your orchestrator owns the provenance
   root of trust: it holds its own ES256 signing key, mints and signs identity
   tokens locally, and publishes its own OIDC discovery + JWKS, so builds produce

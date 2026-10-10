@@ -261,6 +261,30 @@ describe('checkLabels', () => {
     expect(r.message).toContain('linux');
   });
 
+  it('names a mixed exact and regex requirement exactly as before', () => {
+    // One job, built from the shared lock shape with mixed selectors swapped in.
+    const job = {
+      ...(lock.workflows[0]!.jobs[0] as object),
+      runsOn: [
+        { kind: 'exact', value: 'linux' },
+        { kind: 'regex', source: '^gpu', flags: 'i' },
+      ],
+      excludeLabels: [
+        { kind: 'exact', value: 'spot' },
+        { kind: 'regex', source: 'arm', flags: '' },
+      ],
+    };
+    const mixedLock = { ...lock, workflows: [{ name: 'w', jobs: [job] }] } as unknown as LockFile;
+    const r = checkLabels(mixedLock, {
+      ok: true,
+      infra: infra([{ connected: true, agents: [{ labels: ['windows'] }], scalers: [] } as never]),
+    });
+    // fails-when: the shared formatter changes the rendering doctor prints
+    expect(r.message).toBe(
+      'No connected agent or scaler can satisfy: linux + /^gpu/i − spot, /arm/.',
+    );
+  });
+
   it('passes when a non-excluded agent satisfies the labels', () => {
     const excludeLock = {
       schemaVersion: 1,
@@ -389,6 +413,7 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
       lock: null,
     }),
     now: () => FIXED_NOW,
+    env: {},
     ...over,
   };
 }
@@ -436,5 +461,129 @@ describe('doctorCommand', () => {
     );
     spy.mockRestore();
     expect(code).toBe(0);
+  });
+});
+
+describe('run-target check', () => {
+  const DIRECT = { direct: { url: 'https://ci.example.com', token: 't' } };
+  const FRESH_LOCK = async () => ({
+    exists: true,
+    fresh: true,
+    committed: true,
+    gitAvailable: true,
+    lock: { schemaVersion: 1, workflows: [] } as never,
+  });
+  const WHOAMI = {
+    tokenId: 'tok',
+    label: 'dev',
+    subject: 'dev@x',
+    role: 'admin' as const,
+    mode: 'independent' as const,
+    orgId: '__default__',
+    permissions: { trigger: true, read: true },
+  };
+
+  async function run(over: Partial<DoctorDeps>) {
+    const logged: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((m: string) => void logged.push(m));
+    const code = await doctorCommand(
+      { json: true },
+      deps({ gatherLockState: FRESH_LOCK, ...over }),
+    );
+    spy.mockRestore();
+    const parsed = JSON.parse(logged.join('\n')) as {
+      checks: Array<{ name: string; status: string; message: string; nextCommand?: string }>;
+    };
+    return {
+      code,
+      checks: parsed.checks,
+      row: parsed.checks.find((c) => c.name === 'run-target')!,
+    };
+  }
+
+  it('passes for a reachable direct target and names url, source, caller, role and mode', async () => {
+    const { row } = await run({
+      loadConfig: async () => DIRECT,
+      probeDirect: async () => ({ ok: true, whoami: WHOAMI }),
+    });
+    expect(row.status).toBe('pass');
+    expect(row.message).toContain('https://ci.example.com');
+    expect(row.message).toContain('kici connect');
+    expect(row.message).toContain('dev@x, role admin, independent mode');
+  });
+
+  it('fails with kici connect when the token is refused', async () => {
+    const { row } = await run({
+      loadConfig: async () => DIRECT,
+      probeDirect: async () => ({ ok: false, kind: 'auth', message: 'refused' }),
+    });
+    expect(row.status).toBe('fail');
+    expect(row.nextCommand).toBe('kici connect https://ci.example.com');
+  });
+
+  it('fails naming the URL when the orchestrator is unreachable', async () => {
+    const { row } = await run({
+      loadConfig: async () => DIRECT,
+      probeDirect: async () => ({ ok: false, kind: 'unreachable', message: 'ECONNREFUSED' }),
+    });
+    expect(row.status).toBe('fail');
+    expect(row.message).toContain('https://ci.example.com');
+  });
+
+  it('warns for a token that can follow runs but not start them', async () => {
+    const { row } = await run({
+      loadConfig: async () => DIRECT,
+      probeDirect: async () => ({
+        ok: true,
+        whoami: { ...WHOAMI, role: 'auditor', permissions: { trigger: false, read: true } },
+      }),
+    });
+    expect(row.status).toBe('warn');
+    expect(row.message).toContain('can follow runs, cannot start them');
+  });
+
+  it('omits the Platform rows for a direct-only developer and exits 0', async () => {
+    const { code, checks } = await run({
+      loadConfig: async () => DIRECT,
+      probeDirect: async () => ({ ok: true, whoami: WHOAMI }),
+    });
+    // fails-when: a direct-only developer is told to kici login
+    expect(checks.map((c) => c.name)).toEqual(['run-target', 'lock-file']);
+    expect(code).toBe(0);
+  });
+
+  it('keeps the Platform rows and order for a Platform-only config', async () => {
+    const { checks, row } = await run({
+      loadConfig: async () => ({
+        pat: 'tok',
+        platformEndpoint: 'https://api.kici.dev',
+        activeOrgId: 'org1',
+      }),
+    });
+    // breaks-if-wrong: the Platform funnel is unchanged
+    expect(checks.map((c) => c.name)).toEqual([
+      'run-target',
+      'login',
+      'active-org',
+      'lock-file',
+      'token-live',
+      'orchestrator',
+      'labels',
+    ]);
+    expect(row).toMatchObject({
+      status: 'pass',
+      message: 'Platform login (https://api.kici.dev).',
+    });
+  });
+
+  it('warns about a deprecated routingKey field', async () => {
+    const { checks } = await run({
+      loadConfig: async () => ({ ...DIRECT, routingKey: 'github:42' }),
+      probeDirect: async () => ({ ok: true, whoami: WHOAMI }),
+    });
+    const config = checks.find((c) => c.name === 'config')!;
+    expect(config.status).toBe('warn');
+    expect(config.message).toContain('routingKey');
+    expect(config.message).toContain('v1.0.0');
   });
 });

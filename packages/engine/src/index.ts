@@ -297,6 +297,8 @@ export {
   matcherMatches,
   matcherSatisfiedBy,
   partitionMatchers,
+  formatLabelMatcher,
+  formatLabelMatchers,
   compileRegexMatcher,
   HostTargetValue,
   HostTargetSelector,

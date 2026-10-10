@@ -46,8 +46,14 @@ export interface RemoteRunOptions extends PreviewOptions {
   json?: boolean;
   /** Output JUnit XML result */
   junit?: string;
-  /** Override routing key for this run */
+  /**
+   * `--routing-key`: accepted and ignored.
+   *
+   * @deprecated The orchestrator chooses the routing key; removed in v1.0.0.
+   */
   routingKey?: string;
+  /** `--orchestrator-url`: run on this orchestrator directly, skipping the Platform. */
+  orchestratorUrl?: string;
   /** Show recent run history */
   history?: boolean;
   /** --env KEY=VALUE flag values, uploaded as per-run secrets. */

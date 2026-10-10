@@ -55,7 +55,7 @@ import type {
   StoredTrustDirectory,
   TrustDirectoryStore,
 } from '../security/trust-directory-store.js';
-import { applyDecision } from '../approvals/apply-decision.js';
+import { applyDecision, heldRunDecisionAction } from '../approvals/apply-decision.js';
 import { adminActorSub, triggererSubjectFor } from '../approvals/triggerer-subject.js';
 import {
   HoldOutcome,
@@ -189,6 +189,15 @@ const decisionSchema = z.object({
    * {@link unregisteredApproverMessage}.
    */
   asUserId: z.string().min(1).optional(),
+  /**
+   * Marks an approve as a `kici run --approve-all` breakglass approval, so the
+   * access log records it as `held_run.auto_approve` — the same action a
+   * Platform-relayed `--approve-all` writes — instead of an interactive
+   * `held_run.approve`. It changes the audit record only: eligibility is
+   * enforced exactly as for any other approve, and a reject ignores it.
+   * `kici-admin held-run approve` never sends it.
+   */
+  autoApprove: z.boolean().optional(),
 });
 
 /**
@@ -399,7 +408,7 @@ async function applyAdminDecision(
   store: HeldRunStore,
   body: z.infer<typeof decisionSchema>,
 ): Promise<Response> {
-  const { customerId, heldRunId, decision, reason, asUserId } = body;
+  const { customerId, heldRunId, decision, reason, asUserId, autoApprove = false } = body;
   const hold = await store.getById(customerId, heldRunId);
   if (!hold || hold.status !== HeldRunStatus.Pending) {
     return c.json({ error: 'held run not found or already resolved' }, 404);
@@ -438,7 +447,7 @@ async function applyAdminDecision(
       orgId: customerId,
       routingKey: null,
       actor: heldRunActor(c),
-      action: decision === ApprovalDecision.enum.approve ? 'held_run.approve' : 'held_run.reject',
+      action: heldRunDecisionAction(decision, autoApprove),
       target: { type: 'held_run', id: heldRunId },
       requestId: null,
       source: 'admin_http',

@@ -304,6 +304,6 @@ if (ctx.secrets.has('DEPLOY_TOKEN')) { ... }
 
 When you run `kici types`, the compiler generates a `.kici/types/secrets.d.ts` file that provides type-safe autocompletion for your secret keys. The generated types augment the `StepSecrets` interface so that `ctx.secrets.get('...')` and `ctx.secrets.has('...')` offer suggestions for known keys.
 
-This file is a local development aid, not source: `kici init` gitignores `.kici/types/`, so each team member generates their own copy with `kici types` rather than committing it. When the Platform is unreachable, `kici types` keeps any existing copy untouched, or writes an empty stub if none exists, so type checking degrades to "no known keys" instead of failing.
+This file is a local development aid, not source: `kici init` gitignores `.kici/types/`, so each team member generates their own copy with `kici types` rather than committing it. When no orchestrator or Platform can be reached, `kici types` reads the key names from your local secret files. With none of these, it keeps any existing copy untouched, or writes an empty stub if none exists, so type checking degrades to "no known keys" instead of failing.
 
 See [CLI reference](./cli/authoring-and-local.md#kici-types) for the `kici types` command.

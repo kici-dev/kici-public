@@ -93,16 +93,14 @@ kici-admin audit [--context <name>] [--routing-key <key>] [--action <action>] [-
 
 Queries the secrets operation audit log. All date filters use ISO 8601 format. Default limit is 100. `--include-archived` also reads rows moved to cold storage; the cold-storage scan needs `--routing-key`.
 
-### api-key -- API key management
+### api-key -- deprecated
 
-```bash
-kici-admin api-key create [--label <label>] [--routing-keys <keys>]
-kici-admin api-key add-routing-key <id> <pattern>
-```
-
-- Creates API keys for orchestrator-to-Platform authentication.
-- `--routing-keys` accepts comma-separated routing key patterns (e.g., `github:42,github:99`).
-- The key is shown once on creation -- save it immediately.
+`kici-admin api-key create` and `kici-admin api-key add-routing-key` are
+deprecated and have no effect: no KiCI server serves the route they call. Both
+exit with an error that points at `kici-admin token create`. They are removed
+in v1.0.0 (see [Deprecations](../../../user/deprecations.md)). To give a
+developer access, mint a per-person token as described in
+[Tokens for developers](#tokens-for-developers).
 
 ### token -- admin API token management
 
@@ -130,8 +128,9 @@ kici-admin token create alice-ops --role admin --subject alice@example.com
 The orchestrator stores the value and shows it in `token list`. It **cannot
 verify it**, and it never reads it when it authorizes a request — the token's
 `role` and `--routing-key` scope decide that. `--subject` is advisory metadata.
-Its only consumer is the dashboard's RBAC drift report, which joins it against
-your organization's membership. The report answers: whose token is this, is
+The orchestrator returns it to the token's holder (`kici connect` prints it),
+and the dashboard's RBAC drift report joins it against your organization's
+membership. The report answers: whose token is this, is
 that person still a member, and does the token's orchestrator role exceed their
 dashboard permissions.
 
@@ -141,6 +140,28 @@ whose token it is. Re-issue it with a subject and revoke the old one.
 
 See [Two-layer RBAC](../../security/rbac-two-layers.md#reconciling-the-two-layers)
 for how to read the report.
+
+#### Tokens for developers
+
+A developer who runs `kici run remote` or `kici types` straight against this
+orchestrator, with no KiCI Platform account, uses an orchestrator admin token.
+Issue one token per person, so each run and each access-log row names who
+started it:
+
+```bash
+kici-admin token create alice-dev --role admin --subject alice@example.com --expires 30d
+```
+
+The developer saves it with `kici connect <orchestrator-url>` (or sets
+`KICI_ORCHESTRATOR_TOKEN`). An `auditor` token can follow test runs but cannot
+start or cancel one. The test-run routes refuse a token created with
+`--routing-key`, because the orchestrator chooses the routing key for a test
+run. When the person leaves, revoke the token:
+
+```bash
+kici-admin token list
+kici-admin token revoke <id>
+```
 
 #### Routing-key-scoped tokens cannot manage secrets
 
@@ -206,13 +227,13 @@ See [Contexts](../../contexts.md) for the broader feature walkthrough.
 
 ### `kici-admin api-key`
 
-Manage Platform API keys and routing keys
+Deprecated: use kici-admin token create (removed in v1.0.0)
 
 Synopsis: `kici-admin api-key`
 
 ### `kici-admin api-key add-routing-key`
 
-Add a routing key permission pattern to an API key
+Deprecated: use kici-admin token create (removed in v1.0.0)
 
 Synopsis: `kici-admin api-key add-routing-key <id> <pattern>`
 
@@ -225,16 +246,16 @@ Synopsis: `kici-admin api-key add-routing-key <id> <pattern>`
 
 ### `kici-admin api-key create`
 
-Create a new API key with optional routing key permissions
+Deprecated: use kici-admin token create (removed in v1.0.0)
 
 Synopsis: `kici-admin api-key create [options]`
 
 **Options**
 
-| Option                  | Default   | Description                                                     |
-| ----------------------- | --------- | --------------------------------------------------------------- |
-| `--label <label>`       | `unnamed` | Label for the API key                                           |
-| `--routing-keys <keys>` |           | Comma-separated routing key patterns (e.g. github:42,github:99) |
+| Option                  | Default   | Description |
+| ----------------------- | --------- | ----------- |
+| `--label <label>`       | `unnamed` | Ignored     |
+| `--routing-keys <keys>` |           | Ignored     |
 
 ### `kici-admin audit`
 

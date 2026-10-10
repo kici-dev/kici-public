@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ExecutionRunStatus, type ActorPrincipal } from '@kici-dev/engine';
+import { AccessLogSource, ExecutionRunStatus, type ActorPrincipal } from '@kici-dev/engine';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
 import {
   handleTestUploadsInit,
@@ -65,9 +65,9 @@ function makeDbMock(opts: {
 }
 
 describe('handleTestUploadsInit', () => {
-  it('mints an upload via the external presigned URL (internal=false)', async () => {
-    const getUploadUrl = vi.fn().mockResolvedValue('https://ext.example/put?sig=1');
-    const getInternalUploadUrl = vi.fn().mockResolvedValue('https://internal.example/put');
+  it('mints an upload via the developer-facing presigned URL', async () => {
+    const getUploadUrl = vi.fn().mockResolvedValue('https://agent.example/put');
+    const getInternalUploadUrl = vi.fn().mockResolvedValue('https://dev.example/put?sig=1');
     const { db, insert } = makeDbMock({});
     const deps = {
       db,
@@ -87,9 +87,9 @@ describe('handleTestUploadsInit', () => {
       deps,
     );
 
-    expect(getUploadUrl).toHaveBeenCalledTimes(1);
-    expect(getInternalUploadUrl).not.toHaveBeenCalled();
-    expect(result.signedUrl).toBe('https://ext.example/put?sig=1');
+    expect(getInternalUploadUrl).toHaveBeenCalledTimes(1);
+    expect(getUploadUrl).not.toHaveBeenCalled();
+    expect(result.signedUrl).toBe('https://dev.example/put?sig=1');
     expect(result.uploadId).toBeTruthy();
     expect(result.publicKey).toBeTruthy();
     expect(insert.values).toHaveBeenCalled();
@@ -146,6 +146,40 @@ describe('handleTestTrigger', () => {
     expect(result).toEqual({ runId: 'run-1', status: 'accepted', jobIds: ['j1', 'j2'] });
     expect(record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'run.trigger', outcome: 'allowed', actor: ACTOR }),
+    );
+    // breaks-if-wrong: the relay keeps its own source when no override is passed
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({ source: AccessLogSource.enum.platform_proxy }),
+    );
+  });
+
+  it('records the access-log source the caller passes', async () => {
+    const { db } = makeDbMock({});
+    vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
+      runId: 'run-2',
+      status: 'accepted',
+      jobIds: [],
+    });
+    const record = vi.fn().mockResolvedValue(undefined);
+    const deps = {
+      db,
+      accessLog: { record },
+      accessLogSource: AccessLogSource.enum.admin_http,
+    } as unknown as TestRelayHandlerDeps;
+    await handleTestTrigger(
+      {
+        type: 'test.relay.trigger',
+        requestId: 'r9',
+        actor: ACTOR,
+        routingKey: 'remote:__default__',
+        fixtureId: 'fix-1',
+        event: { type: 'push', targetBranch: 'main', payload: {} },
+      },
+      deps,
+    );
+    // fails-when: the trigger always records platform_proxy, hiding a direct run's transport
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({ source: AccessLogSource.enum.admin_http }),
     );
   });
 

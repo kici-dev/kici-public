@@ -248,6 +248,20 @@ describe('unroutableMessage', () => {
     expect(msg).toContain('excluding [spot]');
   });
 
+  it('renders mixed exact and regex selectors exactly as before', () => {
+    // Canonical matchers fold case, so an empty flag set renders as `i`.
+    // fails-when: the shared formatter changes the rendering an operator reads
+    const msg = unroutableMessage(
+      facts({
+        runsOnLabels: ['linux'],
+        runsOnPatterns: [{ kind: 'regex', source: '^gpu-.*$', flags: 'i' }],
+        excludeLabels: ['spot'],
+        excludePatterns: [{ kind: 'regex', source: 'arm', flags: '' }],
+      }),
+    );
+    expect(msg).toContain('runsOn [linux, /^gpu-.*$/i] excluding [spot, /arm/i]');
+  });
+
   it('says any agent would do when the job declares no runsOn', () => {
     const msg = unroutableMessage(facts({ runsOnLabels: [] }));
     expect(msg).toContain('it declares no runsOn, so any agent would do');

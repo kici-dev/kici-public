@@ -1,14 +1,20 @@
 import { execSync } from 'node:child_process';
+import { createReadStream, createWriteStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { create as tarCreate } from 'tar';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
+import { create as tarCreate, replace as tarReplace } from 'tar';
 import picomatch from 'picomatch';
 import { formatBytes, sha256, sha256File } from '@kici-dev/core';
+import { singleLinkTarCaches } from '@kici-dev/core/tar-single-link';
 import { makeTempDir } from '@kici-dev/core/tmp';
 import { encryptTarball } from './encryption.js';
 import {
   classifyOverlayEntries,
   isGitDirPath,
+  isReservedOverlayPath,
+  OVERLAY_MANIFEST_DIR,
   overlaySkipWarnings,
   SkipContext,
 } from './overlay-links.js';
@@ -67,7 +73,7 @@ interface UploadOptions {
 /**
  * Result of a successful upload.
  */
-interface UploadResult {
+export interface UploadResult {
   /** Upload identifier */
   uploadId: string;
   /** CLI's ephemeral public key (needed by agent for decryption) */
@@ -237,6 +243,9 @@ export async function selectOverlayFiles(
   if (kiciIgnore) {
     allFiles = allFiles.filter((f) => !kiciIgnore(f));
   }
+  // The manifest directory is reserved: a repository copy of it would collide
+  // with the real manifest at the same tarball path.
+  allFiles = allFiles.filter((f) => !isReservedOverlayPath(f));
 
   // For a full-working-tree overlay (`kici run remote`), additively include the
   // entire `.git` directory so the extracted overlay is a real git repository
@@ -265,6 +274,49 @@ export async function selectOverlayFiles(
   );
 
   return { sha, hasRemote, existingFiles, deletedFiles };
+}
+
+/**
+ * Write the overlay tarball: the manifest at `.kici-overlay-tmp/manifest.json`,
+ * where the agent reads it, then each repository entry.
+ *
+ * Nothing is written into the repository. The manifest is packed from a
+ * directory under `workDir`, the repository entries are appended to the same
+ * uncompressed archive from `repoRoot`, and the result is gzipped.
+ */
+async function packOverlayTarball(
+  repoRoot: string,
+  workDir: string,
+  manifest: OverlayManifest,
+  repoEntries: string[],
+  tarballPath: string,
+): Promise<void> {
+  const manifestRoot = path.join(workDir, 'manifest-root');
+  const manifestRel = path.posix.join(OVERLAY_MANIFEST_DIR, 'manifest.json');
+  await fs.mkdir(path.join(manifestRoot, OVERLAY_MANIFEST_DIR), { recursive: true });
+  await fs.writeFile(path.join(manifestRoot, manifestRel), JSON.stringify(manifest, null, 2));
+
+  const rawTarPath = path.join(workDir, 'overlay.tar');
+  try {
+    await tarCreate({ file: rawTarPath, cwd: manifestRoot }, [manifestRel]);
+    if (repoEntries.length > 0) {
+      // A symlink (file or directory) ships as a link entry: node-tar does not
+      // follow links unless asked to. git records no hard links, so each path
+      // ships as its own content.
+      await tarReplace(
+        {
+          file: rawTarPath,
+          cwd: repoRoot,
+          ...(await singleLinkTarCaches(repoRoot, repoEntries)),
+        },
+        repoEntries,
+      );
+    }
+    await pipeline(createReadStream(rawTarPath), createGzip(), createWriteStream(tarballPath));
+  } finally {
+    await fs.rm(rawTarPath, { force: true });
+    await fs.rm(manifestRoot, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -332,50 +384,12 @@ export async function createOverlayTarball(
     ...(linkPaths.length > 0 ? { symlinks: entries.symlinks } : {}),
   };
 
-  // Create temp dir for the tarball and manifest. Persist mode: the dir holds
-  // the returned tarball path and outlives this function, so it is not
-  // auto-registered to any temp scope (cleanup is the caller's / GC's).
+  // Persist mode: the dir holds the returned tarball path and outlives this
+  // function, so it is not auto-registered to any temp scope (cleanup is the
+  // caller's / GC's).
   const { path: tmpDir } = await makeTempDir('overlay', { persist: true });
-  const manifestPath = path.join(tmpDir, 'manifest.json');
-  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
-
-  // Copy manifest into repo-relative temp location for tar inclusion
-  const manifestRelDir = '.kici-overlay-tmp';
-  const manifestRepoDir = path.join(repoRoot, manifestRelDir);
-  await fs.mkdir(manifestRepoDir, { recursive: true });
-  await fs.copyFile(manifestPath, path.join(manifestRepoDir, 'manifest.json'));
-
   const tarballPath = path.join(tmpDir, 'overlay.tar.gz');
-
-  try {
-    // A symlink (file or directory) ships as a link entry: node-tar does not
-    // follow links unless asked to.
-    const filesToInclude = [...shipped, path.join(manifestRelDir, 'manifest.json')];
-
-    if (filesToInclude.length > 0) {
-      await tarCreate(
-        {
-          gzip: true,
-          file: tarballPath,
-          cwd: repoRoot,
-        },
-        filesToInclude,
-      );
-    } else {
-      // Empty tarball (no changes)
-      await tarCreate(
-        {
-          gzip: true,
-          file: tarballPath,
-          cwd: repoRoot,
-        },
-        [],
-      );
-    }
-  } finally {
-    // Clean up temp manifest dir from repo
-    await fs.rm(manifestRepoDir, { recursive: true, force: true });
-  }
+  await packOverlayTarball(repoRoot, tmpDir, manifest, [...shipped], tarballPath);
 
   const stat = await fs.stat(tarballPath);
   const compressedSize = stat.size;

@@ -14,6 +14,17 @@ The KiCI CLI reads the following environment variables to customize its behavior
 | `KICI_PLATFORM_URL`   | Platform API base URL                  | `https://api.kici.dev`                       |
 | `KICI_CONFIG_DIR`     | Override the KiCI config directory     | `~/.kici`                                    |
 
+## Direct orchestrator target
+
+These send `kici run remote` and `kici types` straight to an orchestrator, without the KiCI Platform (see [Direct mode](./cli/runs-and-approvals.md#direct-mode)). They take precedence over the target saved by `kici connect`; `--orchestrator-url` takes precedence over both.
+
+| Variable                  | Description                                                                                                                                                                                          | Default |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `KICI_ORCHESTRATOR_TOKEN` | An orchestrator admin token (`kici-admin token create`). Selects a direct target, at `KICI_ORCHESTRATOR_URL` or at the orchestrator saved by `kici connect`.                                         | unset   |
+| `KICI_ORCHESTRATOR_URL`   | The orchestrator's HTTP address. Used only together with `KICI_ORCHESTRATOR_TOKEN`. The agent and the orchestrator read this variable as their own socket address, so on its own it changes nothing. | unset   |
+
+An empty value counts as unset.
+
 ## Browser behavior
 
 | Variable             | Description                                                                                                                                          | Default                         |

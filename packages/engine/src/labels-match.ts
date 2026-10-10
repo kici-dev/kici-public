@@ -141,3 +141,13 @@ export function partitionMatchers(ms: readonly LabelMatcher[]): {
   }
   return { exact, regex };
 }
+
+/** Render one matcher for people: an exact label as itself, a regex as `/source/flags`. */
+export function formatLabelMatcher(m: LabelMatcher): string {
+  return m.kind === 'exact' ? m.value : `/${m.source}/${m.flags}`;
+}
+
+/** Render a matcher list for people, joined by `separator`. */
+export function formatLabelMatchers(ms: readonly LabelMatcher[], separator = ', '): string {
+  return ms.map(formatLabelMatcher).join(separator);
+}

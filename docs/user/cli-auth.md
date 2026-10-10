@@ -80,7 +80,7 @@ kici org use <name-or-id>
 
 Name matching is case-insensitive. You can also use the organization ID directly.
 
-The active organization is both the scope for org-scoped commands (`kici runs list`, `kici diagnostics`, `kici secrets list`, …) **and** the default target for `kici run remote`. After `kici login` and `kici org use <org>`, `kici run remote` dispatches to that org through the Platform — that is the complete path to a remote run. Override the target for a single run with `kici run remote --org <id>`.
+The active organization is both the scope for org-scoped commands (`kici runs list`, `kici diagnostics`, `kici secrets list`, …) **and** the default target for `kici run remote`. After `kici login` and `kici org use <org>`, `kici run remote` dispatches to that org through the Platform — that is the complete path to a remote run. Override the target for a single run with `kici run remote --org <id>`. Without a Platform account, [`kici connect`](./cli/account-and-org.md#kici-connect) sends runs straight to an orchestrator instead (see [Direct mode](./cli/runs-and-approvals.md#direct-mode)).
 
 If an organization has more than one connected orchestrator cluster, set its default cluster once with `kici orchestrators use <name>` (list them with `kici orchestrators list`). `kici run remote` then targets that cluster unless you pass `--orchestrator <name>`. With a single connected orchestrator the cluster is selected automatically.
 
@@ -268,7 +268,7 @@ If the browser opens and you complete sign-in, but `kici login` keeps waiting:
 
 If `KICI_CALLBACK_PORT` names a port something else is already listening on, `kici login` stops immediately and names the port instead of hanging or crashing.
 
-It deliberately does **not** pick another port for you. A fixed port is something you set on purpose — usually because a firewall rule or a WSL `portproxy` entry allows exactly that one — so binding somewhere else would hand the browser a callback URL nothing can reach, and you would wait out the full 5-minute timeout instead of seeing a clear error.
+It deliberately does **not** pick another port for you. A fixed port is something you set on purpose — usually because a firewall rule or a WSL `portproxy` entry allows exactly that one. Binding somewhere else would hand the browser a callback URL nothing can reach, and you would wait out the full 5-minute timeout instead of seeing a clear error.
 
 Two ways forward:
 

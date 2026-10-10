@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   existsSync,
   mkdtempSync,
@@ -15,13 +15,16 @@ import { tmpdir } from 'node:os';
 const embeddedStart = vi.fn();
 const embeddedInit = vi.fn();
 const embeddedCreateDb = vi.fn();
+const embeddedStop = vi.fn();
+const ctorOptions: Array<Record<string, unknown>> = [];
 vi.mock('embedded-postgres', () => ({
-  default: vi.fn().mockImplementation(function () {
+  default: vi.fn().mockImplementation(function (opts: Record<string, unknown>) {
+    ctorOptions.push(opts);
     return {
       initialise: embeddedInit,
       start: embeddedStart,
       createDatabase: embeddedCreateDb,
-      stop: vi.fn(),
+      stop: embeddedStop,
     };
   }),
 }));
@@ -60,6 +63,105 @@ describe('startPlanePostgres', () => {
       'podman',
       expect.arrayContaining(['run', '-d']),
       expect.anything(),
+    );
+  });
+});
+
+describe('embedded Postgres bootstrap', () => {
+  let dir: string;
+  beforeEach(() => {
+    embeddedInit.mockReset();
+    embeddedStart.mockReset();
+    embeddedCreateDb.mockReset();
+    embeddedStop.mockReset().mockResolvedValue(undefined);
+    spawnMock.mockReset();
+    delete process.env.KICI_LOCAL_PG_MODE;
+    dir = mkdtempSync(join(tmpdir(), 'kici-pgboot-'));
+    process.env.KICI_CONFIG_DIR = dir;
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('routes the embedded server log to the plane pg log, not the console', async () => {
+    embeddedInit.mockImplementation(async () => {
+      (ctorOptions.at(-1)!.onLog as (m: string) => void)('database system is shut down');
+    });
+    embeddedStart.mockResolvedValue(undefined);
+    embeddedCreateDb.mockResolvedValue(undefined);
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { startPlanePostgres } = await import('./postgres.js');
+    const { planePaths } = await import('./paths.js');
+    await startPlanePostgres({ embeddedDaemon: async () => {} });
+    // fails-when: onLog is not passed, so embedded-postgres defaults it to console.log
+    expect(consoleLog).not.toHaveBeenCalled();
+    expect(readFileSync(planePaths().pgLogFile, 'utf-8')).toContain('database system is shut down');
+    expect(existsSync(planePaths().pgBootstrapStamp)).toBe(true);
+  });
+
+  it('ignores only duplicate_database from createDatabase', async () => {
+    const { isDuplicateDatabaseError } = await import('./postgres.js');
+    expect(isDuplicateDatabaseError(Object.assign(new Error('exists'), { code: '42P04' }))).toBe(
+      true,
+    );
+    // breaks-if-wrong: any other failure must surface instead of being swallowed
+    expect(isDuplicateDatabaseError(Object.assign(new Error('auth'), { code: '28P01' }))).toBe(
+      false,
+    );
+    expect(isDuplicateDatabaseError('exists')).toBe(false);
+  });
+
+  it('surfaces a createDatabase failure that is not duplicate_database', async () => {
+    embeddedInit.mockResolvedValue(undefined);
+    embeddedStart.mockResolvedValue(undefined);
+    embeddedCreateDb.mockRejectedValue(
+      Object.assign(new Error('password failed'), { code: '28P01' }),
+    );
+    spawnMock.mockReturnValue({ on: vi.fn(), unref: vi.fn() });
+    const { startPlanePostgres } = await import('./postgres.js');
+    const { planePaths } = await import('./paths.js');
+    // fails-when: the createDatabase catch swallows every error again
+    await expect(startPlanePostgres({ readyPoller: async () => false })).rejects.toThrow(
+      /embedded: embedded PostgreSQL bootstrap failed: password failed/,
+    );
+    expect(existsSync(planePaths().pgBootstrapStamp)).toBe(false);
+    // fails-when: a failed bootstrap leaves its in-process server holding the plane port
+    expect(embeddedStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes a half-done bootstrap: PG_VERSION present, stamp absent', async () => {
+    const { planePaths } = await import('./paths.js');
+    mkdirSync(planePaths().pgData, { recursive: true });
+    writeFileSync(join(planePaths().pgData, 'PG_VERSION'), '18\n');
+    embeddedStart.mockResolvedValue(undefined);
+    embeddedCreateDb.mockRejectedValue(Object.assign(new Error('exists'), { code: '42P04' }));
+    const { startPlanePostgres } = await import('./postgres.js');
+    const h = await startPlanePostgres({ embeddedDaemon: async () => {} });
+    expect(h.kind).toBe('embedded');
+    // fails-when: the PG_VERSION early return skips createDatabase forever
+    expect(embeddedInit).not.toHaveBeenCalled();
+    expect(embeddedCreateDb).toHaveBeenCalledWith('kici_local');
+    expect(existsSync(planePaths().pgBootstrapStamp)).toBe(true);
+  });
+
+  it('skips the bootstrap entirely once the stamp exists', async () => {
+    const { planePaths } = await import('./paths.js');
+    mkdirSync(planePaths().root, { recursive: true });
+    writeFileSync(planePaths().pgBootstrapStamp, 'done\n');
+    const { startPlanePostgres } = await import('./postgres.js');
+    await startPlanePostgres({ embeddedDaemon: async () => {} });
+    // breaks-if-wrong: a bootstrapped plane must not restart the in-process server
+    expect(embeddedStart).not.toHaveBeenCalled();
+  });
+
+  it('names the embedded failure and the pg log when podman also fails', async () => {
+    embeddedInit.mockRejectedValue(new Error('initdb: locale not supported'));
+    spawnMock.mockReturnValue({ on: vi.fn(), unref: vi.fn() });
+    const { startPlanePostgres } = await import('./postgres.js');
+    // fails-when: the embedded error is dropped before the podman fallback
+    await expect(startPlanePostgres({ readyPoller: async () => false })).rejects.toThrow(
+      /initdb: locale not supported[\s\S]*orchestrator\.log\.pg/,
     );
   });
 });
@@ -130,7 +232,7 @@ describe('plane Postgres log rotation', () => {
     // falls the plane through to the Podman backend.
     //
     // The serving cluster is real as far as pg_ctl can tell: a data dir with a
-    // PG_VERSION marker (which also skips the one-time init) and a
+    // PG_VERSION marker but no bootstrap stamp (a plane from an older CLI) and a
     // postmaster.pid naming this plane's port and a live same-user pid.
     // `pg_ctl status` checks liveness with kill(pid, 0) and refuses only its own
     // pid and its parent's; the vitest main process is neither.
@@ -158,6 +260,10 @@ describe('plane Postgres log rotation', () => {
       const h = await startPlanePostgres({ embeddedDaemon });
       expect(h.kind).toBe('embedded');
       expect(embeddedDaemon).not.toHaveBeenCalled();
+      // fails-when: the bootstrap runs before the serving check; its in-process
+      // server cannot start against the live cluster, so the plane would fall
+      // through to Podman.
+      expect(embeddedStart).not.toHaveBeenCalled();
       expect(existsSync(`${pgLogFile}.1`)).toBe(false);
       expect(statSync(pgLogFile).size).toBe(PLANE_LOG_MAX_BYTES + 1);
     } finally {

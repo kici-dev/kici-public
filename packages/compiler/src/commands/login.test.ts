@@ -124,6 +124,22 @@ describe('kici login', () => {
     });
   });
 
+  describe('deprecated --routing-key', () => {
+    it('warns and still writes the routing key', async () => {
+      const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockOauthLogin('kici_pat_rk');
+
+      await loginCommand({ routingKey: 'github:7' });
+
+      const warned = stderr.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+      stderr.mockRestore();
+      expect(warned).toContain('--routing-key is deprecated');
+      expect(warned).toContain('v1.0.0');
+      // breaks-if-wrong: the deprecated flag keeps its old effect until v1.0.0
+      expect((await loadGlobalConfig()).routingKey).toBe('github:7');
+    });
+  });
+
   describe('OAuth flow', () => {
     beforeEach(() => {
       // Clear mock call counts between tests

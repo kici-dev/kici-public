@@ -950,8 +950,12 @@ export class AdminApiClient {
     );
   }
 
-  // --- Platform API key management ---
+  // --- Platform API key management (deprecated) ---
 
+  /**
+   * @deprecated No KiCI server serves `/api/v1/api-keys`; use `createToken`
+   * (`kici-admin token create`). Removed in v1.0.0.
+   */
   async createApiKey(opts: {
     label?: string;
     routingKeys?: string[];
@@ -963,6 +967,10 @@ export class AdminApiClient {
     );
   }
 
+  /**
+   * @deprecated No KiCI server serves `/api/v1/api-keys`; use `createToken`
+   * with `routingKey` (`kici-admin token create --routing-key`). Removed in v1.0.0.
+   */
   async addRoutingKeyPermission(
     keyId: string,
     pattern: string,

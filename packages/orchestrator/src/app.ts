@@ -103,6 +103,7 @@ import { createGithubWebhookRoutes, shouldServeGithubIngress } from './routes/gi
 import type { VerifyInboundDeps } from './webhook/verify-inbound.js';
 import type { SourceStore } from './sources/source-store.js';
 import { createAdminRoutes, type AdminRouteDeps } from './routes/admin.js';
+import { createTestDirectRoutes, testDirectRouteDeps } from './routes/test-direct.js';
 import { createAdminEventRoutes } from './routes/admin-events.js';
 import { createAdminRegistrationRoutes } from './routes/admin-registrations.js';
 import { createAdminRunRoutes } from './routes/admin-runs.js';
@@ -1750,6 +1751,24 @@ export function createApp(deps: AppDependencies) {
       }),
     );
   }
+
+  // Direct `kici run remote` routes, in every mode. Absent without admin auth
+  // (KICI_SECRET_KEY): there is no token to authenticate the developer with.
+  const testDirectDeps = testDirectRouteDeps(deps, {
+    mode: deps.config.mode,
+    platformOrgId: () => deps.platformClient?.getOrgId(),
+    db: deps.db,
+    relayDeps: () => ({
+      ...buildProcessingDeps(),
+      db: deps.db,
+      agentRegistry: deps.registry,
+      cacheStorage: deps.cacheStorage,
+      logStorage: deps.logStorage,
+      logWriter: deps.logWriter,
+      accessLog: deps.accessLogWriter,
+    }),
+  });
+  if (testDirectDeps) app.route('', createTestDirectRoutes(testDirectDeps));
 
   // Admin event routes (optional -- mounted when generic source + trust management is available)
   if (deps.genericSourceManager && deps.trustStore && deps.adminDeps) {

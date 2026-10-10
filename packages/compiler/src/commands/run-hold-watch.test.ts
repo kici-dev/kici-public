@@ -138,6 +138,42 @@ describe('handleNewHolds', () => {
     expect(lines.join('\n')).toMatch(/held.*approve/i);
   });
 
+  it('prints the transport answer hint on a non-TTY notify', async () => {
+    const lines: string[] = [];
+    await handleNewHolds({
+      holds: [hold({ id: 'h1' })],
+      seen: new Set(),
+      isTty: false,
+      output: (l) => lines.push(l),
+      confirm: vi.fn(),
+      resolveContext: async () => ctx,
+      answerHint: (h) =>
+        `kici-admin held-run approve --org __default__ --run-id ${h.runId} --hold ${h.id}`,
+    });
+    const text = lines.join('\n');
+    // fails-when: a direct run tells the developer to use the Platform-only kici approve
+    expect(text).toContain(
+      'kici-admin held-run approve --org __default__ --run-id run-1 --hold h1',
+    );
+    expect(text).not.toContain('kici approve run-1');
+  });
+
+  it('prints the kici approve text without an answer hint', async () => {
+    const lines: string[] = [];
+    await handleNewHolds({
+      holds: [hold({ id: 'h1' })],
+      seen: new Set(),
+      isTty: false,
+      output: (l) => lines.push(l),
+      confirm: vi.fn(),
+      resolveContext: async () => ctx,
+    });
+    // breaks-if-wrong: the Platform-routed guidance stays unchanged
+    expect(lines.join('\n')).toContain(
+      'approve via the dashboard or `kici approve run-1 --hold h1`',
+    );
+  });
+
   it('returns the updated seen-set so a hold is handled once', async () => {
     const seen = await handleNewHolds({
       holds: [hold({ id: 'h1' })],

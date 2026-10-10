@@ -40,3 +40,5 @@ If you're not sure, pick Docker / Podman.
 ## Looking for the laptop-only path?
 
 Both quickstarts deploy a real orchestrator + agent. If you only want to write a workflow and dry-run it on your laptop with no infrastructure, [Getting started](./getting-started.md) covers `kici preview` and `kici run <event> --local` instead.
+
+To run workflows on your own orchestrator with no KiCI Platform account, connect the CLI to it directly with [`kici connect`](./cli/account-and-org.md#kici-connect). See [Direct mode](./cli/runs-and-approvals.md#direct-mode).

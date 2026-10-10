@@ -4,9 +4,9 @@
  * Mints an upload record and a presigned PUT URL + ephemeral X25519 public key
  * for the overlay tarball. The developer encrypts the tarball with the returned
  * public key and PUTs it directly to the object store; a test trigger then
- * references the upload id. This is invoked by the Platform-first
- * `test.relay.uploads.init` relay handler — the developer never reaches the
- * orchestrator's HTTP API directly.
+ * references the upload id. It is invoked by the `test.relay.uploads.init`
+ * relay handler (a run routed through the Platform) and by the direct
+ * test-run routes (`POST /api/v1/test/uploads/init`).
  */
 
 import { randomUUID, generateKeyPairSync } from 'node:crypto';
@@ -33,12 +33,17 @@ export interface InitTestUploadParams {
   compressedSize?: number;
   /** PAT/actor identity that owns this upload, written to `test_uploads.created_by`. */
   createdBy?: string | null;
-  /**
-   * When true, presign with the host-facing internal endpoint. When false (the
-   * Platform-relayed path), presign with the external/dev-reachable endpoint so
-   * a developer on a different network can PUT directly to the object store.
-   */
-  internal?: boolean;
+}
+
+/**
+ * The orchestrator has no object storage, so it cannot mint an upload URL.
+ * Callers answer it as "service unavailable" with the message as-is.
+ */
+export class TestUploadStorageUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TestUploadStorageUnavailableError';
+  }
 }
 
 /** Result of {@link initTestUpload}. */
@@ -58,8 +63,8 @@ export interface InitTestUploadDeps {
 /**
  * Mint an upload record and return a presigned PUT URL + ephemeral X25519
  * public key. The encryption keypair is generated per upload; the private key
- * is stored orchestrator-side for post-PUT decryption. The `internal` flag
- * selects the host-facing vs the external/dev-reachable presign endpoint.
+ * is stored orchestrator-side for post-PUT decryption. The URL is the
+ * developer-facing one (`CacheStorage.getInternalUploadUrl`).
  */
 export async function initTestUpload(
   deps: InitTestUploadDeps,
@@ -78,7 +83,7 @@ export async function initTestUpload(
   // returning an empty signedUrl that surfaces downstream as an opaque
   // "Failed to parse URL from " fetch error on the developer's machine.
   if (!deps.cacheStorage) {
-    throw new Error(
+    throw new TestUploadStorageUnavailableError(
       'This orchestrator has no object storage configured, so `kici run remote` ' +
         'is unavailable. Configure cache storage on the orchestrator (set ' +
         'KICI_STORAGE_TYPE to "s3" or "filesystem", plus the matching storage ' +
@@ -90,9 +95,7 @@ export async function initTestUpload(
   const sanitizedKey = sanitizeRoutingKey(routingKey);
   const storageKey = `test-uploads/${sanitizedKey}/${sha ?? 'unknown'}/${uploadId}.tar.gz.enc`;
 
-  const signedUrl = params.internal
-    ? await deps.cacheStorage.getInternalUploadUrl(storageKey)
-    : await deps.cacheStorage.getUploadUrl(storageKey);
+  const signedUrl = await deps.cacheStorage.getInternalUploadUrl(storageKey);
 
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
   await deps.db
@@ -116,7 +119,6 @@ export async function initTestUpload(
     routingKey,
     sha: sha ?? 'unknown',
     storageKey,
-    internal: !!params.internal,
   });
 
   return {

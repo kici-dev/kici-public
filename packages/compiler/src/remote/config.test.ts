@@ -195,6 +195,19 @@ describe('global config management', () => {
       expect(config.oidcIssuer).toBeUndefined();
     });
 
+    it('drops a direct target whose token is not a string', async () => {
+      const kiciDir = path.join(tempDir, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+      await fs.writeFile(
+        path.join(kiciDir, 'config'),
+        JSON.stringify({ direct: { url: 'https://ci.example.com', token: 42 } }),
+        { mode: 0o600 },
+      );
+
+      const config = await loadGlobalConfig();
+      expect(config.direct).toBeUndefined();
+    });
+
     it('throws a helpful error on corrupted JSON', async () => {
       const kiciDir = path.join(tempDir, '.kici');
       await fs.mkdir(kiciDir, { recursive: true });
@@ -314,6 +327,23 @@ describe('global config management', () => {
       expect(merged.defaultClusters).toEqual({ org_a: 'cluster-1', org_b: 'cluster-2' });
       const reloaded = await loadGlobalConfig();
       expect(reloaded.defaultClusters).toEqual({ org_a: 'cluster-1', org_b: 'cluster-2' });
+    });
+
+    it('round-trips a direct target with mode 0600', async () => {
+      await mergeGlobalConfig({ direct: { url: 'https://ci.example.com', token: 't-1' } });
+
+      const reloaded = await loadGlobalConfig();
+      // fails-when: sanitizeConfig strips the direct field
+      expect(reloaded.direct).toEqual({ url: 'https://ci.example.com', token: 't-1' });
+      const stat = await fs.stat(getConfigPath());
+      expect(stat.mode & 0o777).toBe(0o600);
+    });
+
+    it('merges oidcIssuer', async () => {
+      const merged = await mergeGlobalConfig({ oidcIssuer: 'https://auth.example.com' });
+      // fails-when: mergeGlobalConfig drops oidcIssuer, which sanitizeConfig keeps
+      expect(merged.oidcIssuer).toBe('https://auth.example.com');
+      expect((await loadGlobalConfig()).oidcIssuer).toBe('https://auth.example.com');
     });
 
     it('ignores undefined values in partial', async () => {

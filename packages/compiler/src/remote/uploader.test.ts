@@ -91,6 +91,52 @@ async function relink(dir: string, rel: string, text: string): Promise<void> {
   await fs.symlink(text, path.join(dir, rel));
 }
 
+/** Write `content` at `rel` under `dir`, creating its parent directories. */
+async function writeIn(dir: string, rel: string, content: string): Promise<void> {
+  await fs.mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
+  await fs.writeFile(path.join(dir, rel), content);
+}
+
+/** Extraction directories, removed after each test. */
+const extractDirs: string[] = [];
+
+/** Extract a tarball into a fresh temporary directory. */
+async function extractTarball(tarballPath: string): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-uploader-extract-'));
+  extractDirs.push(dir);
+  await tarExtract({ file: tarballPath, cwd: dir });
+  return dir;
+}
+
+/** The manifest the agent reads from the tarball. */
+async function readTarManifest(tarballPath: string): Promise<unknown> {
+  const root = await extractTarball(tarballPath);
+  return JSON.parse(
+    await fs.readFile(path.join(root, '.kici-overlay-tmp', 'manifest.json'), 'utf-8'),
+  );
+}
+
+/**
+ * Check the tarball the way the agent does: extract it, read the manifest at
+ * `.kici-overlay-tmp/manifest.json`, and hash each checksummed entry through
+ * its real path, which must stay inside the extraction root.
+ */
+async function expectAgentVerifies(tarballPath: string): Promise<void> {
+  const root = await fs.realpath(await extractTarball(tarballPath));
+  const manifest = JSON.parse(
+    await fs.readFile(path.join(root, '.kici-overlay-tmp', 'manifest.json'), 'utf-8'),
+  ) as { checksums: Record<string, string> };
+  for (const [file, expected] of Object.entries(manifest.checksums)) {
+    const real = await fs.realpath(path.join(root, file));
+    expect(real.startsWith(`${root}/`), file).toBe(true);
+    const actual = crypto
+      .createHash('sha256')
+      .update(await fs.readFile(real))
+      .digest('hex');
+    expect(actual, file).toBe(expected);
+  }
+}
+
 describe('overlay tarball creation', () => {
   let repoDir: string;
 
@@ -100,6 +146,7 @@ describe('overlay tarball creation', () => {
 
   afterEach(async () => {
     await fs.rm(repoDir, { recursive: true, force: true });
+    for (const dir of extractDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
   });
 
   describe('createOverlayTarball', () => {
@@ -284,14 +331,74 @@ describe('overlay tarball creation', () => {
       expect(getSizeWarning(bigSize)).toBeNull(); // Above error threshold, null for warning fn
     });
 
-    it('cleans up temporary manifest directory from repo', async () => {
+    it('never writes into the working tree', async () => {
       await fs.writeFile(path.join(repoDir, 'change.txt'), 'test\n');
+      const before = await fs.readdir(repoDir);
 
-      await createOverlayTarball(repoDir);
+      // fails-when: the manifest is staged inside repoRoot (mkdir → EACCES on a
+      // read-only root), which is what strands `.kici-overlay-tmp` when the CLI dies
+      await fs.chmod(repoDir, 0o555);
+      try {
+        const { tarballPath, manifest } = await createOverlayTarball(repoDir);
+        expect(await fs.readdir(repoDir)).toEqual(before);
+        expect(await readTarManifest(tarballPath)).toEqual(manifest);
+      } finally {
+        await fs.chmod(repoDir, 0o755);
+      }
+    });
 
-      // Temp manifest dir should be cleaned up
-      const entries = await fs.readdir(repoDir);
-      expect(entries).not.toContain('.kici-overlay-tmp');
+    it('ships the fresh manifest and never a stale .kici-overlay-tmp copy', async () => {
+      // A copy left behind by a CLI killed mid-pack, committed and then modified.
+      await writeIn(repoDir, '.kici-overlay-tmp/manifest.json', '{"sha":"stale"}\n');
+      await writeIn(repoDir, '.kici-overlay-tmp/extra.txt', 'stale\n');
+      commitAll(repoDir);
+      await writeIn(repoDir, '.kici-overlay-tmp/manifest.json', '{"sha":"staler"}\n');
+      await writeIn(repoDir, '.kici-overlay-tmp/untracked.txt', 'stale\n');
+      await fs.writeFile(path.join(repoDir, 'initial.txt'), 'changed\n');
+
+      for (const fullWorkingTree of [false, true]) {
+        // fails-when: the reserved directory is selected, so its manifest.json
+        // ships twice under one path and its checksum names the stale bytes
+        const { tarballPath, manifest } = await createOverlayTarball(repoDir, { fullWorkingTree });
+        const paths = await listTarFiles(tarballPath);
+        expect(paths.filter((p) => p.startsWith('.kici-overlay-tmp'))).toEqual([
+          '.kici-overlay-tmp/manifest.json',
+        ]);
+        expect(
+          Object.keys(manifest.checksums).filter((p) => p.startsWith('.kici-overlay-tmp')),
+        ).toEqual([]);
+        expect(manifest.deletions).toEqual([]);
+        expect(await readTarManifest(tarballPath)).toEqual(manifest);
+        // breaks-if-wrong: the ordinary change still ships and verifies
+        await expectAgentVerifies(tarballPath);
+        expect(manifest.checksums['initial.txt']).toBe(sha256Of('changed\n'));
+      }
+    });
+
+    it('ships a manifest-only tarball when the overlay is only deletions', async () => {
+      await fs.unlink(path.join(repoDir, 'initial.txt'));
+
+      const { tarballPath, manifest } = await createOverlayTarball(repoDir);
+
+      expect(await listTarFiles(tarballPath)).toEqual(['.kici-overlay-tmp/manifest.json']);
+      expect(manifest.deletions).toEqual(['initial.txt']);
+      expect(await readTarManifest(tarballPath)).toEqual(manifest);
+    });
+
+    it('produces a tarball the agent verifies, symlinks and hard links included', async () => {
+      await writeIn(repoDir, 'src/a.ts', 'export const a = 1;\n');
+      await writeIn(repoDir, 'docs/real.md', 'real\n');
+      await fs.symlink('../docs/real.md', path.join(repoDir, 'src/link.md'));
+      await fs.link(path.join(repoDir, 'src/a.ts'), path.join(repoDir, 'src/a-twin.ts'));
+
+      const { tarballPath, manifest } = await createOverlayTarball(repoDir, {
+        fullWorkingTree: true,
+      });
+
+      expect(manifest.checksums['src/link.md']).toBe(sha256Of('real\n'));
+      expect(manifest.checksums['src/a-twin.ts']).toBe(sha256Of('export const a = 1;\n'));
+      // breaks-if-wrong: every repository entry still ships beside the manifest
+      await expectAgentVerifies(tarballPath);
     });
   });
 
@@ -427,9 +534,8 @@ describe('overlay tarball creation', () => {
       return fs.realpath(dir);
     }
 
-    async function write(rel: string, content: string): Promise<void> {
-      await fs.mkdir(path.dirname(path.join(repoDir, rel)), { recursive: true });
-      await fs.writeFile(path.join(repoDir, rel), content);
+    function write(rel: string, content: string): Promise<void> {
+      return writeIn(repoDir, rel, content);
     }
 
     it('ships the unchanged target of a changed file symlink (overlay mode)', async () => {
@@ -682,6 +788,57 @@ describe('overlay tarball creation', () => {
       expect(manifest.checksums).toEqual({});
       expect(manifest).not.toHaveProperty('symlinks');
     });
+
+    it('packs a committed pnpm node_modules tree with hard-linked files', async () => {
+      // pnpm hard-links identical files, both to each other and to its store
+      // outside the repository, and links each package in by a relative
+      // directory symlink into `.pnpm`.
+      const store = await tempDir('kici-uploader-store-');
+      const pkgDir = 'node_modules/.pnpm/pkg@1.0.0/node_modules/pkg';
+      await write(`${pkgDir}/shared.d.ts`, 'export {};\n');
+      const names: string[] = [];
+      for (let i = 0; i < 12; i++) {
+        const own = `${pkgDir}/f${String(i).padStart(2, '0')}a.js`;
+        const twin = `${pkgDir}/f${String(i).padStart(2, '0')}b.d.ts`;
+        await write(own, `module ${i}\n`);
+        await fs.link(path.join(repoDir, `${pkgDir}/shared.d.ts`), path.join(repoDir, twin));
+        names.push(own, twin);
+      }
+      await fs.writeFile(path.join(store, 'stored.js'), 'stored\n');
+      await fs.link(path.join(store, 'stored.js'), path.join(repoDir, `${pkgDir}/stored.js`));
+      await fs.symlink('.pnpm/pkg@1.0.0/node_modules/pkg', path.join(repoDir, 'node_modules/pkg'));
+      await fs.symlink(
+        path.relative(path.join(repoDir, pkgDir), path.join(store, 'stored.js')),
+        path.join(repoDir, `${pkgDir}/outside.js`),
+      );
+      await fs.symlink('loop', path.join(repoDir, 'node_modules/loop'));
+      commitAll(repoDir);
+
+      // fails-when: node-tar parks the hard-linked files and its job table fills
+      // with entries that are never piped, so this promise never settles
+      const { tarballPath, manifest, warnings } = await createOverlayTarball(repoDir, {
+        fullWorkingTree: true,
+      });
+
+      const entries = await listTarEntries(tarballPath);
+      // breaks-if-wrong: each hard-linked path must still ship as its own content
+      for (const name of [...names, `${pkgDir}/shared.d.ts`, `${pkgDir}/stored.js`]) {
+        expect(entries.get(name), name).toBe(TarEntryType.File);
+      }
+      expect(manifest.checksums[`${pkgDir}/f05b.d.ts`]).toBe(sha256Of('export {};\n'));
+      expect(manifest.checksums[`${pkgDir}/stored.js`]).toBe(sha256Of('stored\n'));
+      expect(manifest.symlinks).toEqual({ 'node_modules/pkg': '.pnpm/pkg@1.0.0/node_modules/pkg' });
+      expect(entries.get(`${pkgDir}/outside.js`)).toBe(TarEntryType.SymbolicLink);
+      expect(warnings).toEqual([
+        'Not uploading these symbolic links, whose target does not exist: node_modules/loop. ' +
+          'The remote workspace does not contain them.',
+      ]);
+
+      const root = await extract(tarballPath);
+      expect(await fs.readFile(path.join(root, `${pkgDir}/f11b.d.ts`), 'utf-8')).toBe(
+        'export {};\n',
+      );
+    }, 30_000);
   });
 
   describe('getSizeWarning', () => {

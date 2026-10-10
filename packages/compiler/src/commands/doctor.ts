@@ -1,9 +1,9 @@
 /**
  * kici doctor — walk the onboarding funnel and diagnose where a developer's
  * setup breaks. Each check reports pass/warn/fail with the exact next command
- * to run. Composed entirely from client-side state (the stored config, one
- * authenticated infrastructure read, and local filesystem/git state) — no new
- * Platform API is required.
+ * to run. Composed from client-side state: the stored config, the run target
+ * (one `whoami` read for a direct orchestrator target), one authenticated
+ * Platform infrastructure read, and local filesystem/git state.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -20,11 +20,19 @@ import {
 import {
   canonicalizeLabelSet,
   canonicalizeMatcher,
+  formatLabelMatchers,
   matcherSatisfiedBy,
   type DiagnosticsInfrastructureResponse,
   type LabelMatcher,
 } from '@kici-dev/engine';
 import { loadGlobalConfig, type GlobalConfig } from '../remote/config.js';
+import {
+  DirectApiUnavailableError,
+  DirectRunClient,
+  type DirectWhoami,
+} from '../remote/direct-client.js';
+import { AuthenticationError, ConnectionError } from '../remote/platform-client.js';
+import { resolveRunTarget, type RunTargetResolution } from '../remote/target.js';
 import { resolveKiciDir } from '../execution/index.js';
 import {
   DashboardClient,
@@ -48,7 +56,71 @@ export type ProbeOutcome =
   | { ok: true; infra: DiagnosticsInfrastructureResponse }
   | { ok: false; kind: DashboardErrorKind; message: string };
 
+/** The outcome of the `whoami` probe against a direct orchestrator target. */
+type DirectProbe =
+  | { ok: true; whoami: DirectWhoami }
+  | { ok: false; kind: 'auth' | 'unreachable' | 'unavailable' | 'error'; message: string };
+
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Where a direct target came from, as the run-target row names it. */
+const DIRECT_SOURCE_LABEL: Record<'flag' | 'env' | 'saved', string> = {
+  flag: '--orchestrator-url',
+  env: 'KICI_ORCHESTRATOR_TOKEN',
+  saved: 'kici connect',
+};
+
+/** Check 0: where `kici run remote` sends a run, and whether a direct target answers. */
+function checkRunTarget(
+  resolution: RunTargetResolution,
+  probe: DirectProbe | null,
+): DoctorCheckBody {
+  const name = 'run-target';
+  if (!resolution.ok) {
+    return {
+      name,
+      status: 'fail',
+      message: resolution.error,
+      nextCommand: 'kici connect <url>  (or kici login)',
+    };
+  }
+  const target = resolution.target;
+  if (target.kind === 'platform') {
+    return { name, status: 'pass', message: `Platform login (${target.endpoint}).` };
+  }
+  const where = `Orchestrator ${target.url} (from ${DIRECT_SOURCE_LABEL[target.source]})`;
+  if (!probe || !probe.ok) {
+    const message = probe?.message ?? 'not checked';
+    return {
+      name,
+      status: 'fail',
+      message: `${where}: ${message}`,
+      ...(probe?.kind === 'auth' && { nextCommand: `kici connect ${target.url}` }),
+    };
+  }
+  const me = probe.whoami;
+  const who = `${me.subject ?? me.label}, role ${me.role}, ${me.mode} mode`;
+  if (!me.permissions.trigger) {
+    return {
+      name,
+      status: 'warn',
+      message: `${where} as ${who}: this token can follow runs, cannot start them.`,
+      nextCommand: `kici connect ${target.url}`,
+    };
+  }
+  return { name, status: 'pass', message: `${where} as ${who}.` };
+}
+
+/** A warning row for config fields that are deprecated, or null when there are none. */
+function checkDeprecatedConfig(config: GlobalConfig): DoctorCheckBody | null {
+  if (config.routingKey === undefined) return null;
+  return {
+    name: 'config',
+    status: 'warn',
+    message:
+      'The routingKey field in ~/.kici/config is deprecated and unused; delete it (removed in v1.0.0).',
+  };
+}
 
 /** Is a stored token + endpoint present (regardless of expiry)? */
 export function hasCredentials(config: GlobalConfig): boolean {
@@ -220,13 +292,9 @@ function requirementSatisfiedBy(req: LabelRequirement, labels: ReadonlySet<strin
   );
 }
 
-function describeMatcher(m: LabelMatcher): string {
-  return m.kind === 'regex' ? `/${m.source}/${m.flags}` : m.value;
-}
-
 function describeRequirement(req: LabelRequirement): string {
-  const base = req.runsOn.map(describeMatcher).join(' + ');
-  return req.exclude.length > 0 ? `${base} − ${req.exclude.map(describeMatcher).join(', ')}` : base;
+  const base = formatLabelMatchers(req.runsOn, ' + ');
+  return req.exclude.length > 0 ? `${base} − ${formatLabelMatchers(req.exclude)}` : base;
 }
 
 /**
@@ -306,6 +374,25 @@ export interface DoctorDeps {
   probe: (config: GlobalConfig) => Promise<ProbeOutcome | null>;
   gatherLockState: (kiciDir: string) => Promise<LockState>;
   now: () => number;
+  /** Probe a direct orchestrator target; defaults to `GET /api/v1/test/whoami`. */
+  probeDirect?: (url: string, token: string) => Promise<DirectProbe>;
+  /** The environment the run target resolves against; defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
+}
+
+/** Default direct probe: one `whoami` read, classified for the run-target row. */
+async function defaultProbeDirect(url: string, token: string): Promise<DirectProbe> {
+  try {
+    return { ok: true, whoami: await new DirectRunClient({ url, token }).whoami() };
+  } catch (err) {
+    const message = toErrorMessage(err);
+    if (err instanceof AuthenticationError) return { ok: false, kind: 'auth', message };
+    if (err instanceof ConnectionError) return { ok: false, kind: 'unreachable', message };
+    if (err instanceof DirectApiUnavailableError) {
+      return { ok: false, kind: 'unavailable', message };
+    }
+    return { ok: false, kind: 'error', message };
+  }
 }
 
 /** Newest mtime (ms) across every *.ts under the workflows directory, or 0. */
@@ -437,18 +524,39 @@ export async function doctorCommand(
   const now = deps.now();
   const lockState = await deps.gatherLockState(options.kiciDir ?? '.kici');
 
-  const probeStart = deps.now();
-  const probe = await deps.probe(config);
-  const probeMs = Math.max(0, deps.now() - probeStart);
+  const resolution = resolveRunTarget({ env: deps.env ?? process.env, config });
+  const direct = resolution.ok && resolution.target.kind === 'direct' ? resolution.target : null;
+  const directStart = deps.now();
+  const directProbe = direct
+    ? await (deps.probeDirect ?? defaultProbeDirect)(direct.url, direct.token)
+    : null;
+  const directMs = Math.max(0, deps.now() - directStart);
+  const runTarget = { ...checkRunTarget(resolution, directProbe), durationMs: directMs };
 
-  const checks: DoctorCheckResult[] = [
-    { ...checkLogin(config, now), durationMs: 0 },
-    { ...checkActiveOrg(config), durationMs: 0 },
-    { ...checkLockFile(lockState), durationMs: 0 },
-    { ...checkLiveToken(probe), durationMs: probeMs },
-    { ...checkOrchestrator(probe), durationMs: 0 },
-    { ...checkLabels(lockState.lock, probe), durationMs: 0 },
-  ];
+  // A developer who runs only against an orchestrator has no Platform login,
+  // and telling them to `kici login` would send them the wrong way.
+  const platformRows = hasCredentials(config) || !direct;
+  const lockFile = { ...checkLockFile(lockState), durationMs: 0 };
+  const deprecated = checkDeprecatedConfig(config);
+
+  let checks: DoctorCheckResult[];
+  if (platformRows) {
+    const probeStart = deps.now();
+    const probe = await deps.probe(config);
+    const probeMs = Math.max(0, deps.now() - probeStart);
+    checks = [
+      runTarget,
+      { ...checkLogin(config, now), durationMs: 0 },
+      { ...checkActiveOrg(config), durationMs: 0 },
+      lockFile,
+      { ...checkLiveToken(probe), durationMs: probeMs },
+      { ...checkOrchestrator(probe), durationMs: 0 },
+      { ...checkLabels(lockState.lock, probe), durationMs: 0 },
+    ];
+  } else {
+    checks = [runTarget, lockFile];
+  }
+  if (deprecated) checks.push({ ...deprecated, durationMs: 0 });
 
   const response: DiagnoseResponse & { checks: DoctorCheckResult[] } = {
     status: deriveDiagnoseOverall(checks),

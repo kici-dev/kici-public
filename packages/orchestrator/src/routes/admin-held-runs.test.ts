@@ -27,6 +27,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import {
+  AccessLogAction,
   ApprovalDecision,
   HoldScope,
   HoldType,
@@ -397,24 +398,32 @@ describe('admin held-run routes', () => {
       expect(h.decisions[0].approver_user_id).not.toBe('alice');
     });
 
-    it('refuses a hold whose clauses the operator token cannot satisfy, and dispatches nothing', async () => {
-      const h = makeApp({
-        holds: [
-          makeHold({
-            approval_requirement: {
-              clauses: [{ user: 'alice' }],
-              expiresAt: '2026-08-29T00:00:00Z',
-              reason: 'r',
-            },
-          }),
-        ],
+    // breaks-if-wrong (autoApprove): the --approve-all marker renames the audit
+    // record, never the gate — an ineligible hold still refuses with it set.
+    for (const [label, marker, action] of [
+      ['', {}, AccessLogAction.enum['held_run.approve']],
+      [' (with autoApprove)', { autoApprove: true }, AccessLogAction.enum['held_run.auto_approve']],
+    ] as const) {
+      it(`refuses a hold whose clauses the operator token cannot satisfy, and dispatches nothing${label}`, async () => {
+        const h = makeApp({
+          holds: [
+            makeHold({
+              approval_requirement: {
+                clauses: [{ user: 'alice' }],
+                expiresAt: '2026-08-29T00:00:00Z',
+                reason: 'r',
+              },
+            }),
+          ],
+        });
+        const res = await h.request({ ...approveBody, ...marker });
+        expect(res.status).toBe(409);
+        expect((await res.json()).status).toBe('ineligible');
+        expect(h.onJobRelease).not.toHaveBeenCalled();
+        expect(h.holds[0].status).toBe(HeldRunStatus.Pending);
+        expect(h.auditRows).toEqual([expect.objectContaining({ action, outcome: 'denied' })]);
       });
-      const res = await h.request(approveBody);
-      expect(res.status).toBe(409);
-      expect((await res.json()).status).toBe('ineligible');
-      expect(h.onJobRelease).not.toHaveBeenCalled();
-      expect(h.holds[0].status).toBe(HeldRunStatus.Pending);
-    });
+    }
 
     it('satisfies a {team} clause the stored approval directory places the token in', async () => {
       const h = makeApp({
@@ -475,6 +484,48 @@ describe('admin held-run routes', () => {
         source: 'admin_http',
         outcome: 'allowed',
       });
+    });
+  });
+
+  describe('a direct `kici run --approve-all` (autoApprove)', () => {
+    // fails-when: the route ignores `autoApprove` — the row is then the
+    // interactive `held_run.approve`.
+    it('audits as held_run.auto_approve, attributed to the token, and still releases', async () => {
+      const h = makeApp({ userId: 'ops-token' });
+      const res = await h.request({ ...approveBody, autoApprove: true });
+      expect(res.status).toBe(200);
+      expect(h.onJobRelease).toHaveBeenCalledTimes(1);
+      expect(h.auditRows.map((r) => r.action)).toEqual([
+        AccessLogAction.enum['held_run.auto_approve'],
+      ]);
+      expect(h.auditRows[0]).toMatchObject({
+        actor: { type: 'service_account', id: 'ops-token' },
+        target: { type: 'held_run', id: 'hold-1' },
+        source: 'admin_http',
+        outcome: 'allowed',
+      });
+    });
+
+    // breaks-if-wrong: the marker stays opt-in — an approve without it, or
+    // with it false, is still the interactive action.
+    for (const marker of [{}, { autoApprove: false }]) {
+      it(`audits as held_run.approve with ${JSON.stringify(marker)}`, async () => {
+        const h = makeApp({});
+        await h.request({ ...approveBody, ...marker });
+        expect(h.auditRows.map((r) => r.action)).toEqual([
+          AccessLogAction.enum['held_run.approve'],
+        ]);
+      });
+    }
+
+    it('never turns a reject into an approval action', async () => {
+      const h = makeApp({});
+      await h.request({
+        ...approveBody,
+        decision: ApprovalDecision.enum.reject,
+        autoApprove: true,
+      });
+      expect(h.auditRows.map((r) => r.action)).toEqual([AccessLogAction.enum['held_run.reject']]);
     });
   });
 

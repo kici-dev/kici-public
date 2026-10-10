@@ -43,7 +43,7 @@ The policy state is visible at three layers in the UI:
 - A **per-page banner** on any page containing at least one disabled operation, listing every disabled op on that page and its CLI equivalent.
 - The **Security policy page**, which renders the whole policy as one matrix.
 
-The Security policy page (Settings → Security → Dashboard policy) renders the full 27-row read-only matrix with the current state and the `kici-admin` command for each row. The policy itself cannot be changed from the dashboard — the orchestrator operator manages it via `kici-admin org-settings dashboard-writes`. See [Dashboard-write policy](../../operator/security/dashboard-write-policy.md) for the operator-side details.
+The Security policy page is the **Security** tab of an orchestrator's per-cluster view. **Settings → Orchestrator security** opens the same page for the org's orchestrator, or asks you to pick one when the org has several. The page renders every dashboard write operation as a read-only matrix, with the current state and the `kici-admin` command for each row. The policy itself cannot be changed from the dashboard — the orchestrator operator manages it via `kici-admin org-settings dashboard-writes`. See [Dashboard-write policy](../../operator/security/dashboard-write-policy.md) for the operator-side details.
 
 ## Approval queue
 

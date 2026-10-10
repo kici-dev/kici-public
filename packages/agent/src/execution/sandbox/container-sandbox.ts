@@ -52,6 +52,7 @@ import { runnerLaunchArgv, KICI_RUNTIME_NODE_DIR } from './kici-runtime.js';
 import { assertImageRunnable } from './image-preflight.js';
 import { describeRunnerCrash, MAX_RAW_STDOUT_LINES, pushBounded } from './runner-crash.js';
 import { c as tarCreate } from 'tar';
+import { singleLinkTarCaches } from '@kici-dev/core/tar-single-link';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { buildContainerHardening, type SandboxHardeningOptions } from './container-hardening.js';
 import {
@@ -855,8 +856,13 @@ export class ContainerSandbox implements ExecutionSandbox {
     const started = Date.now();
     try {
       // `portable` drops uid/gid and mtime noise so the archive lands owned by
-      // the container user rather than replaying host ownership.
-      const stream = tarCreate({ cwd: workDir, portable: true }, ['.']);
+      // the container user rather than replaying host ownership. A workdir with
+      // a pnpm `node_modules` holds hard-linked files; the single-link caches
+      // copy each one in as a regular file so node-tar never stalls on them.
+      const stream = tarCreate(
+        { cwd: workDir, portable: true, ...(await singleLinkTarCaches(workDir, ['.'])) },
+        ['.'],
+      );
 
       // The stream errors ASYNCHRONOUSLY (an unreadable or missing workDir
       // surfaces after tarCreate returned), so without racing it the failure

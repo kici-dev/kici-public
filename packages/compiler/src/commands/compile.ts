@@ -20,6 +20,9 @@ import {
 } from '../lockfile/index.js';
 import { formatError, isCompilerError } from '../errors/index.js';
 import { SCHEMA_VERSION, type LockFile } from '../types.js';
+import type { GlobalConfig } from '../remote/config.js';
+import { resolveRunTarget } from '../remote/target.js';
+import { hasLocalSecretFiles } from '../remote/types-sources.js';
 
 /** Options for the compile command */
 export interface CompileOptions {
@@ -35,6 +38,11 @@ export interface CompileOptions {
    * errors are still reported.
    */
   quiet?: boolean;
+  /**
+   * The `--orchestrator-url` of the command that compiles first (`kici run
+   * remote`), so the types refresh reads the same orchestrator the run goes to.
+   */
+  orchestratorUrl?: string;
 }
 
 /**
@@ -176,28 +184,29 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
         );
       }
 
-      // Auto-regenerate types when authenticated against the Platform
-      // (non-blocking). Requires a token, a Platform endpoint, and an active
-      // org — the same context DashboardClient needs to reach the org's
-      // contexts through the relay.
+      // Auto-regenerate types (non-blocking) whenever `kici types` has a
+      // source: a direct orchestrator target, a Platform login with an active
+      // org, or local secret files.
       try {
         const { loadGlobalConfig } = await import('../remote/config.js');
         const config = await loadGlobalConfig();
-        const hasToken = Boolean(config.pat);
-        const hasEndpoint = Boolean(config.platformEndpoint);
-        if (hasToken && hasEndpoint && config.activeOrgId) {
+        if (
+          await shouldRefreshTypes(config, absoluteKiciDir, process.env, options.orchestratorUrl)
+        ) {
           const { typesCommand } = await import('./types.js');
           // The directory this compile actually read, not the raw option. The
           // declarations land in the same tree the lock file's `contentHash`
           // covers, so they must be written where that tree's exclusion can
           // see them.
-          await typesCommand({ kiciDir: absoluteKiciDir, quiet: options.quiet });
+          await typesCommand({
+            kiciDir: absoluteKiciDir,
+            quiet: options.quiet,
+            orchestratorUrl: options.orchestratorUrl,
+          });
         }
       } catch {
         // Non-blocking -- warn and continue
-        logger.warn(
-          pc.yellow('Could not refresh types (Platform unreachable). Compilation succeeded.'),
-        );
+        logger.warn(pc.yellow('Could not refresh types. Compilation succeeded.'));
       }
     } else {
       // --check: additionally run a tsc --noEmit type-check over the workflow
@@ -231,4 +240,20 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     }
     return false;
   }
+}
+
+/**
+ * Whether `kici compile` refreshes the secret type declarations: when a
+ * direct orchestrator target, a Platform login with an active organization,
+ * or a local secret file exists. A bare checkout with none of these skips it.
+ */
+export async function shouldRefreshTypes(
+  config: GlobalConfig,
+  kiciDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  flagUrl?: string,
+): Promise<boolean> {
+  const resolved = resolveRunTarget({ flagUrl, env, config });
+  if (resolved.ok && (resolved.target.kind === 'direct' || config.activeOrgId)) return true;
+  return hasLocalSecretFiles(kiciDir);
 }

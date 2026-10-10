@@ -45,7 +45,7 @@ import type {
   LabelMatcher,
 } from '@kici-dev/engine';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
-import { resolveWhenToRunOn } from '@kici-dev/engine';
+import { formatLabelMatcher, resolveWhenToRunOn } from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
 
 /**
@@ -437,7 +437,7 @@ async function serializeMatrix(
       workflow: { name: ctx.workflowName },
       job: {
         name: jobName,
-        runsOn: runsOn.map((m) => (m.kind === 'exact' ? m.value : `/${m.source}/${m.flags}`)),
+        runsOn: runsOn.map(formatLabelMatcher),
       },
     },
     log: ctx.log,

@@ -45,6 +45,8 @@ export interface AuthTokenInfo {
   role: Role;
   routingKey: string | null;
   label: string;
+  /** The intended holder recorded at `token create --subject`, when one was. */
+  subject?: string | null;
 }
 
 /** The slice of TokenManager this middleware needs (keeps tests trivial to fake). */

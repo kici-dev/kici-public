@@ -21,14 +21,20 @@ import {
   AccessDeniedError,
   ConnectionError,
   NotFoundError,
-  type ClusterTarget,
   type PlatformRunLogsResponse,
   type PlatformRunStatusResponse,
 } from '../remote/platform-client.js';
+import { DirectRunClient, HoldsUnavailableError } from '../remote/direct-client.js';
+import {
+  createDirectTransport,
+  createPlatformTransport,
+  type RunRemoteTransport,
+} from '../remote/run-transport.js';
+import { resolveRunTarget } from '../remote/target.js';
 import { compileFixtures, filterFixtures, type CompiledFixture } from '../fixtures/compiler.js';
 import { describeEvent } from '../fixtures/describe-event.js';
 import { runFixturePicker, FixturePickerCancelledError } from '../fixtures/picker.js';
-import { createOverlayTarball, getSizeWarning, uploadTarball } from '../remote/uploader.js';
+import { createOverlayTarball, getSizeWarning } from '../remote/uploader.js';
 import {
   formatSummary,
   formatErrorHighlight,
@@ -41,11 +47,6 @@ import { formatJunitResult } from '../remote/output/junit.js';
 import { RunHistory } from '../remote/history.js';
 import { buildEncryptedSecrets } from '../remote/secret-upload.js';
 import { buildLocalRepoIdentity } from '../remote/local-repo-identity.js';
-import {
-  resolveHeldRunContext,
-  listHeldRunsForRun,
-  type HeldRunContext,
-} from './held-run-client.js';
 import { handleNewHolds } from './run-hold-watch.js';
 import { compileCommand } from './compile.js';
 import { confirm as inquirerConfirm } from '@inquirer/prompts';
@@ -190,12 +191,15 @@ async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolea
       check: false,
       verbose: options.debug ?? false,
       quiet: pureStdout,
+      // The types refresh reads the orchestrator this run goes to, so a
+      // direct run never reaches a saved Platform login.
+      orchestratorUrl: options.orchestratorUrl,
     });
   return pureStdout ? withStdoutOnStderr(compile) : compile();
 }
 
 /**
- * Run fixtures remotely, routed through the Platform.
+ * Run fixtures remotely, through the Platform or straight to an orchestrator.
  */
 export async function runRemoteCommand(
   fixture: string | undefined,
@@ -318,11 +322,58 @@ function listFixtures(fixtures: CompiledFixture[]): boolean {
   return true;
 }
 
-/** Resolved Platform context: an authenticated client + the target org/cluster. */
-interface PlatformContext {
-  client: PlatformRunClient;
-  orgId: string;
-  target: ClusterTarget;
+/** Write a warning line to stderr, so a `--json` stdout stays pure. */
+function warnStderr(message: string): void {
+  process.stderr.write(`${pc.yellow(message)}\n`);
+}
+
+/** Warn about run flags that are accepted but have no effect. */
+function warnDeprecatedRunFlags(options: RemoteRunOptions): void {
+  if (options.routingKey) {
+    warnStderr(
+      '--routing-key is deprecated and has no effect: the orchestrator chooses the routing key. It will be removed in v1.0.0.',
+    );
+  }
+}
+
+/** Warn that the Platform-only targeting flags do not apply to a direct run. */
+function warnIgnoredForDirect(options: RemoteRunOptions): void {
+  const flags = [options.org && '--org', options.orchestrator && '--orchestrator'].filter(Boolean);
+  warnStderr(
+    `${flags.join(' and ')} ignored: a direct run goes to one orchestrator, and the orchestrator chooses the organization.`,
+  );
+}
+
+/**
+ * Resolve where this run goes and return the transport that reaches it.
+ *
+ * The target comes from `resolveRunTarget` (flag, environment, saved direct
+ * target, Platform login). A direct target is verified with `whoami` first, so
+ * a token that cannot start runs stops here, before anything is uploaded.
+ */
+async function resolveRunContext(
+  config: GlobalConfig,
+  options: RemoteRunOptions,
+): Promise<RunRemoteTransport | null> {
+  warnDeprecatedRunFlags(options);
+  const resolved = resolveRunTarget({ flagUrl: options.orchestratorUrl, env: process.env, config });
+  if (!resolved.ok) {
+    logger.error(pc.red(resolved.error));
+    return null;
+  }
+  if (resolved.target.kind === 'platform') return resolvePlatformTransport(config, options);
+  if (options.org || options.orchestrator) warnIgnoredForDirect(options);
+  const client = new DirectRunClient({ url: resolved.target.url, token: resolved.target.token });
+  const whoami = await client.whoami();
+  if (!whoami.permissions.trigger) {
+    logger.error(
+      pc.red(
+        `The token for ${client.url} has role ${whoami.role}, which cannot start runs. Use an owner or admin token.`,
+      ),
+    );
+    return null;
+  }
+  return createDirectTransport({ client, whoami });
 }
 
 /**
@@ -332,10 +383,10 @@ interface PlatformContext {
  * Cluster resolution: `--orchestrator` → `config.defaultClusters[orgId]` →
  * omit and let the Platform sole-select (or return a 422 the CLI surfaces).
  */
-function resolvePlatformContext(
+function resolvePlatformTransport(
   config: GlobalConfig,
   options: RemoteRunOptions,
-): PlatformContext | null {
+): RunRemoteTransport | null {
   const token = config.pat;
   if (!token) {
     logger.error(pc.red('Not authenticated. Run `kici login` to authenticate.'));
@@ -360,15 +411,17 @@ function resolvePlatformContext(
   const orchestrator = options.orchestrator;
   const defaultCluster = config.defaultClusters?.[orgId];
 
-  return {
+  return createPlatformTransport({
     client: new PlatformRunClient({ platformEndpoint: config.platformEndpoint, token }),
     orgId,
     target: { orchestrator, defaultCluster },
-  };
+    endpoint: config.platformEndpoint,
+    token,
+  });
 }
 
 /**
- * Run fixtures remotely against the Platform.
+ * Run fixtures remotely, through the Platform or straight to an orchestrator.
  */
 async function runFixturesRemotely(
   fixtures: CompiledFixture[],
@@ -377,7 +430,7 @@ async function runFixturesRemotely(
   if (!(await compileBeforeRemoteRun(options))) return false;
 
   const config = await loadGlobalConfig();
-  const ctx = resolvePlatformContext(config, options);
+  const ctx = await resolveRunContext(config, options);
   if (!ctx) return false;
 
   // --json implies --quiet (only structured JSON goes to stdout)
@@ -389,15 +442,14 @@ async function runFixturesRemotely(
   await history.load();
 
   if (!options.quiet) {
-    logger.info(pc.gray(`Platform: ${config.platformEndpoint}`));
-    logger.info(pc.gray(`Organization: ${ctx.orgId}`));
+    for (const line of ctx.banner) logger.info(pc.gray(line));
     logger.info(pc.gray(`Fixtures: ${fixtures.length} to run\n`));
   }
 
   const results: RemoteRunResult[] = [];
 
   if (options.parallel && fixtures.length > 1) {
-    const promises = fixtures.map((f) => runSingleFixture(f, ctx, options, config, history));
+    const promises = fixtures.map((f) => runSingleFixture(f, ctx, options, history));
     const settled = await Promise.allSettled(promises);
     for (const s of settled) {
       if (s.status === 'fulfilled') {
@@ -413,10 +465,15 @@ async function runFixturesRemotely(
     }
   } else {
     for (const f of fixtures) {
-      const result = await runSingleFixture(f, ctx, options, config, history);
+      const result = await runSingleFixture(f, ctx, options, history);
       results.push(result);
-      // Fail fast on rejected
-      if (result.status === 'failed' || result.status === 'error') {
+      // Fail fast, and stop after a cancel: Ctrl-C ends the whole batch, not
+      // only the fixture that was running.
+      if (
+        result.status === 'failed' ||
+        result.status === 'error' ||
+        result.status === 'cancelled'
+      ) {
         break;
       }
     }
@@ -511,8 +568,8 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
     );
   }
 
-  // Platform-first runs always carry the compiled lock inline: the run is
-  // relayed under the `remote:<orgId>` anchor, which resolves the org but has
+  // Remote runs always carry the compiled lock inline, on either transport:
+  // the run lands under the `remote:<orgId>` anchor, which resolves the org but has
   // no webhook provider to fetch the lock from a git host. The dev's local
   // compiled lock is the authority for a test run of their working tree.
   const inlineLockFile = await readFile(path.join(kiciDir, 'kici.lock.json'), 'utf-8');
@@ -533,11 +590,11 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
 }
 
 /**
- * Init the upload (Platform) and PUT the encrypted tarball directly to the
+ * Init the upload (control plane) and PUT the encrypted tarball directly to the
  * object store (data plane). Returns the upload id + the encryption keys.
  */
 async function initAndUpload(
-  ctx: PlatformContext,
+  ctx: RunRemoteTransport,
   overlay: Awaited<ReturnType<typeof prepareOverlay>>,
   options: RemoteRunOptions,
 ): Promise<{ uploadId: string; publicKey: string; cliPublicKey: string }> {
@@ -545,7 +602,7 @@ async function initAndUpload(
     logger.info(pc.gray('Initializing upload...'));
   }
 
-  const upload = await ctx.client.initUpload(ctx.orgId, ctx.target, {
+  const upload = await ctx.initUpload({
     sha: overlay.summary.sha,
     fileCount: overlay.summary.fileCount,
     compressedSize: overlay.summary.compressedSize,
@@ -555,7 +612,7 @@ async function initAndUpload(
     logger.info(pc.gray('Uploading overlay...'));
   }
 
-  const uploadResult = await uploadTarball({
+  const uploadResult = await ctx.uploadTarball({
     tarballPath: overlay.tarballPath,
     signedUrl: upload.signedUrl,
     orchestratorPublicKey: Buffer.from(upload.publicKey, 'base64'),
@@ -569,13 +626,12 @@ async function initAndUpload(
 }
 
 /**
- * Run a single fixture remotely through the Platform.
+ * Run a single fixture remotely over the resolved transport.
  */
 async function runSingleFixture(
   fixture: CompiledFixture,
-  ctx: PlatformContext,
+  ctx: RunRemoteTransport,
   options: RemoteRunOptions,
-  config: GlobalConfig,
   history: RunHistory,
 ): Promise<RemoteRunResult> {
   const opts =
@@ -617,7 +673,7 @@ async function runSingleFixture(
       uploaded.publicKey,
     );
 
-    const triggerResult = await ctx.client.trigger(ctx.orgId, ctx.target, {
+    const triggerResult = await ctx.trigger({
       fixtureId: fixture.id,
       event,
       uploadId: uploaded.uploadId,
@@ -673,7 +729,7 @@ async function runSingleFixture(
       fixtureId: fixture.id,
       status: 'running',
       startedAt: new Date().toISOString(),
-      endpoint: config.platformEndpoint ?? '',
+      endpoint: ctx.endpoint,
     });
 
     // --no-wait: print runId and return immediately
@@ -692,7 +748,7 @@ async function runSingleFixture(
 
     return result;
   } catch (error) {
-    return handleRunError(fixture.id, error, options);
+    return handleRunError(fixture.id, error, options, ctx.kind);
   }
 }
 
@@ -701,6 +757,7 @@ function handleRunError(
   fixtureId: string,
   error: unknown,
   options: RemoteRunOptions,
+  transport: RunRemoteTransport['kind'],
 ): RemoteRunResult {
   if (error instanceof AmbiguousClusterError) {
     logger.error(
@@ -712,7 +769,14 @@ function handleRunError(
   } else if (error instanceof NoClusterError) {
     logger.error(pc.red('No orchestrator is connected for this organization.'));
   } else if (error instanceof AuthenticationError) {
-    logger.error(pc.red('Authentication failed. Run `kici login` to re-authenticate.'));
+    // The direct client's message already names the orchestrator-token remedy.
+    logger.error(
+      pc.red(
+        transport === 'direct'
+          ? error.message
+          : 'Authentication failed. Run `kici login` to re-authenticate.',
+      ),
+    );
   } else if (error instanceof AccessDeniedError) {
     logger.error(pc.red(`Access denied: ${error.message}`));
   } else if (error instanceof ConnectionError) {
@@ -725,14 +789,14 @@ function handleRunError(
 }
 
 /**
- * Poll the Platform for run completion, streaming log lines as they arrive.
+ * Poll the transport for run completion, streaming log lines as they arrive.
  *
  * Advances a monotonic line-offset cursor: each `runLogs(cursor)`
  * returns the next chunk + `nextCursor`; the run is done only when the status
  * is terminal and the log stream has drained.
  */
 async function pollRunToCompletion(
-  ctx: PlatformContext,
+  ctx: RunRemoteTransport,
   runId: string,
   fixtureId: string,
   options: RemoteRunOptions,
@@ -742,36 +806,36 @@ async function pollRunToCompletion(
   const tailLines: string[] = [];
   const MAX_TAIL = 50;
 
-  // Set up Ctrl+C cancel
-  let cancelled = false;
-  const cancelHandler = async () => {
-    if (cancelled) return;
-    cancelled = true;
-    if (!options.quiet) logger.info(pc.yellow('\nCancelling test run...'));
-    try {
-      await ctx.client.cancel(ctx.orgId, runId, ctx.target);
-    } catch {
-      // best effort
+  // Ctrl-C cancels the run. The poll loop stops, and the command returns only
+  // once the cancel request has settled; a second Ctrl-C exits at once.
+  let cancelRequest: Promise<void> | null = null;
+  const cancelHandler = () => {
+    if (!cancelRequest) {
+      cancelRequest = requestRunCancel(ctx, runId, options);
+    } else {
+      process.stderr.write(
+        pc.yellow(`Exiting without waiting. Run ${runId} may still be running.\n`),
+      );
+      process.exit(SIGINT_EXIT_CODE);
     }
   };
   process.on('SIGINT', cancelHandler);
 
   try {
     let lastStatus: PlatformRunStatusResponse | null = null;
-    // Holds observed so far (so we prompt / notify once per hold).
-    const seenHolds = new Set<string>();
-    // Resolved lazily on the first hold so a hold-free run pays no cost.
-    let heldCtx: HeldRunContext | null | undefined;
+    // Holds observed so far (so we prompt / notify once per hold), and whether
+    // this transport has said it cannot list holds for this run.
+    const holdState: HoldWatchState = { seen: new Set<string>(), unavailable: false };
 
     // Flipped by the first successful read. Until then a 404 is treated as
     // "the Platform has not seen this run yet" (see RUN_VISIBILITY_GRACE_MS).
     let runSeen = false;
 
-    while (!cancelled) {
+    while (!cancelRequest) {
       let logs: PlatformRunLogsResponse;
       try {
-        logs = await ctx.client.runLogs(ctx.orgId, runId, cursor, ctx.target);
-        lastStatus = await ctx.client.runStatus(ctx.orgId, runId, ctx.target);
+        logs = await ctx.logs(runId, cursor);
+        lastStatus = await ctx.status(runId);
       } catch (err) {
         if (
           err instanceof NotFoundError &&
@@ -804,18 +868,13 @@ async function pollRunToCompletion(
       // stderr (keeping stdout pure JSON) and forces the non-interactive path so
       // --approve-all auto-approves instead of the run hanging on a gate.
       if (!terminal) {
-        await watchRunHolds(
-          runId,
-          seenHolds,
-          () => heldCtx,
-          (c) => (heldCtx = c),
-          options,
-        );
+        await watchRunHolds(runId, holdState, ctx, options);
       }
 
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
 
+    await cancelRequest;
     return {
       fixtureId,
       runId,
@@ -824,51 +883,112 @@ async function pollRunToCompletion(
       jobs: jobsFromStatus(lastStatus),
     };
   } finally {
+    // A Ctrl-C during the last poll tick still sends its cancel before the
+    // command reports and exits.
+    if (cancelRequest) await cancelRequest;
     process.removeListener('SIGINT', cancelHandler);
   }
 }
 
+/** How long Ctrl-C waits for the orchestrator to answer a cancel request. */
+const CANCEL_REQUEST_TIMEOUT_MS = 15_000;
+
+/** Exit code of a second Ctrl-C: 128 + SIGINT, the shell convention. */
+const SIGINT_EXIT_CODE = 130;
+
 /**
- * Fetch this run's pending holds and surface them to the operator. The held-run
- * context is resolved lazily (cached across ticks via the getter/setter). A
- * resolution / fetch failure is swallowed — hold-visibility is best-effort and
- * must never abort the run watch.
+ * Ask the orchestrator to cancel `runId` and report the outcome. Never throws:
+ * a failed or unanswered request is reported, and the command still ends.
  */
-async function watchRunHolds(
+export async function requestRunCancel(
+  ctx: Pick<RunRemoteTransport, 'cancel'>,
   runId: string,
-  seenHolds: Set<string>,
-  getCtx: () => HeldRunContext | null | undefined,
-  setCtx: (c: HeldRunContext | null) => void,
+  options: Pick<RemoteRunOptions, 'quiet'>,
+  timeoutMs = CANCEL_REQUEST_TIMEOUT_MS,
+): Promise<void> {
+  // Quiet / --json keeps stdout for the result, so the notes go to stderr.
+  const note = (line: string): void => {
+    if (options.quiet) process.stderr.write(`${line}\n`);
+    else logger.info(line);
+  };
+  note(pc.yellow(`\nCancelling run ${runId}... Press Ctrl-C again to exit without waiting.`));
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const answer = await Promise.race([
+      ctx.cancel(runId),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`the orchestrator did not answer within ${timeoutMs / 1000}s`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+    note(
+      pc.yellow(
+        answer.cancelled
+          ? `Cancelled run ${runId}.`
+          : `Run ${runId} had already finished; nothing to cancel.`,
+      ),
+    );
+  } catch (err) {
+    process.stderr.write(
+      `${pc.red(`Could not cancel run ${runId}: ${toErrorMessage(err)}. The run may still be running.`)}\n`,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Hold bookkeeping carried across poll ticks. */
+export interface HoldWatchState {
+  /** Hold ids already shown (prompted or notified once each). */
+  seen: Set<string>;
+  /** Set once the transport says it cannot list holds; listing then stops. */
+  unavailable: boolean;
+}
+
+/**
+ * Fetch this run's pending holds and surface them to the operator, through the
+ * transport's hold access. A transport that cannot list holds here says so
+ * once (`HoldsUnavailableError`) and is not asked again. Any other failure is
+ * swallowed: hold-visibility is best-effort and must never abort the run watch.
+ */
+export async function watchRunHolds(
+  runId: string,
+  state: HoldWatchState,
+  transport: Pick<RunRemoteTransport, 'kind' | 'holds'>,
   options: RemoteRunOptions,
 ): Promise<void> {
+  if (state.unavailable) return;
+  const quiet = Boolean(options.quiet);
+  // Quiet / --json: never block on a stdin prompt (would hang the machine-
+  // readable run) — force the notify path — and never write hold text to
+  // stdout (the pure-JSON channel) — route it to stderr.
+  const output = quiet
+    ? (line: string) => void process.stderr.write(line + '\n')
+    : (line: string) => logger.info(line);
   try {
-    let ctx = getCtx();
-    if (ctx === undefined) {
-      ctx = await resolveHeldRunContext();
-      setCtx(ctx);
-    }
-    if (!ctx) return;
-    const holds = await listHeldRunsForRun(ctx, runId);
+    const holds = await transport.holds.list(runId);
     if (holds.length === 0) return;
 
-    const quiet = Boolean(options.quiet);
-    // Quiet / --json: never block on a stdin prompt (would hang the machine-
-    // readable run) — force the notify path — and never write hold text to
-    // stdout (the pure-JSON channel) — route it to stderr.
     const isTty = quiet ? false : Boolean(process.stdin.isTTY && process.stdout.isTTY);
-    const output = quiet
-      ? (line: string) => void process.stderr.write(line + '\n')
-      : (line: string) => logger.info(line);
-
     await handleNewHolds({
       holds,
-      seen: seenHolds,
+      seen: state.seen,
       isTty,
       output,
       approveAll: Boolean(options.approveAll),
       confirm: (message) => inquirerConfirm({ message, default: false }),
+      resolveContext: () => transport.holds.context(),
+      approve: (ctx, id, auto) => transport.holds.approve(ctx, id, auto),
+      reject: (ctx, id, reason) => transport.holds.reject(ctx, id, reason),
+      ...(transport.kind === 'direct' && { answerHint: transport.holds.answerHint }),
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof HoldsUnavailableError) {
+      state.unavailable = true;
+      output(pc.yellow(`[kici] ${err.message}`));
+    }
     // Best-effort: never let a hold-poll error abort the run watch.
   }
 }
@@ -959,8 +1079,8 @@ function buildEventFromFixture(opts: import('@kici-dev/sdk').FixtureOptions): {
 }
 
 /**
- * Run a specific workflow directly (bypass trigger matching), through the
- * Platform.
+ * Run a specific workflow directly (bypass trigger matching), over the
+ * resolved transport.
  */
 async function runDirectWorkflow(
   workflowName: string,
@@ -969,7 +1089,7 @@ async function runDirectWorkflow(
   if (!(await compileBeforeRemoteRun(options))) return false;
 
   const config = await loadGlobalConfig();
-  const ctx = resolvePlatformContext(config, options);
+  const ctx = await resolveRunContext(config, options);
   if (!ctx) return false;
 
   if (options.json) {
@@ -977,6 +1097,7 @@ async function runDirectWorkflow(
   }
 
   if (!options.quiet) {
+    for (const line of ctx.banner) logger.info(pc.gray(line));
     logger.info(pc.gray(`Running workflow "${workflowName}" directly (bypassing triggers)`));
   }
 
@@ -1005,7 +1126,7 @@ async function runDirectWorkflow(
       uploaded.publicKey,
     );
 
-    const triggerResult = await ctx.client.trigger(ctx.orgId, ctx.target, {
+    const triggerResult = await ctx.trigger({
       fixtureId,
       event: { type: 'manual', targetBranch: 'main', payload },
       uploadId: uploaded.uploadId,
@@ -1042,7 +1163,7 @@ async function runDirectWorkflow(
     const result = await pollRunToCompletion(ctx, triggerResult.runId, fixtureId, options);
     return result.status === 'success';
   } catch (error) {
-    const result = handleRunError(fixtureId, error, options);
+    const result = handleRunError(fixtureId, error, options, ctx.kind);
     return result.status === 'success';
   }
 }

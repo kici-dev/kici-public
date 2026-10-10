@@ -24,17 +24,18 @@
  *
  * Uses tar.gz (Node.js built-in zlib, no external binary) in portable mode to
  * strip user/group info for cross-machine consistency; symlinks are preserved
- * as symlinks so the pnpm link graph restores intact.
+ * as symlinks so the pnpm link graph restores intact. Hard-linked files are
+ * packed as regular files, each with its own content.
  */
 
 import { existsSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
-import { c as tarCreate } from 'tar';
-import { createLogger, sha256 } from '@kici-dev/shared';
+import { createLogger } from '@kici-dev/shared';
 import {
   detectPackageManagerFromManifests,
   PackageManager,
 } from '@kici-dev/shared/package-manager';
+import { packGzipTarball } from './tar-pack.js';
 import { collectInRepoSiblings, resolveYarnNodeModulesRoot } from './workspace-siblings.js';
 
 const logger = createLogger({ prefix: 'dep-packer' });
@@ -72,24 +73,12 @@ export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffe
   logger.info('Packing dependency closure into tarball', { dir: workDir, packageManager, entries });
   const startTime = Date.now();
 
-  // portable: strip the system-specific metadata (uid/gid/uname/gname, dev,
-  // ino, nlink, atime/ctime) so the same closure packs identically on any
-  // machine. It does NOT strip per-entry mtime — node-tar keeps that
-  // deliberately — so two independent installs of the same lockfile still
-  // produce different bytes and a different `depsHash`. That is fine: the dep
-  // cache is content-addressed and the `<lockfileHash>.hash` pointer is
-  // re-published on every upload, so a re-pack lands a new object and the
+  // The closure packs with its mtimes, so two independent installs of the same
+  // lockfile produce different bytes and a different `depsHash`. That is fine:
+  // the dep cache is content-addressed and the `<lockfileHash>.hash` pointer
+  // is re-published on every upload, so a re-pack lands a new object and the
   // pointer follows it. Do not read this as byte-reproducible packing.
-  // follow: false (default) so pnpm's symlink graph is preserved — the store +
-  // siblings travel with it.
-  const stream = tarCreate({ gzip: true, cwd: workDir, portable: true }, entries);
-
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.from(chunk as Uint8Array));
-  }
-  const tarball = Buffer.concat(chunks);
-  const hash = sha256(tarball);
+  const { tarball, hash } = await packGzipTarball(workDir, entries);
 
   const sizeMB = (tarball.length / (1024 * 1024)).toFixed(2);
   logger.info('Dependency closure packed', {

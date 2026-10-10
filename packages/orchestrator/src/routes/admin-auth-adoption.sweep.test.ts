@@ -31,6 +31,7 @@ import { createAdminAccessLogRoutes } from './admin-access-log.js';
 import { createAdminRegistrationRoutes } from './admin-registrations.js';
 import { createAdminScheduledJobsRoutes } from './admin-scheduled-jobs.js';
 import { createFleetRoutes } from './fleet.js';
+import { createTestDirectRoutes } from './test-direct.js';
 
 /** A TokenManager stub whose lookup fails the way an unreachable database does. */
 function throwingTokenManager() {
@@ -118,6 +119,12 @@ const cases: AdoptionCase[] = [
     build: (tokenManager) => createFleetRoutes({ tokenManager } as any),
     method: 'GET',
     path: '/admin/fleet-topology',
+  },
+  {
+    name: 'test-direct.ts',
+    build: (tokenManager) => createTestDirectRoutes({ tokenManager } as any),
+    method: 'GET',
+    path: '/api/v1/test/whoami',
   },
 ];
 

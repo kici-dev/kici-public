@@ -72,9 +72,13 @@ export class TokenManager {
    * @param token - The plaintext token to validate.
    * @returns Token info if valid, null if invalid/expired/revoked.
    */
-  async validate(
-    token: string,
-  ): Promise<{ id: string; role: Role; routingKey: string | null; label: string } | null> {
+  async validate(token: string): Promise<{
+    id: string;
+    role: Role;
+    routingKey: string | null;
+    label: string;
+    subject: string | null;
+  } | null> {
     const tokenHash = hashToken(token);
 
     const row = await this.db
@@ -105,6 +109,7 @@ export class TokenManager {
       role: row.role as Role,
       routingKey: row.routing_key,
       label: row.label,
+      subject: row.subject ?? null,
     };
   }
 

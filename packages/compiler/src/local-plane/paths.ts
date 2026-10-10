@@ -48,6 +48,7 @@ export function planePaths(): {
   stampFile: string;
   logFile: string;
   pgLogFile: string;
+  pgBootstrapStamp: string;
   socketDir: string;
   adminTokenFile: string;
   platformTokenFile: string;
@@ -69,6 +70,9 @@ export function planePaths(): {
     // the call site so the file pg_ctl opens and the file rotation renames can
     // never drift apart.
     pgLogFile: path.join(root, 'orchestrator.log.pg'),
+    // Written once the embedded cluster holds the `kici_local` database; its
+    // absence makes the next start finish an interrupted bootstrap.
+    pgBootstrapStamp: path.join(root, 'pgdata.bootstrapped'),
     socketDir: path.join(root, 'sock'),
     // Bootstrap admin token the CLI presents to the plane's admin API (mode 0600).
     adminTokenFile: path.join(root, 'admin-token'),

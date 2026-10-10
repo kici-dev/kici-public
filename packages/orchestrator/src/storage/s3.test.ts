@@ -354,45 +354,47 @@ describe('getInternalUploadUrl endpoint selection (unit)', () => {
     vi.clearAllMocks();
   });
 
-  it('signs the host-CLI upload URL with the uploadEndpoint client when set', async () => {
+  /** The endpoint of the S3 client the developer upload URL was signed with. */
+  async function signingEndpoint(endpoints: {
+    uploadEndpoint?: string;
+    externalEndpoint?: string;
+  }): Promise<string | undefined> {
     const storage = new S3CacheStorage({
       bucket: 'kici-cache',
       prefix: 'kici-cache/',
       ttlMs: 60_000,
       region: 'us-east-1',
       endpoint: 'http://seaweedfs:8333',
+      forcePathStyle: true,
+      ...endpoints,
+    });
+    await storage.getInternalUploadUrl('test-uploads/x/y.tar.gz.enc');
+    // The first arg to getSignedUrl is the S3 client; our mock records the
+    // construction config on `__config`.
+    const client = vi.mocked(getSignedUrl).mock.calls[0][0] as unknown as {
+      __config: { endpoint?: string };
+    };
+    return client.__config.endpoint;
+  }
+
+  it('signs the developer upload URL with the uploadEndpoint client when set', async () => {
+    const endpoint = await signingEndpoint({
       uploadEndpoint: 'http://localhost:8333',
       externalEndpoint: 'http://host.docker.internal:8333',
-      forcePathStyle: true,
     });
-
-    await storage.getInternalUploadUrl('test-uploads/x/y.tar.gz.enc');
-
-    // The first arg to getSignedUrl is the S3 client; our mock records the
-    // construction config on `__config`. The host-CLI upload must use the
-    // uploadEndpoint client, not the orchestrator's internal endpoint client.
-    const client = vi.mocked(getSignedUrl).mock.calls[0][0] as unknown as {
-      __config: { endpoint?: string };
-    };
-    expect(client.__config.endpoint).toBe('http://localhost:8333');
+    // fails-when: the developer upload URL is signed against the agent-facing
+    // endpoint although KICI_STORAGE_UPLOAD_ENDPOINT is set
+    expect(endpoint).toBe('http://localhost:8333');
   });
 
-  it('falls back to the internal endpoint client when uploadEndpoint is unset', async () => {
-    const storage = new S3CacheStorage({
-      bucket: 'kici-cache',
-      prefix: 'kici-cache/',
-      ttlMs: 60_000,
-      region: 'us-east-1',
-      endpoint: 'http://seaweedfs:8333',
-      externalEndpoint: 'http://host.docker.internal:8333',
-      forcePathStyle: true,
-    });
+  it('falls back to the external endpoint client when uploadEndpoint is unset', async () => {
+    // breaks-if-wrong: without an upload endpoint the agent-facing one is used
+    expect(await signingEndpoint({ externalEndpoint: 'http://host.docker.internal:8333' })).toBe(
+      'http://host.docker.internal:8333',
+    );
+  });
 
-    await storage.getInternalUploadUrl('test-uploads/x/y.tar.gz.enc');
-
-    const client = vi.mocked(getSignedUrl).mock.calls[0][0] as unknown as {
-      __config: { endpoint?: string };
-    };
-    expect(client.__config.endpoint).toBe('http://seaweedfs:8333');
+  it('falls back to the internal endpoint client when neither is set', async () => {
+    expect(await signingEndpoint({})).toBe('http://seaweedfs:8333');
   });
 });

@@ -326,6 +326,24 @@ describe('serializeJobsToLock', () => {
     expect(captured.runsOn).toEqual(['linux', 'docker']);
   });
 
+  it('renders a regex runsOn for the dynamic matrix context exactly as before', async () => {
+    let captured: unknown;
+    const jobs = [
+      job('matrix-regex', {
+        runsOn: ['linux', /^gpu-.*$/i],
+        matrix: async ({ ctx }) => {
+          captured = ctx.job.runsOn;
+          return ['x'];
+        },
+        steps: [step('s1', async () => {})],
+      }),
+    ];
+
+    await serializeJobsToLock(jobs, mockCtx());
+    // fails-when: the shared formatter changes the rendering a dynamic matrix reads
+    expect(captured).toEqual(['linux', '/^gpu-.*$/i']);
+  });
+
   it('propagates errors thrown by dynamic env functions', async () => {
     const jobs = [
       job('throwing', {

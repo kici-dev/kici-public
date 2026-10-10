@@ -127,3 +127,48 @@ describe('kici compile: dynamic-value functions', () => {
     expect(warnLines).not.toContain('~5-10s');
   });
 });
+
+describe('shouldRefreshTypes', () => {
+  let dir: string;
+  beforeEach(async () => {
+    const os = await import('node:os');
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-refresh-types-'));
+  });
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('refreshes with a direct target', async () => {
+    const { shouldRefreshTypes } = await import('./compile.js');
+    expect(
+      await shouldRefreshTypes({ direct: { url: 'http://orch:4000', token: 't' } }, dir, {}),
+    ).toBe(true);
+  });
+
+  it('refreshes with a Platform login and an active org', async () => {
+    const { shouldRefreshTypes } = await import('./compile.js');
+    const login = { pat: 'p', platformEndpoint: 'https://api.kici.dev' };
+    expect(await shouldRefreshTypes({ ...login, activeOrgId: 'o' }, dir, {})).toBe(true);
+    expect(await shouldRefreshTypes(login, dir, {})).toBe(false);
+  });
+
+  it('refreshes with local secret files', async () => {
+    const { shouldRefreshTypes } = await import('./compile.js');
+    await fs.writeFile(path.join(dir, 'secrets.yaml'), 'production: {}\n');
+    // fails-when: a platform-less developer's local secrets never reach kici types
+    expect(await shouldRefreshTypes({}, dir, {})).toBe(true);
+  });
+
+  it('refreshes for a --orchestrator-url run with an env token', async () => {
+    const { shouldRefreshTypes } = await import('./compile.js');
+    expect(
+      await shouldRefreshTypes({}, dir, { KICI_ORCHESTRATOR_TOKEN: 't' }, 'https://ci.example.com'),
+    ).toBe(true);
+  });
+
+  it('skips a bare checkout with no source', async () => {
+    const { shouldRefreshTypes } = await import('./compile.js');
+    // breaks-if-wrong: a bare checkout keeps compiling without touching types
+    expect(await shouldRefreshTypes({}, dir, {})).toBe(false);
+  });
+});

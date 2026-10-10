@@ -1,7 +1,7 @@
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
 import type { LockWorkflow, LockJob } from '../types.js';
-import type { WorkflowDecision } from '@kici-dev/engine';
+import { formatLabelMatchers, type WorkflowDecision } from '@kici-dev/engine';
 
 interface DryRunOptions {
   workflow?: string;
@@ -61,7 +61,7 @@ export function displayDryRun(
       }
 
       logger.info(`    ${pc.bold(job.name)}`);
-      logger.info(pc.gray(`      runs-on: ${job.runsOn}`));
+      for (const line of describeTargeting(job)) logger.info(pc.gray(`      ${line}`));
 
       if (job.needs.length > 0) {
         logger.info(pc.gray(`      needs: ${job.needs.join(', ')}`));
@@ -127,4 +127,20 @@ function displayDecisionSummary(decisions: WorkflowDecision[]): void {
   }
 
   logger.info('');
+}
+
+/** The targeting lines `kici preview` prints for a job. */
+function describeTargeting(job: LockJob): string[] {
+  if (job.runsOnAll) {
+    const groups = job.runsOnAll.include.map((g) => formatLabelMatchers(g, ' + ')).join(' | ');
+    const exclude = job.runsOnAll.exclude.length
+      ? ` (excluding ${formatLabelMatchers(job.runsOnAll.exclude)})`
+      : '';
+    return [`runs-on-all: ${groups}${exclude}`];
+  }
+  const lines = [`runs-on: ${job.runsOn?.length ? formatLabelMatchers(job.runsOn) : 'any agent'}`];
+  if (job.excludeLabels?.length) {
+    lines.push(`exclude-labels: ${formatLabelMatchers(job.excludeLabels)}`);
+  }
+  return lines;
 }

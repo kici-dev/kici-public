@@ -46,7 +46,11 @@ export type Permission =
   /** Stop live Firecracker VMs the node's orchestrator does not track. */
   | 'scaler.manage'
   /** Drop a departed peer from the coordinators' live peer registries. */
-  | 'peer.manage';
+  | 'peer.manage'
+  /** Start or cancel a `kici run remote` test run through the direct test-run routes. */
+  | 'test_run.trigger'
+  /** Follow a test run's status and logs through the direct test-run routes. */
+  | 'test_run.read';
 
 /**
  * Role-to-permission mapping.
@@ -66,6 +70,11 @@ export type Permission =
  * track, so a read-only role can inspect a host but never kill a VM on it.
  * `peer.manage` (owner, admin) drops a departed peer from the live peer
  * registries; the auditor never changes cluster membership.
+ *
+ * `test_run.trigger` (owner, admin) starts and cancels a `kici run remote`
+ * test run, which executes code on the fleet; `test_run.read` (owner, admin,
+ * auditor) follows a test run's status and logs. A read-only role can watch a
+ * test run but never start or cancel one.
  */
 const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
   owner: new Set<Permission>([
@@ -95,6 +104,8 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'scaler.read',
     'scaler.manage',
     'peer.manage',
+    'test_run.trigger',
+    'test_run.read',
   ]),
   admin: new Set<Permission>([
     'context.create',
@@ -121,6 +132,8 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'scaler.read',
     'scaler.manage',
     'peer.manage',
+    'test_run.trigger',
+    'test_run.read',
   ]),
   auditor: new Set<Permission>([
     'context.read',
@@ -130,6 +143,7 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'access_log.read',
     'event_dlq.read',
     'scaler.read',
+    'test_run.read',
   ]),
 };
 

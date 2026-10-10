@@ -44,6 +44,8 @@ const ALL_PERMISSIONS: Permission[] = [
   'scaler.read',
   'scaler.manage',
   'peer.manage',
+  'test_run.trigger',
+  'test_run.read',
 ];
 
 describe('RbacEnforcer', () => {
@@ -164,6 +166,19 @@ describe('RbacEnforcer', () => {
     it('auditor holds neither — the trust policy decides whether a fork PR runs', () => {
       expect(enforcer.hasPermission('auditor', 'ci_trust.read')).toBe(false);
       expect(enforcer.hasPermission('auditor', 'ci_trust.admin')).toBe(false);
+    });
+  });
+
+  describe('test_run permissions', () => {
+    it('auditor follows test runs but never starts one', () => {
+      expect(enforcer.hasPermission('auditor', 'test_run.read')).toBe(true);
+      // fails-when: a read-only token can start runs on the fleet
+      expect(enforcer.hasPermission('auditor', 'test_run.trigger')).toBe(false);
+    });
+    it('admin starts and follows test runs', () => {
+      // breaks-if-wrong: a developer admin token must still be able to run remote
+      expect(enforcer.hasPermission('admin', 'test_run.trigger')).toBe(true);
+      expect(enforcer.hasPermission('admin', 'test_run.read')).toBe(true);
     });
   });
 

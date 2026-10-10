@@ -2,6 +2,32 @@
 
 Release notes for the public KiCI packages.
 
+## v0.17.0 — 2026-10-10
+
+### Features
+
+- Orchestrators serve the kici run remote test-run API directly at /api/v1/test, authenticated with per-person orchestrator admin tokens, in every mode, so remote runs work with no KiCI Platform account. New permissions test_run.trigger (owner, admin) and test_run.read (owner, admin, auditor).
+- New kici connect <url> and kici disconnect save and remove a direct orchestrator target. kici connect verifies the orchestrator token before saving it and prints who it connected as.
+- kici run remote runs your working tree on an orchestrator directly, without the Platform relay: pass --orchestrator-url <url>, set KICI_ORCHESTRATOR_URL and KICI_ORCHESTRATOR_TOKEN, or save a target with kici connect. It works with independent, hybrid and observed orchestrators; the Platform-routed path is unchanged.
+- kici types reads secret key names from a direct orchestrator target, then the Platform, then the local secret files kici run --local uses (.kici/.secrets, .kici/secrets.yaml). The file header names its source, and local files never replace a key set read from an orchestrator or the Platform. kici compile refreshes types whenever one of these sources exists.
+- kici doctor shows the active run target (a direct orchestrator or the Platform login), checks a direct target's reachability and token, and skips the Platform checks for a developer who runs only against an orchestrator.
+
+### Fixes
+
+- kici preview prints each job's runs-on, runs-on-all and exclude-labels selectors readably instead of [object Object].
+- The first kici run --local no longer prints the embedded PostgreSQL server log; it goes to the local plane's Postgres log, which a failure now names. A local plane whose first start was interrupted now finishes creating its database.
+- kici run remote now uploads the working-tree overlay to KICI_STORAGE_UPLOAD_ENDPOINT when it is set, as documented; without it the upload URL uses KICI_STORAGE_EXTERNAL_ENDPOINT, then KICI_STORAGE_ENDPOINT.
+- kici run remote --org <id> now lists and answers the run's approval holds in that organization instead of the active one.
+- kici run remote no longer stops silently after "Creating overlay tarball..." and exits 0 when the repository commits a pnpm node_modules tree: hard-linked files now ship as separate files and the run proceeds.
+- The kici CLI exits 1 with an internal-error message, instead of exiting 0 with its output cut off, when a command stops before it finishes.
+- The agent no longer stalls when it packs a pnpm `node_modules` tree for the dependency cache, or when it copies a workspace that contains one into a container job. It now packs each hard-linked file as a separate file with its own content.
+- kici run remote no longer writes a .kici-overlay-tmp directory into your working tree, and never uploads one left there by an interrupted run, which made the agent fail the overlay checksum check.
+- Ctrl-C on kici run remote now waits for the orchestrator to accept the cancel before the CLI exits, and prints the outcome; before, the CLI could exit before the cancel request was sent, leaving the run running. Press Ctrl-C again to exit at once. A batch of fixtures also stops after a cancel.
+
+### Other
+
+- Deprecated, removed in v1.0.0: kici-admin api-key (no server serves it; it now points at kici-admin token create), the inert --routing-key flags on kici run remote and kici login, and the unread routingKey field in ~/.kici/config.
+
 ## v0.16.0 — 2026-10-07
 
 ### Features

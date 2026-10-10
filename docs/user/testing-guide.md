@@ -113,6 +113,14 @@ kici login
 
 This opens your browser for OAuth authentication and stores a personal access token in `~/.kici/config`. For headless environments, use `kici login --device` instead. For CI/CD pipelines, see [non-interactive environments](cli-auth.md#non-interactive-environments). See [CLI authentication](cli-auth.md) for details.
 
+**No Platform account?** Run against your own orchestrator directly. Ask its operator for a personal orchestrator token, then save the target:
+
+```bash
+kici connect https://ci.example.com
+```
+
+See [Direct mode](cli/runs-and-approvals.md#direct-mode) for what changes when a run goes straight to an orchestrator.
+
 ### 2. Write a test fixture
 
 Fixtures define the events you want to simulate. They live in `.kici/tests/*.ts` and use the same SDK trigger functions as workflows.
@@ -222,7 +230,7 @@ This mapping is honored by **both** `kici run <event> --local` and `kici run rem
 - For a local **`kici run <event> --local`** (see [`kici run <event> --local`](./cli/runs-and-approvals.md#kici-run-event---local)), each named context is resolved from your local secret files (`.kici/.secrets`, `.env.local`, `secrets.yaml`, and `--env` flags).
 - For **`kici run remote`**, each named context maps to an orchestrator **context**, and the orchestrator resolves that context's secrets for the run. The target context must be flagged `allowLocalExecution: true` — mapping a context to a missing or non-test context rejects the run (see [Secret contexts for testing](#secret-contexts-for-testing) below).
 
-**A fixture `secrets:` mapping is fail-closed; a job's bound `context:` is not.** The reject above applies only to the fixture `secrets:` mapping — an explicit request for that context's secrets. A job's own bound `context:` (`job('deploy', { context: 'production', … })`) is treated differently on a test run: if it resolves to a non-test or unconfigured context it is **skipped with a warning**, not rejected, so a job that deploys to production in real runs stays locally testable for its non-secret logic. `kici run remote` prints a warning naming the skipped context(s), and the dashboard run view shows the same notice. See [Skip-on-test](contexts.md#multiple-contexts-per-job) in the contexts guide.
+**A fixture `secrets:` mapping is fail-closed; a job's bound `context:` is not.** The reject above applies only to the fixture `secrets:` mapping — an explicit request for that context's secrets. A job's own bound `context:` (`job('deploy', { context: 'production', … })`) is treated differently on a test run: if it resolves to a non-test or unconfigured context it is **skipped with a warning**, not rejected. So a job that deploys to production in real runs stays locally testable for its non-secret logic. `kici run remote` prints a warning naming the skipped context(s), and the dashboard run view shows the same notice. See [Skip-on-test](contexts.md#multiple-contexts-per-job) in the contexts guide.
 
 ### Async fixtures
 
@@ -294,7 +302,7 @@ kici runs show <run-id>
 
 ### Cancellation
 
-Press Ctrl+C during a running test to send a cancel signal to the orchestrator. The agent job will be terminated gracefully.
+Press Ctrl+C during a running test to send a cancel request to the orchestrator. The agent stops the job gracefully. The CLI waits up to 15 seconds for the orchestrator to answer, then prints `Cancelled run <run-id>.` or the reason the cancel failed. Press Ctrl+C a second time to exit without waiting.
 
 ## Repo state transfer
 
@@ -316,6 +324,7 @@ The agent does not clone your repository. It extracts the tarball into an empty 
 - New untracked files (not in `.gitignore`)
 - The `.git` directory
 - Symbolic links. A link to a file ships with the file it points at, and the agent writes that file's content in place of the link. A link to a directory ships as a link, and the agent recreates it. A link that points outside the repository, or at a file that `.gitignore` or `.kiciignore` excludes, fails the job with an error that names the link.
+- Hard links. Each path ships as a separate file with its own content, also when it shares its data with other files. A `node_modules` directory that pnpm installs contains many hard links.
 
 ### What gets excluded
 

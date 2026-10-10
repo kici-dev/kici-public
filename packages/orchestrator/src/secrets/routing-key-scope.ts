@@ -30,7 +30,7 @@ import type { Context } from 'hono';
 const ACCESS_DENIED_MESSAGE =
   'Access denied: token is restricted to a single routing key and this request targets a different one';
 
-const UNSCOPED_REQUIRED_MESSAGE =
+export const UNSCOPED_REQUIRED_MESSAGE =
   'Access denied: this route requires an unscoped admin token (the calling token is restricted to a single routing key)';
 
 /**

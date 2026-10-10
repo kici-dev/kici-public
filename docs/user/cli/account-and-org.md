@@ -71,7 +71,7 @@ The first match wins, so an SSH session into WSL, or a container running on a WS
 
 Revoke your personal access token on the server and clear local credentials.
 
-If the server is unreachable, local credentials are still cleared (the PAT will expire automatically). The active organization is cleared with the credentials. Connection settings (per-org default clusters, Platform endpoint, OIDC issuer, etc.) are preserved.
+If the server is unreachable, local credentials are still cleared (the PAT expires automatically). The active organization is cleared with the credentials. Connection settings (per-org default clusters, Platform endpoint, OIDC issuer, the orchestrator saved by `kici connect`, etc.) are preserved.
 
 ```bash
 kici logout
@@ -82,6 +82,36 @@ kici logout
 ```bash
 # Log out and revoke PAT
 kici logout
+```
+
+### kici connect
+
+Save an orchestrator as the direct target for `kici run remote` and `kici types`, so they talk to it without the KiCI Platform. Use it when you run your own orchestrator and have no Platform account, or to bypass the Platform relay. The orchestrator's operator gives you a personal orchestrator token (`kici-admin token create <label> --role admin --subject <you>`).
+
+```bash
+kici connect <url> [--token-stdin]
+```
+
+The token comes from standard input with `--token-stdin`, else from `KICI_ORCHESTRATOR_TOKEN`, else from a masked prompt. Before saving anything, `kici connect` asks the orchestrator who the token belongs to (`GET /api/v1/test/whoami`). `kici connect` never saves a refused token. On success it prints the caller, its role, the orchestrator mode and the organization runs land in, and saves `{ url, token }` to `~/.kici/config` (mode `0600`). An `auditor` token is saved with a note that it can follow runs but not start them.
+
+**Examples:**
+
+```bash
+# Prompt for the token
+kici connect https://ci.example.com
+
+# Pipe it in (scripts, CI)
+echo "$KICI_TOKEN" | kici connect https://ci.example.com --token-stdin
+```
+
+The URL is the orchestrator's HTTP address; a base path is kept. See [Direct mode](./runs-and-approvals.md#direct-mode) for what changes when runs go straight to an orchestrator.
+
+### kici disconnect
+
+Forget the orchestrator saved by `kici connect`. Nothing else changes: a Platform login stays, and `kici run remote` goes through the Platform again.
+
+```bash
+kici disconnect
 ```
 
 ### kici init
@@ -315,6 +345,30 @@ Synopsis: `kici admin drain-worker [options]`
 | ------------- | ------- | -------------------------------------------- |
 | `--url <url>` |         | Worker URL (e.g., http://worker-host:<port>) |
 
+### `kici connect`
+
+Run kici run remote and kici types against this orchestrator directly, with an orchestrator token
+
+Synopsis: `kici connect <url> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description                                                  |
+| -------- | -------- | -------- | ------------------------------------------------------------ |
+| `url`    | yes      | no       | The orchestrator's HTTP address, e.g. https://ci.example.com |
+
+**Options**
+
+| Option          | Default | Description                                     |
+| --------------- | ------- | ----------------------------------------------- |
+| `--token-stdin` | `false` | Read the orchestrator token from standard input |
+
+### `kici disconnect`
+
+Forget the saved orchestrator target; runs go through your Platform login again
+
+Synopsis: `kici disconnect`
+
 ### `kici endpoints`
 
 List all webhook entrypoints for the current project
@@ -361,7 +415,7 @@ Synopsis: `kici login [options]`
 | `--device`                  |         | Force device authorization flow (for headless/SSH environments)                     |
 | `--platform-endpoint <url>` |         | Platform relay URL                                                                  |
 | `--oidc-issuer <url>`       |         | OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another) |
-| `--routing-key <key>`       |         | Routing key for webhook source identification                                       |
+| `--routing-key <key>`       |         | Deprecated; saved to the config but never read                                      |
 | `--no-attach`               |         | Skip the post-login prompt to attach the local dev plane                            |
 
 ### `kici logout`

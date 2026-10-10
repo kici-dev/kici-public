@@ -161,6 +161,15 @@ You should see a green `push-main … success` run in your terminal. **That's Pa
 
 `kici run remote` uses two planes. The **control plane** (run initiation, status, logs, cancellation) flows from your machine through the Platform, which relays it over a WebSocket connection to your local orchestrator. The **data plane** — your working-tree overlay — uploads **directly** from your machine to SeaweedFS via a presigned URL and never passes through the Platform. That direct upload is exactly what `KICI_STORAGE_UPLOAD_ENDPOINT=http://localhost:8333` enables: the host CLI uploads to `localhost:8333`, the orchestrator hands the agent a container-routable URL (`host.docker.internal:8333`), and the agent fetches the overlay before running your steps.
 
+The control plane can also skip the Platform and go straight to your orchestrator's HTTP API (published on `localhost:4000`). Connect with an orchestrator admin token, for example the `KICI_BOOTSTRAP_ADMIN_TOKEN` from your `.env`, or a personal token minted with `kici-admin token create`:
+
+```bash
+echo "$KICI_BOOTSTRAP_ADMIN_TOKEN" | kici connect http://localhost:4000 --token-stdin
+kici run remote push-main
+```
+
+See [Direct mode](../cli/runs-and-approvals.md#direct-mode). `kici disconnect` sends runs through the Platform again.
+
 With a single connected orchestrator the Platform selects it automatically. If your org later connects more than one, list them with `kici orchestrators list` and pin a default with `kici orchestrators use <name>` (or pass `--orchestrator <name>` per run).
 
 See the [testing guide](../testing-guide.md) for fixtures, secret contexts, and more.

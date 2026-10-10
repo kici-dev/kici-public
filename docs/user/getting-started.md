@@ -21,7 +21,7 @@ npx kici init
 
 This will:
 
-1. Create `.kici/` directory with `workflows/`, `tests/`, `types/`, `package.json`, and `tsconfig.json`. The `types/` folder holds a local development aid — TypeScript declarations that `kici types` (and an authenticated `kici compile`) generate from your orchestrator's secret contexts. Its content is a snapshot of one org's secret keys, so it is not committed.
+1. Create `.kici/` directory with `workflows/`, `tests/`, `types/`, `package.json`, and `tsconfig.json`. The `types/` folder holds a local development aid — TypeScript declarations that `kici types` (and `kici compile`) generate from your secret contexts. Its content is a snapshot of one org's secret keys, so it is not committed.
 2. Create two `.kiciignore` files with sensible defaults: one at the repo root, which selects the working-tree files a remote run uploads, and one inside `.kici/`, which declares the paths the per-workflow content hash skips
 3. Let you choose from starter workflow templates (hello-world, pr-checks)
 4. Install dependencies using the package manager detected for your repo (npm, pnpm, or yarn)

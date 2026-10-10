@@ -76,6 +76,7 @@ where "agent connected" does not yet mean "services ready".
 - `intervalMs` (default 3000) and `timeoutMs` (default 300000) tune the poll. If
   the probe never succeeds within `timeoutMs`, the step fails with "services did
   not come up".
+- `name` (default `wait-for-host-alive`) sets the step name shown in the logs.
 
 ## Same-host pinning
 

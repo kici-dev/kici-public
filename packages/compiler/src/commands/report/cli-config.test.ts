@@ -54,6 +54,14 @@ describe('redactCliConfig', () => {
     expect(out.defaultClusters).toEqual({ platformEndpoint: '****', org_x: '****' });
   });
 
+  it('keeps the direct orchestrator URL readable and masks its token', () => {
+    const out = redactCliConfig({
+      direct: { url: 'https://ci.example.com/kici', token: 'orch-admin-token-value' },
+    });
+    // breaks-if-wrong: a report bundle never carries the orchestrator token
+    expect(out.direct).toEqual({ url: 'https://ci.example.com/kici', token: '****' });
+  });
+
   it('does not add a readable key the config does not carry', () => {
     const out = redactCliConfig({ pat: 'kici_pat_0123abcd0123abcd0123abcd' });
     expect(Object.keys(out)).toEqual(['pat']);

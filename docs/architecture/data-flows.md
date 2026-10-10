@@ -110,7 +110,7 @@ Developer machine                Platform relay            Orchestrator         
 
 ### Control plane
 
-Run initiation (`upload-init`), the trigger, status polling, log retrieval, and cancellation all flow from the developer machine to the Platform, which relays them over its WebSocket connection to the org's orchestrator. The developer machine never talks to the orchestrator's HTTP API directly. Logs are delivered by the CLI polling the Platform for log chunks — tracked by a monotonic line cursor — and run status until the run reaches a terminal state; there is no direct streaming socket between the developer machine and the orchestrator.
+Run initiation (`upload-init`), the trigger, status polling, log retrieval, and cancellation all flow from the developer machine to the Platform, which relays them over its WebSocket connection to the org's orchestrator. On this path the developer machine never talks to the orchestrator's HTTP API. The CLI polls the Platform for log chunks, tracked by a monotonic line cursor, and for run status until the run reaches a terminal state. There is no streaming socket between the developer machine and the orchestrator.
 
 ### Data plane
 
@@ -120,11 +120,17 @@ The working-tree overlay tarball uploads **directly** from the developer machine
 
 The run is dispatched to the developer's active organization (selected with `kici org use`, or overridden per-run). The orchestrator anchors its bound organization with a system-managed **remote source** (routing key `remote:<orgId>`) that it auto-provisions — no manual webhook source is required, so a zero-source org is immediately routable for remote runs. The Platform forces the run's routing key to `remote:<orgId>` server-side; the developer never sets a routing key. When an org has more than one connected orchestrator cluster, the CLI selects the target cluster explicitly (or relies on the per-org default), and a single connected cluster is auto-selected.
 
-Remote runs are offered by the Platform; an orchestrator with no Platform connection cannot serve them. Executing workflow steps on the developer machine with no orchestrator is the separate `kici run <event> --local` path.
+### Direct path
+
+A developer can also skip the Platform. With an orchestrator admin token (`kici connect`, `--orchestrator-url` or `KICI_ORCHESTRATOR_TOKEN`), the CLI calls the orchestrator's own HTTP API at `/api/v1/test/*`. Those routes run the same handlers the relay runs, with the same request and response shapes, so a direct run is the same run a relayed one is. The orchestrator authenticates the token, attributes the run to the token's service account, and records `admin_http` as the access-log source. It also chooses the org: its default org when `independent`, the Platform-assigned org otherwise. The orchestrator ignores a routing key in the request. The data plane is unchanged. On this path the orchestrator's HTTP API must be reachable from the developer machine, and no Platform connection is needed.
+
+Executing workflow steps on the developer machine with no orchestrator is the separate `kici run <event> --local` path.
 
 ## Source and dependency caching flow
 
 KiCI runs two orchestrator-side caches — the **source tarball cache** (raw `.kici/` directory minus `node_modules/`) and the **dependency tarball cache** (packed `node_modules/`). Both use a build-then-execute pattern: the orchestrator checks the caches before dispatching execution jobs, and if the source cache is cold a build agent populates both in one pass.
+
+Both tarballs keep symbolic links as links. They pack each hard-linked file as a regular file with its own content, such as a file that pnpm links from its store into `node_modules`.
 
 With the shared TypeScript loader hook plus source tarball, execution agents never install or compile `.kici/` at runtime — they restore the workflow directory and its `node_modules` with two S3 GETs and extract. The workspace checkout is unaffected: an execution job still clones the repository at the dispatch ref unless it sets `checkout: false`, and the restored source tree then replaces the clone's `.kici/`.
 

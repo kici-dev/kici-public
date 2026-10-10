@@ -28,7 +28,12 @@
  * relay client answer immediately; the reasons are in that field's own doc.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { ApprovalDecision, HoldScope, type ApprovalRequirement } from '@kici-dev/engine';
+import {
+  AccessLogAction,
+  ApprovalDecision,
+  HoldScope,
+  type ApprovalRequirement,
+} from '@kici-dev/engine';
 
 import type { HeldRun } from '../db/types.js';
 import { HoldOutcome } from '../pipeline/security-hold-check.js';
@@ -43,6 +48,26 @@ import {
 } from './approval-resolver.js';
 
 const logger = createLogger({ prefix: 'apply-decision' });
+
+/**
+ * The access-log action a held-run decision is audited under.
+ *
+ * A `kici run --approve-all` breakglass approval audits as
+ * `held_run.auto_approve`, so the trail shows "auto-approved by the dispatcher"
+ * apart from an interactive approve. The marker only renames the record:
+ * eligibility is enforced the same way for both. It never applies to a reject.
+ * Every approving surface takes its action from here, so the Platform-relayed
+ * and the direct admin-route approvals cannot audit the same act two ways.
+ */
+export function heldRunDecisionAction(
+  decision: ApprovalDecision,
+  autoApprove: boolean,
+): AccessLogAction {
+  if (decision === ApprovalDecision.enum.reject) return AccessLogAction.enum['held_run.reject'];
+  return autoApprove
+    ? AccessLogAction.enum['held_run.auto_approve']
+    : AccessLogAction.enum['held_run.approve'];
+}
 
 /** Whether a decision's post-commit consequence ran to completion. */
 export interface DecisionConsequenceResult {

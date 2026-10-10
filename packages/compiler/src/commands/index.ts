@@ -79,6 +79,7 @@ export {
 export { localTrustRootCommand } from './local-trust-root.js';
 
 export { logoutCommand } from './logout.js';
+export { connectCommand, disconnectCommand } from './connect.js';
 
 export { approveCommand } from './approve.js';
 export type { ApproveOptions } from './approve.js';

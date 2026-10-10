@@ -414,6 +414,10 @@ function suggestClosest(name: string, candidates: string[]): string | undefined 
  *   real CLI var (not a config typo) inherited by every service a test spawns —
  *   which do not read it — same leak-by-inheritance shape as the `KICI_E2E_`
  *   prefix below.
+ * - `KICI_ORCHESTRATOR_TOKEN`: the `kici` CLI's credential for a direct
+ *   orchestrator target, exported in a developer's shell or a CI job next to
+ *   `KICI_ORCHESTRATOR_URL`. No service reads it, and an orchestrator or agent
+ *   started from that same shell inherits it — the `KICI_CONFIG_DIR` shape.
  *
  * Keep this list small and well-justified. Every addition is a typo we can
  * no longer catch, so only list things that are (a) actually set in the
@@ -427,6 +431,7 @@ export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
   'KICI_DEV',
   'KICI_BUILD_COUNTER_NO_COMMIT',
   'KICI_CONFIG_DIR',
+  'KICI_ORCHESTRATOR_TOKEN',
 ];
 
 /**

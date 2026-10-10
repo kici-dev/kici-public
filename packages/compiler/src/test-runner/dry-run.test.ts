@@ -14,7 +14,7 @@ const lockWorkflow: LockWorkflow = {
     {
       _type: 'static',
       name: 'build',
-      runsOn: 'kici:os:linux',
+      runsOn: [{ kind: 'exact', value: 'kici:os:linux' }],
       needs: [],
       steps: [{ name: 'run' }],
     },
@@ -60,5 +60,56 @@ describe('displayDryRun', () => {
     displayDryRun([lockWorkflow], [skipped], {});
     const out = loggerInfo.mock.calls.map((c) => String(c[0])).join('\n');
     expect(out).toContain('No workflows matched the event.');
+  });
+});
+
+describe('displayDryRun targeting lines', () => {
+  const exact = (value: string) => ({ kind: 'exact' as const, value });
+  const regex = (source: string, flags: string) => ({ kind: 'regex' as const, source, flags });
+  const job = (name: string, targeting: Record<string, unknown>) => ({
+    _type: 'static',
+    name,
+    needs: [],
+    steps: [{ name: 'run' }],
+    ...targeting,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('prints every runs-on form readably', async () => {
+    const { logger } = await import('@kici-dev/core');
+    const wf = {
+      name: 'ci',
+      triggers: [{ _type: 'push' }],
+      jobs: [
+        job('one', { runsOn: [exact('linux')] }),
+        job('many', {
+          runsOn: [exact('linux'), regex('x64|arm64', '')],
+          excludeLabels: [exact('slow')],
+        }),
+        job('fanout', {
+          runsOnAll: {
+            include: [[exact('role:web')], [exact('role:db')]],
+            exclude: [exact('drain')],
+          },
+        }),
+        job('any', {}),
+      ],
+    } as unknown as LockWorkflow;
+    displayDryRun([wf], [decision], {});
+    // Strip ANSI colour codes the gray() wrapper adds.
+    const infos = (logger.info as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+      String(c[0]).replace(/\u001b\[[0-9;]*m/g, ''),
+    );
+    // fails-when: dry-run interpolates `job.runsOn` directly ("[object Object]")
+    expect(infos.join('\n')).not.toContain('[object Object]');
+    expect(infos).toContain('      runs-on: linux');
+    expect(infos).toContain('      runs-on: linux, /x64|arm64/');
+    expect(infos).toContain('      exclude-labels: slow');
+    expect(infos).toContain('      runs-on-all: role:web | role:db (excluding drain)');
+    // breaks-if-wrong: a job with no constraint still prints a runs-on line
+    expect(infos).toContain('      runs-on: any agent');
   });
 });

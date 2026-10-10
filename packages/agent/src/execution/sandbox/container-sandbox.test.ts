@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Docker from 'dockerode';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { x as tarExtract } from 'tar';
 
 // Mock the logger so setup() doesn't touch the filesystem.
 vi.mock('@kici-dev/shared', () => ({
@@ -26,7 +27,9 @@ vi.mock('@kici-dev/shared/container-runtime', () => ({
 
 // Mock node:fs so the host name-resolution bind (host-network parity) is
 // deterministic regardless of the test host's /etc layout: both files "exist".
-vi.mock('node:fs', () => ({
+// The rest of the module stays real: the workspace copy-in walks a real tree.
+vi.mock('node:fs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:fs')>()),
   existsSync: vi.fn(() => true),
 }));
 
@@ -570,6 +573,59 @@ describe('ContainerSandbox workspace copy-in', () => {
     expect(opts.path).toBe('/workspace');
     await rm(dir, { recursive: true, force: true });
   });
+
+  it('copies a workdir whose node_modules files are hard-linked', async () => {
+    const { docker, container } = mockDocker();
+    // Consume the archive as the runtime would, so the pack has to finish.
+    let archive = Buffer.alloc(0);
+    const putArchive = vi.fn(async (stream: AsyncIterable<Uint8Array>) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+      archive = Buffer.concat(chunks);
+    });
+    (container as unknown as { putArchive: typeof putArchive }).putArchive = putArchive;
+
+    // pnpm hard-links identical files to one inode in its store, outside the
+    // workdir; this order (plain, link, plain, plain, link, plain) is the one
+    // that stops node-tar's own hard-link handling for good.
+    const dir = await mkdtemp(join(tmpdir(), 'kici-copyin-'));
+    const store = await mkdtemp(join(tmpdir(), 'kici-copyin-store-'));
+    const pkg = join(dir, 'node_modules', '.pnpm', 'p@1.0.0', 'node_modules', 'p');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(join(store, 'shared.d.ts'), 'export {};\n');
+    for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) await writeFile(join(pkg, name), name);
+    for (const name of ['b.d.ts', 'e.d.ts'])
+      await link(join(store, 'shared.d.ts'), join(pkg, name));
+
+    const sandbox = new ContainerSandbox({
+      docker,
+      image: 'python:3.12-slim',
+      runnerPath: '/x/dist/workflow-runner.js',
+      env: {},
+      jobId: 'job-copyin-hardlinks',
+      hardening: hardening(),
+      runtimeNodePath: '/host/opt/kici/node',
+    });
+
+    // fails-when: copyWorkspaceIn hands node-tar no single-link caches, so the
+    // archive never ends and setup never resolves
+    await sandbox.setup({ workDir: dir, env: {}, workspaceFromHost: true });
+
+    // breaks-if-wrong: each linked path must land with its own content
+    const out = await mkdtemp(join(tmpdir(), 'kici-copyin-out-'));
+    await writeFile(join(out, 'workspace.tar'), archive);
+    await tarExtract({ file: join(out, 'workspace.tar'), cwd: out });
+    const landed = join(out, 'node_modules', '.pnpm', 'p@1.0.0', 'node_modules', 'p');
+    for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) {
+      expect(await readFile(join(landed, name), 'utf-8')).toBe(name);
+    }
+    for (const name of ['b.d.ts', 'e.d.ts']) {
+      expect(await readFile(join(landed, name), 'utf-8')).toBe('export {};\n');
+    }
+    await rm(dir, { recursive: true, force: true });
+    await rm(store, { recursive: true, force: true });
+    await rm(out, { recursive: true, force: true });
+  }, 15_000);
 
   it('does not copy anything in when the runner will clone itself', async () => {
     const { docker, container } = mockDocker();

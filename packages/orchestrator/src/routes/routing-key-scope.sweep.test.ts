@@ -37,6 +37,7 @@ import {
   createAdminScheduledJobsRoutes,
   type AdminScheduledJobsRoutesDeps,
 } from './admin-scheduled-jobs.js';
+import { createTestDirectRoutes } from './test-direct.js';
 
 const TOKEN_ROUTING_KEY = 'github:42';
 const OTHER_ROUTING_KEY = 'github:99';
@@ -650,6 +651,20 @@ describe('routing-key scope sweep — admin-scheduled-jobs.ts', () => {
       'http://localhost/api/v1/admin/scheduled-jobs/cold-store-archive/trigger',
       { token: VALID_TOKEN },
     );
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('routing-key scope sweep — test-direct.ts', () => {
+  it('refuses POST /test/trigger (the server chooses the routing key)', async () => {
+    const app = createTestDirectRoutes({
+      tokenManager: scopedTokenManager(ownerScopedToken()),
+      rbac: new RbacEnforcer(),
+    } as any);
+    const res = await request(app, 'POST', 'http://localhost/api/v1/test/trigger', {
+      token: VALID_TOKEN,
+      body: { fixtureId: 'f', event: { type: 'push', targetBranch: 'main', payload: {} } },
+    });
     expect(res.status).toBe(403);
   });
 });

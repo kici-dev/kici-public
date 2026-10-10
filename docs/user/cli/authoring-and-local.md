@@ -45,7 +45,7 @@ The type-check requires `.kici/tsconfig.json` and a `typescript` dependency — 
 
 Compile and validation errors carry the real `file:line:column` of the offending job or step (anchored to the job's first step location), so you can jump straight to the source instead of a generic line 1.
 
-**Auto-type regeneration:** When authenticated (via `kici login`), `kici compile` automatically refreshes `.kici/types/secrets.d.ts` after each successful compilation. This keeps type declarations in sync with your orchestrator's secret contexts. The type regeneration is non-blocking -- if the orchestrator is unreachable, compilation still succeeds with a warning. The `--check` flag skips type regeneration since no files are written.
+**Auto-type regeneration:** When [`kici types`](#kici-types) has a source (a direct orchestrator target, a Platform login with an active organization, or local secret files), `kici compile` refreshes `.kici/types/secrets.d.ts` after each successful compilation. The refresh keeps type declarations in sync with your secret contexts. The type regeneration is non-blocking -- if the source is unreachable, compilation still succeeds with a warning. The `--check` flag skips type regeneration since a check writes no files.
 
 ### kici preview
 
@@ -172,21 +172,30 @@ kici fixture pr:open --output fixtures/pr-open-reference.json
 
 ### kici types
 
-Generate TypeScript declaration files from orchestrator environment metadata. The generated `.d.ts` file augments the SDK's `KnownSecretKeys` and `ContextSecrets` interfaces, providing compile-time autocomplete and type checking for secret key names.
+Generate TypeScript declaration files from your contexts' secret key names. The generated `.d.ts` file augments the SDK's `KnownSecretKeys` and `ContextSecrets` interfaces, providing compile-time autocomplete and type checking for secret key names.
 
 ```bash
 kici types [options]
 ```
 
-**Prerequisites:** Authenticate via `kici login` to fetch the real key set. Without it, `kici types` writes an empty stub (see "Offline behavior" below).
+**Prerequisites:** any one of these sources. `kici types` reads the first that is available:
+
+1. A direct orchestrator target: `--orchestrator-url`, `KICI_ORCHESTRATOR_TOKEN`, or the orchestrator saved by [`kici connect`](./account-and-org.md#kici-connect). The token needs the `owner` or `admin` role.
+2. Your Platform login (`kici login` and an active organization).
+3. The local secret files `kici run --local` reads: `.kici/.secrets` and `.kici/secrets.yaml`. Only key names are read, never values.
+
+With none of them, `kici types` writes an empty stub (see "Offline behavior" below).
 
 **Output:** `.kici/types/secrets.d.ts`
 
 **Examples:**
 
 ```bash
-# Generate types from orchestrator
+# Generate types from the first available source
 kici types
+
+# Read key names from one orchestrator
+KICI_ORCHESTRATOR_TOKEN=... kici types --orchestrator-url https://ci.example.com
 
 # Use custom .kici directory
 kici types --kici-dir packages/app/.kici
@@ -194,17 +203,19 @@ kici types --kici-dir packages/app/.kici
 
 **How it works:**
 
-1. Fetches all environment metadata (environment names and secret key names) from the orchestrator
+1. Reads every context name and its secret key names from the source
 2. Generates a `.d.ts` file that augments `@kici-dev/sdk`'s `KnownSecretKeys` and `ContextSecrets` interfaces
-3. Writes the file to `.kici/types/secrets.d.ts`
+3. Writes the file to `.kici/types/secrets.d.ts`, with a `// Source:` header that names the source: `orchestrator <url>`, `Platform org <id>` or `local files`
+
+**Never downgraded:** local secret files never replace a key set read from an orchestrator or the Platform. On an offline laptop with only local files, `kici types` keeps the existing file and says so. A file written by an older CLI, whose header names the Platform URL, counts as read from the Platform.
 
 After generating types, `ctx.secrets.get('MY_KEY')` and `ctx.secrets.expose('DB_HOST')` gain autocomplete and type checking in your IDE.
 
-**Git workflow:** `.kici/types/secrets.d.ts` is a local development aid, not source — its content is a snapshot of one org's secret keys fetched from the Platform. `kici init` gitignores `.kici/types/`, so the file stays out of version control. Each team member runs `kici types` (or an authenticated `kici compile`) to generate their own copy. Do not commit it: a stale committed copy would type-check against secret keys that no longer exist.
+**Git workflow:** `.kici/types/secrets.d.ts` is a local development aid, not source — its content is a snapshot of one org's secret keys. `kici init` gitignores `.kici/types/`, so the file stays out of version control. Each team member runs `kici types` (or `kici compile`) to generate their own copy. Do not commit it: a stale committed copy would type-check against secret keys that no longer exist.
 
-**Offline behavior:** When the Platform cannot be reached — not logged in, no active org, or offline — `kici types` never fails. If a `secrets.d.ts` already exists, `kici types` keeps it untouched, so a transient outage does not wipe your real key set. If the file is absent (a fresh clone or unauthenticated CI), `kici types` writes a valid empty stub. Type checking then degrades to "no known keys" (any key name is accepted) rather than breaking with "module has no exported member". Run `kici types` again once authenticated to refresh it.
+**Offline behavior:** When no source can be reached — no target configured, or the orchestrator or Platform is offline — `kici types` falls back to the local secret files, and never fails. With no local files either: if a `secrets.d.ts` already exists, `kici types` keeps it untouched, so a transient outage does not wipe your real key set. If the file is absent (a fresh clone or unauthenticated CI), `kici types` writes a valid empty stub. Type checking then degrades to "no known keys" (any key name is accepted) rather than breaking with "module has no exported member". A token the orchestrator or Platform refuses is an error, not a reason to write a stub.
 
-**Auto-regeneration:** `kici compile` automatically runs `kici types` after successful compilation when authenticated. See the [kici compile](#kici-compile) section for details.
+**Auto-regeneration:** `kici compile` automatically runs `kici types` after successful compilation whenever one of the sources above exists. See the [kici compile](#kici-compile) section for details.
 
 **Escape hatch:** For dynamic keys not in the generated types, use a cast: `(ctx.secrets as any).DYNAMIC_KEY`.
 
@@ -477,9 +488,10 @@ Synopsis: `kici types [options]`
 
 **Options**
 
-| Option              | Default | Description             |
-| ------------------- | ------- | ----------------------- |
-| `--kici-dir <path>` | `.kici` | Path to .kici directory |
+| Option                     | Default | Description                                                                                            |
+| -------------------------- | ------- | ------------------------------------------------------------------------------------------------------ |
+| `--kici-dir <path>`        | `.kici` | Path to .kici directory                                                                                |
+| `--orchestrator-url <url>` |         | Read secret key names from this orchestrator directly (token: KICI_ORCHESTRATOR_TOKEN or kici connect) |
 
 ### `kici workflows`
 

@@ -3,17 +3,30 @@ import path from 'node:path';
 import os from 'node:os';
 
 /**
+ * An orchestrator `kici run remote` talks to directly, saved by
+ * `kici connect`: its base URL and the orchestrator admin token to present.
+ */
+export interface DirectTarget {
+  url: string;
+  token: string;
+}
+
+/**
  * Global KiCI configuration stored in ~/.kici/config.
  * Contains authentication tokens and endpoint settings.
  */
 export interface GlobalConfig {
-  /** Orchestrator URL for direct mode */
+  /** Orchestrator URL `kici verify-attestation` uses as its default trust root */
   endpoint?: string;
   /** Platform relay URL */
   platformEndpoint?: string;
   /** OIDC issuer URL the PAT was minted against (provenance; from OAuth login) */
   oidcIssuer?: string;
-  /** Routing key for webhook source identification (e.g., 'github:42') */
+  /**
+   * Routing key written by `kici login --routing-key`.
+   *
+   * @deprecated Never read by any command; removed in v1.0.0.
+   */
   routingKey?: string;
   /** Personal access token (from OAuth login) */
   pat?: string;
@@ -31,6 +44,8 @@ export interface GlobalConfig {
    * is omitted so a developer with one preferred cluster types no flag.
    */
   defaultClusters?: Record<string, string>;
+  /** The orchestrator `kici run remote` and `kici types` call directly (`kici connect`). */
+  direct?: DirectTarget;
 }
 
 /**
@@ -85,6 +100,13 @@ function sanitizeConfig(raw: unknown): GlobalConfig {
     }
     if (Object.keys(clusters).length > 0) {
       config.defaultClusters = clusters;
+    }
+  }
+
+  if (typeof obj.direct === 'object' && obj.direct !== null && !Array.isArray(obj.direct)) {
+    const direct = obj.direct as Record<string, unknown>;
+    if (typeof direct.url === 'string' && typeof direct.token === 'string') {
+      config.direct = { url: direct.url, token: direct.token };
     }
   }
 
@@ -167,6 +189,7 @@ export async function mergeGlobalConfig(partial: Partial<GlobalConfig>): Promise
   const merged: GlobalConfig = { ...existing };
   if (partial.endpoint !== undefined) merged.endpoint = partial.endpoint;
   if (partial.platformEndpoint !== undefined) merged.platformEndpoint = partial.platformEndpoint;
+  if (partial.oidcIssuer !== undefined) merged.oidcIssuer = partial.oidcIssuer;
   if (partial.routingKey !== undefined) merged.routingKey = partial.routingKey;
   if (partial.pat !== undefined) merged.pat = partial.pat;
   if (partial.patId !== undefined) merged.patId = partial.patId;
@@ -174,6 +197,7 @@ export async function mergeGlobalConfig(partial: Partial<GlobalConfig>): Promise
   if (partial.activeOrgId !== undefined) merged.activeOrgId = partial.activeOrgId;
   if (partial.userEmail !== undefined) merged.userEmail = partial.userEmail;
   if (partial.defaultClusters !== undefined) merged.defaultClusters = partial.defaultClusters;
+  if (partial.direct !== undefined) merged.direct = partial.direct;
 
   await saveGlobalConfig(merged);
   return merged;

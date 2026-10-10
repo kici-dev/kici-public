@@ -26,6 +26,10 @@ secret resolution, and storage layout.
 
 ## Deprecated surfaces
 
-| Surface                                | Deprecated                                     | Replacement                                                                                | Deprecated in | Removal  |
-| -------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------- | -------- |
-| `kici-admin cold-store reconcile` flag | `--confirm-cleanup`, which never had an effect | None: omit the flag. `reconcile` rebuilds missing manifests and changes no chunk counters. | `0.16.0`      | `v1.0.0` |
+| Surface                                            | Deprecated                                      | Replacement                                                                                | Deprecated in | Removal  |
+| -------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------- | -------- |
+| `kici-admin cold-store reconcile` flag             | `--confirm-cleanup`, which never had an effect  | None: omit the flag. `reconcile` rebuilds missing manifests and changes no chunk counters. | `0.16.0`      | `v1.0.0` |
+| `kici-admin api-key` (`create`, `add-routing-key`) | the whole command group, which no server serves | `kici-admin token create <label> --role <role> --subject <who> --expires <duration>`       | `0.17.0`      | `v1.0.0` |
+| `kici run remote` flag                             | `--routing-key`, which never had an effect      | None: omit the flag. The orchestrator chooses the routing key.                             | `0.17.0`      | `v1.0.0` |
+| `kici login` flag                                  | `--routing-key`, whose value nothing reads      | None: omit the flag.                                                                       | `0.17.0`      | `v1.0.0` |
+| `~/.kici/config` field                             | `routingKey`, which nothing reads               | None: delete the field.                                                                    | `0.17.0`      | `v1.0.0` |
